@@ -10,6 +10,7 @@ base64 = "0.23.1"
 c6-api.workspace = true
 c6-core.workspace = true
 c6-llm.workspace = true
+c6-mcp.workspace = true
 c6-proto.workspace = true
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -19,6 +20,7 @@ gethostname = "1.1.0"
 hex = "0.4.3"
 if-addrs = "0.15.0"
 mime_guess = "2.0.5"
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
 pem = "4.0.0"
 prost = "0.14.4"
 rand = "0.10.3"

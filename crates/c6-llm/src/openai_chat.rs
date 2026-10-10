@@ -401,6 +401,7 @@ mod tests {
             max_output_tokens: None,
             cache_key: Some("k".into()),
             effort: None,
+            web_search: false,
         };
         let body = c.request_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -426,6 +427,7 @@ mod tests {
             max_output_tokens: None,
             cache_key: None,
             effort: None,
+            web_search: false,
         };
         let body = c.request_body(&req);
         assert_eq!(body["messages"][2], json!({"role": "assistant", "content": ""}));

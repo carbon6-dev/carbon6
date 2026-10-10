@@ -106,6 +106,11 @@ pub struct Session {
     pub status: SessionStatus,
     pub error: Option<String>,
     pub effort: Option<String>,
+    /// Subagent sessions: the parent session and the Task call that ran it.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub parent_call_id: Option<String>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
     pub last_seq: u64,
@@ -235,9 +240,21 @@ pub enum EventKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    Thinking { text: String },
-    ToolUse { id: String, name: String, input_json: String },
+    /// A tool the provider ran itself (e.g. web search), for display.
+    ServerTool {
+        label: String,
+    },
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

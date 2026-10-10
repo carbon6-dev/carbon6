@@ -49,6 +49,9 @@ pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
         content_block::Block::Reasoning(r) => {
             Some(Block::Reasoning { id: r.id.clone(), encrypted: r.encrypted_content.clone(), summary: r.summary.clone() })
         }
+        content_block::Block::Opaque(o) => {
+            Some(Block::Opaque { provider: o.provider.clone(), json: o.json.clone(), label: o.label.clone() })
+        }
     }
 }
 
@@ -68,6 +71,9 @@ pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
             encrypted_content: encrypted.clone(),
             summary: summary.clone(),
         }),
+        Block::Opaque { provider, json, label } => {
+            content_block::Block::Opaque(c6_proto::Opaque { provider: provider.clone(), json: json.clone(), label: label.clone() })
+        }
         Block::ToolResult { .. } => return None,
     };
     Some(c6_proto::ContentBlock { block: Some(block) })

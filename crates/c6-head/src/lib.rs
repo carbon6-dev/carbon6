@@ -11,6 +11,7 @@ pub mod registry;
 pub mod secrets;
 pub mod sessions;
 pub mod store;
+pub mod telemetry;
 pub mod terminals;
 
 use std::net::{IpAddr, SocketAddr};
@@ -61,6 +62,7 @@ pub struct HeadState {
     pub hub: sessions::LiveHub,
     pub oauth: oauth::OAuth,
     pub terminals: terminals::Attaches,
+    pub otlp: Option<telemetry::Otlp>,
     /// For OAuth token exchange and model listing.
     pub http: reqwest::Client,
     /// The UI port, for the OAuth loopback redirect.
@@ -128,6 +130,7 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
         hub: Default::default(),
         oauth: Default::default(),
         terminals: Default::default(),
+        otlp: telemetry::Otlp::from_config(cfg.otlp_endpoint.as_deref(), cfg.otlp_headers.clone()),
         http,
         ui_port: ui_addrs[0].port(),
         worker_url,

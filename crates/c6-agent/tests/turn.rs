@@ -37,6 +37,7 @@ fn cfg() -> TurnConfig {
         cache_key: "s1".into(),
         effort: None,
         context_window: 128_000,
+        web_search: false,
     }
 }
 
@@ -67,7 +68,7 @@ async fn tool_call_then_answer_with_mid_turn_input() {
     let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
     assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user"]);
     assert_eq!(msgs[4]["content"], "and say done");
-    assert_eq!(reqs[0]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(reqs[0]["tools"].as_array().unwrap().len(), 11);
 
     // The recorded log rebuilds the same conversation.
     let events = vec_sink.events.lock().unwrap().clone();

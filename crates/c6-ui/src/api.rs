@@ -227,3 +227,15 @@ pub async fn open_terminal(worker: String, cwd: String) -> Result<TerminalInfo, 
 pub async fn close_terminal(worker: String, id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/workers/{worker}/terminals/{id}")).send().await).await
 }
+
+pub async fn children(id: String) -> Result<Vec<Session>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/children")).send().await).await
+}
+
+pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/settings/{name}")).send().await).await
+}
+
+pub async fn put_setting(name: &'static str, value: serde_json::Value) -> Result<(), String> {
+    empty(Request::put(&format!("/api/v1/settings/{name}")).json(&value).map_err(|e| e.to_string())?.send().await).await
+}

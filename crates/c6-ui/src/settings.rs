@@ -41,6 +41,23 @@ pub fn SettingsPage() -> impl IntoView {
             })}
             <AddConnection on_added=move || connections.refetch() />
             <ChatGptSignIn on_added=move || connections.refetch() />
+            <JsonSetting
+                name="mcp-servers"
+                title="MCP servers"
+                help="Started for each new session: stdio servers run on the worker in the session's directory; HTTP servers are reached from the worker. Their tools appear as mcp__<server>__<tool>."
+                example=r#"[
+  {"name": "github", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "…"}},
+  {"name": "docs", "transport": "http", "url": "http://10.0.0.5:8080/mcp"}
+]"#
+            />
+            <JsonSetting
+                name="skills"
+                title="Skills"
+                help="Instructions the agent loads on demand by name. Skills in a repository's .claude/skills or .agents/skills directories are found automatically and take precedence."
+                example=r#"[
+  {"name": "release", "description": "How to cut a release", "body": "1. Update CHANGELOG.md…"}
+]"#
+            />
         </main>
     }
 }
@@ -244,6 +261,50 @@ fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                 }.into_any(),
             }}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+        </section>
+    }
+}
+
+/// A JSON-array setting edited as text, validated by the head on save.
+#[component]
+fn JsonSetting(name: &'static str, title: &'static str, help: &'static str, example: &'static str) -> impl IntoView {
+    let text = RwSignal::new(String::new());
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let loaded = LocalResource::new(move || api::get_setting(name));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
+            text.set(if pretty == "[]" { String::new() } else { pretty });
+        }
+    });
+    let save = move |_| {
+        let raw = text.get_untracked();
+        let value = if raw.trim().is_empty() {
+            Ok(serde_json::json!([]))
+        } else {
+            serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| format!("Not valid JSON: {e}"))
+        };
+        spawn_local(async move {
+            let r = match value {
+                Ok(v) => api::put_setting(name, v).await.map(|_| "Saved. New sessions will use it."),
+                Err(e) => Err(e),
+            };
+            status.set(Some(r));
+        });
+    };
+    view! {
+        <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">{title}</h2>
+            <p class="text-sm text-zinc-500">{help}</p>
+            <textarea class=format!("{INPUT} min-h-40 font-mono text-xs") placeholder=example
+                prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=save>"Save"</button>
+            </div>
         </section>
     }
 }

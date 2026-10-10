@@ -19,6 +19,8 @@ pub struct OpenAiResponses {
     headers: HashMap<String, String>,
     /// ChatGPT-plan tokens: the backend ignores sampling and output caps.
     plan: bool,
+    /// api.openai.com (not a compatible server): built-in tools are available.
+    official: bool,
 }
 
 impl OpenAiResponses {
@@ -27,7 +29,8 @@ impl OpenAiResponses {
         if !bearer.is_empty() {
             headers.insert("authorization".into(), format!("Bearer {bearer}"));
         }
-        Ok(Self { http: http::client()?, base_url: base_url.trim_end_matches('/').to_owned(), headers, plan })
+        let official = url::Url::parse(base_url).ok().and_then(|u| u.host_str().map(|h| h == "api.openai.com")).unwrap_or(false);
+        Ok(Self { http: http::client()?, base_url: base_url.trim_end_matches('/').to_owned(), headers, plan, official })
     }
 
     pub fn request_body(&self, req: &ModelRequest) -> Value {
@@ -44,12 +47,16 @@ impl OpenAiResponses {
         if let Some(e) = req.effort.as_deref() {
             body["reasoning"]["effort"] = e.into();
         }
-        if !req.tools.is_empty() {
-            body["tools"] = req
-                .tools
-                .iter()
-                .map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": false}))
-                .collect();
+        let mut tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": false}))
+            .collect();
+        if req.web_search && self.official {
+            tools.push(json!({"type": "web_search"}));
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
             body["tool_choice"] = "auto".into();
         }
         if let Some(k) = &req.cache_key {
@@ -92,6 +99,11 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                         }
                         Block::ToolUse { id, name, input_json } => {
                             items.push(json!({"type": "function_call", "call_id": id, "name": name, "arguments": input_json}))
+                        }
+                        Block::Opaque { provider, json, .. } if provider == "openai" => {
+                            if let Ok(v) = serde_json::from_str::<Value>(json) {
+                                items.push(v);
+                            }
                         }
                         // Other providers' reasoning is not replayable here.
                         _ => {}
@@ -251,7 +263,14 @@ fn item_block(item: &Value) -> Option<Block> {
                 summary: summary.join("\n\n"),
             })
         }
-        _ => None,
+        // Built-in tool calls (web_search_call …) are kept verbatim.
+        kind => {
+            let label = match item["action"]["query"].as_str() {
+                Some(q) => format!("{}: {q}", kind.trim_end_matches("_call")),
+                None => kind.trim_end_matches("_call").to_owned(),
+            };
+            Some(Block::Opaque { provider: "openai".into(), json: item.to_string(), label })
+        }
     }
 }
 
@@ -315,6 +334,7 @@ mod tests {
             max_output_tokens: Some(1000),
             cache_key: Some("sess".into()),
             effort: Some("high".into()),
+            web_search: true,
         };
         let b = c.request_body(&req);
         assert_eq!(b["store"], false);
@@ -324,5 +344,6 @@ mod tests {
         let types: Vec<&str> = b["input"].as_array().unwrap().iter().map(|i| i["type"].as_str().unwrap()).collect();
         assert_eq!(types, ["message", "reasoning", "function_call", "function_call_output"]);
         assert_eq!(b["prompt_cache_key"], "sess");
+        assert_eq!(b["tools"][1]["type"], "web_search");
     }
 }

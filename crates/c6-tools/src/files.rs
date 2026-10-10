@@ -234,7 +234,12 @@ mod tests {
     use crate::SessionTools;
 
     fn ctx(dir: &std::path::Path) -> ToolCtx {
-        ToolCtx { session: Arc::new(SessionTools::new(dir.to_owned())), cancel: Default::default(), output: Arc::new(|_: &str| {}) }
+        ToolCtx {
+            session: Arc::new(SessionTools::new(dir.to_owned())),
+            cancel: Default::default(),
+            output: Arc::new(|_: &str| {}),
+            call_id: String::new(),
+        }
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 //! Built-in agent tools and the `Tool` trait.
 
+pub mod agents;
+mod background;
 mod bash;
 mod files;
 mod patch;
@@ -7,6 +9,7 @@ mod plan;
 pub mod profiles;
 mod search;
 mod util;
+mod web;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,12 +22,15 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub use agents::{Skill, SkillTool, Subagents, Task};
+pub use background::{Background, BashOutput, KillShell};
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};
 pub use patch::ApplyPatch;
 pub use plan::Plan;
 pub use profiles::tools_for;
 pub use search::{Glob, Grep};
+pub use web::WebFetch;
 
 /// Output kept inline for the model; the rest is elided from the middle.
 pub const MAX_OUTPUT_CHARS: usize = 30_000;
@@ -61,9 +67,10 @@ impl ToolOutput {
 }
 
 /// State shared by every tool call in a session.
-#[derive(Debug)]
 pub struct SessionTools {
     cwd: Mutex<PathBuf>,
+    pub background: Background,
+    subagents: Mutex<Option<Arc<dyn Subagents>>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -72,11 +79,20 @@ pub struct SessionTools {
 
 impl SessionTools {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd: Mutex::new(cwd), seen: Mutex::default() }
+        Self { cwd: Mutex::new(cwd), seen: Mutex::default(), background: Background::default(), subagents: Mutex::default() }
     }
 
     pub fn cwd(&self) -> PathBuf {
         self.cwd.lock().unwrap().clone()
+    }
+
+    /// Sets who runs `Task` subagents for the current turn.
+    pub fn set_subagents(&self, s: Option<Arc<dyn Subagents>>) {
+        *self.subagents.lock().unwrap() = s;
+    }
+
+    pub fn subagents(&self) -> Option<Arc<dyn Subagents>> {
+        self.subagents.lock().unwrap().clone()
     }
 
     pub(crate) fn set_cwd(&self, cwd: PathBuf) {
@@ -119,6 +135,8 @@ pub struct ToolCtx {
     pub session: Arc<SessionTools>,
     pub cancel: CancellationToken,
     pub output: OutputSink,
+    /// The model's id for this call.
+    pub call_id: String,
 }
 
 #[async_trait]

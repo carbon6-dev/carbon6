@@ -52,12 +52,18 @@ impl Anthropic {
             "cache_control": {"type": "ephemeral"},
             "messages": messages(&req.messages),
         });
-        if !req.tools.is_empty() {
-            body["tools"] = req
-                .tools
-                .iter()
-                .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.parameters, "eager_input_streaming": true}))
-                .collect();
+        let mut tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.parameters, "eager_input_streaming": true}))
+            .collect();
+        if req.web_search && info.tool_profile == crate::ToolProfile::Claude {
+            // Dynamic filtering needs the 4.6+ family; older models get the basic tool.
+            let kind = if info.thinking == Thinking::Adaptive { "web_search_20260209" } else { "web_search_20250305" };
+            tools.push(json!({"type": kind, "name": "web_search"}));
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
         }
         match info.thinking {
             Thinking::Adaptive => {
@@ -90,6 +96,9 @@ fn messages(msgs: &[crate::Message]) -> Vec<Value> {
                         Some(json!({"type": "thinking", "thinking": text, "signature": signature}))
                     }
                     Block::RedactedThinking(data) if m.role == Role::Assistant => Some(json!({"type": "redacted_thinking", "data": data})),
+                    Block::Opaque { provider, json, .. } if provider == "anthropic" && m.role == Role::Assistant => {
+                        serde_json::from_str(json).ok()
+                    }
                     Block::ToolUse { id, name, input_json } => {
                         let input: Value = serde_json::from_str(input_json).unwrap_or_else(|_| json!({}));
                         Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
@@ -150,10 +159,21 @@ impl ModelClient for Anthropic {
 /// A content block being streamed.
 enum Open {
     Text(String),
-    Thinking { text: String, signature: String },
+    Thinking {
+        text: String,
+        signature: String,
+    },
     Redacted(String),
-    ToolUse { id: String, name: String, json: String },
-    Other,
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
+    /// Server-run tool blocks: kept whole; `input` arrives as JSON deltas.
+    Opaque {
+        block: Value,
+        input_json: String,
+    },
 }
 
 struct State {
@@ -236,7 +256,7 @@ impl State {
                         name: b["name"].as_str().unwrap_or("").to_owned(),
                         json: String::new(),
                     },
-                    _ => Open::Other,
+                    _ => Open::Opaque { block: b.clone(), input_json: String::new() },
                 };
                 self.open.insert(index, open);
             }
@@ -258,6 +278,7 @@ impl State {
                     }
                     ("signature_delta", Open::Thinking { signature, .. }) => signature.push_str(d["signature"].as_str().unwrap_or("")),
                     ("input_json_delta", Open::ToolUse { json, .. }) => json.push_str(d["partial_json"].as_str().unwrap_or("")),
+                    ("input_json_delta", Open::Opaque { input_json, .. }) => input_json.push_str(d["partial_json"].as_str().unwrap_or("")),
                     _ => {}
                 }
             }
@@ -269,7 +290,14 @@ impl State {
                     Some(Open::ToolUse { id, name, json }) => {
                         Block::ToolUse { id, name, input_json: if json.trim().is_empty() { "{}".into() } else { json } }
                     }
-                    Some(Open::Other) | None => return,
+                    Some(Open::Opaque { mut block, input_json }) => {
+                        if let Ok(input) = serde_json::from_str::<Value>(&input_json) {
+                            block["input"] = input;
+                        }
+                        let label = opaque_label(&block);
+                        Block::Opaque { provider: "anthropic".into(), json: block.to_string(), label }
+                    }
+                    None => return,
                 };
                 self.pending.push_back(Ok(ModelEvent::Block { index, block }));
             }
@@ -331,6 +359,25 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>, L
     Ok(v["data"].as_array().map(|a| a.iter().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect()).unwrap_or_default())
 }
 
+/// A short description of a server-tool block for the UI.
+fn opaque_label(b: &Value) -> String {
+    let kind = b["type"].as_str().unwrap_or("block");
+    match kind {
+        "server_tool_use" => {
+            let name = b["name"].as_str().unwrap_or("tool");
+            match b["input"]["query"].as_str().or(b["input"]["url"].as_str()) {
+                Some(q) => format!("{name}: {q}"),
+                None => name.to_owned(),
+            }
+        }
+        k if k.ends_with("_tool_result") => match b["content"].as_array() {
+            Some(results) => format!("{} result{}", results.len(), if results.len() == 1 { "" } else { "s" }),
+            None => "tool result".to_owned(),
+        },
+        k => k.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +430,33 @@ mod tests {
     }
 
     #[test]
+    fn server_tool_blocks_are_kept_verbatim() {
+        let evs = run(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust 2026\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://a","title":"A","encrypted_content":"E"}]}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":3}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let mut acc = Accumulator::default();
+        for e in &evs {
+            acc.push(e.as_ref().unwrap());
+        }
+        assert_eq!(acc.stop_reason.as_deref(), Some("pause_turn"));
+        let blocks = acc.finish(true).blocks;
+        let Block::Opaque { json, label, .. } = &blocks[0] else { panic!() };
+        assert_eq!(label, "web_search: rust 2026");
+        assert_eq!(serde_json::from_str::<Value>(json).unwrap()["input"]["query"], "rust 2026");
+        let Block::Opaque { label, .. } = &blocks[1] else { panic!() };
+        assert_eq!(label, "1 result");
+        // Replayed unchanged.
+        let msgs = messages(&[crate::Message { role: Role::Assistant, blocks }]);
+        assert_eq!(msgs[0]["content"][1]["type"], "web_search_tool_result");
+    }
+
+    #[test]
     fn overloaded_error_is_retryable_and_missing_stop_is_error() {
         let evs = run(&[r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]);
         assert!(evs[0].as_ref().unwrap_err().contains("529"));
@@ -411,6 +485,7 @@ mod tests {
             max_output_tokens: None,
             cache_key: None,
             effort: None,
+            web_search: true,
         };
         let b = c.request_body(&req);
         assert_eq!(b["thinking"], json!({"type": "adaptive", "display": "summarized"}));
@@ -418,6 +493,7 @@ mod tests {
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(b["cache_control"]["type"], "ephemeral");
         assert_eq!(b["tools"][0]["eager_input_streaming"], true);
+        assert_eq!(b["tools"][1], json!({"type": "web_search_20260209", "name": "web_search"}));
         let asst = &b["messages"][1]["content"];
         assert_eq!(asst.as_array().unwrap().len(), 2, "Responses reasoning is skipped");
         assert_eq!(asst[0], json!({"type": "thinking", "thinking": "", "signature": "S"}));

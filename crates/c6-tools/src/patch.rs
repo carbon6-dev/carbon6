@@ -305,8 +305,12 @@ mod tests {
         let p = dir.path();
         std::fs::write(p.join("a.py"), "def f():\n    return 1\n\ndef g():\n    return 2\n").unwrap();
         std::fs::write(p.join("old.txt"), "bye\n").unwrap();
-        let ctx =
-            ToolCtx { session: Arc::new(SessionTools::new(p.to_owned())), cancel: Default::default(), output: Arc::new(|_: &str| {}) };
+        let ctx = ToolCtx {
+            session: Arc::new(SessionTools::new(p.to_owned())),
+            cancel: Default::default(),
+            output: Arc::new(|_: &str| {}),
+            call_id: String::new(),
+        };
 
         let patch = "*** Begin Patch\n\
 *** Add File: new/b.txt\n+hello\n+world\n\
@@ -325,8 +329,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("x.txt"), "one\ntwo\n").unwrap();
-        let ctx =
-            ToolCtx { session: Arc::new(SessionTools::new(p.to_owned())), cancel: Default::default(), output: Arc::new(|_: &str| {}) };
+        let ctx = ToolCtx {
+            session: Arc::new(SessionTools::new(p.to_owned())),
+            cancel: Default::default(),
+            output: Arc::new(|_: &str| {}),
+            call_id: String::new(),
+        };
         let patch = "*** Begin Patch\n*** Add File: y.txt\n+y\n*** Update File: x.txt\n-three\n+3\n*** End Patch";
         let r = ApplyPatch.call(&ctx, json!({"input": patch})).await;
         assert!(r.is_error && r.content.contains("did not match"), "{r:?}");

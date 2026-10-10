@@ -7,7 +7,7 @@ An AI coding-agent harness for running agents on many machines from one place.
 
 See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs/architecture.md).
 
-Status: **M3**. You can run coding sessions on any worker from the web UI, using Claude (Anthropic API), OpenAI (API key or your ChatGPT plan via Sign in with ChatGPT), or any OpenAI-compatible server (Ollama, vLLM, …). Each model family gets the tool set it was trained on, prompt caching and reasoning carry-over are on, and long sessions compact automatically. Sessions keep running when the head is unreachable and sync back when it returns. From the head you can browse each worker's files, review git changes, start sessions in fresh worktrees, and open terminals. Claude Code can also run as a session backend, using each worker's own sign-in.
+Status: **M4**. You can run coding sessions on any worker from the web UI, using Claude (Anthropic API), OpenAI (API key or your ChatGPT plan via Sign in with ChatGPT), or any OpenAI-compatible server (Ollama, vLLM, …). Each model family gets the tool set it was trained on, prompt caching and reasoning carry-over are on, and long sessions compact automatically. Sessions keep running when the head is unreachable and sync back when it returns. From the head you can browse each worker's files, review git changes, start sessions in fresh worktrees, and open terminals. Claude Code can also run as a session backend, using each worker's own sign-in. Agents can run background commands, fetch and search the web, delegate to subagents, use MCP servers, and load skills. The head exports OpenTelemetry GenAI traces over OTLP.
 
 ## Build
 
@@ -33,7 +33,7 @@ c6w enroll c6e1.…
 c6w run
 ```
 
-Head config lives in `~/.config/c6h/c6h.toml` (optional; see `crates/c6-head/src/config.rs`). Worker identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
+Head config lives in `~/.config/c6h/c6h.toml` (optional; see `crates/c6-head/src/config.rs`). Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces. Worker identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
 
 ## Local development
 

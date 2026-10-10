@@ -28,6 +28,7 @@ Write a summary detailed enough to continue the work without the original conver
 (quote any precise instructions), key decisions and their reasons, files examined and changed with their paths, the current state \
 of the work, errors encountered and how they were resolved, and the exact next steps. Do not call any tools; reply with only the summary.";
 
+#[derive(Clone)]
 pub struct TurnConfig {
     pub model: String,
     pub system_prompt: String,
@@ -36,6 +37,8 @@ pub struct TurnConfig {
     pub effort: Option<String>,
     /// The model's context window, for automatic compaction.
     pub context_window: u64,
+    /// Offer the provider's built-in web search, where it has one.
+    pub web_search: bool,
 }
 
 /// Mutable conversation state carried across turns.
@@ -94,6 +97,7 @@ impl Turn<'_> {
             max_output_tokens,
             cache_key: Some(self.cfg.cache_key.clone()),
             effort: self.cfg.effort.clone(),
+            web_search: self.cfg.web_search,
         }
     }
 
@@ -210,6 +214,10 @@ impl Turn<'_> {
                 .filter(|m| m.role == Role::Assistant)
                 .map(|m| m.tool_uses().map(|(a, b, c)| (a.to_owned(), b.to_owned(), c.to_owned())).collect())
                 .unwrap_or_default();
+            if calls.is_empty() && resp.stop_reason == stop::PAUSE_TURN {
+                // A long server-tool turn paused; resend to let it continue.
+                continue;
+            }
             if calls.is_empty() && resp.stop_reason == stop::MAX_TOKENS {
                 return self.fail("The response hit the output token limit before finishing.".into()).await;
             }
@@ -358,7 +366,7 @@ async fn run_one(
             (Some(tool), Ok(value)) => {
                 let call_id = id.to_owned();
                 let stream_to = sink_output(sink, call_id);
-                let ctx = ToolCtx { session: session_tools.clone(), cancel: cancel.clone(), output: stream_to };
+                let ctx = ToolCtx { session: session_tools.clone(), cancel: cancel.clone(), output: stream_to, call_id: id.to_owned() };
                 tool.call(&ctx, value).await
             }
         }

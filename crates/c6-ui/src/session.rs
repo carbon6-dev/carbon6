@@ -139,6 +139,25 @@ fn SessionView(id: String) -> impl IntoView {
 
     let id_stored = StoredValue::new(id.clone());
     let navigate = use_navigate();
+    // Subagent sessions started by Task calls, by call id. Refreshed as
+    // tool results arrive.
+    let children = LocalResource::new({
+        let id = id.clone();
+        move || {
+            results.track();
+            api::children(id.clone())
+        }
+    });
+    let child_of_call = Memo::new(move |_| {
+        children
+            .get()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| Some((c.parent_call_id?, c.id)))
+            .collect::<HashMap<_, _>>()
+    });
+    provide_context(ChildLinks(child_of_call));
     let tab = RwSignal::new("transcript");
     // Where the session really runs (its worktree, if it has one).
     let started = Memo::new(move |_| {
@@ -190,6 +209,10 @@ fn SessionView(id: String) -> impl IntoView {
                                 </div>
                             </div>
                             {s.error.clone().map(|e| view! { <ErrorBox message=format!("The session failed to start: {e}") /> })}
+                            {s.parent_id.clone().map(|p| view! {
+                                <p class="mb-3 text-sm text-zinc-500">"Subagent session · started by a Task call in "
+                                    <a class="underline" href=format!("/sessions/{p}")>"its parent session"</a></p>
+                            })}
                         }.into_any()
                     }
                 })}
@@ -226,7 +249,7 @@ fn SessionView(id: String) -> impl IntoView {
                 {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id_stored.get_value() /> }).collect_view()}
             </div>
 
-            <Show when=move || tab.get() == "transcript">
+            <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_id.is_some())>
             <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error />
             </Show>
         </main>
@@ -263,13 +286,16 @@ fn render_event(e: &Event, results: Memo<HashMap<String, ToolResultView>>, strea
             view! {
                 <div class="space-y-2">
                     {blocks.iter().map(|b| match b {
+                        ContentBlock::ServerTool { label } => view! {
+                            <p class="flex items-center gap-2 text-xs text-zinc-500"><span>"⌕"</span><span class="font-mono">{label.clone()}</span></p>
+                        }.into_any(),
                         ContentBlock::Text { text } => view! { <div class="md" inner_html=markdown::to_html(text)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
                             let (out_id, res_id) = (id.clone(), id.clone());
                             let live_output = Signal::derive(move || streaming.with(|s| s.tool_output.get(&out_id).cloned()));
                             let result = Signal::derive(move || results.with(|r| r.get(&res_id).cloned()));
-                            view! { <ToolCard name=name.clone() input_json=input_json.clone() result live_output /> }.into_any()
+                            view! { <ToolCard name=name.clone() input_json=input_json.clone() call_id=id.clone() result live_output /> }.into_any()
                         }
                     }).collect_view()}
                     {interrupted.then(|| view! { <p class="text-xs italic text-zinc-500">"(response cut off)"</p> })}
@@ -310,6 +336,9 @@ fn Thinking(text: String, open: bool) -> impl IntoView {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ChildLinks(Memo<HashMap<String, String>>);
+
 /// Normalizes tool names across profiles (Claude, Codex, generic).
 fn tool_kind(name: &str) -> &str {
     match name {
@@ -320,6 +349,11 @@ fn tool_kind(name: &str) -> &str {
         "Grep" => "grep",
         "Glob" => "glob",
         "TodoWrite" | "update_plan" => "plan",
+        "Task" => "task",
+        "WebFetch" => "web_fetch",
+        "BashOutput" => "bash_output",
+        "KillShell" => "kill_shell",
+        "Skill" => "load_skill",
         other => other,
     }
 }
@@ -348,6 +382,16 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
         "apply_patch" => {
             s("input").lines().filter_map(|l| l.strip_prefix("*** ").filter(|r| r.contains("File:"))).collect::<Vec<_>>().join(", ")
         }
+        "task" => s("description"),
+        "web_fetch" => s("url"),
+        "bash_output" | "kill_shell" => input
+            .get("id")
+            .or_else(|| input.get("bash_id"))
+            .or_else(|| input.get("shell_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        "load_skill" => input.get("skill").or_else(|| input.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
         "plan" => {
             let items = plan_items(input);
             let done = items.iter().filter(|(_, st)| st == "completed").count();
@@ -372,6 +416,7 @@ fn plan_items(input: &serde_json::Value) -> Vec<(String, String)> {
 fn ToolCard(
     name: String,
     input_json: String,
+    call_id: String,
     result: Signal<Option<ToolResultView>>,
     live_output: Signal<Option<String>>,
 ) -> impl IntoView {
@@ -395,10 +440,13 @@ fn ToolCard(
             (full.contains('\n') || full != s).then_some(full)
         }
         "apply_patch" => input.get("input").and_then(|v| v.as_str()).map(str::to_owned),
-        "read" | "glob" | "grep" | "plan" => None,
+        "task" => input.get("prompt").and_then(|v| v.as_str()).map(str::to_owned),
+        "read" | "glob" | "grep" | "plan" | "web_fetch" | "bash_output" | "kill_shell" | "load_skill" => None,
         _ => serde_json::to_string_pretty(&input).ok(),
     };
     let plan = (kind == "plan").then(|| plan_items(&input));
+    let child = (kind == "task").then(use_context::<ChildLinks>).flatten();
+    let child_call = call_id.clone();
     let started_open = plan.is_some();
     view! {
         <div class="rounded-md border border-zinc-200 text-sm dark:border-zinc-800">
@@ -414,6 +462,9 @@ fn ToolCard(
                 }}
                 <span class="font-mono text-xs font-semibold">{name.clone()}</span>
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
+                {move || child.and_then(|c| c.0.with(|m| m.get(&child_call).cloned())).map(|cid| view! {
+                    <a class="text-[11px] text-blue-600 hover:underline dark:text-blue-400" href=format!("/sessions/{cid}") on:click=|ev| ev.stop_propagation()>"open subagent"</a>
+                })}
                 {move || result.get().map(|r| view! { <span class="text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
             </summary>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">

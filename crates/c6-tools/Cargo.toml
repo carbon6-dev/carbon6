@@ -7,14 +7,17 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+c6-core.workspace = true
 c6-llm.workspace = true
 dirs = "7.0.0"
 globset = "0.4.20"
 grep-matcher = "0.1.9"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
+htmd = "0.5.5"
 ignore = "0.4.33"
 nix = { version = "0.31.3", features = ["signal", "process"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["full"] }

@@ -301,8 +301,12 @@ mod tests {
         std::fs::write(p.join("ignored/c.rs"), "hello\n").unwrap();
         // ignore only honours .gitignore inside a git repo.
         std::fs::create_dir(p.join(".git")).unwrap();
-        let ctx =
-            ToolCtx { session: Arc::new(SessionTools::new(p.to_owned())), cancel: Default::default(), output: Arc::new(|_: &str| {}) };
+        let ctx = ToolCtx {
+            session: Arc::new(SessionTools::new(p.to_owned())),
+            cancel: Default::default(),
+            output: Arc::new(|_: &str| {}),
+            call_id: String::new(),
+        };
         (dir, ctx)
     }
 

@@ -29,6 +29,8 @@ pub struct Bash;
 struct BashInput {
     command: String,
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 #[async_trait]
@@ -45,7 +47,8 @@ impl Tool for Bash {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to run"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Timeout in milliseconds"}
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Timeout in milliseconds"},
+                    "run_in_background": {"type": "boolean", "description": "Start the command in the background (servers, watchers, long builds) and return an id for bash_output / kill_shell"}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -62,6 +65,14 @@ impl Tool for Bash {
             Ok(i) => i,
             Err(e) => return e,
         };
+        if input.run_in_background {
+            return match ctx.session.background.spawn(&input.command, &ctx.session.cwd()) {
+                Ok(id) => ToolOutput::ok(format!(
+                    "Started in the background as {id}. Read its output with the output tool and stop it with the kill tool."
+                )),
+                Err(e) => ToolOutput::err(format!("failed to start: {e}")),
+            };
+        }
         let timeout = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
         match run(ctx, &input.command, timeout).await {
             Ok(out) => out,
@@ -205,6 +216,7 @@ mod tests {
             session: Arc::new(SessionTools::new(dir.to_owned())),
             cancel: Default::default(),
             output: Arc::new(move |s: &str| streamed.lock().unwrap().push_str(s)),
+            call_id: String::new(),
         }
     }
 
@@ -232,6 +244,25 @@ mod tests {
         let r = Bash.call(&ctx, json!({"command": "sleep 30 & sleep 30", "timeout_ms": 300})).await;
         assert!(r.is_error && r.content.contains("timed out"), "{r:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn run_in_background_then_read_and_kill() {
+        use crate::{BashOutput, KillShell};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), Default::default());
+        let r = Bash.call(&ctx, json!({"command": "echo first; sleep 30", "run_in_background": true})).await;
+        assert!(r.content.contains("bg1"), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = BashOutput::generic().call(&ctx, json!({"id": "bg1"})).await;
+        assert!(r.content.starts_with("first\n") && r.content.contains("still running"), "{r:?}");
+        let r = BashOutput::generic().call(&ctx, json!({"id": "bg1"})).await;
+        assert!(r.content.starts_with("(no new output)"), "{r:?}");
+        let r = KillShell::generic().call(&ctx, json!({"id": "bg1"})).await;
+        assert_eq!(r.content, "Stopped bg1");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = BashOutput::generic().call(&ctx, json!({"id": "bg1"})).await;
+        assert!(r.content.contains("exited"), "{r:?}");
     }
 
     #[tokio::test]

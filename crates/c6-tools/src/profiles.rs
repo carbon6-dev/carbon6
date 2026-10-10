@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use c6_llm::{ToolProfile, ToolSpec};
 use serde_json::{Map, Value, json};
 
-use crate::{ApplyPatch, Bash, Concurrency, Edit, Glob, Grep, Plan, Read, Tool, ToolCtx, ToolOutput, Write};
+use crate::{
+    ApplyPatch, Bash, BashOutput, Concurrency, Edit, Glob, Grep, KillShell, Plan, Read, Task, Tool, ToolCtx, ToolOutput, WebFetch, Write,
+};
 
 pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
     match profile {
@@ -16,12 +18,16 @@ pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
             Arc::new(Write),
             Arc::new(Edit),
             Arc::new(Bash),
+            Arc::new(BashOutput::generic()),
+            Arc::new(KillShell::generic()),
             Arc::new(Grep),
             Arc::new(Glob),
+            Arc::new(WebFetch::generic()),
             Arc::new(Plan::update_plan()),
+            Arc::new(Task::generic()),
         ],
         ToolProfile::Claude => claude(),
-        ToolProfile::Codex => vec![Arc::new(Shell), Arc::new(ApplyPatch), Arc::new(Plan::update_plan())],
+        ToolProfile::Codex => vec![Arc::new(Shell), Arc::new(ApplyPatch), Arc::new(Plan::update_plan()), Arc::new(WebFetch::generic())],
     }
 }
 
@@ -115,7 +121,8 @@ fn claude() -> Vec<Arc<dyn Tool>> {
                 parameters: json!({"type": "object", "properties": {
                     "command": {"type": "string", "description": "The command to execute"},
                     "timeout": {"type": "number", "description": "Optional timeout in milliseconds (max 600000)"},
-                    "description": {"type": "string", "description": "Clear, concise description of what this command does in 5-10 words"}
+                    "description": {"type": "string", "description": "Clear, concise description of what this command does in 5-10 words"},
+                    "run_in_background": {"type": "boolean", "description": "Run in the background; read output later with BashOutput"}
                 }, "required": ["command"], "additionalProperties": false}),
             },
             inner: Arc::new(Bash),
@@ -152,7 +159,11 @@ fn claude() -> Vec<Arc<dyn Tool>> {
             inner: Arc::new(Glob),
             map: |m| m,
         }),
+        Arc::new(BashOutput::claude()),
+        Arc::new(KillShell::claude()),
+        Arc::new(WebFetch::claude()),
         Arc::new(Plan::todo_write()),
+        Arc::new(Task::claude()),
     ]
 }
 
@@ -227,6 +238,7 @@ mod tests {
             session: Arc::new(SessionTools::new(dir.path().to_owned())),
             cancel: Default::default(),
             output: Arc::new(|_: &str| {}),
+            call_id: String::new(),
         };
 
         let claude = tools_for(ToolProfile::Claude);
@@ -242,6 +254,6 @@ mod tests {
         assert_eq!(r.content, "it's\n");
 
         let names: Vec<String> = tools_for(ToolProfile::Codex).iter().map(|t| t.spec().name).collect();
-        assert_eq!(names, ["shell", "apply_patch", "update_plan"]);
+        assert_eq!(names, ["shell", "apply_patch", "update_plan", "web_fetch"]);
     }
 }

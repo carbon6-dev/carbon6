@@ -18,6 +18,10 @@ use uuid::Uuid;
 use crate::store::{NewCommand, SessionRow};
 use crate::{HeadState, bad_request, convert, not_found, prompts};
 
+/// Settings keys, included in every new session's configuration.
+pub const MCP_SERVERS: &str = "mcp_servers";
+pub const SKILLS: &str = "skills";
+
 /// Per-session broadcast channels for stream subscribers.
 #[derive(Default)]
 pub struct LiveHub {
@@ -73,6 +77,8 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         status: "starting".into(),
         error: None,
         effort: effort.clone(),
+        parent_id: None,
+        parent_call_id: None,
         created_at: now,
         updated_at: now,
         last_seq: 0,
@@ -94,6 +100,8 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
             cwd: row.cwd.clone(),
             base_prompt: prompts::BASE_PROMPT.into(),
             worktree: req.worktree,
+            mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
+            skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
         })),
     };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
@@ -135,6 +143,9 @@ pub async fn send_input(st: &HeadState, session_id: &str, text: &str) -> anyhow:
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.parent_id.is_some() {
+        return Err(bad_request("subagent sessions run once and cannot take messages"));
+    }
     if session.status == "failed" {
         return Err(bad_request(format!("session failed to start: {}", session.error.unwrap_or_default())));
     }
@@ -184,7 +195,37 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     if !ing.events.is_empty() {
         st.registry.bump();
     }
+    let ended: Vec<u64> =
+        ing.events.iter().filter(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_)))).map(|e| e.seq).collect();
+    if st.otlp.is_some() && !ended.is_empty() {
+        export_turns(st, worker_id, &batch.session_id, ended).await;
+    }
     Ok(Some(ing.last_seq))
+}
+
+async fn export_turns(st: &HeadState, worker_id: WorkerId, session_id: &str, ended: Vec<u64>) {
+    let Some(otlp) = &st.otlp else { return };
+    let (Ok(Some(session)), worker) = (st.store.session(session_id).await, st.store.worker(worker_id).await) else { return };
+    let provider = match st.store.connection(&session.connection_id).await {
+        Ok(Some(c)) => match c.kind.as_str() {
+            "anthropic" | "claude_code" => "anthropic",
+            "openai" | "chatgpt" | "openai_compat" => "openai",
+            other => other,
+        }
+        .to_owned(),
+        _ => "unknown".to_owned(),
+    };
+    let worker_name = worker.ok().flatten().map(|w| w.name).unwrap_or_default();
+    for seq in ended {
+        match st.store.turn_events(session_id, seq).await {
+            Ok(events) => {
+                if let Some(req) = crate::telemetry::turn_spans(&session, &provider, &worker_name, &events) {
+                    otlp.export(req).await;
+                }
+            }
+            Err(e) => warn!("loading turn for telemetry: {e:#}"),
+        }
+    }
 }
 
 pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEvent) {

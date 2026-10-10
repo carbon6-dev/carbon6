@@ -44,6 +44,13 @@ pub enum Block {
         encrypted: String,
         summary: String,
     },
+    /// A provider-run tool block (web search …), replayed verbatim to the
+    /// same provider. `label` is for display.
+    Opaque {
+        provider: String,
+        json: String,
+        label: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -94,6 +101,8 @@ pub struct ModelRequest {
     pub cache_key: Option<String>,
     /// Reasoning effort ("low" … "max"); `None` uses the model default.
     pub effort: Option<String>,
+    /// Offer the provider's own web search tool, where it has one.
+    pub web_search: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +146,9 @@ pub mod stop {
     pub const MAX_TOKENS: &str = "max_tokens";
     pub const REFUSAL: &str = "refusal";
     pub const CONTEXT_EXCEEDED: &str = "model_context_window_exceeded";
+    /// The provider paused a long server-tool turn; send the same request
+    /// (with the partial response appended) to continue.
+    pub const PAUSE_TURN: &str = "pause_turn";
 }
 
 #[derive(Debug, thiserror::Error)]

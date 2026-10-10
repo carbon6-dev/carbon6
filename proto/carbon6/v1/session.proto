@@ -36,6 +36,10 @@ message SessionStarted {
   // Set when the session runs in its own worktree.
   string worktree_branch = 7;
   string repo_root = 8;
+  // Set for subagent sessions, which the worker creates itself.
+  string parent_session_id = 9;
+  string parent_call_id = 10;
+  string title = 11;
 }
 
 message UserMessage {
@@ -63,7 +67,17 @@ message ContentBlock {
     SignedThinking signed_thinking = 4; // Anthropic
     string redacted_thinking = 5;       // Anthropic, opaque data
     Reasoning reasoning = 6;            // OpenAI Responses
+    Opaque opaque = 7;                  // provider-run tools (web search …)
   }
+}
+
+// A provider-specific block kept verbatim (e.g. Anthropic server_tool_use
+// and web_search_tool_result, Responses web_search_call), replayed only to
+// the same provider.
+message Opaque {
+  string provider = 1;
+  string json = 2;
+  string label = 3; // for display
 }
 
 message SignedThinking {
@@ -196,6 +210,10 @@ message CreateSession {
   string base_prompt = 3;
   // Run in a new git worktree on a new branch instead of `cwd` itself.
   bool worktree = 4;
+  // Head configuration snapshot for this session (JSON arrays): MCP servers
+  // and skills. Fixed for the session so the tool list stays stable.
+  string mcp_servers_json = 5;
+  string skills_json = 6;
 }
 
 message ModelSpec {

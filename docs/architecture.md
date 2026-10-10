@@ -401,7 +401,7 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 | M4 | MCP, skills, subagents, web tools, background shells, OTLP export | Feature parity with the requirements |
 | M5 | Hardening: chaos tests, evals, performance, UX polish | Comfortable as the only harness |
 
-## 16. Implementation notes (M1–M3)
+## 16. Implementation notes (M1–M4)
 
 Decisions made while building M1 that refine the sections above:
 
@@ -428,6 +428,20 @@ Decisions made while building M1 that refine the sections above:
   - The worker sends the scrollback, then live output. It takes the scrollback snapshot and subscribes to live output under one lock, so no output is lost or duplicated between them.
 - **Worktrees (M3).** `CreateSession.worktree` runs `git worktree add -b c6/<id> <state>/worktrees/<repo>/<id> HEAD` and starts the session at the same relative path inside it. `SessionStarted` records the branch and repo root. Worktrees are kept when a session is archived; removing them is manual for now.
 - **Claude Code backend.** Each turn runs `claude -p --output-format stream-json` in the session's directory and maps its output onto session events (see requirements R-LLM-3).
+- **Tools (M4).**
+  - Every profile gains background shells (`run_in_background` plus output and kill tools), `web_fetch` (HTML converted to Markdown), and `Task`/`task` subagents (Claude and generic profiles).
+  - Anthropic and OpenAI (api.openai.com) sessions also get the provider's own web search tool. Its calls and results are stored as `Opaque` blocks and replayed verbatim; Anthropic's `pause_turn` resends the request so the provider can continue.
+  - The tool set is fixed when a session starts: the profile's tools, `Skill`/`load_skill` if there are skills, then MCP tools sorted by name.
+- **MCP and skills (M4).**
+  - Configured on the head (settings `mcp_servers`, `skills`) and copied into each `CreateSession`.
+  - MCP stdio servers run on the worker in the session directory; HTTP servers are reached from the worker. A server that fails to start shows as an error event and does not fail the session.
+  - Repo skills (`.claude/skills`, `.agents/skills`) override head skills of the same name, and the skills index goes at the end of the system prompt.
+- **Subagents (M4).**
+  - `Task` runs a child session on the same worker, with the same system prompt and model, the parent's tools minus `Task`, and a fresh conversation. Its final report is returned as the tool result.
+  - The child's log syncs like any session's. The head creates its row when the first event arrives (`SessionStarted.parent_session_id`). Child sessions are hidden from the main list and take no messages.
+- **Telemetry (M4) differs from §11.**
+  - Spans are built on the head from session events when a turn ends, rather than emitted by workers. There is one trace per session: `invoke_agent` per turn, `chat {model}` per model response (with `gen_ai.usage.*` including cache read and write), and `execute_tool {name}` per tool result.
+  - Spans are exported over OTLP/HTTP protobuf to `otlp_endpoint` or `OTEL_EXPORTER_OTLP_ENDPOINT`. Turns that ran while a worker was offline are exported when they sync.
 - **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
 
 ## 17. Open items to settle during implementation

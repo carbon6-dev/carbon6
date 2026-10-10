@@ -206,6 +206,8 @@ pub struct SessionRow {
     pub status: String,
     pub error: Option<String>,
     pub effort: Option<String>,
+    pub parent_id: Option<String>,
+    pub parent_call_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_seq: i64,
@@ -264,10 +266,27 @@ impl Store {
     }
 
     pub async fn sessions(&self, limit: i64) -> anyhow::Result<Vec<SessionRow>> {
-        Ok(sqlx::query_as("SELECT * FROM sessions WHERE archived = 0 ORDER BY updated_at DESC LIMIT ?")
+        Ok(sqlx::query_as("SELECT * FROM sessions WHERE archived = 0 AND parent_id IS NULL ORDER BY updated_at DESC LIMIT ?")
             .bind(limit)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    pub async fn child_sessions(&self, parent_id: &str) -> anyhow::Result<Vec<SessionRow>> {
+        Ok(sqlx::query_as("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at").bind(parent_id).fetch_all(&self.pool).await?)
+    }
+
+    pub async fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&self.pool).await?.map(|r| r.get("value")))
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<bool> {
@@ -309,12 +328,15 @@ impl Store {
         use prost::Message;
 
         let mut tx = self.pool.begin().await?;
-        let Some(row) = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ? AND worker_id = ?")
+        let mut row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ? AND worker_id = ?")
             .bind(session_id)
             .bind(worker_id.to_string())
             .fetch_optional(&mut *tx)
-            .await?
-        else {
+            .await?;
+        if row.is_none() && create_subagent_session(&mut tx, worker_id, session_id, events).await? {
+            row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
+        }
+        let Some(row) = row else {
             return Ok(None);
         };
         let mut last = row.get::<i64, _>("last_seq") as u64;
@@ -364,6 +386,27 @@ impl Store {
         Ok(Some(Ingested { last_seq: last, events: stored, done_commands: done }))
     }
 
+    /// The events of the turn that ends at `end_seq`, from its TurnStarted.
+    pub async fn turn_events(&self, session_id: &str, end_seq: u64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
+        use prost::Message;
+        let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq <= ? ORDER BY seq DESC LIMIT 5000")
+            .bind(session_id)
+            .bind(end_seq as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::new();
+        for r in rows {
+            let ev = c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
+            let start = matches!(ev.kind, Some(c6_proto::session_event::Kind::TurnStarted(_)));
+            out.push(ev);
+            if start {
+                break;
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     pub async fn events_after(&self, session_id: &str, after: u64, limit: i64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
         use prost::Message;
         let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
@@ -374,6 +417,47 @@ impl Store {
             .await?;
         rows.iter().map(|r| Ok(c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?)).collect()
     }
+}
+
+/// Subagent sessions are created by the worker. Accept one when its first
+/// event names a parent session that belongs to the same worker.
+async fn create_subagent_session(
+    tx: &mut sqlx::SqliteConnection,
+    worker_id: WorkerId,
+    session_id: &str,
+    events: &[c6_proto::SessionEvent],
+) -> anyhow::Result<bool> {
+    let Some(c6_proto::session_event::Kind::Started(s)) = events.first().filter(|e| e.seq == 1).and_then(|e| e.kind.as_ref()) else {
+        return Ok(false);
+    };
+    if s.parent_session_id.is_empty() {
+        return Ok(false);
+    }
+    let parent = sqlx::query("SELECT connection_id, model, effort FROM sessions WHERE id = ? AND worker_id = ?")
+        .bind(&s.parent_session_id)
+        .bind(worker_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(parent) = parent else { return Ok(false) };
+    let now = c6_core::now_ms();
+    sqlx::query(
+        "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id) \
+         VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(worker_id.to_string())
+    .bind(if s.title.is_empty() { "Subagent" } else { &s.title })
+    .bind(&s.cwd)
+    .bind(parent.get::<String, _>("connection_id"))
+    .bind(parent.get::<String, _>("model"))
+    .bind(now)
+    .bind(now)
+    .bind(parent.get::<Option<String>, _>("effort"))
+    .bind(&s.parent_session_id)
+    .bind(&s.parent_call_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(true)
 }
 
 // --- Commands -----------------------------------------------------------------

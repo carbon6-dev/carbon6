@@ -30,6 +30,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
         .route("/api/v1/sessions/{id}/events", get(session_events))
+        .route("/api/v1/sessions/{id}/children", get(session_children))
+        .route("/api/v1/settings/mcp-servers", get(get_mcp_servers).put(put_mcp_servers))
+        .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
@@ -386,6 +389,52 @@ async fn session_events(
 ) -> ApiResult<Json<Vec<api::Event>>> {
     let events = st.store.events_after(&id, q.after, EVENT_PAGE).await?;
     Ok(Json(events.iter().filter_map(crate::convert::event).collect()))
+}
+
+async fn session_children(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<api::Session>>> {
+    Ok(Json(st.store.child_sessions(&id).await?.iter().map(crate::convert::session).collect()))
+}
+
+/// MCP servers and skills are stored as validated JSON arrays and included in
+/// each new session's configuration.
+async fn get_setting(st: &HeadState, key: &str) -> ApiResult<Json<serde_json::Value>> {
+    let raw = st.store.setting(key).await?.unwrap_or_else(|| "[]".into());
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!([]))))
+}
+
+async fn get_mcp_servers(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    get_setting(&st, crate::sessions::MCP_SERVERS).await
+}
+
+async fn put_mcp_servers(State(st): State<Arc<HeadState>>, Json(servers): Json<Vec<c6_mcp::ServerConfig>>) -> ApiResult<StatusCode> {
+    let mut names = std::collections::HashSet::new();
+    for s in &servers {
+        if s.name.trim().is_empty() || !names.insert(s.name.clone()) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, "each MCP server needs a unique, non-empty name".into()));
+        }
+    }
+    st.store.set_setting(crate::sessions::MCP_SERVERS, &serde_json::to_string(&servers).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SkillDef {
+    name: String,
+    #[serde(default)]
+    description: String,
+    body: String,
+}
+
+async fn get_skills(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    get_setting(&st, crate::sessions::SKILLS).await
+}
+
+async fn put_skills(State(st): State<Arc<HeadState>>, Json(skills): Json<Vec<SkillDef>>) -> ApiResult<StatusCode> {
+    if skills.iter().any(|s| s.name.trim().is_empty() || s.body.trim().is_empty()) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "each skill needs a name and a body".into()));
+    }
+    st.store.set_setting(crate::sessions::SKILLS, &serde_json::to_string(&skills).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn send_message(

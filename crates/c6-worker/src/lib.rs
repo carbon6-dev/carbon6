@@ -10,6 +10,7 @@ pub mod link;
 pub mod pty;
 pub mod rpc;
 pub mod session;
+mod subagent;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

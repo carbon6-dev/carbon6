@@ -27,6 +27,10 @@ pub struct HeadConfig {
     /// Permit binding non-private addresses. The head has no login; only set
     /// this if something else controls access.
     pub allow_public_bind: bool,
+    /// OTLP/HTTP endpoint for traces (e.g. `http://127.0.0.1:4318`); falls
+    /// back to `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    pub otlp_endpoint: Option<String>,
+    pub otlp_headers: std::collections::HashMap<String, String>,
 }
 
 impl Default for HeadConfig {
@@ -39,6 +43,8 @@ impl Default for HeadConfig {
             advertise_host: None,
             extra_names: Vec::new(),
             allow_public_bind: false,
+            otlp_endpoint: None,
+            otlp_headers: Default::default(),
         }
     }
 }
