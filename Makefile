@@ -74,8 +74,8 @@ dev-head: ui ## Run a loopback-only dev head (dev/c6h.toml, state in target/dev)
 dev-token: ## Print an enrollment token from the dev head's database
 	@cargo run -q -p c6h -- --config dev/c6h.toml enroll-token --name dev
 
-dev-worker: ## Enroll (TOKEN=...) and run a dev worker against the dev head
-	cargo run -p c6w -- --state-dir target/dev/c6w enroll --force $(TOKEN)
+dev-worker: ## Run the dev worker (pass TOKEN=... to enroll it first)
+	@if [ -n "$(TOKEN)" ]; then cargo run -p c6w -- --state-dir target/dev/c6w enroll --force "$(TOKEN)"; fi
 	cargo run -p c6w -- --state-dir target/dev/c6w run
 
 clean: ## Remove build outputs (target/, dist/, crates/c6-ui/dist)

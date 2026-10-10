@@ -75,7 +75,7 @@ c6w run
 ```bash
 make dev-head                     # loopback-only head using dev/c6h.toml, state in target/dev
 make dev-token                    # prints a token
-make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it
+make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it (later: just make dev-worker)
 ```
 
 - For UI work, `cd crates/c6-ui && trunk serve` proxies `/api` to the dev head.
