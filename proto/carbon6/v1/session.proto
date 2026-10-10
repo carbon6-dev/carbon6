@@ -40,6 +40,9 @@ message SessionStarted {
   string parent_session_id = 9;
   string parent_call_id = 10;
   string title = 11;
+  // Context window the worker assumes for the model (compaction threshold
+  // and the UI's context gauge); 0 when unknown.
+  uint64 context_window = 12;
 }
 
 message UserMessage {

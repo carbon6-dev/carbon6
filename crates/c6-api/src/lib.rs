@@ -194,6 +194,8 @@ pub enum EventKind {
         worktree_branch: String,
         #[serde(default)]
         repo_root: String,
+        #[serde(default)]
+        context_window: u64,
     },
     User {
         command_id: String,

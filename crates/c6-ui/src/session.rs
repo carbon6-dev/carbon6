@@ -26,6 +26,120 @@ struct ToolResultView {
     duration_ms: u64,
 }
 
+/// Token usage summed over model calls.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Tokens {
+    calls: u64,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    reasoning: u64,
+}
+
+impl Tokens {
+    fn add(&mut self, kind: &EventKind) {
+        if let EventKind::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, .. } = kind {
+            self.calls += 1;
+            self.input += input_tokens;
+            self.cache_read += cache_read_tokens;
+            self.cache_write += cache_write_tokens;
+            self.output += output_tokens;
+            self.reasoning += reasoning_tokens;
+        }
+    }
+
+    /// All prompt tokens, cached or not.
+    fn prompt(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+
+    /// "12.3k in (85% cached, 1.2k written) · 950 out (300 reasoning)"
+    fn summary(&self) -> String {
+        let mut cache = vec![format!("{}% cached", (self.cache_read * 100).checked_div(self.prompt()).unwrap_or(0))];
+        if self.cache_write > 0 {
+            cache.push(format!("{} written", tokens(self.cache_write)));
+        }
+        let reasoning = if self.reasoning > 0 { format!(" ({} reasoning)", tokens(self.reasoning)) } else { String::new() };
+        format!("{} in ({}) · {} out{reasoning}", tokens(self.prompt()), cache.join(", "), tokens(self.output))
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct TurnStats {
+    tokens: Tokens,
+    started: i64,
+    ended: Option<i64>,
+    /// Context size at the turn's last model call.
+    context: Option<u64>,
+}
+
+/// Per-turn usage plus the session's totals and current context size.
+#[derive(Clone, Default, PartialEq)]
+struct UsageStats {
+    turns: HashMap<u64, TurnStats>,
+    current_turn: Option<u64>,
+    total: Tokens,
+    /// Prompt plus output of the last model call since the last compaction:
+    /// what the next request starts from.
+    context: Option<u64>,
+    context_window: u64,
+}
+
+impl UsageStats {
+    fn from_events(evs: &[Event]) -> Self {
+        let mut st = Self::default();
+        for e in evs {
+            match &e.kind {
+                EventKind::Started { context_window, .. } => st.context_window = *context_window,
+                EventKind::TurnStarted { turn } => {
+                    st.current_turn = Some(*turn);
+                    st.turns.insert(*turn, TurnStats { started: e.ts, ..Default::default() });
+                }
+                EventKind::TurnEnded { turn, .. } => {
+                    if let Some(t) = st.turns.get_mut(turn) {
+                        t.ended = Some(e.ts);
+                    }
+                    st.current_turn = None;
+                }
+                EventKind::Compaction { .. } => st.context = None,
+                EventKind::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, .. } => {
+                    st.total.add(&e.kind);
+                    let ctx = input_tokens + cache_read_tokens + cache_write_tokens + output_tokens;
+                    st.context = Some(ctx);
+                    if let Some(t) = st.current_turn.and_then(|n| st.turns.get_mut(&n)) {
+                        t.tokens.add(&e.kind);
+                        t.context = Some(ctx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        st
+    }
+}
+
+fn duration(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s >= 60 { format!("{}m {:02}s", s / 60, s % 60) } else { format!("{s}s") }
+}
+
+/// One line of a turn's numbers; `elapsed` for a turn still running.
+fn turn_line(t: &TurnStats, now: Option<i64>) -> String {
+    let mut parts = Vec::new();
+    if let Some(end) = t.ended.or(now) {
+        parts.push(duration(end - t.started));
+    }
+    if t.tokens.calls > 0 {
+        parts.push(format!("{} model call{}", t.tokens.calls, if t.tokens.calls == 1 { "" } else { "s" }));
+        parts.push(t.tokens.summary());
+    }
+    if let Some(c) = t.context {
+        parts.push(format!("context {}", tokens(c)));
+    }
+    parts.join(" · ")
+}
+
 #[component]
 pub fn SessionPage() -> impl IntoView {
     let params = use_params_map();
@@ -126,15 +240,14 @@ fn SessionView(id: String) -> impl IntoView {
                 .collect::<HashMap<_, _>>()
         })
     });
-    let usage = Memo::new(move |_| {
-        events.with(|evs| {
-            evs.iter().fold((0u64, 0u64, 0u64), |(i, c, o), e| match &e.kind {
-                EventKind::Usage { input_tokens, cache_read_tokens, output_tokens, .. } => {
-                    (i + input_tokens + cache_read_tokens, c + cache_read_tokens, o + output_tokens)
-                }
-                _ => (i, c, o),
-            })
-        })
+    let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
+    // Ticks while a turn runs, for its elapsed time.
+    let now = RwSignal::new(js_sys::Date::now() as i64);
+    let ticker = set_interval_with_handle(move || now.set(js_sys::Date::now() as i64), std::time::Duration::from_secs(1)).ok();
+    on_cleanup(move || {
+        if let Some(t) = ticker {
+            t.clear();
+        }
     });
 
     let id_stored = StoredValue::new(id.clone());
@@ -201,7 +314,6 @@ fn SessionView(id: String) -> impl IntoView {
                                             <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
                                         })}
                                         <span>{s.model.clone()}{s.effort.clone().map(|e| format!(" · {e}"))}</span>
-                                        <span>{move || { let (i, c, o) = usage.get(); if i + o == 0 { String::new() } else { format!("{} in ({}% cached) · {} out", tokens(i), (c * 100).checked_div(i).unwrap_or(0), tokens(o)) } }}</span>
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-2">
@@ -218,6 +330,7 @@ fn SessionView(id: String) -> impl IntoView {
                                     }>"Archive"</button>
                                 </div>
                             </div>
+                            <SessionStats usage />
                             {s.error.clone().map(|e| view! { <ErrorBox message=format!("The session failed to start: {e}") /> })}
                             {move || (!online() && (status.get() == SessionStatus::Running || !queued.with(Vec::is_empty))).then(|| view! {
                                 <p class="mb-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
@@ -248,7 +361,7 @@ fn SessionView(id: String) -> impl IntoView {
                 // Events are append-only: keyed by seq, each renders once, so
                 // expanded cards stay open while the turn continues.
                 <For each=move || events.get() key=|e| e.seq let:e>
-                    {render_event(&e, results, streaming)}
+                    {render_event(&e, results, streaming, usage)}
                 </For>
                 {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
                     <div class="space-y-2">
@@ -260,6 +373,9 @@ fn SessionView(id: String) -> impl IntoView {
                     <div class="flex items-center gap-2 text-sm text-zinc-500">
                         <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>"Working…"
                     </div>
+                })}
+                {move || running().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
+                    <p class="font-mono text-[11px] text-zinc-500">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
                 })}
                 {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id_stored.get_value() /> }).collect_view()}
             </div>
@@ -281,7 +397,54 @@ fn tokens(n: u64) -> String {
     }
 }
 
-fn render_event(e: &Event, results: Memo<HashMap<String, ToolResultView>>, streaming: RwSignal<Streaming>) -> AnyView {
+#[component]
+fn SessionStats(usage: Memo<UsageStats>) -> impl IntoView {
+    move || {
+        usage.with(|u| {
+            (u.total.calls > 0).then(|| {
+                let context = u.context.map(|c| {
+                    let pct = (c * 100).checked_div(u.context_window);
+                    let bar = match pct {
+                        Some(p) if p >= 85 => "bg-red-500",
+                        Some(p) if p >= 60 => "bg-amber-500",
+                        _ => "bg-blue-500",
+                    };
+                    let label = match pct {
+                        Some(p) => format!("{} / {} ({p}%)", tokens(c), tokens(u.context_window)),
+                        None => tokens(c),
+                    };
+                    let width = format!("width: {}%", pct.unwrap_or(0).min(100));
+                    view! {
+                        <span class="flex items-center gap-1.5" title="Tokens the next model request starts from. Compaction runs at 85% of the window.">
+                            "Context"
+                            <span class="inline-block h-1.5 w-20 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+                                <span class=format!("block h-full {bar}") style=width></span>
+                            </span>
+                            <span class="text-zinc-700 dark:text-zinc-300">{label}</span>
+                        </span>
+                    }
+                });
+                let turns = u.turns.len();
+                let calls = u.total.calls;
+                view! {
+                    <div class="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-zinc-500">
+                        {context}
+                        <span title="Totals for the session">
+                            {format!("Session: {} · {turns} turn{} · {calls} model call{}", u.total.summary(), if turns == 1 { "" } else { "s" }, if calls == 1 { "" } else { "s" })}
+                        </span>
+                    </div>
+                }
+            })
+        })
+    }
+}
+
+fn render_event(
+    e: &Event,
+    results: Memo<HashMap<String, ToolResultView>>,
+    streaming: RwSignal<Streaming>,
+    usage: Memo<UsageStats>,
+) -> AnyView {
     match &e.kind {
         EventKind::Started { system_prompt, tools, .. } => view! {
             <details class="text-xs text-zinc-500">
@@ -328,17 +491,25 @@ fn render_event(e: &Event, results: Memo<HashMap<String, ToolResultView>>, strea
             </details>
         }
         .into_any(),
-        EventKind::TurnEnded { reason, .. } => match reason {
-            TurnEndReason::Interrupted => note("Interrupted"),
-            TurnEndReason::WorkerRestarted => note("Stopped: the worker restarted during this turn"),
-            _ => ().into_any(),
-        },
+        EventKind::TurnEnded { reason, turn } => {
+            let turn = *turn;
+            let note = match reason {
+                TurnEndReason::Interrupted => Some("Interrupted"),
+                TurnEndReason::WorkerRestarted => Some("Stopped: the worker restarted during this turn"),
+                _ => None,
+            };
+            view! {
+                {note.map(|n| view! { <p class="text-center text-xs text-zinc-500">{n}</p> })}
+                {move || usage.with(|u| u.turns.get(&turn).copied()).map(|t| view! {
+                    <p class="border-t border-zinc-200 pt-1 font-mono text-[11px] text-zinc-400 dark:border-zinc-800">
+                        {format!("Turn {turn} · {}", turn_line(&t, None))}
+                    </p>
+                })}
+            }
+            .into_any()
+        }
         _ => ().into_any(),
     }
-}
-
-fn note(text: &'static str) -> AnyView {
-    view! { <p class="text-center text-xs text-zinc-500">{text}</p> }.into_any()
 }
 
 #[component]

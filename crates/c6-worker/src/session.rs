@@ -110,11 +110,12 @@ impl SessionManager {
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
         let mut session_tools = Vec::new();
+        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+        let context_window = model_info(provider, &model.model).context_window;
         let (profile, tools, system_prompt) = if model.connection_kind == "claude_code" {
             // Claude Code brings its own prompt (incl. CLAUDE.md) and tools.
             (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
         } else {
-            let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
             let profile = model_info(provider, &model.model).tool_profile;
             let built = build_tools(&spec, &cwd, profile).await;
             setup_errors = built.errors;
@@ -136,6 +137,7 @@ impl SessionManager {
             tool_profile: profile.clone(),
             worktree_branch,
             repo_root,
+            context_window,
             ..Default::default()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
