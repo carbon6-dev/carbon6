@@ -310,7 +310,7 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/auth/passkeys/register/begin", post(register_begin))
         .route("/api/v1/auth/passkeys/register/finish", post(register_finish))
         .route("/api/v1/auth/passkeys", get(list_passkeys))
-        .route("/api/v1/auth/passkeys/{id}", delete(delete_passkey))
+        .route("/api/v1/auth/passkeys/{id}", delete(delete_passkey).patch(rename_passkey))
         .route("/api/v1/auth/sessions", get(list_sessions))
         .route("/api/v1/auth/sessions/{id}", delete(delete_session))
 }
@@ -546,6 +546,23 @@ async fn list_passkeys(State(st): State<Arc<HeadState>>) -> Res<Json<Vec<api::Pa
     Ok(Json(st.store.passkeys().await?))
 }
 
+async fn rename_passkey(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Json(req): Json<api::RenamePasskey>) -> Res<StatusCode> {
+    let name = req.name.trim().chars().take(80).collect::<String>();
+    if name.is_empty() {
+        return Err(bad_request("a passkey needs a name").into());
+    }
+    let done = sqlx::query("UPDATE passkeys SET name = ? WHERE id = ?")
+        .bind(&name)
+        .bind(&id)
+        .execute(&st.store.pool)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if done.rows_affected() == 0 {
+        return Err(crate::not_found("no such passkey").into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn delete_passkey(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> Res<StatusCode> {
     sqlx::query("DELETE FROM passkeys WHERE id = ?").bind(&id).execute(&st.store.pool).await.map_err(anyhow::Error::from)?;
     Ok(StatusCode::NO_CONTENT)
@@ -576,7 +593,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::{Value, json};
 
-    use crate::webauthn::tests::SoftKey;
+    use crate::webauthn::{self, tests::SoftKey};
 
     /// The session cookie a response set.
     fn cookie(r: &reqwest::Response) -> String {
@@ -636,6 +653,16 @@ mod tests {
         let cred = key.register(opts["challenge"].as_str().unwrap(), &origin, "localhost");
         let r = post("/auth/passkeys/register/finish", Some(&link_session), json!({"name": "laptop", "credential": cred})).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+
+        // Rename it.
+        let id = webauthn::encode(&key.id);
+        let rename = |name: &str| {
+            http.patch(format!("{api}/auth/passkeys/{id}")).header("cookie", &link_session).json(&json!({"name": name})).send()
+        };
+        assert_eq!(rename("  ").await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rename("Google Password Manager").await.unwrap().status(), StatusCode::NO_CONTENT);
+        let keys: Vec<Value> = get("/auth/passkeys", Some(&link_session)).await.unwrap().json().await.unwrap();
+        assert_eq!(keys[0]["name"], "Google Password Manager");
 
         // Sign out, then back in with the passkey.
         post("/auth/logout", Some(&link_session), json!({})).await.unwrap();

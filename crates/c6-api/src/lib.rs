@@ -388,6 +388,12 @@ pub struct RegisterPasskey {
     pub credential: serde_json::Value,
 }
 
+/// `PATCH /api/v1/auth/passkeys/{id}`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RenamePasskey {
+    pub name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Passkey {
     pub id: String,

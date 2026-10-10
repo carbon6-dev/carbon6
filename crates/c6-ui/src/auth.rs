@@ -223,25 +223,68 @@ pub fn SignInSettings() -> impl IntoView {
                 {move || passkeys.get().map(|r| match r {
                     Ok(ps) if ps.is_empty() => view! { <p class="px-4 py-3 text-zinc-500">"No passkeys yet."</p> }.into_any(),
                     Ok(ps) => ps.into_iter().map(|p| {
-                        let id = p.id.clone();
+                        let (id, rename_id) = (p.id.clone(), p.id.clone());
+                        // Some(draft) while renaming.
+                        let editing = RwSignal::new(None::<String>);
+                        let name = p.name.clone();
+                        let save = move || {
+                            let Some(new) = editing.get_untracked() else { return };
+                            let id = rename_id.clone();
+                            spawn_local(async move {
+                                match api::rename_passkey(id, new).await {
+                                    Ok(()) => {
+                                        editing.set(None);
+                                        passkeys.refetch();
+                                    }
+                                    Err(e) => error.set(Some(e)),
+                                }
+                            });
+                        };
+                        let save2 = save.clone();
                         view! {
                             <div class="flex items-center justify-between gap-3 px-4 py-2">
-                                <div class="min-w-0">
-                                    <div class="font-medium">{p.name.clone()}</div>
+                                <div class="min-w-0 flex-1">
+                                    {move || match editing.get() {
+                                        Some(draft) => {
+                                            let save = save.clone();
+                                            view! {
+                                                <input class=format!("{INPUT} max-w-xs py-1") prop:value=draft autofocus
+                                                    on:input=move |ev| editing.set(Some(event_target_value(&ev)))
+                                                    on:keydown=move |ev| match ev.key().as_str() {
+                                                        "Enter" => save(),
+                                                        "Escape" => editing.set(None),
+                                                        _ => {}
+                                                    } />
+                                            }.into_any()
+                                        }
+                                        None => view! { <div class="font-medium">{name.clone()}</div> }.into_any(),
+                                    }}
                                     <div class="truncate text-xs text-zinc-500">
                                         {format!("{} · added {}", p.rp_id, ago(now_ms() - p.created_at))}
                                         {p.last_used_at.map(|t| format!(" · used {}", ago(now_ms() - t)))}
                                     </div>
                                 </div>
-                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
-                                    let id = id.clone();
-                                    spawn_local(async move {
-                                        match api::delete_passkey(id).await {
-                                            Ok(()) => passkeys.refetch(),
-                                            Err(e) => error.set(Some(e)),
-                                        }
-                                    });
-                                }>"Remove"</button>
+                                {move || if editing.with(Option::is_some) {
+                                    let save = save2.clone();
+                                    view! {
+                                        <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| save()>"Save"</button>
+                                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| editing.set(None)>"Cancel"</button>
+                                    }.into_any()
+                                } else {
+                                    let (id, name) = (id.clone(), p.name.clone());
+                                    view! {
+                                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| editing.set(Some(name.clone()))>"Rename"</button>
+                                        <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                            let id = id.clone();
+                                            spawn_local(async move {
+                                                match api::delete_passkey(id).await {
+                                                    Ok(()) => passkeys.refetch(),
+                                                    Err(e) => error.set(Some(e)),
+                                                }
+                                            });
+                                        }>"Remove"</button>
+                                    }.into_any()
+                                }}
                             </div>
                         }
                     }).collect_view().into_any(),

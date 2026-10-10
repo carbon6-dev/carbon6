@@ -327,3 +327,14 @@ pub async fn create_login_code() -> Result<c6_api::LoginCode, String> {
 pub async fn redeem_code(code: String) -> Result<(), String> {
     empty(Request::post("/api/v1/auth/code").json(&c6_api::RedeemCode { code }).map_err(|e| e.to_string())?.send().await).await
 }
+
+pub async fn rename_passkey(id: String, name: String) -> Result<(), String> {
+    empty(
+        Request::patch(&format!("/api/v1/auth/passkeys/{id}"))
+            .json(&c6_api::RenamePasskey { name })
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
