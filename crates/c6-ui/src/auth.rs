@@ -26,7 +26,9 @@ fn js_error(e: JsValue) -> String {
     let name = js_sys::Reflect::get(&e, &"name".into()).ok().and_then(|v| v.as_string()).unwrap_or_default();
     match name.as_str() {
         "NotAllowedError" => "The passkey prompt was cancelled or timed out.".into(),
-        "InvalidStateError" => "This device already has a passkey for carbon6.".into(),
+        "InvalidStateError" => "This device already has a passkey for this head, probably synced from another device \
+            (Google Password Manager or iCloud Keychain). You can sign in with it; no new one is needed."
+            .into(),
         _ => js_sys::Reflect::get(&e, &"message".into()).ok().and_then(|v| v.as_string()).unwrap_or_else(|| format!("{e:?}")),
     }
 }
