@@ -262,6 +262,7 @@ fn SessionView(id: String) -> impl IntoView {
     });
 
     let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
+    let choice = ModelChoice::follow(events, Default::default());
     let id_stored = StoredValue::new(id.clone());
     let navigate = use_navigate();
     let tab = RwSignal::new("transcript");
@@ -310,7 +311,7 @@ fn SessionView(id: String) -> impl IntoView {
                                         {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
                                             <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
                                         })}
-                                        <span>{s.model.clone()}{s.effort.clone().map(|e| format!(" · {e}"))}</span>
+                                        <span>{move || { let m = choice.current.get().1; if m.is_empty() { s.model.clone() } else { m } }}{s.effort.clone().map(|e| format!(" · {e}"))}</span>
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-2">
@@ -359,7 +360,7 @@ fn SessionView(id: String) -> impl IntoView {
             </div>
 
             <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some())>
-            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error />
+            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice />
             </Show>
         </main>
     }
@@ -511,26 +512,8 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     let running = Signal::derive(move || feed.running());
     let error = RwSignal::new(None::<String>);
     let id = session.id.clone();
-    // The model the side chat runs on now: its last switch, or its start.
-    let start = (session.connection_id.clone(), session.model.clone());
-    let current = Memo::new(move |_| {
-        feed.events.with(|evs| {
-            evs.iter()
-                .rev()
-                .find_map(|e| match &e.kind {
-                    EventKind::ModelSwitched { connection_id, model, .. } => Some((connection_id.clone(), model.clone())),
-                    _ => None,
-                })
-                .unwrap_or_else(|| start.clone())
-        })
-    });
-    let choice = ModelChoice { connection: RwSignal::new(String::new()), model: RwSignal::new(String::new()), current };
-    Effect::new(move || {
-        let (c, m) = current.get();
-        choice.connection.set(c);
-        model_label.set(m.clone());
-        choice.model.set(m);
-    });
+    let choice = ModelChoice::follow(feed.events, (session.connection_id.clone(), session.model.clone()));
+    Effect::new(move || model_label.set(choice.current.get().1));
     view! {
         <div class="space-y-3 pb-2 pt-1">
             <Transcript session feed running />
@@ -549,6 +532,32 @@ struct ModelChoice {
 }
 
 impl ModelChoice {
+    /// A picker that follows the session's model: its last switch, else the
+    /// one it started with (`start` until the log has loaded). It resets
+    /// to the current model whenever that changes.
+    fn follow(events: RwSignal<Vec<Event>>, start: (String, String)) -> Self {
+        let current = Memo::new(move |_| {
+            events.with(|evs| {
+                evs.iter()
+                    .rev()
+                    .find_map(|e| match &e.kind {
+                        EventKind::ModelSwitched { connection_id, model, .. } | EventKind::Started { connection_id, model, .. } => {
+                            Some((connection_id.clone(), model.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| start.clone())
+            })
+        });
+        let choice = ModelChoice { connection: RwSignal::new(String::new()), model: RwSignal::new(String::new()), current };
+        Effect::new(move || {
+            let (c, m) = current.get();
+            choice.connection.set(c);
+            choice.model.set(m);
+        });
+        choice
+    }
+
     /// The (connection, model) to switch to, if the choice differs.
     fn switch(&self) -> Option<(String, String)> {
         let chosen = (self.connection.get_untracked(), self.model.get_untracked().trim().to_owned());
