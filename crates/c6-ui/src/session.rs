@@ -457,6 +457,29 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
     // A side chat's setup (prompt, tools) is the parent's: not worth a line.
     let side = session.fork_seq.is_some();
     let asking = RwSignal::new(None::<u64>);
+    // Rewinding or editing a message: (seq, edit).
+    let rewinding = RwSignal::new(None::<(u64, bool)>);
+    // Events no longer counting since a rewind: seq → the Rewound's seq;
+    // and how many each rewind covers.
+    let rewound = Memo::new(move |_| {
+        events.with(|evs| {
+            let mut by = HashMap::<u64, u64>::new();
+            let mut counts = HashMap::<u64, usize>::new();
+            for (i, e) in evs.iter().enumerate() {
+                if let EventKind::Rewound { to_seq, .. } = e.kind {
+                    for x in &evs[..i] {
+                        if x.seq >= to_seq && !by.contains_key(&x.seq) && !matches!(x.kind, EventKind::Checkpoint { .. }) {
+                            by.insert(x.seq, e.seq);
+                            *counts.entry(e.seq).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            (by, counts)
+        })
+    });
+    // Rewinds whose events are shown.
+    let shown = RwSignal::new(std::collections::HashSet::<u64>::new());
     // A side chat just started here opens expanded.
     let opened = RwSignal::new(None::<String>);
     let defaults = StoredValue::new((session.connection_id.clone(), session.model.clone(), session.effort.clone().unwrap_or_default()));
@@ -476,17 +499,63 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                 {
                     let seq = e.seq;
                     let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
+                    let user_text = match &e.kind {
+                        EventKind::User { text, .. } => Some(text.clone()),
+                        _ => None,
+                    };
+                    let is_user = user_text.is_some();
+                    let by = move || rewound.with(|(by, _)| by.get(&seq).copied());
+                    let hidden = move || by().is_some_and(|r| !shown.with(|s| s.contains(&r)));
+                    let marker = match &e.kind {
+                        EventKind::Rewound { to_seq, restored_files, restore_error } => {
+                            Some((*to_seq, *restored_files, restore_error.clone()))
+                        }
+                        _ => None,
+                    };
+                    let ubtn = "rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 shadow-sm hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100";
                     view! {
-                        <div id=format!("{}-e{seq}", id.get_value()) class=if anchorable { "group relative pb-7" } else { "group relative" }>
-                            {(!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&e, results, streaming, usage))}
+                        <div
+                            id=format!("{}-e{seq}", id.get_value())
+                            class=move || format!("group relative {} {} {}",
+                                if anchorable { "pb-7" } else { "" },
+                                if hidden() { "hidden" } else { "" },
+                                if by().is_some() { "opacity-50" } else { "" })
+                        >
+                            {match marker {
+                                Some((to_seq, restored, err)) => {
+                                    let what = events.with_untracked(|evs| evs.iter().find_map(|x| match &x.kind {
+                                        EventKind::User { text, .. } if x.seq == to_seq => Some(text.chars().take(60).collect::<String>()),
+                                        _ => None,
+                                    })).unwrap_or_default();
+                                    let files = if restored { " · files restored".to_owned() } else if err.is_empty() { String::new() } else { format!(" · files not restored: {err}") };
+                                    view! {
+                                        <div class="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-zinc-300 px-3 py-1.5 text-xs text-zinc-500 dark:border-zinc-700">
+                                            <span>{format!("↶ Rewound to before “{what}”{files}")}</span>
+                                            <span class="flex-1"></span>
+                                            <button class="underline" on:click=move |_| shown.update(|s| if !s.remove(&seq) { s.insert(seq); })>
+                                                {move || {
+                                                    let n = rewound.with(|(_, c)| c.get(&seq).copied().unwrap_or(0));
+                                                    if shown.with(|s| s.contains(&seq)) { format!("hide {n} rewound") } else { format!("show {n} rewound") }
+                                                }}
+                                            </button>
+                                        </div>
+                                    }.into_any()
+                                }
+                                None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&e, results, streaming, usage)).into_any(),
+                            }}
                             {anchorable.then(|| view! {
-                                <button
-                                    class="absolute bottom-0 right-0 rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 opacity-0 shadow-sm transition group-hover:opacity-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100"
-                                    title="Ask about this in a side chat"
-                                    on:click=move |_| asking.set(Some(seq))
-                                >"↳ Ask"</button>
+                                <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
+                                    {move || (is_user && by().is_none()).then(|| view! {
+                                        <button class=ubtn title="Change this message and send it again (rewinds to before it)" on:click=move |_| rewinding.set(Some((seq, true)))>"✎ Edit"</button>
+                                        <button class=ubtn title="Rewind the conversation (and optionally files) to before this message" on:click=move |_| rewinding.set(Some((seq, false)))>"↶ Rewind"</button>
+                                    })}
+                                    <button class=ubtn title="Ask about this in a side chat" on:click=move |_| asking.set(Some(seq))>"↳ Ask"</button>
+                                </div>
                             })}
                         </div>
+                        {move || rewinding.get().filter(|(s, _)| *s == seq).map(|(_, edit)| view! {
+                            <RewindPanel session=id.get_value() seq text=user_text.clone().unwrap_or_default() edit on_done=Callback::new(move |()| rewinding.set(None)) />
+                        })}
                         <For
                             each=move || child_list.with(|cs| cs.iter().filter(|c| c.fork_seq == Some(seq)).cloned().collect::<Vec<_>>())
                             key=|c| c.id.clone()
@@ -515,6 +584,64 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                 <p class="font-mono text-[11px] text-zinc-500">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
             })}
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() /> }).collect_view()}
+        </div>
+    }
+}
+
+/// Rewind to before a message, or edit it and send it again (a rewind
+/// followed by the new message).
+#[component]
+fn RewindPanel(session: String, seq: u64, text: String, edit: bool, on_done: Callback<()>) -> impl IntoView {
+    let draft = RwSignal::new(text);
+    let restore = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let session = StoredValue::new(session);
+    let go = move || {
+        if busy.get_untracked() {
+            return;
+        }
+        let text = draft.get_untracked();
+        if edit && text.trim().is_empty() {
+            return;
+        }
+        busy.set(true);
+        spawn_local(async move {
+            let r = match api::rewind(session.get_value(), seq, restore.get_untracked()).await {
+                Ok(()) if edit => api::send_message(session.get_value(), text, None).await.map(drop),
+                other => other,
+            };
+            busy.set(false);
+            match r {
+                Ok(()) => on_done.run(()),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <div class="space-y-2 rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/30">
+            {if edit {
+                view! {
+                    <textarea class=format!("{INPUT} min-h-[3rem] resize-y") prop:value=move || draft.get()
+                        on:input=move |ev| draft.set(event_target_value(&ev))
+                        on:keydown=move |ev| {
+                            if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); go(); }
+                            if ev.key() == "Escape" { on_done.run(()); }
+                        }></textarea>
+                }.into_any()
+            } else {
+                view! { <p class="text-zinc-700 dark:text-zinc-300">"Rewind the conversation to before this message? The messages after it stop counting (they stay visible, folded)."</p> }.into_any()
+            }}
+            <div class="flex flex-wrap items-center gap-3">
+                <label class="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400" title="Files in the session's folder go back to how they were before this message. Other sessions in the same folder see the change too.">
+                    <input type="checkbox" prop:checked=move || restore.get() on:change=move |ev| restore.set(event_target_checked(&ev)) />
+                    "Also restore files to before this message"
+                </label>
+                <span class="flex-1"></span>
+                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| on_done.run(())>"Cancel"</button>
+                <button class=format!("{BUTTON} text-xs") prop:disabled=move || busy.get() on:click=move |_| go()>{if edit { "Resend" } else { "Rewind" }}</button>
+            </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
         </div>
     }
 }

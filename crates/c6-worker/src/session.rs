@@ -2,21 +2,22 @@
 //! of its event log.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
 use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
-    CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionStarted,
-    TurnEndReason, TurnEnded, TurnStarted, UserMessage, ephemeral_event, session_command, session_event,
+    Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Rewound, SessionActivity, SessionCommand,
+    SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, UserMessage, ephemeral_event, session_command, session_event,
 };
 use c6_tools::{SessionTools, Skill, SkillTool, Tool};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::checkpoint::Checkpoints;
 use crate::journal::Journal;
 use crate::link::HeadLink;
 
@@ -24,10 +25,18 @@ pub struct SessionManager {
     journal: Arc<Journal>,
     link: Arc<HeadLink>,
     worktrees: PathBuf,
+    /// The worker's state directory (checkpoint repositories live here).
+    state_dir: PathBuf,
     actors: Mutex<HashMap<String, mpsc::UnboundedSender<ActorMsg>>>,
 }
 
 enum ActorMsg {
+    /// Rewind the conversation (after interrupting a running turn).
+    Rewind {
+        command_id: String,
+        to_seq: u64,
+        restore_files: bool,
+    },
     /// An input, possibly switching the session's model from it on.
     Input(PendingInput, Option<ModelSpec>),
     Interrupt,
@@ -35,7 +44,8 @@ enum ActorMsg {
 
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
-        Self { journal, link, worktrees, actors: Mutex::default() }
+        let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
+        Self { journal, link, worktrees, state_dir, actors: Mutex::default() }
     }
 
     /// Session ids with a live actor.
@@ -82,6 +92,20 @@ impl SessionManager {
                 let spec = r.spec.ok_or("restore without a session spec")?;
                 self.journal.import(&cmd.session_id, &spec, &r.events).await.map_err(internal)?;
                 info!(session = %cmd.session_id, events = r.events.len(), "session restored from the head");
+                Ok(())
+            }
+            Some(session_command::Kind::Rewind(r)) => {
+                if self.journal.is_applied(&cmd.command_id).await.map_err(internal)? {
+                    return Ok(());
+                }
+                // Only to one of the session's own messages.
+                let events = self.journal.events_after(&cmd.session_id, 0, u32::MAX).await.map_err(internal)?;
+                let is_user = events.iter().any(|e| e.seq == r.to_seq && matches!(e.kind, Some(session_event::Kind::User(_))));
+                if !is_user {
+                    return Err("can only rewind to before one of your messages".into());
+                }
+                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+                let _ = actor.send(ActorMsg::Rewind { command_id: cmd.command_id, to_seq: r.to_seq, restore_files: r.restore_files });
                 Ok(())
             }
             Some(session_command::Kind::Interrupt(_)) => {
@@ -216,45 +240,9 @@ impl SessionManager {
             next_seq += 1;
         }
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
-        // The session runs on the model of its last switch. Reasoning from
-        // before the current model's run (another model wrote it) is dropped.
         let mut spec = spec;
-        let all = [seed_events(&spec), events.clone()].concat();
-        let model_of = |e: &SessionEvent| match &e.kind {
-            Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
-            Some(session_event::Kind::Started(s)) => s.model.clone(),
-            _ => None,
-        };
-        let key = |m: &ModelSpec| (m.connection_id.clone(), m.model.clone());
-        if let Some(m) = events.iter().rev().find_map(|e| match &e.kind {
-            Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
-            _ => None,
-        }) {
-            spec.model = Some(m);
-        }
-        let current = spec.model.as_ref().map(key);
-        // Start of the current model's run: just after the last event naming
-        // another model, at the next event naming this one.
-        let other = all.iter().rposition(|e| model_of(e).is_some_and(|m| Some(key(&m)) != current));
-        let history = match other {
-            Some(i) => {
-                let run = all[i + 1..].iter().position(|e| model_of(e).is_some()).map_or(all.len(), |p| i + 1 + p);
-                history_from_events(&[c6_agent::portable_events(&all[..run]), all[run..].to_vec()].concat())
-            }
-            None => history_from_events(&all),
-        };
-        // The last request's size since the last compaction, for the next
-        // compaction decision.
-        let context_tokens = events
-            .iter()
-            .rev()
-            .take_while(|e| !matches!(e.kind, Some(session_event::Kind::Compaction(_))))
-            .find_map(|e| match &e.kind {
-                Some(session_event::Kind::Usage(u)) => Some(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens),
-                _ => None,
-            })
-            .unwrap_or(0);
-        Ok(Some(self.spawn(session_id, spec, started, Conversation { history, context_tokens }, next_seq, turns, None).await))
+        let conv = conversation_from_log(&mut spec, &events);
+        Ok(Some(self.spawn(session_id, spec, started, conv, next_seq, turns, None).await))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -280,6 +268,7 @@ impl SessionManager {
             None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
             None => build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile)).await.tools,
         };
+        let started_cwd = started.cwd.clone();
         let actor = Actor {
             spec,
             session_tools: Arc::new(SessionTools::new(PathBuf::from(&started.cwd))),
@@ -291,11 +280,55 @@ impl SessionManager {
             writer,
             link: self.link.clone(),
             inbox: Arc::default(),
+            checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, Path::new(&started_cwd))),
         };
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), tx.clone());
         tx
     }
+}
+
+/// The conversation a session's log adds up to (its seed first, rewinds
+/// applied), and the model it runs on now (its last switch, set in
+/// `spec`). Reasoning from before the current model's run is dropped:
+/// another model wrote it.
+fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> Conversation {
+    let all = [seed_events(spec), events.to_vec()].concat();
+    let model_of = |e: &SessionEvent| match &e.kind {
+        Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
+        Some(session_event::Kind::Started(s)) => s.model.clone(),
+        _ => None,
+    };
+    let key = |m: &ModelSpec| (m.connection_id.clone(), m.model.clone());
+    if let Some(m) = events.iter().rev().find_map(|e| match &e.kind {
+        Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
+        _ => None,
+    }) {
+        spec.model = Some(m);
+    }
+    let current = spec.model.as_ref().map(key);
+    // Start of the current model's run: just after the last event naming
+    // another model, at the next event naming this one.
+    let other = all.iter().rposition(|e| model_of(e).is_some_and(|m| Some(key(&m)) != current));
+    let history = match other {
+        Some(i) => {
+            let run = all[i + 1..].iter().position(|e| model_of(e).is_some()).map_or(all.len(), |p| i + 1 + p);
+            history_from_events(&[c6_agent::portable_events(&all[..run]), all[run..].to_vec()].concat())
+        }
+        None => history_from_events(&all),
+    };
+    // The last request's size since the last compaction, for the next
+    // compaction decision.
+    let context_tokens = c6_agent::effective_events(events)
+        .iter()
+        .rev()
+        .take_while(|e| !matches!(e.kind, Some(session_event::Kind::Compaction(_))))
+        .find_map(|e| match &e.kind {
+            Some(session_event::Kind::Usage(u)) => Some(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Conversation { history, context_tokens }
 }
 
 /// A side chat's branched-from conversation, made portable when the side
@@ -353,12 +386,22 @@ struct Actor {
     journal: Arc<Journal>,
     tools: Vec<Arc<dyn Tool>>,
     inbox: Arc<Mutex<Inbox>>,
+    checkpoints: Arc<Checkpoints>,
 }
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
         let mut running: Option<(tokio::task::JoinHandle<Option<Conversation>>, CancellationToken)> = None;
+        // A rewind that waits for the running turn to stop.
+        let mut rewind: Option<(String, u64, bool)> = None;
         loop {
+            if running.is_none()
+                && let Some((command_id, to_seq, restore)) = rewind.take()
+                && let Err(e) = self.rewind(command_id, to_seq, restore).await
+            {
+                error!(session = %self.writer.session_id, "rewinding: {e:#}");
+                return;
+            }
             if running.is_none() && !self.inbox.lock().unwrap().queue.is_empty() {
                 let switch = self.inbox.lock().unwrap().take_switch();
                 if let Some(model) = switch
@@ -375,6 +418,10 @@ impl Actor {
                     Some(ActorMsg::Input(input, model)) => self.inbox.lock().unwrap().push(input, model),
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
+                    }
+                    Some(ActorMsg::Rewind { command_id, to_seq, restore_files }) => {
+                        if let Some((_, cancel)) = &running { cancel.cancel(); }
+                        rewind = Some((command_id, to_seq, restore_files));
                     }
                 },
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
@@ -395,6 +442,33 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Rewinds the conversation to before event `to_seq`, restoring files
+    /// to the checkpoint taken before it if asked to.
+    async fn rewind(&mut self, command_id: String, to_seq: u64, restore_files: bool) -> anyhow::Result<()> {
+        let sid = self.writer.session_id.clone();
+        let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        let mut restore_error = String::new();
+        let mut restored = false;
+        if restore_files {
+            let commit = events.iter().filter(|e| e.seq < to_seq).rev().find_map(|e| match &e.kind {
+                Some(session_event::Kind::Checkpoint(c)) if !c.commit.is_empty() => Some(c.commit.clone()),
+                _ => None,
+            });
+            match commit {
+                None => restore_error = "no checkpoint was taken before that message".into(),
+                Some(c) => match self.checkpoints.restore(&c).await {
+                    Ok(()) => restored = true,
+                    Err(e) => restore_error = format!("{e:#}"),
+                },
+            }
+        }
+        self.writer.append(session_event::Kind::Rewound(Rewound { command_id, to_seq, restored_files: restored, restore_error })).await?;
+        info!(session = %sid, to_seq, restored, "rewound");
+        let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        self.conv = Some(conversation_from_log(&mut self.spec, &events));
+        Ok(())
     }
 
     /// Runs the session on `model` from the next turn on. Earlier reasoning
@@ -449,8 +523,23 @@ impl Actor {
 
         let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
         let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
+        let checkpoints = self.checkpoints.clone();
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
+            // The files as they are before this turn's messages, for
+            // rewinding to before them. A failed snapshot does not stop the
+            // turn; the rewind then cannot restore files.
+            let checkpoint = match checkpoints.snapshot().await {
+                Ok(commit) => Checkpoint { commit, error: String::new() },
+                Err(e) => {
+                    warn!(session = %writer.session_id, "no checkpoint: {e:#}");
+                    Checkpoint { commit: String::new(), error: format!("{e:#}") }
+                }
+            };
+            if let Err(e) = sink.append(session_event::Kind::Checkpoint(checkpoint)).await {
+                error!(session = %writer.session_id, "turn failed: {e:#}");
+                return None;
+            }
             let result = if claude_code {
                 let inputs = inbox.lock().unwrap().drain();
                 // Claude Code keeps its own history: a side chat's context

@@ -227,6 +227,7 @@ async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &Se
     let command_id = match &event.kind {
         Some(session_event::Kind::User(u)) => Some(&u.command_id),
         Some(session_event::Kind::Started(s)) => Some(&s.command_id),
+        Some(session_event::Kind::Rewound(r)) => Some(&r.command_id),
         _ => None,
     };
     if let Some(id) = command_id.filter(|id| !id.is_empty()) {

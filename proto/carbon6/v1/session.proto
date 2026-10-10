@@ -21,7 +21,28 @@ message SessionEvent {
     ErrorEvent error = 17;
     Compaction compaction = 18;
     ModelSwitched model_switched = 19;
+    Checkpoint checkpoint = 20;
+    Rewound rewound = 21;
   }
+}
+
+// A snapshot of the session's working directory, taken before a turn's
+// first user message (a commit in the worker's private checkpoint repo).
+message Checkpoint {
+  string commit = 1;
+  // Set when no snapshot could be taken (the turn runs anyway).
+  string error = 2;
+}
+
+// The conversation was rewound: events from `to_seq` up to this one no
+// longer count (they stay in the log, for the record).
+message Rewound {
+  string command_id = 1;
+  uint64 to_seq = 2;
+  // Files were restored to the checkpoint before `to_seq`.
+  bool restored_files = 3;
+  // Why files could not be restored, if asked to.
+  string restore_error = 4;
 }
 
 // The session runs on another model from here on. Recorded before the user
@@ -211,7 +232,15 @@ message SessionCommand {
     UserInput input = 11;
     Interrupt interrupt = 12;
     Restore restore = 13;
+    Rewind rewind = 14;
   }
+}
+
+// Rewinds the conversation to before event `to_seq` (a user message),
+// optionally restoring files to the checkpoint taken before it.
+message Rewind {
+  uint64 to_seq = 1;
+  bool restore_files = 2;
 }
 
 // Re-seeds a worker that no longer has a session (lost or trimmed journal)

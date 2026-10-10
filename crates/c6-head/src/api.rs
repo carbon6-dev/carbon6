@@ -40,6 +40,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
+        .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
@@ -563,6 +564,15 @@ async fn send_message(
     Json(req): Json<api::SendMessage>,
 ) -> ApiResult<Json<api::QueuedInput>> {
     Ok(Json(crate::sessions::send_input(&st, &id, &req).await?))
+}
+
+async fn rewind_session(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::RewindRequest>,
+) -> ApiResult<StatusCode> {
+    crate::sessions::rewind(&st, &id, &req).await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

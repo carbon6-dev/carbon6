@@ -9,7 +9,7 @@ use c6_proto::{SessionEvent, content_block, session_event};
 /// that never got a result (crash or interrupt) so providers accept them.
 pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
     let mut msgs: Vec<Message> = Vec::new();
-    for ev in events {
+    for ev in &effective_events(events) {
         match &ev.kind {
             Some(session_event::Kind::User(u)) => push_user_block(&mut msgs, Block::Text(u.text.clone())),
             Some(session_event::Kind::Assistant(a)) => {
@@ -27,6 +27,29 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
         }
     }
     repair_tool_results(msgs)
+}
+
+/// The events that still count: a `Rewound` drops the events of its own
+/// session from its `to_seq` on. Each session's part of the list starts at
+/// its `Started` event (a side chat's list begins with its parents' events,
+/// whose seqs overlap its own).
+pub fn effective_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
+    let mut kept: Vec<SessionEvent> = Vec::with_capacity(events.len());
+    let mut segment = 0;
+    for ev in events {
+        match &ev.kind {
+            Some(session_event::Kind::Started(_)) => {
+                segment = kept.len();
+                kept.push(ev.clone());
+            }
+            Some(session_event::Kind::Rewound(r)) => {
+                let cut = kept[segment..].iter().position(|e| e.seq >= r.to_seq).map_or(kept.len(), |p| segment + p);
+                kept.truncate(cut);
+            }
+            _ => kept.push(ev.clone()),
+        }
+    }
+    kept
 }
 
 /// Removes provider-bound blocks (signed or encrypted reasoning, provider
@@ -228,5 +251,33 @@ mod tests {
                 Block::Text("again".into()),
             ]
         );
+    }
+
+    #[test]
+    fn rewinds_drop_their_own_session_events() {
+        let at = |seq: u64, kind: session_event::Kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
+        let user = |t: &str| session_event::Kind::User(UserMessage { command_id: String::new(), text: t.into() });
+        let started = || session_event::Kind::Started(Default::default());
+        let rewound = |to: u64| session_event::Kind::Rewound(c6_proto::Rewound { to_seq: to, ..Default::default() });
+        // A side chat: its parent's events (seed), then its own.
+        let events = vec![
+            at(1, started()),
+            at(2, user("parent one")),
+            at(3, user("parent two")),
+            at(1, started()),
+            at(2, user("mine one")),
+            at(3, user("mine two")),
+            at(4, rewound(3)),
+            at(5, user("mine again")),
+        ];
+        let texts: Vec<String> = history_from_events(&events)
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["parent one", "parent two", "mine one", "mine again"]);
     }
 }

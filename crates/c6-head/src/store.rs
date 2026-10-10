@@ -369,6 +369,7 @@ impl Store {
                     done.push(s.command_id.clone());
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
+                Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(_)) => status = "idle".into(),
                 Some(Kind::ModelSwitched(m)) => {

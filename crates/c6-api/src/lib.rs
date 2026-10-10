@@ -181,6 +181,16 @@ pub struct SendMessage {
     pub effort: Option<String>,
 }
 
+/// `POST /api/v1/sessions/{id}/rewind`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RewindRequest {
+    /// The user message to rewind to before (its event seq).
+    pub to_seq: u64,
+    /// Also put files back as they were before that message.
+    #[serde(default)]
+    pub restore_files: bool,
+}
+
 /// Input accepted by the head but not yet recorded by the worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueuedInput {
@@ -265,6 +275,19 @@ pub enum EventKind {
     Compaction {
         summary: String,
         tokens_before: u64,
+    },
+    /// A snapshot of the working directory, before a turn (for rewinding).
+    Checkpoint {
+        #[serde(default)]
+        error: String,
+    },
+    /// The conversation was rewound to before event `to_seq`; the events in
+    /// between no longer count.
+    Rewound {
+        to_seq: u64,
+        restored_files: bool,
+        #[serde(default)]
+        restore_error: String,
     },
     /// From here on the session runs on this model.
     ModelSwitched {

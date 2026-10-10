@@ -81,6 +81,10 @@ c6w run
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
+### Rewind and edit
+
+Hover one of your messages: **↶ Rewind** takes the conversation back to before it, and **✎ Edit** changes it and sends it again. Either can also restore files: before each turn the worker snapshots the session's folder into a private repository in its state directory (your own git repository, if any, is never touched; folders without git work too; `node_modules/`, `target/` and the like are skipped, as are files your `.gitignore` ignores). Rewound messages stay in the transcript, folded under a marker.
+
 ### Workspace
 
 The UI is a workspace of up to four tiles side by side, each a stack of columns:

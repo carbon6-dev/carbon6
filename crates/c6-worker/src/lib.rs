@@ -1,6 +1,7 @@
 //! The carbon6 worker (`c6w`): a headless daemon that attaches to the head and
 //! runs agent sessions on this machine.
 
+pub mod checkpoint;
 pub mod claude_code;
 pub mod conn;
 pub mod enroll;

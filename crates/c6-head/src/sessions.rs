@@ -279,6 +279,31 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     Ok(api::QueuedInput { command_id: id, text: text.to_owned(), created_at: now_ms(), rejected: None })
 }
 
+/// Queues a rewind (applied after a running turn is interrupted). Commands
+/// keep their order, so a message sent right after lands on the rewound
+/// conversation.
+pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) -> anyhow::Result<()> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.parent_call_id.is_some() {
+        return Err(bad_request("subagent sessions cannot be rewound"));
+    }
+    let target = st.store.events_after(session_id, req.to_seq.saturating_sub(1), 1).await?;
+    if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(_))) || target[0].seq != req.to_seq {
+        return Err(bad_request("can only rewind to before one of your messages"));
+    }
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    let id = Uuid::now_v7().to_string();
+    let data = SessionCommand {
+        command_id: id.clone(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: req.to_seq, restore_files: req.restore_files })),
+    }
+    .encode_to_vec();
+    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: None }).await?;
+    st.registry.deliver(worker_id);
+    Ok(())
+}
+
 /// The spec for switching `session` to another model. Claude Code runs a
 /// different agent loop, so a session cannot switch into or out of it.
 async fn model_switch(
