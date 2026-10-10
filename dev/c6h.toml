@@ -7,6 +7,7 @@ bind = ["0.0.0.0"]
 allow_public_bind = true
 # HTTPS from the head's own private CA (nothing is published in public
 # certificate logs), so passkeys work at https://<tailnet name>:7700. Trust
-# the CA once per device: http://<head>:7700/ca.mobileconfig (Apple) or
-# /ca.pem (anything else).
+# the CA once per device (see README → Configuration). On this Mac:
+#   curl -so /tmp/carbon6-ca.pem http://localhost:7700/ca.pem
+#   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/carbon6-ca.pem
 ui_tls_head_ca = true

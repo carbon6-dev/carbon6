@@ -222,10 +222,10 @@ pub fn SignInSettings() -> impl IntoView {
                 <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
                     <div class="font-medium">"Other devices"</div>
                     <p class="mt-1 text-zinc-500">
-                        "This head signs its own HTTPS certificate, so its name never appears in public certificate logs. Each device trusts it once: "
-                        "on an iPhone, iPad or Mac, open the "<a class="underline" href="/ca.mobileconfig">"configuration profile"</a>
-                        ", install it in Settings, and on iPhone/iPad turn it on under General → About → Certificate Trust Settings; elsewhere, add "
-                        <a class="underline" href="/ca.pem">"ca.pem"</a>" to the system's trusted certificates. "
+                        "This head signs its own HTTPS certificate, so its name never appears in public certificate logs. Each device trusts it once (browsers use the system's trusted certificates): "
+                        "on a Mac, open "<a class="underline" href="/ca.pem">"ca.pem"</a>" in Keychain Access and set Trust → Always Trust, then restart the browser; "
+                        "on an iPhone or iPad, install the "<a class="underline" href="/ca.mobileconfig">"configuration profile"</a>
+                        " and turn it on under General → About → Certificate Trust Settings; elsewhere, add ca.pem to the system's trusted certificates. "
                         "It can only vouch for this head's names and private addresses."
                     </p>
                 </div>

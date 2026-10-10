@@ -67,7 +67,8 @@ c6w run
 - **Head:** `~/.config/c6h/c6h.toml`, optional (see `crates/c6-head/src/config.rs`).
   - Add any names you reach the head by to `extra_names`; the head refuses requests addressed to other names. Its Tailscale MagicDNS name is added automatically.
   - Passkeys need HTTPS (or `http://localhost`). `ui_tls_head_ca = true` makes the head issue its own certificate from a private CA, so its names never appear in public Certificate Transparency logs (as they would with Let's Encrypt or Tailscale certificates). Trust that CA once per device:
-    - iPhone, iPad, Mac: open `http://<head>:7700/ca.mobileconfig`, install the profile in Settings, and on iPhone/iPad also enable it under General → About → Certificate Trust Settings.
+    - Mac (Chrome and Safari use the macOS Keychain): `curl -so /tmp/carbon6-ca.pem http://<head>:7700/ca.pem`, then `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/carbon6-ca.pem`, and restart the browser. (Or open the file in Keychain Access and set Trust → Always Trust.)
+    - iPhone, iPad: open `http://<head>:7700/ca.mobileconfig`, install the profile in Settings, then enable it under General → About → Certificate Trust Settings.
     - Elsewhere: add `http://<head>:7700/ca.pem` to the system's trusted certificates (Linux: `/usr/local/share/ca-certificates` + `update-ca-certificates`).
     - The CA is name-constrained to the head's names and private IP ranges, so it cannot vouch for any other site.
   - Or set `ui_tls_cert`/`ui_tls_key` to PEM files. With HTTPS on, plain HTTP on the UI port redirects to the HTTPS name.
