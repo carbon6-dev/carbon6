@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
 use c6_proto::{
-    CommandRejected, CreateSession, CredentialGrant, CredentialRequest, EphemeralEvent, ModelSpec, SessionCommand, SessionEventBatch,
-    UserInput, session_command,
+    CommandRejected, CreateSession, CredentialGrant, CredentialRequest, EphemeralEvent, ModelSpec, SessionCommand, SessionEvent,
+    SessionEventBatch, UserInput, session_command, session_event,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -65,24 +65,15 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     if worker.revoked_at.is_some() {
         return Err(bad_request("worker is revoked"));
     }
-    let connection = st.store.connection(&req.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
-    const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-    let effort = req.effort.clone().filter(|e| !e.is_empty());
-    if let Some(e) = &effort
-        && !EFFORTS.contains(&e.as_str())
-    {
-        return Err(bad_request(format!("effort must be one of {}", EFFORTS.join(", "))));
-    }
+    let effort = check_effort(req.effort.clone())?;
     if req.cwd.trim().is_empty() || req.model.trim().is_empty() {
         return Err(bad_request("cwd and model are required"));
     }
-
-    let session_id = Uuid::now_v7().to_string();
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let title = req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| default_title(prompt));
     let row = SessionRow {
-        id: session_id.clone(),
+        id: Uuid::now_v7().to_string(),
         worker_id: worker_id.to_string(),
         title,
         cwd: req.cwd.trim().to_owned(),
@@ -90,34 +81,140 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         model: req.model.trim().to_owned(),
         status: "starting".into(),
         error: None,
-        effort: effort.clone(),
+        effort,
         parent_id: None,
         parent_call_id: None,
+        fork_seq: None,
         created_at: now,
         updated_at: now,
         last_seq: 0,
         archived: 0,
     };
+    let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
+    insert(st, row, spec, prompt).await
+}
 
-    let create_id = Uuid::now_v7().to_string();
-    let create = SessionCommand {
-        command_id: create_id.clone(),
-        session_id: session_id.clone(),
-        kind: Some(session_command::Kind::Create(CreateSession {
-            model: Some(ModelSpec {
-                connection_id: row.connection_id.clone(),
-                model: row.model.clone(),
-                max_output_tokens: 0,
-                effort: effort.unwrap_or_default(),
-                connection_kind: connection.kind.clone(),
-            }),
-            cwd: row.cwd.clone(),
-            base_prompt: c6_agent::BASE_PROMPT.into(),
-            worktree: req.worktree,
-            mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
-            skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
-        })),
+/// A side chat on `parent_id`, branching after event `anchor_seq`.
+pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateSideChat) -> anyhow::Result<api::Session> {
+    let parent = st.store.session(parent_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if parent.parent_call_id.is_some() {
+        return Err(bad_request("subagent sessions cannot have side chats"));
+    }
+    if parent.status == "failed" {
+        return Err(bad_request("the session failed to start"));
+    }
+    let prompt = req.prompt.trim();
+    if prompt.is_empty() || req.model.trim().is_empty() {
+        return Err(bad_request("a question and a model are required"));
+    }
+    let effort = check_effort(req.effort.clone())?;
+    // The parent's real directory (its worktree, if it has one).
+    let started = st.store.events_after(parent_id, 0, 1).await?;
+    let cwd = match started.first().and_then(|e| e.kind.as_ref()) {
+        Some(session_event::Kind::Started(s)) => s.cwd.clone(),
+        _ => return Err(bad_request("the session has not started yet")),
     };
+    let now = now_ms();
+    let row = SessionRow {
+        id: Uuid::now_v7().to_string(),
+        worker_id: parent.worker_id.clone(),
+        title: default_title(Some(prompt)),
+        cwd,
+        connection_id: req.connection_id.clone(),
+        model: req.model.trim().to_owned(),
+        status: "starting".into(),
+        error: None,
+        effort,
+        parent_id: Some(parent.id.clone()),
+        parent_call_id: None,
+        fork_seq: Some(req.anchor_seq as i64),
+        created_at: now,
+        updated_at: now,
+        last_seq: 0,
+        archived: 0,
+    };
+    let seed = fork_seed(st, &parent, req.anchor_seq).await?;
+    let spec = session_spec(st, &row, false, seed).await?;
+    insert(st, row, spec, Some(prompt)).await
+}
+
+fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
+    const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+    let effort = effort.filter(|e| !e.is_empty());
+    if let Some(e) = &effort
+        && !EFFORTS.contains(&e.as_str())
+    {
+        return Err(bad_request(format!("effort must be one of {}", EFFORTS.join(", "))));
+    }
+    Ok(effort)
+}
+
+/// Added to the base prompt of side chats.
+const SIDE_CHAT_NOTE: &str = "This is a side chat: the user branched off the conversation above to ask about it. \
+The main session continues on its own and does not see this chat. Answer the user's questions here; \
+look at files and run read-only commands as needed, but do not change files unless the user asks you to.";
+
+/// The worker-side spec of a session, from its row. `seed` is the branched-
+/// from conversation of a side chat.
+async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Vec<SessionEvent>) -> anyhow::Result<CreateSession> {
+    let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    let base_prompt =
+        if row.fork_seq.is_some() { format!("{}\n\n{SIDE_CHAT_NOTE}", c6_agent::BASE_PROMPT) } else { c6_agent::BASE_PROMPT.into() };
+    Ok(CreateSession {
+        model: Some(ModelSpec {
+            connection_id: row.connection_id.clone(),
+            model: row.model.clone(),
+            max_output_tokens: 0,
+            effort: row.effort.clone().unwrap_or_default(),
+            connection_kind: connection.kind.clone(),
+        }),
+        cwd: row.cwd.clone(),
+        base_prompt,
+        worktree,
+        mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
+        skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
+        seed,
+    })
+}
+
+/// The conversation a side chat branching from `session` after `upto` sees:
+/// the session's own seed (its ancestors), then its events up to `upto`,
+/// plus the results of tool calls made by then, so every call is answered.
+async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::Result<Vec<SessionEvent>> {
+    let mut seed = match (&session.parent_id, session.fork_seq) {
+        (Some(p), Some(f)) => {
+            let parent = st.store.session(p).await?.ok_or_else(|| not_found("a parent session is missing"))?;
+            Box::pin(fork_seed(st, &parent, f as u64)).await?
+        }
+        _ => Vec::new(),
+    };
+    let mut calls = std::collections::HashSet::new();
+    for ev in st.store.events_after(&session.id, 0, i64::MAX).await? {
+        match &ev.kind {
+            Some(session_event::Kind::Assistant(a)) if ev.seq <= upto => {
+                for b in &a.blocks {
+                    if let Some(c6_proto::content_block::Block::ToolUse(u)) = &b.block {
+                        calls.insert(u.id.clone());
+                    }
+                }
+                seed.push(ev);
+            }
+            Some(session_event::Kind::ToolResult(r)) if ev.seq <= upto || calls.contains(&r.call_id) => seed.push(ev),
+            _ if ev.seq <= upto => seed.push(ev),
+            _ => {}
+        }
+    }
+    Ok(seed)
+}
+
+/// Stores a new session with its Create command (and first input) and
+/// tells the worker.
+async fn insert(st: &HeadState, row: SessionRow, spec: CreateSession, prompt: Option<&str>) -> anyhow::Result<api::Session> {
+    let worker_id: WorkerId = row.worker_id.parse()?;
+    let session_id = row.id.clone();
+    let create_id = Uuid::now_v7().to_string();
+    let create =
+        SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
     let input_id = Uuid::now_v7().to_string();
     if let Some(text) = prompt {
@@ -157,7 +254,7 @@ pub async fn send_input(st: &HeadState, session_id: &str, text: &str) -> anyhow:
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    if session.parent_id.is_some() {
+    if session.parent_call_id.is_some() {
         return Err(bad_request("subagent sessions run once and cannot take messages"));
     }
     if session.status == "failed" {
@@ -283,7 +380,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
 /// Queues a `Restore` and a fresh copy of the rejected input, in that order.
 async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
     let Some(session) = st.store.session(session_id).await? else { return Ok(false) };
-    if session.status == "failed" || session.parent_id.is_some() || session.worker_id != worker_id.to_string() {
+    if session.status == "failed" || session.parent_call_id.is_some() || session.worker_id != worker_id.to_string() {
         return Ok(false);
     }
     let Some(text) = st.store.pending_input_text(command_id).await? else { return Ok(false) };
@@ -291,21 +388,14 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     if events.is_empty() {
         return Ok(false);
     }
-    let kind = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
-    let spec = CreateSession {
-        model: Some(ModelSpec {
-            connection_id: session.connection_id.clone(),
-            model: session.model.clone(),
-            max_output_tokens: 0,
-            effort: session.effort.clone().unwrap_or_default(),
-            connection_kind: kind,
-        }),
-        cwd: session.cwd.clone(),
-        base_prompt: c6_agent::BASE_PROMPT.into(),
-        worktree: false,
-        mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
-        skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
+    let seed = match (&session.parent_id, session.fork_seq) {
+        (Some(p), Some(f)) => match st.store.session(p).await? {
+            Some(parent) => fork_seed(st, &parent, f as u64).await?,
+            None => return Ok(false),
+        },
+        _ => Vec::new(),
     };
+    let spec = session_spec(st, &session, false, seed).await?;
     let restore_id = Uuid::now_v7().to_string();
     let cmd = SessionCommand {
         command_id: restore_id.clone(),

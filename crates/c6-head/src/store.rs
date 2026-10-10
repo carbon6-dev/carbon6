@@ -208,6 +208,7 @@ pub struct SessionRow {
     pub effort: Option<String>,
     pub parent_id: Option<String>,
     pub parent_call_id: Option<String>,
+    pub fork_seq: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_seq: i64,
@@ -240,7 +241,8 @@ impl Store {
     pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -252,6 +254,8 @@ impl Store {
         .bind(s.created_at)
         .bind(s.updated_at)
         .bind(&s.effort)
+        .bind(&s.parent_id)
+        .bind(s.fork_seq)
         .execute(&mut *tx)
         .await?;
         for c in commands {

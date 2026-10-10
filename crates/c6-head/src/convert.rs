@@ -108,6 +108,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         effort: r.effort.clone(),
         parent_id: r.parent_id.clone(),
         parent_call_id: r.parent_call_id.clone(),
+        fork_seq: r.fork_seq.map(|s| s as u64),
         created_at: r.created_at,
         updated_at: r.updated_at,
         last_seq: r.last_seq as u64,

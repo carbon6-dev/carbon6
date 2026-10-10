@@ -152,7 +152,7 @@ impl SessionManager {
             next_seq += 1;
         }
         info!(session = %session_id, cwd = %cwd.display(), %profile, "session created");
-        let conv = Conversation { history: Vec::new(), context_tokens: 0 };
+        let conv = Conversation { history: history_from_events(&seed_events(&spec)), context_tokens: 0 };
         self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools)).await;
         Ok(())
     }
@@ -215,7 +215,7 @@ impl SessionManager {
             next_seq += 1;
         }
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
-        let history = history_from_events(&events);
+        let history = history_from_events(&[seed_events(&spec), events.clone()].concat());
         // The last request's size since the last compaction, for the next
         // compaction decision.
         let context_tokens = events
@@ -269,6 +269,19 @@ impl SessionManager {
         self.actors.lock().unwrap().insert(session_id.to_owned(), tx.clone());
         tx
     }
+}
+
+/// A side chat's branched-from conversation, made portable when the side
+/// chat runs on a different model than produced any of it.
+fn seed_events(spec: &CreateSession) -> Vec<SessionEvent> {
+    let model = spec.model.clone().unwrap_or_default();
+    let same_model = spec.seed.iter().all(|e| match &e.kind {
+        Some(session_event::Kind::Started(s)) => {
+            s.model.as_ref().is_some_and(|m| m.connection_id == model.connection_id && m.model == model.model)
+        }
+        _ => true,
+    });
+    if same_model { spec.seed.clone() } else { c6_agent::portable_events(&spec.seed) }
 }
 
 /// Inputs waiting for the next model-request boundary.
@@ -372,10 +385,19 @@ impl Actor {
         writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true }));
 
         let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
+        let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             let result = if claude_code {
                 let inputs = inbox.lock().unwrap().drain();
+                // Claude Code keeps its own history: a side chat's context
+                // goes in as text with the first question.
+                let preamble = (turn == 1 && !seed.is_empty()).then(|| {
+                    format!(
+                        "<conversation-so-far>\n{}\n</conversation-so-far>\n\nThe user branched off the conversation above to ask:",
+                        c6_agent::transcript_text(&seed)
+                    )
+                });
                 crate::claude_code::run_turn(
                     turn,
                     &writer.session_id,
@@ -383,6 +405,7 @@ impl Actor {
                     &cfg.model,
                     cfg.effort.as_deref(),
                     inputs,
+                    preamble.as_deref(),
                     &sink,
                     &c,
                 )

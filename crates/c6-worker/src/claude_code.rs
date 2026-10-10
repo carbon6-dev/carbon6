@@ -46,10 +46,11 @@ pub async fn run_turn(
     model: &str,
     effort: Option<&str>,
     inputs: Vec<PendingInput>,
+    preamble: Option<&str>,
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
-    let prompt: Vec<&str> = inputs.iter().map(|i| i.text.as_str()).collect();
+    let prompt: Vec<&str> = preamble.into_iter().chain(inputs.iter().map(|i| i.text.as_str())).collect();
     let prompt = prompt.join("\n\n");
     for input in inputs {
         sink.append(session_event::Kind::User(UserMessage { command_id: input.command_id, text: input.text })).await?;
@@ -328,7 +329,7 @@ EOF
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let inputs = vec![PendingInput { command_id: "c1".into(), text: "list files".into() }];
         // Turn 2 tries --resume first; the fake has no conversation, so it falls back.
-        let reason = run_turn(2, "0199-session", dir.path(), "opus", Some("high"), inputs, &sink, &CancellationToken::new()).await.unwrap();
+        let reason = run_turn(2, "0199-session", dir.path(), "opus", Some("high"), inputs, None, &sink, &CancellationToken::new()).await.unwrap();
         assert_eq!(reason, TurnEndReason::Completed);
         assert_eq!(std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap(), "list files");
 

@@ -29,6 +29,51 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
     repair_tool_results(msgs)
 }
 
+/// Removes provider-bound blocks (signed or encrypted reasoning, provider
+/// tool blocks) from assistant events, so a conversation produced by one
+/// model can be continued by another.
+pub fn portable_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
+    events
+        .iter()
+        .cloned()
+        .map(|mut ev| {
+            if let Some(session_event::Kind::Assistant(a)) = &mut ev.kind {
+                a.blocks.retain(|b| matches!(b.block, Some(content_block::Block::Text(_)) | Some(content_block::Block::ToolUse(_))));
+            }
+            ev
+        })
+        .collect()
+}
+
+/// A plain-text rendering of a conversation, for backends that cannot be
+/// given a history (Claude Code). Long tool output is shortened.
+pub fn transcript_text(events: &[SessionEvent]) -> String {
+    fn clip(s: &str, max: usize) -> String {
+        if s.chars().count() <= max { s.to_owned() } else { format!("{}… (shortened)", s.chars().take(max).collect::<String>()) }
+    }
+    let mut out = String::new();
+    for ev in events {
+        match &ev.kind {
+            Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", u.text)),
+            Some(session_event::Kind::Assistant(a)) => {
+                for b in &a.blocks {
+                    match &b.block {
+                        Some(content_block::Block::Text(t)) => out.push_str(&format!("\n## Assistant\n{t}\n")),
+                        Some(content_block::Block::ToolUse(u)) => {
+                            out.push_str(&format!("\n[tool call {}: {}]\n", u.name, clip(&u.input_json, 2000)))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(session_event::Kind::ToolResult(r)) => out.push_str(&format!("[tool result]\n{}\n", clip(&r.output, 2000))),
+            Some(session_event::Kind::Compaction(c)) => out = format!("## Summary of the earlier conversation\n{}\n", c.summary),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The user message that stands in for a compacted conversation.
 pub fn compacted_context(summary: &str) -> String {
     format!(

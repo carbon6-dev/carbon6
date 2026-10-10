@@ -32,6 +32,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/sessions/{id}/children", get(session_children))
+        .route("/api/v1/sessions/{id}/side-chats", post(create_side_chat))
         .route("/api/v1/settings/mcp-servers", get(get_mcp_servers).put(put_mcp_servers))
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
@@ -381,6 +382,14 @@ async fn list_sessions(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<a
 
 async fn create_session(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateSession>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::sessions::create(&st, req).await?))
+}
+
+async fn create_side_chat(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::CreateSideChat>,
+) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::sessions::create_side_chat(&st, &id, req).await?))
 }
 
 async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::SessionDetail>> {

@@ -452,6 +452,11 @@ Decisions made while building M1 that refine the sections above:
   - Messages up to 64 MiB are allowed in both directions.
 - **Live deltas are coalesced (M5).** The worker batches text, thinking and tool-output deltas over 25 ms and merges consecutive deltas from the same stream before sending.
 - **Evals (M5).** `c6-eval` with tasks in `evals/tasks` (see `evals/README.md`).
+- **Side chats.**
+  - A side chat is a child session (`parent_id`, no `parent_call_id`) that branches after one event of its parent (`fork_seq`). It runs on the parent's worker, in the parent's real directory, with its own model.
+  - The head builds its context as a `seed` in `CreateSession`: the ancestors' seed, then the parent's events up to the branch point, plus results of tool calls already made by then. The worker prepends the seed to the history and keeps it in the journaled spec, so reloads and `Restore` keep the context.
+  - If the seed came from a different model, signed/encrypted reasoning and provider tool blocks are dropped from it. Claude Code sessions get the seed as a text transcript with the first question.
+  - The base prompt gains a note that this is a side conversation that should not change files unless asked. Side chats take messages and can have their own side chats; the UI shows them as collapsible threads under the message they branch from.
 - **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
 
 ## 17. Open items to settle during implementation

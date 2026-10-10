@@ -56,7 +56,9 @@ impl Subagents for Runner {
             ..p.started.clone()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
-        p.journal.create_session(&child_id, &p.spec, &ev).await.map_err(|e| format!("{e:#}"))?;
+        // Subagents start fresh: a side chat's seed is not theirs.
+        let spec = CreateSession { seed: Vec::new(), ..p.spec.clone() };
+        p.journal.create_session(&child_id, &spec, &ev).await.map_err(|e| format!("{e:#}"))?;
         info!(parent = %p.session_id, child = %child_id, %description, "subagent started");
 
         let writer: Arc<dyn EventSink> = Arc::new(Writer {

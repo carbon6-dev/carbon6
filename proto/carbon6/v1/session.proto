@@ -225,6 +225,10 @@ message CreateSession {
   // and skills. Fixed for the session so the tool list stays stable.
   string mcp_servers_json = 5;
   string skills_json = 6;
+  // Side chats: the conversation they branch from (the parent's events up
+  // to the branch point, its own ancestors' first). History only; the
+  // session's own log starts at its SessionStarted.
+  repeated SessionEvent seed = 7;
 }
 
 message ModelSpec {

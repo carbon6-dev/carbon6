@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use c6_api::{ContentBlock, Event, EventKind, QueuedInput, SessionStatus, StreamMsg, TurnEndReason};
+use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params_map};
 
-use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill};
+use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, storage_get, storage_set};
 use crate::{api, markdown, sessions};
 
 /// Live-only state, replaced by durable events as they arrive.
@@ -147,6 +147,78 @@ pub fn SessionPage() -> impl IntoView {
     view! { {move || { let id = id(); view! { <SessionView id /> } }} }
 }
 
+/// Live state of one session's log, fed by its stream.
+#[derive(Clone, Copy)]
+struct Feed {
+    events: RwSignal<Vec<Event>>,
+    streaming: RwSignal<Streaming>,
+    queued: RwSignal<Vec<QueuedInput>>,
+    activity: RwSignal<Option<bool>>,
+}
+
+impl Feed {
+    /// Follows the session's stream until the calling scope is cleaned up.
+    fn open(id: String) -> Self {
+        let feed = Feed {
+            events: RwSignal::new(Vec::new()),
+            streaming: RwSignal::new(Streaming::default()),
+            queued: RwSignal::new(Vec::new()),
+            activity: RwSignal::new(None),
+        };
+        let Feed { events, streaming, queued, activity } = feed;
+        let handle = api::stream_session(
+            id,
+            move |msg| match msg {
+                StreamMsg::Event { event } => {
+                    streaming.update(|s| match &event.kind {
+                        EventKind::Assistant { .. } => {
+                            s.text.clear();
+                            s.thinking.clear();
+                        }
+                        EventKind::ToolResult { call_id, .. } => {
+                            s.tool_output.remove(call_id);
+                        }
+                        EventKind::TurnEnded { .. } => *s = Streaming::default(),
+                        _ => {}
+                    });
+                    if let EventKind::TurnEnded { .. } = event.kind {
+                        activity.set(Some(false));
+                    }
+                    if let EventKind::TurnStarted { .. } = event.kind {
+                        activity.set(Some(true));
+                    }
+                    events.update(|evs| {
+                        if evs.last().is_none_or(|l| l.seq < event.seq) {
+                            evs.push(event)
+                        }
+                    });
+                }
+                StreamMsg::Text { text, .. } => streaming.update(|s| s.text.push_str(&text)),
+                StreamMsg::Thinking { text, .. } => streaming.update(|s| s.thinking.push_str(&text)),
+                StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
+                StreamMsg::Activity { running } => activity.set(Some(running)),
+                StreamMsg::Queue { queued: q } => queued.set(q),
+            },
+            move || events.with_untracked(|e| e.last().map(|e| e.seq).unwrap_or(0)),
+        );
+        on_cleanup(move || handle.abort());
+        feed
+    }
+
+    /// A turn is in progress (live activity, or an unclosed turn in the log).
+    fn running(&self) -> bool {
+        self.activity.get().unwrap_or_else(|| {
+            self.events.with(|evs| {
+                evs.iter().rev().find_map(|e| match e.kind {
+                    EventKind::TurnStarted { .. } => Some(true),
+                    EventKind::TurnEnded { .. } => Some(false),
+                    _ => None,
+                }) == Some(true)
+            })
+        })
+    }
+}
+
 #[component]
 fn SessionView(id: String) -> impl IntoView {
     let live = api::live();
@@ -154,48 +226,9 @@ fn SessionView(id: String) -> impl IntoView {
         let id = id.clone();
         move || api::session(id.clone())
     });
-    let events = RwSignal::new(Vec::<Event>::new());
-    let streaming = RwSignal::new(Streaming::default());
-    let queued = RwSignal::new(Vec::<QueuedInput>::new());
-    let activity = RwSignal::new(None::<bool>);
+    let feed = Feed::open(id.clone());
+    let Feed { events, streaming, queued, activity } = feed;
     let error = RwSignal::new(None::<String>);
-
-    let handle = api::stream_session(
-        id.clone(),
-        move |msg| match msg {
-            StreamMsg::Event { event } => {
-                streaming.update(|s| match &event.kind {
-                    EventKind::Assistant { .. } => {
-                        s.text.clear();
-                        s.thinking.clear();
-                    }
-                    EventKind::ToolResult { call_id, .. } => {
-                        s.tool_output.remove(call_id);
-                    }
-                    EventKind::TurnEnded { .. } => *s = Streaming::default(),
-                    _ => {}
-                });
-                if let EventKind::TurnEnded { .. } = event.kind {
-                    activity.set(Some(false));
-                }
-                if let EventKind::TurnStarted { .. } = event.kind {
-                    activity.set(Some(true));
-                }
-                events.update(|evs| {
-                    if evs.last().is_none_or(|l| l.seq < event.seq) {
-                        evs.push(event)
-                    }
-                });
-            }
-            StreamMsg::Text { text, .. } => streaming.update(|s| s.text.push_str(&text)),
-            StreamMsg::Thinking { text, .. } => streaming.update(|s| s.thinking.push_str(&text)),
-            StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
-            StreamMsg::Activity { running } => activity.set(Some(running)),
-            StreamMsg::Queue { queued: q } => queued.set(q),
-        },
-        move || events.with_untracked(|e| e.last().map(|e| e.seq).unwrap_or(0)),
-    );
-    on_cleanup(move || handle.abort());
 
     let status = {
         let id = id.clone();
@@ -227,55 +260,18 @@ fn SessionView(id: String) -> impl IntoView {
         }
     });
 
-    let results = Memo::new(move |_| {
-        events.with(|evs| {
-            evs.iter()
-                .filter_map(|e| match &e.kind {
-                    EventKind::ToolResult { call_id, output, is_error, truncated, duration_ms, .. } => Some((
-                        call_id.clone(),
-                        ToolResultView { output: output.clone(), is_error: *is_error, truncated: *truncated, duration_ms: *duration_ms },
-                    )),
-                    _ => None,
-                })
-                .collect::<HashMap<_, _>>()
-        })
-    });
     let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
-    // Ticks while a turn runs, for its elapsed time.
-    let now = RwSignal::new(js_sys::Date::now() as i64);
-    let ticker = set_interval_with_handle(move || now.set(js_sys::Date::now() as i64), std::time::Duration::from_secs(1)).ok();
-    on_cleanup(move || {
-        if let Some(t) = ticker {
-            t.clear();
-        }
-    });
-
     let id_stored = StoredValue::new(id.clone());
     let navigate = use_navigate();
-    // Subagent sessions started by Task calls, by call id. Refreshed as
-    // tool results arrive.
-    let children = LocalResource::new({
-        let id = id.clone();
-        move || {
-            results.track();
-            api::children(id.clone())
-        }
-    });
-    let child_of_call = Memo::new(move |_| {
-        children
-            .get()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|c| Some((c.parent_call_id?, c.id)))
-            .collect::<HashMap<_, _>>()
-    });
-    provide_context(ChildLinks(child_of_call));
     let tab = RwSignal::new("transcript");
-    // Esc stops a running turn.
+    // Esc stops a running turn (unless typing in a field, e.g. a side chat).
     let esc_id = id.clone();
     let _esc = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" && running() {
+        let in_field = ev
+            .target()
+            .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
+            .is_some_and(|el| matches!(el.tag_name().as_str(), "TEXTAREA" | "INPUT"));
+        if ev.key() == "Escape" && running() && !in_field {
             let id = esc_id.clone();
             spawn_local(async move {
                 let _ = api::interrupt(id).await;
@@ -337,9 +333,9 @@ fn SessionView(id: String) -> impl IntoView {
                                     "The worker is offline. A running turn continues there and syncs back; queued messages are delivered when it reconnects."
                                 </p>
                             })}
-                            {s.parent_id.clone().map(|p| view! {
-                                <p class="mb-3 text-sm text-zinc-500">"Subagent session · started by a Task call in "
-                                    <a class="underline" href=format!("/sessions/{p}")>"its parent session"</a></p>
+                            {s.parent_id.clone().map(|p| {
+                                let what = if s.parent_call_id.is_some() { "Subagent session · started by a Task call in " } else { "Side chat · branched from " };
+                                view! { <p class="mb-3 text-sm text-zinc-500">{what}<a class="underline" href=format!("/sessions/{p}")>"its parent session"</a></p> }
                             })}
                         }.into_any()
                     }
@@ -357,33 +353,249 @@ fn SessionView(id: String) -> impl IntoView {
                     _ => view! { <p class="py-6 text-center text-sm text-zinc-500">"Available once the session has started."</p> }.into_any(),
                 }
             }}
-            <div class="space-y-4" class:hidden=move || tab.get() != "transcript">
-                // Events are append-only: keyed by seq, each renders once, so
-                // expanded cards stay open while the turn continues.
-                <For each=move || events.get() key=|e| e.seq let:e>
-                    {render_event(&e, results, streaming, usage)}
-                </For>
-                {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
-                    <div class="space-y-2">
-                        {(!s.thinking.is_empty()).then(|| view! { <Thinking text=s.thinking.clone() open=true /> })}
-                        {(!s.text.is_empty()).then(|| view! { <div class="md" inner_html=markdown::to_html(&s.text)></div> })}
-                    </div>
-                }))}
-                {move || (running() && streaming.with(|s| s.text.is_empty() && s.thinking.is_empty())).then(|| view! {
-                    <div class="flex items-center gap-2 text-sm text-zinc-500">
-                        <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>"Working…"
-                    </div>
-                })}
-                {move || running().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
-                    <p class="font-mono text-[11px] text-zinc-500">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
-                })}
-                {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id_stored.get_value() /> }).collect_view()}
+            <div class:hidden=move || tab.get() != "transcript">
+                {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
             </div>
 
-            <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_id.is_some())>
+            <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some())>
             <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error />
             </Show>
         </main>
+    }
+}
+
+/// A session's transcript, with the side chats branching from its messages
+/// shown under them (recursively).
+#[component]
+fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoView {
+    let Feed { events, streaming, queued, .. } = feed;
+    let id = StoredValue::new(session.id.clone());
+    let results = Memo::new(move |_| {
+        events.with(|evs| {
+            evs.iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::ToolResult { call_id, output, is_error, truncated, duration_ms, .. } => Some((
+                        call_id.clone(),
+                        ToolResultView { output: output.clone(), is_error: *is_error, truncated: *truncated, duration_ms: *duration_ms },
+                    )),
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>()
+        })
+    });
+    let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
+    // Ticks while a turn runs, for its elapsed time.
+    let now = RwSignal::new(js_sys::Date::now() as i64);
+    let ticker = set_interval_with_handle(move || now.set(js_sys::Date::now() as i64), std::time::Duration::from_secs(1)).ok();
+    on_cleanup(move || {
+        if let Some(t) = ticker {
+            t.clear();
+        }
+    });
+
+    // Child sessions: subagents (linked from their Task calls) and side
+    // chats. Refreshed as tool results arrive and after a side chat starts.
+    let refresh = RwSignal::new(0u32);
+    let children = LocalResource::new(move || {
+        results.track();
+        refresh.track();
+        api::children(id.get_value())
+    });
+    let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
+    let child_of_call = Memo::new(move |_| {
+        child_list.get().into_iter().filter_map(|c| Some((c.parent_call_id?, c.id))).collect::<HashMap<_, _>>()
+    });
+    provide_context(ChildLinks(child_of_call));
+
+    let can_branch = session.parent_call_id.is_none();
+    // A side chat's setup (prompt, tools) is the parent's: not worth a line.
+    let side = session.fork_seq.is_some();
+    let asking = RwSignal::new(None::<u64>);
+    // A side chat just started here opens expanded.
+    let opened = RwSignal::new(None::<String>);
+    let defaults = StoredValue::new((session.connection_id.clone(), session.model.clone()));
+    let on_done = Callback::new(move |s: Option<Session>| {
+        asking.set(None);
+        if let Some(s) = s {
+            opened.set(Some(s.id));
+            refresh.update(|n| *n += 1);
+        }
+    });
+
+    view! {
+        <div class="space-y-4">
+            // Events are append-only: keyed by seq, each renders once, so
+            // expanded cards stay open while the turn continues.
+            <For each=move || events.get() key=|e| e.seq let:e>
+                {
+                    let seq = e.seq;
+                    let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
+                    view! {
+                        <div class="group relative">
+                            {(!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&e, results, streaming, usage))}
+                            {anchorable.then(|| view! {
+                                <button
+                                    class="absolute -top-3 right-0 rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 opacity-0 shadow-sm transition group-hover:opacity-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100"
+                                    title="Ask about this in a side chat"
+                                    on:click=move |_| asking.set(Some(seq))
+                                >"↳ Ask"</button>
+                            })}
+                        </div>
+                        <For
+                            each=move || child_list.with(|cs| cs.iter().filter(|c| c.fork_seq == Some(seq)).cloned().collect::<Vec<_>>())
+                            key=|c| c.id.clone()
+                            let:c
+                        >
+                            {let open = opened.get_untracked().as_deref() == Some(c.id.as_str()); side_chat(c, open)}
+                        </For>
+                        {move || (asking.get() == Some(seq)).then(|| view! {
+                            <NewSideChat parent=id.get_value() anchor_seq=seq defaults=defaults.get_value() on_done />
+                        })}
+                    }
+                }
+            </For>
+            {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
+                <div class="space-y-2">
+                    {(!s.thinking.is_empty()).then(|| view! { <Thinking text=s.thinking.clone() open=true /> })}
+                    {(!s.text.is_empty()).then(|| view! { <div class="md" inner_html=markdown::to_html(&s.text)></div> })}
+                </div>
+            }))}
+            {move || (running.get() && streaming.with(|s| s.text.is_empty() && s.thinking.is_empty())).then(|| view! {
+                <div class="flex items-center gap-2 text-sm text-zinc-500">
+                    <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>"Working…"
+                </div>
+            })}
+            {move || running.get().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
+                <p class="font-mono text-[11px] text-zinc-500">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
+            })}
+            {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() /> }).collect_view()}
+        </div>
+    }
+}
+
+/// A collapsible side-chat thread. Returns `AnyView` to end the type
+/// recursion (side chats contain transcripts that contain side chats).
+fn side_chat(s: Session, open_now: bool) -> AnyView {
+    let key = format!("c6.side.{}", s.id);
+    let open = RwSignal::new(open_now || storage_get(&key).is_some_and(|v| v == "1"));
+    if open_now {
+        storage_set(&key, "1");
+    }
+    let toggle = move |_| {
+        open.update(|o| *o = !*o);
+        storage_set(&key, if open.get_untracked() { "1" } else { "0" });
+    };
+    let (title, model) = (s.title.clone(), s.model.clone());
+    let s = StoredValue::new(s);
+    view! {
+        <div class="ml-2 border-l-2 border-sky-300 pl-3 dark:border-sky-800">
+            <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
+                <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
+                <span class="shrink-0 font-medium text-sky-700 dark:text-sky-400">"Side chat"</span>
+                <span class="truncate text-zinc-700 dark:text-zinc-300">{title}</span>
+                <span class="ml-auto shrink-0 font-mono">{model}</span>
+            </button>
+            <Show when=move || open.get()>
+                <SideChatBody session=s.get_value() />
+            </Show>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn SideChatBody(session: Session) -> impl IntoView {
+    let feed = Feed::open(session.id.clone());
+    let running = Signal::derive(move || feed.running());
+    let error = RwSignal::new(None::<String>);
+    let id = session.id.clone();
+    view! {
+        <div class="space-y-3 pb-2 pt-1">
+            <Transcript session feed running />
+            <Composer id running disabled=Signal::derive(|| false) error inline=true />
+        </div>
+    }
+}
+
+const SMALL_INPUT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900";
+
+/// The question box that starts a side chat after `anchor_seq`.
+#[component]
+fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_done: Callback<Option<Session>>) -> impl IntoView {
+    let text = RwSignal::new(String::new());
+    let (connection, model) = (RwSignal::new(defaults.0), RwSignal::new(defaults.1));
+    let connections = LocalResource::new(api::connections);
+    let models = LocalResource::new(move || api::models(connection.get()));
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let parent = StoredValue::new(parent);
+    let send = move || {
+        let prompt = text.get_untracked();
+        if prompt.trim().is_empty() || busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        let req = c6_api::CreateSideChat {
+            anchor_seq,
+            connection_id: connection.get_untracked(),
+            model: model.get_untracked(),
+            effort: None,
+            prompt,
+        };
+        spawn_local(async move {
+            match api::create_side_chat(parent.get_value(), req).await {
+                Ok(s) => on_done.run(Some(s)),
+                Err(e) => {
+                    error.set(Some(e));
+                    busy.set(false);
+                }
+            }
+        });
+    };
+    let input = NodeRef::<leptos::html::Textarea>::new();
+    Effect::new(move || {
+        if let Some(el) = input.get() {
+            let _ = el.focus();
+        }
+    });
+    let list_id = format!("c6-side-models-{anchor_seq}-{}", parent.get_value());
+    view! {
+        <div class="ml-2 space-y-2 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/30">
+            <textarea
+                node_ref=input
+                class=format!("{INPUT} min-h-[2.75rem] resize-y")
+                rows="2"
+                placeholder="Ask about this in a side chat (Enter to send, Esc to cancel)"
+                prop:value=move || text.get()
+                on:input=move |ev| text.set(event_target_value(&ev))
+                on:keydown=move |ev| {
+                    if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); send(); }
+                    if ev.key() == "Escape" { on_done.run(None); }
+                }
+            ></textarea>
+            <div class="flex flex-wrap items-center gap-2">
+                <select class=format!("{SMALL_INPUT} max-w-48") on:change=move |ev| {
+                    let c = event_target_value(&ev);
+                    let default = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c)).and_then(|x| x.default_model);
+                    connection.set(c);
+                    model.set(default.unwrap_or_default());
+                }>
+                    {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|c| {
+                        let id = c.id.clone();
+                        view! { <option value=c.id.clone() selected=move || connection.get() == id>{c.name.clone()}</option> }
+                    }).collect_view()}
+                </select>
+                <input class=format!("{SMALL_INPUT} w-56 font-mono") list=list_id.clone() placeholder="model id"
+                    prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
+                <datalist id=list_id>
+                    {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
+                </datalist>
+                <span class="flex-1"></span>
+                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| on_done.run(None)>"Cancel"</button>
+                <button class=format!("{BUTTON} text-xs") prop:disabled=move || busy.get() on:click=move |_| send()>"Ask"</button>
+            </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+        </div>
     }
 }
 
@@ -705,7 +917,15 @@ fn Queued(q: QueuedInput, session_id: String) -> impl IntoView {
 }
 
 #[component]
-fn Composer(id: String, running: Signal<bool>, disabled: Signal<bool>, error: RwSignal<Option<String>>) -> impl IntoView {
+fn Composer(
+    id: String,
+    running: Signal<bool>,
+    disabled: Signal<bool>,
+    error: RwSignal<Option<String>>,
+    /// Inside a side chat instead of fixed at the bottom of the page.
+    #[prop(optional)]
+    inline: bool,
+) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let id = StoredValue::new(id);
     let send = move || {
@@ -731,14 +951,14 @@ fn Composer(id: String, running: Signal<bool>, disabled: Signal<bool>, error: Rw
         });
     };
     view! {
-        <div class="fixed inset-x-0 bottom-0 z-10 border-t border-zinc-200 bg-zinc-50/95 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95">
-            <div class="mx-auto max-w-4xl space-y-2 px-4 py-3">
+        <div class=if inline { "" } else { "fixed inset-x-0 bottom-0 z-10 border-t border-zinc-200 bg-zinc-50/95 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95" }>
+            <div class=if inline { "space-y-2" } else { "mx-auto max-w-4xl space-y-2 px-4 py-3" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex items-end gap-2">
                     <textarea
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else { "Message the agent (Enter to send, Shift+Enter for a new line)" }
+                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat" } else { "Message the agent (Enter to send, Shift+Enter for a new line)" }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| text.set(event_target_value(&ev))

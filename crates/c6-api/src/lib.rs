@@ -111,9 +111,24 @@ pub struct Session {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub parent_call_id: Option<String>,
+    /// Side chats: the parent event they branch from.
+    #[serde(default)]
+    pub fork_seq: Option<u64>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
     pub last_seq: u64,
+}
+
+/// A side chat: a new session that branches from `anchor_seq` of a session
+/// (with everything up to there as context) on the same worker.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateSideChat {
+    pub anchor_seq: u64,
+    pub connection_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+    pub prompt: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

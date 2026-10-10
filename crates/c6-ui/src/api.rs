@@ -163,6 +163,10 @@ pub async fn create_session(req: CreateSession) -> Result<Session, String> {
     send_json(Request::post("/api/v1/sessions"), &req).await
 }
 
+pub async fn create_side_chat(parent: String, req: c6_api::CreateSideChat) -> Result<Session, String> {
+    send_json(Request::post(&format!("/api/v1/sessions/{parent}/side-chats")), &req).await
+}
+
 pub async fn session(id: String) -> Result<SessionDetail, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}")).send().await).await
 }
