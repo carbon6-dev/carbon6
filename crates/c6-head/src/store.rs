@@ -361,6 +361,7 @@ impl Store {
                 .bind(ev.encode_to_vec())
                 .execute(&mut *tx)
                 .await?;
+            crate::search::index_event(&mut tx, session_id, ev).await?;
             last = ev.seq;
             match &ev.kind {
                 Some(Kind::Started(s)) => {

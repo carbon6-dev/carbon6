@@ -9,6 +9,7 @@ pub mod hub;
 pub mod oauth;
 pub mod pki;
 pub mod registry;
+pub mod search;
 pub mod secrets;
 pub mod sessions;
 pub mod store;
@@ -168,6 +169,14 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     });
 
     let mut tasks = JoinSet::new();
+
+    // Build the search index in the background (first start, or new format).
+    let st = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = search::backfill(&st.store).await {
+            tracing::warn!("building the search index: {e:#}");
+        }
+    });
 
     let tls = ServerTlsConfig::new()
         .identity(state.pki.server_identity())

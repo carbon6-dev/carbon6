@@ -338,3 +338,14 @@ pub async fn rename_passkey(id: String, name: String) -> Result<(), String> {
     )
     .await
 }
+
+pub async fn search(q: String, kind: String, worker: String) -> Result<c6_api::SearchResponse, String> {
+    let mut params = vec![("q", q)];
+    if !kind.is_empty() {
+        params.push(("kind", kind));
+    }
+    if !worker.is_empty() {
+        params.push(("worker", worker));
+    }
+    json(Request::get("/api/v1/search").query(params).send().await).await
+}

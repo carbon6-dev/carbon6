@@ -1,0 +1,327 @@
+//! Full-text search over sessions (SQLite FTS5, trigram tokens).
+//!
+//! Every durable event becomes zero or more rows in the `search` table, in
+//! the same transaction that stores the event, so the index never drifts
+//! from the log. The index is derived data: when `search.version` differs
+//! from [`VERSION`] (first start, or a format change), a background task
+//! rebuilds it session by session.
+
+use std::collections::HashMap;
+
+use c6_api as api;
+use c6_proto::{SessionEvent, content_block, session_event};
+use prost::Message;
+use sqlx::{Row, SqliteConnection};
+
+use crate::bad_request;
+use crate::store::Store;
+
+/// Bump when what gets indexed changes; the head then re-indexes.
+const VERSION: &str = "1";
+const VERSION_KEY: &str = "search.version";
+/// Text indexed per entry. Tool output is most of the text in a session.
+const MAX_TEXT: usize = 32 * 1024;
+/// Candidate matches read per query, before grouping by session.
+const CANDIDATES: i64 = 400;
+const HITS_PER_SESSION: usize = 3;
+
+/// The searchable entries of an event: (part, kind, text).
+fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
+    use session_event::Kind;
+    let mut out = Vec::new();
+    match &ev.kind {
+        Some(Kind::User(u)) => out.push((0, "user", u.text.clone())),
+        Some(Kind::Assistant(a)) => {
+            for (i, b) in a.blocks.iter().enumerate() {
+                let (kind, text) = match &b.block {
+                    Some(content_block::Block::Text(t)) => ("assistant", t.clone()),
+                    Some(content_block::Block::Thinking(t)) => ("thinking", t.clone()),
+                    Some(content_block::Block::SignedThinking(t)) => ("thinking", t.text.clone()),
+                    Some(content_block::Block::Reasoning(r)) => ("thinking", r.summary.clone()),
+                    Some(content_block::Block::ToolUse(u)) => ("tool_call", tool_call_text(&u.name, &u.input_json)),
+                    _ => continue,
+                };
+                out.push((i as u32, kind, text));
+            }
+        }
+        Some(Kind::ToolResult(r)) => out.push((0, "tool_result", r.output.clone())),
+        Some(Kind::Error(e)) => out.push((0, "error", e.message.clone())),
+        Some(Kind::Compaction(c)) => out.push((0, "summary", c.summary.clone())),
+        _ => {}
+    }
+    out.retain(|(_, _, t)| !t.trim().is_empty());
+    for (_, _, t) in &mut out {
+        truncate(t, MAX_TEXT);
+    }
+    out
+}
+
+/// A tool call as text: its name and the string values of its arguments
+/// (commands, paths, patches) unescaped, so they match as typed.
+fn tool_call_text(name: &str, input_json: &str) -> String {
+    fn strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|v| strings(v, out)),
+            other => out.push(other.to_string()),
+        }
+    }
+    let mut parts = vec![name.to_owned()];
+    match serde_json::from_str::<serde_json::Value>(input_json) {
+        Ok(v) => strings(&v, &mut parts),
+        Err(_) => parts.push(input_json.to_owned()),
+    }
+    parts.join("\n")
+}
+
+fn truncate(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
+/// Indexes `ev` (called in the transaction that stores it).
+pub(crate) async fn index_event(conn: &mut SqliteConnection, session_id: &str, ev: &SessionEvent) -> anyhow::Result<()> {
+    for (part, kind, text) in entries(ev) {
+        sqlx::query("INSERT INTO search (text, session_id, seq, part, kind) VALUES (?, ?, ?, ?, ?)")
+            .bind(text)
+            .bind(session_id)
+            .bind(ev.seq as i64)
+            .bind(part as i64)
+            .bind(kind)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Rebuilds the index if it is missing or from another version. Each
+/// session is re-indexed in one transaction (delete, then insert all), so
+/// events ingested meanwhile are neither lost nor doubled.
+pub async fn backfill(store: &Store) -> anyhow::Result<()> {
+    if store.setting(VERSION_KEY).await?.as_deref() == Some(VERSION) {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let ids: Vec<String> = sqlx::query("SELECT id FROM sessions").fetch_all(&store.pool).await?.iter().map(|r| r.get("id")).collect();
+    let mut events = 0usize;
+    for id in &ids {
+        let mut tx = store.pool.begin().await?;
+        sqlx::query("DELETE FROM search WHERE session_id = ?").bind(id).execute(&mut *tx).await?;
+        let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? ORDER BY seq").bind(id).fetch_all(&mut *tx).await?;
+        for r in &rows {
+            let ev = SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
+            index_event(&mut tx, id, &ev).await?;
+        }
+        events += rows.len();
+        tx.commit().await?;
+    }
+    store.set_setting(VERSION_KEY, VERSION).await?;
+    tracing::info!(sessions = ids.len(), events, elapsed = ?started.elapsed(), "search index built");
+    Ok(())
+}
+
+/// The user's query as an FTS5 expression: whitespace-separated terms and
+/// "quoted phrases" must all match; a leading `-` excludes. Each is matched
+/// as a substring (trigram), so it needs at least 3 characters.
+fn fts_query(q: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    let mut chars = q.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let negate = c == '-';
+        if negate {
+            chars.next();
+        }
+        let term: String = if chars.peek() == Some(&'"') {
+            chars.next();
+            chars.by_ref().take_while(|c| *c != '"').collect()
+        } else {
+            let mut t = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                t.push(c);
+                chars.next();
+            }
+            t
+        };
+        let term = term.trim().to_owned();
+        if term.chars().count() < 3 {
+            continue;
+        }
+        if negate { exclude.push(term) } else { include.push(term) }
+    }
+    if include.is_empty() {
+        return Err(bad_request("search for at least one word of 3 or more characters"));
+    }
+    let quote = |t: &String| format!("\"{}\"", t.replace('"', "\"\""));
+    let mut expr = include.iter().map(quote).collect::<Vec<_>>().join(" AND ");
+    for t in &exclude {
+        expr = format!("({expr}) NOT {}", quote(t));
+    }
+    Ok((expr, include))
+}
+
+/// A snippet around the first match in `highlighted` (text with matches
+/// between \u{1} and \u{2}): about 80 characters before it and 200 after.
+fn snippet(highlighted: &str) -> Vec<api::SnippetPart> {
+    let chars: Vec<char> = highlighted.chars().collect();
+    let first = chars.iter().position(|c| *c == '\u{1}').unwrap_or(0);
+    let mut start = first.saturating_sub(80);
+    let mut end = (first + 200).min(chars.len());
+    // Start and end at word boundaries when one is near.
+    if start > 0
+        && let Some(p) = chars[start..first].iter().position(|c| c.is_whitespace())
+    {
+        start += p + 1;
+    }
+    if end < chars.len()
+        && let Some(p) = chars[first..end].iter().rposition(|c| c.is_whitespace())
+    {
+        end = (first + p).max(first + 1);
+    }
+    // A match cut by the window still counts as one.
+    let mut hit = chars[..start].iter().filter(|c| **c == '\u{1}').count() > chars[..start].iter().filter(|c| **c == '\u{2}').count();
+    let mut parts: Vec<api::SnippetPart> = Vec::new();
+    let mut cur = String::new();
+    if start > 0 {
+        cur.push('…');
+    }
+    let flush = |parts: &mut Vec<api::SnippetPart>, cur: &mut String, hit: bool| {
+        if !cur.is_empty() {
+            // Collapse runs of whitespace (code and logs have many).
+            let text = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+            let text = if cur.starts_with(char::is_whitespace) && !parts.is_empty() { format!(" {text}") } else { text };
+            let text = if cur.ends_with(char::is_whitespace) { format!("{text} ") } else { text };
+            parts.push(api::SnippetPart { text, hit });
+            cur.clear();
+        }
+    };
+    for &c in &chars[start..end] {
+        match c {
+            '\u{1}' => {
+                flush(&mut parts, &mut cur, hit);
+                hit = true;
+            }
+            '\u{2}' => {
+                flush(&mut parts, &mut cur, hit);
+                hit = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if end < chars.len() {
+        cur.push('…');
+    }
+    flush(&mut parts, &mut cur, hit);
+    parts
+}
+
+/// Searches; sessions ordered by their best match.
+pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api::SearchResponse> {
+    let (expr, terms) = fts_query(&req.q)?;
+    let kinds: Vec<String> =
+        req.kind.as_deref().unwrap_or("").split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned).collect();
+    let mut sql = String::from(
+        "SELECT search.session_id AS sid, search.seq AS seq, search.part AS part, search.kind AS kind, \
+         highlight(search, 0, char(1), char(2)) AS hl, e.ts AS ts \
+         FROM search JOIN sessions s ON s.id = search.session_id \
+         JOIN events e ON e.session_id = search.session_id AND e.seq = search.seq \
+         WHERE search MATCH ?",
+    );
+    if req.worker.is_some() {
+        sql.push_str(" AND s.worker_id = ?");
+    }
+    if !kinds.is_empty() {
+        sql.push_str(&format!(" AND search.kind IN ({})", vec!["?"; kinds.len()].join(", ")));
+    }
+    sql.push_str(" ORDER BY bm25(search) LIMIT ?");
+    // Safe: the SQL only gains fixed clauses and `?` placeholders; every
+    // value is bound.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(&expr);
+    if let Some(w) = &req.worker {
+        query = query.bind(w.to_string());
+    }
+    for k in &kinds {
+        query = query.bind(k);
+    }
+    let rows = query.bind(CANDIDATES).fetch_all(&store.pool).await.map_err(|e| match &e {
+        sqlx::Error::Database(d) if d.message().contains("fts5") => bad_request(format!("cannot search for that: {}", d.message())),
+        _ => e.into(),
+    })?;
+    let truncated = rows.len() as i64 == CANDIDATES;
+
+    // Group by session, keeping the best-ranked order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, (Vec<api::SearchHit>, u32)> = HashMap::new();
+    for r in &rows {
+        let sid: String = r.get("sid");
+        let (hits, total) = groups.entry(sid.clone()).or_insert_with(|| {
+            order.push(sid.clone());
+            (Vec::new(), 0)
+        });
+        *total += 1;
+        if hits.len() < HITS_PER_SESSION {
+            hits.push(api::SearchHit {
+                seq: r.get::<i64, _>("seq") as u64,
+                part: r.get::<i64, _>("part") as u32,
+                kind: r.get("kind"),
+                ts: r.get("ts"),
+                snippet: snippet(&r.get::<String, _>("hl")),
+            });
+        }
+    }
+    let limit = req.limit.unwrap_or(30).clamp(1, 100) as usize;
+    let mut results = Vec::new();
+    for sid in order.into_iter().take(limit) {
+        let Some(row) = store.session(&sid).await? else { continue };
+        let worker_name = match store.worker(row.worker_id.parse()?).await? {
+            Some(w) => w.name,
+            None => String::new(),
+        };
+        let (hits, total_hits) = groups.remove(&sid).unwrap_or_default();
+        results.push(api::SearchResult { session: crate::convert::session(&row), worker_name, hits, total_hits });
+    }
+    Ok(api::SearchResponse { results, terms, truncated })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_syntax() {
+        assert_eq!(fts_query("foo_bar src/").unwrap().0, r#""foo_bar" AND "src/""#);
+        assert_eq!(fts_query(r#""out of memory" -oom2 x"#).unwrap().0, r#"("out of memory") NOT "oom2""#);
+        assert_eq!(fts_query(r#"say "hi""#).unwrap().0, r#""say""#, "short phrases are dropped");
+        assert!(fts_query("ab -cdef").is_err());
+        assert_eq!(fts_query(r#"a"b"c"#).unwrap().0, r#""a""b""c""#, "quotes inside a term are escaped");
+    }
+
+    #[test]
+    fn snippets_window_and_mark() {
+        let text = format!("{} start \u{1}needle\u{2} middle \u{1}needle\u{2} {}", "x ".repeat(100), "y ".repeat(200));
+        let s = snippet(&text);
+        assert!(s.first().unwrap().text.starts_with('…'));
+        assert!(s.last().unwrap().text.ends_with('…'));
+        assert_eq!(s.iter().filter(|p| p.hit).count(), 2);
+        assert!(s.iter().filter(|p| p.hit).all(|p| p.text == "needle"));
+    }
+
+    #[test]
+    fn tool_calls_index_their_arguments() {
+        let t = tool_call_text("bash", r#"{"command":"cargo test -p \"c6-head\"","timeout":30}"#);
+        assert_eq!(t, "bash\ncargo test -p \"c6-head\"\n30");
+    }
+}

@@ -242,7 +242,31 @@ fn SessionView(id: String) -> impl IntoView {
     let running = move || status.get() == SessionStatus::Running || activity.get() == Some(true);
 
     // Follow the bottom of the transcript unless the user scrolled up.
-    let stick = RwSignal::new(true);
+    // A deep link from search: `#e<seq>`, with the query in `?q=` to
+    // highlight. The transcript then does not stick to the bottom.
+    let target = window().location().hash().ok().and_then(|h| h.strip_prefix("#e")?.parse::<u64>().ok());
+    let stick = RwSignal::new(target.is_none());
+    if let Some(seq) = target {
+        let q = leptos_router::hooks::use_query_map().get_untracked().get("q").unwrap_or_default();
+        let terms = serde_json::to_string(&crate::search::terms(&q)).unwrap_or_else(|_| "[]".into());
+        let session = id.clone();
+        let done = RwSignal::new(false);
+        Effect::new(move || {
+            if done.get_untracked() {
+                return;
+            }
+            // The element of the event; a tool result shows in its call's card.
+            let el = events.with(|evs| {
+                evs.iter().find(|e| e.seq == seq).map(|e| match &e.kind {
+                    EventKind::ToolResult { call_id, .. } => format!("call-{call_id}"),
+                    _ => format!("{session}-e{seq}"),
+                })
+            });
+            let Some(el) = el else { return };
+            done.set(true);
+            reveal_when_rendered(el, terms.clone(), 0);
+        });
+    }
     let _scroll = window_event_listener(leptos::ev::scroll, move |_| {
         let w = window();
         let doc_h = document().document_element().map(|e| e.scroll_height()).unwrap_or(0) as f64;
@@ -436,7 +460,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                     let seq = e.seq;
                     let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
                     view! {
-                        <div class=if anchorable { "group relative pb-7" } else { "group relative" }>
+                        <div id=format!("{}-e{seq}", id.get_value()) class=if anchorable { "group relative pb-7" } else { "group relative" }>
                             {(!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&e, results, streaming, usage))}
                             {anchorable.then(|| view! {
                                 <button
@@ -695,6 +719,24 @@ fn model_label(model: &str, effort: &str) -> String {
     if effort.is_empty() { model.to_owned() } else { format!("{model} · {effort}") }
 }
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = c6Search, js_name = reveal)]
+    fn js_reveal(id: &str, terms_json: &str) -> bool;
+}
+
+/// Reveals a search hit once its element exists (events render in batches).
+fn reveal_when_rendered(id: String, terms: String, tries: u32) {
+    set_timeout(
+        move || {
+            if !js_reveal(&id, &terms) && tries < 40 {
+                reveal_when_rendered(id, terms, tries + 1);
+            }
+        },
+        std::time::Duration::from_millis(50),
+    );
+}
+
 fn tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1e6)
@@ -949,9 +991,11 @@ fn ToolCard(
     let plan = (kind == "plan").then(|| plan_items(&input));
     let child = (kind == "task").then(use_context::<ChildLinks>).flatten();
     let child_call = call_id.clone();
+    // Where a search hit in this call's output scrolls to.
+    let dom_id = format!("call-{call_id}");
     let started_open = plan.is_some();
     view! {
-        <div class="rounded-md border border-zinc-200 text-sm dark:border-zinc-800">
+        <div id=dom_id class="rounded-md border border-zinc-200 text-sm dark:border-zinc-800">
         <details class="group" open=started_open>
             <summary class="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5">
                 {move || {

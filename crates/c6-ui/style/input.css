@@ -19,3 +19,17 @@
   .md table { @apply border-collapse text-xs; }
   .md th, .md td { @apply border border-zinc-300 px-2 py-1 dark:border-zinc-700; }
 }
+
+/* Search: terms in a revealed hit, and a flash on the hit's block. */
+::highlight(c6-search) {
+  background-color: rgb(253 224 71 / 0.75);
+  color: inherit;
+}
+@keyframes c6-flash {
+  from { box-shadow: 0 0 0 3px rgb(251 191 36 / 0.9); }
+  to { box-shadow: 0 0 0 3px rgb(251 191 36 / 0); }
+}
+.c6-flash {
+  border-radius: 0.5rem;
+  animation: c6-flash 2.5s ease-out;
+}

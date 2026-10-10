@@ -416,3 +416,60 @@ pub struct AuthSession {
     /// The session making this request.
     pub current: bool,
 }
+
+// --- Search -------------------------------------------------------------------
+
+/// `GET /api/v1/search`
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SearchQuery {
+    /// Words and "quoted phrases" (all must match, as substrings of 3+
+    /// characters); `-word` excludes.
+    pub q: String,
+    /// Comma-separated entry kinds: user, assistant, thinking, tool_call,
+    /// tool_result, error, summary. Empty: all.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub worker: Option<Uuid>,
+    /// Sessions to return (default 30).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchResponse {
+    /// Sessions, best match first.
+    pub results: Vec<SearchResult>,
+    /// The terms that were searched for, for highlighting.
+    pub terms: Vec<String>,
+    /// More matches exist than were read; narrow the search.
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub session: Session,
+    pub worker_name: String,
+    /// The best few matches in the session.
+    pub hits: Vec<SearchHit>,
+    /// Matches in the session (among those read).
+    pub total_hits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// The event, for a deep link: `/sessions/{id}#e{seq}`.
+    pub seq: u64,
+    /// The block within an assistant message.
+    pub part: u32,
+    pub kind: String,
+    pub ts: UnixMs,
+    pub snippet: Vec<SnippetPart>,
+}
+
+/// A piece of a snippet; `hit` pieces match the query.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnippetPart {
+    pub text: String,
+    pub hit: bool,
+}

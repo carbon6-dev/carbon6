@@ -6,6 +6,7 @@ mod files;
 mod fleet;
 mod markdown;
 mod notify;
+mod search;
 mod session;
 mod sessions;
 mod settings;
@@ -59,6 +60,7 @@ fn Main() -> impl IntoView {
                             <NavLink href="/settings" label="Settings" />
                         </nav>
                         <div class="flex items-center gap-3">
+                            <search::SearchBox />
                             <notify::NotifyToggle />
                             <ConnBadge connected=live.connected />
                         </div>
@@ -70,6 +72,7 @@ fn Main() -> impl IntoView {
                     <Route path=path!("/workers") view=fleet::FleetPage />
                     <Route path=path!("/workers/:id") view=fleet::WorkerPage />
                     <Route path=path!("/settings") view=settings::SettingsPage />
+                    <Route path=path!("/search") view=search::SearchPage />
                     <Route path=path!("/login/:token") view=auth::LinkSignIn />
                 </Routes>
             </div>
