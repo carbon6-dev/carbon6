@@ -490,3 +490,23 @@ pub struct SnippetPart {
     pub text: String,
     pub hit: bool,
 }
+
+/// `GET /api/v1/sessions/{id}/matches?q=`: find in a session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionMatches {
+    /// In transcript order, side chats included.
+    pub matches: Vec<SessionMatch>,
+    pub terms: Vec<String>,
+    #[serde(default)]
+    pub ignored: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionMatch {
+    /// The transcript element showing it (see `SearchHit::anchor`).
+    pub anchor: String,
+    /// Side chats to expand first, outermost first.
+    pub open: Vec<String>,
+    pub kind: String,
+}

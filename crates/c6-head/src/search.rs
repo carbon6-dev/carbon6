@@ -271,6 +271,77 @@ async fn open_in(store: &Store, row: &crate::store::SessionRow) -> anyhow::Resul
     Ok(Some(api::OpenIn { session_id: cur.id, title: cur.title, side_chats: chain }))
 }
 
+/// Matches read for one session (find in session).
+const SESSION_MATCHES: usize = 1000;
+
+/// Every match of `q` in a session and its side chats, in the order the
+/// transcript shows them (a side chat right after the event it branches
+/// from), for stepping through them.
+pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow::Result<api::SessionMatches> {
+    let (expr, terms, ignored) = fts_query(q)?;
+    // The session and its side chats, with each one's place in the page:
+    // its parent's key, then (branch event, 1 = after it, creation time).
+    let rows = sqlx::query(
+        "WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL \
+         SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id WHERE s.fork_seq IS NOT NULL) \
+         SELECT s.id, s.parent_id, s.fork_seq, s.created_at FROM sessions s JOIN tree ON s.id = tree.id",
+    )
+    .bind(session_id)
+    .fetch_all(&store.pool)
+    .await?;
+    if rows.is_empty() {
+        return Err(crate::not_found("no such session"));
+    }
+    let parents: HashMap<String, (Option<String>, i64, i64)> = rows
+        .iter()
+        .map(|r| (r.get("id"), (r.get("parent_id"), r.get::<Option<i64>, _>("fork_seq").unwrap_or(0), r.get("created_at"))))
+        .collect();
+    // Order key and side chats to open, per session in the tree.
+    fn place(id: &str, root: &str, parents: &HashMap<String, (Option<String>, i64, i64)>) -> (Vec<i64>, Vec<String>) {
+        if id == root {
+            return (Vec::new(), Vec::new());
+        }
+        let (parent, fork, created) = &parents[id];
+        let (mut key, mut open) = place(parent.as_deref().unwrap_or(root), root, parents);
+        key.extend([*fork, 1, *created]);
+        open.push(id.to_owned());
+        (key, open)
+    }
+    let ids: Vec<&String> = parents.keys().collect();
+    let sql = format!(
+        "SELECT search.session_id AS sid, search.seq AS seq, search.part AS part, search.kind AS kind, e.data AS data \
+         FROM search JOIN events e ON e.session_id = search.session_id AND e.seq = search.seq \
+         WHERE search MATCH ? AND search.session_id IN ({}) LIMIT ?",
+        vec!["?"; ids.len()].join(", ")
+    );
+    // Safe: only `?` placeholders are added; every value is bound.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(&expr);
+    for id in &ids {
+        query = query.bind(*id);
+    }
+    let hits = query.bind(SESSION_MATCHES as i64 + 1).fetch_all(&store.pool).await?;
+    let truncated = hits.len() > SESSION_MATCHES;
+    let mut matches: Vec<(Vec<i64>, api::SessionMatch)> = hits
+        .iter()
+        .take(SESSION_MATCHES)
+        .map(|r| {
+            let sid: String = r.get("sid");
+            let seq = r.get::<i64, _>("seq");
+            let part = r.get::<i64, _>("part");
+            let (mut key, open) = place(&sid, session_id, &parents);
+            key.extend([seq, 0, part]);
+            let m = api::SessionMatch { anchor: anchor(&sid, seq as u64, &r.get::<Vec<u8>, _>("data")), open, kind: r.get("kind") };
+            (key, m)
+        })
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    // Several entries of one block (or a call and its output) reveal the
+    // same element: step through each element once.
+    let mut seen = std::collections::HashSet::new();
+    let matches = matches.into_iter().map(|(_, m)| m).filter(|m| seen.insert(m.anchor.clone())).collect();
+    Ok(api::SessionMatches { matches, terms, ignored, truncated })
+}
+
 /// Searches; sessions ordered by their best match.
 pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api::SearchResponse> {
     let (expr, terms, ignored) = fts_query(&req.q)?;

@@ -250,7 +250,11 @@ fn SessionView(id: String) -> impl IntoView {
     let stick = RwSignal::new(hash.is_empty());
     let query = leptos_router::hooks::use_query_map().get_untracked();
     let open: Vec<String> = query.get("open").map(|o| o.split(',').map(str::to_owned).collect()).unwrap_or_default();
-    provide_context(ForceOpen(StoredValue::new(open)));
+    let force_open = ForceOpen(RwSignal::new(open));
+    provide_context(force_open);
+    // Find in session: open when arriving from search (or via Find).
+    let find_open = RwSignal::new(query.get("q").is_some_and(|q| !q.trim().is_empty()));
+    let find_q = query.get("q").unwrap_or_default();
     if !hash.is_empty() {
         let terms = serde_json::to_string(&crate::search::terms(&query.get("q").unwrap_or_default())).unwrap_or_else(|_| "[]".into());
         match hash.strip_prefix('e').and_then(|n| n.parse::<u64>().ok()) {
@@ -328,6 +332,7 @@ fn SessionView(id: String) -> impl IntoView {
 
     view! {
         <main class="mx-auto max-w-4xl px-4 pb-48 pt-4">
+            {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open /> })}
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -357,6 +362,10 @@ fn SessionView(id: String) -> impl IntoView {
                                     <crate::fleet::TabButton tab label="Changes" value="changes" />
                                     <crate::fleet::TabButton tab label="Files" value="files" />
                                     <crate::fleet::TabButton tab label="Terminal" value="terminal" />
+                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
+                                        tab.set("transcript");
+                                        find_open.set(true);
+                                    }>"Find"</button>
                                     {move || view! { <StatusPill status=status.get() /> }}
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| {
                                         let navigate = navigate.clone();
@@ -516,13 +525,23 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
 /// recursion (side chats contain transcripts that contain side chats).
 /// Side chats a deep link expands (from `?open=`).
 #[derive(Clone, Copy)]
-struct ForceOpen(StoredValue<Vec<String>>);
+struct ForceOpen(RwSignal<Vec<String>>);
 
 fn side_chat(s: Session, open_now: bool) -> AnyView {
     let key = format!("c6.side.{}", s.id);
     // Opened for a deep link: open now, without changing the saved state.
-    let forced = use_context::<ForceOpen>().is_some_and(|f| f.0.with_value(|ids| ids.contains(&s.id)));
+    let force = use_context::<ForceOpen>();
+    let forced = force.is_some_and(|f| f.0.with_untracked(|ids| ids.contains(&s.id)));
     let open = RwSignal::new(open_now || forced || storage_get(&key).is_some_and(|v| v == "1"));
+    // Also when stepping through matches later.
+    if let Some(f) = force {
+        let id = s.id.clone();
+        Effect::new(move || {
+            if f.0.with(|ids| ids.contains(&id)) {
+                open.set(true);
+            }
+        });
+    }
     if open_now {
         storage_set(&key, "1");
     }
@@ -739,6 +758,112 @@ fn model_label(model: &str, effort: &str) -> String {
 extern "C" {
     #[wasm_bindgen(js_namespace = c6Search, js_name = reveal)]
     fn js_reveal(id: &str, terms_json: &str) -> bool;
+
+    #[wasm_bindgen(js_namespace = c6Search, js_name = clear)]
+    fn js_clear_highlights();
+}
+
+/// Find in session: steps through the matches of a query in this session
+/// and its side chats, expanding side chats and blocks on the way.
+#[component]
+fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: ForceOpen) -> impl IntoView {
+    let text = RwSignal::new(initial.clone());
+    let applied = RwSignal::new(initial);
+    let current = RwSignal::new(None::<usize>);
+    let error = RwSignal::new(None::<String>);
+    let session = StoredValue::new(session);
+    let matches = LocalResource::new(move || {
+        let q = applied.get();
+        async move { if q.trim().is_empty() { Ok(None) } else { api::session_matches(session.get_value(), q).await.map(Some) } }
+    });
+    let found = Memo::new(move |_| matches.get().and_then(|r| r.ok()).flatten());
+    let go = move |i: usize| {
+        let Some(m) = found.get_untracked() else { return };
+        let Some(hit) = m.matches.get(i).cloned() else { return };
+        current.set(Some(i));
+        force_open.0.update(|ids| ids.extend(hit.open.iter().filter(|o| !ids.contains(o)).cloned().collect::<Vec<_>>()));
+        reveal_when_rendered(hit.anchor, serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()), 0);
+    };
+    let step = move |delta: isize| {
+        let n = found.with_untracked(|m| m.as_ref().map_or(0, |m| m.matches.len()));
+        if n == 0 {
+            return;
+        }
+        let next = match current.get_untracked() {
+            Some(i) => (i as isize + delta).rem_euclid(n as isize) as usize,
+            None if delta < 0 => n - 1,
+            None => 0,
+        };
+        go(next);
+    };
+    // When results arrive: start at the deep-linked match if there is one
+    // (the page already revealed it), else at the first.
+    Effect::new(move || {
+        let Some(r) = matches.get() else { return };
+        match r {
+            Err(e) => error.set(Some(e)),
+            Ok(None) => current.set(None),
+            Ok(Some(m)) => {
+                error.set(None);
+                let hash = window().location().hash().unwrap_or_default();
+                match m.matches.iter().position(|x| format!("#{}", x.anchor) == hash) {
+                    Some(i) if current.get_untracked().is_none() => current.set(Some(i)),
+                    _ if !m.matches.is_empty() => go(0),
+                    _ => current.set(None),
+                }
+            }
+        }
+    });
+    let close = move || {
+        js_clear_highlights();
+        open.set(false);
+    };
+    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key().eq_ignore_ascii_case("g") && (ev.meta_key() || ev.ctrl_key()) {
+            ev.prevent_default();
+            step(if ev.shift_key() { -1 } else { 1 });
+        }
+    });
+    let input = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move || {
+        if let Some(el) = input.get()
+            && applied.get_untracked().is_empty()
+        {
+            let _ = el.focus();
+        }
+    });
+    view! {
+        <div class="fixed right-4 top-14 z-30 flex items-center gap-1 rounded-lg border border-zinc-200 bg-white/95 p-1.5 text-sm shadow-md backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/95">
+            <input
+                node_ref=input
+                type="search"
+                class="w-48 rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                placeholder="Find in this session"
+                prop:value=move || text.get()
+                on:input=move |ev| text.set(event_target_value(&ev))
+                on:keydown=move |ev| match ev.key().as_str() {
+                    "Enter" if text.get_untracked() != applied.get_untracked() => {
+                        current.set(None);
+                        applied.set(text.get_untracked());
+                    }
+                    "Enter" => step(if ev.shift_key() { -1 } else { 1 }),
+                    "Escape" => close(),
+                    _ => {}
+                }
+            />
+            <span class="min-w-16 px-1 text-center text-xs tabular-nums text-zinc-500" title=move || error.get().unwrap_or_default()>
+                {move || match (error.get(), found.get()) {
+                    (Some(_), _) => "—".to_owned(),
+                    (None, Some(m)) if m.matches.is_empty() => "no matches".to_owned(),
+                    (None, Some(m)) => format!("{} of {}{}", current.get().map_or(0, |i| i + 1), m.matches.len(), if m.truncated { "+" } else { "" }),
+                    (None, None) => String::new(),
+                }}
+            </span>
+            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Previous match (Shift+Enter, ⇧⌘G)" on:click=move |_| step(-1)>"↑"</button>
+            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Next match (Enter, ⌘G)" on:click=move |_| step(1)>"↓"</button>
+            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| close()>"✕"</button>
+        </div>
+    }
 }
 
 /// Reveals a search hit once its element exists (events render in batches).

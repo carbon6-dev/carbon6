@@ -349,3 +349,7 @@ pub async fn search(q: String, kind: String, worker: String) -> Result<c6_api::S
     }
     json(Request::get("/api/v1/search").query(params).send().await).await
 }
+
+pub async fn session_matches(id: String, q: String) -> Result<c6_api::SessionMatches, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/matches")).query([("q", q)]).send().await).await
+}

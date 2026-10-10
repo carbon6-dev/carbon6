@@ -2,6 +2,9 @@
 // it, and highlight the search terms in it with the CSS Custom Highlight API
 // (no DOM changes, so Leptos's view of the DOM stays intact).
 window.c6Search = {
+  clear() {
+    if (window.CSS && CSS.highlights) CSS.highlights.delete("c6-search");
+  },
   reveal(id, termsJson) {
     const el = document.getElementById(id);
     if (!el) return false;

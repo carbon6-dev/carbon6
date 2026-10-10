@@ -83,7 +83,7 @@ c6w run
 
 ### Search
 
-The search box in the header (⌘K) searches every message, tool call, tool output, thinking block and error in all sessions, including side chats and subagents. Words and `"quoted phrases"` must all match, as substrings (3+ characters each, case-insensitive); `-word` excludes. Results are grouped by session; each match links to its place in the transcript, opened and highlighted. The index (SQLite FTS5) is kept in the head's database, updated as events arrive, and rebuilt automatically when its format changes.
+The search box in the header (⌘K) searches every message, tool call, tool output, thinking block and error in all sessions, including side chats and subagents. Words and `"quoted phrases"` must all match, as substrings (3+ characters each, case-insensitive); `-word` excludes. Results are grouped by session; each match links to its place in the transcript, opened and highlighted. In a session, the find bar (it opens from a search result, or with **Find**) steps through every match in the session and its side chats: Enter / ⌘G for the next, Shift+Enter / ⇧⌘G for the previous, Esc to close. The index (SQLite FTS5) is kept in the head's database, updated as events arrive, and rebuilt automatically when its format changes.
 
 ## Local development
 

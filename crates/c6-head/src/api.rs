@@ -53,6 +53,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/workers/{id}/terminals/{tid}/attach", get(attach_terminal))
         .route("/api/v1/live", get(live))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/sessions/{id}/matches", get(session_matches))
         .merge(crate::auth::routes())
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
@@ -439,6 +440,19 @@ async fn ui_ca_profile(State(st): State<Arc<HeadState>>) -> Response {
             .into_response(),
         None => (StatusCode::NOT_FOUND, "this head does not issue its own HTTPS certificate").into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct FindQuery {
+    q: String,
+}
+
+async fn session_matches(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Query(f): Query<FindQuery>,
+) -> ApiResult<Json<api::SessionMatches>> {
+    Ok(Json(crate::search::session_matches(&st.store, &id, &f.q).await?))
 }
 
 async fn search(State(st): State<Arc<HeadState>>, Query(q): Query<api::SearchQuery>) -> ApiResult<Json<api::SearchResponse>> {

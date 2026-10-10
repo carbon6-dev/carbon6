@@ -136,6 +136,23 @@ async fn search_finds_events_and_survives_reindex() {
     assert!(r["results"][0]["hits"][0]["anchor"].as_str().unwrap().starts_with("call-"), "{r}");
     assert!(r["results"][0]["open_in"].is_null());
 
+    // Find in session: matches in transcript order, side chats included.
+    let find = |q: &str| {
+        let (http, url) = (http.clone(), format!("{api}/sessions/{}/matches", s.id));
+        let q = q.to_owned();
+        async move { http.get(url).query(&[("q", q)]).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let m = find("zebra").await;
+    let anchors: Vec<&str> = m["matches"].as_array().unwrap().iter().map(|m| m["anchor"].as_str().unwrap()).collect();
+    assert_eq!(anchors.len(), 2, "{m}");
+    assert!(anchors[0].starts_with(&format!("{}-e", s.id)) && anchors[1].starts_with("call-"), "the call, then its output: {anchors:?}");
+    let m = find("capybara").await;
+    assert_eq!(m["matches"].as_array().unwrap().len(), 2, "the question and the reply in the side chat: {m}");
+    assert_eq!(m["matches"][0]["open"], json!([side.id]));
+    assert_eq!(m["matches"][0]["kind"], "user");
+    let m = find("striped capybara").await;
+    assert!(m["matches"].as_array().unwrap().is_empty());
+
     // A format change re-indexes on start, without duplicates.
     stop.cancel();
     head.state.store.set_setting("search.version", "0").await.unwrap();
