@@ -173,6 +173,21 @@ async fn side_chats_branch_continue_nest_and_restore() {
     env.idle(&side.id, 4).await;
     assert_eq!(mock.requests().last().unwrap()["model"], "other-model");
 
+    // An effort-only switch keeps the model.
+    mock.push(Reply::Text("thought harder".into()));
+    let _: Value = env
+        .post(
+            &format!("/sessions/{}/messages", side.id),
+            json!({"text": "think harder", "connection_id": conn.id, "model": "other-model", "effort": "high"}),
+        )
+        .await;
+    let evs = env.idle(&side.id, 5).await;
+    // (Chat Completions sends effort only to OpenAI itself, so check the log.)
+    assert_eq!(mock.requests().last().unwrap()["model"], "other-model");
+    assert!(evs.iter().any(|e| matches!(&e.kind, EventKind::ModelSwitched { effort, .. } if effort == "high")));
+    let d: SessionDetail = env.get(&format!("/sessions/{}", side.id)).await;
+    assert_eq!(d.session.effort.as_deref(), Some("high"));
+
     // Side chats are children, not top-level sessions.
     let children: Vec<Session> = env.get(&format!("/sessions/{}/children", main.id)).await;
     assert_eq!(children.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), [side.id.as_str()]);
@@ -190,7 +205,7 @@ async fn side_chats_branch_continue_nest_and_restore() {
     let (_worker, stop) = run_worker(state.path()).await;
     mock.push(Reply::Text("after restore".into()));
     let _: Value = env.post(&format!("/sessions/{}/messages", side.id), json!({"text": "still there?"})).await;
-    env.idle(&side.id, 5).await;
+    env.idle(&side.id, 6).await;
     let msgs = last_request(&mock);
     for s in ["first question", "main answer one", "why?", "side answer two", "switched answer", "still there?"] {
         assert!(msgs.contains(s), "{s} missing after restore: {msgs}");

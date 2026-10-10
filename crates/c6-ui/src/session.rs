@@ -263,6 +263,10 @@ fn SessionView(id: String) -> impl IntoView {
 
     let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
     let choice = ModelChoice::follow(events, Default::default());
+    let model_label = Memo::new(move |_| {
+        let (_, m, e) = choice.current.get();
+        if e.is_empty() { m } else { format!("{m} · {e}") }
+    });
     let id_stored = StoredValue::new(id.clone());
     let navigate = use_navigate();
     let tab = RwSignal::new("transcript");
@@ -311,7 +315,7 @@ fn SessionView(id: String) -> impl IntoView {
                                         {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
                                             <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
                                         })}
-                                        <span>{move || { let m = choice.current.get().1; if m.is_empty() { s.model.clone() } else { m } }}{s.effort.clone().map(|e| format!(" · {e}"))}</span>
+                                        <span>{move || { let m = model_label.get(); if m.is_empty() { s.model.clone() } else { m } }}</span>
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-2">
@@ -414,7 +418,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
     let asking = RwSignal::new(None::<u64>);
     // A side chat just started here opens expanded.
     let opened = RwSignal::new(None::<String>);
-    let defaults = StoredValue::new((session.connection_id.clone(), session.model.clone()));
+    let defaults = StoredValue::new((session.connection_id.clone(), session.model.clone(), session.effort.clone().unwrap_or_default()));
     let on_done = Callback::new(move |s: Option<Session>| {
         asking.set(None);
         if let Some(s) = s {
@@ -512,8 +516,12 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     let running = Signal::derive(move || feed.running());
     let error = RwSignal::new(None::<String>);
     let id = session.id.clone();
-    let choice = ModelChoice::follow(feed.events, (session.connection_id.clone(), session.model.clone()));
-    Effect::new(move || model_label.set(choice.current.get().1));
+    let start = (session.connection_id.clone(), session.model.clone(), session.effort.clone().unwrap_or_default());
+    let choice = ModelChoice::follow(feed.events, start);
+    Effect::new(move || {
+        let (_, m, e) = choice.current.get();
+        model_label.set(if e.is_empty() { m } else { format!("{m} · {e}") });
+    });
     view! {
         <div class="space-y-3 pb-2 pt-1">
             <Transcript session feed running />
@@ -528,39 +536,49 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
 struct ModelChoice {
     connection: RwSignal<String>,
     model: RwSignal<String>,
-    current: Memo<(String, String)>,
+    /// Empty for the model's default.
+    effort: RwSignal<String>,
+    /// (connection, model, effort) the session runs on now.
+    current: Memo<(String, String, String)>,
 }
 
 impl ModelChoice {
     /// A picker that follows the session's model: its last switch, else the
     /// one it started with (`start` until the log has loaded). It resets
     /// to the current model whenever that changes.
-    fn follow(events: RwSignal<Vec<Event>>, start: (String, String)) -> Self {
+    fn follow(events: RwSignal<Vec<Event>>, start: (String, String, String)) -> Self {
         let current = Memo::new(move |_| {
             events.with(|evs| {
                 evs.iter()
                     .rev()
                     .find_map(|e| match &e.kind {
-                        EventKind::ModelSwitched { connection_id, model, .. } | EventKind::Started { connection_id, model, .. } => {
-                            Some((connection_id.clone(), model.clone()))
+                        EventKind::ModelSwitched { connection_id, model, effort, .. }
+                        | EventKind::Started { connection_id, model, effort, .. } => {
+                            Some((connection_id.clone(), model.clone(), effort.clone()))
                         }
                         _ => None,
                     })
                     .unwrap_or_else(|| start.clone())
             })
         });
-        let choice = ModelChoice { connection: RwSignal::new(String::new()), model: RwSignal::new(String::new()), current };
+        let choice = ModelChoice {
+            connection: RwSignal::new(String::new()),
+            model: RwSignal::new(String::new()),
+            effort: RwSignal::new(String::new()),
+            current,
+        };
         Effect::new(move || {
-            let (c, m) = current.get();
+            let (c, m, e) = current.get();
             choice.connection.set(c);
             choice.model.set(m);
+            choice.effort.set(e);
         });
         choice
     }
 
-    /// The (connection, model) to switch to, if the choice differs.
-    fn switch(&self) -> Option<(String, String)> {
-        let chosen = (self.connection.get_untracked(), self.model.get_untracked().trim().to_owned());
+    /// The (connection, model, effort) to switch to, if the choice differs.
+    fn switch(&self) -> Option<(String, String, String)> {
+        let chosen = (self.connection.get_untracked(), self.model.get_untracked().trim().to_owned(), self.effort.get_untracked());
         (!chosen.1.is_empty() && chosen != self.current.get_untracked()).then_some(chosen)
     }
 }
@@ -568,7 +586,7 @@ impl ModelChoice {
 /// Connection select plus a model field that suggests the connection's
 /// models and also takes free text.
 #[component]
-fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>) -> impl IntoView {
+fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: RwSignal<String>) -> impl IntoView {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let list_id = format!("c6-models-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let connections = LocalResource::new(api::connections);
@@ -590,16 +608,25 @@ fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>) -> impl In
         <datalist id=list_id>
             {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
         </datalist>
+        <select class=SMALL_INPUT title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
+            {EFFORTS.iter().map(|&(value, label)| view! {
+                <option value=value selected=move || effort.get() == value>{label}</option>
+            }).collect_view()}
+        </select>
     }
 }
+
+/// Reasoning efforts; "" is the model's default.
+const EFFORTS: [(&str, &str); 6] =
+    [("", "default effort"), ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh"), ("max", "max")];
 
 const SMALL_INPUT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900";
 
 /// The question box that starts a side chat after `anchor_seq`.
 #[component]
-fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_done: Callback<Option<Session>>) -> impl IntoView {
+fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, String), on_done: Callback<Option<Session>>) -> impl IntoView {
     let text = RwSignal::new(String::new());
-    let (connection, model) = (RwSignal::new(defaults.0), RwSignal::new(defaults.1));
+    let (connection, model, effort) = (RwSignal::new(defaults.0), RwSignal::new(defaults.1), RwSignal::new(defaults.2));
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let parent = StoredValue::new(parent);
@@ -613,7 +640,7 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_d
             anchor_seq,
             connection_id: connection.get_untracked(),
             model: model.get_untracked(),
-            effort: None,
+            effort: Some(effort.get_untracked()).filter(|e| !e.is_empty()),
             prompt,
         };
         spawn_local(async move {
@@ -647,7 +674,7 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_d
                 }
             ></textarea>
             <div class="flex flex-wrap items-center gap-2">
-                <ModelPicker connection model />
+                <ModelPicker connection model effort />
                 <span class="flex-1"></span>
                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| on_done.run(None)>"Cancel"</button>
                 <button class=format!("{BUTTON} text-xs") prop:disabled=move || busy.get() on:click=move |_| send()>"Ask"</button>
@@ -1045,9 +1072,9 @@ fn Composer(
                 {model.map(|m| view! {
                     <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                         <span>"Model"</span>
-                        <ModelPicker connection=m.connection model=m.model />
+                        <ModelPicker connection=m.connection model=m.model effort=m.effort />
                         {move || {
-                            let _ = (m.connection.get(), m.model.get());
+                            let _ = (m.connection.get(), m.model.get(), m.effort.get());
                             m.switch().map(|_| view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> })
                         }}
                     </div>

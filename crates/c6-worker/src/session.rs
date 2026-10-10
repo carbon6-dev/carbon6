@@ -216,17 +216,30 @@ impl SessionManager {
             next_seq += 1;
         }
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
-        // The model of the last switch, and the conversation made portable up
-        // to it (another model wrote that part).
+        // The session runs on the model of its last switch. Reasoning from
+        // before the current model's run (another model wrote it) is dropped.
         let mut spec = spec;
         let all = [seed_events(&spec), events.clone()].concat();
-        let last_switch = all.iter().rposition(|e| matches!(e.kind, Some(session_event::Kind::ModelSwitched(_))));
-        let history = match last_switch {
+        let model_of = |e: &SessionEvent| match &e.kind {
+            Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
+            Some(session_event::Kind::Started(s)) => s.model.clone(),
+            _ => None,
+        };
+        let key = |m: &ModelSpec| (m.connection_id.clone(), m.model.clone());
+        if let Some(m) = events.iter().rev().find_map(|e| match &e.kind {
+            Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
+            _ => None,
+        }) {
+            spec.model = Some(m);
+        }
+        let current = spec.model.as_ref().map(key);
+        // Start of the current model's run: just after the last event naming
+        // another model, at the next event naming this one.
+        let other = all.iter().rposition(|e| model_of(e).is_some_and(|m| Some(key(&m)) != current));
+        let history = match other {
             Some(i) => {
-                if let Some(session_event::Kind::ModelSwitched(m)) = &all[i].kind {
-                    spec.model = m.model.clone();
-                }
-                history_from_events(&[c6_agent::portable_events(&all[..i]), all[i..].to_vec()].concat())
+                let run = all[i + 1..].iter().position(|e| model_of(e).is_some()).map_or(all.len(), |p| i + 1 + p);
+                history_from_events(&[c6_agent::portable_events(&all[..run]), all[run..].to_vec()].concat())
             }
             None => history_from_events(&all),
         };
@@ -395,8 +408,10 @@ impl Actor {
         let context_window = model_info(provider, &model.model).context_window;
         self.writer.append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(model.clone()), context_window })).await?;
         info!(session = %self.writer.session_id, model = %model.model, "model switched");
+        // An effort change keeps the model, and with it the reasoning.
+        let same_model = (&current.connection_id, &current.model) == (&model.connection_id, &model.model);
         self.spec.model = Some(model);
-        if let Some(conv) = &mut self.conv {
+        if !same_model && let Some(conv) = &mut self.conv {
             conv.history = c6_agent::portable_messages(std::mem::take(&mut conv.history));
         }
         Ok(())

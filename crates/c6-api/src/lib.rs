@@ -219,6 +219,9 @@ pub enum EventKind {
         repo_root: String,
         #[serde(default)]
         context_window: u64,
+        /// Reasoning effort; empty for the model's default.
+        #[serde(default)]
+        effort: String,
     },
     User {
         command_id: String,
