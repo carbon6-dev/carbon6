@@ -166,7 +166,9 @@ async fn side_chats_branch_continue_nest_and_restore() {
     assert_eq!(req["model"], "other-model");
     assert!(req["messages"].to_string().contains("side answer two"), "history carries over");
     let switched = evs.iter().position(|e| matches!(&e.kind, EventKind::ModelSwitched { model, .. } if model == "other-model")).unwrap();
-    assert!(matches!(&evs[switched + 1].kind, EventKind::User { text, .. } if text == "now on another model"), "{:?}", evs[switched + 1]);
+    // The switch comes before the message (a checkpoint may sit between).
+    let next = evs[switched + 1..].iter().find(|e| !matches!(e.kind, EventKind::Checkpoint { .. })).unwrap();
+    assert!(matches!(&next.kind, EventKind::User { text, .. } if text == "now on another model"), "{next:?}");
     let d: SessionDetail = env.get(&format!("/sessions/{}", side.id)).await;
     assert_eq!(d.session.model, "other-model");
     mock.push(Reply::Text("still switched".into()));

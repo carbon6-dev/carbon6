@@ -107,7 +107,10 @@ async fn task_runs_and_survives_head_outage() {
 
     let evs = events(session.id.clone()).await;
     let kinds: Vec<&str> = evs.iter().map(kind).collect();
-    assert_eq!(kinds, ["started", "user", "turn_started", "assistant", "usage", "tool_result", "assistant", "usage", "turn_ended"]);
+    assert_eq!(
+        kinds,
+        ["started", "checkpoint", "user", "turn_started", "assistant", "usage", "tool_result", "assistant", "usage", "turn_ended"]
+    );
     let EventKind::Started { system_prompt, .. } = &evs[0].kind else { panic!() };
     assert!(system_prompt.contains("Always be brief."), "AGENTS.md is in the prompt");
     assert_eq!(mock.requests()[0]["model"], "mock-1");
@@ -204,5 +207,7 @@ fn kind(e: &Event) -> &'static str {
         EventKind::Error { .. } => "error",
         EventKind::Compaction { .. } => "compaction",
         EventKind::ModelSwitched { .. } => "model_switched",
+        EventKind::Checkpoint { .. } => "checkpoint",
+        EventKind::Rewound { .. } => "rewound",
     }
 }
