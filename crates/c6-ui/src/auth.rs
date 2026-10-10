@@ -264,7 +264,8 @@ pub fn SignInSettings() -> impl IntoView {
                         "on an iPhone or iPad, install the "<a class="underline" href="/ca.mobileconfig" rel="external" download="carbon6-ca.mobileconfig">"configuration profile"</a>
                         " and turn it on under General → About → Certificate Trust Settings; on Android, download "
                         <a class="underline" href="/ca.crt" rel="external" download="carbon6-ca.crt">"ca.crt"</a>
-                        " and install it under Settings → Encryption & credentials → Install a certificate → CA certificate; elsewhere, add ca.pem to the system's trusted certificates. "
+                        " and install it under Settings → Encryption & credentials → Install a certificate → CA certificate, then force-stop Chrome; elsewhere, add ca.pem to the system's trusted certificates. "
+                        "Afterwards restart the browser fully: one that was shown the certificate warning keeps saying \"Not secure\" until it restarts. "
                         "It can only vouch for this head's names and private addresses."
                     </p>
                 </div>
