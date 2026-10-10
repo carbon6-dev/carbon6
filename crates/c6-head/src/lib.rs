@@ -104,7 +104,8 @@ impl Head {
 }
 
 /// Binds all listeners, prepares state and starts serving.
-pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
+pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
+    cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;
     std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
 
@@ -224,7 +225,8 @@ pub async fn create_enrollment(
 
 /// Creates an enrollment without a running head (for `c6h enroll-token`).
 /// Safe to run alongside a running head: SQLite WAL allows it.
-pub async fn offline_enrollment(cfg: HeadConfig, name: Option<&str>) -> anyhow::Result<c6_api::Enrollment> {
+pub async fn offline_enrollment(mut cfg: HeadConfig, name: Option<&str>) -> anyhow::Result<c6_api::Enrollment> {
+    cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;
     let worker_addrs: Vec<_> = ips.iter().map(|ip| SocketAddr::new(*ip, cfg.worker_port)).collect();
     let worker_addrs = config::reachable_addrs(&worker_addrs)?;

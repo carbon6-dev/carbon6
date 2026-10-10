@@ -450,7 +450,7 @@ Decisions made while building M1 that refine the sections above:
   - A worker that has lost a session rejects input as "unknown session" (for example after a reinstall, or because the journal trimmed it). The head then queues `Restore{spec, events}`, which carries its authoritative log, followed by a fresh copy of the input. This happens at most once a minute per session.
   - Because of that, workers trim sessions from their journal once they are fully acknowledged, not mid-turn, and idle for 7 days.
   - Messages up to 64 MiB are allowed in both directions.
-- **Wildcard binds.** With `bind = ["0.0.0.0"]` (or `::`, which needs `allow_public_bind`), the head treats every interface address of that family as its own: they go into the server certificate, the advertised worker URL (tailnet first) and the Host allowlist. The dev config binds this way.
+- **Wildcard binds.** With `bind = ["0.0.0.0"]` (or `::`, which needs `allow_public_bind`), the head treats every interface address of that family as its own: they go into the server certificate, the advertised worker URL (tailnet first) and the Host allowlist. The dev config binds this way. The head also asks Tailscale (`tailscale status --json`) for its MagicDNS name at startup and answers to it and its short form, so `http://<machine>.<tailnet>.ts.net:7700` works without `extra_names`.
 - **Live deltas are coalesced (M5).** The worker batches text, thinking and tool-output deltas over 25 ms and merges consecutive deltas from the same stream before sending.
 - **Evals (M5).** `c6-eval` with tasks in `evals/tasks` (see `evals/README.md`).
 - **Side chats.**

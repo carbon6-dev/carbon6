@@ -129,6 +129,28 @@ pub fn reachable_addrs(listen: &[SocketAddr]) -> anyhow::Result<Vec<SocketAddr>>
     Ok(out)
 }
 
+/// This machine's Tailscale MagicDNS name and its short form (e.g.
+/// `darkstar.example.ts.net` and `darkstar`), so the head answers to them
+/// without configuration. Empty when Tailscale is not installed or not up.
+pub async fn tailnet_names() -> Vec<String> {
+    const CLIS: [&str; 2] = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"];
+    for cli in CLIS {
+        let run = tokio::process::Command::new(cli).args(["status", "--json"]).kill_on_drop(true).output();
+        let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(3), run).await else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let Ok(status) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { continue };
+        let Some(full) = status["Self"]["DNSName"].as_str().map(|n| n.trim_end_matches('.')).filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let mut names = vec![full.to_ascii_lowercase()];
+        names.extend(full.split('.').next().filter(|s| *s != full).map(str::to_ascii_lowercase));
+        return names;
+    }
+    Vec::new()
+}
+
 fn private_interface_ips() -> anyhow::Result<Vec<IpAddr>> {
     let mut ips: Vec<IpAddr> =
         if_addrs::get_if_addrs().context("listing network interfaces")?.into_iter().map(|i| i.ip()).filter(is_private).collect();
