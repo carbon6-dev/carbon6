@@ -87,19 +87,25 @@ impl SessionManager {
         let date = time::OffsetDateTime::now_utc().date().to_string();
         let system_prompt = build_system_prompt(&spec.base_prompt, &cwd, &date);
         let model = spec.model.clone().unwrap_or_default();
-        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
-        let profile = model_info(provider, &model.model).tool_profile;
+        let (profile, tools, system_prompt) = if model.connection_kind == "claude_code" {
+            // Claude Code brings its own prompt (incl. CLAUDE.md) and tools.
+            (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
+        } else {
+            let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+            let profile = model_info(provider, &model.model).tool_profile;
+            (profile.as_str().to_owned(), c6_tools::tools_for(profile).iter().map(|t| t.spec().name).collect(), system_prompt)
+        };
         let started = SessionStarted {
             command_id: command_id.to_owned(),
             model: spec.model.clone(),
             cwd: cwd.display().to_string(),
             system_prompt,
-            tools: c6_tools::tools_for(profile).iter().map(|t| t.spec().name).collect(),
-            tool_profile: profile.as_str().into(),
+            tools,
+            tool_profile: profile.clone(),
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
         self.journal.create_session(session_id, &spec, &ev).await.map_err(|e| format!("worker error: {e:#}"))?;
-        info!(session = %session_id, cwd = %cwd.display(), profile = profile.as_str(), "session created");
+        info!(session = %session_id, cwd = %cwd.display(), %profile, "session created");
         self.spawn(session_id, spec, started, Conversation { history: Vec::new(), context_tokens: 0 }, 2, 0);
         Ok(())
     }
@@ -251,7 +257,9 @@ impl Actor {
             system_prompt: self.started.system_prompt.clone(),
             max_output_tokens: (model.max_output_tokens > 0).then_some(model.max_output_tokens),
             cache_key: self.writer.session_id.clone(),
-            effort: Some(model.effort.clone()).filter(|e| !e.is_empty()).or_else(|| info.default_effort.map(str::to_owned)),
+            effort: Some(model.effort.clone())
+                .filter(|e| !e.is_empty())
+                .or_else(|| (model.connection_kind != "claude_code").then_some(info.default_effort).flatten().map(str::to_owned)),
             context_window: info.context_window,
         };
         let mut conv = self.conv.take().expect("no turn is running");
@@ -259,11 +267,27 @@ impl Actor {
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
         writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true }));
 
+        let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
-            if let Err(e) =
+            let result = if claude_code {
+                let inputs = inbox.lock().unwrap().drain();
+                crate::claude_code::run_turn(
+                    turn,
+                    &writer.session_id,
+                    &session_tools.cwd(),
+                    &cfg.model,
+                    cfg.effort.as_deref(),
+                    inputs,
+                    &sink,
+                    &c,
+                )
+                .await
+                .map(drop)
+            } else {
                 run_session_turn(turn, &cfg, &model.connection_id, &link, &tools, &session_tools, &sink, &mut conv, &inbox, &c).await
-            {
+            };
+            if let Err(e) = result {
                 // Only journal writes fail here. The in-memory history may now
                 // differ from the log; a worker restart rebuilds it from the log.
                 error!(session = %writer.session_id, "turn failed: {e:#}");

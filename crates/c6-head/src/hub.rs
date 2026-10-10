@@ -116,7 +116,7 @@ impl WorkerHub for HubSvc {
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 
         tokio::spawn(async move {
-            let guard = st.registry.attach(worker_id, now_ms(), tx.clone());
+            let guard = st.registry.attach(worker_id, now_ms(), tx.clone(), hello.capabilities.clone());
             info!(worker = %worker_id, name = %row.name, version = %hello.version, "worker attached");
             let reason = serve_worker(&st, &guard, &mut inbound, &tx).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();

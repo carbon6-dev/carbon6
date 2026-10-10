@@ -28,6 +28,9 @@ pub struct Worker {
     pub last_seen: Option<UnixMs>,
     pub connected_since: Option<UnixMs>,
     pub rtt_us: Option<u32>,
+    /// Optional features of a connected worker, e.g. `claude_code`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -68,7 +71,8 @@ pub struct Connection {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateConnection {
-    /// `openai_compat` (default), `openai`, or `anthropic`. ChatGPT
+    /// `openai_compat` (default), `openai`, `anthropic`, or `claude_code`
+    /// (runs the worker's own signed-in Claude Code). ChatGPT
     /// connections are created by signing in instead.
     #[serde(default)]
     pub kind: Option<String>,

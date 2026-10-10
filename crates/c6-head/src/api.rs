@@ -88,7 +88,8 @@ pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>
                 enrolled_at: r.enrolled_at,
                 last_seen: live.as_ref().map(|l| l.last_seen).or(r.last_seen),
                 connected_since: live.as_ref().map(|l| l.connected_since),
-                rtt_us: live.and_then(|l| l.rtt_us),
+                rtt_us: live.as_ref().and_then(|l| l.rtt_us),
+                capabilities: live.map(|l| l.capabilities).unwrap_or_default(),
             })
         })
         .collect())
@@ -185,21 +186,23 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
     let kind = req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()).unwrap_or("openai_compat");
     let default_url = match kind {
         "openai_compat" => None,
+        "claude_code" => Some("local"),
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com"),
         "chatgpt" => return Err(ApiErr(StatusCode::BAD_REQUEST, "ChatGPT connections are created with Sign in with ChatGPT".into())),
-        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai or anthropic".into())),
+        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai, anthropic or claude_code".into())),
     };
     let name = req.name.trim();
     let base_url = Some(req.base_url.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).or(default_url).unwrap_or("");
     if name.is_empty() {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "name is required".into()));
     }
-    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+    let base_url = if kind == "claude_code" { "local" } else { base_url };
+    if kind != "claude_code" && !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "base URL must start with http:// or https://".into()));
     }
     let api_key = req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(|k| st.secrets.encrypt(k)).transpose()?;
-    if api_key.is_none() && kind != "openai_compat" {
+    if api_key.is_none() && !matches!(kind, "openai_compat" | "claude_code") {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "an API key is required for this kind of connection".into()));
     }
     let row = crate::store::ConnectionRow {
@@ -287,6 +290,10 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
 /// all model calls for sessions happen on workers.
 async fn connection_models(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<String>>> {
     let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
+    if c.kind == "claude_code" {
+        // Claude Code model aliases; full model ids work too.
+        return Ok(Json(["opus", "sonnet", "haiku", "fable"].map(String::from).to_vec()));
+    }
     let (key, anthropic) = match c.kind.as_str() {
         "chatgpt" => (crate::sessions::chatgpt_tokens(&st, &c.id).await?.access_token, false),
         kind => (c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default(), kind == "anthropic"),

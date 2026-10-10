@@ -50,6 +50,7 @@ fn kind_label(kind: &str) -> &'static str {
         "anthropic" => "Anthropic",
         "openai" => "OpenAI",
         "chatgpt" => "ChatGPT plan",
+        "claude_code" => "Claude Code",
         _ => "OpenAI-compatible",
     }
 }
@@ -75,9 +76,9 @@ fn ConnectionRow(c: Connection, on_change: impl Fn() + Copy + Send + Sync + 'sta
             <div class="min-w-0 flex-1">
                 <div class="font-medium">{c.name.clone()}</div>
                 <div class="truncate font-mono text-xs text-zinc-500">
-                    {kind_label(&c.kind)} " · " {c.base_url.clone()}
+                    {kind_label(&c.kind)} {(c.kind != "claude_code").then(|| format!(" · {}", c.base_url))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
-                    {match (c.kind.as_str(), c.has_api_key) { ("chatgpt", _) => "", (_, true) => " · key set", _ => " · no key" }}
+                    {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
             </div>
             <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=remove>"Delete"</button>
@@ -133,6 +134,7 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
         Signal::derive(move || match kind.get().as_str() {
             "anthropic" => anthropic,
             "openai" => openai,
+            "claude_code" => "",
             _ => compat,
         })
     };
@@ -146,8 +148,15 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                     <option value="anthropic">"Anthropic API (Claude)"</option>
                     <option value="openai">"OpenAI API (Responses)"</option>
                     <option value="openai_compat">"OpenAI-compatible (Chat Completions: Ollama, vLLM, OpenRouter, …)"</option>
+                    <option value="claude_code">"Claude Code (each worker's own signed-in claude CLI)"</option>
                 </select>
             </label>
+            {move || (kind.get() == "claude_code").then(|| view! {
+                <p class="text-sm text-zinc-500">
+                    "Sessions run the official Claude Code CLI on the worker, with its own tools and sign-in (your Claude subscription or API key). Install it on each worker and run "
+                    <code class="font-mono">"claude auth login"</code> " there. No key is stored here."
+                </p>
+            })}
             <div class="grid gap-3 sm:grid-cols-2">
                 {field("Name", name, by_kind("Anthropic", "OpenAI", "Ollama"), "text")}
                 {field("Base URL", base_url, by_kind("https://api.anthropic.com (default)", "https://api.openai.com/v1 (default)", "http://127.0.0.1:11434/v1"), "url")}

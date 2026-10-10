@@ -190,6 +190,14 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                     if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { ev.prevent_default(); submit(); }
                 }
             ></textarea>
+            {move || {
+                let is_cc = conns.with_value(|cs| cs.iter().any(|c| c.id == connection.get() && c.kind == "claude_code"));
+                let w = worker.get();
+                let missing = live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online && !x.capabilities.iter().any(|c| c == "claude_code")));
+                (is_cc && missing).then(|| view! {
+                    <p class="text-sm text-amber-700 dark:text-amber-400">"This worker doesn't have the claude CLI installed (or it isn't on the worker's PATH; set C6_CLAUDE_BIN)."</p>
+                })
+            }}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex justify-end">
                 <button class=BUTTON disabled=move || pending.get() on:click=move |_| submit_click()>"Start session"</button>

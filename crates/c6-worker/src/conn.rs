@@ -102,7 +102,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         hostname: crate::hostname(),
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
-        capabilities: Vec::new(),
+        capabilities: crate::claude_code::find_claude().map(|_| "claude_code".to_owned()).into_iter().collect(),
         sessions: match worker.journal.unacked().await {
             Ok(cursors) => cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq }).collect(),
             Err(e) => return Ended::Retry(e.context("reading journal")),

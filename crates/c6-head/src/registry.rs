@@ -17,6 +17,7 @@ pub struct LiveWorker {
     pub connected_since: i64,
     pub last_seen: i64,
     pub rtt_us: Option<u32>,
+    pub capabilities: Vec<String>,
     cancel: CancellationToken,
     tx: HeadTx,
     /// Wakes the connection task to send newly queued commands. All durable
@@ -65,7 +66,7 @@ impl Registry {
 
     /// Registers a connection. A previous connection for the same worker is
     /// cancelled: the newest one wins.
-    pub fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx) -> ConnGuard<'_> {
+    pub fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx, capabilities: Vec<String>) -> ConnGuard<'_> {
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let cancel = self.shutdown.child_token();
         let deliver = Arc::new(Notify::new());
@@ -74,6 +75,7 @@ impl Registry {
             connected_since: now,
             last_seen: now,
             rtt_us: None,
+            capabilities,
             cancel: cancel.clone(),
             tx,
             deliver: deliver.clone(),
@@ -139,8 +141,8 @@ mod tests {
         let reg = Registry::new(CancellationToken::new());
         let id = WorkerId::new();
         let tx = mpsc::channel(1).0;
-        let first = reg.attach(id, 1, tx.clone());
-        let second = reg.attach(id, 2, tx);
+        let first = reg.attach(id, 1, tx.clone(), vec![]);
+        let second = reg.attach(id, 2, tx, vec![]);
         assert!(first.cancel.is_cancelled());
         drop(first); // must not unregister the newer connection
         assert_eq!(reg.get(id).unwrap().conn_id, second.conn_id);

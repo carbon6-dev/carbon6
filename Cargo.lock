@@ -527,6 +527,7 @@ dependencies = [
  "c6-tools",
  "dirs",
  "gethostname",
+ "nix",
  "pem",
  "prost",
  "rand 0.10.3",
