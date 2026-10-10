@@ -8,11 +8,7 @@ fn started() -> SessionEvent {
 }
 
 fn user(seq: u64, command_id: &str) -> SessionEvent {
-    SessionEvent {
-        seq,
-        ts_ms: 0,
-        kind: Some(session_event::Kind::User(UserMessage { command_id: command_id.into(), text: "hi".into() })),
-    }
+    SessionEvent { seq, ts_ms: 0, kind: Some(session_event::Kind::User(UserMessage { command_id: command_id.into(), text: "hi".into() })) }
 }
 
 #[tokio::test]

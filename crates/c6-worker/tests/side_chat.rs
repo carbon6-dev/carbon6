@@ -151,6 +151,28 @@ async fn side_chats_branch_continue_nest_and_restore() {
     }
     assert!(!msgs.contains("and then?"), "branched before the follow-up: {msgs}");
 
+    // Switch the side chat's model mid-conversation: recorded in the log,
+    // used from that message on, and kept for later messages.
+    mock.push(Reply::Text("switched answer".into()));
+    let _: Value = env
+        .post(
+            &format!("/sessions/{}/messages", side.id),
+            json!({"text": "now on another model", "connection_id": conn.id, "model": "other-model"}),
+        )
+        .await;
+    let evs = env.idle(&side.id, 3).await;
+    let req = mock.requests().last().unwrap().clone();
+    assert_eq!(req["model"], "other-model");
+    assert!(req["messages"].to_string().contains("side answer two"), "history carries over");
+    let switched = evs.iter().position(|e| matches!(&e.kind, EventKind::ModelSwitched { model, .. } if model == "other-model")).unwrap();
+    assert!(matches!(&evs[switched + 1].kind, EventKind::User { text, .. } if text == "now on another model"), "{:?}", evs[switched + 1]);
+    let d: SessionDetail = env.get(&format!("/sessions/{}", side.id)).await;
+    assert_eq!(d.session.model, "other-model");
+    mock.push(Reply::Text("still switched".into()));
+    let _: Value = env.post(&format!("/sessions/{}/messages", side.id), json!({"text": "and next?"})).await;
+    env.idle(&side.id, 4).await;
+    assert_eq!(mock.requests().last().unwrap()["model"], "other-model");
+
     // Side chats are children, not top-level sessions.
     let children: Vec<Session> = env.get(&format!("/sessions/{}/children", main.id)).await;
     assert_eq!(children.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), [side.id.as_str()]);
@@ -168,11 +190,12 @@ async fn side_chats_branch_continue_nest_and_restore() {
     let (_worker, stop) = run_worker(state.path()).await;
     mock.push(Reply::Text("after restore".into()));
     let _: Value = env.post(&format!("/sessions/{}/messages", side.id), json!({"text": "still there?"})).await;
-    env.idle(&side.id, 3).await;
+    env.idle(&side.id, 5).await;
     let msgs = last_request(&mock);
-    for s in ["first question", "main answer one", "why?", "side answer two", "still there?"] {
+    for s in ["first question", "main answer one", "why?", "side answer two", "switched answer", "still there?"] {
         assert!(msgs.contains(s), "{s} missing after restore: {msgs}");
     }
+    assert_eq!(mock.requests().last().unwrap()["model"], "other-model", "the switch survives a restore");
     stop.cancel();
     head.shutdown().await.unwrap();
 }

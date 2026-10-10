@@ -168,6 +168,14 @@ pub struct CompleteChatGptSignIn {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SendMessage {
     pub text: String,
+    /// Switch the session to this connection and model from this message
+    /// on. Both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Input accepted by the head but not yet recorded by the worker.
@@ -251,6 +259,14 @@ pub enum EventKind {
     Compaction {
         summary: String,
         tokens_before: u64,
+    },
+    /// From here on the session runs on this model.
+    ModelSwitched {
+        connection_id: String,
+        model: String,
+        #[serde(default)]
+        effort: String,
+        context_window: u64,
     },
 }
 

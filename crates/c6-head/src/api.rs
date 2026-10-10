@@ -495,7 +495,7 @@ async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<api::SendMessage>,
 ) -> ApiResult<Json<api::QueuedInput>> {
-    Ok(Json(crate::sessions::send_input(&st, &id, &req.text).await?))
+    Ok(Json(crate::sessions::send_input(&st, &id, &req).await?))
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

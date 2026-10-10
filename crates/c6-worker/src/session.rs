@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
 use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
-    CreateSession, EphemeralEvent, ErrorEvent, SessionActivity, SessionCommand, SessionEvent, SessionStarted, TurnEndReason, TurnEnded,
-    TurnStarted, UserMessage, ephemeral_event, session_command, session_event,
+    CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionStarted,
+    TurnEndReason, TurnEnded, TurnStarted, UserMessage, ephemeral_event, session_command, session_event,
 };
 use c6_tools::{SessionTools, Skill, SkillTool, Tool};
 use tokio::sync::mpsc;
@@ -28,7 +28,8 @@ pub struct SessionManager {
 }
 
 enum ActorMsg {
-    Input(PendingInput),
+    /// An input, possibly switching the session's model from it on.
+    Input(PendingInput, Option<ModelSpec>),
     Interrupt,
 }
 
@@ -71,7 +72,7 @@ impl SessionManager {
                     return Ok(());
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                let _ = actor.send(ActorMsg::Input(PendingInput { command_id: cmd.command_id, text: input.text }));
+                let _ = actor.send(ActorMsg::Input(PendingInput { command_id: cmd.command_id, text: input.text }, input.model));
                 Ok(())
             }
             Some(session_command::Kind::Restore(r)) => {
@@ -215,7 +216,20 @@ impl SessionManager {
             next_seq += 1;
         }
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
-        let history = history_from_events(&[seed_events(&spec), events.clone()].concat());
+        // The model of the last switch, and the conversation made portable up
+        // to it (another model wrote that part).
+        let mut spec = spec;
+        let all = [seed_events(&spec), events.clone()].concat();
+        let last_switch = all.iter().rposition(|e| matches!(e.kind, Some(session_event::Kind::ModelSwitched(_))));
+        let history = match last_switch {
+            Some(i) => {
+                if let Some(session_event::Kind::ModelSwitched(m)) = &all[i].kind {
+                    spec.model = m.model.clone();
+                }
+                history_from_events(&[c6_agent::portable_events(&all[..i]), all[i..].to_vec()].concat())
+            }
+            None => history_from_events(&all),
+        };
         // The last request's size since the last compaction, for the next
         // compaction decision.
         let context_tokens = events
@@ -287,21 +301,30 @@ fn seed_events(spec: &CreateSession) -> Vec<SessionEvent> {
 /// Inputs waiting for the next model-request boundary.
 #[derive(Default)]
 struct Inbox {
-    queue: VecDeque<PendingInput>,
+    /// Inputs with the model switch each asks for.
+    queue: VecDeque<(PendingInput, Option<ModelSpec>)>,
     /// Every command id ever queued here, so redeliveries are ignored even
     /// while an input is being recorded.
     seen: HashSet<String>,
 }
 
 impl Inbox {
-    fn push(&mut self, input: PendingInput) {
+    fn push(&mut self, input: PendingInput, model: Option<ModelSpec>) {
         if self.seen.insert(input.command_id.clone()) {
-            self.queue.push_back(input);
+            self.queue.push_back((input, model));
         }
     }
 
+    /// The model switch the next input asks for, which applies before it.
+    fn take_switch(&mut self) -> Option<ModelSpec> {
+        self.queue.front_mut().and_then(|(_, m)| m.take())
+    }
+
+    /// Inputs up to the next model switch: a switch waits for a turn of its
+    /// own rather than joining a running one.
     fn drain(&mut self) -> Vec<PendingInput> {
-        self.queue.drain(..).collect()
+        let n = self.queue.iter().position(|(_, m)| m.is_some()).unwrap_or(self.queue.len());
+        self.queue.drain(..n).map(|(i, _)| i).collect()
     }
 }
 
@@ -324,12 +347,19 @@ impl Actor {
         let mut running: Option<(tokio::task::JoinHandle<Option<Conversation>>, CancellationToken)> = None;
         loop {
             if running.is_none() && !self.inbox.lock().unwrap().queue.is_empty() {
+                let switch = self.inbox.lock().unwrap().take_switch();
+                if let Some(model) = switch
+                    && let Err(e) = self.switch_model(model).await
+                {
+                    error!(session = %self.writer.session_id, "recording a model switch: {e:#}");
+                    return;
+                }
                 running = Some(self.start_turn());
             }
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
-                    Some(ActorMsg::Input(input)) => self.inbox.lock().unwrap().push(input),
+                    Some(ActorMsg::Input(input, model)) => self.inbox.lock().unwrap().push(input, model),
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
                     }
@@ -352,6 +382,24 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Runs the session on `model` from the next turn on. Earlier reasoning
+    /// is dropped from the history: it is bound to the model that wrote it.
+    async fn switch_model(&mut self, model: ModelSpec) -> anyhow::Result<()> {
+        let current = self.spec.model.clone().unwrap_or_default();
+        if (&current.connection_id, &current.model, &current.effort) == (&model.connection_id, &model.model, &model.effort) {
+            return Ok(()); // e.g. redelivered after the switch was recorded
+        }
+        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+        let context_window = model_info(provider, &model.model).context_window;
+        self.writer.append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(model.clone()), context_window })).await?;
+        info!(session = %self.writer.session_id, model = %model.model, "model switched");
+        self.spec.model = Some(model);
+        if let Some(conv) = &mut self.conv {
+            conv.history = c6_agent::portable_messages(std::mem::take(&mut conv.history));
+        }
+        Ok(())
     }
 
     fn start_turn(&mut self) -> (tokio::task::JoinHandle<Option<Conversation>>, CancellationToken) {

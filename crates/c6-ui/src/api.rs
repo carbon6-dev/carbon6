@@ -171,8 +171,10 @@ pub async fn session(id: String) -> Result<SessionDetail, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}")).send().await).await
 }
 
-pub async fn send_message(id: String, text: String) -> Result<QueuedInput, String> {
-    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text }).await
+/// `switch`: (connection, model) to switch the session to from this message.
+pub async fn send_message(id: String, text: String, switch: Option<(String, String)>) -> Result<QueuedInput, String> {
+    let (connection_id, model) = switch.unzip();
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, connection_id, model, effort: None }).await
 }
 
 pub async fn interrupt(id: String) -> Result<(), String> {

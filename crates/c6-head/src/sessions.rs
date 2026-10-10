@@ -240,16 +240,21 @@ fn default_title(prompt: Option<&str>) -> String {
 }
 
 fn input_command(command_id: &str, session_id: &str, text: &str) -> Vec<u8> {
+    switch_command(command_id, session_id, text, None)
+}
+
+/// An input that also switches the session to `model`.
+fn switch_command(command_id: &str, session_id: &str, text: &str, model: Option<ModelSpec>) -> Vec<u8> {
     SessionCommand {
         command_id: command_id.to_owned(),
         session_id: session_id.to_owned(),
-        kind: Some(session_command::Kind::Input(UserInput { text: text.to_owned() })),
+        kind: Some(session_command::Kind::Input(UserInput { text: text.to_owned(), model })),
     }
     .encode_to_vec()
 }
 
-pub async fn send_input(st: &HeadState, session_id: &str, text: &str) -> anyhow::Result<api::QueuedInput> {
-    let text = text.trim();
+pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
+    let text = req.text.trim();
     if text.is_empty() {
         return Err(bad_request("message is empty"));
     }
@@ -260,14 +265,42 @@ pub async fn send_input(st: &HeadState, session_id: &str, text: &str) -> anyhow:
     if session.status == "failed" {
         return Err(bad_request(format!("session failed to start: {}", session.error.unwrap_or_default())));
     }
+    let model = match (&req.connection_id, &req.model) {
+        (Some(c), Some(m)) if !m.trim().is_empty() => Some(model_switch(st, &session, c, m.trim(), req.effort.clone()).await?),
+        (None, None) => None,
+        _ => return Err(bad_request("a model switch needs both a connection and a model")),
+    };
     let worker_id: WorkerId = session.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
-    st.store
-        .enqueue_command(&NewCommand { id: &id, session_id, worker_id, data: input_command(&id, session_id, text), text: Some(text) })
-        .await?;
+    let data = switch_command(&id, session_id, text, model);
+    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(text) }).await?;
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
     Ok(api::QueuedInput { command_id: id, text: text.to_owned(), created_at: now_ms(), rejected: None })
+}
+
+/// The spec for switching `session` to another model. Claude Code runs a
+/// different agent loop, so a session cannot switch into or out of it.
+async fn model_switch(
+    st: &HeadState,
+    session: &SessionRow,
+    connection_id: &str,
+    model: &str,
+    effort: Option<String>,
+) -> anyhow::Result<ModelSpec> {
+    let effort = check_effort(effort)?;
+    let to = st.store.connection(connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    let from = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
+    if (to.kind == "claude_code") != (from == "claude_code") {
+        return Err(bad_request("a session cannot switch between Claude Code and other connections"));
+    }
+    Ok(ModelSpec {
+        connection_id: connection_id.to_owned(),
+        model: model.to_owned(),
+        max_output_tokens: 0,
+        effort: effort.unwrap_or_default(),
+        connection_kind: to.kind,
+    })
 }
 
 /// Interrupts are not queued: they only make sense while the worker is
@@ -383,7 +416,12 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     if session.status == "failed" || session.parent_call_id.is_some() || session.worker_id != worker_id.to_string() {
         return Ok(false);
     }
-    let Some(text) = st.store.pending_input_text(command_id).await? else { return Ok(false) };
+    let Some((text, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
+    // Keep a model switch the input asked for.
+    let model = SessionCommand::decode(data.as_slice()).ok().and_then(|c| match c.kind {
+        Some(session_command::Kind::Input(i)) => i.model,
+        _ => None,
+    });
     let events = st.store.events_after(session_id, 0, i64::MAX).await?;
     if events.is_empty() {
         return Ok(false);
@@ -407,7 +445,13 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         .replace_with_restore(
             command_id,
             &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
-            &NewCommand { id: &input_id, session_id, worker_id, data: input_command(&input_id, session_id, &text), text: Some(&text) },
+            &NewCommand {
+                id: &input_id,
+                session_id,
+                worker_id,
+                data: switch_command(&input_id, session_id, &text, model),
+                text: Some(&text),
+            },
         )
         .await?;
     warn!(session = %session_id, "worker no longer had this session; restoring it from the head's log");

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use c6_proto::{ephemeral_event, session_event};
 
 pub use base_prompt::BASE_PROMPT;
-pub use history::{compacted_context, history_from_events, portable_events, transcript_text};
+pub use history::{compacted_context, history_from_events, portable_events, portable_messages, transcript_text};
 pub use prompt::build_system_prompt;
 pub use turn::{Conversation, TurnConfig, run_turn};
 

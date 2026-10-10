@@ -103,6 +103,7 @@ impl UsageStats {
                     st.current_turn = None;
                 }
                 EventKind::Compaction { .. } => st.context = None,
+                EventKind::ModelSwitched { context_window, .. } => st.context_window = *context_window,
                 EventKind::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, .. } => {
                     st.total.add(&e.kind);
                     let ctx = input_tokens + cache_read_tokens + cache_write_tokens + output_tokens;
@@ -402,9 +403,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         api::children(id.get_value())
     });
     let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
-    let child_of_call = Memo::new(move |_| {
-        child_list.get().into_iter().filter_map(|c| Some((c.parent_call_id?, c.id))).collect::<HashMap<_, _>>()
-    });
+    let child_of_call =
+        Memo::new(move |_| child_list.get().into_iter().filter_map(|c| Some((c.parent_call_id?, c.id))).collect::<HashMap<_, _>>());
     provide_context(ChildLinks(child_of_call));
 
     let can_branch = session.parent_call_id.is_none();
@@ -431,11 +431,11 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                     let seq = e.seq;
                     let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
                     view! {
-                        <div class="group relative">
+                        <div class=if anchorable { "group relative pb-7" } else { "group relative" }>
                             {(!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&e, results, streaming, usage))}
                             {anchorable.then(|| view! {
                                 <button
-                                    class="absolute -top-3 right-0 rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 opacity-0 shadow-sm transition group-hover:opacity-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100"
+                                    class="absolute bottom-0 right-0 rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 opacity-0 shadow-sm transition group-hover:opacity-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100"
                                     title="Ask about this in a side chat"
                                     on:click=move |_| asking.set(Some(seq))
                                 >"↳ Ask"</button>
@@ -509,11 +509,75 @@ fn SideChatBody(session: Session) -> impl IntoView {
     let running = Signal::derive(move || feed.running());
     let error = RwSignal::new(None::<String>);
     let id = session.id.clone();
+    // The model the side chat runs on now: its last switch, or its start.
+    let start = (session.connection_id.clone(), session.model.clone());
+    let current = Memo::new(move |_| {
+        feed.events.with(|evs| {
+            evs.iter()
+                .rev()
+                .find_map(|e| match &e.kind {
+                    EventKind::ModelSwitched { connection_id, model, .. } => Some((connection_id.clone(), model.clone())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| start.clone())
+        })
+    });
+    let choice = ModelChoice { connection: RwSignal::new(String::new()), model: RwSignal::new(String::new()), current };
+    Effect::new(move || {
+        let (c, m) = current.get();
+        choice.connection.set(c);
+        choice.model.set(m);
+    });
     view! {
         <div class="space-y-3 pb-2 pt-1">
             <Transcript session feed running />
-            <Composer id running disabled=Signal::derive(|| false) error inline=true />
+            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice />
         </div>
+    }
+}
+
+/// The model picker of a side chat's reply box: sending with a different
+/// choice than `current` switches the side chat to it.
+#[derive(Clone, Copy)]
+struct ModelChoice {
+    connection: RwSignal<String>,
+    model: RwSignal<String>,
+    current: Memo<(String, String)>,
+}
+
+impl ModelChoice {
+    /// The (connection, model) to switch to, if the choice differs.
+    fn switch(&self) -> Option<(String, String)> {
+        let chosen = (self.connection.get_untracked(), self.model.get_untracked().trim().to_owned());
+        (!chosen.1.is_empty() && chosen != self.current.get_untracked()).then_some(chosen)
+    }
+}
+
+/// Connection select plus a model field that suggests the connection's
+/// models and also takes free text.
+#[component]
+fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>) -> impl IntoView {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let list_id = format!("c6-models-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let connections = LocalResource::new(api::connections);
+    let models = LocalResource::new(move || api::models(connection.get()));
+    view! {
+        <select class=format!("{SMALL_INPUT} max-w-48") on:change=move |ev| {
+            let c = event_target_value(&ev);
+            let default = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c)).and_then(|x| x.default_model);
+            connection.set(c);
+            model.set(default.unwrap_or_default());
+        }>
+            {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|c| {
+                let id = c.id.clone();
+                view! { <option value=c.id.clone() selected=move || connection.get() == id>{c.name.clone()}</option> }
+            }).collect_view()}
+        </select>
+        <input class=format!("{SMALL_INPUT} w-56 font-mono") list=list_id.clone() placeholder="model id"
+            prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
+        <datalist id=list_id>
+            {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
+        </datalist>
     }
 }
 
@@ -524,8 +588,6 @@ const SMALL_INPUT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 
 fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_done: Callback<Option<Session>>) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let (connection, model) = (RwSignal::new(defaults.0), RwSignal::new(defaults.1));
-    let connections = LocalResource::new(api::connections);
-    let models = LocalResource::new(move || api::models(connection.get()));
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let parent = StoredValue::new(parent);
@@ -558,7 +620,6 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_d
             let _ = el.focus();
         }
     });
-    let list_id = format!("c6-side-models-{anchor_seq}-{}", parent.get_value());
     view! {
         <div class="ml-2 space-y-2 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/30">
             <textarea
@@ -574,22 +635,7 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String), on_d
                 }
             ></textarea>
             <div class="flex flex-wrap items-center gap-2">
-                <select class=format!("{SMALL_INPUT} max-w-48") on:change=move |ev| {
-                    let c = event_target_value(&ev);
-                    let default = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c)).and_then(|x| x.default_model);
-                    connection.set(c);
-                    model.set(default.unwrap_or_default());
-                }>
-                    {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|c| {
-                        let id = c.id.clone();
-                        view! { <option value=c.id.clone() selected=move || connection.get() == id>{c.name.clone()}</option> }
-                    }).collect_view()}
-                </select>
-                <input class=format!("{SMALL_INPUT} w-56 font-mono") list=list_id.clone() placeholder="model id"
-                    prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
-                <datalist id=list_id>
-                    {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
-                </datalist>
+                <ModelPicker connection model />
                 <span class="flex-1"></span>
                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| on_done.run(None)>"Cancel"</button>
                 <button class=format!("{BUTTON} text-xs") prop:disabled=move || busy.get() on:click=move |_| send()>"Ask"</button>
@@ -694,6 +740,14 @@ fn render_event(
             .into_any()
         }
         EventKind::Error { message } => view! { <ErrorBox message=message.clone() /> }.into_any(),
+        EventKind::ModelSwitched { model, .. } => view! {
+            <p class="flex items-center gap-2 text-xs text-zinc-500">
+                <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
+                {format!("Switched to {model}")}
+                <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
+            </p>
+        }
+        .into_any(),
         EventKind::Compaction { summary, tokens_before } => view! {
             <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-700">
                 <summary class="cursor-pointer select-none">
@@ -925,6 +979,9 @@ fn Composer(
     /// Inside a side chat instead of fixed at the bottom of the page.
     #[prop(optional)]
     inline: bool,
+    /// Offer a model picker; sending with another model switches to it.
+    #[prop(optional)]
+    model: Option<ModelChoice>,
 ) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let id = StoredValue::new(id);
@@ -933,9 +990,10 @@ fn Composer(
         if t.trim().is_empty() || disabled.get_untracked() {
             return;
         }
+        let switch = model.and_then(|m| m.switch());
         text.set(String::new());
         spawn_local(async move {
-            if let Err(e) = api::send_message(id.get_value(), t.clone()).await {
+            if let Err(e) = api::send_message(id.get_value(), t.clone(), switch).await {
                 error.set(Some(e));
                 text.set(t);
             } else {
@@ -972,6 +1030,16 @@ fn Composer(
                         view! { <button class=format!("{BUTTON} py-2") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()
                     }}
                 </div>
+                {model.map(|m| view! {
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                        <span>"Model"</span>
+                        <ModelPicker connection=m.connection model=m.model />
+                        {move || {
+                            let _ = (m.connection.get(), m.model.get());
+                            m.switch().map(|_| view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> })
+                        }}
+                    </div>
+                })}
             </div>
         </div>
     }

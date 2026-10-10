@@ -204,19 +204,23 @@ async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &Se
     };
     let now = c6_core::now_ms();
     let updated = match open_turn {
-        Some(turn) => sqlx::query("UPDATE sessions SET last_seq = ?, open_turn = ?, last_activity = ? WHERE id = ?")
-            .bind(event.seq as i64)
-            .bind(turn)
-            .bind(now)
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?,
-        None => sqlx::query("UPDATE sessions SET last_seq = ?, last_activity = ? WHERE id = ?")
-            .bind(event.seq as i64)
-            .bind(now)
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?,
+        Some(turn) => {
+            sqlx::query("UPDATE sessions SET last_seq = ?, open_turn = ?, last_activity = ? WHERE id = ?")
+                .bind(event.seq as i64)
+                .bind(turn)
+                .bind(now)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?
+        }
+        None => {
+            sqlx::query("UPDATE sessions SET last_seq = ?, last_activity = ? WHERE id = ?")
+                .bind(event.seq as i64)
+                .bind(now)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?
+        }
     };
     // Without its row the event would never be uploaded.
     anyhow::ensure!(updated.rows_affected() == 1, "session {session_id} is not in the journal");

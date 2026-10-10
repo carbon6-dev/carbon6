@@ -20,7 +20,15 @@ message SessionEvent {
     TurnEnded turn_ended = 16;
     ErrorEvent error = 17;
     Compaction compaction = 18;
+    ModelSwitched model_switched = 19;
   }
+}
+
+// The session runs on another model from here on. Recorded before the user
+// message that asked for it.
+message ModelSwitched {
+  ModelSpec model = 1;
+  uint64 context_window = 2;
 }
 
 message SessionStarted {
@@ -244,6 +252,8 @@ message ModelSpec {
 
 message UserInput {
   string text = 1;
+  // Set to switch the session to this model from this message on.
+  ModelSpec model = 2;
 }
 
 message Interrupt {}

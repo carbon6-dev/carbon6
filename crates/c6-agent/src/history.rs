@@ -45,6 +45,25 @@ pub fn portable_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
         .collect()
 }
 
+/// `portable_events` for an in-memory conversation.
+pub fn portable_messages(msgs: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::new();
+    for mut m in msgs {
+        if m.role == Role::Assistant {
+            m.blocks.retain(|b| matches!(b, Block::Text(_) | Block::ToolUse { .. }));
+            if m.blocks.is_empty() {
+                continue;
+            }
+        }
+        match out.last_mut() {
+            // Dropping an assistant message can leave two user messages in a row.
+            Some(last) if last.role == m.role && m.role == Role::User => last.blocks.extend(m.blocks),
+            _ => out.push(m),
+        }
+    }
+    out
+}
+
 /// A plain-text rendering of a conversation, for backends that cannot be
 /// given a history (Claude Code). Long tool output is shortened.
 pub fn transcript_text(events: &[SessionEvent]) -> String {

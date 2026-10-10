@@ -196,5 +196,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::TurnEnded { .. } => "turn_ended",
         EventKind::Error { .. } => "error",
         EventKind::Compaction { .. } => "compaction",
+        EventKind::ModelSwitched { .. } => "model_switched",
     }
 }

@@ -77,6 +77,15 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         },
         Kind::Error(e) => api::EventKind::Error { message: e.message.clone() },
         Kind::Compaction(c) => api::EventKind::Compaction { summary: c.summary.clone(), tokens_before: c.tokens_before },
+        Kind::ModelSwitched(m) => {
+            let spec = m.model.clone().unwrap_or_default();
+            api::EventKind::ModelSwitched {
+                connection_id: spec.connection_id,
+                model: spec.model,
+                effort: spec.effort,
+                context_window: m.context_window,
+            }
+        }
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
 }

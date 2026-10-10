@@ -370,6 +370,16 @@ impl Store {
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(_)) => status = "idle".into(),
+                Some(Kind::ModelSwitched(m)) => {
+                    let spec = m.model.clone().unwrap_or_default();
+                    sqlx::query("UPDATE sessions SET connection_id = ?, model = ?, effort = ? WHERE id = ?")
+                        .bind(&spec.connection_id)
+                        .bind(&spec.model)
+                        .bind(Some(spec.effort).filter(|e| !e.is_empty()))
+                        .bind(session_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 _ => {}
             }
             stored.push(ev.clone());
@@ -543,12 +553,13 @@ impl Store {
         Ok(Some(session_id))
     }
 
-    pub async fn pending_input_text(&self, command_id: &str) -> anyhow::Result<Option<String>> {
-        Ok(sqlx::query("SELECT text FROM commands WHERE id = ? AND state = 'pending'")
+    /// A pending input's text and encoded command.
+    pub async fn pending_input(&self, command_id: &str) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        Ok(sqlx::query("SELECT text, data FROM commands WHERE id = ? AND state = 'pending'")
             .bind(command_id)
             .fetch_optional(&self.pool)
             .await?
-            .and_then(|r| r.get::<Option<String>, _>("text")))
+            .and_then(|r| Some((r.get::<Option<String>, _>("text")?, r.get::<Vec<u8>, _>("data")))))
     }
 
     /// Retires a rejected input and queues a restore followed by a copy of it.

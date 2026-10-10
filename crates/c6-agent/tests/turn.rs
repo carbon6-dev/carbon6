@@ -146,5 +146,6 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::TurnEnded(_) => "turn_ended",
         session_event::Kind::Error(_) => "error",
         session_event::Kind::Compaction(_) => "compaction",
+        session_event::Kind::ModelSwitched(_) => "model_switched",
     }
 }

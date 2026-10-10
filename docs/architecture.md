@@ -457,6 +457,10 @@ Decisions made while building M1 that refine the sections above:
   - The head builds its context as a `seed` in `CreateSession`: the ancestors' seed, then the parent's events up to the branch point, plus results of tool calls already made by then. The worker prepends the seed to the history and keeps it in the journaled spec, so reloads and `Restore` keep the context.
   - If the seed came from a different model, signed/encrypted reasoning and provider tool blocks are dropped from it. Claude Code sessions get the seed as a text transcript with the first question.
   - The base prompt gains a note that this is a side conversation that should not change files unless asked. Side chats take messages and can have their own side chats; the UI shows them as collapsible threads under the message they branch from.
+- **Model switching.**
+  - A message can switch its session to another connection and model (`UserInput.model`; the UI offers it in side chats). The worker applies it at the start of the next turn, never mid-turn: it records `ModelSwitched` before the user message, then runs on the new model. The head updates the session row when it ingests the event.
+  - Signed/encrypted reasoning and provider tool blocks from before the switch are dropped from the history, since only the model that wrote them accepts them. A reloaded session resumes on the last switched-to model.
+  - Tools and system prompt stay as the session started (a stable prefix). Switching into or out of Claude Code is refused.
 - **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
 
 ## 17. Open items to settle during implementation
