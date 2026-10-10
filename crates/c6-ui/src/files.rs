@@ -150,8 +150,16 @@ pub fn Changes(worker_id: String, path: String) -> impl IntoView {
         status.refetch();
         diff.refetch();
     };
+    let not_repo = move || matches!(status.get(), Some(Ok(ref s)) if s["repo"] == false);
     view! {
         <div class="space-y-3">
+            <Show when=not_repo>
+                <p class="rounded-md border border-zinc-200 px-4 py-6 text-center text-sm text-zinc-500 dark:border-zinc-800">
+                    "This folder isn't in a git repository, so there are no changes to show. Initialize one (for example "
+                    <code class="font-mono">"git init"</code> " in a terminal) to track what the agent changes."
+                </p>
+            </Show>
+            <Show when=move || !not_repo()>
             <Suspense fallback=|| ()>
                 {move || status.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -167,6 +175,7 @@ pub fn Changes(worker_id: String, path: String) -> impl IntoView {
                     Ok(d) => view! { <DiffView diff=d["diff"].as_str().unwrap_or("").to_owned() truncated=d["truncated"] == true /> }.into_any(),
                 })}
             </Suspense>
+            </Show>
         </div>
     }
 }

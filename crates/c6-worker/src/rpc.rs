@@ -21,9 +21,19 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         "fs.list" => fs_list(serde_json::from_value(params)?).await,
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
         "fs.mkdir" => fs_mkdir(&path_param(&params)?).await,
-        "git.status" => git_status(&path_param(&params)?).await,
-        "git.diff" => git_diff(&path_param(&params)?, params["file"].as_str()).await,
-        "git.log" => git_log(&path_param(&params)?).await,
+        // Outside a repository, git methods answer `{"repo": false}` rather
+        // than failing, so the UI can say so plainly.
+        "git.status" | "git.diff" | "git.log" => {
+            let dir = path_param(&params)?;
+            if !in_repo(&dir).await? {
+                return Ok(json!({"repo": false}));
+            }
+            match method {
+                "git.status" => git_status(&dir).await,
+                "git.diff" => git_diff(&dir, params["file"].as_str()).await,
+                _ => git_log(&dir).await,
+            }
+        }
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),
@@ -133,6 +143,22 @@ async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether `dir` is inside a git work tree. Errors only if `dir` is missing
+/// or git cannot run.
+async fn in_repo(dir: &Path) -> anyhow::Result<bool> {
+    if !tokio::fs::metadata(dir).await.map(|m| m.is_dir()).unwrap_or(false) {
+        bail!("{} is not a directory", dir.display());
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .await
+        .context("running git (is it installed on this worker?)")?;
+    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
 }
 
 /// `git status --porcelain=v2 --branch`, parsed.
@@ -262,6 +288,10 @@ mod tests {
         assert!(made["path"].as_str().unwrap().ends_with("/newdir"));
         assert!(fs_mkdir(&d.join("newdir")).await.unwrap_err().to_string().contains("already exists"));
         std::fs::remove_dir(d.join("newdir")).unwrap();
+
+        let plain = tempfile::tempdir().unwrap();
+        assert!(!in_repo(plain.path()).await.unwrap());
+        assert!(in_repo(d).await.unwrap());
 
         let listing = fs_list(ListParams { path: Some(d.display().to_string()), hidden: false }).await.unwrap();
         let names: Vec<&str> = listing["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
