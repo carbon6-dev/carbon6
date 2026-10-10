@@ -485,7 +485,9 @@ fn side_chat(s: Session, open_now: bool) -> AnyView {
         open.update(|o| *o = !*o);
         storage_set(&key, if open.get_untracked() { "1" } else { "0" });
     };
-    let (title, model) = (s.title.clone(), s.model.clone());
+    // The row's model is current as of loading the page; an open side chat
+    // keeps it current from its log (model switches).
+    let (title, model) = (s.title.clone(), RwSignal::new(s.model.clone()));
     let s = StoredValue::new(s);
     view! {
         <div class="ml-2 border-l-2 border-sky-300 pl-3 dark:border-sky-800">
@@ -493,10 +495,10 @@ fn side_chat(s: Session, open_now: bool) -> AnyView {
                 <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
                 <span class="shrink-0 font-medium text-sky-700 dark:text-sky-400">"Side chat"</span>
                 <span class="truncate text-zinc-700 dark:text-zinc-300">{title}</span>
-                <span class="ml-auto shrink-0 font-mono">{model}</span>
+                <span class="ml-auto shrink-0 font-mono">{move || model.get()}</span>
             </button>
             <Show when=move || open.get()>
-                <SideChatBody session=s.get_value() />
+                <SideChatBody session=s.get_value() model_label=model />
             </Show>
         </div>
     }
@@ -504,7 +506,7 @@ fn side_chat(s: Session, open_now: bool) -> AnyView {
 }
 
 #[component]
-fn SideChatBody(session: Session) -> impl IntoView {
+fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoView {
     let feed = Feed::open(session.id.clone());
     let running = Signal::derive(move || feed.running());
     let error = RwSignal::new(None::<String>);
@@ -526,6 +528,7 @@ fn SideChatBody(session: Session) -> impl IntoView {
     Effect::new(move || {
         let (c, m) = current.get();
         choice.connection.set(c);
+        model_label.set(m.clone());
         choice.model.set(m);
     });
     view! {
