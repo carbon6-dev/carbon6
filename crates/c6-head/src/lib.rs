@@ -4,6 +4,7 @@ pub mod api;
 pub mod config;
 mod convert;
 pub mod hub;
+pub mod oauth;
 pub mod pki;
 mod prompts;
 pub mod registry;
@@ -57,6 +58,11 @@ pub struct HeadState {
     pub registry: registry::Registry,
     pub secrets: secrets::Secrets,
     pub hub: sessions::LiveHub,
+    pub oauth: oauth::OAuth,
+    /// For OAuth token exchange and model listing.
+    pub http: reqwest::Client,
+    /// The UI port, for the OAuth loopback redirect.
+    pub ui_port: u16,
     /// URL workers dial, as put into enrollment tokens.
     pub worker_url: String,
     pub shutdown: CancellationToken,
@@ -110,7 +116,20 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
     let shutdown = CancellationToken::new();
     let registry = registry::Registry::new(shutdown.clone());
     let secrets = secrets::Secrets::load_or_create(&cfg.data_dir.join("master.key"))?;
-    let state = Arc::new(HeadState { store, pki, registry, secrets, hub: Default::default(), worker_url, shutdown: shutdown.clone() });
+    c6_llm::install_crypto_provider();
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let state = Arc::new(HeadState {
+        store,
+        pki,
+        registry,
+        secrets,
+        hub: Default::default(),
+        oauth: Default::default(),
+        http,
+        ui_port: ui_addrs[0].port(),
+        worker_url,
+        shutdown: shutdown.clone(),
+    });
 
     let mut tasks = JoinSet::new();
 

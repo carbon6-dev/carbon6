@@ -68,6 +68,10 @@ pub struct Connection {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateConnection {
+    /// `openai_compat` (default), `openai`, or `anthropic`. ChatGPT
+    /// connections are created by signing in instead.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub name: String,
     pub base_url: String,
     pub api_key: Option<String>,
@@ -97,6 +101,7 @@ pub struct Session {
     pub model: String,
     pub status: SessionStatus,
     pub error: Option<String>,
+    pub effort: Option<String>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
     pub last_seq: u64,
@@ -111,6 +116,26 @@ pub struct CreateSession {
     pub title: Option<String>,
     /// First message, sent right after creation.
     pub prompt: Option<String>,
+    /// Reasoning effort: low, medium, high, xhigh, max. Default: per model.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StartChatGptSignIn {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatGptSignIn {
+    /// Open this in a browser and approve.
+    pub authorize_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompleteChatGptSignIn {
+    /// The address the browser landed on after approving.
+    pub callback_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,14 +172,53 @@ pub struct Event {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
-    Started { connection_id: String, model: String, cwd: String, system_prompt: String, tools: Vec<String> },
-    User { command_id: String, text: String },
-    TurnStarted { turn: u64 },
-    Assistant { turn: u64, blocks: Vec<ContentBlock>, stop_reason: String },
-    ToolResult { call_id: String, tool: String, output: String, is_error: bool, truncated: bool, duration_ms: u64 },
-    Usage { model: String, input_tokens: u64, output_tokens: u64, cache_read_tokens: u64, cache_write_tokens: u64, reasoning_tokens: u64 },
-    TurnEnded { turn: u64, reason: TurnEndReason },
-    Error { message: String },
+    Started {
+        connection_id: String,
+        model: String,
+        cwd: String,
+        system_prompt: String,
+        tools: Vec<String>,
+    },
+    User {
+        command_id: String,
+        text: String,
+    },
+    TurnStarted {
+        turn: u64,
+    },
+    Assistant {
+        turn: u64,
+        blocks: Vec<ContentBlock>,
+        stop_reason: String,
+    },
+    ToolResult {
+        call_id: String,
+        tool: String,
+        output: String,
+        is_error: bool,
+        truncated: bool,
+        duration_ms: u64,
+    },
+    Usage {
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+    },
+    TurnEnded {
+        turn: u64,
+        reason: TurnEndReason,
+    },
+    Error {
+        message: String,
+    },
+    /// Earlier conversation was replaced, for the model, by this summary.
+    Compaction {
+        summary: String,
+        tokens_before: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

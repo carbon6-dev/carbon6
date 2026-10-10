@@ -8,9 +8,9 @@ mod turn;
 use async_trait::async_trait;
 use c6_proto::{ephemeral_event, session_event};
 
-pub use history::history_from_events;
+pub use history::{compacted_context, history_from_events};
 pub use prompt::build_system_prompt;
-pub use turn::{TurnConfig, run_turn};
+pub use turn::{Conversation, TurnConfig, run_turn};
 
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.

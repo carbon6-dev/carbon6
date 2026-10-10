@@ -143,6 +143,14 @@ pub async fn create_connection(req: CreateConnection) -> Result<Connection, Stri
     send_json(Request::post("/api/v1/connections"), &req).await
 }
 
+pub async fn start_chatgpt(name: String) -> Result<c6_api::ChatGptSignIn, String> {
+    send_json(Request::post("/api/v1/connections/chatgpt/start"), &c6_api::StartChatGptSignIn { name }).await
+}
+
+pub async fn complete_chatgpt(callback_url: String) -> Result<Connection, String> {
+    send_json(Request::post("/api/v1/connections/chatgpt/complete"), &c6_api::CompleteChatGptSignIn { callback_url }).await
+}
+
 pub async fn delete_connection(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/connections/{id}")).send().await).await
 }

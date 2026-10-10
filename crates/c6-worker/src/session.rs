@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use c6_agent::{EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
-use c6_llm::{Block, Message, Role, openai_chat::OpenAiChat};
+use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
+use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
     CreateSession, EphemeralEvent, ErrorEvent, SessionActivity, SessionCommand, SessionEvent, SessionStarted, TurnEndReason, TurnEnded,
     TurnStarted, UserMessage, ephemeral_event, session_command, session_event,
@@ -23,7 +23,6 @@ use crate::link::HeadLink;
 pub struct SessionManager {
     journal: Arc<Journal>,
     link: Arc<HeadLink>,
-    tools: Vec<Arc<dyn Tool>>,
     actors: Mutex<HashMap<String, mpsc::UnboundedSender<ActorMsg>>>,
 }
 
@@ -34,7 +33,7 @@ enum ActorMsg {
 
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>) -> Self {
-        Self { journal, link, tools: c6_tools::default_tools(), actors: Mutex::default() }
+        Self { journal, link, actors: Mutex::default() }
     }
 
     /// Closes turns left open by a crash or kill.
@@ -87,17 +86,21 @@ impl SessionManager {
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         let date = time::OffsetDateTime::now_utc().date().to_string();
         let system_prompt = build_system_prompt(&spec.base_prompt, &cwd, &date);
+        let model = spec.model.clone().unwrap_or_default();
+        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+        let profile = model_info(provider, &model.model).tool_profile;
         let started = SessionStarted {
             command_id: command_id.to_owned(),
             model: spec.model.clone(),
             cwd: cwd.display().to_string(),
             system_prompt,
-            tools: self.tools.iter().map(|t| t.spec().name).collect(),
+            tools: c6_tools::tools_for(profile).iter().map(|t| t.spec().name).collect(),
+            tool_profile: profile.as_str().into(),
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
         self.journal.create_session(session_id, &spec, &ev).await.map_err(|e| format!("worker error: {e:#}"))?;
-        info!(session = %session_id, cwd = %cwd.display(), "session created");
-        self.spawn(session_id, spec, started, Vec::new(), 2, 0);
+        info!(session = %session_id, cwd = %cwd.display(), profile = profile.as_str(), "session created");
+        self.spawn(session_id, spec, started, Conversation { history: Vec::new(), context_tokens: 0 }, 2, 0);
         Ok(())
     }
 
@@ -115,7 +118,18 @@ impl SessionManager {
         let next_seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
         let history = history_from_events(&events);
-        Ok(Some(self.spawn(session_id, spec, started, history, next_seq, turns)))
+        // The last request's size since the last compaction, for the next
+        // compaction decision.
+        let context_tokens = events
+            .iter()
+            .rev()
+            .take_while(|e| !matches!(e.kind, Some(session_event::Kind::Compaction(_))))
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::Usage(u)) => Some(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens),
+                _ => None,
+            })
+            .unwrap_or(0);
+        Ok(Some(self.spawn(session_id, spec, started, Conversation { history, context_tokens }, next_seq, turns)))
     }
 
     fn spawn(
@@ -123,7 +137,7 @@ impl SessionManager {
         session_id: &str,
         spec: CreateSession,
         started: SessionStarted,
-        history: Vec<Message>,
+        conv: Conversation,
         next_seq: u64,
         turns: u64,
     ) -> mpsc::UnboundedSender<ActorMsg> {
@@ -137,12 +151,12 @@ impl SessionManager {
         let actor = Actor {
             spec,
             session_tools: Arc::new(SessionTools::new(PathBuf::from(&started.cwd))),
+            tools: c6_tools::tools_for(ToolProfile::parse(&started.tool_profile)),
             started,
-            history,
+            conv: Some(conv),
             turns,
             writer,
             link: self.link.clone(),
-            tools: self.tools.clone(),
             inbox: Arc::default(),
         };
         tokio::spawn(actor.run(rx));
@@ -185,7 +199,8 @@ struct Actor {
     spec: CreateSession,
     started: SessionStarted,
     session_tools: Arc<SessionTools>,
-    history: Vec<Message>,
+    /// `None` while a turn task holds it.
+    conv: Option<Conversation>,
     turns: u64,
     writer: Arc<Writer>,
     link: Arc<HeadLink>,
@@ -195,7 +210,7 @@ struct Actor {
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
-        let mut running: Option<(tokio::task::JoinHandle<Vec<Message>>, CancellationToken)> = None;
+        let mut running: Option<(tokio::task::JoinHandle<Conversation>, CancellationToken)> = None;
         loop {
             if running.is_none() && !self.inbox.lock().unwrap().queue.is_empty() {
                 running = Some(self.start_turn());
@@ -211,8 +226,12 @@ impl Actor {
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     running = None;
                     match done {
-                        Ok(history) => self.history = history,
-                        Err(e) => error!(session = %self.writer.session_id, "turn task panicked: {e}"),
+                        Ok(conv) => self.conv = Some(conv),
+                        Err(e) => {
+                            // Rebuild from the log on the next turn.
+                            error!(session = %self.writer.session_id, "turn task panicked: {e}");
+                            return;
+                        }
                     }
                     self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
                 }
@@ -220,18 +239,22 @@ impl Actor {
         }
     }
 
-    fn start_turn(&mut self) -> (tokio::task::JoinHandle<Vec<Message>>, CancellationToken) {
+    fn start_turn(&mut self) -> (tokio::task::JoinHandle<Conversation>, CancellationToken) {
         self.turns += 1;
         let turn = self.turns;
         let cancel = CancellationToken::new();
         let model = self.spec.model.clone().unwrap_or_default();
+        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+        let info = model_info(provider, &model.model);
         let cfg = TurnConfig {
             model: model.model.clone(),
             system_prompt: self.started.system_prompt.clone(),
             max_output_tokens: (model.max_output_tokens > 0).then_some(model.max_output_tokens),
             cache_key: self.writer.session_id.clone(),
+            effort: Some(model.effort.clone()).filter(|e| !e.is_empty()).or_else(|| info.default_effort.map(str::to_owned)),
+            context_window: info.context_window,
         };
-        let mut history = std::mem::take(&mut self.history);
+        let mut conv = self.conv.take().expect("no turn is running");
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
         writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true }));
@@ -239,13 +262,13 @@ impl Actor {
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             if let Err(e) =
-                run_session_turn(turn, &cfg, &model.connection_id, &link, &tools, &session_tools, &sink, &mut history, &inbox, &c).await
+                run_session_turn(turn, &cfg, &model.connection_id, &link, &tools, &session_tools, &sink, &mut conv, &inbox, &c).await
             {
                 // Only journal writes fail here. The in-memory history may now
                 // differ from the log; a worker restart rebuilds it from the log.
                 error!(session = %writer.session_id, "turn failed: {e:#}");
             }
-            history
+            conv
         });
         (task, cancel)
     }
@@ -260,7 +283,7 @@ async fn run_session_turn(
     tools: &[Arc<dyn Tool>],
     session_tools: &Arc<SessionTools>,
     sink: &Arc<dyn EventSink>,
-    history: &mut Vec<Message>,
+    conv: &mut Conversation,
     inbox: &Mutex<Inbox>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
@@ -270,23 +293,24 @@ async fn run_session_turn(
         sink.append(session_event::Kind::User(UserMessage { command_id: input.command_id, text: input.text.clone() })).await?;
         blocks.push(Block::Text(input.text));
     }
-    match history.last_mut() {
+    match conv.history.last_mut() {
         Some(m) if m.role == Role::User => m.blocks.extend(blocks),
-        _ if !blocks.is_empty() => history.push(Message { role: Role::User, blocks }),
+        _ if !blocks.is_empty() => conv.history.push(Message { role: Role::User, blocks }),
         _ => {}
     }
 
-    let client = match link.credential(connection_id).await.and_then(|g| Ok(OpenAiChat::new(&g.base_url, &g.bearer, g.headers)?)) {
-        Ok(c) => c,
-        Err(e) => {
-            sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
-            sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e:#}") })).await?;
-            sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
-            return Ok(());
-        }
-    };
+    let client =
+        match link.credential(connection_id).await.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
+            Ok(c) => c,
+            Err(e) => {
+                sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+                sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e:#}") })).await?;
+                sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+                return Ok(());
+            }
+        };
     let mut pending = || inbox.lock().unwrap().drain();
-    run_turn(turn, cfg, &client, tools, session_tools, sink, history, &mut pending, cancel).await?;
+    run_turn(turn, cfg, client.as_ref(), tools, session_tools, sink, conv, &mut pending, cancel).await?;
     Ok(())
 }
 

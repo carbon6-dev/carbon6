@@ -160,7 +160,7 @@ fn SessionView(id: String) -> impl IntoView {
                                             {d.worker_name.clone()}
                                         </span>
                                         <span class="font-mono">{s.cwd.clone()}</span>
-                                        <span>{s.model.clone()}</span>
+                                        <span>{s.model.clone()}{s.effort.clone().map(|e| format!(" · {e}"))}</span>
                                         <span>{move || { let (i, c, o) = usage.get(); if i + o == 0 { String::new() } else { format!("{} in ({}% cached) · {} out", tokens(i), (c * 100).checked_div(i).unwrap_or(0), tokens(o)) } }}</span>
                                     </div>
                                 </div>
@@ -181,10 +181,11 @@ fn SessionView(id: String) -> impl IntoView {
             </Suspense>
 
             <div class="space-y-4">
-                {move || {
-                    let results = results.get();
-                    events.with(|evs| evs.iter().map(|e| render_event(e, &results, streaming)).collect_view())
-                }}
+                // Events are append-only: keyed by seq, each renders once, so
+                // expanded cards stay open while the turn continues.
+                <For each=move || events.get() key=|e| e.seq let:e>
+                    {render_event(&e, results, streaming)}
+                </For>
                 {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
                     <div class="space-y-2">
                         {(!s.thinking.is_empty()).then(|| view! { <Thinking text=s.thinking.clone() open=true /> })}
@@ -214,7 +215,7 @@ fn tokens(n: u64) -> String {
     }
 }
 
-fn render_event(e: &Event, results: &HashMap<String, ToolResultView>, streaming: RwSignal<Streaming>) -> AnyView {
+fn render_event(e: &Event, results: Memo<HashMap<String, ToolResultView>>, streaming: RwSignal<Streaming>) -> AnyView {
     match &e.kind {
         EventKind::Started { system_prompt, tools, .. } => view! {
             <details class="text-xs text-zinc-500">
@@ -237,9 +238,10 @@ fn render_event(e: &Event, results: &HashMap<String, ToolResultView>, streaming:
                         ContentBlock::Text { text } => view! { <div class="md" inner_html=markdown::to_html(text)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
-                            let call_id = id.clone();
-                            let live_output = Signal::derive(move || streaming.with(|s| s.tool_output.get(&call_id).cloned()));
-                            view! { <ToolCard name=name.clone() input_json=input_json.clone() result=results.get(id).cloned() live_output /> }.into_any()
+                            let (out_id, res_id) = (id.clone(), id.clone());
+                            let live_output = Signal::derive(move || streaming.with(|s| s.tool_output.get(&out_id).cloned()));
+                            let result = Signal::derive(move || results.with(|r| r.get(&res_id).cloned()));
+                            view! { <ToolCard name=name.clone() input_json=input_json.clone() result live_output /> }.into_any()
                         }
                     }).collect_view()}
                     {interrupted.then(|| view! { <p class="text-xs italic text-zinc-500">"(response cut off)"</p> })}
@@ -248,6 +250,15 @@ fn render_event(e: &Event, results: &HashMap<String, ToolResultView>, streaming:
             .into_any()
         }
         EventKind::Error { message } => view! { <ErrorBox message=message.clone() /> }.into_any(),
+        EventKind::Compaction { summary, tokens_before } => view! {
+            <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-700">
+                <summary class="cursor-pointer select-none">
+                    {format!("Context compacted ({} tokens summarized); the model continues from this summary", tokens(*tokens_before))}
+                </summary>
+                <div class="md mt-2 text-zinc-700 dark:text-zinc-300" inner_html=markdown::to_html(summary)></div>
+            </details>
+        }
+        .into_any(),
         EventKind::TurnEnded { reason, .. } => match reason {
             TurnEndReason::Interrupted => note("Interrupted"),
             TurnEndReason::WorkerRestarted => note("Stopped: the worker restarted during this turn"),
@@ -271,64 +282,139 @@ fn Thinking(text: String, open: bool) -> impl IntoView {
     }
 }
 
+/// Normalizes tool names across profiles (Claude, Codex, generic).
+fn tool_kind(name: &str) -> &str {
+    match name {
+        "Bash" | "shell" => "bash",
+        "Read" => "read",
+        "Write" => "write",
+        "Edit" => "edit",
+        "Grep" => "grep",
+        "Glob" => "glob",
+        "TodoWrite" | "update_plan" => "plan",
+        other => other,
+    }
+}
+
 /// One-line description of a tool call from its input.
 fn summarize(name: &str, input: &serde_json::Value) -> String {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    match name {
-        "bash" => s("command").lines().next().unwrap_or("").to_owned(),
-        "read" | "write" | "edit" => s("path"),
+    let path = || input.get("file_path").or_else(|| input.get("path")).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    match tool_kind(name) {
+        "bash" => match input.get("command") {
+            Some(serde_json::Value::Array(argv)) => {
+                let argv: Vec<&str> = argv.iter().filter_map(|a| a.as_str()).collect();
+                let script = if argv.len() == 3 && argv[1].ends_with('c') { argv[2].to_owned() } else { argv.join(" ") };
+                script.lines().next().unwrap_or("").to_owned()
+            }
+            _ => {
+                let desc = s("description");
+                if desc.is_empty() { s("command").lines().next().unwrap_or("").to_owned() } else { desc }
+            }
+        },
+        "read" | "write" | "edit" => path(),
         "grep" => {
             format!("{}{}", s("pattern"), input.get("path").and_then(|v| v.as_str()).map(|p| format!("  in {p}")).unwrap_or_default())
         }
         "glob" => s("pattern"),
+        "apply_patch" => {
+            s("input").lines().filter_map(|l| l.strip_prefix("*** ").filter(|r| r.contains("File:"))).collect::<Vec<_>>().join(", ")
+        }
+        "plan" => {
+            let items = plan_items(input);
+            let done = items.iter().filter(|(_, st)| st == "completed").count();
+            format!("{done}/{} done", items.len())
+        }
         _ => input.to_string(),
     }
 }
 
+/// (text, status) for update_plan / TodoWrite inputs.
+fn plan_items(input: &serde_json::Value) -> Vec<(String, String)> {
+    let list = input.get("plan").or_else(|| input.get("todos")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    list.iter()
+        .map(|i| {
+            let text = i.get("step").or_else(|| i.get("content")).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            (text, i.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_owned())
+        })
+        .collect()
+}
+
 #[component]
-fn ToolCard(name: String, input_json: String, result: Option<ToolResultView>, live_output: Signal<Option<String>>) -> impl IntoView {
+fn ToolCard(
+    name: String,
+    input_json: String,
+    result: Signal<Option<ToolResultView>>,
+    live_output: Signal<Option<String>>,
+) -> impl IntoView {
     let input: serde_json::Value = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
     let summary = summarize(&name, &input);
-    let (icon, icon_cls) = match &result {
-        None => ("●", "animate-pulse text-blue-500"),
-        Some(r) if r.is_error => ("✕", "text-red-500"),
-        Some(_) => ("✓", "text-emerald-600"),
-    };
-    let detail_input = match name.as_str() {
+    let kind = tool_kind(&name).to_owned();
+    let detail_input = match kind.as_str() {
         "write" => input.get("content").and_then(|v| v.as_str()).map(str::to_owned),
         "edit" => Some(format!(
             "- {}\n+ {}",
             input.get("old_string").and_then(|v| v.as_str()).unwrap_or("").replace('\n', "\n- "),
             input.get("new_string").and_then(|v| v.as_str()).unwrap_or("").replace('\n', "\n+ ")
         )),
-        "bash" => input.get("command").and_then(|v| v.as_str()).filter(|c| c.contains('\n')).map(str::to_owned),
-        "read" | "glob" | "grep" => None,
+        "bash" => {
+            let s = summarize(&name, &input);
+            let full = match input.get("command") {
+                Some(serde_json::Value::String(c)) => c.clone(),
+                Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "),
+                _ => String::new(),
+            };
+            (full.contains('\n') || full != s).then_some(full)
+        }
+        "apply_patch" => input.get("input").and_then(|v| v.as_str()).map(str::to_owned),
+        "read" | "glob" | "grep" | "plan" => None,
         _ => serde_json::to_string_pretty(&input).ok(),
     };
-    let pending = result.is_none();
+    let plan = (kind == "plan").then(|| plan_items(&input));
+    let started_open = plan.is_some();
     view! {
-        <details class="group rounded-md border border-zinc-200 text-sm dark:border-zinc-800" open=pending>
+        <div class="rounded-md border border-zinc-200 text-sm dark:border-zinc-800">
+        <details class="group" open=started_open>
             <summary class="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5">
-                <span class=format!("text-xs {icon_cls}")>{icon}</span>
+                {move || {
+                    let (icon, cls) = match result.get() {
+                        None => ("●", "animate-pulse text-blue-500"),
+                        Some(r) if r.is_error => ("✕", "text-red-500"),
+                        Some(_) => ("✓", "text-emerald-600"),
+                    };
+                    view! { <span class=format!("text-xs {cls}")>{icon}</span> }
+                }}
                 <span class="font-mono text-xs font-semibold">{name.clone()}</span>
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
-                {result.as_ref().map(|r| view! { <span class="text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
+                {move || result.get().map(|r| view! { <span class="text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
             </summary>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                {plan.map(|items| view! {
+                    <ul class="space-y-1 text-sm">
+                        {items.into_iter().map(|(text, status)| {
+                            let (mark, cls) = match status.as_str() {
+                                "completed" => ("☑", "text-zinc-400 line-through"),
+                                "in_progress" => ("▶", "font-medium"),
+                                _ => ("☐", ""),
+                            };
+                            view! { <li class=format!("flex gap-2 {cls}")><span>{mark}</span><span>{text}</span></li> }
+                        }).collect_view()}
+                    </ul>
+                })}
                 {detail_input.map(|d| view! { <pre class="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-xs text-zinc-600 dark:text-zinc-400">{d}</pre> })}
-                {match result {
-                    Some(r) => view! {
-                        <pre class=format!("max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900 {}", if r.is_error { "text-red-700 dark:text-red-300" } else { "" })>
-                            {r.output}
-                        </pre>
-                        {r.truncated.then(|| view! { <p class="text-[11px] text-zinc-500">"Output was truncated for the model."</p> })}
-                    }.into_any(),
-                    None => view! {
-                        {move || live_output.get().map(|o| view! { <pre class="max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{o}</pre> })}
-                    }.into_any(),
-                }}
+                {move || result.get().map(|r| view! {
+                    <pre class=format!("max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900 {}", if r.is_error { "text-red-700 dark:text-red-300" } else { "" })>
+                        {r.output}
+                    </pre>
+                    {r.truncated.then(|| view! { <p class="text-[11px] text-zinc-500">"Output was truncated for the model."</p> })}
+                })}
             </div>
         </details>
+        // Live output of a running tool, visible without expanding the card.
+        {move || result.with(Option::is_none).then(|| live_output.get()).flatten().map(|o| view! {
+            <pre class="mx-3 mb-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{o}</pre>
+        })}
+        </div>
     }
 }
 

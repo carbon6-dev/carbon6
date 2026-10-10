@@ -183,6 +183,11 @@ impl Store {
         Ok(sqlx::query_as("SELECT * FROM connections WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
 
+    pub async fn set_connection_secret(&self, id: &str, secret: &[u8]) -> anyhow::Result<()> {
+        sqlx::query("UPDATE connections SET api_key = ? WHERE id = ?").bind(secret).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn delete_connection(&self, id: &str) -> anyhow::Result<bool> {
         Ok(sqlx::query("DELETE FROM connections WHERE id = ?").bind(id).execute(&self.pool).await?.rows_affected() > 0)
     }
@@ -200,6 +205,7 @@ pub struct SessionRow {
     pub model: String,
     pub status: String,
     pub error: Option<String>,
+    pub effort: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_seq: i64,
@@ -232,7 +238,7 @@ impl Store {
     pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -243,6 +249,7 @@ impl Store {
         .bind(&s.status)
         .bind(s.created_at)
         .bind(s.updated_at)
+        .bind(&s.effort)
         .execute(&mut *tx)
         .await?;
         for c in commands {

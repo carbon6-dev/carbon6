@@ -76,6 +76,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         storage_get("c6.connection").filter(|c| connections.iter().any(|x| &x.id == c)).unwrap_or_else(|| connections[0].id.clone()),
     );
     let model = RwSignal::new(String::new());
+    let effort = RwSignal::new(storage_get("c6.effort").unwrap_or_default());
     let prompt = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -120,7 +121,9 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             model: model.get_untracked(),
             title: None,
             prompt: Some(prompt.get_untracked()).filter(|p| !p.trim().is_empty()),
+            effort: Some(effort.get_untracked()).filter(|e| !e.is_empty()),
         };
+        storage_set("c6.effort", &effort.get_untracked());
         storage_set("c6.worker", &req.worker_id.to_string());
         storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
         storage_set("c6.connection", &req.connection_id);
@@ -139,7 +142,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
 
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50">
-            <div class="grid gap-3 sm:grid-cols-[1fr_2fr]">
+            <div class="grid gap-3 sm:grid-cols-[1fr_2fr_auto]">
                 <label class="block text-xs text-zinc-500">
                     "Worker"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| worker.set(event_target_value(&ev)) prop:value=move || worker.get()>
@@ -149,7 +152,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                         }).collect_view()}
                     </select>
                 </label>
-                <label class="block text-xs text-zinc-500">
+                <label class="block text-xs text-zinc-500 sm:col-span-2">
                     "Working directory"
                     <input class=format!("mt-1 font-mono {INPUT}") placeholder="~/src/project"
                         prop:value=move || cwd.get() on:input=move |ev| cwd.set(event_target_value(&ev)) />
@@ -167,6 +170,17 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                     <datalist id="c6-models">
                         {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
                     </datalist>
+                </label>
+                <label class="block text-xs text-zinc-500">
+                    "Effort"
+                    <select class=format!("mt-1 {INPUT}") prop:value=move || effort.get() on:change=move |ev| effort.set(event_target_value(&ev))>
+                        <option value="">"default"</option>
+                        <option value="low">"low"</option>
+                        <option value="medium">"medium"</option>
+                        <option value="high">"high"</option>
+                        <option value="xhigh">"xhigh"</option>
+                        <option value="max">"max"</option>
+                    </select>
                 </label>
             </div>
             <textarea class=format!("{INPUT} min-h-24 resize-y") placeholder="What should the agent do? (⌘/Ctrl+Enter to start)"

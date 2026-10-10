@@ -2,6 +2,9 @@
 
 mod bash;
 mod files;
+mod patch;
+mod plan;
+pub mod profiles;
 mod search;
 mod util;
 
@@ -18,6 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};
+pub use patch::ApplyPatch;
+pub use plan::Plan;
+pub use profiles::tools_for;
 pub use search::{Glob, Grep};
 
 /// Output kept inline for the model; the rest is elided from the middle.
@@ -122,9 +128,9 @@ pub trait Tool: Send + Sync {
     async fn call(&self, ctx: &ToolCtx, input: Value) -> ToolOutput;
 }
 
-/// The default tool set.
+/// The generic tool set (for models without a family-specific profile).
 pub fn default_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Read), Arc::new(Write), Arc::new(Edit), Arc::new(Bash), Arc::new(Grep), Arc::new(Glob)]
+    tools_for(c6_llm::ToolProfile::Generic)
 }
 
 pub(crate) fn parse_input<T: DeserializeOwned>(input: Value) -> Result<T, ToolOutput> {

@@ -47,7 +47,14 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     if worker.revoked_at.is_some() {
         return Err(bad_request("worker is revoked"));
     }
-    st.store.connection(&req.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    let connection = st.store.connection(&req.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+    let effort = req.effort.clone().filter(|e| !e.is_empty());
+    if let Some(e) = &effort
+        && !EFFORTS.contains(&e.as_str())
+    {
+        return Err(bad_request(format!("effort must be one of {}", EFFORTS.join(", "))));
+    }
     if req.cwd.trim().is_empty() || req.model.trim().is_empty() {
         return Err(bad_request("cwd and model are required"));
     }
@@ -65,6 +72,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         model: req.model.trim().to_owned(),
         status: "starting".into(),
         error: None,
+        effort: effort.clone(),
         created_at: now,
         updated_at: now,
         last_seq: 0,
@@ -76,7 +84,13 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         command_id: create_id.clone(),
         session_id: session_id.clone(),
         kind: Some(session_command::Kind::Create(CreateSession {
-            model: Some(ModelSpec { connection_id: row.connection_id.clone(), model: row.model.clone(), max_output_tokens: 0 }),
+            model: Some(ModelSpec {
+                connection_id: row.connection_id.clone(),
+                model: row.model.clone(),
+                max_output_tokens: 0,
+                effort: effort.unwrap_or_default(),
+                connection_kind: connection.kind.clone(),
+            }),
             cwd: row.cwd.clone(),
             base_prompt: prompts::BASE_PROMPT.into(),
         })),
@@ -202,25 +216,56 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
 
 pub async fn credential(st: &HeadState, req: CredentialRequest) -> CredentialGrant {
     let mut grant = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id.clone(), ..Default::default() };
-    match st.store.connection(&req.connection_id).await {
-        Ok(Some(c)) => {
-            let bearer = match c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose() {
-                Ok(k) => k.unwrap_or_default(),
-                Err(e) => {
-                    warn!(connection = %c.id, "decrypting API key: {e:#}");
-                    grant.error = "credential unavailable".into();
-                    return grant;
-                }
-            };
-            grant.kind = c.kind;
-            grant.base_url = c.base_url;
-            grant.bearer = bearer;
+    let conn = match st.store.connection(&req.connection_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            grant.error = "no such connection".into();
+            return grant;
         }
-        Ok(None) => grant.error = "no such connection".into(),
         Err(e) => {
             warn!("loading connection: {e:#}");
             grant.error = "internal error".into();
+            return grant;
+        }
+    };
+    grant.kind = conn.kind.clone();
+    grant.base_url = conn.base_url.clone();
+    if conn.kind == "chatgpt" {
+        match chatgpt_tokens(st, &conn.id).await {
+            Ok(t) => {
+                grant.bearer = t.access_token;
+                grant.expires_at_ms = t.expires_at_ms;
+            }
+            Err(e) => {
+                warn!(connection = %conn.id, "ChatGPT credentials: {e:#}");
+                grant.error = format!("ChatGPT sign-in needs attention: {e}");
+            }
+        }
+        return grant;
+    }
+    match conn.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose() {
+        Ok(k) => grant.bearer = k.unwrap_or_default(),
+        Err(e) => {
+            warn!(connection = %conn.id, "decrypting API key: {e:#}");
+            grant.error = "credential unavailable".into();
         }
     }
     grant
+}
+
+/// Current ChatGPT tokens for a connection, refreshed here (never on
+/// workers) when close to expiry.
+pub async fn chatgpt_tokens(st: &HeadState, connection_id: &str) -> anyhow::Result<crate::oauth::ChatGptTokens> {
+    let lock = st.oauth.lock_for(connection_id);
+    let _guard = lock.lock().await;
+    // Read under the lock so a refresh that just finished is seen.
+    let row = st.store.connection(connection_id).await?.ok_or_else(|| not_found("no such connection"))?;
+    let blob = row.api_key.ok_or_else(|| bad_request("connection has no stored sign-in"))?;
+    let tokens: crate::oauth::ChatGptTokens = serde_json::from_str(&st.secrets.decrypt(&blob)?)?;
+    if !crate::oauth::OAuth::needs_refresh(&tokens) {
+        return Ok(tokens);
+    }
+    let refreshed = st.oauth.refresh(&st.http, tokens).await?;
+    st.store.set_connection_secret(connection_id, &st.secrets.encrypt(&serde_json::to_string(&refreshed)?)?).await?;
+    Ok(refreshed)
 }

@@ -32,6 +32,15 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                         content_block::Block::ToolUse(u) => {
                             api::ContentBlock::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() }
                         }
+                        // Only the readable part goes to the UI; signatures and
+                        // encrypted reasoning stay in the log.
+                        content_block::Block::SignedThinking(t) if !t.text.is_empty() => {
+                            api::ContentBlock::Thinking { text: t.text.clone() }
+                        }
+                        content_block::Block::Reasoning(r) if !r.summary.is_empty() => {
+                            api::ContentBlock::Thinking { text: r.summary.clone() }
+                        }
+                        _ => return None,
                     })
                 })
                 .collect(),
@@ -64,6 +73,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             },
         },
         Kind::Error(e) => api::EventKind::Error { message: e.message.clone() },
+        Kind::Compaction(c) => api::EventKind::Compaction { summary: c.summary.clone(), tokens_before: c.tokens_before },
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
 }
@@ -92,6 +102,7 @@ pub fn session(r: &SessionRow) -> api::Session {
             _ => api::SessionStatus::Starting,
         },
         error: r.error.clone(),
+        effort: r.effort.clone(),
         created_at: r.created_at,
         updated_at: r.updated_at,
         last_seq: r.last_seq as u64,

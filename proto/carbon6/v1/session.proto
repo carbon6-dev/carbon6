@@ -19,6 +19,7 @@ message SessionEvent {
     Usage usage = 15;
     TurnEnded turn_ended = 16;
     ErrorEvent error = 17;
+    Compaction compaction = 18;
   }
 }
 
@@ -29,6 +30,9 @@ message SessionStarted {
   // Full system prompt as sent to the model, for inspection.
   string system_prompt = 4;
   repeated string tools = 5;
+  // Tool profile the session was started with ("generic", "claude",
+  // "codex"); fixed for the session so the tool list stays a stable prefix.
+  string tool_profile = 6;
 }
 
 message UserMessage {
@@ -46,12 +50,28 @@ message AssistantMessage {
   string stop_reason = 3;
 }
 
+// Provider-specific reasoning blocks are kept verbatim so they can be sent
+// back unchanged to the same provider family; other families skip them.
 message ContentBlock {
   oneof block {
     string text = 1;
-    string thinking = 2;
+    string thinking = 2;              // unsigned (Chat Completions reasoning)
     ToolUse tool_use = 3;
+    SignedThinking signed_thinking = 4; // Anthropic
+    string redacted_thinking = 5;       // Anthropic, opaque data
+    Reasoning reasoning = 6;            // OpenAI Responses
   }
+}
+
+message SignedThinking {
+  string text = 1; // may be empty: the signature carries the reasoning
+  string signature = 2;
+}
+
+message Reasoning {
+  string id = 1;
+  string encrypted_content = 2;
+  string summary = 3;
 }
 
 message ToolUse {
@@ -93,6 +113,12 @@ message TurnEnded {
 
 message ErrorEvent {
   string message = 1;
+}
+
+// Everything before this event is replaced, for the model, by `summary`.
+message Compaction {
+  string summary = 1;
+  uint64 tokens_before = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +197,11 @@ message ModelSpec {
   string connection_id = 1;
   string model = 2;
   uint32 max_output_tokens = 3;
+  // "low" | "medium" | "high" | "xhigh" | "max"; empty = model default.
+  string effort = 4;
+  // Connection kind (openai_compat, openai, chatgpt, anthropic), so the
+  // worker can pick the tool profile before fetching credentials.
+  string connection_kind = 5;
 }
 
 message UserInput {

@@ -37,8 +37,8 @@ Carbon6 is an AI coding-agent harness, written in Rust, for one developer workin
 ### 3.2 LLM connections
 The head is where LLM connections are configured. Supported connection types:
 - R-LLM-1: OpenAI-compatible API providers (OpenAI, local LLM servers such as vLLM, Ollama and llama.cpp, gateways such as OpenRouter). Both Chat Completions and the Responses API.
-- R-LLM-2: OpenAI (ChatGPT) subscription via OAuth.
-- R-LLM-3: Claude subscription (Claude Code OAuth).
+- R-LLM-2: OpenAI (ChatGPT) plan via OpenAI's official "Sign in with ChatGPT" for open-source apps (PKCE, dynamic client registration, Responses API).
+- R-LLM-3: Claude subscription. **Not implemented as OAuth:** Anthropic's terms (since February 2026) allow Claude Free/Pro/Max OAuth tokens only in Claude Code and claude.ai, and they enforce this server-side. Proposed alternative, pending a decision: a "Claude Code backend" in which the worker runs the official `claude` CLI headless, signed in with the user's own subscription. Claude via an API key is supported.
 - R-LLM-4: Model calls are made **directly from the worker**, using credentials held by the head (see §5.2).
 - R-LLM-5: Use every conversation optimization the provider offers: prompt caching (cache breakpoints and stable prefixes), extended or adaptive thinking with signature passthrough, reasoning-effort controls, encrypted reasoning carry-over (Responses API), streaming, parallel tool calls.
 - R-LLM-6: Model and effort can be chosen per session and changed mid-session.
@@ -123,5 +123,5 @@ The head is where LLM connections are configured. Supported connection types:
 - D-5 Wire protocol: gRPC/tonic with protobuf bidirectional streams (R-NET-6).
 - D-6 Config: all config on the head; workers keep only a non-authoritative cache (R-HEAD-1a/1b).
 - D-7 Terminals: yes (R-UI-7).
-- D-8 Subscription OAuth: Claude and ChatGPT subscription connections are built behind a feature flag. Check the providers' current terms before relying on them.
+- D-8 Subscription access: ChatGPT uses OpenAI's sanctioned "Sign in with ChatGPT" flow, so it needs no feature flag. Claude subscription OAuth is not built, because Anthropic's terms prohibit it in third-party tools (see R-LLM-3).
 - D-9 Platforms: macOS and Linux only for now.

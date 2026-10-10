@@ -3,18 +3,16 @@
 //! Ollama, LM Studio, OpenRouter, ...).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 
+use crate::http::{self, truncate};
 use crate::sse::SseDecoder;
 use crate::{Block, EventStream, LlmError, ModelClient, ModelEvent, ModelRequest, Role, Usage};
-
-const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Clone)]
 pub struct OpenAiChat {
@@ -26,13 +24,7 @@ pub struct OpenAiChat {
 
 impl OpenAiChat {
     pub fn new(base_url: &str, bearer: &str, headers: HashMap<String, String>) -> Result<Self, LlmError> {
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            // No overall timeout: streams can legitimately run for minutes.
-            .read_timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| LlmError::Config(e.to_string()))?;
+        let http = http::client()?;
         Ok(Self { http, base_url: base_url.trim_end_matches('/').to_owned(), bearer: bearer.to_owned(), headers })
     }
 
@@ -97,33 +89,15 @@ impl OpenAiChat {
             body["max_tokens"] = n.into();
         }
         // Only OpenAI is known to accept this; strict servers reject unknown fields.
-        if let (true, Some(key)) = (self.is_openai(), &req.cache_key) {
-            body["prompt_cache_key"] = key.clone().into();
+        if self.is_openai() {
+            if let Some(key) = &req.cache_key {
+                body["prompt_cache_key"] = key.clone().into();
+            }
+            if let Some(e) = &req.effort {
+                body["reasoning_effort"] = e.clone().into();
+            }
         }
         body
-    }
-
-    async fn send(&self, body: &Value) -> Result<reqwest::Response, LlmError> {
-        let mut req = self.http.post(format!("{}/chat/completions", self.base_url)).json(body);
-        if !self.bearer.is_empty() {
-            req = req.bearer_auth(&self.bearer);
-        }
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        let resp = req.send().await.map_err(|e| LlmError::Network(e.to_string()))?;
-        if resp.status().is_success() {
-            return Ok(resp);
-        }
-        let status = resp.status().as_u16();
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|s| Duration::from_secs_f64(s.clamp(0.0, 120.0)));
-        let body = resp.text().await.unwrap_or_default();
-        Err(LlmError::Http { status, body: truncate(&body, 2000), retry_after })
     }
 }
 
@@ -131,22 +105,11 @@ impl OpenAiChat {
 impl ModelClient for OpenAiChat {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
-        let mut attempt = 0;
-        let resp = loop {
-            attempt += 1;
-            match self.send(&body).await {
-                Ok(r) => break r,
-                Err(e) if e.retryable() && attempt < MAX_ATTEMPTS => {
-                    let wait = match &e {
-                        LlmError::Http { retry_after: Some(d), .. } => *d,
-                        _ => Duration::from_millis(1000 * 2u64.pow(attempt - 1)).min(Duration::from_secs(30)),
-                    };
-                    warn!(error = %e, attempt, ?wait, "model request failed; retrying");
-                    tokio::time::sleep(wait).await;
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let mut headers = self.headers.clone();
+        if !self.bearer.is_empty() {
+            headers.insert("authorization".into(), format!("Bearer {}", self.bearer));
+        }
+        let resp = http::post_json(&self.http, &format!("{}/chat/completions", self.base_url), &headers, &body).await?;
 
         let state = StreamState::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
@@ -343,7 +306,8 @@ impl StreamState {
 /// `GET {base}/models`: ids of the models a connection offers.
 pub async fn list_models(base_url: &str, bearer: &str) -> Result<Vec<String>, LlmError> {
     crate::install_crypto_provider();
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().map_err(|e| LlmError::Config(e.to_string()))?;
+    let http =
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().map_err(|e| LlmError::Config(e.to_string()))?;
     let mut req = http.get(format!("{}/models", base_url.trim_end_matches('/')));
     if !bearer.is_empty() {
         req = req.bearer_auth(bearer);
@@ -366,17 +330,6 @@ pub async fn list_models(base_url: &str, bearer: &str) -> Result<Vec<String>, Ll
     let mut ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
     ids.sort();
     Ok(ids)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]
@@ -447,6 +400,7 @@ mod tests {
             tools: vec![ToolSpec { name: "read".into(), description: "d".into(), parameters: json!({"type":"object"}) }],
             max_output_tokens: None,
             cache_key: Some("k".into()),
+            effort: None,
         };
         let body = c.request_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -471,6 +425,7 @@ mod tests {
             tools: vec![],
             max_output_tokens: None,
             cache_key: None,
+            effort: None,
         };
         let body = c.request_body(&req);
         assert_eq!(body["messages"][2], json!({"role": "assistant", "content": ""}));

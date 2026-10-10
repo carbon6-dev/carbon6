@@ -199,7 +199,7 @@ Workers cache this config in a non-authoritative way so they can run offline. Th
 - OAuth connections (ChatGPT, Claude subscription): the head alone refreshes them, and does so before access tokens expire. It pushes new grants to every connected worker that uses the connection. Workers never see refresh tokens.
 - An offline worker keeps working until its cached access token expires.
 
-**OAuth login in the UI.** These are PKCE flows. Some providers redirect to a `localhost` URL, which doesn't reach a head that isn't on your machine. For those, the UI asks you to paste the final redirect URL (or the code) back into the UI. Subscription connection types are compiled behind the `subscription-auth` cargo feature (D-8).
+**ChatGPT sign-in.** This is OpenAI's "Sign in with ChatGPT" for open-source apps: authorization code with PKCE, dynamic client registration (`dynamic_agent_client` on first use, then the issued `oaiapp_…` id), and the `chatgpt.tokens.use.direct` scope. The redirect must be a loopback URL. The head uses `http://127.0.0.1:<ui port>/auth/callback`, so a browser on the head's machine completes the flow directly. From any other machine, the user pastes the address the browser ended on into the UI. The head never uses the ID token's claims, so it does not verify them. Claude subscription OAuth is not supported (requirements R-LLM-3).
 
 ### 6.3 HTTP API (sketch)
 
@@ -401,7 +401,7 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 | M4 | MCP, skills, subagents, web tools, background shells, OTLP export | Feature parity with the requirements |
 | M5 | Hardening: chaos tests, evals, performance, UX polish | Comfortable as the only harness |
 
-## 16. Implementation notes (M1)
+## 16. Implementation notes (M1, M2)
 
 Decisions made while building M1 that refine the sections above:
 
@@ -409,6 +409,18 @@ Decisions made while building M1 that refine the sections above:
 - **Queued input is recorded at the request boundary.** The worker appends `UserMessage` when the input actually goes into a model request, not when it arrives. Recording it on arrival would interleave it between tool calls and their results in the log. Until then the head shows the input as queued, and a worker restart simply gets it redelivered.
 - **A rejected `Create` fails the session.** The session gets status `failed` with the worker's reason (for example, a missing working directory), and everything queued behind it is rejected.
 - **No head↔worker read loop ever blocks on control replies.** Pongs and acks use `try_send`: acks are cumulative, and losing a pong is harmless. This prevents a deadlock when both directions' buffers fill.
+- **Providers (M2).** There are three wire clients. Anthropic Messages (`anthropic`), OpenAI Responses (`openai`, and `chatgpt` with plan tokens), and Chat Completions (`openai_compat`).
+  - Anthropic: adaptive thinking with `display: "summarized"` and effort via `output_config.effort`. Thinking blocks, including empty ones with only a signature, are stored and sent back unchanged. Caching uses an explicit breakpoint on the system prompt plus top-level automatic caching. Tools use `eager_input_streaming`, and the agent parses tool input strictly.
+  - Responses: `store: false` with `include: ["reasoning.encrypted_content"]`. Reasoning items are kept in output order and sent back.
+  - A client skips another provider's reasoning blocks.
+- **Stop reasons.** If a response hits `max_tokens` with tool calls, none of them run: the model gets an error result for each. A `refusal` ends the turn with an error.
+- **Tool profiles (M2).** The profile is chosen from the model when the session starts and recorded in `SessionStarted.tool_profile`, so the tool list never changes during a session. All three present the same implementations:
+  - Generic: read, write, edit, bash, grep, glob, update_plan.
+  - Claude: Read, Write, Edit, Bash, Grep, Glob, TodoWrite, with Claude Code's parameter names.
+  - Codex: shell (argv), apply_patch (Codex patch format, whole patch validated before writing), update_plan.
+- **Compaction (M2) is "simple compaction".**
+  - When the last request used 85% of the context window, or the provider reports a context overflow, the same model summarizes the conversation. It runs with the same system prompt and tools, so the cached prefix is reused.
+  - A `Compaction` event then replaces the whole history with the summary, and nothing older is sent again. This keeps the history append-only, which providers that check reasoning blocks against the history require.
 - **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
 
 ## 17. Open items to settle during implementation

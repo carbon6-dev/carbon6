@@ -24,6 +24,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections", get(list_connections).post(create_connection))
         .route("/api/v1/connections/{id}", delete(delete_connection))
         .route("/api/v1/connections/{id}/models", get(connection_models))
+        .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
+        .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
+        .route("/auth/callback", get(chatgpt_callback))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
         .route("/api/v1/sessions/{id}/events", get(session_events))
@@ -179,8 +182,16 @@ async fn list_connections(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Ve
 }
 
 async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateConnection>) -> ApiResult<Json<api::Connection>> {
+    let kind = req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()).unwrap_or("openai_compat");
+    let default_url = match kind {
+        "openai_compat" => None,
+        "openai" => Some("https://api.openai.com/v1"),
+        "anthropic" => Some("https://api.anthropic.com"),
+        "chatgpt" => return Err(ApiErr(StatusCode::BAD_REQUEST, "ChatGPT connections are created with Sign in with ChatGPT".into())),
+        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai or anthropic".into())),
+    };
     let name = req.name.trim();
-    let base_url = req.base_url.trim().trim_end_matches('/');
+    let base_url = Some(req.base_url.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).or(default_url).unwrap_or("");
     if name.is_empty() {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "name is required".into()));
     }
@@ -188,10 +199,13 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         return Err(ApiErr(StatusCode::BAD_REQUEST, "base URL must start with http:// or https://".into()));
     }
     let api_key = req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(|k| st.secrets.encrypt(k)).transpose()?;
+    if api_key.is_none() && kind != "openai_compat" {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "an API key is required for this kind of connection".into()));
+    }
     let row = crate::store::ConnectionRow {
         id: uuid::Uuid::now_v7().to_string(),
         name: name.to_owned(),
-        kind: "openai_compat".into(),
+        kind: kind.to_owned(),
         base_url: base_url.to_owned(),
         api_key,
         default_model: req.default_model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
@@ -199,6 +213,67 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
     };
     st.store.insert_connection(&row).await?;
     Ok(Json(connection_view(row)))
+}
+
+async fn chatgpt_start(State(st): State<Arc<HeadState>>, Json(req): Json<api::StartChatGptSignIn>) -> ApiResult<Json<api::ChatGptSignIn>> {
+    let name = Some(req.name.trim()).filter(|n| !n.is_empty()).unwrap_or("ChatGPT").to_owned();
+    // Reuse the client id issued to us by an earlier sign-in.
+    let mut client_id = None;
+    for c in st.store.connections().await?.into_iter().filter(|c| c.kind == "chatgpt") {
+        if let Some(t) = c
+            .api_key
+            .as_deref()
+            .and_then(|k| st.secrets.decrypt(k).ok())
+            .and_then(|j| serde_json::from_str::<crate::oauth::ChatGptTokens>(&j).ok())
+        {
+            client_id = Some(t.client_id);
+            break;
+        }
+    }
+    Ok(Json(api::ChatGptSignIn { authorize_url: st.oauth.start(&name, st.ui_port, client_id) }))
+}
+
+async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::Connection> {
+    let done = st.oauth.complete(&st.http, callback).await?;
+    let row = crate::store::ConnectionRow {
+        id: uuid::Uuid::now_v7().to_string(),
+        name: done.name,
+        kind: "chatgpt".into(),
+        base_url: crate::oauth::RESOURCE.into(),
+        api_key: Some(st.secrets.encrypt(&serde_json::to_string(&done.tokens)?)?),
+        default_model: None,
+        created_at: now_ms(),
+    };
+    st.store.insert_connection(&row).await?;
+    Ok(connection_view(row))
+}
+
+async fn chatgpt_complete(
+    State(st): State<Arc<HeadState>>,
+    Json(req): Json<api::CompleteChatGptSignIn>,
+) -> ApiResult<Json<api::Connection>> {
+    Ok(Json(finish_chatgpt(&st, &req.callback_url).await?))
+}
+
+/// The OAuth redirect lands here when the browser runs on the head machine.
+async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Response {
+    let query = uri.query().unwrap_or_default();
+    match finish_chatgpt(&st, query).await {
+        Ok(_) => axum::response::Redirect::to("/settings?signed_in=chatgpt").into_response(),
+        Err(e) => {
+            let msg =
+                e.downcast_ref::<crate::UserError>().map(|u| u.to_string()).unwrap_or_else(|| "sign-in failed; see the head's log".into());
+            let html = format!(
+                "<!doctype html><meta charset=utf-8><title>carbon6</title><p style=\"font-family:sans-serif\">ChatGPT sign-in failed: {}</p><p><a href=\"/settings\">Back to settings</a></p>",
+                html_escape(&msg)
+            );
+            (StatusCode::BAD_REQUEST, axum::response::Html(html)).into_response()
+        }
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
@@ -212,8 +287,16 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
 /// all model calls for sessions happen on workers.
 async fn connection_models(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<String>>> {
     let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
-    let key = c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default();
-    c6_llm::openai_chat::list_models(&c.base_url, &key).await.map(Json).map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, e.to_string()))
+    let (key, anthropic) = match c.kind.as_str() {
+        "chatgpt" => (crate::sessions::chatgpt_tokens(&st, &c.id).await?.access_token, false),
+        kind => (c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default(), kind == "anthropic"),
+    };
+    let models = if anthropic {
+        c6_llm::anthropic::list_models(&c.base_url, &key).await
+    } else {
+        c6_llm::openai_chat::list_models(&c.base_url, &key).await
+    };
+    models.map(Json).map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
 // --- Sessions -------------------------------------------------------------------

@@ -1,7 +1,11 @@
 //! Model clients and the provider-neutral conversation model.
 
 mod accumulate;
+pub mod anthropic;
+mod http;
+pub mod models;
 pub mod openai_chat;
+pub mod openai_responses;
 mod sse;
 
 use std::time::Duration;
@@ -11,6 +15,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 pub use accumulate::Accumulator;
+pub use models::{ModelInfo, ToolProfile, model_info};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -18,12 +23,37 @@ pub enum Role {
     Assistant,
 }
 
+/// One piece of a message. Reasoning variants are provider-specific and are
+/// replayed verbatim to the provider family that produced them; other
+/// families skip them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Block {
     Text(String),
+    /// Unsigned reasoning text (Chat Completions servers). Display only.
     Thinking(String),
-    ToolUse { id: String, name: String, input_json: String },
-    ToolResult { id: String, content: String, is_error: bool },
+    /// Anthropic thinking. Must go back unchanged, even with empty text.
+    SignedThinking {
+        text: String,
+        signature: String,
+    },
+    /// Anthropic redacted thinking (opaque).
+    RedactedThinking(String),
+    /// OpenAI Responses reasoning item, carried statelessly.
+    Reasoning {
+        id: String,
+        encrypted: String,
+        summary: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,6 +92,8 @@ pub struct ModelRequest {
     pub max_output_tokens: Option<u32>,
     /// Stable per-conversation key for providers with keyed prefix caching.
     pub cache_key: Option<String>,
+    /// Reasoning effort ("low" … "max"); `None` uses the model default.
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,10 +119,24 @@ pub enum ModelEvent {
         index: u32,
         args: String,
     },
+    /// A finished block at position `index` of the response. Providers that
+    /// emit these (Anthropic, Responses) define the message content entirely
+    /// by them; deltas are then for live display only.
+    Block {
+        index: u32,
+        block: Block,
+    },
     Usage(Usage),
     Done {
         stop_reason: String,
     },
+}
+
+/// Normalized stop reasons the agent loop acts on.
+pub mod stop {
+    pub const MAX_TOKENS: &str = "max_tokens";
+    pub const REFUSAL: &str = "refusal";
+    pub const CONTEXT_EXCEEDED: &str = "model_context_window_exceeded";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +149,9 @@ pub enum LlmError {
     Protocol(String),
     #[error("{0}")]
     Config(String),
+    /// The request does not fit the model's context window.
+    #[error("context window exceeded: {0}")]
+    ContextOverflow(String),
 }
 
 impl LlmError {
@@ -121,6 +170,40 @@ pub type EventStream = BoxStream<'static, Result<ModelEvent, LlmError>>;
 pub trait ModelClient: Send + Sync {
     /// Starts a streaming completion. Dropping the stream cancels the request.
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError>;
+}
+
+/// Which wire protocol a connection speaks. Matches `CredentialGrant.kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+}
+
+impl Provider {
+    /// Connection kinds: `openai_compat`, `openai`, `chatgpt`, `anthropic`.
+    pub fn from_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "openai_compat" | "" => Some(Self::OpenAiChat),
+            "openai" | "chatgpt" => Some(Self::OpenAiResponses),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+}
+
+/// Builds the client for a connection kind.
+pub fn client_for(
+    kind: &str,
+    base_url: &str,
+    bearer: &str,
+    headers: std::collections::HashMap<String, String>,
+) -> Result<Box<dyn ModelClient>, LlmError> {
+    Ok(match Provider::from_kind(kind).ok_or_else(|| LlmError::Config(format!("unknown connection kind `{kind}`")))? {
+        Provider::OpenAiChat => Box::new(openai_chat::OpenAiChat::new(base_url, bearer, headers)?),
+        Provider::OpenAiResponses => Box::new(openai_responses::OpenAiResponses::new(base_url, bearer, headers, kind == "chatgpt")?),
+        Provider::Anthropic => Box::new(anthropic::Anthropic::new(base_url, bearer, headers)?),
+    })
 }
 
 /// rustls needs one process-wide crypto provider; we standardize on ring.

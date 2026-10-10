@@ -21,10 +21,20 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
             Some(session_event::Kind::ToolResult(r)) => {
                 push_user_block(&mut msgs, Block::ToolResult { id: r.call_id.clone(), content: r.output.clone(), is_error: r.is_error })
             }
+            // Simple compaction: the summary replaces everything before it.
+            Some(session_event::Kind::Compaction(c)) => msgs = vec![Message::user_text(compacted_context(&c.summary))],
             _ => {}
         }
     }
     repair_tool_results(msgs)
+}
+
+/// The user message that stands in for a compacted conversation.
+pub fn compacted_context(summary: &str) -> String {
+    format!(
+        "This session continues from an earlier conversation that was compacted to fit the context window. \
+         Summary of the work so far:\n\n{summary}\n\nContinue from where it left off."
+    )
 }
 
 pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
@@ -33,6 +43,11 @@ pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
         content_block::Block::Thinking(t) => Some(Block::Thinking(t.clone())),
         content_block::Block::ToolUse(u) => {
             Some(Block::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() })
+        }
+        content_block::Block::SignedThinking(t) => Some(Block::SignedThinking { text: t.text.clone(), signature: t.signature.clone() }),
+        content_block::Block::RedactedThinking(d) => Some(Block::RedactedThinking(d.clone())),
+        content_block::Block::Reasoning(r) => {
+            Some(Block::Reasoning { id: r.id.clone(), encrypted: r.encrypted_content.clone(), summary: r.summary.clone() })
         }
     }
 }
@@ -44,6 +59,15 @@ pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
         Block::ToolUse { id, name, input_json } => {
             content_block::Block::ToolUse(c6_proto::ToolUse { id: id.clone(), name: name.clone(), input_json: input_json.clone() })
         }
+        Block::SignedThinking { text, signature } => {
+            content_block::Block::SignedThinking(c6_proto::SignedThinking { text: text.clone(), signature: signature.clone() })
+        }
+        Block::RedactedThinking(d) => content_block::Block::RedactedThinking(d.clone()),
+        Block::Reasoning { id, encrypted, summary } => content_block::Block::Reasoning(c6_proto::Reasoning {
+            id: id.clone(),
+            encrypted_content: encrypted.clone(),
+            summary: summary.clone(),
+        }),
         Block::ToolResult { .. } => return None,
     };
     Some(c6_proto::ContentBlock { block: Some(block) })

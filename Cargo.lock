@@ -412,6 +412,7 @@ dependencies = [
  "prost",
  "rand 0.10.3",
  "rcgen",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
@@ -427,6 +428,7 @@ dependencies = [
  "tonic",
  "tower-http 0.7.1",
  "tracing",
+ "url",
  "uuid",
  "x509-parser",
 ]
@@ -2980,6 +2982,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
