@@ -43,7 +43,14 @@ impl HostGuard {
     }
 }
 
-pub async fn check(State(guard): State<HostGuard>, req: Request, next: Next) -> Response {
+pub async fn check(State(guard): State<HostGuard>, mut req: Request, next: Next) -> Response {
+    // HTTP/2 carries the host in the URI (`:authority`), not in Host; give
+    // later layers a Host either way.
+    if !req.headers().contains_key(header::HOST)
+        && let Some(v) = req.uri().authority().and_then(|a| header::HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(header::HOST, v);
+    }
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").to_owned();
     if !guard.host_ok(&host) {
         let msg = format!(

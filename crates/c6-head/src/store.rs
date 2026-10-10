@@ -10,7 +10,7 @@ use sqlx::{FromRow, Row};
 
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 #[derive(Clone, Debug, FromRow)]

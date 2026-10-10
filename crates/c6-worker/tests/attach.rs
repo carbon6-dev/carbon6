@@ -10,7 +10,14 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 fn head_config(data_dir: &Path, worker_port: u16) -> HeadConfig {
-    HeadConfig { data_dir: data_dir.to_owned(), bind: vec!["127.0.0.1".parse().unwrap()], ui_port: 0, worker_port, ..Default::default() }
+    HeadConfig {
+        data_dir: data_dir.to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port,
+        auth: false,
+        ..Default::default()
+    }
 }
 
 async fn wait_for(rx: &mut watch::Receiver<ConnState>, pred: impl Fn(&ConnState) -> bool) -> ConnState {

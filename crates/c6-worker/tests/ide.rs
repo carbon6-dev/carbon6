@@ -30,6 +30,7 @@ async fn setup() -> Setup {
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port: 0,
         worker_port: 0,
+        auth: false,
         ..Default::default()
     };
     let head = c6_head::start(cfg).await.unwrap();

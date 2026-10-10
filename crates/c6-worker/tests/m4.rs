@@ -61,6 +61,7 @@ async fn subagents_mcp_skills_and_otlp() {
         ui_port: 0,
         worker_port: 0,
         otlp_endpoint: Some(format!("http://{collector_addr}")),
+        auth: false,
         ..Default::default()
     };
     let head = c6_head::start(cfg).await.unwrap();

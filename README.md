@@ -53,8 +53,9 @@ On the head machine:
 c6h               # binds private/tailnet addresses only; prints the web UI URL
 ```
 
-1. In the UI, add an LLM connection under **Settings**. For a local Ollama, use `http://127.0.0.1:11434/v1` with no key.
-2. On the **Workers** page, click **Add worker**, then run the printed command on the worker machine (or create a token with `c6h enroll-token` on the head):
+1. Sign in: run `c6h login-link` on the head and open the link it prints (it works once, for 15 minutes). Then add a passkey under **Settings → Sign-in**, and sign in with Touch ID, Face ID or a security key from then on. A new link always gets you back in.
+2. In the UI, add an LLM connection under **Settings**. For a local Ollama, use `http://127.0.0.1:11434/v1` with no key.
+3. On the **Workers** page, click **Add worker**, then run the printed command on the worker machine (or create a token with `c6h enroll-token` on the head):
 
 ```bash
 c6w enroll c6e1.…
@@ -64,7 +65,9 @@ c6w run
 ### Configuration
 
 - **Head:** `~/.config/c6h/c6h.toml`, optional (see `crates/c6-head/src/config.rs`).
-  - Add any names you reach the head by, such as a MagicDNS name, to `extra_names`; the head refuses requests addressed to other names.
+  - Add any names you reach the head by to `extra_names`; the head refuses requests addressed to other names. Its Tailscale MagicDNS name is added automatically.
+  - Passkeys need HTTPS (or `http://localhost`). `ui_tls_tailscale = true` serves the UI with this machine's Tailscale certificate (enable HTTPS certificates for the tailnet in the admin console, under DNS); or set `ui_tls_cert`/`ui_tls_key` to PEM files. Plain HTTP on the UI port then redirects to the HTTPS name.
+  - Sign-in is on by default; `auth = false` turns it off.
   - Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
   - MCP servers and skills are configured in the UI.
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
@@ -76,6 +79,7 @@ c6w run
 make dev-head                     # head on all interfaces using dev/c6h.toml, state in target/dev
 make dev-token                    # prints a token
 make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it (later: just make dev-worker)
+make dev-login-link               # a one-time link to sign in to the dev UI
 ```
 
 - For UI work, `cd crates/c6-ui && trunk serve` proxies `/api` to the dev head.

@@ -49,11 +49,13 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/workers/{id}/terminals/{tid}", delete(close_terminal))
         .route("/api/v1/workers/{id}/terminals/{tid}/attach", get(attach_terminal))
         .route("/api/v1/live", get(live))
+        .merge(crate::auth::routes())
         .fallback(static_asset)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
         .with_state(state)
 }
 
-pub struct ApiErr(StatusCode, String);
+pub struct ApiErr(pub StatusCode, pub String);
 
 impl IntoResponse for ApiErr {
     fn into_response(self) -> Response {

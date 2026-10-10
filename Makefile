@@ -15,8 +15,8 @@ ARCH         := $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/
 UI_PORT      ?= 7700
 WORKER_PORT  ?= 7701
 
-.PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token \
-        ui build test dev-head dev-token dev-worker clean
+.PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
+        ui build test dev-head dev-token dev-login-link dev-worker clean
 
 help: ## Show this help
 	@echo "Usage: make <target> [VAR=value]"
@@ -57,6 +57,9 @@ docker-head-stop: ## Stop and remove the head container (the c6h-data volume is 
 docker-token: ## Print a worker enrollment token from the running head container
 	@$(DOCKER) exec c6h c6h --config /etc/c6h/c6h.toml enroll-token
 
+docker-login-link: ## Print a one-time web UI login link from the running head container
+	@$(DOCKER) exec c6h c6h --config /etc/c6h/c6h.toml login-link
+
 ##@ Local toolchain
 
 ui: ## Build the web UI into crates/c6-ui/dist (embedded into c6h)
@@ -73,6 +76,9 @@ dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml, state in targe
 
 dev-token: ## Print an enrollment token from the dev head's database
 	@cargo run -q -p c6h -- --config dev/c6h.toml enroll-token --name dev
+
+dev-login-link: ## Print a one-time web UI login link for the dev head
+	@cargo run -q -p c6h -- --config dev/c6h.toml login-link
 
 dev-worker: ## Run the dev worker (pass TOKEN=... to enroll it first)
 	@if [ -n "$(TOKEN)" ]; then cargo run -p c6w -- --state-dir target/dev/c6w enroll --force "$(TOKEN)"; fi

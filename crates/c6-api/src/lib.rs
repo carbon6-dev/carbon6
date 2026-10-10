@@ -340,3 +340,55 @@ pub enum StreamMsg {
 pub struct ApiError {
     pub error: String,
 }
+
+// --- Sign-in ------------------------------------------------------------------
+
+/// `GET /api/v1/auth/status`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub authenticated: bool,
+    /// The head requires sign-in (`auth = true`, the default).
+    pub required: bool,
+    /// Passkeys work at the address this page was loaded from (HTTPS with a
+    /// host name, or `localhost`).
+    pub passkeys_here: bool,
+    /// Passkeys exist for this host name.
+    pub has_passkeys: bool,
+}
+
+/// `POST /api/v1/auth/link`: redeem a one-time login link.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RedeemLink {
+    pub token: String,
+}
+
+/// `POST /api/v1/auth/passkeys/register/finish`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegisterPasskey {
+    pub name: String,
+    /// What `navigator.credentials.create` returned, as the UI encodes it.
+    pub credential: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Passkey {
+    pub id: String,
+    pub name: String,
+    /// The host name it signs in to.
+    pub rp_id: String,
+    pub created_at: UnixMs,
+    pub last_used_at: Option<UnixMs>,
+}
+
+/// A signed-in browser.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthSession {
+    pub id: String,
+    /// "passkey" or "link".
+    pub method: String,
+    pub user_agent: Option<String>,
+    pub created_at: UnixMs,
+    pub last_seen_at: UnixMs,
+    /// The session making this request.
+    pub current: bool,
+}

@@ -19,6 +19,7 @@ dirs = "7.0.0"
 futures = "0.3.34"
 gethostname = "1.1.0"
 hex = "0.4.3"
+hyper-util = { version = "0.1.21", features = ["server-auto", "tokio", "service"] }
 if-addrs = "0.15.0"
 mime_guess = "2.0.5"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
@@ -26,6 +27,9 @@ pem = "4.0.0"
 prost = "0.14.4"
 rand = "0.10.3"
 rcgen = { version = "0.14.10", features = ["x509-parser", "pem"] }
+ring = "0.17.14"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.15.0", features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form", "http2"] }
 rust-embed = "8.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -35,6 +39,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 thiserror = "2.0.21"
 time = "0.3.55"
 tokio = { version = "1.53.2", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-stream = "0.1.19"
 tokio-util = "0.7.20"
 toml = "1.1.8"

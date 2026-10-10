@@ -388,6 +388,7 @@ name = "c6-api"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -443,6 +444,7 @@ dependencies = [
  "futures",
  "gethostname",
  "hex",
+ "hyper-util",
  "if-addrs",
  "mime_guess",
  "opentelemetry-proto",
@@ -451,7 +453,10 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "reqwest",
+ "ring",
  "rust-embed",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -460,6 +465,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "toml",

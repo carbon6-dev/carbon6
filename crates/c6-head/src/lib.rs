@@ -1,6 +1,7 @@
 //! The carbon6 head (`c6h`): system of record, worker hub and web UI server.
 
 pub mod api;
+pub mod auth;
 pub mod config;
 mod convert;
 pub mod guard;
@@ -13,6 +14,8 @@ pub mod sessions;
 pub mod store;
 pub mod telemetry;
 pub mod terminals;
+pub mod tls;
+mod webauthn;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -62,6 +65,7 @@ pub struct HeadState {
     pub hub: sessions::LiveHub,
     pub oauth: oauth::OAuth,
     pub terminals: terminals::Attaches,
+    pub auth: auth::Auth,
     pub otlp: Option<telemetry::Otlp>,
     /// For OAuth token exchange and model listing.
     pub http: reqwest::Client,
@@ -77,6 +81,8 @@ pub struct Head {
     pub state: Arc<HeadState>,
     pub ui_addrs: Vec<SocketAddr>,
     pub worker_addrs: Vec<SocketAddr>,
+    /// Where to open the web UI.
+    pub ui_urls: Vec<String>,
     shutdown: CancellationToken,
     tasks: JoinSet<anyhow::Result<()>>,
 }
@@ -136,6 +142,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         hub: Default::default(),
         oauth: Default::default(),
         terminals: Default::default(),
+        auth: auth::Auth::new(cfg.auth),
         otlp: telemetry::Otlp::from_config(cfg.otlp_endpoint.as_deref(), cfg.otlp_headers.clone()),
         http,
         ui_port: ui_addrs[0].port(),
@@ -171,16 +178,41 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     // Literal loopback addresses can't be rebound, and are how a published
     // container port is usually reached.
     names.extend(["127.0.0.1".to_owned(), "[::1]".to_owned()]);
+    let ui_tls = tls::UiTls::setup(&cfg).await?.map(Arc::new);
+    if let Some(t) = &ui_tls {
+        names.push(t.name.clone());
+        t.spawn_refresh(shutdown.clone());
+    }
     let guard = guard::HostGuard::new(&ui_reach, &names);
     let app = api::router(state.clone()).layer(axum::middleware::from_fn_with_state(guard, guard::check));
     for listener in ui_listeners {
-        let app = app.clone();
-        let token = shutdown.clone();
-        tasks.spawn(async move { axum::serve(listener, app).with_graceful_shutdown(token.cancelled_owned()).await.context("UI port") });
+        let (app, token) = (app.clone(), shutdown.clone());
+        let tls = match &ui_tls {
+            Some(t) => Some((t.acceptor()?, t.name.clone())),
+            None => None,
+        };
+        tasks.spawn(async move { tls::serve(listener, app, tls, token).await.context("UI port") });
     }
+    let port = ui_addrs[0].port();
+    let ui_urls = match &ui_tls {
+        Some(t) => vec![format!("https://{}:{port}", t.name)],
+        None => {
+            // localhost (where passkeys work over HTTP) when reachable there,
+            // and the tailnet name.
+            let mut urls = Vec::new();
+            if ui_reach.iter().any(|a| a.ip().is_loopback()) {
+                urls.push(format!("http://localhost:{port}"));
+            }
+            urls.extend(cfg.extra_names.iter().find(|n| n.contains('.')).map(|n| format!("http://{n}:{port}")));
+            if urls.is_empty() {
+                urls = ui_addrs.iter().map(|a| format!("http://{a}")).collect();
+            }
+            urls
+        }
+    };
 
-    info!(ui = ?ui_addrs, worker = ?worker_addrs, worker_url = %state.worker_url, "head started");
-    Ok(Head { state, ui_addrs, worker_addrs, shutdown, tasks })
+    info!(ui = ?ui_urls, worker = ?worker_addrs, worker_url = %state.worker_url, auth = cfg.auth, "head started");
+    Ok(Head { state, ui_addrs, worker_addrs, ui_urls, shutdown, tasks })
 }
 
 /// The URL workers dial, plus the IPs and DNS names the server certificate
@@ -225,6 +257,28 @@ pub async fn create_enrollment(
 
 /// Creates an enrollment without a running head (for `c6h enroll-token`).
 /// Safe to run alongside a running head: SQLite WAL allows it.
+/// A one-time login link, made without the head running (or beside it):
+/// one URL per way to reach the UI.
+pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
+    let token = store.create_login_link().await?;
+    let port = cfg.ui_port;
+    let tailnet = config::tailnet_names().await;
+    let bases: Vec<String> = if let (Some(cert), Some(_)) = (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
+        vec![format!("https://{}:{port}", tls::cert_name(cert)?)]
+    } else if cfg.ui_tls_tailscale
+        // The head has a certificate (it falls back to HTTP without one).
+        && cfg.data_dir.join("ui-tls/cert.pem").exists()
+        && let Some(name) = tailnet.first()
+    {
+        vec![format!("https://{name}:{port}")]
+    } else {
+        std::iter::once("localhost".to_owned()).chain(tailnet.into_iter().take(1)).map(|h| format!("http://{h}:{port}")).collect()
+    };
+    Ok(bases.into_iter().map(|b| format!("{b}/login/{token}")).collect())
+}
+
 pub async fn offline_enrollment(mut cfg: HeadConfig, name: Option<&str>) -> anyhow::Result<c6_api::Enrollment> {
     cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;

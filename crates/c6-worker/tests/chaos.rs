@@ -19,6 +19,7 @@ fn cfg(dir: &Path, ui: u16, worker: u16) -> HeadConfig {
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port: ui,
         worker_port: worker,
+        auth: false,
         ..Default::default()
     }
 }

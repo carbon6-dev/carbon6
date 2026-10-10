@@ -1,6 +1,7 @@
 //! carbon6 web UI (Leptos CSR). Talks only to the head's `/api/v1`.
 
 mod api;
+mod auth;
 mod files;
 mod fleet;
 mod markdown;
@@ -20,13 +21,34 @@ fn main() {
     leptos::mount::mount_to_body(App);
 }
 
+/// Signs the browser in first: until then only the sign-in pages render, so
+/// nothing else talks to the head.
 #[component]
 fn App() -> impl IntoView {
+    let status = LocalResource::new(api::auth_status);
+    let signed_out = api::signed_out();
+    view! {
+        <Router>
+            {move || match status.get() {
+                None => ().into_any(),
+                Some(Ok(s)) if s.authenticated && !signed_out.get() => view! { <Main /> }.into_any(),
+                Some(Ok(s)) => view! {
+                    <Routes fallback=move || view! { <auth::SignIn status=s.clone() /> }>
+                        <Route path=path!("/login/:token") view=auth::LinkSignIn />
+                    </Routes>
+                }.into_any(),
+                Some(Err(e)) => view! { <div class="p-8"><util::ErrorBox message=format!("Cannot reach the head: {e}") /></div> }.into_any(),
+            }}
+        </Router>
+    }
+}
+
+#[component]
+fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
     notify::watch_sessions(live);
     view! {
-        <Router>
             <div class="min-h-screen">
                 <header class="sticky top-0 z-20 border-b border-zinc-200 bg-zinc-50/90 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90">
                     <div class="mx-auto flex h-12 max-w-6xl items-center justify-between gap-4 px-4">
@@ -48,9 +70,9 @@ fn App() -> impl IntoView {
                     <Route path=path!("/workers") view=fleet::FleetPage />
                     <Route path=path!("/workers/:id") view=fleet::WorkerPage />
                     <Route path=path!("/settings") view=settings::SettingsPage />
+                    <Route path=path!("/login/:token") view=auth::LinkSignIn />
                 </Routes>
             </div>
-        </Router>
     }
 }
 

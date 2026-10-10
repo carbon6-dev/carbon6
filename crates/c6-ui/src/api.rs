@@ -102,10 +102,23 @@ pub fn ws_url(path: &str) -> String {
     format!("{scheme}://{}{path}", loc.host().unwrap_or_default())
 }
 
+thread_local! {
+    /// Set when the head answers 401: the session ended (expired, revoked,
+    /// signed out elsewhere). The app then shows the sign-in page.
+    static SIGNED_OUT: RwSignal<bool> = RwSignal::new(false);
+}
+
+pub fn signed_out() -> RwSignal<bool> {
+    SIGNED_OUT.with(|s| *s)
+}
+
 async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, String> {
     let resp = resp.map_err(|e| e.to_string())?;
     if resp.ok() {
         return Ok(resp);
+    }
+    if resp.status() == 401 {
+        signed_out().set(true);
     }
     let msg = resp.json::<c6_api::ApiError>().await.map(|e| e.error).unwrap_or_else(|_| resp.status_text());
     Err(msg)
@@ -263,4 +276,46 @@ pub async fn test_connection(
 ) -> Result<Vec<String>, String> {
     let body = serde_json::json!({"kind": kind, "base_url": base_url, "api_key": api_key, "connection_id": connection_id});
     send_json(Request::post("/api/v1/connections/test"), &body).await
+}
+
+// --- Sign-in ------------------------------------------------------------------
+
+pub async fn auth_status() -> Result<c6_api::AuthStatus, String> {
+    json(Request::get("/api/v1/auth/status").send().await).await
+}
+
+pub async fn redeem_link(token: String) -> Result<(), String> {
+    empty(Request::post("/api/v1/auth/link").json(&c6_api::RedeemLink { token }).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn logout() -> Result<(), String> {
+    empty(Request::post("/api/v1/auth/logout").send().await).await
+}
+
+pub async fn passkey_options(path: &str) -> Result<serde_json::Value, String> {
+    json(Request::post(&format!("/api/v1/auth/passkeys/{path}/begin")).send().await).await
+}
+
+pub async fn passkey_login(credential: serde_json::Value) -> Result<(), String> {
+    empty(Request::post("/api/v1/auth/passkeys/login/finish").json(&credential).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn passkey_register(name: String, credential: serde_json::Value) -> Result<c6_api::Passkey, String> {
+    send_json(Request::post("/api/v1/auth/passkeys/register/finish"), &c6_api::RegisterPasskey { name, credential }).await
+}
+
+pub async fn passkeys() -> Result<Vec<c6_api::Passkey>, String> {
+    json(Request::get("/api/v1/auth/passkeys").send().await).await
+}
+
+pub async fn delete_passkey(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/auth/passkeys/{id}")).send().await).await
+}
+
+pub async fn auth_sessions() -> Result<Vec<c6_api::AuthSession>, String> {
+    json(Request::get("/api/v1/auth/sessions").send().await).await
+}
+
+pub async fn delete_auth_session(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/auth/sessions/{id}")).send().await).await
 }

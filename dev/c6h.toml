@@ -5,3 +5,8 @@ data_dir = "target/dev/c6h"
 # use it. For loopback only, use bind = ["127.0.0.1"] and drop the next line.
 bind = ["0.0.0.0"]
 allow_public_bind = true
+# HTTPS with this machine's Tailscale certificate, so passkeys work at
+# https://<machine>.<tailnet>.ts.net:7700. Needs HTTPS certificates enabled
+# for the tailnet (admin console → DNS); until then the head serves HTTP and
+# you sign in with `make dev-login-link` (passkeys work on http://localhost).
+ui_tls_tailscale = true

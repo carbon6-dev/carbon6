@@ -84,6 +84,7 @@ async fn side_chats_branch_continue_nest_and_restore() {
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port: 0,
         worker_port: 0,
+        auth: false,
         ..Default::default()
     })
     .await

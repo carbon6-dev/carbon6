@@ -31,6 +31,14 @@ pub struct HeadConfig {
     /// back to `OTEL_EXPORTER_OTLP_ENDPOINT`.
     pub otlp_endpoint: Option<String>,
     pub otlp_headers: std::collections::HashMap<String, String>,
+    /// Require sign-in (passkey or login link) for the web UI and API.
+    pub auth: bool,
+    /// HTTPS for the web UI from these PEM files (certificate chain, key).
+    pub ui_tls_cert: Option<PathBuf>,
+    pub ui_tls_key: Option<PathBuf>,
+    /// HTTPS for the web UI with a Tailscale certificate for this machine's
+    /// MagicDNS name (`tailscale cert`; HTTPS must be enabled for the tailnet).
+    pub ui_tls_tailscale: bool,
 }
 
 impl Default for HeadConfig {
@@ -45,6 +53,10 @@ impl Default for HeadConfig {
             allow_public_bind: false,
             otlp_endpoint: None,
             otlp_headers: Default::default(),
+            auth: true,
+            ui_tls_cert: None,
+            ui_tls_key: None,
+            ui_tls_tailscale: false,
         }
     }
 }
@@ -133,22 +145,29 @@ pub fn reachable_addrs(listen: &[SocketAddr]) -> anyhow::Result<Vec<SocketAddr>>
 /// `darkstar.example.ts.net` and `darkstar`), so the head answers to them
 /// without configuration. Empty when Tailscale is not installed or not up.
 pub async fn tailnet_names() -> Vec<String> {
-    const CLIS: [&str; 2] = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"];
-    for cli in CLIS {
-        let run = tokio::process::Command::new(cli).args(["status", "--json"]).kill_on_drop(true).output();
-        let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(3), run).await else { continue };
-        if !out.status.success() {
-            continue;
+    let Some(cli) = tailscale_cli().await else { return Vec::new() };
+    let run = tokio::process::Command::new(cli).args(["status", "--json"]).kill_on_drop(true).output();
+    let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(3), run).await else { return Vec::new() };
+    let status = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or_default();
+    let Some(full) = status["Self"]["DNSName"].as_str().map(|n| n.trim_end_matches('.')).filter(|n| !n.is_empty()) else {
+        return Vec::new();
+    };
+    let mut names = vec![full.to_ascii_lowercase()];
+    names.extend(full.split('.').next().filter(|s| *s != full).map(str::to_ascii_lowercase));
+    names
+}
+
+/// The Tailscale CLI: on the PATH, or inside the macOS app.
+pub async fn tailscale_cli() -> Option<&'static str> {
+    for cli in ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"] {
+        let run = tokio::process::Command::new(cli).arg("version").kill_on_drop(true).output();
+        if let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(3), run).await
+            && out.status.success()
+        {
+            return Some(cli);
         }
-        let Ok(status) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { continue };
-        let Some(full) = status["Self"]["DNSName"].as_str().map(|n| n.trim_end_matches('.')).filter(|n| !n.is_empty()) else {
-            continue;
-        };
-        let mut names = vec![full.to_ascii_lowercase()];
-        names.extend(full.split('.').next().filter(|s| *s != full).map(str::to_ascii_lowercase));
-        return names;
     }
-    Vec::new()
+    None
 }
 
 fn private_interface_ips() -> anyhow::Result<Vec<IpAddr>> {

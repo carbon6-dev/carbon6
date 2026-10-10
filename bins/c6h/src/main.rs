@@ -26,6 +26,10 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Print a one-time link that signs a browser in to the web UI (valid
+    /// for 15 minutes). Use it to sign in the first time, then add a passkey
+    /// under Settings, or to recover after losing your passkeys.
+    LoginLink,
 }
 
 #[tokio::main]
@@ -37,9 +41,13 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
+            let auth = cfg.auth;
             let mut head = c6_head::start(cfg).await?;
-            for addr in &head.ui_addrs {
-                eprintln!("web UI: http://{addr}");
+            for url in &head.ui_urls {
+                eprintln!("web UI: {url}");
+            }
+            if auth {
+                eprintln!("sign in with a passkey, or run `c6h login-link` for a one-time link");
             }
             let token = head.shutdown_token();
             tokio::spawn(async move {
@@ -47,6 +55,13 @@ async fn main() -> anyhow::Result<()> {
                 token.cancel();
             });
             head.wait().await
+        }
+        Command::LoginLink => {
+            for url in c6_head::offline_login_link(cfg).await.context("creating login link")? {
+                println!("{url}");
+            }
+            eprintln!("Open one of these within 15 minutes; it works once. Then add a passkey under Settings → Sign-in.");
+            Ok(())
         }
         Command::EnrollToken { name } => {
             let enrollment = c6_head::offline_enrollment(cfg, name.as_deref()).await.context("creating enrollment")?;
