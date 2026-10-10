@@ -265,7 +265,7 @@ fn SessionView(id: String) -> impl IntoView {
     let choice = ModelChoice::follow(events, Default::default());
     let model_label = Memo::new(move |_| {
         let (_, m, e) = choice.current.get();
-        if e.is_empty() { m } else { format!("{m} · {e}") }
+        model_label(&m, &e)
     });
     let id_stored = StoredValue::new(id.clone());
     let navigate = use_navigate();
@@ -492,7 +492,7 @@ fn side_chat(s: Session, open_now: bool) -> AnyView {
     };
     // The row's model is current as of loading the page; an open side chat
     // keeps it current from its log (model switches).
-    let (title, model) = (s.title.clone(), RwSignal::new(s.model.clone()));
+    let (title, model) = (s.title.clone(), RwSignal::new(model_label(&s.model, s.effort.as_deref().unwrap_or_default())));
     let s = StoredValue::new(s);
     view! {
         <div class="ml-2 border-l-2 border-sky-300 pl-3 dark:border-sky-800">
@@ -520,7 +520,7 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     let choice = ModelChoice::follow(feed.events, start);
     Effect::new(move || {
         let (_, m, e) = choice.current.get();
-        model_label.set(if e.is_empty() { m } else { format!("{m} · {e}") });
+        model_label.set(self::model_label(&m, &e));
     });
     view! {
         <div class="space-y-3 pb-2 pt-1">
@@ -688,6 +688,11 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
         </div>
     }
+}
+
+/// "model · effort", or just the model when it runs at its default effort.
+fn model_label(model: &str, effort: &str) -> String {
+    if effort.is_empty() { model.to_owned() } else { format!("{model} · {effort}") }
 }
 
 fn tokens(n: u64) -> String {
