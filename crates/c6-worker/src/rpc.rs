@@ -20,6 +20,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
     match method {
         "fs.list" => fs_list(serde_json::from_value(params)?).await,
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
+        "fs.mkdir" => fs_mkdir(&path_param(&params)?).await,
         "git.status" => git_status(&path_param(&params)?).await,
         "git.diff" => git_diff(&path_param(&params)?, params["file"].as_str()).await,
         "git.log" => git_log(&path_param(&params)?).await,
@@ -79,6 +80,21 @@ async fn fs_list(p: ListParams) -> anyhow::Result<Value> {
     entries.sort_by(|a, b| (a["kind"] != "dir", a["name"].as_str()).cmp(&(b["kind"] != "dir", b["name"].as_str())));
     let git_root = dir.ancestors().find(|d| d.join(".git").exists()).map(|d| d.display().to_string());
     Ok(json!({"path": dir.display().to_string(), "entries": entries, "git_root": git_root}))
+}
+
+/// Creates one new directory (its parent must exist).
+async fn fs_mkdir(path: &Path) -> anyhow::Result<Value> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("invalid folder name");
+    }
+    match tokio::fs::create_dir(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("{} already exists", path.display()),
+        Err(e) => return Err(e).with_context(|| format!("cannot create {}", path.display())),
+    }
+    let path = tokio::fs::canonicalize(path).await?;
+    Ok(json!({"path": path.display().to_string()}))
 }
 
 #[derive(Deserialize)]
@@ -241,6 +257,11 @@ mod tests {
         assert!(diff.contains("+b"));
         assert!(diff.contains("rename to new.txt"));
         assert!(diff.contains("+++ b/untracked.txt"));
+
+        let made = fs_mkdir(&d.join("newdir")).await.unwrap();
+        assert!(made["path"].as_str().unwrap().ends_with("/newdir"));
+        assert!(fs_mkdir(&d.join("newdir")).await.unwrap_err().to_string().contains("already exists"));
+        std::fs::remove_dir(d.join("newdir")).unwrap();
 
         let listing = fs_list(ListParams { path: Some(d.display().to_string()), hidden: false }).await.unwrap();
         let names: Vec<&str> = listing["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();

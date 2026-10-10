@@ -239,3 +239,18 @@ pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String
 pub async fn put_setting(name: &'static str, value: serde_json::Value) -> Result<(), String> {
     empty(Request::put(&format!("/api/v1/settings/{name}")).json(&value).map_err(|e| e.to_string())?.send().await).await
 }
+
+pub async fn fs_mkdir(worker: String, path: String) -> Result<serde_json::Value, String> {
+    send_json(Request::post(&format!("/api/v1/workers/{worker}/fs/mkdir")), &serde_json::json!({"path": path})).await
+}
+
+/// Checks connection details and returns the models the server offers.
+pub async fn test_connection(
+    kind: String,
+    base_url: String,
+    api_key: Option<String>,
+    connection_id: Option<String>,
+) -> Result<Vec<String>, String> {
+    let body = serde_json::json!({"kind": kind, "base_url": base_url, "api_key": api_key, "connection_id": connection_id});
+    send_json(Request::post("/api/v1/connections/test"), &body).await
+}

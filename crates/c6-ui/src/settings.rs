@@ -88,16 +88,28 @@ fn ConnectionRow(c: Connection, on_change: impl Fn() + Copy + Send + Sync + 'sta
             }
         });
     };
+    let check = RwSignal::new(None::<Result<Vec<String>, String>>);
+    let test_id = c.id.clone();
+    let test = move |_| {
+        let id = test_id.clone();
+        check.set(None);
+        spawn_local(async move { check.set(Some(api::models(id).await)) });
+    };
     view! {
         <div class="flex items-center gap-3 px-4 py-3">
             <div class="min-w-0 flex-1">
                 <div class="font-medium">{c.name.clone()}</div>
+                {move || check.get().map(|r| match r {
+                    Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{format!("✓ Connected · {} models", m.len())}</div> }.into_any(),
+                    Err(e) => view! { <div class="text-xs text-red-600">{format!("✕ {e}")}</div> }.into_any(),
+                })}
                 <div class="truncate font-mono text-xs text-zinc-500">
                     {kind_label(&c.kind)} {(c.kind != "claude_code").then(|| format!(" · {}", c.base_url))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
                     {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
             </div>
+            <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=test>"Test"</button>
             <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=remove>"Delete"</button>
         </div>
     }
@@ -112,6 +124,31 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
     let default_model = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
+    // Result of "Test connection": the server's models, or why it failed.
+    let tested = RwSignal::new(None::<Result<Vec<String>, String>>);
+    let testing = RwSignal::new(false);
+    // Any edit invalidates an earlier test.
+    Effect::new(move || {
+        kind.track();
+        base_url.track();
+        api_key.track();
+        tested.set(None);
+    });
+    let test = move |_| {
+        testing.set(true);
+        let (k, url, key) = (kind.get_untracked(), base_url.get_untracked(), api_key.get_untracked());
+        spawn_local(async move {
+            let r = api::test_connection(k, url, Some(key).filter(|k| !k.is_empty()), None).await;
+            if let Ok(models) = &r
+                && default_model.get_untracked().is_empty()
+                && models.len() == 1
+            {
+                default_model.set(models[0].clone());
+            }
+            tested.set(Some(r));
+            testing.set(false);
+        });
+    };
 
     let add = move |_| {
         pending.set(true);
@@ -130,6 +167,7 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                     base_url.set(String::new());
                     api_key.set(String::new());
                     default_model.set(String::new());
+                    tested.set(None);
                     on_added();
                 }
                 Err(e) => error.set(Some(e)),
@@ -178,10 +216,31 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                 {field("Name", name, by_kind("Anthropic", "OpenAI", "Ollama"), "text")}
                 {field("Base URL", base_url, by_kind("https://api.anthropic.com (default)", "https://api.openai.com/v1 (default)", "http://127.0.0.1:11434/v1"), "url")}
                 {field("API key", api_key, by_kind("sk-ant-…", "sk-…", "optional for local servers"), "password")}
-                {field("Default model (optional)", default_model, by_kind("claude-opus-5-5", "gpt-5.5", "qwen3.6:27b"), "text")}
+                <label class="block text-xs text-zinc-500">
+                    "Default model (optional)"
+                    // Suggestions from the server after a test; any name can be typed.
+                    <input class=format!("mt-1 font-mono {INPUT}") list="c6-conn-models" autocomplete="off"
+                        placeholder=move || if matches!(tested.get(), Some(Ok(_))) { "pick or type a model" } else { by_kind("claude-opus-5-5", "gpt-5.5", "qwen3.6:27b").get() }
+                        prop:value=move || default_model.get() on:input=move |ev| default_model.set(event_target_value(&ev)) />
+                    <datalist id="c6-conn-models">
+                        {move || tested.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
+                    </datalist>
+                </label>
             </div>
+            {move || tested.get().map(|r| match r {
+                Ok(models) => view! {
+                    <p class="text-sm text-emerald-700 dark:text-emerald-400">
+                        {format!("✓ Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
+                        {(!models.is_empty()).then(|| view! { <span class="text-zinc-500">" (suggested in the model field)"</span> })}
+                    </p>
+                }.into_any(),
+                Err(e) => view! { <p class="text-sm text-red-600">{format!("✕ {e}")}</p> }.into_any(),
+            })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            <div class="flex justify-end">
+            <div class="flex justify-end gap-2">
+                <button class=BUTTON_QUIET disabled=move || testing.get() on:click=test>
+                    {move || if testing.get() { "Testing…" } else { "Test connection" }}
+                </button>
                 <button class=BUTTON disabled=move || pending.get() on:click=add>"Add connection"</button>
             </div>
         </section>

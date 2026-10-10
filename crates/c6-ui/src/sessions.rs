@@ -97,6 +97,11 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
 
     let worker = RwSignal::new(storage_get("c6.worker").unwrap_or_default());
     let cwd = RwSignal::new(String::new());
+    let picking = RwSignal::new(false);
+    let worker_online = move || {
+        let w = worker.get();
+        live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online))
+    };
     let connection = RwSignal::new(
         storage_get("c6.connection").filter(|c| connections.iter().any(|x| &x.id == c)).unwrap_or_else(|| connections[0].id.clone()),
     );
@@ -108,21 +113,39 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
 
-    // Pick a worker once the fleet loads, preferring the last one used.
+    // Pick a worker once the fleet loads: the last one used if it is online,
+    // otherwise an online one. A worker the user picks by hand is kept.
+    let chosen_by_hand = RwSignal::new(false);
     Effect::new(move || {
         let ws = live.workers.get();
+        if chosen_by_hand.get_untracked() {
+            return;
+        }
         let current = worker.get_untracked();
-        if !ws.iter().any(|w| w.id.to_string() == current && w.status != WorkerStatus::Revoked)
-            && let Some(w) =
-                ws.iter().find(|w| w.status == WorkerStatus::Online).or_else(|| ws.iter().find(|w| w.status != WorkerStatus::Revoked))
-        {
+        let status = |id: &str| ws.iter().find(|w| w.id.to_string() == id).map(|w| w.status);
+        if status(&current) == Some(WorkerStatus::Online) {
+            return;
+        }
+        let pick = ws
+            .iter()
+            .find(|w| w.status == WorkerStatus::Online)
+            .or_else(|| (status(&current).is_none()).then(|| ws.iter().find(|w| w.status != WorkerStatus::Revoked)).flatten());
+        if let Some(w) = pick {
             worker.set(w.id.to_string());
         }
-    });
-    // Remember the last directory per worker.
+    }); // Remember the last directory per worker.
     Effect::new(move || {
         let w = worker.get();
-        cwd.set(storage_get(&format!("c6.cwd.{w}")).unwrap_or_default());
+        let remembered = storage_get(&format!("c6.cwd.{w}")).unwrap_or_default();
+        cwd.set(remembered.clone());
+        // Forget a remembered folder that no longer exists there.
+        if !remembered.is_empty() {
+            spawn_local(async move {
+                if api::fs_list(w.clone(), remembered.clone(), false).await.is_err() && cwd.get_untracked() == remembered {
+                    cwd.set(String::new());
+                }
+            });
+        }
     });
     // Default model per connection; offer the provider's model list.
     let models = LocalResource::new(move || api::models(connection.get()));
@@ -134,6 +157,10 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
 
     let submit = move || {
         if pending.get_untracked() {
+            return;
+        }
+        if cwd.get_untracked().is_empty() {
+            error.set(Some("Choose a working directory".into()));
             return;
         }
         let Ok(worker_id) = worker.get_untracked().parse() else {
@@ -169,22 +196,36 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let submit_click = submit.clone();
 
     view! {
+        {move || picking.get().then(|| view! {
+            <crate::files::FolderPicker
+                worker_id=worker.get_untracked()
+                start=cwd.get_untracked()
+                on_select=Callback::new(move |p: String| { cwd.set(p); picking.set(false); })
+                on_cancel=Callback::new(move |_| picking.set(false))
+            />
+        })}
         <section class="space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50">
             <div class="grid gap-3 sm:grid-cols-[1fr_2fr_auto]">
                 <label class="block text-xs text-zinc-500">
                     "Worker"
-                    <select class=format!("mt-1 {INPUT}") on:change=move |ev| worker.set(event_target_value(&ev)) prop:value=move || worker.get()>
+                    <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
                         {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked).map(|w| {
                             let label = if w.status == WorkerStatus::Online { w.name.clone() } else { format!("{} (offline)", w.name) };
                             view! { <option value=w.id.to_string()>{label}</option> }
                         }).collect_view()}
                     </select>
                 </label>
-                <label class="block text-xs text-zinc-500 sm:col-span-2">
+                <div class="block text-xs text-zinc-500 sm:col-span-2">
                     "Working directory"
-                    <input class=format!("mt-1 font-mono {INPUT}") placeholder="~/src/project"
-                        prop:value=move || cwd.get() on:input=move |ev| cwd.set(event_target_value(&ev)) />
-                </label>
+                    <div class="mt-1 flex gap-2">
+                        <button class=format!("{INPUT} min-w-0 flex-1 truncate text-left font-mono disabled:opacity-60")
+                            disabled=move || !worker_online()
+                            title=move || if worker_online() { "Choose a folder on the worker" } else { "The worker is offline" }
+                            on:click=move |_| picking.set(true)>
+                            {move || if cwd.get().is_empty() { "Choose a folder…".to_owned() } else { cwd.get() }}
+                        </button>
+                    </div>
+                </div>
                 <label class="block text-xs text-zinc-500">
                     "Connection"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| connection.set(event_target_value(&ev)) prop:value=move || connection.get()>

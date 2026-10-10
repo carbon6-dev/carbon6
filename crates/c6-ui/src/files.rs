@@ -1,6 +1,7 @@
 //! Remote file browsing and git changes on a worker.
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use serde_json::Value;
 
 use crate::api;
@@ -243,4 +244,133 @@ pub fn DiffView(diff: String, truncated: bool) -> impl IntoView {
         </div>
     }
     .into_any()
+}
+
+/// Modal folder chooser for a worker: folders only, breadcrumb navigation,
+/// and "New folder". `on_select` receives the chosen absolute path.
+#[component]
+pub fn FolderPicker(
+    worker_id: String,
+    #[prop(optional)] start: Option<String>,
+    on_select: Callback<String>,
+    on_cancel: Callback<()>,
+) -> impl IntoView {
+    let wid = StoredValue::new(worker_id);
+    let dir = RwSignal::new(start.unwrap_or_default());
+    let hidden = RwSignal::new(false);
+    let listing = LocalResource::new(move || api::fs_list(wid.get_value(), dir.get(), hidden.get()));
+    // The resolved absolute path of what is shown (the start may be "" or "~").
+    let current = Memo::new(move |_| listing.get().and_then(|r| r.ok()).and_then(|l| l["path"].as_str().map(str::to_owned)));
+    let new_name = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+
+    // A remembered folder that no longer exists: fall back to home.
+    Effect::new(move || {
+        if let Some(Err(_)) = listing.get()
+            && !dir.get_untracked().is_empty()
+        {
+            dir.set(String::new());
+        }
+    });
+
+    let create = move || {
+        let (Some(base), Some(name)) = (current.get_untracked(), new_name.get_untracked()) else { return };
+        let name = name.trim().to_owned();
+        if name.is_empty() || name.contains('/') {
+            error.set(Some("Enter a folder name (without /).".into()));
+            return;
+        }
+        let path = if base.ends_with('/') { format!("{base}{name}") } else { format!("{base}/{name}") };
+        spawn_local(async move {
+            match api::fs_mkdir(wid.get_value(), path).await {
+                Ok(v) => {
+                    new_name.set(None);
+                    error.set(None);
+                    dir.set(v["path"].as_str().unwrap_or_default().to_owned());
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+
+    view! {
+        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 px-4" on:click=move |_| on_cancel.run(())>
+            <div class="flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 rounded-lg bg-white p-4 shadow-xl dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
+                <h2 class="font-medium">"Choose a working directory"</h2>
+                // Breadcrumbs: each segment is clickable.
+                <div class="flex flex-wrap items-center gap-0.5 font-mono text-xs">
+                    {move || {
+                        let path = current.get().unwrap_or_default();
+                        let mut acc = String::new();
+                        let mut crumbs = vec![("/".to_owned(), "/".to_owned())];
+                        for seg in path.split('/').filter(|s| !s.is_empty()) {
+                            acc.push('/');
+                            acc.push_str(seg);
+                            crumbs.push((format!("{seg}/"), acc.clone()));
+                        }
+                        crumbs.into_iter().map(|(label, target)| view! {
+                            <button class="rounded px-1 py-0.5 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| dir.set(target.clone())>{label}</button>
+                        }).collect_view()
+                    }}
+                </div>
+                <div class="min-h-48 flex-1 overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+                    <Suspense fallback=|| view! { <p class="p-3 text-sm text-zinc-500">"Loading…"</p> }>
+                        {move || listing.get().map(|r| match r {
+                            Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
+                            Ok(l) => {
+                                let base = l["path"].as_str().unwrap_or("").to_owned();
+                                let dirs: Vec<String> = l["entries"].as_array().into_iter().flatten()
+                                    .filter(|e| e["kind"] == "dir")
+                                    .filter_map(|e| e["name"].as_str().map(str::to_owned))
+                                    .collect();
+                                if dirs.is_empty() {
+                                    return view! { <p class="p-3 text-sm text-zinc-500">"No folders here."</p> }.into_any();
+                                }
+                                view! {
+                                    <ul class="divide-y divide-zinc-100 text-sm dark:divide-zinc-900">
+                                        {dirs.into_iter().map(|name| {
+                                            let full = if base.ends_with('/') { format!("{base}{name}") } else { format!("{base}/{name}") };
+                                            view! {
+                                                <li><button class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                                    on:click=move |_| dir.set(full.clone())>
+                                                    <span class="text-zinc-400">"▸"</span><span class="truncate">{name}</span>
+                                                </button></li>
+                                            }
+                                        }).collect_view()}
+                                    </ul>
+                                }.into_any()
+                            }
+                        })}
+                    </Suspense>
+                </div>
+                {move || match new_name.get() {
+                    Some(_) => view! {
+                        <div class="flex gap-2">
+                            <input class=format!("{INPUT}") placeholder="New folder name" autofocus
+                                prop:value=move || new_name.get().unwrap_or_default()
+                                on:input=move |ev| new_name.set(Some(event_target_value(&ev)))
+                                on:keydown=move |ev| match ev.key().as_str() { "Enter" => create(), "Escape" => new_name.set(None), _ => {} } />
+                            <button class=crate::util::BUTTON on:click=move |_| create()>"Create"</button>
+                            <button class=crate::util::BUTTON_QUIET on:click=move |_| new_name.set(None)>"Cancel"</button>
+                        </div>
+                    }.into_any(),
+                    None => ().into_any(),
+                }}
+                {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                <div class="flex flex-wrap items-center gap-2">
+                    <button class=crate::util::BUTTON_QUIET on:click=move |_| { error.set(None); new_name.set(Some(String::new())) }>"New folder"</button>
+                    <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                        <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
+                        "Show hidden"
+                    </label>
+                    <span class="flex-1"></span>
+                    <button class=crate::util::BUTTON_QUIET on:click=move |_| on_cancel.run(())>"Cancel"</button>
+                    <button class=crate::util::BUTTON disabled=move || current.get().is_none()
+                        on:click=move |_| if let Some(p) = current.get_untracked() { on_select.run(p) }>
+                        {move || format!("Use {}", current.get().map(|p| p.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("/").to_owned()).unwrap_or_default())}
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
 }
