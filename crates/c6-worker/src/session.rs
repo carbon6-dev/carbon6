@@ -109,6 +109,7 @@ impl SessionManager {
         let system_prompt = build_system_prompt(&spec.base_prompt, &cwd, &date);
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
+        let mut session_tools = Vec::new();
         let (profile, tools, system_prompt) = if model.connection_kind == "claude_code" {
             // Claude Code brings its own prompt (incl. CLAUDE.md) and tools.
             (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
@@ -122,7 +123,9 @@ impl SessionManager {
                 prompt.push_str("\n\n");
                 prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
             }
-            (profile.as_str().to_owned(), built.tools.iter().map(|t| t.spec().name).collect(), prompt)
+            let names = built.tools.iter().map(|t| t.spec().name).collect();
+            session_tools = built.tools;
+            (profile.as_str().to_owned(), names, prompt)
         };
         let started = SessionStarted {
             command_id: command_id.to_owned(),
@@ -147,7 +150,8 @@ impl SessionManager {
             next_seq += 1;
         }
         info!(session = %session_id, cwd = %cwd.display(), %profile, "session created");
-        self.spawn(session_id, spec, started, Conversation { history: Vec::new(), context_tokens: 0 }, next_seq, 0).await;
+        let conv = Conversation { history: Vec::new(), context_tokens: 0 };
+        self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools)).await;
         Ok(())
     }
 
@@ -194,7 +198,20 @@ impl SessionManager {
             _ => None,
         });
         let Some(started) = started else { anyhow::bail!("session {session_id} has no SessionStarted event") };
-        let next_seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
+        let mut next_seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
+        // A turn left open by a failed turn task: close it so the head and
+        // the history agree that it is over.
+        let open_turn = events.iter().rev().find_map(|e| match &e.kind {
+            Some(session_event::Kind::TurnStarted(t)) => Some(Some(t.turn)),
+            Some(session_event::Kind::TurnEnded(_)) => Some(None),
+            _ => None,
+        });
+        if let Some(Some(turn)) = open_turn {
+            warn!(session = %session_id, turn, "closing a turn left open by a failed turn");
+            let kind = session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 });
+            self.journal.append(session_id, &SessionEvent { seq: next_seq, ts_ms: c6_core::now_ms(), kind: Some(kind) }).await?;
+            next_seq += 1;
+        }
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
         let history = history_from_events(&events);
         // The last request's size since the last compaction, for the next
@@ -208,9 +225,10 @@ impl SessionManager {
                 _ => None,
             })
             .unwrap_or(0);
-        Ok(Some(self.spawn(session_id, spec, started, Conversation { history, context_tokens }, next_seq, turns).await))
+        Ok(Some(self.spawn(session_id, spec, started, Conversation { history, context_tokens }, next_seq, turns, None).await))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn(
         &self,
         session_id: &str,
@@ -219,6 +237,7 @@ impl SessionManager {
         conv: Conversation,
         next_seq: u64,
         turns: u64,
+        tools: Option<Vec<Arc<dyn Tool>>>,
     ) -> mpsc::UnboundedSender<ActorMsg> {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = Arc::new(Writer {
@@ -227,10 +246,10 @@ impl SessionManager {
             link: self.link.clone(),
             next_seq: tokio::sync::Mutex::new(next_seq),
         });
-        let tools = if started.tool_profile == crate::claude_code::PROFILE {
-            Vec::new()
-        } else {
-            build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile)).await.tools
+        let tools = match tools {
+            Some(t) => t,
+            None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
+            None => build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile)).await.tools,
         };
         let actor = Actor {
             spec,
@@ -287,7 +306,7 @@ struct Actor {
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
-        let mut running: Option<(tokio::task::JoinHandle<Conversation>, CancellationToken)> = None;
+        let mut running: Option<(tokio::task::JoinHandle<Option<Conversation>>, CancellationToken)> = None;
         loop {
             if running.is_none() && !self.inbox.lock().unwrap().queue.is_empty() {
                 running = Some(self.start_turn());
@@ -302,21 +321,25 @@ impl Actor {
                 },
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     running = None;
+                    self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
                     match done {
-                        Ok(conv) => self.conv = Some(conv),
+                        Ok(Some(conv)) => self.conv = Some(conv),
+                        // The log and the in-memory state may disagree, and
+                        // queued inputs may be lost: stop, and let the next
+                        // command (or the head's redelivery) rebuild the
+                        // session from the log.
+                        Ok(None) => return,
                         Err(e) => {
-                            // Rebuild from the log on the next turn.
                             error!(session = %self.writer.session_id, "turn task panicked: {e}");
                             return;
                         }
                     }
-                    self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
                 }
             }
         }
     }
 
-    fn start_turn(&mut self) -> (tokio::task::JoinHandle<Conversation>, CancellationToken) {
+    fn start_turn(&mut self) -> (tokio::task::JoinHandle<Option<Conversation>>, CancellationToken) {
         self.turns += 1;
         let turn = self.turns;
         let cancel = CancellationToken::new();
@@ -366,12 +389,14 @@ impl Actor {
             } else {
                 run_session_turn(turn, &cfg, &model.connection_id, &link, &tools, &session_tools, &sink, &mut conv, &inbox, &c, sub).await
             };
-            if let Err(e) = result {
-                // Only journal writes fail here. The in-memory history may now
-                // differ from the log; a worker restart rebuilds it from the log.
-                error!(session = %writer.session_id, "turn failed: {e:#}");
+            match result {
+                Ok(()) => Some(conv),
+                Err(e) => {
+                    // Only journal writes fail here.
+                    error!(session = %writer.session_id, "turn failed: {e:#}");
+                    None
+                }
             }
-            conv
         });
         (task, cancel)
     }

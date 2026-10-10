@@ -15,6 +15,8 @@ mod subagent;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
+
 pub use conn::ConnState;
 pub use identity::Identity;
 
@@ -31,17 +33,29 @@ pub struct Worker {
     pub terminals: pty::Terminals,
     /// The live connection to the head, for opening extra streams.
     channel: Mutex<Option<tonic::transport::Channel>>,
+    /// Held for the process lifetime: one worker per state directory.
+    _lock: std::fs::File,
 }
 
 impl Worker {
     pub async fn open(state_dir: &Path, identity: Identity) -> anyhow::Result<Arc<Self>> {
         c6_llm::install_crypto_provider();
+        std::fs::create_dir_all(state_dir)?;
+        let lock_path = state_dir.join("c6w.lock");
+        let lock = std::fs::File::create(&lock_path).with_context(|| format!("creating {}", lock_path.display()))?;
+        if lock.try_lock().is_err() {
+            anyhow::bail!("another c6w is already running with state directory {}", state_dir.display());
+        }
         let journal = Arc::new(journal::Journal::open(&state_dir.join("journal.db")).await?);
         let link = Arc::new(link::HeadLink::default());
         let sessions = session::SessionManager::new(journal.clone(), link.clone(), state_dir.join("worktrees"));
         sessions.recover().await?;
         // Keep the journal small: idle, fully synced sessions can be restored
         // from the head when they are used again.
+        let orphans = journal.drop_orphans().await?;
+        if orphans > 0 {
+            tracing::warn!(orphans, "dropped journal events of sessions with no session row; the head will restore them");
+        }
         let trimmed = journal.trim(c6_core::now_ms() - JOURNAL_KEEP_MS, &[]).await?;
         if trimmed > 0 {
             tracing::info!(trimmed, "trimmed idle sessions from the journal");
@@ -54,6 +68,7 @@ impl Worker {
             sessions,
             terminals: pty::Terminals::default(),
             channel: Mutex::new(None),
+            _lock: lock,
         }))
     }
 

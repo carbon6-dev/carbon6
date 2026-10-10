@@ -163,8 +163,10 @@ async fn worker_restart_mid_turn_then_continue() {
     let id = env.create(&first, project.path(), "start").await;
     until("turn running", 15, async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Running)).await;
 
-    // "Crash": the old process stops talking; a new one opens the same state.
+    // "Crash": the old process stops talking; a new one opens the same state
+    // (once the old one has released the state directory lock).
     stop_first.cancel();
+    drop(first);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (second, stop_second) = run_worker(state.path()).await;
     env.idle_after(&id, 4, 15).await;

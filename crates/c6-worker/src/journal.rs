@@ -57,10 +57,12 @@ impl Journal {
     /// Records a new session with its first event (`SessionStarted`, seq 1).
     pub async fn create_session(&self, session_id: &str, spec: &CreateSession, started: &SessionEvent) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO sessions (id, spec, created_at) VALUES (?, ?, ?)")
+        let now = c6_core::now_ms();
+        sqlx::query("INSERT INTO sessions (id, spec, created_at, last_activity) VALUES (?, ?, ?, ?)")
             .bind(session_id)
             .bind(spec.encode_to_vec())
-            .bind(c6_core::now_ms())
+            .bind(now)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
         append_in(&mut tx, session_id, started).await?;
@@ -124,10 +126,16 @@ impl Journal {
     /// already acknowledged.
     pub async fn import(&self, session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO sessions (id, spec, created_at) VALUES (?, ?, ?)")
+        // Leftovers of a session whose row was lost (rows written by an
+        // earlier build that trimmed live sessions) would collide.
+        sqlx::query("DELETE FROM events WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM applied_commands WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+        let now = c6_core::now_ms();
+        sqlx::query("INSERT INTO sessions (id, spec, created_at, last_activity) VALUES (?, ?, ?, ?)")
             .bind(session_id)
             .bind(spec.encode_to_vec())
-            .bind(c6_core::now_ms())
+            .bind(now)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
         for ev in events {
@@ -162,6 +170,18 @@ impl Journal {
         Ok(n)
     }
 
+    /// Removes events and applied commands whose session row is gone (an
+    /// earlier build could trim a live session). Without this, the head's
+    /// redelivered input would be taken as already applied.
+    pub async fn drop_orphans(&self) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let events =
+            sqlx::query("DELETE FROM events WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?.rows_affected();
+        sqlx::query("DELETE FROM applied_commands WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(events)
+    }
+
     /// Sessions left mid-turn by a crash: (session id, last seq, open turn).
     pub async fn open_turns(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
         let rows = sqlx::query("SELECT id, last_seq, open_turn FROM sessions WHERE open_turn IS NOT NULL").fetch_all(&self.pool).await?;
@@ -182,19 +202,24 @@ async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &Se
         Some(session_event::Kind::TurnEnded(_)) => Some(None),
         _ => None,
     };
-    match open_turn {
-        Some(turn) => {
-            sqlx::query("UPDATE sessions SET last_seq = ?, open_turn = ? WHERE id = ?")
-                .bind(event.seq as i64)
-                .bind(turn)
-                .bind(session_id)
-                .execute(&mut *tx)
-                .await?
-        }
-        None => {
-            sqlx::query("UPDATE sessions SET last_seq = ? WHERE id = ?").bind(event.seq as i64).bind(session_id).execute(&mut *tx).await?
-        }
+    let now = c6_core::now_ms();
+    let updated = match open_turn {
+        Some(turn) => sqlx::query("UPDATE sessions SET last_seq = ?, open_turn = ?, last_activity = ? WHERE id = ?")
+            .bind(event.seq as i64)
+            .bind(turn)
+            .bind(now)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?,
+        None => sqlx::query("UPDATE sessions SET last_seq = ?, last_activity = ? WHERE id = ?")
+            .bind(event.seq as i64)
+            .bind(now)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?,
     };
+    // Without its row the event would never be uploaded.
+    anyhow::ensure!(updated.rows_affected() == 1, "session {session_id} is not in the journal");
     let command_id = match &event.kind {
         Some(session_event::Kind::User(u)) => Some(&u.command_id),
         Some(session_event::Kind::Started(s)) => Some(&s.command_id),
