@@ -192,6 +192,20 @@ pub enum Provider {
     Anthropic,
 }
 
+/// Whether a connection passes the reasoning effort on to the model. Chat
+/// Completions servers other than OpenAI's own may reject the field, so it
+/// is only sent there.
+pub fn supports_effort(kind: &str, base_url: &str) -> bool {
+    match kind {
+        "openai_compat" | "" => is_openai_api(base_url),
+        _ => true,
+    }
+}
+
+pub(crate) fn is_openai_api(base_url: &str) -> bool {
+    url::Url::parse(base_url).ok().and_then(|u| u.host_str().map(|h| h == "api.openai.com")).unwrap_or(false)
+}
+
 impl Provider {
     /// Connection kinds: `openai_compat`, `openai`, `chatgpt`, `anthropic`.
     pub fn from_kind(kind: &str) -> Option<Self> {
@@ -221,4 +235,16 @@ pub fn client_for(
 /// rustls needs one process-wide crypto provider; we standardize on ring.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn effort_support() {
+        assert!(super::supports_effort("openai_compat", "https://api.openai.com/v1"));
+        assert!(!super::supports_effort("openai_compat", "http://127.0.0.1:11434/v1"));
+        for kind in ["openai", "chatgpt", "anthropic", "claude_code"] {
+            assert!(super::supports_effort(kind, "http://anything"), "{kind}");
+        }
+    }
 }

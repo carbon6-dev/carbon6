@@ -29,7 +29,7 @@ impl OpenAiChat {
     }
 
     fn is_openai(&self) -> bool {
-        url::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(|h| h == "api.openai.com")).unwrap_or(false)
+        crate::is_openai_api(&self.base_url)
     }
 
     pub fn request_body(&self, req: &ModelRequest) -> Value {

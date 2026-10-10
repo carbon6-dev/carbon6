@@ -66,6 +66,9 @@ pub struct Connection {
     pub base_url: String,
     pub default_model: Option<String>,
     pub has_api_key: bool,
+    /// The connection passes a reasoning effort on to the model.
+    #[serde(default)]
+    pub supports_effort: bool,
     pub created_at: UnixMs,
 }
 

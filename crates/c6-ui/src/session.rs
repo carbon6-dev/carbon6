@@ -591,10 +591,16 @@ fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: Rw
     let list_id = format!("c6-models-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let connections = LocalResource::new(api::connections);
     let models = LocalResource::new(move || api::models(connection.get()));
+    // Effort only where the connection passes it on to the model.
+    let supports_effort =
+        move |id: &str| connections.get().and_then(Result::ok).is_some_and(|cs| cs.iter().any(|c| c.id == id && c.supports_effort));
     view! {
         <select class=format!("{SMALL_INPUT} max-w-48") on:change=move |ev| {
             let c = event_target_value(&ev);
             let default = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c)).and_then(|x| x.default_model);
+            if !supports_effort(&c) {
+                effort.set(String::new());
+            }
             connection.set(c);
             model.set(default.unwrap_or_default());
         }>
@@ -608,7 +614,7 @@ fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: Rw
         <datalist id=list_id>
             {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
         </datalist>
-        <select class=SMALL_INPUT title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
+        <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
                 <option value=value selected=move || effort.get() == value>{label}</option>
             }).collect_view()}

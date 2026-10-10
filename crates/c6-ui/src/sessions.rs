@@ -112,6 +112,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
+    // Effort only where the connection passes it on to the model.
+    let effort_supported = move || conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).is_some_and(|c| c.supports_effort));
 
     // Pick a worker once the fleet loads: the last one used if it is online,
     // otherwise an online one. A worker the user picks by hand is kept.
@@ -174,7 +176,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             model: model.get_untracked(),
             title: None,
             prompt: Some(prompt.get_untracked()).filter(|p| !p.trim().is_empty()),
-            effort: Some(effort.get_untracked()).filter(|e| !e.is_empty()),
+            effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked(),
         };
         storage_set("c6.worktree", if worktree.get_untracked() { "1" } else { "0" });
@@ -240,7 +242,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                         {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
                     </datalist>
                 </label>
-                <label class="block text-xs text-zinc-500">
+                <label class="block text-xs text-zinc-500" class:hidden=move || !effort_supported()>
                     "Effort"
                     <select class=format!("mt-1 {INPUT}") prop:value=move || effort.get() on:change=move |ev| effort.set(event_target_value(&ev))>
                         <option value="">"default"</option>

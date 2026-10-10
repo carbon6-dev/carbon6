@@ -182,6 +182,7 @@ async fn live_socket(st: Arc<HeadState>, mut socket: WebSocket) {
 
 fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
     api::Connection {
+        supports_effort: c6_llm::supports_effort(&c.kind, &c.base_url),
         id: c.id,
         name: c.name,
         kind: c.kind,
