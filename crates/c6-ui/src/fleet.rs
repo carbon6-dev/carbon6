@@ -21,13 +21,12 @@ pub fn FleetPage() -> impl IntoView {
 
 /// One worker: its files, git changes and terminals.
 #[component]
-pub fn WorkerPage() -> impl IntoView {
-    let params = leptos_router::hooks::use_params_map();
+pub fn WorkerPage(id: String) -> impl IntoView {
     let live = api::live();
     let tab = RwSignal::new("files");
     // Only the id drives the page body; live status updates touch just the
     // header, so open terminals are not torn down on every heartbeat.
-    let id = Memo::new(move |_| params.read().get("id").unwrap_or_default());
+    let id = Memo::new(move |_| id.clone());
     let worker = move || live.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id.get()).cloned());
     view! {
         <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
@@ -160,7 +159,7 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
             <td class="px-3 py-2">
                 <div class="flex items-center gap-2">
                     <span class=format!("h-2 w-2 shrink-0 rounded-full {dot}") title=label></span>
-                    <a class="font-medium hover:underline" href=format!("/workers/{}", w.id)>{w.name.clone()}</a>
+                    <crate::workspace::Go to=crate::workspace::View::Worker { id: w.id.to_string() } class="font-medium hover:underline">{w.name.clone()}</crate::workspace::Go>
                 </div>
             </td>
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{w.hostname}</td>

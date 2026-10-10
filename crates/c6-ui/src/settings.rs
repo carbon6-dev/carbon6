@@ -8,16 +8,19 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 #[component]
-pub fn SettingsPage() -> impl IntoView {
+/// `note`: a notice after a redirect ("chatgpt": signed in with ChatGPT;
+/// "link": signed in with a login link).
+pub fn SettingsPage(note: Option<String>) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let error = RwSignal::new(None::<String>);
-    let query = leptos_router::hooks::use_query_map();
-    let signed_in = move || query.read().get("signed_in").is_some();
+    let after_link = note.as_deref() == Some("link");
+    let signed_in = note.as_deref() == Some("chatgpt");
+    let signed_in = move || signed_in;
 
     let auth_required = LocalResource::new(api::auth_status);
     view! {
         <main class="mx-auto max-w-3xl space-y-6 px-4 py-6">
-            {move || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required).then(|| view! { <crate::auth::SignInSettings /> })}
+            {move || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required).then(|| view! { <crate::auth::SignInSettings after_link /> })}
             <section class="space-y-3">
                 <div>
                     <h1 class="text-lg font-semibold">"LLM connections"</h1>

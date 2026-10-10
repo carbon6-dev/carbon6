@@ -3,11 +3,10 @@
 use c6_api::{Connection, CreateSession, Session, SessionStatus, WorkerStatus};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos_router::components::A;
-use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::util::{BUTTON, ErrorBox, INPUT, StatusPill, ago, clock, storage_get, storage_set};
+use crate::workspace::{Go, How, View, use_column, use_workspace};
 
 #[component]
 pub fn SessionsPage() -> impl IntoView {
@@ -23,7 +22,7 @@ pub fn SessionsPage() -> impl IntoView {
                 {move || connections.get().map(|r| match r {
                     Ok(conns) if conns.is_empty() => view! {
                         <div class="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
-                            "Add an LLM connection in " <A href="/settings" attr:class="underline">"Settings"</A> " to start a session."
+                            "Add an LLM connection in " <Go to=View::Settings { note: None } class="underline">"Settings"</Go> " to start a session."
                         </div>
                     }.into_any(),
                     Ok(conns) => view! { <NewSession connections=conns /> }.into_any(),
@@ -77,7 +76,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let worker = live.worker_name(&s.worker_id.to_string());
     let updated = s.updated_at;
     view! {
-        <A href=format!("/sessions/{}", s.id) attr:class="flex items-center gap-3 px-4 py-3 hover:bg-zinc-100 dark:hover:bg-zinc-900">
+        <Go to=View::session(s.id.clone()) class="flex items-center gap-3 px-4 py-3 hover:bg-zinc-100 dark:hover:bg-zinc-900" title="Open beside this list (⌘-click: new tile)">
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="truncate text-xs text-zinc-500">
@@ -86,14 +85,14 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
             </div>
             <StatusPill status=s.status />
             <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
-        </A>
+        </Go>
     }
 }
 
 #[component]
 fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let live = api::live();
-    let navigate = use_navigate();
+    let (ws, col) = (use_workspace(), use_column());
 
     let worker = RwSignal::new(storage_get("c6.worker").unwrap_or_default());
     let cwd = RwSignal::new(String::new());
@@ -186,16 +185,19 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         storage_set("c6.connection", &req.connection_id);
         storage_set(&format!("c6.model.{}", req.connection_id), &req.model);
         pending.set(true);
-        let navigate = navigate.clone();
         spawn_local(async move {
             match api::create_session(req).await {
-                Ok(s) => navigate(&format!("/sessions/{}", s.id), Default::default()),
+                // Beside the form, so another can start right away.
+                Ok(s) => match col {
+                    Some(c) => c.open(View::session(s.id), How::Beside),
+                    None => ws.open(None, View::session(s.id), How::Beside),
+                },
                 Err(e) => error.set(Some(e)),
             }
             pending.set(false);
         });
     };
-    let submit_click = submit.clone();
+    let submit_click = submit;
 
     view! {
         {move || picking.get().then(|| view! {

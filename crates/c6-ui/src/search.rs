@@ -2,10 +2,10 @@
 
 use c6_api::{SearchHit, SearchResult, SnippetPart};
 use leptos::prelude::*;
-use leptos_router::hooks::{use_navigate, use_query_map};
 
 use crate::api;
 use crate::util::{ErrorBox, INPUT, ago, now_ms};
+use crate::workspace::{Go, How, Target, View, use_column, use_workspace};
 
 const SELECT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900";
 
@@ -22,10 +22,6 @@ const KINDS: [(&str, &str); 7] = [
 
 fn kind_label(kind: &str) -> &str {
     KINDS.iter().find(|(k, _)| *k == kind).map_or(kind, |(_, l)| l)
-}
-
-fn enc(s: &str) -> String {
-    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
 }
 
 /// The search terms of a query, as the head reads them (for highlighting).
@@ -52,7 +48,7 @@ pub fn terms(q: &str) -> Vec<String> {
 /// The search box in the header. ⌘K / Ctrl+K focuses it.
 #[component]
 pub fn SearchBox() -> impl IntoView {
-    let navigate = use_navigate();
+    let ws = use_workspace();
     let text = RwSignal::new(String::new());
     let input = NodeRef::<leptos::html::Input>::new();
     let _hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
@@ -76,7 +72,8 @@ pub fn SearchBox() -> impl IntoView {
                 if ev.key() == "Enter" {
                     let q = text.get_untracked();
                     if !q.trim().is_empty() {
-                        navigate(&format!("/search?q={}", enc(q.trim())), Default::default());
+                        // In the focused tile (reusing its search column, if any).
+                        ws.open(None, View::Search { q: q.trim().to_owned(), kind: String::new(), worker: String::new() }, How::Beside);
                     }
                 }
             }
@@ -84,17 +81,16 @@ pub fn SearchBox() -> impl IntoView {
     }
 }
 
-/// `/search?q=…&kind=…&worker=…`
+/// A search, in a workspace column; changing it updates the column.
 #[component]
-pub fn SearchPage() -> impl IntoView {
-    let query = use_query_map();
-    let navigate = use_navigate();
+pub fn SearchPage(q: String, kind: String, worker: String) -> impl IntoView {
     let live = api::live();
-    let q = move || query.read().get("q").unwrap_or_default();
-    let kind = move || query.read().get("kind").unwrap_or_default();
-    let worker = move || query.read().get("worker").unwrap_or_default();
+    let col = use_column();
+    let (q0, kind0, worker0) = (StoredValue::new(q), StoredValue::new(kind), StoredValue::new(worker));
+    let q = move || q0.get_value();
+    let kind = move || kind0.get_value();
+    let worker = move || worker0.get_value();
     let text = RwSignal::new(q());
-    Effect::new(move || text.set(q()));
     let results = LocalResource::new(move || {
         let (q, kind, worker) = (q(), kind(), worker());
         async move {
@@ -104,20 +100,12 @@ pub fn SearchPage() -> impl IntoView {
             api::search(q, kind, worker).await.map(Some)
         }
     });
-    let go = {
-        let navigate = navigate.clone();
-        move |q: String, kind: String, worker: String| {
-            let mut url = format!("/search?q={}", enc(q.trim()));
-            if !kind.is_empty() {
-                url.push_str(&format!("&kind={}", enc(&kind)));
-            }
-            if !worker.is_empty() {
-                url.push_str(&format!("&worker={}", enc(&worker)));
-            }
-            navigate(&url, Default::default());
+    let go = move |q: String, kind: String, worker: String| {
+        if let Some(c) = col {
+            c.replace(View::Search { q: q.trim().to_owned(), kind, worker });
         }
     };
-    let (go1, go2, go3) = (go.clone(), go.clone(), go);
+    let (go1, go2, go3) = (go, go, go);
     view! {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-6">
             <div class="flex flex-wrap items-center gap-2">
@@ -196,17 +184,18 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
     };
     // Side chats open inside their top-level session.
     let (page, open) = match &res.open_in {
-        Some(o) => (o.session_id.clone(), Some(o.side_chats.join(","))),
-        None => (s.id.clone(), None),
+        Some(o) => (o.session_id.clone(), o.side_chats.clone()),
+        None => (s.id.clone(), Vec::new()),
     };
-    let base = format!("/sessions/{page}?q={}{}", enc(&q), open.as_ref().map(|o| format!("&open={}", enc(o))).unwrap_or_default());
-    let title_href = base.clone();
+    let at =
+        move |anchor: Option<String>| View::Session { id: page.clone(), target: Some(Target { q: q.clone(), anchor, open: open.clone() }) };
+    let title_view = at(None);
     let parent = res.open_in.as_ref().map(|o| o.title.clone());
     view! {
         <div class="rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
             <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 border-b border-zinc-100 px-4 py-2 dark:border-zinc-800">
                 <div class="min-w-0 truncate">
-                    <a class="font-medium hover:underline" href=title_href>{s.title.clone()}</a>
+                    <Go to=title_view class="font-medium hover:underline" title="Open beside the results (⌘-click: new tile)">{s.title.clone()}</Go>
                     {parent.map(|p| view! { <span class="ml-2 text-xs text-zinc-500">{format!("in “{p}”")}</span> })}
                 </div>
                 <div class="flex shrink-0 items-center gap-2 text-xs text-zinc-500">
@@ -217,7 +206,7 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
                 </div>
             </div>
             <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
-                {res.hits.into_iter().map(|h| view! { <HitRow h base=base.clone() /> }).collect_view()}
+                {res.hits.into_iter().map(|h| { let to = at(Some(h.anchor.clone())); view! { <HitRow h to /> } }).collect_view()}
             </div>
             {(more > 0).then(|| view! { <p class="px-4 py-1.5 text-xs text-zinc-500">{format!("{more} more match{} in this session", if more == 1 { "" } else { "es" })}</p> })}
         </div>
@@ -225,15 +214,14 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
 }
 
 #[component]
-fn HitRow(h: SearchHit, base: String) -> impl IntoView {
-    let href = format!("{base}#{}", h.anchor);
+fn HitRow(h: SearchHit, to: View) -> impl IntoView {
     view! {
-        <a class="block px-4 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60" href=href>
+        <Go to class="block px-4 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60" title="Open beside the results (⌘-click: new tile)">
             <span class="mr-2 inline-block rounded bg-zinc-100 px-1.5 text-[11px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">{kind_label(&h.kind).to_owned()}</span>
             <span class=if matches!(h.kind.as_str(), "tool_call" | "tool_result") { "font-mono text-xs text-zinc-700 dark:text-zinc-300" } else { "text-zinc-700 dark:text-zinc-300" }>
                 {snippet(h.snippet)}
             </span>
-        </a>
+        </Go>
     }
 }
 

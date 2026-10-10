@@ -5,15 +5,15 @@ use std::collections::HashMap;
 use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos_router::hooks::{use_navigate, use_params_map};
 
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, storage_get, storage_set};
+use crate::workspace::{Go, ScrollBox, Target, View, use_column};
 use crate::{api, markdown, sessions};
 
 /// Live-only state, replaced by durable events as they arrive.
 #[derive(Clone, Default)]
-struct Streaming {
-    text: String,
+pub(crate) struct Streaming {
+    pub(crate) text: String,
     thinking: String,
     tool_output: HashMap<String, String>,
 }
@@ -141,25 +141,18 @@ fn turn_line(t: &TurnStats, now: Option<i64>) -> String {
     parts.join(" · ")
 }
 
-#[component]
-pub fn SessionPage() -> impl IntoView {
-    let params = use_params_map();
-    let id = move || params.read().get("id").unwrap_or_default();
-    view! { {move || { let id = id(); view! { <SessionView id /> } }} }
-}
-
 /// Live state of one session's log, fed by its stream.
 #[derive(Clone, Copy)]
-struct Feed {
-    events: RwSignal<Vec<Event>>,
-    streaming: RwSignal<Streaming>,
+pub(crate) struct Feed {
+    pub(crate) events: RwSignal<Vec<Event>>,
+    pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
     activity: RwSignal<Option<bool>>,
 }
 
 impl Feed {
     /// Follows the session's stream until the calling scope is cleaned up.
-    fn open(id: String) -> Self {
+    pub(crate) fn open(id: String) -> Self {
         let feed = Feed {
             events: RwSignal::new(Vec::new()),
             streaming: RwSignal::new(Streaming::default()),
@@ -220,9 +213,15 @@ impl Feed {
     }
 }
 
+/// A session in a workspace column. `target`: a place to reveal once it
+/// loads (from search).
 #[component]
-fn SessionView(id: String) -> impl IntoView {
+pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let live = api::live();
+    let col = use_column();
+    // Keyboard shortcuts only act in the active column.
+    let active = move || col.is_none_or(|c| c.active.get_untracked());
+    let root = col.map(|c| c.root_id()).unwrap_or_default();
     let detail = LocalResource::new({
         let id = id.clone();
         move || api::session(id.clone())
@@ -241,24 +240,21 @@ fn SessionView(id: String) -> impl IntoView {
     };
     let running = move || status.get() == SessionStatus::Running || activity.get() == Some(true);
 
-    // Follow the bottom of the transcript unless the user scrolled up.
-    // A deep link from search: `#<element id>` (or the older `#e<seq>`),
-    // `?q=` to highlight, and `?open=` side chats to expand on the way to
-    // it. The transcript then does not stick to the bottom.
-    let hash = window().location().hash().unwrap_or_default();
-    let hash = hash.strip_prefix('#').unwrap_or("").to_owned();
-    let stick = RwSignal::new(hash.is_empty());
-    let query = leptos_router::hooks::use_query_map().get_untracked();
-    let open: Vec<String> = query.get("open").map(|o| o.split(',').map(str::to_owned).collect()).unwrap_or_default();
-    let force_open = ForceOpen(RwSignal::new(open));
+    // Follow the bottom of the transcript unless the user scrolled up, or
+    // came for a particular place (from search).
+    let target = target.unwrap_or_default();
+    let scroller = NodeRef::<leptos::html::Div>::new();
+    let stick = RwSignal::new(target.anchor.is_none());
+    let force_open = ForceOpen(RwSignal::new(target.open.clone()));
     provide_context(force_open);
     // Find in session: open when arriving from search (or via Find).
-    let find_open = RwSignal::new(query.get("q").is_some_and(|q| !q.trim().is_empty()));
-    let find_q = query.get("q").unwrap_or_default();
-    if !hash.is_empty() {
-        let terms = serde_json::to_string(&crate::search::terms(&query.get("q").unwrap_or_default())).unwrap_or_else(|_| "[]".into());
-        match hash.strip_prefix('e').and_then(|n| n.parse::<u64>().ok()) {
-            // `#e<seq>`: an event of this session, once it has loaded.
+    let find_open = RwSignal::new(!target.q.trim().is_empty());
+    let find_q = target.q.clone();
+    if let Some(anchor) = target.anchor.clone() {
+        let terms = serde_json::to_string(&crate::search::terms(&target.q)).unwrap_or_else(|_| "[]".into());
+        let root = root.clone();
+        match anchor.strip_prefix('e').and_then(|n| n.parse::<u64>().ok()) {
+            // `e<seq>`: an event of this session, once it has loaded.
             Some(seq) => {
                 let session = id.clone();
                 let done = RwSignal::new(false);
@@ -275,26 +271,26 @@ fn SessionView(id: String) -> impl IntoView {
                     });
                     let Some(el) = el else { return };
                     done.set(true);
-                    reveal_when_rendered(el, terms.clone(), 0);
+                    reveal_when_rendered(root.clone(), el, terms.clone(), 0);
                 });
             }
-            None => reveal_when_rendered(hash, terms, 0),
+            None => reveal_when_rendered(root, anchor, terms, 0),
         }
     }
-    let _scroll = window_event_listener(leptos::ev::scroll, move |_| {
-        let w = window();
-        let doc_h = document().document_element().map(|e| e.scroll_height()).unwrap_or(0) as f64;
-        let bottom = w.scroll_y().unwrap_or(0.0) + w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-        stick.set(doc_h - bottom < 120.0);
+    let on_scroll = Callback::new(move |()| {
+        if let Some(el) = scroller.get_untracked() {
+            stick.set(el.scroll_height() - el.scroll_top() - el.client_height() < 120);
+        }
     });
     Effect::new(move || {
         events.track();
         streaming.track();
         queued.track();
         if stick.get_untracked() {
-            request_animation_frame(|| {
-                let h = document().document_element().map(|e| e.scroll_height()).unwrap_or(0);
-                window().scroll_to_with_x_and_y(0.0, h as f64);
+            request_animation_frame(move || {
+                if let Some(el) = scroller.get_untracked() {
+                    el.set_scroll_top(el.scroll_height());
+                }
             });
         }
     });
@@ -306,7 +302,6 @@ fn SessionView(id: String) -> impl IntoView {
         model_label(&m, &e)
     });
     let id_stored = StoredValue::new(id.clone());
-    let navigate = use_navigate();
     let tab = RwSignal::new("transcript");
     // Esc stops a running turn (unless typing in a field, e.g. a side chat).
     let esc_id = id.clone();
@@ -315,7 +310,7 @@ fn SessionView(id: String) -> impl IntoView {
             .target()
             .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
             .is_some_and(|el| matches!(el.tag_name().as_str(), "TEXTAREA" | "INPUT"));
-        if ev.key() == "Escape" && running() && !in_field {
+        if ev.key() == "Escape" && running() && !in_field && active() {
             let id = esc_id.clone();
             spawn_local(async move {
                 let _ = api::interrupt(id).await;
@@ -330,9 +325,12 @@ fn SessionView(id: String) -> impl IntoView {
         })
     });
 
+    let find_root = root.clone();
     view! {
-        <main class="mx-auto max-w-4xl px-4 pb-48 pt-4">
-            {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open /> })}
+        <div class="relative flex min-h-0 flex-1 flex-col">
+        {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
+        <ScrollBox node_ref=scroller on_scroll>
+        <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -340,7 +338,6 @@ fn SessionView(id: String) -> impl IntoView {
                         let s = d.session.clone();
                         let worker_id = s.worker_id;
                         let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
-                        let navigate = navigate.clone();
                         view! {
                             <div class="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
                                 <div class="min-w-0">
@@ -367,10 +364,9 @@ fn SessionView(id: String) -> impl IntoView {
                                         find_open.set(true);
                                     }>"Find"</button>
                                     {move || view! { <StatusPill status=status.get() /> }}
-                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| {
-                                        let navigate = navigate.clone();
+                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
                                         spawn_local(async move {
-                                            if api::archive(id_stored.get_value()).await.is_ok() { navigate("/", Default::default()); }
+                                            if api::archive(id_stored.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
                                         });
                                     }>"Archive"</button>
                                 </div>
@@ -384,7 +380,7 @@ fn SessionView(id: String) -> impl IntoView {
                             })}
                             {s.parent_id.clone().map(|p| {
                                 let what = if s.parent_call_id.is_some() { "Subagent session · started by a Task call in " } else { "Side chat · branched from " };
-                                view! { <p class="mb-3 text-sm text-zinc-500">{what}<a class="underline" href=format!("/sessions/{p}")>"its parent session"</a></p> }
+                                view! { <p class="mb-3 text-sm text-zinc-500">{what}<Go to=View::session(p) class="underline">"its parent session"</Go></p> }
                             })}
                         }.into_any()
                     }
@@ -406,10 +402,12 @@ fn SessionView(id: String) -> impl IntoView {
                 {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
             </div>
 
+        </div>
+        </ScrollBox>
             <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some())>
             <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice />
             </Show>
-        </main>
+        </div>
     }
 }
 
@@ -757,19 +755,21 @@ fn model_label(model: &str, effort: &str) -> String {
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = c6Search, js_name = reveal)]
-    fn js_reveal(id: &str, terms_json: &str) -> bool;
+    fn js_reveal(root: &str, id: &str, terms_json: &str) -> bool;
 
     #[wasm_bindgen(js_namespace = c6Search, js_name = clear)]
-    fn js_clear_highlights();
+    fn js_clear_highlights(root: &str);
 
     #[wasm_bindgen(js_namespace = c6Search, js_name = highlightAll)]
-    fn js_highlight_all(terms_json: &str);
+    fn js_highlight_all(root: &str, terms_json: &str);
 }
 
 /// Find in session: steps through the matches of a query in this session
 /// and its side chats, expanding side chats and blocks on the way.
 #[component]
-fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: ForceOpen) -> impl IntoView {
+fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: ForceOpen, root: String) -> impl IntoView {
+    let col = use_column();
+    let root = StoredValue::new(root);
     let text = RwSignal::new(initial.clone());
     let applied = RwSignal::new(initial);
     let current = RwSignal::new(None::<usize>);
@@ -785,7 +785,7 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         let Some(hit) = m.matches.get(i).cloned() else { return };
         current.set(Some(i));
         force_open.0.update(|ids| ids.extend(hit.open.iter().filter(|o| !ids.contains(o)).cloned().collect::<Vec<_>>()));
-        reveal_when_rendered(hit.anchor, serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()), 0);
+        reveal_when_rendered(root.get_value(), hit.anchor, serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()), 0);
     };
     let step = move |delta: isize| {
         let n = found.with_untracked(|m| m.as_ref().map_or(0, |m| m.matches.len()));
@@ -806,12 +806,12 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         match r {
             Err(e) => error.set(Some(e)),
             Ok(None) => {
-                js_clear_highlights();
+                js_clear_highlights(&root.get_value());
                 current.set(None);
             }
             Ok(Some(m)) => {
                 error.set(None);
-                js_highlight_all(&serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()));
+                js_highlight_all(&root.get_value(), &serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()));
                 let hash = window().location().hash().unwrap_or_default();
                 match m.matches.iter().position(|x| format!("#{}", x.anchor) == hash) {
                     Some(i) if current.get_untracked().is_none() => current.set(Some(i)),
@@ -822,13 +822,13 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         }
     });
     let close = move || {
-        js_clear_highlights();
+        js_clear_highlights(&root.get_value());
         open.set(false);
     };
     // Leaving the page (or closing the bar) stops highlighting.
-    on_cleanup(js_clear_highlights);
+    on_cleanup(move || js_clear_highlights(&root.get_value()));
     let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key().eq_ignore_ascii_case("g") && (ev.meta_key() || ev.ctrl_key()) {
+        if ev.key().eq_ignore_ascii_case("g") && (ev.meta_key() || ev.ctrl_key()) && col.is_none_or(|c| c.active.get_untracked()) {
             ev.prevent_default();
             step(if ev.shift_key() { -1 } else { 1 });
         }
@@ -842,7 +842,7 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         }
     });
     view! {
-        <div data-c6-nohl class="fixed right-4 top-14 z-30 flex items-center gap-1 rounded-lg border border-zinc-200 bg-white/95 p-1.5 text-sm shadow-md backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/95">
+        <div data-c6-nohl class="absolute right-3 top-2 z-30 flex items-center gap-1 rounded-lg border border-zinc-200 bg-white/95 p-1.5 text-sm shadow-md backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/95">
             <input
                 node_ref=input
                 type="search"
@@ -876,12 +876,12 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
 }
 
 /// Reveals a search hit once its element exists (events render in batches).
-fn reveal_when_rendered(id: String, terms: String, tries: u32) {
+fn reveal_when_rendered(root: String, id: String, terms: String, tries: u32) {
     set_timeout(
         move || {
             // Nested side chats load their events one after another.
-            if !js_reveal(&id, &terms) && tries < 200 {
-                reveal_when_rendered(id, terms, tries + 1);
+            if !js_reveal(&root, &id, &terms) && tries < 200 {
+                reveal_when_rendered(root, id, terms, tries + 1);
             }
         },
         std::time::Duration::from_millis(50),
@@ -1160,7 +1160,7 @@ fn ToolCard(
                 <span class="font-mono text-xs font-semibold">{name.clone()}</span>
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
                 {move || child.and_then(|c| c.0.with(|m| m.get(&child_call).cloned())).map(|cid| view! {
-                    <a class="text-[11px] text-blue-600 hover:underline dark:text-blue-400" href=format!("/sessions/{cid}") on:click=|ev| ev.stop_propagation()>"open subagent"</a>
+                    <Go to=View::session(cid) class="text-[11px] text-blue-600 hover:underline dark:text-blue-400" stop=true>"open subagent"</Go>
                 })}
                 {move || result.get().map(|r| view! { <span class="text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
             </summary>
@@ -1254,7 +1254,7 @@ fn Composer(
         });
     };
     view! {
-        <div class=if inline { "" } else { "fixed inset-x-0 bottom-0 z-10 border-t border-zinc-200 bg-zinc-50/95 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95" }>
+        <div class=if inline { "" } else { "shrink-0 border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" }>
             <div class=if inline { "space-y-2" } else { "mx-auto max-w-4xl space-y-2 px-4 py-3" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex items-end gap-2">

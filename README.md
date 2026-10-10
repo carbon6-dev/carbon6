@@ -81,6 +81,16 @@ c6w run
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
+### Workspace
+
+The UI is a workspace of up to four tiles side by side, each a stack of columns:
+
+- **Columns:** opening something (a session from the list, a search result, a side chat's parent) puts it in a column beside where you clicked, so where you came from stays open — a search stays beside the result you are reading. Earlier columns fold into spines; click one to go back to it (the columns after it fold to the right until you open something new). The header's nav swaps sections in place.
+- **Tiles:** ⌘/Ctrl-click any link (or ⧉ in a column header, or **+ Tile**) to open it in a new tile. ⌘1–4 focus a tile; ⌘[ and ⌘] step back and forward in the focused tile.
+- **Activity dock** (left, on wide screens): running sessions, ones that finished or failed while not on screen (amber/red), and pinned ones (☆ in a session's header). **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
+- **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; a column fills the screen, with ‹ › in its header and the nav in ☰.
+- The workspace is saved in the browser; the address bar shows the focused column, so links and reloads land in the right place.
+
 ### Search
 
 The search box in the header (⌘K) searches every message, tool call, tool output, thinking block and error in all sessions, including side chats and subagents. Words and `"quoted phrases"` must all match, as substrings (3+ characters each, case-insensitive); `-word` excludes. Results are grouped by session; each match links to its place in the transcript, opened and highlighted. In a session, the find bar (it opens from a search result, or with **Find**) highlights every match on the page (the current one in orange) and steps through every match in the session and its side chats: Enter / ⌘G for the next, Shift+Enter / ⇧⌘G for the previous, Esc to close. The index (SQLite FTS5) is kept in the head's database, updated as events arrive, and rebuilt automatically when its format changes.

@@ -15,7 +15,7 @@ fn enabled() -> bool {
 }
 
 /// Watches the live session list and notifies on running → idle/failed.
-pub fn watch_sessions(live: LiveFeed) {
+pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace) {
     let previous = StoredValue::new(HashMap::<String, SessionStatus>::new());
     Effect::new(move || {
         let sessions = live.sessions.get();
@@ -33,10 +33,10 @@ pub fn watch_sessions(live: LiveFeed) {
                     ));
                     opts.set_tag(&s.id);
                     if let Ok(n) = Notification::new_with_options(&s.title, &opts) {
-                        let url = format!("/sessions/{}", s.id);
+                        let id = s.id.clone();
                         let onclick = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
                             let _ = window().focus();
-                            let _ = window().location().set_href(&url);
+                            ws.open(None, crate::workspace::View::session(id.clone()), crate::workspace::How::Beside);
                         });
                         n.set_onclick(Some(wasm_bindgen::JsCast::unchecked_ref(onclick.as_ref())));
                         onclick.forget();
@@ -67,7 +67,7 @@ pub fn NotifyToggle() -> impl IntoView {
         }
     };
     view! {
-        <button class="text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100" title="Notify me when a session finishes while this tab is in the background" on:click=click>
+        <button class="hidden text-xs text-zinc-500 hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title="Notify me when a session finishes while this tab is in the background" on:click=click>
             {move || if state.get() { "🔔 on" } else { "🔕 off" }}
         </button>
     }

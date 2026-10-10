@@ -167,15 +167,14 @@ pub fn LinkSignIn() -> impl IntoView {
 
 /// Settings → Sign-in: passkeys, signed-in browsers, sign out.
 #[component]
-pub fn SignInSettings() -> impl IntoView {
+pub fn SignInSettings(after_link: bool) -> impl IntoView {
     let status = LocalResource::new(api::auth_status);
     let passkeys = LocalResource::new(api::passkeys);
     let sessions = LocalResource::new(api::auth_sessions);
     let error = RwSignal::new(None::<String>);
     let name = RwSignal::new(default_name());
     let busy = RwSignal::new(false);
-    let query = leptos_router::hooks::use_query_map();
-    let after_link = move || query.read().get("signed_in_with_link").is_some();
+    let after_link = move || after_link;
     let can_add = move || status.get().and_then(Result::ok).is_some_and(|s| s.passkeys_here) && js_supported();
     let add = move |_| {
         busy.set(true);
