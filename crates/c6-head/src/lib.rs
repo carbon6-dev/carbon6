@@ -15,6 +15,7 @@ pub mod store;
 pub mod telemetry;
 pub mod terminals;
 pub mod tls;
+pub mod ui_ca;
 mod webauthn;
 
 use std::net::{IpAddr, SocketAddr};
@@ -66,6 +67,9 @@ pub struct HeadState {
     pub oauth: oauth::OAuth,
     pub terminals: terminals::Attaches,
     pub auth: auth::Auth,
+    /// The web UI's certificate authority, when the head issues its own
+    /// HTTPS certificate (served at /ca.pem for devices to trust).
+    pub ui_ca: Option<Arc<ui_ca::UiCa>>,
     pub otlp: Option<telemetry::Otlp>,
     /// For OAuth token exchange and model listing.
     pub http: reqwest::Client,
@@ -128,6 +132,18 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     let (worker_url, cert_ips, dns_names) = endpoint_names(&cfg, &reach_ips, &worker_reach)?;
 
     let pki = pki::Pki::load_or_create(&cfg.data_dir.join("pki"), &cert_ips, &dns_names)?;
+
+    // Only answer to our own names (see guard.rs).
+    let mut names = dns_names.clone();
+    names.extend(cfg.extra_names.iter().cloned());
+    // Literal loopback addresses can't be rebound, and are how a published
+    // container port is usually reached.
+    names.extend(["127.0.0.1".to_owned(), "[::1]".to_owned()]);
+    let ui_ips: Vec<IpAddr> = ui_reach.iter().map(|a| a.ip()).collect();
+    let ui_tls = tls::UiTls::setup(&cfg, &names, &ui_ips)?.map(Arc::new);
+    if let Some(t) = &ui_tls {
+        names.push(t.name.clone());
+    }
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
     let shutdown = CancellationToken::new();
     let registry = registry::Registry::new(shutdown.clone());
@@ -143,6 +159,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         oauth: Default::default(),
         terminals: Default::default(),
         auth: auth::Auth::new(cfg.auth),
+        ui_ca: ui_tls.as_ref().and_then(|t| t.ca.clone()),
         otlp: telemetry::Otlp::from_config(cfg.otlp_endpoint.as_deref(), cfg.otlp_headers.clone()),
         http,
         ui_port: ui_addrs[0].port(),
@@ -172,15 +189,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     let token = shutdown.clone();
     tasks.spawn(async move { grpc.serve_with_incoming_shutdown(incoming, token.cancelled_owned()).await.context("worker port") });
 
-    // Only answer to our own names (see guard.rs).
-    let mut names = dns_names.clone();
-    names.extend(cfg.extra_names.iter().cloned());
-    // Literal loopback addresses can't be rebound, and are how a published
-    // container port is usually reached.
-    names.extend(["127.0.0.1".to_owned(), "[::1]".to_owned()]);
-    let ui_tls = tls::UiTls::setup(&cfg).await?.map(Arc::new);
     if let Some(t) = &ui_tls {
-        names.push(t.name.clone());
         t.spawn_refresh(shutdown.clone());
     }
     let guard = guard::HostGuard::new(&ui_reach, &names);
@@ -267,12 +276,10 @@ pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> 
     let tailnet = config::tailnet_names().await;
     let bases: Vec<String> = if let (Some(cert), Some(_)) = (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
         vec![format!("https://{}:{port}", tls::cert_name(cert)?)]
-    } else if cfg.ui_tls_tailscale
-        // The head has a certificate (it falls back to HTTP without one).
-        && cfg.data_dir.join("ui-tls/cert.pem").exists()
-        && let Some(name) = tailnet.first()
-    {
-        vec![format!("https://{name}:{port}")]
+    } else if cfg.ui_tls_head_ca {
+        let mut cfg = cfg.clone();
+        cfg.extra_names.extend(tailnet);
+        vec![format!("https://{}:{port}", tls::head_ca_name(&cfg))]
     } else {
         std::iter::once("localhost".to_owned()).chain(tailnet.into_iter().take(1)).map(|h| format!("http://{h}:{port}")).collect()
     };

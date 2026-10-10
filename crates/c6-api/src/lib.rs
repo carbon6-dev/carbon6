@@ -354,6 +354,10 @@ pub struct AuthStatus {
     pub passkeys_here: bool,
     /// Passkeys exist for this host name.
     pub has_passkeys: bool,
+    /// The head serves HTTPS with its own CA, downloadable at `/ca.pem` and
+    /// `/ca.mobileconfig` for other devices to trust.
+    #[serde(default)]
+    pub head_ca: bool,
 }
 
 /// `POST /api/v1/auth/link`: redeem a one-time login link.

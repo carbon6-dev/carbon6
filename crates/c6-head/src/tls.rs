@@ -1,14 +1,16 @@
 //! HTTPS for the web UI (passkeys need a secure context).
 //!
-//! The certificate comes from `ui_tls_cert`/`ui_tls_key`, or from Tailscale
-//! (`ui_tls_tailscale`: `tailscale cert` for this machine's MagicDNS name,
-//! a publicly trusted certificate). It is reloaded twice a day, so renewals
-//! need no restart.
+//! The certificate comes from `ui_tls_cert`/`ui_tls_key`, or from the head's
+//! own web UI certificate authority (`ui_tls_head_ca`, see `ui_ca.rs`),
+//! which keeps the head's names out of public Certificate Transparency
+//! logs. Files are reloaded twice a day, so renewals need no restart.
 //!
 //! TLS and plain HTTP share the UI port: the first byte of a connection
 //! tells them apart. Plain HTTP is redirected to the HTTPS name, except the
+//! CA download (a device fetches it before it trusts the CA) and the
 //! ChatGPT OAuth callback, which OpenAI requires on `http://127.0.0.1`.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -32,18 +34,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::HeadConfig;
+use crate::ui_ca::UiCa;
 
 /// The UI's certificate and the name it is for.
 pub struct UiTls {
     /// The HTTPS host name (the certificate's name).
     pub name: String,
+    /// The head's CA, when it issued the certificate.
+    pub ca: Option<Arc<UiCa>>,
     slot: Arc<Slot>,
     source: Source,
 }
 
 enum Source {
     Files { cert: PathBuf, key: PathBuf },
-    Tailscale { dir: PathBuf },
+    HeadCa { names: Vec<String>, ips: Vec<IpAddr> },
 }
 
 #[derive(Debug)]
@@ -55,39 +60,33 @@ impl ResolvesServerCert for Slot {
     }
 }
 
+/// The name to serve HTTPS at with the head's CA: the first configured or
+/// tailnet name with a dot, else the host name, else `localhost`.
+pub fn head_ca_name(cfg: &HeadConfig) -> String {
+    cfg.extra_names
+        .iter()
+        .find(|n| n.contains('.') && n.parse::<IpAddr>().is_err())
+        .cloned()
+        .or_else(|| gethostname::gethostname().into_string().ok().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_else(|| "localhost".into())
+}
+
 impl UiTls {
-    /// The configured certificate, if any.
-    pub async fn setup(cfg: &HeadConfig) -> anyhow::Result<Option<Self>> {
-        let (name, source) = match (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
-            (Some(cert), Some(key)) => {
-                let name = cert_name(cert)?;
-                (name, Source::Files { cert: cert.clone(), key: key.clone() })
-            }
+    /// The configured certificate, if any. `names` and `ips` are what the
+    /// head answers to, for a certificate from its own CA.
+    pub fn setup(cfg: &HeadConfig, names: &[String], ips: &[IpAddr]) -> anyhow::Result<Option<Self>> {
+        let (name, source, ca) = match (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
+            (Some(cert), Some(key)) => (cert_name(cert)?, Source::Files { cert: cert.clone(), key: key.clone() }, None),
             (Some(_), None) | (None, Some(_)) => anyhow::bail!("ui_tls_cert and ui_tls_key go together"),
-            (None, None) if cfg.ui_tls_tailscale => {
-                let Some(name) = crate::config::tailnet_names().await.into_iter().next() else {
-                    warn!("ui_tls_tailscale is set, but Tailscale is not running here (or MagicDNS is off): serving plain HTTP");
-                    return Ok(None);
-                };
-                let source = Source::Tailscale { dir: cfg.data_dir.join("ui-tls") };
-                // Not fatal: sign-in still works with login links (and
-                // passkeys on localhost) until HTTPS is available.
-                match load(&name, &source).await {
-                    Ok(key) => {
-                        info!(%name, "web UI serves HTTPS");
-                        return Ok(Some(Self { name, slot: Arc::new(Slot(RwLock::new(key))), source }));
-                    }
-                    Err(e) => {
-                        warn!("no Tailscale certificate, serving plain HTTP: {e:#}");
-                        return Ok(None);
-                    }
-                }
+            (None, None) if cfg.ui_tls_head_ca => {
+                let ca = Arc::new(UiCa::load_or_create(&cfg.data_dir.join("pki"), names)?);
+                (head_ca_name(cfg), Source::HeadCa { names: names.to_vec(), ips: ips.to_vec() }, Some(ca))
             }
             (None, None) => return Ok(None),
         };
-        let key = load(&name, &source).await?;
+        let key = load(&source, ca.as_deref())?;
         info!(%name, "web UI serves HTTPS");
-        Ok(Some(Self { name, slot: Arc::new(Slot(RwLock::new(key))), source }))
+        Ok(Some(Self { name, ca, slot: Arc::new(Slot(RwLock::new(key))), source }))
     }
 
     pub fn acceptor(&self) -> anyhow::Result<TlsAcceptor> {
@@ -100,8 +99,12 @@ impl UiTls {
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
-    /// Reloads (and for Tailscale renews) the certificate twice a day.
+    /// Reloads certificate files twice a day (the head's own certificate is
+    /// issued fresh on every start).
     pub fn spawn_refresh(self: &Arc<Self>, shutdown: CancellationToken) {
+        if !matches!(self.source, Source::Files { .. }) {
+            return;
+        }
         let me = self.clone();
         tokio::spawn(async move {
             loop {
@@ -109,46 +112,29 @@ impl UiTls {
                     _ = shutdown.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_secs(12 * 3600)) => {}
                 }
-                match load(&me.name, &me.source).await {
+                match load(&me.source, None) {
                     Ok(key) => *me.slot.0.write().unwrap() = key,
-                    Err(e) => warn!("refreshing the web UI certificate: {e:#}"),
+                    Err(e) => warn!("reloading the web UI certificate: {e:#}"),
                 }
             }
         });
     }
 }
 
-async fn load(name: &str, source: &Source) -> anyhow::Result<Arc<CertifiedKey>> {
-    let (cert, key) = match source {
-        Source::Files { cert, key } => (cert.clone(), key.clone()),
-        Source::Tailscale { dir } => {
-            std::fs::create_dir_all(dir)?;
-            let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
-            // Renews only when the certificate is close to expiry.
-            let out = tokio::process::Command::new(crate::config::tailscale_cli().await.context("tailscale CLI not found")?)
-                .arg("cert")
-                .arg("--cert-file")
-                .arg(&cert)
-                .arg("--key-file")
-                .arg(&key)
-                .arg(name)
-                .output()
-                .await
-                .context("running tailscale cert")?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "tailscale cert {name} failed: {}. HTTPS certificates must be enabled for the tailnet (admin console → DNS).",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            (cert, key)
+fn load(source: &Source, ca: Option<&UiCa>) -> anyhow::Result<Arc<CertifiedKey>> {
+    let (chain_pem, key_pem) = match (source, ca) {
+        (Source::Files { cert, key }, _) => (
+            std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?,
+            std::fs::read(key).with_context(|| format!("reading {}", key.display()))?,
+        ),
+        (Source::HeadCa { names, ips }, Some(ca)) => {
+            let (chain, key) = ca.issue(names, ips)?;
+            (chain.into_bytes(), key.into_bytes())
         }
+        (Source::HeadCa { .. }, None) => anyhow::bail!("no CA to issue the web UI certificate"),
     };
-    let chain = CertificateDer::pem_file_iter(&cert)
-        .with_context(|| format!("reading {}", cert.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("parsing {}", cert.display()))?;
-    let key = PrivateKeyDer::from_pem_file(&key).with_context(|| format!("reading {}", key.display()))?;
+    let chain = CertificateDer::pem_slice_iter(&chain_pem).collect::<Result<Vec<_>, _>>().context("parsing the certificate chain")?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).context("parsing the private key")?;
     let signer = rustls::crypto::ring::sign::any_supported_type(&key).context("unsupported private key")?;
     Ok(Arc::new(CertifiedKey::new(chain, signer)))
 }
@@ -221,9 +207,10 @@ where
     auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(io, TowerToHyperService::new(app)).await
 }
 
-/// Plain HTTP when HTTPS is on: redirect, except the OAuth callback.
+/// Plain HTTP when HTTPS is on: redirect, except the OAuth callback and
+/// the CA download.
 async fn to_https(State(base): State<Arc<String>>, req: Request, next: Next) -> Response {
-    if req.uri().path() == "/auth/callback" {
+    if matches!(req.uri().path(), "/auth/callback" | "/ca.pem" | "/ca.mobileconfig") {
         return next.run(req).await;
     }
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
@@ -282,6 +269,39 @@ mod tests {
         assert_eq!(r.headers()["location"], format!("https://localhost:{port}/sessions/x?y=1").as_str());
         let r = plain.get(format!("http://127.0.0.1:{port}/auth/callback?code=x&state=y")).send().await.unwrap();
         assert_ne!(r.status(), StatusCode::PERMANENT_REDIRECT);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_ca_serves_https_and_its_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ui_tls_head_ca: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let port = head.ui_addrs[0].port();
+        let plain = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+        // A device fetches the CA over plain HTTP, before it trusts it.
+        let r = plain.get(format!("http://127.0.0.1:{port}/ca.pem")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let ca_pem = r.text().await.unwrap();
+        let r = plain.get(format!("http://127.0.0.1:{port}/ca.mobileconfig")).send().await.unwrap();
+        assert_eq!(r.headers()["content-type"], "application/x-apple-aspen-config");
+        assert_eq!(plain.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap().status(), StatusCode::PERMANENT_REDIRECT);
+
+        // Trusting only that CA, HTTPS to the head's names works.
+        let https =
+            reqwest::Client::builder().tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()]).build().unwrap();
+        let st: serde_json::Value =
+            https.get(format!("https://localhost:{port}/api/v1/auth/status")).send().await.unwrap().json().await.unwrap();
+        assert_eq!((st["passkeys_here"].as_bool(), st["head_ca"].as_bool()), (Some(true), Some(true)));
         head.shutdown().await.unwrap();
     }
 }

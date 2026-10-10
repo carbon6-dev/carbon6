@@ -297,6 +297,7 @@ async fn status(State(st): State<Arc<HeadState>>, tls: Option<axum::Extension<Tl
         required: st.auth.required,
         passkeys_here: here.rp_id.is_some(),
         has_passkeys,
+        head_ca: st.ui_ca.is_some(),
     }))
 }
 

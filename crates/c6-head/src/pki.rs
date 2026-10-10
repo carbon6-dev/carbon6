@@ -135,30 +135,30 @@ fn ca_params() -> CertificateParams {
     params
 }
 
-fn dn(common_name: &str) -> DistinguishedName {
+pub(crate) fn dn(common_name: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, common_name);
     dn
 }
 
-fn set_validity(params: &mut CertificateParams, lifetime: Duration) {
+pub(crate) fn set_validity(params: &mut CertificateParams, lifetime: Duration) {
     let now = OffsetDateTime::now_utc();
     // Backdate to tolerate clock skew between nodes.
     params.not_before = now - Duration::hours(1);
     params.not_after = now + lifetime;
 }
 
-fn random_serial() -> SerialNumber {
+pub(crate) fn random_serial() -> SerialNumber {
     let mut bytes: [u8; 16] = rand::random();
     bytes[0] &= 0x7f; // keep it positive
     SerialNumber::from_slice(&bytes)
 }
 
-fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
     Ok(::pem::parse(pem).context("parsing PEM")?.into_contents())
 }
 
-fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;

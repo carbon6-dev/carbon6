@@ -82,8 +82,8 @@ pub fn SignIn(status: c6_api::AuthStatus) -> impl IntoView {
             } else {
                 view! {
                     <p class="text-sm text-zinc-500">
-                        "Passkeys need a secure address: the head's HTTPS name (set "<code class="font-mono">"ui_tls_tailscale"</code>
-                        " or "<code class="font-mono">"ui_tls_cert"</code>" in c6h.toml), or http://localhost on the head's machine."
+                        "Passkeys need a secure address: the head's HTTPS name (set "<code class="font-mono">"ui_tls_head_ca"</code>
+                        " in c6h.toml), or http://localhost on the head's machine."
                     </p>
                 }.into_any()
             }}
@@ -218,6 +218,18 @@ pub fn SignInSettings() -> impl IntoView {
                     <p class="text-xs text-zinc-500">"To add a passkey, open the head at its HTTPS name (or http://localhost on its machine)."</p>
                 }.into_any()
             }}
+            {move || status.get().and_then(Result::ok).is_some_and(|s| s.head_ca).then(|| view! {
+                <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
+                    <div class="font-medium">"Other devices"</div>
+                    <p class="mt-1 text-zinc-500">
+                        "This head signs its own HTTPS certificate, so its name never appears in public certificate logs. Each device trusts it once: "
+                        "on an iPhone, iPad or Mac, open the "<a class="underline" href="/ca.mobileconfig">"configuration profile"</a>
+                        ", install it in Settings, and on iPhone/iPad turn it on under General → About → Certificate Trust Settings; elsewhere, add "
+                        <a class="underline" href="/ca.pem">"ca.pem"</a>" to the system's trusted certificates. "
+                        "It can only vouch for this head's names and private addresses."
+                    </p>
+                </div>
+            })}
             <h3 class="pt-2 text-sm font-semibold">"Signed-in browsers"</h3>
             <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 text-sm dark:divide-zinc-800 dark:border-zinc-800">
                 {move || sessions.get().map(|r| match r {

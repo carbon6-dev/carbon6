@@ -28,6 +28,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
         .route("/auth/callback", get(chatgpt_callback))
+        .route("/ca.pem", get(ui_ca_pem))
+        .route("/ca.mobileconfig", get(ui_ca_profile))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
         .route("/api/v1/sessions/{id}/events", get(session_events))
@@ -393,6 +395,33 @@ async fn create_side_chat(
     Json(req): Json<api::CreateSideChat>,
 ) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::sessions::create_side_chat(&st, &id, req).await?))
+}
+
+/// The web UI's CA, for devices to trust (public: it is a certificate).
+async fn ui_ca_pem(State(st): State<Arc<HeadState>>) -> Response {
+    match &st.ui_ca {
+        Some(ca) => (
+            [(header::CONTENT_TYPE, "application/x-pem-file"), (header::CONTENT_DISPOSITION, "attachment; filename=\"carbon6-ca.pem\"")],
+            ca.cert_pem().to_owned(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "this head does not issue its own HTTPS certificate").into_response(),
+    }
+}
+
+/// The same CA as an Apple configuration profile (iPhone, iPad, Mac).
+async fn ui_ca_profile(State(st): State<Arc<HeadState>>) -> Response {
+    match &st.ui_ca {
+        Some(ca) => (
+            [
+                (header::CONTENT_TYPE, "application/x-apple-aspen-config"),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"carbon6-ca.mobileconfig\""),
+            ],
+            ca.mobileconfig(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "this head does not issue its own HTTPS certificate").into_response(),
+    }
 }
 
 async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::SessionDetail>> {

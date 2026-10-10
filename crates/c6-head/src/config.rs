@@ -36,9 +36,10 @@ pub struct HeadConfig {
     /// HTTPS for the web UI from these PEM files (certificate chain, key).
     pub ui_tls_cert: Option<PathBuf>,
     pub ui_tls_key: Option<PathBuf>,
-    /// HTTPS for the web UI with a Tailscale certificate for this machine's
-    /// MagicDNS name (`tailscale cert`; HTTPS must be enabled for the tailnet).
-    pub ui_tls_tailscale: bool,
+    /// HTTPS for the web UI with a certificate from the head's own,
+    /// name-constrained CA (trust `/ca.pem` once per device). Keeps the
+    /// head's names out of public Certificate Transparency logs.
+    pub ui_tls_head_ca: bool,
 }
 
 impl Default for HeadConfig {
@@ -56,7 +57,7 @@ impl Default for HeadConfig {
             auth: true,
             ui_tls_cert: None,
             ui_tls_key: None,
-            ui_tls_tailscale: false,
+            ui_tls_head_ca: false,
         }
     }
 }
