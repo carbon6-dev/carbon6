@@ -761,6 +761,9 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = c6Search, js_name = clear)]
     fn js_clear_highlights();
+
+    #[wasm_bindgen(js_namespace = c6Search, js_name = highlightAll)]
+    fn js_highlight_all(terms_json: &str);
 }
 
 /// Find in session: steps through the matches of a query in this session
@@ -802,9 +805,13 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         let Some(r) = matches.get() else { return };
         match r {
             Err(e) => error.set(Some(e)),
-            Ok(None) => current.set(None),
+            Ok(None) => {
+                js_clear_highlights();
+                current.set(None);
+            }
             Ok(Some(m)) => {
                 error.set(None);
+                js_highlight_all(&serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()));
                 let hash = window().location().hash().unwrap_or_default();
                 match m.matches.iter().position(|x| format!("#{}", x.anchor) == hash) {
                     Some(i) if current.get_untracked().is_none() => current.set(Some(i)),
@@ -818,6 +825,8 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         js_clear_highlights();
         open.set(false);
     };
+    // Leaving the page (or closing the bar) stops highlighting.
+    on_cleanup(js_clear_highlights);
     let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key().eq_ignore_ascii_case("g") && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
@@ -833,7 +842,7 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         }
     });
     view! {
-        <div class="fixed right-4 top-14 z-30 flex items-center gap-1 rounded-lg border border-zinc-200 bg-white/95 p-1.5 text-sm shadow-md backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/95">
+        <div data-c6-nohl class="fixed right-4 top-14 z-30 flex items-center gap-1 rounded-lg border border-zinc-200 bg-white/95 p-1.5 text-sm shadow-md backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/95">
             <input
                 node_ref=input
                 type="search"
