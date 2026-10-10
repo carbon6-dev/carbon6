@@ -29,6 +29,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
         .route("/auth/callback", get(chatgpt_callback))
         .route("/ca.pem", get(ui_ca_pem))
+        .route("/ca.crt", get(ui_ca_crt))
         .route("/ca.mobileconfig", get(ui_ca_profile))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
@@ -403,6 +404,21 @@ async fn ui_ca_pem(State(st): State<Arc<HeadState>>) -> Response {
         Some(ca) => (
             [(header::CONTENT_TYPE, "application/x-pem-file"), (header::CONTENT_DISPOSITION, "attachment; filename=\"carbon6-ca.pem\"")],
             ca.cert_pem().to_owned(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "this head does not issue its own HTTPS certificate").into_response(),
+    }
+}
+
+/// The same CA in DER, as Android's certificate installer wants it.
+async fn ui_ca_crt(State(st): State<Arc<HeadState>>) -> Response {
+    match &st.ui_ca {
+        Some(ca) => (
+            [
+                (header::CONTENT_TYPE, "application/x-x509-ca-cert"),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"carbon6-ca.crt\""),
+            ],
+            ca.cert_der().to_vec(),
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, "this head does not issue its own HTTPS certificate").into_response(),

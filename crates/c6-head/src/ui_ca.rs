@@ -76,6 +76,10 @@ impl UiCa {
         &self.cert_pem
     }
 
+    pub fn cert_der(&self) -> &[u8] {
+        &self.cert_der
+    }
+
     pub fn cert_path(&self) -> PathBuf {
         self.dir.join("ui-ca.crt")
     }

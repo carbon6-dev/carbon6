@@ -210,7 +210,7 @@ where
 /// Plain HTTP when HTTPS is on: redirect, except the OAuth callback and
 /// the CA download.
 async fn to_https(State(base): State<Arc<String>>, req: Request, next: Next) -> Response {
-    if matches!(req.uri().path(), "/auth/callback" | "/ca.pem" | "/ca.mobileconfig") {
+    if matches!(req.uri().path(), "/auth/callback" | "/ca.pem" | "/ca.crt" | "/ca.mobileconfig") {
         return next.run(req).await;
     }
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
@@ -294,6 +294,10 @@ mod tests {
         let ca_pem = r.text().await.unwrap();
         let r = plain.get(format!("http://127.0.0.1:{port}/ca.mobileconfig")).send().await.unwrap();
         assert_eq!(r.headers()["content-type"], "application/x-apple-aspen-config");
+        let r = plain.get(format!("http://127.0.0.1:{port}/ca.crt")).send().await.unwrap();
+        assert_eq!(r.headers()["content-type"], "application/x-x509-ca-cert");
+        let der = r.bytes().await.unwrap();
+        assert_eq!(der.first(), Some(&0x30), "DER, not PEM");
         assert_eq!(plain.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap().status(), StatusCode::PERMANENT_REDIRECT);
 
         // Trusting only that CA, HTTPS to the head's names works.
