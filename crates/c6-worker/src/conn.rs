@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use c6_proto::{
-    CommandRejected, HeadMsg, Hello, Ping, SessionCursor, SessionEventBatch, WorkerMsg, head_msg, worker_hub_client::WorkerHubClient,
-    worker_msg,
+    CommandRejected, HeadMsg, Hello, Ping, RpcResponse, SessionCursor, SessionEventBatch, WorkerMsg, head_msg,
+    worker_hub_client::WorkerHubClient, worker_msg,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -110,7 +110,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     };
     tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Hello(hello)) }).await.ok();
 
-    let mut inbound = match WorkerHubClient::new(channel).attach(ReceiverStream::new(rx)).await {
+    let mut inbound = match WorkerHubClient::new(channel.clone()).attach(ReceiverStream::new(rx)).await {
         Ok(r) => r.into_inner(),
         Err(s) => return classify(s),
     };
@@ -131,6 +131,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     }
 
     worker.link.connected(tx.clone());
+    worker.set_channel(Some(channel));
+    let _clear_channel = ClearChannel(worker.clone());
     let uploads = CancellationToken::new();
     let _stop_uploads = uploads.clone().drop_guard();
     // A separate task so a slow uplink never stops us reading acks and commands.
@@ -183,6 +185,18 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                             }
                         }
                         head_msg::Msg::Credential(grant) => worker.link.on_grant(grant),
+                        head_msg::Msg::RpcRequest(req) => {
+                            // Off the read loop: requests may take a while (git, big files).
+                            let (w, tx) = (worker.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let params = serde_json::from_slice(&req.params_json).unwrap_or(serde_json::Value::Null);
+                                let resp = match crate::rpc::handle(&w, &req.method, params).await {
+                                    Ok(v) => RpcResponse { id: req.id, result_json: serde_json::to_vec(&v).unwrap_or_default(), error: String::new() },
+                                    Err(e) => RpcResponse { id: req.id, result_json: Vec::new(), error: format!("{e:#}") },
+                                };
+                                let _ = tx.send(WorkerMsg { msg: Some(worker_msg::Msg::RpcResponse(resp)) }).await;
+                            });
+                        }
                     }
                 }
                 Ok(Some(HeadMsg { msg: None })) => deadline = Instant::now() + READ_TIMEOUT, // newer head
@@ -234,6 +248,14 @@ async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: Cancel
                 _ = journal.appended.notified() => {}
             }
         }
+    }
+}
+
+struct ClearChannel(Arc<Worker>);
+
+impl Drop for ClearChannel {
+    fn drop(&mut self) {
+        self.0.set_channel(None);
     }
 }
 

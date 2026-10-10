@@ -30,6 +30,47 @@ message EnrollResponse {
 // enrollment; the worker id is taken from the certificate, never the payload.
 service WorkerHub {
   rpc Attach(stream WorkerMsg) returns (stream HeadMsg);
+
+  // A terminal's byte stream. Opened by the worker when the head asks it to
+  // (RpcRequest "pty.attach"), so terminal traffic gets its own HTTP/2
+  // stream and never delays the control stream.
+  rpc Pty(stream PtyFrame) returns (stream PtyFrame);
+}
+
+message PtyFrame {
+  oneof frame {
+    PtyOpen open = 1;     // worker -> head, first frame: which attach this is
+    bytes data = 2;       // output (worker -> head) or input (head -> worker)
+    PtySize resize = 3;   // head -> worker
+    PtyExit exit = 4;     // worker -> head
+  }
+}
+
+message PtyOpen {
+  string terminal_id = 1;
+  string attach_token = 2;
+}
+
+message PtySize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message PtyExit {
+  int32 code = 1;
+}
+
+// Head -> worker request with a JSON payload; answered by RpcResponse.
+message RpcRequest {
+  uint64 id = 1;
+  string method = 2;
+  bytes params_json = 3;
+}
+
+message RpcResponse {
+  uint64 id = 1;
+  bytes result_json = 2;
+  string error = 3; // set on failure
 }
 
 message WorkerMsg {
@@ -40,6 +81,7 @@ message WorkerMsg {
     EphemeralEvent ephemeral = 4;
     CommandRejected rejected = 5;
     CredentialRequest credential_request = 6;
+    RpcResponse rpc_response = 7;
   }
 }
 
@@ -50,6 +92,7 @@ message HeadMsg {
     EventAck ack = 3;
     SessionCommand command = 4;
     CredentialGrant credential = 5;
+    RpcRequest rpc_request = 6;
   }
 }
 

@@ -77,6 +77,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     );
     let model = RwSignal::new(String::new());
     let effort = RwSignal::new(storage_get("c6.effort").unwrap_or_default());
+    let worktree = RwSignal::new(storage_get("c6.worktree").as_deref() == Some("1"));
     let prompt = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -122,7 +123,9 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             title: None,
             prompt: Some(prompt.get_untracked()).filter(|p| !p.trim().is_empty()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty()),
+            worktree: worktree.get_untracked(),
         };
+        storage_set("c6.worktree", if worktree.get_untracked() { "1" } else { "0" });
         storage_set("c6.effort", &effort.get_untracked());
         storage_set("c6.worker", &req.worker_id.to_string());
         storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
@@ -199,7 +202,11 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 })
             }}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            <div class="flex justify-end">
+            <div class="flex items-center justify-end gap-4">
+                <label class="flex items-center gap-1.5 text-sm text-zinc-600 dark:text-zinc-400" title="Create a c6/… branch and a separate checkout for this session">
+                    <input type="checkbox" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
+                    "New git worktree"
+                </label>
                 <button class=BUTTON disabled=move || pending.get() on:click=move |_| submit_click()>"Start session"</button>
             </div>
         </section>

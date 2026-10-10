@@ -19,6 +19,54 @@ pub fn FleetPage() -> impl IntoView {
     view! { <main class="mx-auto max-w-6xl px-4 py-6"><Fleet workers /></main> }
 }
 
+/// One worker: its files, git changes and terminals.
+#[component]
+pub fn WorkerPage() -> impl IntoView {
+    let params = leptos_router::hooks::use_params_map();
+    let live = api::live();
+    let tab = RwSignal::new("files");
+    // Only the id drives the page body; live status updates touch just the
+    // header, so open terminals are not torn down on every heartbeat.
+    let id = Memo::new(move |_| params.read().get("id").unwrap_or_default());
+    let worker = move || live.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id.get()).cloned());
+    view! {
+        <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
+            <div class="flex items-center gap-3">
+                <h1 class="text-lg font-semibold">{move || worker().map(|w| w.name).unwrap_or_default()}</h1>
+                {move || worker().map(|w| {
+                    let online = w.status == WorkerStatus::Online;
+                    view! { <span class=if online { "text-xs text-emerald-600" } else { "text-xs text-zinc-500" }>{if online { "online" } else { "offline" }}</span> }
+                })}
+                <span class="flex-1"></span>
+                <TabButton tab label="Files" value="files" />
+                <TabButton tab label="Terminals" value="terminals" />
+            </div>
+            {move || worker().filter(|w| w.status != WorkerStatus::Online).map(|_| view! {
+                <p class="text-sm text-amber-700 dark:text-amber-400">"This worker is offline; files and terminals are unavailable until it reconnects."</p>
+            })}
+            {move || {
+                let id = id.get();
+                match tab.get() {
+                    "terminals" => view! { <crate::term::Terminals worker_id=id /> }.into_any(),
+                    _ => view! { <crate::files::FileBrowser worker_id=id /> }.into_any(),
+                }
+            }}
+        </main>
+    }
+}
+
+#[component]
+pub fn TabButton(tab: RwSignal<&'static str>, label: &'static str, value: &'static str) -> impl IntoView {
+    view! {
+        <button
+            class=move || if tab.get() == value { "rounded-md bg-zinc-200 px-2.5 py-1 text-sm dark:bg-zinc-800" } else { "rounded-md px-2.5 py-1 text-sm text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-900" }
+            on:click=move |_| tab.set(value)
+        >
+            {label}
+        </button>
+    }
+}
+
 #[component]
 pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
     // Ticks so "last seen" stays fresh between snapshots.
@@ -112,7 +160,7 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
             <td class="px-3 py-2">
                 <div class="flex items-center gap-2">
                     <span class=format!("h-2 w-2 shrink-0 rounded-full {dot}") title=label></span>
-                    <span class="font-medium">{w.name.clone()}</span>
+                    <a class="font-medium hover:underline" href=format!("/workers/{}", w.id)>{w.name.clone()}</a>
                 </div>
             </td>
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{w.hostname}</td>

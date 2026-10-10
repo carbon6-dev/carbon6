@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+bytes = "1.12.1"
 c6-agent.workspace = true
 c6-core.workspace = true
 c6-llm.workspace = true
@@ -15,6 +16,7 @@ dirs = "7.0.0"
 gethostname = "1.1.0"
 nix = { version = "0.31.3", features = ["signal", "process"] }
 pem = "4.0.0"
+portable-pty = "0.9.0"
 prost = "0.14.4"
 rand = "0.10.3"
 rcgen = { version = "0.14.10", features = ["pem"] }
@@ -39,8 +41,10 @@ c6-core.workspace = true
 c6-head.workspace = true
 c6-proto.workspace = true
 c6-testkit.workspace = true
-reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+futures = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
+tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.20"
 tracing-subscriber = "0.3.23"

@@ -93,6 +93,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
             }),
             cwd: row.cwd.clone(),
             base_prompt: prompts::BASE_PROMPT.into(),
+            worktree: req.worktree,
         })),
     };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];

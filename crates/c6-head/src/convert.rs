@@ -16,6 +16,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 cwd: s.cwd.clone(),
                 system_prompt: s.system_prompt.clone(),
                 tools: s.tools.clone(),
+                worktree_branch: s.worktree_branch.clone(),
+                repo_root: s.repo_root.clone(),
             }
         }
         Kind::User(u) => api::EventKind::User { command_id: u.command_id.clone(), text: u.text.clone() },

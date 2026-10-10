@@ -7,7 +7,7 @@ An AI coding-agent harness for running agents on many machines from one place.
 
 See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs/architecture.md).
 
-Status: **M2**. You can run coding sessions on any worker from the web UI, using Claude (Anthropic API), OpenAI (API key or your ChatGPT plan via Sign in with ChatGPT), or any OpenAI-compatible server (Ollama, vLLM, …). Each model family gets the tool set it was trained on, prompt caching and reasoning carry-over are on, and long sessions compact automatically. Sessions keep running when the head is unreachable and sync back when it returns.
+Status: **M3**. You can run coding sessions on any worker from the web UI, using Claude (Anthropic API), OpenAI (API key or your ChatGPT plan via Sign in with ChatGPT), or any OpenAI-compatible server (Ollama, vLLM, …). Each model family gets the tool set it was trained on, prompt caching and reasoning carry-over are on, and long sessions compact automatically. Sessions keep running when the head is unreachable and sync back when it returns. From the head you can browse each worker's files, review git changes, start sessions in fresh worktrees, and open terminals. Claude Code can also run as a session backend, using each worker's own sign-in.
 
 ## Build
 

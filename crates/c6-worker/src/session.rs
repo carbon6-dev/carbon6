@@ -23,6 +23,7 @@ use crate::link::HeadLink;
 pub struct SessionManager {
     journal: Arc<Journal>,
     link: Arc<HeadLink>,
+    worktrees: PathBuf,
     actors: Mutex<HashMap<String, mpsc::UnboundedSender<ActorMsg>>>,
 }
 
@@ -32,8 +33,8 @@ enum ActorMsg {
 }
 
 impl SessionManager {
-    pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>) -> Self {
-        Self { journal, link, actors: Mutex::default() }
+    pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
+        Self { journal, link, worktrees, actors: Mutex::default() }
     }
 
     /// Closes turns left open by a crash or kill.
@@ -79,11 +80,17 @@ impl SessionManager {
     }
 
     async fn create(&self, session_id: &str, command_id: &str, spec: CreateSession) -> Result<(), String> {
-        let cwd = expand_home(&spec.cwd);
+        let cwd = crate::expand_home(&spec.cwd);
         if !cwd.is_dir() {
             return Err(format!("working directory {} does not exist on this worker", cwd.display()));
         }
         let cwd = cwd.canonicalize().unwrap_or(cwd);
+        let (cwd, worktree_branch, repo_root) = if spec.worktree {
+            let (path, branch, root) = self.create_worktree(session_id, &cwd).await?;
+            (path, branch, root)
+        } else {
+            (cwd, String::new(), String::new())
+        };
         let date = time::OffsetDateTime::now_utc().date().to_string();
         let system_prompt = build_system_prompt(&spec.base_prompt, &cwd, &date);
         let model = spec.model.clone().unwrap_or_default();
@@ -102,12 +109,46 @@ impl SessionManager {
             system_prompt,
             tools,
             tool_profile: profile.clone(),
+            worktree_branch,
+            repo_root,
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
         self.journal.create_session(session_id, &spec, &ev).await.map_err(|e| format!("worker error: {e:#}"))?;
         info!(session = %session_id, cwd = %cwd.display(), %profile, "session created");
         self.spawn(session_id, spec, started, Conversation { history: Vec::new(), context_tokens: 0 }, 2, 0);
         Ok(())
+    }
+
+    /// `git worktree add` on a new `c6/<id>` branch from HEAD. Returns the
+    /// session directory (same relative position as `cwd` in the repo), the
+    /// branch, and the repo root.
+    async fn create_worktree(&self, session_id: &str, cwd: &std::path::Path) -> Result<(PathBuf, String, String), String> {
+        let root = cwd
+            .ancestors()
+            .find(|d| d.join(".git").exists())
+            .ok_or_else(|| format!("{} is not inside a git repository, so a worktree cannot be created", cwd.display()))?
+            .to_owned();
+        let repo = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
+        let short: String =
+            session_id.chars().filter(|c| c.is_ascii_hexdigit()).rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+        let branch = format!("c6/{short}");
+        let path = self.worktrees.join(&repo).join(&short);
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("creating {}: {e}", self.worktrees.display()))?;
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "add", "-b", &branch])
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .await
+            .map_err(|e| format!("running git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git worktree add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        let rel = cwd.strip_prefix(&root).unwrap_or(std::path::Path::new(""));
+        info!(session = %session_id, %branch, path = %path.display(), "worktree created");
+        Ok((path.join(rel), branch, root.display().to_string()))
     }
 
     /// The session's actor, starting it from the journal if needed.
@@ -168,15 +209,6 @@ impl SessionManager {
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), tx.clone());
         tx
-    }
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    match path.strip_prefix("~") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            dirs::home_dir().map(|h| h.join(rest.trim_start_matches('/'))).unwrap_or_else(|| PathBuf::from(path))
-        }
-        _ => PathBuf::from(path),
     }
 }
 

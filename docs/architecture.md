@@ -401,7 +401,7 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 | M4 | MCP, skills, subagents, web tools, background shells, OTLP export | Feature parity with the requirements |
 | M5 | Hardening: chaos tests, evals, performance, UX polish | Comfortable as the only harness |
 
-## 16. Implementation notes (M1, M2)
+## 16. Implementation notes (M1–M3)
 
 Decisions made while building M1 that refine the sections above:
 
@@ -421,6 +421,13 @@ Decisions made while building M1 that refine the sections above:
 - **Compaction (M2) is "simple compaction".**
   - When the last request used 85% of the context window, or the provider reports a context overflow, the same model summarizes the conversation. It runs with the same system prompt and tools, so the cached prefix is reused.
   - A `Compaction` event then replaces the whole history with the summary, and nothing older is sent again. This keeps the history append-only, which providers that check reasoning blocks against the history require.
+- **Head→worker RPC (M3).** `RpcRequest`/`RpcResponse` on the Attach stream, with JSON payloads and an id that matches each response to its request. The methods are `fs.list`, `fs.read`, `git.status`, `git.diff`, `git.log` and `pty.*`. The worker handles each one in its own task, so a slow git call never blocks the read loop. The head's API endpoints pass requests straight through to the worker.
+- **Terminals (M3).**
+  - Each terminal is a `portable-pty` login shell that lives on the worker, with 1 MiB of scrollback, until its shell exits or it is closed.
+  - To attach, the browser opens a WebSocket to the head. The head asks the worker (RPC `pty.attach` with a one-time token) to open a `Pty` gRPC stream back to it, then joins the two.
+  - The worker sends the scrollback, then live output. It takes the scrollback snapshot and subscribes to live output under one lock, so no output is lost or duplicated between them.
+- **Worktrees (M3).** `CreateSession.worktree` runs `git worktree add -b c6/<id> <state>/worktrees/<repo>/<id> HEAD` and starts the session at the same relative path inside it. `SessionStarted` records the branch and repo root. Worktrees are kept when a session is archived; removing them is manual for now.
+- **Claude Code backend.** Each turn runs `claude -p --output-format stream-json` in the session's directory and maps its output onto session events (see requirements R-LLM-3).
 - **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
 
 ## 17. Open items to settle during implementation

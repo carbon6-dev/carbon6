@@ -123,6 +123,9 @@ pub struct CreateSession {
     /// Reasoning effort: low, medium, high, xhigh, max. Default: per model.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Run in a new git worktree on a new `c6/…` branch.
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -182,6 +185,10 @@ pub enum EventKind {
         cwd: String,
         system_prompt: String,
         tools: Vec<String>,
+        #[serde(default)]
+        worktree_branch: String,
+        #[serde(default)]
+        repo_root: String,
     },
     User {
         command_id: String,

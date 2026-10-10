@@ -96,7 +96,7 @@ pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, 
     handle
 }
 
-fn ws_url(path: &str) -> String {
+pub fn ws_url(path: &str) -> String {
     let loc = window().location();
     let scheme = if loc.protocol().as_deref() == Ok("https:") { "wss" } else { "ws" };
     format!("{scheme}://{}{path}", loc.host().unwrap_or_default())
@@ -185,4 +185,45 @@ pub async fn archive(id: String) -> Result<(), String> {
 
 pub async fn dismiss_rejected(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/rejected")).send().await).await
+}
+
+// --- Worker files, git, terminals ---------------------------------------------
+
+fn enc(s: &str) -> String {
+    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+}
+
+pub async fn fs_list(worker: String, path: String, hidden: bool) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/workers/{worker}/fs/list?path={}&hidden={hidden}", enc(&path))).send().await).await
+}
+
+pub async fn fs_read(worker: String, path: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/workers/{worker}/fs/read?path={}", enc(&path))).send().await).await
+}
+
+pub async fn git_status(worker: String, path: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/workers/{worker}/git/status?path={}", enc(&path))).send().await).await
+}
+
+pub async fn git_diff(worker: String, path: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/workers/{worker}/git/diff?path={}", enc(&path))).send().await).await
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct TerminalInfo {
+    pub id: String,
+    pub cwd: String,
+    pub exited: Option<i32>,
+}
+
+pub async fn terminals(worker: String) -> Result<Vec<TerminalInfo>, String> {
+    json(Request::get(&format!("/api/v1/workers/{worker}/terminals")).send().await).await
+}
+
+pub async fn open_terminal(worker: String, cwd: String) -> Result<TerminalInfo, String> {
+    send_json(Request::post(&format!("/api/v1/workers/{worker}/terminals")), &serde_json::json!({"cwd": cwd})).await
+}
+
+pub async fn close_terminal(worker: String, id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/workers/{worker}/terminals/{id}")).send().await).await
 }

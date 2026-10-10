@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use c6_core::{WorkerId, now_ms, protocol_compatible};
 use c6_proto::{
-    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, SessionCommand, SessionCursor, Welcome, WorkerMsg,
-    enrollment_server::Enrollment, head_msg, worker_hub_server::WorkerHub, worker_msg,
+    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, SessionCommand, SessionCursor, Welcome, WorkerMsg,
+    enrollment_server::Enrollment, head_msg, pty_frame, worker_hub_server::WorkerHub, worker_msg,
 };
 use futures::Stream;
 use prost::Message;
@@ -68,9 +68,31 @@ pub struct HubSvc(pub Arc<HeadState>);
 
 type HeadStream = Pin<Box<dyn Stream<Item = Result<HeadMsg, Status>> + Send>>;
 
+type PtyStream = Pin<Box<dyn Stream<Item = Result<PtyFrame, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl WorkerHub for HubSvc {
     type AttachStream = HeadStream;
+    type PtyStream = PtyStream;
+
+    /// A worker answering a terminal attach: hand the stream to the waiting
+    /// browser connection identified by the attach token.
+    async fn pty(&self, req: Request<Streaming<PtyFrame>>) -> Result<Response<PtyStream>, Status> {
+        let certs = req.peer_certs().ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let (worker_id, _) = certs
+            .first()
+            .and_then(|c| crate::pki::worker_identity(c))
+            .ok_or_else(|| Status::unauthenticated("certificate has no worker identity"))?;
+        let mut inbound = req.into_inner();
+        let open = match inbound.message().await? {
+            Some(PtyFrame { frame: Some(pty_frame::Frame::Open(o)) }) => o,
+            _ => return Err(Status::invalid_argument("first frame must be Open")),
+        };
+        let waiter = self.0.terminals.take(&open.attach_token, worker_id).ok_or_else(|| Status::not_found("no such attach"))?;
+        let (tx, rx) = mpsc::channel(256);
+        waiter.send((inbound, tx)).map_err(|_| Status::cancelled("viewer went away"))?;
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
 
     async fn attach(&self, req: Request<Streaming<WorkerMsg>>) -> Result<Response<HeadStream>, Status> {
         let st = self.0.clone();
@@ -190,6 +212,7 @@ async fn serve_worker(
                     warn!(worker = %worker_id, "recording rejection: {e:#}");
                 }
             }
+            worker_msg::Msg::RpcResponse(resp) => guard.rpc_response(resp),
             worker_msg::Msg::CredentialRequest(req) => {
                 let grant = sessions::credential(st, req).await;
                 if tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await.is_err() {

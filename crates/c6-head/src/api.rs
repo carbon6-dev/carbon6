@@ -34,6 +34,14 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
+        .route("/api/v1/workers/{id}/fs/list", get(fs_list))
+        .route("/api/v1/workers/{id}/fs/read", get(fs_read))
+        .route("/api/v1/workers/{id}/git/status", get(git_status))
+        .route("/api/v1/workers/{id}/git/diff", get(git_diff))
+        .route("/api/v1/workers/{id}/git/log", get(git_log))
+        .route("/api/v1/workers/{id}/terminals", get(list_terminals).post(open_terminal))
+        .route("/api/v1/workers/{id}/terminals/{tid}", delete(close_terminal))
+        .route("/api/v1/workers/{id}/terminals/{tid}/attach", get(attach_terminal))
         .route("/api/v1/live", get(live))
         .fallback(static_asset)
         .with_state(state)
@@ -275,6 +283,11 @@ async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Respons
     }
 }
 
+fn is_fingerprinted(path: &str) -> bool {
+    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("");
+    stem.rsplit_once('-').is_some_and(|(_, h)| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -470,6 +483,130 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, after: u64, mut s
     }
 }
 
+// --- Worker files, git, terminals (proxied to the worker) ----------------------
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn worker_call(st: &HeadState, id: &str, method: &str, params: serde_json::Value) -> ApiResult<Json<serde_json::Value>> {
+    let worker_id = parse_worker_id(id)?;
+    match st.registry.call(worker_id, method, params, RPC_TIMEOUT).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) if e.contains("not connected") || e.contains("disconnected") => Err(ApiErr(StatusCode::CONFLICT, e)),
+        Err(e) => Err(ApiErr(StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+type Params = Query<std::collections::HashMap<String, String>>;
+
+fn params_json(q: std::collections::HashMap<String, String>) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in q {
+        let v = match v.as_str() {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            _ => serde_json::Value::String(v),
+        };
+        m.insert(k, v);
+    }
+    serde_json::Value::Object(m)
+}
+
+async fn fs_list(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "fs.list", params_json(q)).await
+}
+
+async fn fs_read(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "fs.read", params_json(q)).await
+}
+
+async fn git_status(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "git.status", params_json(q)).await
+}
+
+async fn git_diff(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "git.diff", params_json(q)).await
+}
+
+async fn git_log(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "git.log", params_json(q)).await
+}
+
+async fn list_terminals(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "pty.list", serde_json::json!({})).await
+}
+
+async fn open_terminal(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "pty.open", body).await
+}
+
+async fn close_terminal(State(st): State<Arc<HeadState>>, Path((id, tid)): Path<(String, String)>) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "pty.close", serde_json::json!({ "terminal_id": tid })).await
+}
+
+/// Browser ↔ terminal: binary frames carry bytes both ways; text frames are
+/// control messages (`{"type":"resize","cols":..,"rows":..}` in,
+/// `{"type":"exit","code":..}` / `{"type":"error",..}` out).
+async fn attach_terminal(State(st): State<Arc<HeadState>>, Path((id, tid)): Path<(String, String)>, ws: WebSocketUpgrade) -> Response {
+    let Ok(worker_id) = parse_worker_id(&id) else { return StatusCode::BAD_REQUEST.into_response() };
+    ws.on_upgrade(move |socket| terminal_socket(st, worker_id, tid, socket))
+}
+
+async fn terminal_socket(st: Arc<HeadState>, worker_id: WorkerId, tid: String, mut socket: WebSocket) {
+    use c6_proto::{PtyFrame, PtySize, pty_frame};
+    let control = |v: serde_json::Value| Message::Text(v.to_string().into());
+
+    let (token, waiting) = st.terminals.expect(worker_id);
+    if let Err(e) =
+        st.registry.call(worker_id, "pty.attach", serde_json::json!({"terminal_id": tid, "token": token}), Duration::from_secs(10)).await
+    {
+        st.terminals.forget(&token);
+        let _ = socket.send(control(serde_json::json!({"type": "error", "message": e}))).await;
+        return;
+    }
+    let (mut inbound, tx) = match tokio::time::timeout(Duration::from_secs(10), waiting).await {
+        Ok(Ok(pair)) => pair,
+        _ => {
+            st.terminals.forget(&token);
+            let _ =
+                socket.send(control(serde_json::json!({"type": "error", "message": "the worker did not open the terminal stream"}))).await;
+            return;
+        }
+    };
+    let frame = |f| Ok(PtyFrame { frame: Some(f) });
+    loop {
+        tokio::select! {
+            _ = st.shutdown.cancelled() => return,
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Binary(b))) => if tx.send(frame(pty_frame::Frame::Data(b.to_vec()))).await.is_err() { return },
+                Some(Ok(Message::Text(t))) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                    if v["type"] == "resize" {
+                        let size = PtySize { cols: v["cols"].as_u64().unwrap_or(0) as u32, rows: v["rows"].as_u64().unwrap_or(0) as u32 };
+                        if tx.send(frame(pty_frame::Frame::Resize(size))).await.is_err() { return }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(_)) => {}
+            },
+            f = inbound.message() => match f {
+                Ok(Some(PtyFrame { frame: Some(pty_frame::Frame::Data(d)) })) => {
+                    if socket.send(Message::Binary(d.into())).await.is_err() { return }
+                }
+                Ok(Some(PtyFrame { frame: Some(pty_frame::Frame::Exit(e)) })) => {
+                    let _ = socket.send(control(serde_json::json!({"type": "exit", "code": e.code}))).await;
+                    return;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return,
+            },
+        }
+    }
+}
+
 #[derive(RustEmbed)]
 #[folder = "../c6-ui/dist"]
 #[allow_missing = true]
@@ -489,7 +626,8 @@ async fn static_asset(uri: Uri) -> Response {
         },
     };
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    // Trunk fingerprints asset names; only index.html must be revalidated.
-    let cache = if path == "index.html" { "no-cache" } else { "public, max-age=31536000, immutable" };
+    // Trunk fingerprints its outputs (`name-<16 hex>.ext`); those never
+    // change. Everything else (index.html, vendored scripts) is revalidated.
+    let cache = if is_fingerprinted(path) { "public, max-age=31536000, immutable" } else { "no-cache" };
     ([(header::CONTENT_TYPE, mime.as_ref().to_owned()), (header::CACHE_CONTROL, cache.to_owned())], file.data).into_response()
 }

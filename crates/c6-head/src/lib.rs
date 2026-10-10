@@ -11,6 +11,7 @@ pub mod registry;
 pub mod secrets;
 pub mod sessions;
 pub mod store;
+pub mod terminals;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -59,6 +60,7 @@ pub struct HeadState {
     pub secrets: secrets::Secrets,
     pub hub: sessions::LiveHub,
     pub oauth: oauth::OAuth,
+    pub terminals: terminals::Attaches,
     /// For OAuth token exchange and model listing.
     pub http: reqwest::Client,
     /// The UI port, for the OAuth loopback redirect.
@@ -125,6 +127,7 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
         secrets,
         hub: Default::default(),
         oauth: Default::default(),
+        terminals: Default::default(),
         http,
         ui_port: ui_addrs[0].port(),
         worker_url,
@@ -145,7 +148,11 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .add_service(EnrollmentServer::new(hub::EnrollmentSvc(state.clone())))
-        .add_service(WorkerHubServer::new(hub::HubSvc(state.clone())));
+        .add_service(
+            WorkerHubServer::new(hub::HubSvc(state.clone()))
+                .max_decoding_message_size(32 * 1024 * 1024)
+                .max_encoding_message_size(32 * 1024 * 1024),
+        );
     let token = shutdown.clone();
     tasks.spawn(async move { grpc.serve_with_incoming_shutdown(incoming, token.cancelled_owned()).await.context("worker port") });
 

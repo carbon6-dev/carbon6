@@ -33,6 +33,9 @@ message SessionStarted {
   // Tool profile the session was started with ("generic", "claude",
   // "codex"); fixed for the session so the tool list stays a stable prefix.
   string tool_profile = 6;
+  // Set when the session runs in its own worktree.
+  string worktree_branch = 7;
+  string repo_root = 8;
 }
 
 message UserMessage {
@@ -191,6 +194,8 @@ message CreateSession {
   // Base prompt from the head; the worker appends environment details and
   // project instruction files.
   string base_prompt = 3;
+  // Run in a new git worktree on a new branch instead of `cwd` itself.
+  bool worktree = 4;
 }
 
 message ModelSpec {

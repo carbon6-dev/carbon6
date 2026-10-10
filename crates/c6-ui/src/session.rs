@@ -139,6 +139,14 @@ fn SessionView(id: String) -> impl IntoView {
 
     let id_stored = StoredValue::new(id.clone());
     let navigate = use_navigate();
+    let tab = RwSignal::new("transcript");
+    // Where the session really runs (its worktree, if it has one).
+    let started = Memo::new(move |_| {
+        events.with(|evs| match evs.first().map(|e| &e.kind) {
+            Some(EventKind::Started { cwd, worktree_branch, .. }) => Some((cwd.clone(), worktree_branch.clone())),
+            _ => None,
+        })
+    });
 
     view! {
         <main class="mx-auto max-w-4xl px-4 pb-48 pt-4">
@@ -159,12 +167,19 @@ fn SessionView(id: String) -> impl IntoView {
                                             <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
                                             {d.worker_name.clone()}
                                         </span>
-                                        <span class="font-mono">{s.cwd.clone()}</span>
+                                        <span class="font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
+                                        {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
+                                            <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
+                                        })}
                                         <span>{s.model.clone()}{s.effort.clone().map(|e| format!(" · {e}"))}</span>
                                         <span>{move || { let (i, c, o) = usage.get(); if i + o == 0 { String::new() } else { format!("{} in ({}% cached) · {} out", tokens(i), (c * 100).checked_div(i).unwrap_or(0), tokens(o)) } }}</span>
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-2">
+                                    <crate::fleet::TabButton tab label="Transcript" value="transcript" />
+                                    <crate::fleet::TabButton tab label="Changes" value="changes" />
+                                    <crate::fleet::TabButton tab label="Files" value="files" />
+                                    <crate::fleet::TabButton tab label="Terminal" value="terminal" />
                                     {move || view! { <StatusPill status=status.get() /> }}
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| {
                                         let navigate = navigate.clone();
@@ -180,7 +195,18 @@ fn SessionView(id: String) -> impl IntoView {
                 })}
             </Suspense>
 
-            <div class="space-y-4">
+            {move || {
+                let wid = detail.get().and_then(|d| d.ok()).map(|d| d.session.worker_id.to_string());
+                let cwd = started.get().map(|(c, _)| c);
+                match (tab.get(), wid, cwd) {
+                    ("changes", Some(w), Some(c)) => view! { <crate::files::Changes worker_id=w path=c /> }.into_any(),
+                    ("files", Some(w), Some(c)) => view! { <crate::files::FileBrowser worker_id=w root=c /> }.into_any(),
+                    ("terminal", Some(w), Some(c)) => view! { <crate::term::Terminals worker_id=w default_cwd=c /> }.into_any(),
+                    ("transcript", _, _) => ().into_any(),
+                    _ => view! { <p class="py-6 text-center text-sm text-zinc-500">"Available once the session has started."</p> }.into_any(),
+                }
+            }}
+            <div class="space-y-4" class:hidden=move || tab.get() != "transcript">
                 // Events are append-only: keyed by seq, each renders once, so
                 // expanded cards stay open while the turn continues.
                 <For each=move || events.get() key=|e| e.seq let:e>
@@ -200,7 +226,9 @@ fn SessionView(id: String) -> impl IntoView {
                 {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id_stored.get_value() /> }).collect_view()}
             </div>
 
+            <Show when=move || tab.get() == "transcript">
             <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error />
+            </Show>
         </main>
     }
 }

@@ -1,11 +1,13 @@
 //! carbon6 web UI (Leptos CSR). Talks only to the head's `/api/v1`.
 
 mod api;
+mod files;
 mod fleet;
 mod markdown;
 mod session;
 mod sessions;
 mod settings;
+mod term;
 mod util;
 
 use leptos::prelude::*;
@@ -39,6 +41,7 @@ fn App() -> impl IntoView {
                     <Route path=path!("/") view=sessions::SessionsPage />
                     <Route path=path!("/sessions/:id") view=session::SessionPage />
                     <Route path=path!("/workers") view=fleet::FleetPage />
+                    <Route path=path!("/workers/:id") view=fleet::WorkerPage />
                     <Route path=path!("/settings") view=settings::SettingsPage />
                 </Routes>
             </div>
