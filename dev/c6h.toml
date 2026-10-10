@@ -1,0 +1,3 @@
+# Local development head: loopback only, state under target/.
+data_dir = "target/dev/c6h"
+bind = ["127.0.0.1"]

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "c6h-dev",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-q", "-p", "c6h", "--", "--config", "dev/c6h.toml"],
+      "port": 7700
+    }
+  ]
+}

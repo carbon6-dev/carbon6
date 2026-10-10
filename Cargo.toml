@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*"]
+default-members = ["crates/c6-proto", "crates/c6-core", "crates/c6-api", "crates/c6-head", "crates/c6-worker", "bins/c6h", "bins/c6w"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/carbon6-dev/carbon6"
+
+[workspace.dependencies]
+c6-proto = { path = "crates/c6-proto" }
+c6-core = { path = "crates/c6-core" }
+c6-api = { path = "crates/c6-api" }
+c6-head = { path = "crates/c6-head" }
+c6-worker = { path = "crates/c6-worker" }

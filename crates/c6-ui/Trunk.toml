@@ -1,0 +1,11 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[tools]
+tailwindcss = "4.1.14"
+
+# `trunk serve` for UI development against a running head on the default port.
+[[proxy]]
+backend = "http://127.0.0.1:7700/api/"
+ws = true

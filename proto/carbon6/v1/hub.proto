@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package carbon6.v1;
+
+// One-time enrollment. Served on the worker port over server-authenticated
+// TLS; the caller has no client certificate yet.
+service Enrollment {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message EnrollRequest {
+  string secret = 1;   // from the enrollment token
+  string csr_pem = 2;  // worker-generated key never leaves the worker
+  string hostname = 3;
+  string os = 4;
+  string arch = 5;
+  string version = 6;
+}
+
+message EnrollResponse {
+  string worker_id = 1;
+  string worker_name = 2;
+  string cert_pem = 3;
+  string ca_pem = 4;
+}
+
+// Long-lived worker connection. Requires an mTLS client certificate issued at
+// enrollment; the worker id is taken from the certificate, never the payload.
+service WorkerHub {
+  rpc Attach(stream WorkerMsg) returns (stream HeadMsg);
+}
+
+message WorkerMsg {
+  oneof msg {
+    Hello hello = 1; // must be first
+    Ping ping = 2;
+  }
+}
+
+message HeadMsg {
+  oneof msg {
+    Welcome welcome = 1;
+    Pong pong = 2;
+  }
+}
+
+message Hello {
+  uint32 protocol_version = 1;
+  string version = 2;
+  string hostname = 3;
+  string os = 4;
+  string arch = 5;
+  repeated string capabilities = 6;
+}
+
+message Welcome {
+  uint32 protocol_version = 1;
+  string head_version = 2;
+  string worker_id = 3;
+  string worker_name = 4;
+}
+
+message Ping {
+  uint64 nonce = 1;
+  // Round-trip time measured on the previous ping, for display on the head.
+  uint32 last_rtt_us = 2;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}

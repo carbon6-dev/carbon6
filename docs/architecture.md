@@ -74,8 +74,8 @@ Why a CSR SPA rather than Leptos SSR/server functions: requirement R-HEAD-4 call
 
 ```proto
 service WorkerHub {
-  // Control plane + durable events. Exactly one per worker connection.
-  rpc Connect(stream WorkerMsg) returns (stream HeadMsg);
+  // Control plane + durable events. Exactly one per worker connection. (Not named Connect: that collides with tonic's generated client constructor.)
+  rpc Attach(stream WorkerMsg) returns (stream HeadMsg);
 
   // Data-plane streams, opened by the worker in response to a head request
   // ("reverse dial"), so bulk/interactive traffic gets its own h2 stream
@@ -112,7 +112,7 @@ message HeadMsg { oneof msg {
 
 The worker then resends every journaled event with `seq > acked_seq`.
 
-**Head→worker requests.** Each `RpcRequest` carries `{id, deadline, method, payload}`. Small replies come back as `RpcResponse` on the Connect stream. For streaming methods (`pty.open`, large `fs.read`), the worker opens the matching data-plane RPC and tags it with the request id. The head's `RpcRouter` holds the pending requests and the correlation ids.
+**Head→worker requests.** Each `RpcRequest` carries `{id, deadline, method, payload}`. Small replies come back as `RpcResponse` on the Attach stream. For streaming methods (`pty.open`, large `fs.read`), the worker opens the matching data-plane RPC and tags it with the request id. The head's `RpcRouter` holds the pending requests and the correlation ids.
 
 **Flow control.** HTTP/2 window flow control carries the bytes. On top of it, the worker bounds the number of unacknowledged durable events it has in flight per session. Ephemeral messages are dropped under backpressure; durable ones never are.
 
@@ -394,7 +394,7 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 
 | M | Scope | Done when |
 |---|---|---|
-| M0 | Workspace, protos, PKI and enrollment, Connect/heartbeat, fleet page | A worker enrolls and shows as online in the UI |
+| M0 | Workspace, protos, PKI and enrollment, Attach/heartbeat, fleet page | A worker enrolls and shows as online in the UI |
 | M1 | OpenAIChat client, agent loop, core tools (Read/Write/Edit/Bash/Grep/Glob), journal + sync, session view with streaming | A coding task runs end-to-end on a remote worker and survives a disconnect |
 | M2 | Anthropic + Responses clients, OAuth connections, caching/thinking, model registry, tool profiles, compaction | Daily use on Claude and GPT models with high cache hit rates |
 | M3 | Remote fs browser, git status/diff, worktrees, terminals | IDE-like browsing and shells from the head |
