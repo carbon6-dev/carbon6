@@ -216,6 +216,9 @@ pub fn SignInSettings() -> impl IntoView {
                 </div>
             })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            <p class="text-xs text-zinc-500">
+                "Each passkey is listed once, named after the device it was made on. Password managers (Google Password Manager, iCloud Keychain) sync it to your other devices, which then sign in with that same passkey."
+            </p>
             <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 text-sm dark:divide-zinc-800 dark:border-zinc-800">
                 {move || passkeys.get().map(|r| match r {
                     Ok(ps) if ps.is_empty() => view! { <p class="px-4 py-3 text-zinc-500">"No passkeys yet."</p> }.into_any(),
