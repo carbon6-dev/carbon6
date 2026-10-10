@@ -1,0 +1,8 @@
+# Head configuration inside the container. Binding all interfaces is safe
+# here: exposure is decided by how the ports are published (`make
+# docker-head` publishes them on 127.0.0.1 only). Set C6H_ADVERTISE_HOST to
+# the address workers should dial, and C6H_EXTRA_NAMES to the names the UI
+# is reached by.
+data_dir = "/data"
+bind = ["0.0.0.0"]
+allow_public_bind = true

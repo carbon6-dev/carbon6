@@ -1,3 +1,4 @@
 target/
 crates/c6-ui/dist/
 .DS_Store
+dist/

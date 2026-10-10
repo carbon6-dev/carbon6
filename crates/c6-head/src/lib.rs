@@ -162,6 +162,9 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
     // Only answer to our own names (see guard.rs).
     let mut names = dns_names.clone();
     names.extend(cfg.extra_names.iter().cloned());
+    // Literal loopback addresses can't be rebound, and are how a published
+    // container port is usually reached.
+    names.extend(["127.0.0.1".to_owned(), "[::1]".to_owned()]);
     let guard = guard::HostGuard::new(&ui_addrs, &names);
     let app = api::router(state.clone()).layer(axum::middleware::from_fn_with_state(guard, guard::check));
     for listener in ui_listeners {

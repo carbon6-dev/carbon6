@@ -58,13 +58,22 @@ pub fn default_config_path() -> PathBuf {
 }
 
 impl HeadConfig {
-    /// Loads `path`, or defaults if it does not exist.
+    /// Loads `path`, or defaults if it does not exist, then applies
+    /// environment overrides: `C6H_ADVERTISE_HOST` and `C6H_EXTRA_NAMES`
+    /// (comma-separated). Containers use these.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        let mut cfg: Self = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        if let Some(h) = std::env::var("C6H_ADVERTISE_HOST").ok().filter(|h| !h.is_empty()) {
+            cfg.advertise_host = Some(h);
         }
+        if let Ok(names) = std::env::var("C6H_EXTRA_NAMES") {
+            cfg.extra_names.extend(names.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned));
+        }
+        Ok(cfg)
     }
 
     /// The IPs to bind, after applying the private-only policy.

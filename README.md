@@ -23,10 +23,25 @@ See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs
 
 ## Build
 
-You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
+Run `make` to list the targets.
+
+**With Docker only.** You need nothing else installed:
 
 ```bash
-make build    # web UI, then release c6h and c6w
+make docker-build      # Linux binaries for this machine's architecture → dist/linux-<arch>/
+make docker-test       # the full test suite
+make docker-head       # run the head in a container on http://127.0.0.1:7700
+make docker-token      # an enrollment token from that head
+```
+
+- `make docker-build-all` builds both amd64 and arm64.
+- `make docker-images` builds the `carbon6/c6h` and `carbon6/c6w` runtime images.
+- Docker produces Linux binaries only. A worker on a Mac needs a native `c6w`, built with the local toolchain below.
+
+**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
+
+```bash
+make build             # web UI, then release c6h and c6w into target/release
 make test
 ```
 

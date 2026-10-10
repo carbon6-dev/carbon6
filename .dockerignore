@@ -1,0 +1,6 @@
+target
+dist
+crates/c6-ui/dist
+.git
+.claude
+**/.DS_Store
