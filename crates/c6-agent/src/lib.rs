@@ -1,6 +1,7 @@
 //! The agent loop: turns user input into model calls and tool calls, recording
 //! everything as session events.
 
+mod base_prompt;
 mod history;
 mod prompt;
 mod turn;
@@ -8,6 +9,7 @@ mod turn;
 use async_trait::async_trait;
 use c6_proto::{ephemeral_event, session_event};
 
+pub use base_prompt::BASE_PROMPT;
 pub use history::{compacted_context, history_from_events};
 pub use prompt::build_system_prompt;
 pub use turn::{Conversation, TurnConfig, run_turn};

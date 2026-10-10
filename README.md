@@ -2,16 +2,28 @@
 
 An AI coding-agent harness for running agents on many machines from one place.
 
-- **`c6h`** (head) runs centrally. It owns all configuration and session data and serves the web UI.
-- **`c6w`** (worker) runs headless on each dev machine. It attaches to the head and runs agent sessions there.
+- **`c6h`** (head) runs centrally. It owns all configuration, credentials and session data, and serves the web UI.
+- **`c6w`** (worker) runs headless on each dev machine (macOS or Linux). It attaches to the head and runs agent sessions there.
 
 See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs/architecture.md).
 
-Status: **M4**. You can run coding sessions on any worker from the web UI, using Claude (Anthropic API), OpenAI (API key or your ChatGPT plan via Sign in with ChatGPT), or any OpenAI-compatible server (Ollama, vLLM, …). Each model family gets the tool set it was trained on, prompt caching and reasoning carry-over are on, and long sessions compact automatically. Sessions keep running when the head is unreachable and sync back when it returns. From the head you can browse each worker's files, review git changes, start sessions in fresh worktrees, and open terminals. Claude Code can also run as a session backend, using each worker's own sign-in. Agents can run background commands, fetch and search the web, delegate to subagents, use MCP servers, and load skills. The head exports OpenTelemetry GenAI traces over OTLP.
+## What it does
+
+- **Sessions on any worker, from one web UI.** You can watch output stream live (text, reasoning, tool calls and shell output), send messages mid-turn, and stop a turn. Sessions can run in a fresh git worktree.
+- **Providers:**
+  - Anthropic API (Claude)
+  - OpenAI API (Responses), or your ChatGPT plan via Sign in with ChatGPT
+  - Any OpenAI-compatible server (Ollama, vLLM, OpenRouter, …)
+  - **Claude Code**, which runs each worker's own signed-in `claude` CLI
+- **Model features:** prompt caching, reasoning carried between steps, effort per session, and automatic compaction for long sessions.
+- **Tool sets per model family:** Claude Code-style for Claude, Codex-style for GPT, and a generic set otherwise. Tools include read, write, edit, `apply_patch`, bash (with background jobs), grep, glob, `web_fetch`, the provider's own web search, plans, subagents, MCP servers and skills.
+- **Offline-tolerant.** Workers journal every event before sending it. Sessions keep running when the head is unreachable and sync back exactly when it returns. A worker that loses its journal has its sessions restored from the head.
+- **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser.
+- **Observability:** the head exports OpenTelemetry GenAI traces over OTLP.
 
 ## Build
 
-Requires a Rust toolchain with `wasm32-unknown-unknown` and [Trunk](https://trunkrs.dev). Trunk downloads Tailwind and wasm-bindgen on first build. protoc is vendored.
+You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
 
 ```bash
 make build    # web UI, then release c6h and c6w
@@ -26,14 +38,22 @@ On the head machine:
 c6h               # binds private/tailnet addresses only; prints the web UI URL
 ```
 
-Open the UI, add an LLM connection under **Settings** (for a local Ollama: `http://127.0.0.1:11434/v1`, no key), then click **Add worker** on the Workers page, and run the printed command on the worker machine (or use `c6h enroll-token` on the head):
+1. In the UI, add an LLM connection under **Settings**. For a local Ollama, use `http://127.0.0.1:11434/v1` with no key.
+2. On the **Workers** page, click **Add worker**, then run the printed command on the worker machine (or create a token with `c6h enroll-token` on the head):
 
 ```bash
 c6w enroll c6e1.…
 c6w run
 ```
 
-Head config lives in `~/.config/c6h/c6h.toml` (optional; see `crates/c6-head/src/config.rs`). Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces. Worker identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
+### Configuration
+
+- **Head:** `~/.config/c6h/c6h.toml`, optional (see `crates/c6-head/src/config.rs`).
+  - Add any names you reach the head by, such as a MagicDNS name, to `extra_names`; the head refuses requests addressed to other names.
+  - Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
+  - MCP servers and skills are configured in the UI.
+- **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
+  - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
 ## Local development
 
@@ -43,4 +63,5 @@ make dev-token                    # prints a token
 make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it
 ```
 
-For UI work, `cd crates/c6-ui && trunk serve` proxies `/api` to the dev head.
+- For UI work, `cd crates/c6-ui && trunk serve` proxies `/api` to the dev head.
+- Evals: see [evals/README.md](evals/README.md).

@@ -1,0 +1,3 @@
+# Production overrides base.toml
+[server]
+workers = 16

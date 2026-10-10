@@ -14,6 +14,8 @@ pub fn SessionsPage() -> impl IntoView {
     let live = api::live();
     let now = clock();
     let connections = LocalResource::new(api::connections);
+    let query = RwSignal::new(String::new());
+    let status_filter = RwSignal::new(String::new());
 
     view! {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-6">
@@ -30,10 +32,33 @@ pub fn SessionsPage() -> impl IntoView {
             </Suspense>
 
             <section class="space-y-2">
-                <h2 class="text-sm font-medium text-zinc-500">"Sessions"</h2>
+                <div class="flex flex-wrap items-center gap-2">
+                    <h2 class="flex-1 text-sm font-medium text-zinc-500">"Sessions"</h2>
+                    <input class=format!("{INPUT} w-56") placeholder="Search titles, workers, paths" prop:value=move || query.get()
+                        on:input=move |ev| query.set(event_target_value(&ev)) />
+                    <select class=format!("{INPUT} w-32") prop:value=move || status_filter.get() on:change=move |ev| status_filter.set(event_target_value(&ev))>
+                        <option value="">"All"</option>
+                        <option value="running">"Running"</option>
+                        <option value="idle">"Idle"</option>
+                        <option value="failed">"Failed"</option>
+                    </select>
+                </div>
                 <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || {
-                        let sessions = live.sessions.get();
+                        let q = query.get().to_lowercase();
+                        let st = status_filter.get();
+                        let sessions: Vec<Session> = live
+                            .sessions
+                            .get()
+                            .into_iter()
+                            .filter(|s| st.is_empty() || serde_json::to_value(s.status).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
+                            .filter(|s| {
+                                q.is_empty()
+                                    || s.title.to_lowercase().contains(&q)
+                                    || s.cwd.to_lowercase().contains(&q)
+                                    || live.worker_name(&s.worker_id.to_string()).to_lowercase().contains(&q)
+                            })
+                            .collect();
                         if sessions.is_empty() {
                             view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">"No sessions yet."</p> }.into_any()
                         } else {

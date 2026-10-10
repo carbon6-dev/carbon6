@@ -4,6 +4,7 @@ mod api;
 mod files;
 mod fleet;
 mod markdown;
+mod notify;
 mod session;
 mod sessions;
 mod settings;
@@ -23,6 +24,7 @@ fn main() {
 fn App() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
+    notify::watch_sessions(live);
     view! {
         <Router>
             <div class="min-h-screen">
@@ -34,7 +36,10 @@ fn App() -> impl IntoView {
                             <NavLink href="/workers" label="Workers" />
                             <NavLink href="/settings" label="Settings" />
                         </nav>
-                        <ConnBadge connected=live.connected />
+                        <div class="flex items-center gap-3">
+                            <notify::NotifyToggle />
+                            <ConnBadge connected=live.connected />
+                        </div>
                     </div>
                 </header>
                 <Routes fallback=|| view! { <p class="p-8 text-zinc-500">"Not found"</p> }>

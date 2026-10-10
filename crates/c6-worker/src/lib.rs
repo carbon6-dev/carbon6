@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 pub use conn::ConnState;
 pub use identity::Identity;
 
+/// Idle, synced sessions stay in the journal this long.
+const JOURNAL_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
+
 /// Everything a running worker shares between its connection and sessions.
 pub struct Worker {
     pub identity: Identity,
@@ -37,6 +40,12 @@ impl Worker {
         let link = Arc::new(link::HeadLink::default());
         let sessions = session::SessionManager::new(journal.clone(), link.clone(), state_dir.join("worktrees"));
         sessions.recover().await?;
+        // Keep the journal small: idle, fully synced sessions can be restored
+        // from the head when they are used again.
+        let trimmed = journal.trim(c6_core::now_ms() - JOURNAL_KEEP_MS, &[]).await?;
+        if trimmed > 0 {
+            tracing::info!(trimmed, "trimmed idle sessions from the journal");
+        }
         Ok(Arc::new(Self {
             identity,
             state_dir: state_dir.to_owned(),

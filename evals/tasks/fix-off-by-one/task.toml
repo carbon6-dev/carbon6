@@ -1,0 +1,2 @@
+prompt = "The tests in test_stats.py fail. Find and fix the bug in stats.py (not the tests), and run the tests to confirm."
+check = "python3 test_stats.py && git diff --quiet -- test_stats.py"

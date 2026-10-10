@@ -28,6 +28,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 /// Events per upload message.
 const UPLOAD_BATCH: u32 = 256;
+/// Largest message either way (a `Restore` carries a whole session log).
+pub(crate) const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnState {
@@ -110,7 +112,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     };
     tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Hello(hello)) }).await.ok();
 
-    let mut inbound = match WorkerHubClient::new(channel.clone()).attach(ReceiverStream::new(rx)).await {
+    let client = WorkerHubClient::new(channel.clone()).max_decoding_message_size(MAX_MESSAGE).max_encoding_message_size(MAX_MESSAGE);
+    let mut inbound = match client.clone().attach(ReceiverStream::new(rx)).await {
         Ok(r) => r.into_inner(),
         Err(s) => return classify(s),
     };

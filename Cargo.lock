@@ -405,12 +405,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "c6-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "c6-agent",
+ "c6-llm",
+ "c6-proto",
+ "c6-tools",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
 name = "c6-head"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "c6-agent",
  "c6-api",
  "c6-core",
  "c6-llm",
@@ -443,6 +464,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "url",

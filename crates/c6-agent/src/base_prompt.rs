@@ -1,4 +1,4 @@
-//! Default prompts. Configurable on the head later; these are the defaults.
+//! The default base system prompt, shared by the head and the eval harness.
 
 pub const BASE_PROMPT: &str = "\
 You are carbon6, an autonomous software engineering agent working in a developer's repository on their machine. \

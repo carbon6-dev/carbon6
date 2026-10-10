@@ -120,6 +120,48 @@ impl Journal {
         Ok(())
     }
 
+    /// Imports a session from the head's log (see `Restore`). Everything is
+    /// already acknowledged.
+    pub async fn import(&self, session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO sessions (id, spec, created_at) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(spec.encode_to_vec())
+            .bind(c6_core::now_ms())
+            .execute(&mut *tx)
+            .await?;
+        for ev in events {
+            append_in(&mut tx, session_id, ev).await?;
+        }
+        let last = events.last().map(|e| e.seq).unwrap_or(0) as i64;
+        sqlx::query("UPDATE sessions SET acked_seq = ? WHERE id = ?").bind(last).bind(session_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drops sessions that are fully synced, not mid-turn, and idle since
+    /// `before_ms` (except `keep`). The head can restore them on demand.
+    pub async fn trim(&self, before_ms: i64, keep: &[String]) -> anyhow::Result<usize> {
+        let rows = sqlx::query("SELECT id FROM sessions WHERE acked_seq = last_seq AND open_turn IS NULL AND last_activity < ?")
+            .bind(before_ms)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut n = 0;
+        for r in rows {
+            let id: String = r.get("id");
+            if keep.contains(&id) {
+                continue;
+            }
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM events WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM applied_commands WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM sessions WHERE id = ?").bind(&id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// Sessions left mid-turn by a crash: (session id, last seq, open turn).
     pub async fn open_turns(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
         let rows = sqlx::query("SELECT id, last_seq, open_turn FROM sessions WHERE open_turn IS NOT NULL").fetch_all(&self.pool).await?;

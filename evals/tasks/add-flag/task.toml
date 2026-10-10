@@ -1,0 +1,8 @@
+prompt = "Add a --shout flag to greet.py that prints the greeting in upper case. It may appear before or after the name. Keep the existing behaviour otherwise."
+check = '''
+set -e
+test "$(python3 greet.py Ada)" = "Hello, Ada!"
+test "$(python3 greet.py)" = "Hello, world!"
+test "$(python3 greet.py --shout Ada)" = "HELLO, ADA!"
+test "$(python3 greet.py Ada --shout)" = "HELLO, ADA!"
+'''

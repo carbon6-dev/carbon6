@@ -539,6 +539,24 @@ impl Store {
         Ok(Some(session_id))
     }
 
+    pub async fn pending_input_text(&self, command_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query("SELECT text FROM commands WHERE id = ? AND state = 'pending'")
+            .bind(command_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .and_then(|r| r.get::<Option<String>, _>("text")))
+    }
+
+    /// Retires a rejected input and queues a restore followed by a copy of it.
+    pub async fn replace_with_restore(&self, old_id: &str, restore: &NewCommand<'_>, input: &NewCommand<'_>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(old_id).execute(&mut *tx).await?;
+        insert_command(&mut tx, restore).await?;
+        insert_command(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Clears rejected inputs from a session's queue (the user dismissed them).
     pub async fn dismiss_rejected(&self, session_id: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE commands SET state = 'done' WHERE session_id = ? AND state = 'rejected'")

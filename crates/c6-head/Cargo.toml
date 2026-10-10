@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23.1"
+c6-agent.workspace = true
 c6-api.workspace = true
 c6-core.workspace = true
 c6-llm.workspace = true
@@ -46,3 +47,4 @@ x509-parser = "0.18.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

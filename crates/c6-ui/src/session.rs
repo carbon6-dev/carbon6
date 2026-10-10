@@ -159,6 +159,16 @@ fn SessionView(id: String) -> impl IntoView {
     });
     provide_context(ChildLinks(child_of_call));
     let tab = RwSignal::new("transcript");
+    // Esc stops a running turn.
+    let esc_id = id.clone();
+    let _esc = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" && running() {
+            let id = esc_id.clone();
+            spawn_local(async move {
+                let _ = api::interrupt(id).await;
+            });
+        }
+    });
     // Where the session really runs (its worktree, if it has one).
     let started = Memo::new(move |_| {
         events.with(|evs| match evs.first().map(|e| &e.kind) {
@@ -209,6 +219,11 @@ fn SessionView(id: String) -> impl IntoView {
                                 </div>
                             </div>
                             {s.error.clone().map(|e| view! { <ErrorBox message=format!("The session failed to start: {e}") /> })}
+                            {move || (!online() && (status.get() == SessionStatus::Running || !queued.with(Vec::is_empty))).then(|| view! {
+                                <p class="mb-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                                    "The worker is offline. A running turn continues there and syncs back; queued messages are delivered when it reconnects."
+                                </p>
+                            })}
                             {s.parent_id.clone().map(|p| view! {
                                 <p class="mb-3 text-sm text-zinc-500">"Subagent session · started by a Task call in "
                                     <a class="underline" href=format!("/sessions/{p}")>"its parent session"</a></p>

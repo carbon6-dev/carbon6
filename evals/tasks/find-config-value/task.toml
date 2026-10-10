@@ -1,0 +1,2 @@
+prompt = "How many server workers does this project run with in production? Write just the number into a file named ANSWER.txt."
+check = "test \"$(tr -d '[:space:]' < ANSWER.txt)\" = 16"

@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::store::{NewCommand, SessionRow};
-use crate::{HeadState, bad_request, convert, not_found, prompts};
+use crate::{HeadState, bad_request, convert, not_found};
 
 /// Settings keys, included in every new session's configuration.
 pub const MCP_SERVERS: &str = "mcp_servers";
@@ -28,9 +28,23 @@ pub struct LiveHub {
     channels: Mutex<HashMap<String, broadcast::Sender<api::StreamMsg>>>,
     /// Session → owning worker, to vet ephemeral events cheaply.
     owners: Mutex<HashMap<String, WorkerId>>,
+    /// Last restore per session, to rate-limit them.
+    restores: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl LiveHub {
+    fn may_restore(&self, session_id: &str) -> bool {
+        let mut r = self.restores.lock().unwrap();
+        let now = std::time::Instant::now();
+        match r.get(session_id) {
+            Some(t) if now.duration_since(*t) < std::time::Duration::from_secs(60) => false,
+            _ => {
+                r.insert(session_id.to_owned(), now);
+                true
+            }
+        }
+    }
+
     pub fn subscribe(&self, session_id: &str) -> broadcast::Receiver<api::StreamMsg> {
         self.channels.lock().unwrap().entry(session_id.to_owned()).or_insert_with(|| broadcast::channel(1024).0).subscribe()
     }
@@ -98,7 +112,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
                 connection_kind: connection.kind.clone(),
             }),
             cwd: row.cwd.clone(),
-            base_prompt: prompts::BASE_PROMPT.into(),
+            base_prompt: c6_agent::BASE_PROMPT.into(),
             worktree: req.worktree,
             mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
             skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
@@ -248,12 +262,68 @@ pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEven
 }
 
 pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected) -> anyhow::Result<()> {
+    // The worker lost (or trimmed) this session: send it the log, then the
+    // input again. At most once a minute per session, so a worker that
+    // cannot restore does not loop.
+    if r.reason.contains("unknown session") && st.hub.may_restore(&r.session_id) {
+        match restore(st, worker_id, &r.session_id, &r.command_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => warn!(session = %r.session_id, "restoring session: {e:#}"),
+        }
+    }
     if let Some(session_id) = st.store.reject_command(worker_id, &r.command_id, &r.reason).await? {
         warn!(session = %session_id, reason = %r.reason, "worker rejected command");
         publish_queue(st, &session_id).await;
         st.registry.bump();
     }
     Ok(())
+}
+
+/// Queues a `Restore` and a fresh copy of the rejected input, in that order.
+async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+    let Some(session) = st.store.session(session_id).await? else { return Ok(false) };
+    if session.status == "failed" || session.parent_id.is_some() || session.worker_id != worker_id.to_string() {
+        return Ok(false);
+    }
+    let Some(text) = st.store.pending_input_text(command_id).await? else { return Ok(false) };
+    let events = st.store.events_after(session_id, 0, i64::MAX).await?;
+    if events.is_empty() {
+        return Ok(false);
+    }
+    let kind = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
+    let spec = CreateSession {
+        model: Some(ModelSpec {
+            connection_id: session.connection_id.clone(),
+            model: session.model.clone(),
+            max_output_tokens: 0,
+            effort: session.effort.clone().unwrap_or_default(),
+            connection_kind: kind,
+        }),
+        cwd: session.cwd.clone(),
+        base_prompt: c6_agent::BASE_PROMPT.into(),
+        worktree: false,
+        mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
+        skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
+    };
+    let restore_id = Uuid::now_v7().to_string();
+    let cmd = SessionCommand {
+        command_id: restore_id.clone(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), events })),
+    };
+    let input_id = Uuid::now_v7().to_string();
+    st.store
+        .replace_with_restore(
+            command_id,
+            &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
+            &NewCommand { id: &input_id, session_id, worker_id, data: input_command(&input_id, session_id, &text), text: Some(&text) },
+        )
+        .await?;
+    warn!(session = %session_id, "worker no longer had this session; restoring it from the head's log");
+    publish_queue(st, session_id).await;
+    st.registry.deliver(worker_id);
+    Ok(true)
 }
 
 pub async fn credential(st: &HeadState, req: CredentialRequest) -> CredentialGrant {

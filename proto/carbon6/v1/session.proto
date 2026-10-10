@@ -199,7 +199,15 @@ message SessionCommand {
     CreateSession create = 10;
     UserInput input = 11;
     Interrupt interrupt = 12;
+    Restore restore = 13;
   }
+}
+
+// Re-seeds a worker that no longer has a session (lost or trimmed journal)
+// with the head's authoritative log.
+message Restore {
+  CreateSession spec = 1;
+  repeated SessionEvent events = 2;
 }
 
 message CreateSession {

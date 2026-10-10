@@ -375,7 +375,7 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 
 ## 13. Security posture (single-user, yolo)
 
-- No login. The protection is the network: both ports bind only to the configured private or tailnet addresses, and c6h refuses to bind `0.0.0.0` unless forced with a flag.
+- No login. The protection is the network: both ports bind only to the configured private or tailnet addresses, and c6h refuses to bind `0.0.0.0` unless forced with a flag. Browser-borne attacks (cross-site requests, cross-site WebSockets, DNS rebinding) are refused by `Host`/`Origin` checks (see §16).
 - The worker port requires mTLS. Without an enrolled certificate, nobody can impersonate a worker or pull credentials.
 - Workers never receive refresh tokens. Revoking a worker in the UI invalidates its certificate (CRL check at handshake) and stops grants to it.
 - Tools run as the worker's OS user with no sandbox. Recommended: run c6w under a dedicated user account on shared machines.
@@ -401,7 +401,7 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 | M4 | MCP, skills, subagents, web tools, background shells, OTLP export | Feature parity with the requirements |
 | M5 | Hardening: chaos tests, evals, performance, UX polish | Comfortable as the only harness |
 
-## 16. Implementation notes (M1–M4)
+## 16. Implementation notes (M1–M5)
 
 Decisions made while building M1 that refine the sections above:
 
@@ -442,6 +442,16 @@ Decisions made while building M1 that refine the sections above:
 - **Telemetry (M4) differs from §11.**
   - Spans are built on the head from session events when a turn ends, rather than emitted by workers. There is one trace per session: `invoke_agent` per turn, `chat {model}` per model response (with `gen_ai.usage.*` including cache read and write), and `execute_tool {name}` per tool result.
   - Spans are exported over OTLP/HTTP protobuf to `otlp_endpoint` or `OTEL_EXPORTER_OTLP_ENDPOINT`. Turns that ran while a worker was offline are exported when they sync.
+- **Browser hardening (M5).**
+  - There is no login, but a web page in the user's browser can still reach the head: cross-site WebSockets need no CORS approval, simple cross-site POSTs need no preflight, and DNS rebinding can make a hostile name resolve to the head.
+  - So every UI/API request must carry a `Host` the head owns: listen address, hostname, `localhost`, advertised name or `extra_names`. Anything else gets 421.
+  - Any request with a foreign `Origin` gets 403, which covers terminal WebSockets.
+- **Restore and journal trimming (M5).**
+  - A worker that has lost a session rejects input as "unknown session" (for example after a reinstall, or because the journal trimmed it). The head then queues `Restore{spec, events}`, which carries its authoritative log, followed by a fresh copy of the input. This happens at most once a minute per session.
+  - Because of that, workers trim sessions from their journal once they are fully acknowledged, not mid-turn, and idle for 7 days.
+  - Messages up to 64 MiB are allowed in both directions.
+- **Live deltas are coalesced (M5).** The worker batches text, thinking and tool-output deltas over 25 ms and merges consecutive deltas from the same stream before sending.
+- **Evals (M5).** `c6-eval` with tasks in `evals/tasks` (see `evals/README.md`).
 - **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
 
 ## 17. Open items to settle during implementation

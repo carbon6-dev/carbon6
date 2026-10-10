@@ -1,0 +1,2 @@
+prompt = "Create slug.py with a slugify function so that the tests in test_slug.py pass. Don't change the tests. Run them to check."
+check = "python3 test_slug.py && git diff --quiet -- test_slug.py"

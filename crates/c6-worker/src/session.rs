@@ -37,6 +37,11 @@ impl SessionManager {
         Self { journal, link, worktrees, actors: Mutex::default() }
     }
 
+    /// Session ids with a live actor.
+    pub fn active(&self) -> Vec<String> {
+        self.actors.lock().unwrap().iter().filter(|(_, a)| !a.is_closed()).map(|(id, _)| id.clone()).collect()
+    }
+
     /// Closes turns left open by a crash or kill.
     pub async fn recover(&self) -> anyhow::Result<()> {
         for (session_id, last_seq, turn) in self.journal.open_turns().await? {
@@ -67,6 +72,15 @@ impl SessionManager {
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
                 let _ = actor.send(ActorMsg::Input(PendingInput { command_id: cmd.command_id, text: input.text }));
+                Ok(())
+            }
+            Some(session_command::Kind::Restore(r)) => {
+                if self.journal.has_session(&cmd.session_id).await.map_err(internal)? {
+                    return Ok(());
+                }
+                let spec = r.spec.ok_or("restore without a session spec")?;
+                self.journal.import(&cmd.session_id, &spec, &r.events).await.map_err(internal)?;
+                info!(session = %cmd.session_id, events = r.events.len(), "session restored from the head");
                 Ok(())
             }
             Some(session_command::Kind::Interrupt(_)) => {

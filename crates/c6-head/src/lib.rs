@@ -3,10 +3,10 @@
 pub mod api;
 pub mod config;
 mod convert;
+pub mod guard;
 pub mod hub;
 pub mod oauth;
 pub mod pki;
-mod prompts;
 pub mod registry;
 pub mod secrets;
 pub mod sessions;
@@ -153,13 +153,17 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
         .add_service(EnrollmentServer::new(hub::EnrollmentSvc(state.clone())))
         .add_service(
             WorkerHubServer::new(hub::HubSvc(state.clone()))
-                .max_decoding_message_size(32 * 1024 * 1024)
-                .max_encoding_message_size(32 * 1024 * 1024),
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
         );
     let token = shutdown.clone();
     tasks.spawn(async move { grpc.serve_with_incoming_shutdown(incoming, token.cancelled_owned()).await.context("worker port") });
 
-    let app = api::router(state.clone());
+    // Only answer to our own names (see guard.rs).
+    let mut names = dns_names.clone();
+    names.extend(cfg.extra_names.iter().cloned());
+    let guard = guard::HostGuard::new(&ui_addrs, &names);
+    let app = api::router(state.clone()).layer(axum::middleware::from_fn_with_state(guard, guard::check));
     for listener in ui_listeners {
         let app = app.clone();
         let token = shutdown.clone();
