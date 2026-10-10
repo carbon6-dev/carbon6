@@ -454,11 +454,25 @@ pub struct SearchResult {
     pub hits: Vec<SearchHit>,
     /// Matches in the session (among those read).
     pub total_hits: u32,
+    /// For a side chat: open its top-level session with these side chats
+    /// expanded, instead of the side chat on its own.
+    #[serde(default)]
+    pub open_in: Option<OpenIn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpenIn {
+    pub session_id: String,
+    pub title: String,
+    /// Side chat ids to expand, outermost first; the last is the result's.
+    pub side_chats: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchHit {
-    /// The event, for a deep link: `/sessions/{id}#e{seq}`.
+    /// The transcript element showing the match: `{session}-e{seq}`, or
+    /// `call-{id}` for tool output (shown in its call's card).
+    pub anchor: String,
     pub seq: u64,
     /// The block within an assistant message.
     pub part: u32,

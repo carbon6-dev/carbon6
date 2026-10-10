@@ -106,6 +106,36 @@ async fn search_finds_events_and_survives_reindex() {
     let r = http.get(format!("{api}/search")).query(&[("q", "ab")]).send().await.unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // A match in a side chat says where to open it: the main session with
+    // the side chat expanded.
+    let events: Vec<Value> = http.get(format!("{api}/sessions/{}/events", s.id)).send().await.unwrap().json().await.unwrap();
+    let anchor_seq = events.iter().find(|e| e["type"] == "assistant").unwrap()["seq"].clone();
+    mock.push(Reply::Text("Capybaras are not involved.".into()));
+    let side: Session = http
+        .post(format!("{api}/sessions/{}/side-chats", s.id))
+        .json(&json!({"anchor_seq": anchor_seq, "connection_id": conn.id, "model": "m", "prompt": "Any capybaras?"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    eventually("side chat turn", async || {
+        let d: SessionDetail = http.get(format!("{api}/sessions/{}", side.id)).send().await.ok()?.json().await.ok()?;
+        (d.session.status == SessionStatus::Idle && d.queued.is_empty() && d.session.last_seq >= 5).then_some(())
+    })
+    .await;
+    let r = search(&http, &api, &[("q", "capybaras"), ("kind", "assistant")]).await;
+    let res = &r["results"][0];
+    assert_eq!(res["session"]["id"], side.id.as_str());
+    assert_eq!(res["open_in"]["session_id"], s.id.as_str());
+    assert_eq!(res["open_in"]["side_chats"], json!([side.id]));
+    assert_eq!(res["hits"][0]["anchor"], format!("{}-e{}", side.id, res["hits"][0]["seq"]));
+    // Tool output points at its call's card.
+    let r = search(&http, &api, &[("q", "zebra"), ("kind", "tool_result")]).await;
+    assert!(r["results"][0]["hits"][0]["anchor"].as_str().unwrap().starts_with("call-"), "{r}");
+    assert!(r["results"][0]["open_in"].is_null());
+
     // A format change re-indexes on start, without duplicates.
     stop.cancel();
     head.state.store.set_setting("search.version", "0").await.unwrap();

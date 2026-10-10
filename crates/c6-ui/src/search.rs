@@ -173,11 +173,21 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
     } else {
         None
     };
-    let id = s.id.clone();
+    // Side chats open inside their top-level session.
+    let (page, open) = match &res.open_in {
+        Some(o) => (o.session_id.clone(), Some(o.side_chats.join(","))),
+        None => (s.id.clone(), None),
+    };
+    let base = format!("/sessions/{page}?q={}{}", enc(&q), open.as_ref().map(|o| format!("&open={}", enc(o))).unwrap_or_default());
+    let title_href = base.clone();
+    let parent = res.open_in.as_ref().map(|o| o.title.clone());
     view! {
         <div class="rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
             <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 border-b border-zinc-100 px-4 py-2 dark:border-zinc-800">
-                <a class="min-w-0 truncate font-medium hover:underline" href=format!("/sessions/{}", s.id)>{s.title.clone()}</a>
+                <div class="min-w-0 truncate">
+                    <a class="font-medium hover:underline" href=title_href>{s.title.clone()}</a>
+                    {parent.map(|p| view! { <span class="ml-2 text-xs text-zinc-500">{format!("in “{p}”")}</span> })}
+                </div>
                 <div class="flex shrink-0 items-center gap-2 text-xs text-zinc-500">
                     {badge.map(|b| view! { <span class="rounded bg-sky-100 px-1.5 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{b}</span> })}
                     <span>{res.worker_name.clone()}</span>
@@ -186,7 +196,7 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
                 </div>
             </div>
             <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
-                {res.hits.into_iter().map(|h| view! { <HitRow h session=id.clone() q=q.clone() /> }).collect_view()}
+                {res.hits.into_iter().map(|h| view! { <HitRow h base=base.clone() /> }).collect_view()}
             </div>
             {(more > 0).then(|| view! { <p class="px-4 py-1.5 text-xs text-zinc-500">{format!("{more} more match{} in this session", if more == 1 { "" } else { "es" })}</p> })}
         </div>
@@ -194,8 +204,8 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
 }
 
 #[component]
-fn HitRow(h: SearchHit, session: String, q: String) -> impl IntoView {
-    let href = format!("/sessions/{session}?q={}#e{}", enc(&q), h.seq);
+fn HitRow(h: SearchHit, base: String) -> impl IntoView {
+    let href = format!("{base}#{}", h.anchor);
     view! {
         <a class="block px-4 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60" href=href>
             <span class="mr-2 inline-block rounded bg-zinc-100 px-1.5 text-[11px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">{kind_label(&h.kind).to_owned()}</span>

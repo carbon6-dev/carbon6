@@ -242,30 +242,40 @@ fn SessionView(id: String) -> impl IntoView {
     let running = move || status.get() == SessionStatus::Running || activity.get() == Some(true);
 
     // Follow the bottom of the transcript unless the user scrolled up.
-    // A deep link from search: `#e<seq>`, with the query in `?q=` to
-    // highlight. The transcript then does not stick to the bottom.
-    let target = window().location().hash().ok().and_then(|h| h.strip_prefix("#e")?.parse::<u64>().ok());
-    let stick = RwSignal::new(target.is_none());
-    if let Some(seq) = target {
-        let q = leptos_router::hooks::use_query_map().get_untracked().get("q").unwrap_or_default();
-        let terms = serde_json::to_string(&crate::search::terms(&q)).unwrap_or_else(|_| "[]".into());
-        let session = id.clone();
-        let done = RwSignal::new(false);
-        Effect::new(move || {
-            if done.get_untracked() {
-                return;
+    // A deep link from search: `#<element id>` (or the older `#e<seq>`),
+    // `?q=` to highlight, and `?open=` side chats to expand on the way to
+    // it. The transcript then does not stick to the bottom.
+    let hash = window().location().hash().unwrap_or_default();
+    let hash = hash.strip_prefix('#').unwrap_or("").to_owned();
+    let stick = RwSignal::new(hash.is_empty());
+    let query = leptos_router::hooks::use_query_map().get_untracked();
+    let open: Vec<String> = query.get("open").map(|o| o.split(',').map(str::to_owned).collect()).unwrap_or_default();
+    provide_context(ForceOpen(StoredValue::new(open)));
+    if !hash.is_empty() {
+        let terms = serde_json::to_string(&crate::search::terms(&query.get("q").unwrap_or_default())).unwrap_or_else(|_| "[]".into());
+        match hash.strip_prefix('e').and_then(|n| n.parse::<u64>().ok()) {
+            // `#e<seq>`: an event of this session, once it has loaded.
+            Some(seq) => {
+                let session = id.clone();
+                let done = RwSignal::new(false);
+                Effect::new(move || {
+                    if done.get_untracked() {
+                        return;
+                    }
+                    // A tool result shows in its call's card.
+                    let el = events.with(|evs| {
+                        evs.iter().find(|e| e.seq == seq).map(|e| match &e.kind {
+                            EventKind::ToolResult { call_id, .. } => format!("call-{call_id}"),
+                            _ => format!("{session}-e{seq}"),
+                        })
+                    });
+                    let Some(el) = el else { return };
+                    done.set(true);
+                    reveal_when_rendered(el, terms.clone(), 0);
+                });
             }
-            // The element of the event; a tool result shows in its call's card.
-            let el = events.with(|evs| {
-                evs.iter().find(|e| e.seq == seq).map(|e| match &e.kind {
-                    EventKind::ToolResult { call_id, .. } => format!("call-{call_id}"),
-                    _ => format!("{session}-e{seq}"),
-                })
-            });
-            let Some(el) = el else { return };
-            done.set(true);
-            reveal_when_rendered(el, terms.clone(), 0);
-        });
+            None => reveal_when_rendered(hash, terms, 0),
+        }
     }
     let _scroll = window_event_listener(leptos::ev::scroll, move |_| {
         let w = window();
@@ -504,9 +514,15 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
 
 /// A collapsible side-chat thread. Returns `AnyView` to end the type
 /// recursion (side chats contain transcripts that contain side chats).
+/// Side chats a deep link expands (from `?open=`).
+#[derive(Clone, Copy)]
+struct ForceOpen(StoredValue<Vec<String>>);
+
 fn side_chat(s: Session, open_now: bool) -> AnyView {
     let key = format!("c6.side.{}", s.id);
-    let open = RwSignal::new(open_now || storage_get(&key).is_some_and(|v| v == "1"));
+    // Opened for a deep link: open now, without changing the saved state.
+    let forced = use_context::<ForceOpen>().is_some_and(|f| f.0.with_value(|ids| ids.contains(&s.id)));
+    let open = RwSignal::new(open_now || forced || storage_get(&key).is_some_and(|v| v == "1"));
     if open_now {
         storage_set(&key, "1");
     }
@@ -729,7 +745,8 @@ extern "C" {
 fn reveal_when_rendered(id: String, terms: String, tries: u32) {
     set_timeout(
         move || {
-            if !js_reveal(&id, &terms) && tries < 40 {
+            // Nested side chats load their events one after another.
+            if !js_reveal(&id, &terms) && tries < 200 {
                 reveal_when_rendered(id, terms, tries + 1);
             }
         },

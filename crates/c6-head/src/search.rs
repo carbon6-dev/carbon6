@@ -228,6 +228,37 @@ fn snippet(highlighted: &str) -> Vec<api::SnippetPart> {
     parts
 }
 
+/// The transcript element showing an event: a tool result shows inside its
+/// call's card, everything else in the event's own block.
+fn anchor(session_id: &str, seq: u64, data: &[u8]) -> String {
+    match SessionEvent::decode(data).ok().and_then(|e| e.kind) {
+        Some(session_event::Kind::ToolResult(r)) => format!("call-{}", r.call_id),
+        _ => format!("{session_id}-e{seq}"),
+    }
+}
+
+/// Where a side chat is shown: the top-level session it branches from,
+/// with the side chats to expand on the way down (outermost first).
+async fn open_in(store: &Store, row: &crate::store::SessionRow) -> anyhow::Result<Option<api::OpenIn>> {
+    let mut chain = Vec::new();
+    let mut cur = row.clone();
+    while let (Some(parent), Some(_)) = (cur.parent_id.clone(), cur.fork_seq) {
+        chain.push(cur.id.clone());
+        match store.session(&parent).await? {
+            Some(p) => cur = p,
+            None => return Ok(None),
+        }
+        if chain.len() > 64 {
+            return Ok(None); // a cycle would be a bug; show the side chat alone
+        }
+    }
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    chain.reverse();
+    Ok(Some(api::OpenIn { session_id: cur.id, title: cur.title, side_chats: chain }))
+}
+
 /// Searches; sessions ordered by their best match.
 pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api::SearchResponse> {
     let (expr, terms) = fts_query(&req.q)?;
@@ -235,7 +266,7 @@ pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api
         req.kind.as_deref().unwrap_or("").split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned).collect();
     let mut sql = String::from(
         "SELECT search.session_id AS sid, search.seq AS seq, search.part AS part, search.kind AS kind, \
-         highlight(search, 0, char(1), char(2)) AS hl, e.ts AS ts \
+         highlight(search, 0, char(1), char(2)) AS hl, e.ts AS ts, e.data AS data \
          FROM search JOIN sessions s ON s.id = search.session_id \
          JOIN events e ON e.session_id = search.session_id AND e.seq = search.seq \
          WHERE search MATCH ?",
@@ -273,8 +304,10 @@ pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api
         });
         *total += 1;
         if hits.len() < HITS_PER_SESSION {
+            let seq = r.get::<i64, _>("seq") as u64;
             hits.push(api::SearchHit {
-                seq: r.get::<i64, _>("seq") as u64,
+                anchor: anchor(&sid, seq, &r.get::<Vec<u8>, _>("data")),
+                seq,
                 part: r.get::<i64, _>("part") as u32,
                 kind: r.get("kind"),
                 ts: r.get("ts"),
@@ -291,7 +324,8 @@ pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api
             None => String::new(),
         };
         let (hits, total_hits) = groups.remove(&sid).unwrap_or_default();
-        results.push(api::SearchResult { session: crate::convert::session(&row), worker_name, hits, total_hits });
+        let open_in = open_in(store, &row).await?;
+        results.push(api::SearchResult { session: crate::convert::session(&row), worker_name, hits, total_hits, open_in });
     }
     Ok(api::SearchResponse { results, terms, truncated })
 }
