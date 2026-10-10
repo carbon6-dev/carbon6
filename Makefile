@@ -71,7 +71,7 @@ build: ui ## Build release binaries into target/release
 test: ## Run the test suite
 	cargo test
 
-dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml, state in target/dev)
+dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml; state in the standard data directory)
 	cargo run -p c6h -- --config dev/c6h.toml
 
 dev-token: ## Print an enrollment token from the dev head's database
@@ -81,8 +81,8 @@ dev-login-link: ## Print a one-time web UI login link for the dev head
 	@cargo run -q -p c6h -- --config dev/c6h.toml login-link
 
 dev-worker: ## Run the dev worker (pass TOKEN=... to enroll it first)
-	@if [ -n "$(TOKEN)" ]; then cargo run -p c6w -- --state-dir target/dev/c6w enroll --force "$(TOKEN)"; fi
-	cargo run -p c6w -- --state-dir target/dev/c6w run
+	@if [ -n "$(TOKEN)" ]; then cargo run -p c6w -- enroll --force "$(TOKEN)"; fi
+	cargo run -p c6w -- run
 
 clean: ## Remove build outputs (target/, dist/, crates/c6-ui/dist)
 	cargo clean

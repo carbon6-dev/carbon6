@@ -65,7 +65,8 @@ c6w run
 
 ### Configuration
 
-- **Head:** `~/.config/c6h/c6h.toml`, optional (see `crates/c6-head/src/config.rs`).
+- **Head:** `c6h.toml`, optional (see `crates/c6-head/src/config.rs`): `~/Library/Application Support/c6h/c6h.toml` on macOS, `~/.config/c6h/c6h.toml` on Linux, or `--config`.
+  - State (database, `master.key`, CAs) lives in `data_dir`: by default `~/Library/Application Support/c6h` (macOS) or `~/.local/share/c6h` (Linux). Back up `c6h.db` and `master.key` together.
   - Add any names you reach the head by to `extra_names`; the head refuses requests addressed to other names. Its Tailscale MagicDNS name is added automatically.
   - Passkeys need HTTPS (or `http://localhost`). `ui_tls_head_ca = true` makes the head issue its own certificate from a private CA, so its names never appear in public Certificate Transparency logs (as they would with Let's Encrypt or Tailscale certificates). Trust that CA once per device:
     - Mac (Chrome and Safari use the macOS Keychain): `curl -so /tmp/carbon6-ca.pem http://<head>:7700/ca.pem`, then `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/carbon6-ca.pem`, and restart the browser. (Or open the file in Keychain Access and set Trust → Always Trust.)
@@ -83,7 +84,7 @@ c6w run
 ## Local development
 
 ```bash
-make dev-head                     # head on all interfaces using dev/c6h.toml, state in target/dev
+make dev-head                     # head on all interfaces using dev/c6h.toml; state in the standard data directory
 make dev-token                    # prints a token
 make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it (later: just make dev-worker)
 make dev-login-link               # a one-time link to sign in to the dev UI

@@ -1,8 +1,9 @@
-# Local development head: state under target/.
-data_dir = "target/dev/c6h"
+# Local development head. State lives in the standard data directory
+# (~/Library/Application Support/c6h on macOS, ~/.local/share/c6h on Linux),
+# so `cargo clean` leaves it alone.
 # All interfaces, so the UI can be opened from other machines on the network
-# (and tailnet). The head has no login: anyone who can reach port 7700 can
-# use it. For loopback only, use bind = ["127.0.0.1"] and drop the next line.
+# (and tailnet); sign-in protects it. For loopback only, use
+# bind = ["127.0.0.1"] and drop the next line.
 bind = ["0.0.0.0"]
 allow_public_bind = true
 # HTTPS from the head's own private CA (nothing is published in public
