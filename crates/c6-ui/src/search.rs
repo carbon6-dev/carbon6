@@ -146,11 +146,15 @@ pub fn SearchPage() -> impl IntoView {
                 {move || results.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(None) => view! { <p class="text-sm text-zinc-500">"Search every message, tool call and tool output in your sessions."</p> }.into_any(),
-                    Ok(Some(r)) if r.results.is_empty() => view! { <p class="text-sm text-zinc-500">"No matches."</p> }.into_any(),
+                    Ok(Some(r)) if r.results.is_empty() => view! {
+                        <Ignored words=r.ignored.clone() />
+                        <p class="text-sm text-zinc-500">"No matches."</p>
+                    }.into_any(),
                     Ok(Some(r)) => {
                         let q = q();
                         view! {
                             <div class="space-y-3">
+                                <Ignored words=r.ignored.clone() />
                                 {r.results.into_iter().map(|res| view! { <ResultCard res q=q.clone() /> }).collect_view()}
                                 {r.truncated.then(|| view! { <p class="text-xs text-zinc-500">"Showing the best matches; add words to narrow the search."</p> })}
                             </div>
@@ -160,6 +164,23 @@ pub fn SearchPage() -> impl IntoView {
             </Suspense>
         </main>
     }
+}
+
+/// A note about words too short to search for.
+#[component]
+fn Ignored(words: Vec<String>) -> impl IntoView {
+    (!words.is_empty()).then(|| {
+        let list = words.iter().map(|w| format!("“{w}”")).collect::<Vec<_>>().join(", ");
+        let plural = words.len() > 1;
+        view! {
+            <p class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                {format!("Ignored {list}: {} shorter than 3 characters. To include {}, put {} in a \"quoted phrase\" with a longer word, like \"macOS 15\".",
+                    if plural { "words are" } else { "it is" },
+                    if plural { "them" } else { "it" },
+                    if plural { "them" } else { "it" })}
+            </p>
+        }
+    })
 }
 
 #[component]

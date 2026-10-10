@@ -442,6 +442,9 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     /// The terms that were searched for, for highlighting.
     pub terms: Vec<String>,
+    /// Words left out of the search for being shorter than 3 characters.
+    #[serde(default)]
+    pub ignored: Vec<String>,
     /// More matches exist than were read; narrow the search.
     pub truncated: bool,
 }

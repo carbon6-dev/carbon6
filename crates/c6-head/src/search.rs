@@ -129,9 +129,11 @@ pub async fn backfill(store: &Store) -> anyhow::Result<()> {
 /// The user's query as an FTS5 expression: whitespace-separated terms and
 /// "quoted phrases" must all match; a leading `-` excludes. Each is matched
 /// as a substring (trigram), so it needs at least 3 characters.
-fn fts_query(q: &str) -> anyhow::Result<(String, Vec<String>)> {
+/// Also returns the searched terms and the ones ignored as too short.
+fn fts_query(q: &str) -> anyhow::Result<(String, Vec<String>, Vec<String>)> {
     let mut include = Vec::new();
     let mut exclude = Vec::new();
+    let mut ignored = Vec::new();
     let mut chars = q.chars().peekable();
     while let Some(&c) = chars.peek() {
         if c.is_whitespace() {
@@ -158,19 +160,29 @@ fn fts_query(q: &str) -> anyhow::Result<(String, Vec<String>)> {
         };
         let term = term.trim().to_owned();
         if term.chars().count() < 3 {
+            if !term.is_empty() {
+                ignored.push(if negate { format!("-{term}") } else { term });
+            }
             continue;
         }
         if negate { exclude.push(term) } else { include.push(term) }
     }
     if include.is_empty() {
-        return Err(bad_request("search for at least one word of 3 or more characters"));
+        return Err(bad_request(if ignored.is_empty() {
+            "Search for at least one word of 3 or more characters".to_owned()
+        } else {
+            format!(
+                "Every word was shorter than 3 characters ({}): use longer words, or a \"quoted phrase\" that includes them",
+                ignored.join(", ")
+            )
+        }));
     }
     let quote = |t: &String| format!("\"{}\"", t.replace('"', "\"\""));
     let mut expr = include.iter().map(quote).collect::<Vec<_>>().join(" AND ");
     for t in &exclude {
         expr = format!("({expr}) NOT {}", quote(t));
     }
-    Ok((expr, include))
+    Ok((expr, include, ignored))
 }
 
 /// A snippet around the first match in `highlighted` (text with matches
@@ -261,7 +273,7 @@ async fn open_in(store: &Store, row: &crate::store::SessionRow) -> anyhow::Resul
 
 /// Searches; sessions ordered by their best match.
 pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api::SearchResponse> {
-    let (expr, terms) = fts_query(&req.q)?;
+    let (expr, terms, ignored) = fts_query(&req.q)?;
     let kinds: Vec<String> =
         req.kind.as_deref().unwrap_or("").split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned).collect();
     let mut sql = String::from(
@@ -327,7 +339,7 @@ pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api
         let open_in = open_in(store, &row).await?;
         results.push(api::SearchResult { session: crate::convert::session(&row), worker_name, hits, total_hits, open_in });
     }
-    Ok(api::SearchResponse { results, terms, truncated })
+    Ok(api::SearchResponse { results, terms, ignored, truncated })
 }
 
 #[cfg(test)]
@@ -338,7 +350,10 @@ mod tests {
     fn query_syntax() {
         assert_eq!(fts_query("foo_bar src/").unwrap().0, r#""foo_bar" AND "src/""#);
         assert_eq!(fts_query(r#""out of memory" -oom2 x"#).unwrap().0, r#"("out of memory") NOT "oom2""#);
-        assert_eq!(fts_query(r#"say "hi""#).unwrap().0, r#""say""#, "short phrases are dropped");
+        let (expr, _, ignored) = fts_query(r#"say "hi" macOS 15 -ab"#).unwrap();
+        assert_eq!(expr, r#""say" AND "macOS""#, "short words and phrases are dropped");
+        assert_eq!(ignored, ["hi", "15", "-ab"]);
+        assert!(fts_query("ab 15").unwrap_err().to_string().contains("ab, 15"));
         assert!(fts_query("ab -cdef").is_err());
         assert_eq!(fts_query(r#"a"b"c"#).unwrap().0, r#""a""b""c""#, "quotes inside a term are escaped");
     }
