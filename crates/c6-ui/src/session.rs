@@ -347,14 +347,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                             <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
                                             {d.worker_name.clone()}
                                         </span>
-                                        <span class="font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
+                                        <span class="break-all font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
                                         {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
                                             <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
                                         })}
                                         <span>{move || { let m = model_label.get(); if m.is_empty() { s.model.clone() } else { m } }}</span>
                                     </div>
                                 </div>
-                                <div class="flex items-center gap-2">
+                                <div class="flex flex-wrap items-center gap-2">
                                     <crate::fleet::TabButton tab label="Transcript" value="transcript" />
                                     <crate::fleet::TabButton tab label="Changes" value="changes" />
                                     <crate::fleet::TabButton tab label="Files" value="files" />

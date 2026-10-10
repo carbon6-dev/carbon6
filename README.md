@@ -86,6 +86,7 @@ c6w run
 The UI is a workspace of up to four tiles side by side, each a stack of columns:
 
 - **Columns:** opening something (a session from the list, a search result, a side chat's parent) puts it in a column beside where you clicked, so where you came from stays open — a search stays beside the result you are reading. Earlier columns fold into spines; click one to go back to it (the columns after it fold to the right until you open something new). The header's nav swaps sections in place.
+- **Sessions side by side:** from a list (Sessions, Inbox, Mission, search results), the first session opens beside the list; each further one opens in a new tile at the right, up to four (then it replaces the least recently used tile). A session that is already open is shown where it is instead of opening twice.
 - **Tiles:** ⌘/Ctrl-click any link (or ⧉ in a column header, or **+ Tile**) to open it in a new tile. ⌘1–4 focus a tile; ⌘[ and ⌘] step back and forward in the focused tile.
 - **Activity dock** (left, on wide screens): running sessions, ones that finished or failed while not on screen (amber/red), and pinned ones (☆ in a session's header). **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
 - **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; a column fills the screen, with ‹ › in its header and the nav in ☰.

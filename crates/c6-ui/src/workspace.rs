@@ -177,6 +177,11 @@ impl View {
         }
     }
 
+    /// Lists of sessions: opening a second session from one opens a tile.
+    fn is_list(&self) -> bool {
+        matches!(self, View::Sessions | View::Search { .. } | View::Inbox | View::Mission)
+    }
+
     /// A top-level section (not one session or worker): the header's nav
     /// and search swap one section for another in place instead of
     /// stacking columns.
@@ -200,6 +205,10 @@ pub struct Tile {
     pub cursor: usize,
     /// The column last interacted with: keyboard shortcuts act on it.
     pub active: u64,
+    /// When the tile was last focused (a counter), to pick the least
+    /// recently used one to replace when all tiles are in use.
+    #[serde(default)]
+    pub used: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -225,7 +234,42 @@ impl Layout {
 
     fn new_tile(&mut self, view: View) -> Tile {
         let (tk, ck) = (self.key(), self.key());
-        Tile { key: tk, columns: vec![Column { key: ck, view }], cursor: 0, active: ck }
+        Tile { key: tk, columns: vec![Column { key: ck, view }], cursor: 0, active: ck, used: self.next }
+    }
+
+    fn touch(&mut self, ti: usize) {
+        let k = self.key();
+        if let Some(t) = self.tiles.get_mut(ti) {
+            t.used = k;
+        }
+    }
+
+    /// Where a session is open: (tile index, column index).
+    fn find_session(&self, id: &str) -> Option<(usize, usize)> {
+        self.tiles
+            .iter()
+            .enumerate()
+            .find_map(|(ti, t)| t.columns.iter().position(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|ci| (ti, ci)))
+    }
+
+    /// Opens `view` in a new tile at the right end (left to right in the
+    /// order opened), or, when all tiles are in use, in place of the least
+    /// recently used tile other than `origin`.
+    fn open_tile(&mut self, origin: usize, view: View) {
+        if self.tiles.len() < MAX_TILES {
+            let tile = self.new_tile(view);
+            self.tiles.push(tile);
+            self.focus = self.tiles.len() - 1;
+        } else {
+            let lru = (0..self.tiles.len()).filter(|&i| i != origin).min_by_key(|&i| self.tiles[i].used).unwrap_or(origin);
+            let key = self.key();
+            let t = &mut self.tiles[lru];
+            t.columns = vec![Column { key, view }];
+            t.cursor = 0;
+            t.active = key;
+            self.focus = lru;
+        }
+        self.touch(self.focus);
     }
 
     pub fn tile(&self, key: u64) -> Option<&Tile> {
@@ -326,17 +370,38 @@ impl Workspace {
 
     /// Opens `view` from column `from` (tile key, column key), or from the
     /// focused tile's current column.
+    ///
+    /// A session already open somewhere is shown where it is. A session
+    /// opened from a list that already has something beside it gets a new
+    /// tile, so sessions open side by side instead of replacing each other.
     pub fn open(&self, from: Option<(u64, u64)>, view: View, how: How) {
         self.layout.update(|l| {
-            if how == How::NewTile && l.tiles.len() < MAX_TILES {
-                // Beside the tile it came from.
-                let at = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus) + 1;
-                let tile = l.new_tile(view);
-                l.tiles.insert(at.min(l.tiles.len()), tile);
-                l.focus = at.min(l.tiles.len() - 1);
+            let origin = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus);
+            if let View::Session { id, target } = &view
+                && let Some((ti, ci)) = l.find_session(id)
+            {
+                let t = &mut l.tiles[ti];
+                if target.is_some() {
+                    t.columns[ci].view = view.clone(); // go to the new place in it
+                }
+                t.cursor = ci;
+                t.active = t.columns[ci].key;
+                l.focus = ti;
+                l.touch(ti);
                 return;
             }
-            let ti = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus);
+            if how == How::NewTile && l.tiles.len() < MAX_TILES {
+                l.open_tile(origin, view);
+                return;
+            }
+            let from_list = from
+                .and_then(|(t, c)| l.tile(t)?.columns.iter().position(|x| x.key == c).map(|i| (t, i)))
+                .filter(|&(t, i)| l.tile(t).is_some_and(|t| t.columns[i].view.is_list() && t.columns.len() > i + 1));
+            if matches!(view, View::Session { .. }) && from_list.is_some() {
+                l.open_tile(origin, view);
+                return;
+            }
+            let ti = origin;
             let key = l.key();
             let t = &mut l.tiles[ti];
             let at = from.and_then(|(_, c)| t.columns.iter().position(|x| x.key == c)).unwrap_or(t.cursor);
@@ -357,6 +422,7 @@ impl Workspace {
                 t.active = key;
             }
             l.focus = ti;
+            l.touch(ti);
         });
     }
 
@@ -400,6 +466,7 @@ impl Workspace {
         self.layout.update(|l| {
             if index < l.tiles.len() && l.focus != index {
                 l.focus = index;
+                l.touch(index);
             }
         });
     }
