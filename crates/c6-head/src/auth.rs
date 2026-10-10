@@ -26,6 +26,11 @@ use crate::{HeadState, bad_request};
 const COOKIE: &str = "c6_session";
 const SESSION_MS: i64 = 90 * 24 * 3600 * 1000;
 const LINK_MS: i64 = 15 * 60 * 1000;
+const CODE_MS: i64 = 10 * 60 * 1000;
+/// Wrong codes tolerated before every outstanding code is cancelled.
+const CODE_TRIES: u32 = 5;
+/// Crockford base32: no I, L, O or U, so codes read back unambiguously.
+const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CHALLENGE_MS: i64 = 5 * 60 * 1000;
 /// `last_seen_at` is refreshed at most this often.
 const TOUCH_MS: i64 = 10 * 60 * 1000;
@@ -39,6 +44,8 @@ pub struct Tls;
 pub struct Auth {
     pub required: bool,
     challenges: Mutex<HashMap<String, Pending>>,
+    /// Wrong one-time codes since the last cancellation.
+    code_failures: Mutex<u32>,
 }
 
 struct Pending {
@@ -50,7 +57,7 @@ struct Pending {
 
 impl Auth {
     pub fn new(required: bool) -> Self {
-        Self { required, challenges: Mutex::default() }
+        Self { required, challenges: Mutex::default(), code_failures: Mutex::default() }
     }
 
     fn issue(&self, register: bool, here: &Here) -> String {
@@ -129,14 +136,43 @@ impl Store {
     }
 
     async fn redeem_login_link(&self, token: &str) -> anyhow::Result<bool> {
+        self.redeem(token, "link").await
+    }
+
+    /// Uses up a link or code of `kind`. Each kind is only accepted at its
+    /// own endpoint: short codes must not be guessable through the link one.
+    async fn redeem(&self, secret: &str, kind: &str) -> anyhow::Result<bool> {
         let now = now_ms();
-        let done = sqlx::query("UPDATE login_links SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?")
+        let done =
+            sqlx::query("UPDATE login_links SET used_at = ? WHERE token_hash = ? AND kind = ? AND used_at IS NULL AND expires_at > ?")
+                .bind(now)
+                .bind(sha256_hex(secret))
+                .bind(kind)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// A new one-time code ("K7QM-2XRD"), valid for 10 minutes.
+    async fn create_login_code(&self) -> anyhow::Result<(String, i64)> {
+        let raw: String = rand::random::<[u8; 8]>().iter().map(|b| CODE_ALPHABET[(*b & 31) as usize] as char).collect();
+        let now = now_ms();
+        sqlx::query("INSERT INTO login_links (token_hash, created_at, expires_at, kind) VALUES (?, ?, ?, 'code')")
+            .bind(sha256_hex(&raw))
             .bind(now)
-            .bind(sha256_hex(token))
-            .bind(now)
+            .bind(now + CODE_MS)
             .execute(&self.pool)
             .await?;
-        Ok(done.rows_affected() == 1)
+        Ok((format!("{}-{}", &raw[..4], &raw[4..]), now + CODE_MS))
+    }
+
+    async fn cancel_login_codes(&self) -> anyhow::Result<()> {
+        sqlx::query("UPDATE login_links SET used_at = ? WHERE kind = 'code' AND used_at IS NULL")
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn create_auth_session(&self, method: &str, user_agent: Option<&str>) -> anyhow::Result<String> {
@@ -232,9 +268,10 @@ impl Store {
 // --- Middleware -----------------------------------------------------------------
 
 /// Endpoints reachable without a session.
-const PUBLIC: [&str; 5] = [
+const PUBLIC: [&str; 6] = [
     "/api/v1/auth/status",
     "/api/v1/auth/link",
+    "/api/v1/auth/code",
     "/api/v1/auth/logout",
     "/api/v1/auth/passkeys/login/begin",
     "/api/v1/auth/passkeys/login/finish",
@@ -265,6 +302,8 @@ pub fn routes() -> Router<Arc<HeadState>> {
     Router::new()
         .route("/api/v1/auth/status", get(status))
         .route("/api/v1/auth/link", post(redeem_link))
+        .route("/api/v1/auth/code", post(redeem_code))
+        .route("/api/v1/auth/codes", post(create_code))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/passkeys/login/begin", post(login_begin))
         .route("/api/v1/auth/passkeys/login/finish", post(login_finish))
@@ -319,6 +358,52 @@ async fn redeem_link(
         return Err(bad_request("this login link is invalid, expired or already used; run `c6h login-link` for a new one").into());
     }
     sign_in(&st, "link", &headers, is_tls(tls)).await
+}
+
+/// The code as typed: case, spaces and dashes don't matter, and the
+/// look-alikes O, I and L read as 0, 1 and 1.
+fn normalize_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        })
+        .collect()
+}
+
+async fn create_code(State(st): State<Arc<HeadState>>) -> Res<Json<api::LoginCode>> {
+    let (code, expires_at) = st.store.create_login_code().await?;
+    tracing::info!("one-time sign-in code created");
+    Ok(Json(api::LoginCode { code, expires_at }))
+}
+
+async fn redeem_code(
+    State(st): State<Arc<HeadState>>,
+    tls: Option<axum::Extension<Tls>>,
+    headers: HeaderMap,
+    Json(req): Json<api::RedeemCode>,
+) -> Res<Response> {
+    if st.store.redeem(&normalize_code(&req.code), "code").await? {
+        *st.auth.code_failures.lock().unwrap() = 0;
+        return sign_in(&st, "code", &headers, is_tls(tls)).await;
+    }
+    let cancel = {
+        let mut failures = st.auth.code_failures.lock().unwrap();
+        *failures += 1;
+        let cancel = *failures >= CODE_TRIES;
+        if cancel {
+            *failures = 0;
+        }
+        cancel
+    };
+    if cancel {
+        tracing::warn!("too many wrong sign-in codes: cancelled all outstanding codes");
+        st.store.cancel_login_codes().await?;
+        return Err(bad_request("too many wrong codes: all codes were cancelled; create a new one").into());
+    }
+    Err(bad_request("that code is wrong, expired or already used").into())
 }
 
 async fn logout(State(st): State<Arc<HeadState>>, tls: Option<axum::Extension<Tls>>, headers: HeaderMap) -> Res<Response> {
@@ -569,6 +654,32 @@ mod tests {
         assert_eq!(get("/workers", Some(&passkey_session)).await.unwrap().status(), StatusCode::OK);
         let st: Value = get("/auth/status", Some(&passkey_session)).await.unwrap().json().await.unwrap();
         assert_eq!((st["authenticated"].as_bool(), st["has_passkeys"].as_bool()), (Some(true), Some(true)));
+
+        // A one-time code from a signed-in browser signs in another one.
+        assert_eq!(post("/auth/codes", None, json!({})).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let code: Value = post("/auth/codes", Some(&passkey_session), json!({})).await.unwrap().json().await.unwrap();
+        let code = code["code"].as_str().unwrap().to_owned();
+        assert_eq!(code.len(), 9, "{code}");
+        // Not accepted as a link token.
+        assert_eq!(post("/auth/link", None, json!({"token": code})).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        // Case and dashes don't matter.
+        let typed = code.replace('-', " ").to_lowercase();
+        let r = post("/auth/code", None, json!({"code": typed})).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert_eq!(get("/workers", Some(&cookie(&r))).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(post("/auth/code", None, json!({"code": code})).await.unwrap().status(), StatusCode::BAD_REQUEST, "single use");
+
+        // Guessing: five wrong codes cancel the outstanding ones.
+        let fresh: Value = post("/auth/codes", Some(&passkey_session), json!({})).await.unwrap().json().await.unwrap();
+        // (The reused code above already counted as one.)
+        let mut cancelled = false;
+        for _ in 0..5 {
+            let r = post("/auth/code", None, json!({"code": "0000-0000"})).await.unwrap();
+            cancelled |= r.text().await.unwrap().contains("cancelled");
+        }
+        assert!(cancelled);
+        let r = post("/auth/code", None, json!({"code": fresh["code"]})).await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "cancelled after too many wrong codes");
 
         // Sessions can be listed and revoked.
         let sessions: Vec<Value> = get("/auth/sessions", Some(&passkey_session)).await.unwrap().json().await.unwrap();

@@ -319,3 +319,11 @@ pub async fn auth_sessions() -> Result<Vec<c6_api::AuthSession>, String> {
 pub async fn delete_auth_session(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/auth/sessions/{id}")).send().await).await
 }
+
+pub async fn create_login_code() -> Result<c6_api::LoginCode, String> {
+    json(Request::post("/api/v1/auth/codes").send().await).await
+}
+
+pub async fn redeem_code(code: String) -> Result<(), String> {
+    empty(Request::post("/api/v1/auth/code").json(&c6_api::RedeemCode { code }).map_err(|e| e.to_string())?.send().await).await
+}

@@ -366,6 +366,20 @@ pub struct RedeemLink {
     pub token: String,
 }
 
+/// `POST /api/v1/auth/codes`: a one-time code for signing in another device.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoginCode {
+    /// e.g. "K7QM-2XRD"
+    pub code: String,
+    pub expires_at: UnixMs,
+}
+
+/// `POST /api/v1/auth/code`: sign in with a one-time code.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RedeemCode {
+    pub code: String,
+}
+
 /// `POST /api/v1/auth/passkeys/register/finish`
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegisterPasskey {
@@ -388,7 +402,7 @@ pub struct Passkey {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthSession {
     pub id: String,
-    /// "passkey" or "link".
+    /// "passkey", "link" or "code".
     pub method: String,
     pub user_agent: Option<String>,
     pub created_at: UnixMs,

@@ -87,11 +87,48 @@ pub fn SignIn(status: c6_api::AuthStatus) -> impl IntoView {
                     </p>
                 }.into_any()
             }}
+            <CodeSignIn />
             <p class="text-sm text-zinc-500">
-                {if passkeys && status.has_passkeys { "No passkey on this device? " } else { "" }}
-                "Run "<code class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">"c6h login-link"</code>
+                "Or run "<code class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">"c6h login-link"</code>
                 " on the head and open the link it prints."
             </p>
+        </div>
+    }
+}
+
+/// Sign in with a one-time code made on a signed-in device.
+#[component]
+fn CodeSignIn() -> impl IntoView {
+    let code = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let go = move || {
+        let c = code.get_untracked();
+        if c.trim().is_empty() || busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        spawn_local(async move {
+            match api::redeem_code(c).await {
+                Ok(()) => reload_to(&window().location().pathname().unwrap_or_else(|_| "/".into())),
+                Err(e) => {
+                    error.set(Some(e));
+                    busy.set(false);
+                }
+            }
+        });
+    };
+    view! {
+        <div class="space-y-2 border-t border-zinc-200 pt-4 dark:border-zinc-800">
+            <label class="block text-sm text-zinc-500" for="c6-code">"Have a one-time code? Make one on a signed-in device under Settings → Sign-in."</label>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            <div class="flex gap-2">
+                <input id="c6-code" class=format!("{INPUT} font-mono uppercase tracking-widest") placeholder="XXXX-XXXX"
+                    autocomplete="one-time-code" autocapitalize="characters" spellcheck="false"
+                    prop:value=move || code.get() on:input=move |ev| code.set(event_target_value(&ev))
+                    on:keydown=move |ev| if ev.key() == "Enter" { go() } />
+                <button class=format!("{BUTTON} shrink-0 whitespace-nowrap") prop:disabled=move || busy.get() on:click=move |_| go()>"Sign in"</button>
+            </div>
         </div>
     }
 }
@@ -232,6 +269,7 @@ pub fn SignInSettings() -> impl IntoView {
                     </p>
                 </div>
             })}
+            <OtherDevice />
             <h3 class="pt-2 text-sm font-semibold">"Signed-in browsers"</h3>
             <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 text-sm dark:divide-zinc-800 dark:border-zinc-800">
                 {move || sessions.get().map(|r| match r {
@@ -241,7 +279,7 @@ pub fn SignInSettings() -> impl IntoView {
                             <div class="flex items-center justify-between gap-3 px-4 py-2">
                                 <div class="min-w-0">
                                     <div class="truncate">{browser_name(s.user_agent.as_deref())}{s.current.then_some(" (this browser)")}</div>
-                                    <div class="text-xs text-zinc-500">{format!("{} · signed in {} · active {}", if s.method == "passkey" { "passkey" } else { "login link" }, ago(now_ms() - s.created_at), ago(now_ms() - s.last_seen_at))}</div>
+                                    <div class="text-xs text-zinc-500">{format!("{} · signed in {} · active {}", match s.method.as_str() { "passkey" => "passkey", "code" => "one-time code", _ => "login link" }, ago(now_ms() - s.created_at), ago(now_ms() - s.last_seen_at))}</div>
                                 </div>
                                 {(!s.current).then(|| view! {
                                     <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
@@ -261,6 +299,59 @@ pub fn SignInSettings() -> impl IntoView {
                 })}
             </div>
         </section>
+    }
+}
+
+/// Settings: a one-time code to type in on another device.
+#[component]
+fn OtherDevice() -> impl IntoView {
+    let code = RwSignal::new(None::<c6_api::LoginCode>);
+    let error = RwSignal::new(None::<String>);
+    // A 1-second clock for the countdown.
+    let now = RwSignal::new(now_ms());
+    let ticker = set_interval_with_handle(move || now.set(now_ms()), std::time::Duration::from_secs(1)).ok();
+    on_cleanup(move || {
+        if let Some(t) = ticker {
+            t.clear();
+        }
+    });
+    let create = move |_| {
+        spawn_local(async move {
+            match api::create_login_code().await {
+                Ok(c) => {
+                    error.set(None);
+                    now.set(now_ms());
+                    code.set(Some(c));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let origin = window().location().origin().unwrap_or_default();
+    view! {
+        <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <div class="font-medium">"Sign in another device"</div>
+                    <p class="text-zinc-500">{format!("On the other device, open {origin} and enter a one-time code.")}</p>
+                </div>
+                <button class=format!("{BUTTON} shrink-0") on:click=create>"Create a code"</button>
+            </div>
+            {move || error.get().map(|e| view! { <div class="mt-2"><ErrorBox message=e /></div> })}
+            {move || code.get().map(|c| {
+                let left = (c.expires_at - now.get()) / 1000;
+                if left <= 0 {
+                    view! { <p class="mt-2 text-zinc-500">"The code expired. Create a new one."</p> }.into_any()
+                } else {
+                    view! {
+                        <div class="mt-3 flex items-baseline gap-3">
+                            <span class="select-all font-mono text-2xl font-semibold tracking-widest">{c.code.clone()}</span>
+                            <span class="text-xs text-zinc-500">{format!("works once · expires in {}:{:02}", left / 60, left % 60)}</span>
+                        </div>
+                    }.into_any()
+                }
+            })}
+        </div>
     }
 }
 

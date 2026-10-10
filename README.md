@@ -54,6 +54,7 @@ c6h               # binds private/tailnet addresses only; prints the web UI URL
 ```
 
 1. Sign in: run `c6h login-link` on the head and open the link it prints (it works once, for 15 minutes). Then add a passkey under **Settings → Sign-in**, and sign in with Touch ID, Face ID or a security key from then on. A new link always gets you back in.
+   - To sign in another device (a phone), create a one-time code under **Settings → Sign-in → Sign in another device** and type it into that device's sign-in page. Codes work once, for 10 minutes; five wrong codes cancel all outstanding ones.
 2. In the UI, add an LLM connection under **Settings**. For a local Ollama, use `http://127.0.0.1:11434/v1` with no key.
 3. On the **Workers** page, click **Add worker**, then run the printed command on the worker machine (or create a token with `c6h enroll-token` on the head):
 
