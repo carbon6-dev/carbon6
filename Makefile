@@ -68,7 +68,7 @@ build: ui ## Build release binaries into target/release
 test: ## Run the test suite
 	cargo test
 
-dev-head: ui ## Run a loopback-only dev head (dev/c6h.toml, state in target/dev)
+dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml, state in target/dev)
 	cargo run -p c6h -- --config dev/c6h.toml
 
 dev-token: ## Print an enrollment token from the dev head's database

@@ -106,6 +106,29 @@ impl HeadConfig {
     }
 }
 
+/// The addresses the head can be reached at: listen addresses, with an
+/// unspecified one (`0.0.0.0`, `::`) replaced by every interface address of
+/// its family. IPv6 link-local addresses are left out (they need a scope).
+pub fn reachable_addrs(listen: &[SocketAddr]) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut out = Vec::new();
+    for a in listen {
+        if !a.ip().is_unspecified() {
+            out.push(*a);
+            continue;
+        }
+        for i in if_addrs::get_if_addrs().context("listing network interfaces")? {
+            let ip = i.ip();
+            let link_local_v6 = matches!(ip, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80);
+            if ip.is_ipv4() == a.is_ipv4() && !link_local_v6 {
+                out.push(SocketAddr::new(ip, a.port()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 fn private_interface_ips() -> anyhow::Result<Vec<IpAddr>> {
     let mut ips: Vec<IpAddr> =
         if_addrs::get_if_addrs().context("listing network interfaces")?.into_iter().map(|i| i.ip()).filter(is_private).collect();
@@ -139,6 +162,16 @@ fn is_ula(ip: &Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcard_expands_to_interfaces() {
+        let any: SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        let reach = reachable_addrs(&[any]).unwrap();
+        assert!(reach.contains(&"127.0.0.1:7700".parse().unwrap()), "{reach:?}");
+        assert!(reach.iter().all(|a| a.is_ipv4() && !a.ip().is_unspecified() && a.port() == 7700));
+        let lo: SocketAddr = "127.0.0.1:7700".parse().unwrap();
+        assert_eq!(reachable_addrs(&[lo]).unwrap(), vec![lo]);
+    }
 
     #[test]
     fn private_ranges() {

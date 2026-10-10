@@ -73,7 +73,7 @@ c6w run
 ## Local development
 
 ```bash
-make dev-head                     # loopback-only head using dev/c6h.toml, state in target/dev
+make dev-head                     # head on all interfaces using dev/c6h.toml, state in target/dev
 make dev-token                    # prints a token
 make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it (later: just make dev-worker)
 ```

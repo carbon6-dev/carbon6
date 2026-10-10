@@ -1,3 +1,7 @@
-# Local development head: loopback only, state under target/.
+# Local development head: state under target/.
 data_dir = "target/dev/c6h"
-bind = ["127.0.0.1"]
+# All interfaces, so the UI can be opened from other machines on the network
+# (and tailnet). The head has no login: anyone who can reach port 7700 can
+# use it. For loopback only, use bind = ["127.0.0.1"] and drop the next line.
+bind = ["0.0.0.0"]
+allow_public_bind = true

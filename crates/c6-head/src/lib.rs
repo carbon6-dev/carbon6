@@ -113,7 +113,12 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
     let ui_addrs: Vec<_> = ui_listeners.iter().map(|l| l.local_addr()).collect::<Result<_, _>>()?;
     let worker_addrs: Vec<_> = worker_listeners.iter().map(|l| l.local_addr()).collect::<Result<_, _>>()?;
 
-    let (worker_url, cert_ips, dns_names) = endpoint_names(&cfg, &ips, &worker_addrs)?;
+    // A wildcard bind (0.0.0.0) is reached at the interface addresses: those
+    // go into the certificate, the advertised URL and the Host allowlist.
+    let ui_reach = config::reachable_addrs(&ui_addrs)?;
+    let worker_reach = config::reachable_addrs(&worker_addrs)?;
+    let reach_ips: Vec<IpAddr> = worker_reach.iter().map(|a| a.ip()).collect();
+    let (worker_url, cert_ips, dns_names) = endpoint_names(&cfg, &reach_ips, &worker_reach)?;
 
     let pki = pki::Pki::load_or_create(&cfg.data_dir.join("pki"), &cert_ips, &dns_names)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
@@ -165,7 +170,7 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
     // Literal loopback addresses can't be rebound, and are how a published
     // container port is usually reached.
     names.extend(["127.0.0.1".to_owned(), "[::1]".to_owned()]);
-    let guard = guard::HostGuard::new(&ui_addrs, &names);
+    let guard = guard::HostGuard::new(&ui_reach, &names);
     let app = api::router(state.clone()).layer(axum::middleware::from_fn_with_state(guard, guard::check));
     for listener in ui_listeners {
         let app = app.clone();
@@ -222,6 +227,8 @@ pub async fn create_enrollment(
 pub async fn offline_enrollment(cfg: HeadConfig, name: Option<&str>) -> anyhow::Result<c6_api::Enrollment> {
     let ips = cfg.bind_ips()?;
     let worker_addrs: Vec<_> = ips.iter().map(|ip| SocketAddr::new(*ip, cfg.worker_port)).collect();
+    let worker_addrs = config::reachable_addrs(&worker_addrs)?;
+    let ips: Vec<IpAddr> = worker_addrs.iter().map(|a| a.ip()).collect();
     let (worker_url, cert_ips, dns_names) = endpoint_names(&cfg, &ips, &worker_addrs)?;
     std::fs::create_dir_all(&cfg.data_dir)?;
     let pki = pki::Pki::load_or_create(&cfg.data_dir.join("pki"), &cert_ips, &dns_names)?;
