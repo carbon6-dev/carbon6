@@ -1,2 +1,21 @@
 @import "tailwindcss";
 @source "../src/**/*.rs";
+
+/* Rendered markdown from model output. */
+@layer components {
+  .md { @apply text-sm leading-relaxed; }
+  .md > * + * { @apply mt-3; }
+  .md h1 { @apply text-lg font-semibold; }
+  .md h2 { @apply text-base font-semibold; }
+  .md h3, .md h4 { @apply font-semibold; }
+  .md ul { @apply list-disc pl-5; }
+  .md ol { @apply list-decimal pl-5; }
+  .md li + li { @apply mt-1; }
+  .md a { @apply underline; }
+  .md code { @apply rounded bg-zinc-200/70 px-1 py-0.5 font-mono text-[0.85em] dark:bg-zinc-800; }
+  .md pre { @apply overflow-x-auto rounded-md bg-zinc-100 p-3 dark:bg-zinc-900; }
+  .md pre code { @apply bg-transparent p-0; }
+  .md blockquote { @apply border-l-2 border-zinc-300 pl-3 text-zinc-600 dark:border-zinc-700 dark:text-zinc-400; }
+  .md table { @apply border-collapse text-xs; }
+  .md th, .md td { @apply border border-zinc-300 px-2 py-1 dark:border-zinc-700; }
+}

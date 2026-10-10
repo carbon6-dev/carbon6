@@ -1,0 +1,207 @@
+syntax = "proto3";
+
+package carbon6.v1;
+
+// ---------------------------------------------------------------------------
+// Durable session events. Each session is an append-only log written only by
+// the worker running it; `seq` starts at 1 and has no gaps.
+// ---------------------------------------------------------------------------
+
+message SessionEvent {
+  uint64 seq = 1;
+  int64 ts_ms = 2;
+  oneof kind {
+    SessionStarted started = 10;
+    UserMessage user = 11;
+    TurnStarted turn_started = 12;
+    AssistantMessage assistant = 13;
+    ToolResult tool_result = 14;
+    Usage usage = 15;
+    TurnEnded turn_ended = 16;
+    ErrorEvent error = 17;
+  }
+}
+
+message SessionStarted {
+  string command_id = 1;
+  ModelSpec model = 2;
+  string cwd = 3;
+  // Full system prompt as sent to the model, for inspection.
+  string system_prompt = 4;
+  repeated string tools = 5;
+}
+
+message UserMessage {
+  string command_id = 1;
+  string text = 2;
+}
+
+message TurnStarted {
+  uint64 turn = 1;
+}
+
+message AssistantMessage {
+  uint64 turn = 1;
+  repeated ContentBlock blocks = 2;
+  string stop_reason = 3;
+}
+
+message ContentBlock {
+  oneof block {
+    string text = 1;
+    string thinking = 2;
+    ToolUse tool_use = 3;
+  }
+}
+
+message ToolUse {
+  string id = 1;
+  string name = 2;
+  string input_json = 3;
+}
+
+message ToolResult {
+  string call_id = 1;
+  string tool = 2;
+  string output = 3;
+  bool is_error = 4;
+  bool truncated = 5;
+  uint64 duration_ms = 6;
+}
+
+message Usage {
+  string model = 1;
+  uint64 input_tokens = 2;
+  uint64 output_tokens = 3;
+  uint64 cache_read_tokens = 4;
+  uint64 cache_write_tokens = 5;
+  uint64 reasoning_tokens = 6;
+}
+
+enum TurnEndReason {
+  TURN_END_REASON_UNSPECIFIED = 0;
+  TURN_END_REASON_COMPLETED = 1;
+  TURN_END_REASON_INTERRUPTED = 2;
+  TURN_END_REASON_ERROR = 3;
+  TURN_END_REASON_WORKER_RESTARTED = 4;
+}
+
+message TurnEnded {
+  uint64 turn = 1;
+  TurnEndReason reason = 2;
+}
+
+message ErrorEvent {
+  string message = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Ephemeral events: live streaming only, never journaled. Losing them loses
+// nothing because the durable events carry the final content.
+// ---------------------------------------------------------------------------
+
+message EphemeralEvent {
+  string session_id = 1;
+  oneof kind {
+    TextDelta text = 2;
+    TextDelta thinking = 3;
+    ToolOutputDelta tool_output = 4;
+    SessionActivity activity = 5;
+  }
+}
+
+message TextDelta {
+  uint64 turn = 1;
+  string text = 2;
+}
+
+message ToolOutputDelta {
+  string call_id = 1;
+  string text = 2;
+}
+
+message SessionActivity {
+  bool running = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Sync
+// ---------------------------------------------------------------------------
+
+message SessionCursor {
+  string session_id = 1;
+  uint64 seq = 2;
+}
+
+message SessionEventBatch {
+  string session_id = 1;
+  repeated SessionEvent events = 2;
+}
+
+// Cumulative: every event with seq <= `seq` is durable on the head.
+message EventAck {
+  string session_id = 1;
+  uint64 seq = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Commands (head -> worker). Delivered at least once; the worker applies each
+// command_id at most once.
+// ---------------------------------------------------------------------------
+
+message SessionCommand {
+  string command_id = 1;
+  string session_id = 2;
+  oneof kind {
+    CreateSession create = 10;
+    UserInput input = 11;
+    Interrupt interrupt = 12;
+  }
+}
+
+message CreateSession {
+  ModelSpec model = 1;
+  string cwd = 2;
+  // Base prompt from the head; the worker appends environment details and
+  // project instruction files.
+  string base_prompt = 3;
+}
+
+message ModelSpec {
+  string connection_id = 1;
+  string model = 2;
+  uint32 max_output_tokens = 3;
+}
+
+message UserInput {
+  string text = 1;
+}
+
+message Interrupt {}
+
+message CommandRejected {
+  string command_id = 1;
+  string session_id = 2;
+  string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+
+message CredentialRequest {
+  uint64 request_id = 1;
+  string connection_id = 2;
+}
+
+message CredentialGrant {
+  uint64 request_id = 1;
+  string connection_id = 2;
+  // Empty on failure, with `error` set.
+  string error = 3;
+  string kind = 4; // "openai_compat"
+  string base_url = 5;
+  string bearer = 6;
+  map<string, string> headers = 7;
+  int64 expires_at_ms = 8; // 0 = no expiry
+}

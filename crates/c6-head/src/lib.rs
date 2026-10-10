@@ -2,9 +2,13 @@
 
 pub mod api;
 pub mod config;
+mod convert;
 pub mod hub;
 pub mod pki;
+mod prompts;
 pub mod registry;
+pub mod secrets;
+pub mod sessions;
 pub mod store;
 
 use std::net::{IpAddr, SocketAddr};
@@ -22,10 +26,37 @@ use tracing::info;
 
 pub use config::HeadConfig;
 
+/// An error caused by the request, shown to the user as is.
+#[derive(Debug)]
+pub enum UserError {
+    BadRequest(String),
+    NotFound(String),
+}
+
+impl std::fmt::Display for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserError::BadRequest(m) | UserError::NotFound(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for UserError {}
+
+pub(crate) fn bad_request(msg: impl Into<String>) -> anyhow::Error {
+    UserError::BadRequest(msg.into()).into()
+}
+
+pub(crate) fn not_found(msg: impl Into<String>) -> anyhow::Error {
+    UserError::NotFound(msg.into()).into()
+}
+
 pub struct HeadState {
     pub store: store::Store,
     pub pki: pki::Pki,
     pub registry: registry::Registry,
+    pub secrets: secrets::Secrets,
+    pub hub: sessions::LiveHub,
     /// URL workers dial, as put into enrollment tokens.
     pub worker_url: String,
     pub shutdown: CancellationToken,
@@ -78,7 +109,8 @@ pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
     let shutdown = CancellationToken::new();
     let registry = registry::Registry::new(shutdown.clone());
-    let state = Arc::new(HeadState { store, pki, registry, worker_url, shutdown: shutdown.clone() });
+    let secrets = secrets::Secrets::load_or_create(&cfg.data_dir.join("master.key"))?;
+    let state = Arc::new(HeadState { store, pki, registry, secrets, hub: Default::default(), worker_url, shutdown: shutdown.clone() });
 
     let mut tasks = JoinSet::new();
 

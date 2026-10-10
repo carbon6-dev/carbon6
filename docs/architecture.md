@@ -42,8 +42,9 @@ carbon6/
     c6-core/              ids, session event model helpers, config schema, errors
     c6-api/               HTTP/WS API types shared by c6h and c6-ui (compiles to wasm)
     c6-llm/               provider clients, canonical message model, caching/thinking logic
-    c6-agent/             agent loop, context assembly, compaction, subagents, Tool trait
-    c6-tools/             built-in tools
+    c6-agent/             agent loop, context assembly, compaction, subagents
+    c6-tools/             Tool trait and built-in tools
+    c6-testkit/           scripted OpenAI-compatible mock server for tests
     c6-mcp/               MCP client integration (wraps rmcp)
     c6-head/              head library: storage, services, API, worker hub
     c6-worker/            worker library: connection mgr, journal, session runtime, fs/git/pty
@@ -143,8 +144,7 @@ kind =
   SessionStarted   { model_ref, system_prompt_hash, tool_profile, cwd, git_head }
   UserMessage      { command_id, parts[] }              // text, image(blob), file refs
   TurnStarted      { turn_id }
-  AssistantMessage { turn_id, blocks[], stop_reason, provider_opaque? }
-  ToolCall         { call_id, tool, input_json }
+  AssistantMessage { turn_id, blocks[], stop_reason, provider_opaque? }   // tool calls are ToolUse blocks here
   ToolResult       { call_id, output_parts[], is_error, truncated, full_output_blob? }
   Usage            { request_id, model, input, output, cache_read, cache_write, reasoning, cost_micros? }
   Compaction       { summary, replaces_through_seq }
@@ -401,7 +401,17 @@ Shared tools run concurrently when the model makes parallel calls. Exclusive too
 | M4 | MCP, skills, subagents, web tools, background shells, OTLP export | Feature parity with the requirements |
 | M5 | Hardening: chaos tests, evals, performance, UX polish | Comfortable as the only harness |
 
-## 16. Open items to settle during implementation
+## 16. Implementation notes (M1)
+
+Decisions made while building M1 that refine the sections above:
+
+- **Command delivery is per connection and ordered.** Durable commands (create, input) are rows in the head's `commands` table. The API only inserts a row and wakes the worker's connection task, and that one task sends pending rows in `seq` order. A session's `Create` therefore always arrives before its inputs. Interrupts are not stored; they are sent only if the worker is connected.
+- **Queued input is recorded at the request boundary.** The worker appends `UserMessage` when the input actually goes into a model request, not when it arrives. Recording it on arrival would interleave it between tool calls and their results in the log. Until then the head shows the input as queued, and a worker restart simply gets it redelivered.
+- **A rejected `Create` fails the session.** The session gets status `failed` with the worker's reason (for example, a missing working directory), and everything queued behind it is rejected.
+- **No head↔worker read loop ever blocks on control replies.** Pongs and acks use `try_send`: acks are cumulative, and losing a pong is harmless. This prevents a deadlock when both directions' buffers fill.
+- **Chat Completions quirks.** An assistant message with no text and no tool calls is sent with `content: ""`, because Ollama rejects `null` there. Reasoning is read from either `reasoning_content` or `reasoning`.
+
+## 17. Open items to settle during implementation
 
 - Exact Codex and Claude Code tool schemas and descriptions, to mirror per tool profile. Get them from public sources and evals.
 - How to render a long-running session with many subagents in the UI.

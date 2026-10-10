@@ -7,7 +7,7 @@ An AI coding-agent harness for running agents on many machines from one place.
 
 See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs/architecture.md).
 
-Status: **M0**. Workers enroll and attach over mTLS, and the fleet page shows them live. There are no agent sessions yet.
+Status: **M1**. You can run coding sessions on any worker from the web UI, against any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, …). The core tools are read, write, edit, bash, grep and glob. Sessions keep running when the head is unreachable and sync back when it returns.
 
 ## Build
 
@@ -26,7 +26,7 @@ On the head machine:
 c6h               # binds private/tailnet addresses only; prints the web UI URL
 ```
 
-Open the UI, click **Add worker**, and run the printed command on the worker machine (or use `c6h enroll-token` on the head):
+Open the UI, add an LLM connection under **Settings** (for a local Ollama: `http://127.0.0.1:11434/v1`, no key), then click **Add worker** on the Workers page, and run the printed command on the worker machine (or use `c6h enroll-token` on the head):
 
 ```bash
 c6w enroll c6e1.…

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use c6_api::WorkerStatus;
 use c6_head::HeadConfig;
-use c6_worker::{ConnState, Identity, conn, enroll};
+use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +38,7 @@ async fn enroll_attach_restart_revoke() {
     identity.save(worker_dir.path()).unwrap();
     let identity = Identity::load(worker_dir.path()).unwrap();
     let id = identity.meta.worker_id;
+    let worker_state = worker_dir.path().join("state");
 
     let reuse = enroll::enroll(&enrollment.token).await;
     assert!(reuse.is_err(), "token must be single-use");
@@ -45,7 +46,8 @@ async fn enroll_attach_restart_revoke() {
     // Attach.
     let (state_tx, mut state_rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
-    let worker = tokio::spawn(conn::run(identity, state_tx, stop.clone()));
+    let worker = Worker::open(&worker_state, identity).await.unwrap();
+    let worker = tokio::spawn(conn::run(worker, state_tx, stop.clone()));
     wait_for(&mut state_rx, |s| matches!(s, ConnState::Attached { .. })).await;
     assert_eq!(status(&head, id).await, WorkerStatus::Online);
 

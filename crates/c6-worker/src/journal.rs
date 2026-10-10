@@ -1,0 +1,169 @@
+//! Local durable journal of session events (SQLite, WAL).
+//!
+//! Every durable event is committed here before it is sent to the head, so a
+//! disconnect or crash never loses one. It is a cache: the head's copy is
+//! authoritative once acknowledged.
+
+use std::path::Path;
+use std::str::FromStr;
+
+use anyhow::Context;
+use c6_proto::{CreateSession, SessionEvent, session_event};
+use prost::Message;
+use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
+use tokio::sync::Notify;
+
+pub struct Journal {
+    pool: SqlitePool,
+    /// Signalled after every append. Single consumer (the uploader), so
+    /// `notify_one` keeps a permit when it is busy and nothing is missed.
+    pub appended: Notify,
+}
+
+/// Upload position of a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub session_id: String,
+    pub last_seq: u64,
+    pub acked_seq: u64,
+}
+
+impl Journal {
+    pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let opts = SqliteConnectOptions::from_str("sqlite:")?
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            // FULL: an event must survive power loss once appended.
+            .synchronous(SqliteSynchronous::Full);
+        let pool =
+            SqlitePoolOptions::new().max_connections(4).connect_with(opts).await.with_context(|| format!("opening {}", path.display()))?;
+        sqlx::migrate!("./migrations").run(&pool).await.context("journal migrations")?;
+        Ok(Self { pool, appended: Notify::new() })
+    }
+
+    pub async fn is_applied(&self, command_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("SELECT 1 FROM applied_commands WHERE command_id = ?").bind(command_id).fetch_optional(&self.pool).await?.is_some())
+    }
+
+    pub async fn has_session(&self, session_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("SELECT 1 FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&self.pool).await?.is_some())
+    }
+
+    /// Records a new session with its first event (`SessionStarted`, seq 1).
+    pub async fn create_session(&self, session_id: &str, spec: &CreateSession, started: &SessionEvent) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO sessions (id, spec, created_at) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(spec.encode_to_vec())
+            .bind(c6_core::now_ms())
+            .execute(&mut *tx)
+            .await?;
+        append_in(&mut tx, session_id, started).await?;
+        tx.commit().await?;
+        self.appended.notify_one();
+        Ok(())
+    }
+
+    /// Appends an event. The caller (the session's single writer) assigns
+    /// consecutive seqs.
+    pub async fn append(&self, session_id: &str, event: &SessionEvent) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        append_in(&mut tx, session_id, event).await?;
+        tx.commit().await?;
+        self.appended.notify_one();
+        Ok(())
+    }
+
+    pub async fn load_session(&self, session_id: &str) -> anyhow::Result<Option<(CreateSession, Vec<SessionEvent>)>> {
+        let Some(row) = sqlx::query("SELECT spec FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&self.pool).await? else {
+            return Ok(None);
+        };
+        let spec = CreateSession::decode(row.get::<Vec<u8>, _>("spec").as_slice())?;
+        let events = self.events_after(session_id, 0, u32::MAX).await?;
+        Ok(Some((spec, events)))
+    }
+
+    pub async fn events_after(&self, session_id: &str, after: u64, limit: u32) -> anyhow::Result<Vec<SessionEvent>> {
+        let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
+            .bind(session_id)
+            .bind(after as i64)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|r| Ok(SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?)).collect()
+    }
+
+    /// Sessions with events the head has not acknowledged.
+    pub async fn unacked(&self) -> anyhow::Result<Vec<Cursor>> {
+        let rows = sqlx::query("SELECT id, last_seq, acked_seq FROM sessions WHERE last_seq > acked_seq").fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| Cursor {
+                session_id: r.get("id"),
+                last_seq: r.get::<i64, _>("last_seq") as u64,
+                acked_seq: r.get::<i64, _>("acked_seq") as u64,
+            })
+            .collect())
+    }
+
+    pub async fn set_acked(&self, session_id: &str, seq: u64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE sessions SET acked_seq = MAX(acked_seq, MIN(?, last_seq)) WHERE id = ?")
+            .bind(seq as i64)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Sessions left mid-turn by a crash: (session id, last seq, open turn).
+    pub async fn open_turns(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
+        let rows = sqlx::query("SELECT id, last_seq, open_turn FROM sessions WHERE open_turn IS NOT NULL").fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| (r.get("id"), r.get::<i64, _>("last_seq") as u64, r.get::<i64, _>("open_turn") as u64)).collect())
+    }
+}
+
+async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &SessionEvent) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO events (session_id, seq, data) VALUES (?, ?, ?)")
+        .bind(session_id)
+        .bind(event.seq as i64)
+        .bind(event.encode_to_vec())
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("appending seq {} to {session_id}", event.seq))?;
+    let open_turn: Option<Option<i64>> = match &event.kind {
+        Some(session_event::Kind::TurnStarted(t)) => Some(Some(t.turn as i64)),
+        Some(session_event::Kind::TurnEnded(_)) => Some(None),
+        _ => None,
+    };
+    match open_turn {
+        Some(turn) => {
+            sqlx::query("UPDATE sessions SET last_seq = ?, open_turn = ? WHERE id = ?")
+                .bind(event.seq as i64)
+                .bind(turn)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?
+        }
+        None => {
+            sqlx::query("UPDATE sessions SET last_seq = ? WHERE id = ?").bind(event.seq as i64).bind(session_id).execute(&mut *tx).await?
+        }
+    };
+    let command_id = match &event.kind {
+        Some(session_event::Kind::User(u)) => Some(&u.command_id),
+        Some(session_event::Kind::Started(s)) => Some(&s.command_id),
+        _ => None,
+    };
+    if let Some(id) = command_id.filter(|id| !id.is_empty()) {
+        sqlx::query("INSERT OR IGNORE INTO applied_commands (command_id, session_id) VALUES (?, ?)")
+            .bind(id)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}

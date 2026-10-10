@@ -14,6 +14,12 @@ fn now_ms() -> i64 {
 }
 
 #[component]
+pub fn FleetPage() -> impl IntoView {
+    let workers = api::live().workers;
+    view! { <main class="mx-auto max-w-6xl px-4 py-6"><Fleet workers /></main> }
+}
+
+#[component]
 pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
     // Ticks so "last seen" stays fresh between snapshots.
     let now = RwSignal::new(now_ms());

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package carbon6.v1;
 
+import "carbon6/v1/session.proto";
+
 // One-time enrollment. Served on the worker port over server-authenticated
 // TLS; the caller has no client certificate yet.
 service Enrollment {
@@ -34,6 +36,10 @@ message WorkerMsg {
   oneof msg {
     Hello hello = 1; // must be first
     Ping ping = 2;
+    SessionEventBatch events = 3;
+    EphemeralEvent ephemeral = 4;
+    CommandRejected rejected = 5;
+    CredentialRequest credential_request = 6;
   }
 }
 
@@ -41,6 +47,9 @@ message HeadMsg {
   oneof msg {
     Welcome welcome = 1;
     Pong pong = 2;
+    EventAck ack = 3;
+    SessionCommand command = 4;
+    CredentialGrant credential = 5;
   }
 }
 
@@ -51,6 +60,8 @@ message Hello {
   string os = 4;
   string arch = 5;
   repeated string capabilities = 6;
+  // Last journaled seq of every session with events the head may not have.
+  repeated SessionCursor sessions = 7;
 }
 
 message Welcome {
@@ -58,6 +69,9 @@ message Welcome {
   string head_version = 2;
   string worker_id = 3;
   string worker_name = 4;
+  // Head's durable position for each session in Hello; the worker resends
+  // everything after it.
+  repeated SessionCursor acks = 5;
 }
 
 message Ping {

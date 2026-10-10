@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Run => {
-            let id = Identity::load(&state_dir)?;
+            let worker = c6_worker::Worker::open(&state_dir, Identity::load(&state_dir)?).await?;
             let (state_tx, _state_rx) = watch::channel(ConnState::Connecting);
             let stop = CancellationToken::new();
             let token = stop.clone();
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::signal::ctrl_c().await.ok();
                 token.cancel();
             });
-            conn::run(id, state_tx, stop).await
+            conn::run(worker, state_tx, stop).await
         }
         Command::Status => {
             let id = Identity::load(&state_dir)?;

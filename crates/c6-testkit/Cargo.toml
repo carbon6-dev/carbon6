@@ -1,0 +1,13 @@
+[package]
+name = "c6-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = "0.8"
+futures = "0.3.34"
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-stream = "0.1.19"

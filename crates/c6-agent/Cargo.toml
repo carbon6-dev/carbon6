@@ -1,0 +1,23 @@
+[package]
+name = "c6-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+c6-core.workspace = true
+c6-llm.workspace = true
+c6-proto.workspace = true
+c6-tools.workspace = true
+futures = "0.3.34"
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+
+[dev-dependencies]
+c6-testkit.workspace = true
+tempfile = "3.27.0"

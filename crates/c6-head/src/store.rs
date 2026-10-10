@@ -146,3 +146,314 @@ impl Store {
         Ok(r.rows_affected() > 0)
     }
 }
+
+// --- Connections --------------------------------------------------------------
+
+#[derive(Clone, Debug, FromRow)]
+pub struct ConnectionRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key: Option<Vec<u8>>,
+    pub default_model: Option<String>,
+    pub created_at: i64,
+}
+
+impl Store {
+    pub async fn insert_connection(&self, c: &ConnectionRow) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(&c.id)
+            .bind(&c.name)
+            .bind(&c.kind)
+            .bind(&c.base_url)
+            .bind(&c.api_key)
+            .bind(&c.default_model)
+            .bind(c.created_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn connections(&self) -> anyhow::Result<Vec<ConnectionRow>> {
+        Ok(sqlx::query_as("SELECT * FROM connections ORDER BY name").fetch_all(&self.pool).await?)
+    }
+
+    pub async fn connection(&self, id: &str) -> anyhow::Result<Option<ConnectionRow>> {
+        Ok(sqlx::query_as("SELECT * FROM connections WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn delete_connection(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("DELETE FROM connections WHERE id = ?").bind(id).execute(&self.pool).await?.rows_affected() > 0)
+    }
+}
+
+// --- Sessions and events ------------------------------------------------------
+
+#[derive(Clone, Debug, FromRow)]
+pub struct SessionRow {
+    pub id: String,
+    pub worker_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub connection_id: String,
+    pub model: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seq: i64,
+    pub archived: i64,
+}
+
+#[derive(Clone, Debug, FromRow)]
+pub struct CommandRow {
+    pub seq: i64,
+    pub id: String,
+    pub session_id: String,
+    pub worker_id: String,
+    pub data: Vec<u8>,
+    pub text: Option<String>,
+    pub created_at: i64,
+    pub state: String,
+    pub error: Option<String>,
+}
+
+/// What an event batch changed.
+pub struct Ingested {
+    pub last_seq: u64,
+    pub events: Vec<c6_proto::SessionEvent>,
+    /// Commands the worker has now applied.
+    pub done_commands: Vec<String>,
+}
+
+impl Store {
+    /// Creates a session and enqueues its commands atomically.
+    pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&s.id)
+        .bind(&s.worker_id)
+        .bind(&s.title)
+        .bind(&s.cwd)
+        .bind(&s.connection_id)
+        .bind(&s.model)
+        .bind(&s.status)
+        .bind(s.created_at)
+        .bind(s.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        for c in commands {
+            insert_command(&mut tx, c).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn session(&self, id: &str) -> anyhow::Result<Option<SessionRow>> {
+        Ok(sqlx::query_as("SELECT * FROM sessions WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn sessions(&self, limit: i64) -> anyhow::Result<Vec<SessionRow>> {
+        Ok(sqlx::query_as("SELECT * FROM sessions WHERE archived = 0 ORDER BY updated_at DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    pub async fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE sessions SET archived = ? WHERE id = ?").bind(archived as i64).bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn set_title(&self, id: &str, title: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE sessions SET title = ? WHERE id = ?").bind(title).bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Last durable seq for each of `ids` that belongs to `worker_id`.
+    pub async fn session_positions(&self, worker_id: WorkerId, ids: &[String]) -> anyhow::Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(row) = sqlx::query("SELECT last_seq FROM sessions WHERE id = ? AND worker_id = ?")
+                .bind(id)
+                .bind(worker_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+            {
+                out.push((id.clone(), row.get::<i64, _>("last_seq") as u64));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stores the next contiguous events of a worker's session; duplicates
+    /// are skipped and a gap stops the batch (the worker resends from the
+    /// ack). Returns `None` if the session is unknown or not this worker's.
+    pub async fn ingest(
+        &self,
+        worker_id: WorkerId,
+        session_id: &str,
+        events: &[c6_proto::SessionEvent],
+    ) -> anyhow::Result<Option<Ingested>> {
+        use c6_proto::session_event::Kind;
+        use prost::Message;
+
+        let mut tx = self.pool.begin().await?;
+        let Some(row) = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ? AND worker_id = ?")
+            .bind(session_id)
+            .bind(worker_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut last = row.get::<i64, _>("last_seq") as u64;
+        let mut status: String = row.get("status");
+        let mut stored = Vec::new();
+        let mut done = Vec::new();
+        for ev in events {
+            if ev.seq <= last {
+                continue;
+            }
+            if ev.seq != last + 1 {
+                break;
+            }
+            sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, ?, ?, ?)")
+                .bind(session_id)
+                .bind(ev.seq as i64)
+                .bind(ev.ts_ms)
+                .bind(ev.encode_to_vec())
+                .execute(&mut *tx)
+                .await?;
+            last = ev.seq;
+            match &ev.kind {
+                Some(Kind::Started(s)) => {
+                    status = "idle".into();
+                    done.push(s.command_id.clone());
+                }
+                Some(Kind::User(u)) => done.push(u.command_id.clone()),
+                Some(Kind::TurnStarted(_)) => status = "running".into(),
+                Some(Kind::TurnEnded(_)) => status = "idle".into(),
+                _ => {}
+            }
+            stored.push(ev.clone());
+        }
+        if !stored.is_empty() {
+            sqlx::query("UPDATE sessions SET last_seq = ?, status = ?, updated_at = ? WHERE id = ?")
+                .bind(last as i64)
+                .bind(&status)
+                .bind(c6_core::now_ms())
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+            for id in &done {
+                sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(id).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(Some(Ingested { last_seq: last, events: stored, done_commands: done }))
+    }
+
+    pub async fn events_after(&self, session_id: &str, after: u64, limit: i64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
+        use prost::Message;
+        let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
+            .bind(session_id)
+            .bind(after as i64)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|r| Ok(c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?)).collect()
+    }
+}
+
+// --- Commands -----------------------------------------------------------------
+
+pub struct NewCommand<'a> {
+    pub id: &'a str,
+    pub session_id: &'a str,
+    pub worker_id: WorkerId,
+    pub data: Vec<u8>,
+    pub text: Option<&'a str>,
+}
+
+async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(c.id)
+        .bind(c.session_id)
+        .bind(c.worker_id.to_string())
+        .bind(&c.data)
+        .bind(c.text)
+        .bind(c6_core::now_ms())
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+impl Store {
+    pub async fn enqueue_command(&self, c: &NewCommand<'_>) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        insert_command(&mut conn, c).await
+    }
+
+    /// Pending commands for a worker after `after_seq`, in delivery order.
+    pub async fn pending_commands(&self, worker_id: WorkerId, after_seq: i64) -> anyhow::Result<Vec<CommandRow>> {
+        Ok(sqlx::query_as("SELECT * FROM commands WHERE worker_id = ? AND state = 'pending' AND seq > ? ORDER BY seq LIMIT 500")
+            .bind(worker_id.to_string())
+            .bind(after_seq)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// Inputs not yet applied (or rejected) for a session, oldest first.
+    pub async fn queued_inputs(&self, session_id: &str) -> anyhow::Result<Vec<CommandRow>> {
+        Ok(sqlx::query_as("SELECT * FROM commands WHERE session_id = ? AND state != 'done' AND text IS NOT NULL ORDER BY seq")
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// Marks a pending command rejected. A rejected `Create` fails the
+    /// session and everything queued behind it. Returns the session id.
+    pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(row) =
+            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, text")
+                .bind(reason)
+                .bind(id)
+                .bind(worker_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let session_id: String = row.get("session_id");
+        if row.get::<Option<String>, _>("text").is_none() {
+            sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+                .bind(reason)
+                .bind(c6_core::now_ms())
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE commands SET state = 'rejected', error = 'session failed to start' WHERE session_id = ? AND state = 'pending'",
+            )
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(session_id))
+    }
+
+    /// Clears rejected inputs from a session's queue (the user dismissed them).
+    pub async fn dismiss_rejected(&self, session_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE commands SET state = 'done' WHERE session_id = ? AND state = 'rejected'")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}

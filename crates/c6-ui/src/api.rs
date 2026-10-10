@@ -2,24 +2,32 @@
 
 use std::time::Duration;
 
-use c6_api::{CreateEnrollment, Enrollment, LiveEvent, Worker};
+use c6_api::{
+    Connection, CreateConnection, CreateEnrollment, CreateSession, Enrollment, LiveEvent, QueuedInput, SendMessage, Session, SessionDetail,
+    StreamMsg, Worker,
+};
 use futures::StreamExt;
-use gloo_net::http::{Request, Response};
+use futures::future::{AbortHandle, abortable};
+use gloo_net::http::{Request, RequestBuilder, Response};
 use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-/// Fleet state kept current over `WS /api/v1/live`, reconnecting forever.
+/// Fleet and session lists kept current over `WS /api/v1/live`.
 #[derive(Clone, Copy)]
 pub struct LiveFeed {
     pub workers: ReadSignal<Vec<Worker>>,
+    pub sessions: ReadSignal<Vec<Session>>,
     pub connected: ReadSignal<bool>,
 }
 
 impl LiveFeed {
     pub fn connect() -> Self {
         let (workers, set_workers) = signal(Vec::new());
+        let (sessions, set_sessions) = signal(Vec::new());
         let (connected, set_connected) = signal(false);
         spawn_local(async move {
             let mut backoff = 500;
@@ -29,10 +37,13 @@ impl LiveFeed {
                     while let Some(Ok(msg)) = rx.next().await {
                         let Message::Text(text) = msg else { continue };
                         match serde_json::from_str::<LiveEvent>(&text) {
-                            Ok(LiveEvent::Workers { workers }) => {
+                            Ok(ev) => {
                                 set_connected.set(true);
                                 backoff = 500;
-                                set_workers.set(workers);
+                                match ev {
+                                    LiveEvent::Workers { workers } => set_workers.set(workers),
+                                    LiveEvent::Sessions { sessions } => set_sessions.set(sessions),
+                                }
                             }
                             Err(e) => leptos::logging::warn!("bad live event: {e}"),
                         }
@@ -43,8 +54,46 @@ impl LiveFeed {
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, connected }
+        Self { workers, sessions, connected }
     }
+
+    pub fn worker_name(&self, id: &str) -> String {
+        self.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id).map(|w| w.name.clone()).unwrap_or_else(|| "unknown".into()))
+    }
+}
+
+pub fn live() -> LiveFeed {
+    expect_context::<LiveFeed>()
+}
+
+/// Streams a session's events and live deltas, resuming from the last seen
+/// seq after reconnects. Returns a handle that stops it.
+pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, last_seq: impl Fn() -> u64 + 'static) -> AbortHandle {
+    let (fut, handle) = abortable(async move {
+        let mut backoff = 500;
+        loop {
+            let url = ws_url(&format!("/api/v1/sessions/{session_id}/stream?after={}", last_seq()));
+            if let Ok(ws) = WebSocket::open(&url) {
+                let (_tx, mut rx) = ws.split();
+                while let Some(Ok(msg)) = rx.next().await {
+                    let Message::Text(text) = msg else { continue };
+                    match serde_json::from_str::<StreamMsg>(&text) {
+                        Ok(m) => {
+                            backoff = 500;
+                            on_msg(m);
+                        }
+                        Err(e) => leptos::logging::warn!("bad stream message: {e}"),
+                    }
+                }
+            }
+            gloo_timers::future::sleep(Duration::from_millis(backoff)).await;
+            backoff = (backoff * 2).min(10_000);
+        }
+    });
+    spawn_local(async move {
+        let _ = fut.await;
+    });
+    handle
 }
 
 fn ws_url(path: &str) -> String {
@@ -62,15 +111,70 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, Stri
     Err(msg)
 }
 
+async fn json<T: DeserializeOwned>(req: Result<Response, gloo_net::Error>) -> Result<T, String> {
+    check(req).await?.json().await.map_err(|e| e.to_string())
+}
+
+async fn send_json<T: DeserializeOwned>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
+    json(req.json(body).map_err(|e| e.to_string())?.send().await).await
+}
+
+async fn empty(req: Result<Response, gloo_net::Error>) -> Result<(), String> {
+    check(req).await.map(drop)
+}
+
 pub async fn create_enrollment(name: Option<String>) -> Result<Enrollment, String> {
-    let req = Request::post("/api/v1/workers/enrollments").json(&CreateEnrollment { name }).map_err(|e| e.to_string())?;
-    check(req.send().await).await?.json().await.map_err(|e| e.to_string())
+    send_json(Request::post("/api/v1/workers/enrollments"), &CreateEnrollment { name }).await
 }
 
 pub async fn revoke_worker(id: String) -> Result<(), String> {
-    check(Request::post(&format!("/api/v1/workers/{id}/revoke")).send().await).await.map(drop)
+    empty(Request::post(&format!("/api/v1/workers/{id}/revoke")).send().await).await
 }
 
 pub async fn delete_worker(id: String) -> Result<(), String> {
-    check(Request::delete(&format!("/api/v1/workers/{id}")).send().await).await.map(drop)
+    empty(Request::delete(&format!("/api/v1/workers/{id}")).send().await).await
+}
+
+pub async fn connections() -> Result<Vec<Connection>, String> {
+    json(Request::get("/api/v1/connections").send().await).await
+}
+
+pub async fn create_connection(req: CreateConnection) -> Result<Connection, String> {
+    send_json(Request::post("/api/v1/connections"), &req).await
+}
+
+pub async fn delete_connection(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/connections/{id}")).send().await).await
+}
+
+pub async fn models(connection_id: String) -> Result<Vec<String>, String> {
+    json(Request::get(&format!("/api/v1/connections/{connection_id}/models")).send().await).await
+}
+
+pub async fn create_session(req: CreateSession) -> Result<Session, String> {
+    send_json(Request::post("/api/v1/sessions"), &req).await
+}
+
+pub async fn session(id: String) -> Result<SessionDetail, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}")).send().await).await
+}
+
+pub async fn send_message(id: String, text: String) -> Result<QueuedInput, String> {
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text }).await
+}
+
+pub async fn interrupt(id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/interrupt")).send().await).await
+}
+
+pub async fn archive(id: String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Body {
+        archived: bool,
+    }
+    empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { archived: true }).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn dismiss_rejected(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/rejected")).send().await).await
 }

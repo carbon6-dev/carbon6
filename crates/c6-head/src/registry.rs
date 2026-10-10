@@ -1,12 +1,15 @@
 //! Live worker connections.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use c6_core::WorkerId;
-use tokio::sync::watch;
+use c6_proto::{HeadMsg, SessionCommand, head_msg};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
+
+pub type HeadTx = mpsc::Sender<Result<HeadMsg, tonic::Status>>;
 
 #[derive(Clone, Debug)]
 pub struct LiveWorker {
@@ -15,6 +18,10 @@ pub struct LiveWorker {
     pub last_seen: i64,
     pub rtt_us: Option<u32>,
     cancel: CancellationToken,
+    tx: HeadTx,
+    /// Wakes the connection task to send newly queued commands. All durable
+    /// command delivery goes through that one task, which keeps it in order.
+    deliver: Arc<Notify>,
 }
 
 pub struct Registry {
@@ -33,6 +40,7 @@ pub struct ConnGuard<'a> {
     pub worker_id: WorkerId,
     pub conn_id: u64,
     pub cancel: CancellationToken,
+    pub deliver: Arc<Notify>,
 }
 
 impl Drop for ConnGuard<'_> {
@@ -57,15 +65,37 @@ impl Registry {
 
     /// Registers a connection. A previous connection for the same worker is
     /// cancelled: the newest one wins.
-    pub fn attach(&self, worker_id: WorkerId, now: i64) -> ConnGuard<'_> {
+    pub fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx) -> ConnGuard<'_> {
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let cancel = self.shutdown.child_token();
-        let live = LiveWorker { conn_id, connected_since: now, last_seen: now, rtt_us: None, cancel: cancel.clone() };
+        let deliver = Arc::new(Notify::new());
+        let live = LiveWorker {
+            conn_id,
+            connected_since: now,
+            last_seen: now,
+            rtt_us: None,
+            cancel: cancel.clone(),
+            tx,
+            deliver: deliver.clone(),
+        };
         if let Some(old) = self.conns.lock().unwrap().insert(worker_id, live) {
             old.cancel.cancel();
         }
         self.bump();
-        ConnGuard { registry: self, worker_id, conn_id, cancel }
+        ConnGuard { registry: self, worker_id, conn_id, cancel, deliver }
+    }
+
+    /// Asks the worker's connection (if any) to deliver pending commands.
+    pub fn deliver(&self, worker_id: WorkerId) {
+        if let Some(c) = self.conns.lock().unwrap().get(&worker_id) {
+            c.deliver.notify_one();
+        }
+    }
+
+    /// Sends a non-durable command now; false if the worker is not connected.
+    pub fn send_command(&self, worker_id: WorkerId, cmd: SessionCommand) -> bool {
+        let tx = self.conns.lock().unwrap().get(&worker_id).map(|c| c.tx.clone());
+        tx.is_some_and(|tx| tx.try_send(Ok(HeadMsg { msg: Some(head_msg::Msg::Command(cmd)) })).is_ok())
     }
 
     pub fn heartbeat(&self, worker_id: WorkerId, conn_id: u64, now: i64, rtt_us: Option<u32>) {
@@ -108,8 +138,9 @@ mod tests {
     fn newer_connection_wins() {
         let reg = Registry::new(CancellationToken::new());
         let id = WorkerId::new();
-        let first = reg.attach(id, 1);
-        let second = reg.attach(id, 2);
+        let tx = mpsc::channel(1).0;
+        let first = reg.attach(id, 1, tx.clone());
+        let second = reg.attach(id, 2, tx);
         assert!(first.cancel.is_cancelled());
         drop(first); // must not unregister the newer connection
         assert_eq!(reg.get(id).unwrap().conn_id, second.conn_id);

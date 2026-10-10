@@ -1,9 +1,14 @@
-//! The worker's connection to the head: attach, heartbeat, reconnect.
+//! The worker's connection to the head: attach, heartbeat, event upload,
+//! command delivery, reconnect.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use c6_proto::{HeadMsg, Hello, Ping, WorkerMsg, head_msg, worker_hub_client::WorkerHubClient, worker_msg};
+use c6_proto::{
+    CommandRejected, HeadMsg, Hello, Ping, SessionCursor, SessionEventBatch, WorkerMsg, head_msg, worker_hub_client::WorkerHubClient,
+    worker_msg,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -11,7 +16,8 @@ use tonic::Code;
 use tonic::transport::Endpoint;
 use tracing::{info, warn};
 
-use crate::identity::Identity;
+use crate::Worker;
+use crate::journal::Journal;
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// No message from the head for this long means the connection is dead.
@@ -20,6 +26,8 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A connection that lasted this long resets the backoff.
 const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// Events per upload message.
+const UPLOAD_BATCH: u32 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnState {
@@ -40,12 +48,14 @@ enum Ended {
 
 /// Keeps the worker attached to the head until `shutdown` or a fatal
 /// rejection.
-pub async fn run(identity: Identity, state: watch::Sender<ConnState>, shutdown: CancellationToken) -> anyhow::Result<()> {
+pub async fn run(worker: Arc<Worker>, state: watch::Sender<ConnState>, shutdown: CancellationToken) -> anyhow::Result<()> {
     let mut backoff = MIN_BACKOFF;
     loop {
         state.send_replace(ConnState::Connecting);
         let started = Instant::now();
-        let err = match attach_once(&identity, &state, &shutdown).await {
+        let ended = attach_once(&worker, &state, &shutdown).await;
+        worker.link.disconnected();
+        let err = match ended {
             Ended::Shutdown => return Ok(()),
             Ended::Fatal(e) => {
                 state.send_replace(ConnState::Disconnected { reason: format!("{e:#}") });
@@ -67,7 +77,8 @@ pub async fn run(identity: Identity, state: watch::Sender<ConnState>, shutdown: 
     }
 }
 
-async fn attach_once(identity: &Identity, state: &watch::Sender<ConnState>, shutdown: &CancellationToken) -> Ended {
+async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shutdown: &CancellationToken) -> Ended {
+    let identity = &worker.identity;
     let endpoint = match Endpoint::from_shared(identity.meta.head_url.clone()).and_then(|e| e.tls_config(identity.tls_config())) {
         Ok(e) => e
             .connect_timeout(Duration::from_secs(10))
@@ -92,6 +103,10 @@ async fn attach_once(identity: &Identity, state: &watch::Sender<ConnState>, shut
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
         capabilities: Vec::new(),
+        sessions: match worker.journal.unacked().await {
+            Ok(cursors) => cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq }).collect(),
+            Err(e) => return Ended::Retry(e.context("reading journal")),
+        },
     };
     tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Hello(hello)) }).await.ok();
 
@@ -103,12 +118,23 @@ async fn attach_once(identity: &Identity, state: &watch::Sender<ConnState>, shut
     match tokio::time::timeout(READ_TIMEOUT, inbound.message()).await {
         Ok(Ok(Some(HeadMsg { msg: Some(head_msg::Msg::Welcome(w)) }))) => {
             info!(worker = %w.worker_id, name = %w.worker_name, head = %w.head_version, "attached to head");
+            for ack in &w.acks {
+                if let Err(e) = worker.journal.set_acked(&ack.session_id, ack.seq).await {
+                    return Ended::Retry(e.context("recording acks"));
+                }
+            }
             state.send_replace(ConnState::Attached { worker_name: w.worker_name, head_version: w.head_version });
         }
         Ok(Err(s)) => return classify(s),
         Err(_) => return Ended::Retry(anyhow::anyhow!("timed out waiting for Welcome")),
         _ => return Ended::Retry(anyhow::anyhow!("expected Welcome from head")),
     }
+
+    worker.link.connected(tx.clone());
+    let uploads = CancellationToken::new();
+    let _stop_uploads = uploads.clone().drop_guard();
+    // A separate task so a slow uplink never stops us reading acks and commands.
+    tokio::spawn(upload(worker.journal.clone(), tx.clone(), uploads));
 
     let mut pings = tokio::time::interval(PING_INTERVAL);
     let mut nonce = 0u64;
@@ -125,7 +151,9 @@ async fn attach_once(identity: &Identity, state: &watch::Sender<ConnState>, shut
                 in_flight.insert(nonce, Instant::now());
                 // Bound the map if pongs go missing.
                 in_flight.retain(|n, _| nonce - n < 16);
-                if tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Ping(Ping { nonce, last_rtt_us })) }).await.is_err() {
+                // Never block the read loop on a ping; the read deadline
+                // catches a dead connection.
+                if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(WorkerMsg { msg: Some(worker_msg::Msg::Ping(Ping { nonce, last_rtt_us })) }) {
                     return Ended::Retry(anyhow::anyhow!("outbound stream closed"));
                 }
             }
@@ -139,12 +167,72 @@ async fn attach_once(identity: &Identity, state: &watch::Sender<ConnState>, shut
                             }
                         }
                         head_msg::Msg::Welcome(_) => warn!("unexpected second Welcome"),
+                        head_msg::Msg::Ack(a) => {
+                            if let Err(e) = worker.journal.set_acked(&a.session_id, a.seq).await {
+                                warn!("recording ack: {e:#}");
+                            }
+                        }
+                        head_msg::Msg::Command(cmd) => {
+                            let (command_id, session_id) = (cmd.command_id.clone(), cmd.session_id.clone());
+                            if let Err(reason) = worker.sessions.handle(cmd).await {
+                                warn!(session = %session_id, %reason, "command rejected");
+                                let rejected = CommandRejected { command_id, session_id, reason };
+                                if tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) }).await.is_err() {
+                                    return Ended::Retry(anyhow::anyhow!("outbound stream closed"));
+                                }
+                            }
+                        }
+                        head_msg::Msg::Credential(grant) => worker.link.on_grant(grant),
                     }
                 }
                 Ok(Some(HeadMsg { msg: None })) => deadline = Instant::now() + READ_TIMEOUT, // newer head
                 Ok(None) => return Ended::Retry(anyhow::anyhow!("head closed the connection")),
                 Err(s) => return classify(s),
             },
+        }
+    }
+}
+
+/// Streams journaled events the head has not acknowledged, in seq order per
+/// session, starting from the head's acked position.
+async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: CancellationToken) {
+    let mut sent: HashMap<String, u64> = HashMap::new();
+    loop {
+        let mut progressed = false;
+        let cursors = match journal.unacked().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reading journal: {e:#}");
+                Vec::new()
+            }
+        };
+        for c in cursors {
+            let from = sent.get(&c.session_id).copied().unwrap_or(0).max(c.acked_seq);
+            if c.last_seq <= from {
+                continue;
+            }
+            let events = match journal.events_after(&c.session_id, from, UPLOAD_BATCH).await {
+                Ok(e) if !e.is_empty() => e,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("reading journal: {e:#}");
+                    continue;
+                }
+            };
+            let last = events.last().map(|e| e.seq).unwrap_or(from);
+            let batch = SessionEventBatch { session_id: c.session_id.clone(), events };
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                r = tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Events(batch)) }) => if r.is_err() { return },
+            }
+            sent.insert(c.session_id, last);
+            progressed = true;
+        }
+        if !progressed {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = journal.appended.notified() => {}
+            }
         }
     }
 }
