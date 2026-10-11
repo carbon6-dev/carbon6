@@ -42,6 +42,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/secrets", get(list_secrets))
         .route("/api/v1/settings/templates", get(get_templates).put(put_templates))
         .route("/api/v1/templates/{name}/run", post(run_template))
+        .route("/api/v1/automations", get(list_automations).post(create_automation))
+        .route("/api/v1/automations/{id}", axum::routing::patch(update_automation).delete(delete_automation))
+        .route("/api/v1/automations/{id}/run", post(run_automation))
+        .route("/api/v1/automations/{id}/rotate", post(rotate_automation))
+        .route("/api/v1/webhooks/{id}/{token}", post(call_webhook))
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
@@ -711,6 +716,51 @@ async fn put_templates(State(st): State<Arc<HeadState>>, Json(templates): Json<V
     crate::templates::check(&templates)?;
     st.store.set_setting(crate::templates::TEMPLATES, &serde_json::to_string(&templates).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_automations(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Automation>>> {
+    Ok(Json(crate::automations::list(&st).await?))
+}
+
+async fn create_automation(State(st): State<Arc<HeadState>>, Json(e): Json<api::AutomationEdit>) -> ApiResult<Json<api::Automation>> {
+    Ok(Json(crate::automations::create(&st, e).await?))
+}
+
+async fn update_automation(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(e): Json<api::AutomationEdit>,
+) -> ApiResult<Json<api::Automation>> {
+    Ok(Json(crate::automations::update(&st, &id, e).await?))
+}
+
+async fn delete_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::automations::delete(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::TemplateRun>> {
+    Ok(Json(crate::automations::run_now(&st, &id).await?))
+}
+
+async fn rotate_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::Automation>> {
+    Ok(Json(crate::automations::rotate(&st, &id).await?))
+}
+
+/// A webhook call from outside (no sign-in: the token in the URL is the
+/// credential). 404 for a wrong token, so URLs cannot be probed.
+async fn call_webhook(
+    State(st): State<Arc<HeadState>>,
+    Path((id, token)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> ApiResult<(StatusCode, Json<api::TemplateRun>)> {
+    if body.len() > crate::automations::MAX_WEBHOOK_BODY {
+        return Err(ApiErr(StatusCode::PAYLOAD_TOO_LARGE, "the body is too large".into()));
+    }
+    match crate::automations::webhook(&st, &id, &token, &body).await? {
+        Some(run) => Ok((StatusCode::ACCEPTED, Json(run))),
+        None => Err(ApiErr(StatusCode::NOT_FOUND, "not found".into())),
+    }
 }
 
 async fn run_template(

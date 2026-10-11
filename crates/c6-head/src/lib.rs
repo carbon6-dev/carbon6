@@ -2,8 +2,10 @@
 
 pub mod api;
 pub mod auth;
+pub mod automations;
 pub mod config;
 mod convert;
+mod cron;
 mod export;
 pub mod guard;
 pub mod hub;
@@ -171,6 +173,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     });
 
     let mut tasks = JoinSet::new();
+
+    // Scheduled automations.
+    automations::spawn_scheduler(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

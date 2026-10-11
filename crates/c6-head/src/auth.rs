@@ -331,7 +331,8 @@ const PUBLIC: [&str; 6] = [
 
 pub async fn require(State(st): State<Arc<HeadState>>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if !st.auth.required || !path.starts_with("/api/") || PUBLIC.contains(&path) {
+    // Webhooks carry their own credential (the token in the URL).
+    if !st.auth.required || !path.starts_with("/api/") || PUBLIC.contains(&path) || path.starts_with("/api/v1/webhooks/") {
         return next.run(req).await;
     }
     if let Some(token) = bearer_token(req.headers()) {

@@ -437,3 +437,27 @@ pub async fn templates() -> Result<Vec<c6_api::Template>, String> {
 pub async fn run_template(name: String, input: String) -> Result<c6_api::TemplateRun, String> {
     send_json(Request::post(&format!("/api/v1/templates/{name}/run")), &c6_api::RunTemplate { input }).await
 }
+
+pub async fn automations() -> Result<Vec<c6_api::Automation>, String> {
+    json(Request::get("/api/v1/automations").send().await).await
+}
+
+pub async fn create_automation(e: c6_api::AutomationEdit) -> Result<c6_api::Automation, String> {
+    send_json(Request::post("/api/v1/automations"), &e).await
+}
+
+pub async fn update_automation(id: String, e: c6_api::AutomationEdit) -> Result<c6_api::Automation, String> {
+    send_json(Request::patch(&format!("/api/v1/automations/{id}")), &e).await
+}
+
+pub async fn delete_automation(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/automations/{id}")).send().await).await
+}
+
+pub async fn run_automation(id: String) -> Result<c6_api::TemplateRun, String> {
+    json(Request::post(&format!("/api/v1/automations/{id}/run")).send().await).await
+}
+
+pub async fn rotate_automation(id: String) -> Result<c6_api::Automation, String> {
+    json(Request::post(&format!("/api/v1/automations/{id}/rotate")).send().await).await
+}

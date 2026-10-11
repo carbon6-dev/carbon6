@@ -720,6 +720,55 @@ pub struct TemplateRun {
     pub errors: Vec<String>,
 }
 
+/// An automation: starts a template on a schedule or from a webhook.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Automation {
+    pub id: String,
+    pub name: String,
+    pub template: String,
+    /// "schedule" or "webhook".
+    pub trigger: String,
+    /// Schedules: five cron fields in the head's local time, or @daily etc.
+    #[serde(default)]
+    pub cron: String,
+    /// Schedules: the template's {{input}}.
+    #[serde(default)]
+    pub input: String,
+    pub enabled: bool,
+    pub created_at: UnixMs,
+    #[serde(default)]
+    pub last_run_at: Option<UnixMs>,
+    /// Its sessions carry the label run:<last_run_id>.
+    #[serde(default)]
+    pub last_run_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Schedules: when it runs next.
+    #[serde(default)]
+    pub next_run_at: Option<UnixMs>,
+    /// Webhooks: the URL to call, only in the response that creates the
+    /// automation or a new token (it holds the token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+/// `POST /api/v1/automations` (create) and `PATCH /api/v1/automations/{id}`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AutomationEdit {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
 /// The commands built into carbon6: (name, description, argument hint).
 /// `compact`, `init` and `review` run on the worker; `clear` and `export`
 /// in the UI.

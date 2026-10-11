@@ -126,6 +126,17 @@ A template (**Settings → Templates**) is a saved way to start a session:
 
 Settings has examples: a health check across hosts, updating every worker, a research digest.
 
+### Automations: schedules and webhooks
+
+An automation (**Settings → Automations**) starts a template:
+
+- **On a schedule:** cron fields in the head's local time, with presets like "weekdays at 9:00" and `@daily`. Each automation shows its next run.
+- **When its webhook is called:** `POST` any body to the URL you're shown once. JSON is passed to the template's `{{input}}` pretty-printed. Point CI, an alert manager or a form at it.
+
+**Webhook URLs:** the URL is the webhook's only credential, so treat it like a password. **New URL** replaces it, and a wrong or switched-off URL answers 404.
+
+**Runs:** each run is labelled `automation:<name>` and `run:<id>` and lands in your inbox when it finishes. Every automation shows its last run, any error, and **Run now**. Times missed while the head was down are skipped, not made up.
+
 ### Outputs: decks, reports and other deliverables
 
 When the agent finishes a deliverable (a slide deck, a report, a chart, a document), it publishes it with the `publish_file` tool, and it appears in the session's **Outputs** tab:

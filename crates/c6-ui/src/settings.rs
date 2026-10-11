@@ -87,6 +87,7 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 fields=TEMPLATE_FIELDS
                 examples=template_examples
             />
+            <AutomationsSetting />
             <HooksSetting />
             <SecretsSetting />
             <WebSearchSetting />
@@ -1173,6 +1174,197 @@ fn WebSearchSetting() -> impl IntoView {
                     Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
                 })}
                 <button class=BUTTON on:click=save>"Save"</button>
+            </div>
+        </section>
+    }
+}
+
+const SCHEDULE_PRESETS: &[(&str, &str)] = &[
+    ("Every hour", "0 * * * *"),
+    ("Every day at 8:00", "0 8 * * *"),
+    ("Weekdays at 9:00", "0 9 * * mon-fri"),
+    ("Mondays at 7:30", "30 7 * * mon"),
+    ("Every 15 minutes", "*/15 * * * *"),
+];
+
+fn when(ms: i64) -> String {
+    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
+    let s: String = d.to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED).into();
+    s
+}
+
+/// Settings: automations, which start templates on a schedule or from a
+/// webhook.
+#[component]
+fn AutomationsSetting() -> impl IntoView {
+    let list = LocalResource::new(api::automations);
+    let templates = LocalResource::new(api::templates);
+    let filter = crate::labels::use_filter().0;
+    let ws = crate::workspace::use_workspace();
+    let (name, template, trigger, cron, input) = (
+        RwSignal::new(String::new()),
+        RwSignal::new(String::new()),
+        RwSignal::new("schedule".to_owned()),
+        RwSignal::new(String::new()),
+        RwSignal::new(String::new()),
+    );
+    let status = RwSignal::new(None::<Result<String, String>>);
+    // A webhook's URL, shown once (after creating it or a new token).
+    let url = RwSignal::new(None::<String>);
+    let origin = StoredValue::new(window().location().origin().unwrap_or_default());
+    let show_url = move |a: &c6_api::Automation| {
+        if let Some(p) = &a.webhook_url {
+            url.set(Some(format!("{}{p}", origin.get_value())));
+        }
+    };
+    let create = move |_| {
+        let e = c6_api::AutomationEdit {
+            name: Some(name.get_untracked()),
+            template: Some(template.get_untracked()),
+            trigger: Some(trigger.get_untracked()),
+            cron: Some(cron.get_untracked()),
+            input: Some(input.get_untracked()),
+            enabled: Some(true),
+        };
+        spawn_local(async move {
+            match api::create_automation(e).await {
+                Ok(a) => {
+                    show_url(&a);
+                    status.set(Some(Ok(format!("Added {}.", a.name))));
+                    name.set(String::new());
+                    input.set(String::new());
+                    list.refetch();
+                }
+                Err(e) => status.set(Some(Err(e))),
+            }
+        });
+    };
+    let open_run = move |run: String| {
+        filter.set(vec![format!("run:{run}")]);
+        ws.open(None, crate::workspace::View::Mission, crate::workspace::How::Beside);
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Automations"</h2>
+                <p class="text-sm text-zinc-500">
+                    "Start a template on a schedule (the head's local time) or when a webhook is called (the request body becomes the template's {{input}}; the URL is its only credential, so keep it private). Runs are labelled automation:<name> and land in your inbox when they finish."
+                </p>
+            </div>
+            {move || url.get().map(|u| view! {
+                <div class="space-y-1 rounded-md bg-amber-50 p-3 text-sm dark:bg-amber-950">
+                    <p class="font-medium">"The webhook's URL (shown once; make a new one if it leaks):"</p>
+                    <div class="select-all break-all font-mono text-xs">{u.clone()}</div>
+                    <div class="select-all break-all font-mono text-xs text-zinc-500">{format!("curl -X POST --data '{{\"alert\":\"…\"}}' {u}")}</div>
+                </div>
+            })}
+            <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                {move || list.get().map(|r| match r {
+                    Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No automations."</p> }.into_any(),
+                    Ok(v) => v.into_iter().map(|a| {
+                        let (id1, id2, id3, id4) = (a.id.clone(), a.id.clone(), a.id.clone(), a.id.clone());
+                        let enabled = a.enabled;
+                        let what = if a.trigger == "schedule" {
+                            format!("{} · {}", a.cron, a.next_run_at.map(|t| format!("next {}", when(t))).unwrap_or_else(|| "off".into()))
+                        } else {
+                            "webhook".to_owned()
+                        };
+                        let last = a.last_run_id.clone();
+                        view! {
+                            <div class=format!("space-y-1 py-2 text-sm {}", if enabled { "" } else { "opacity-60" })>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <input type="checkbox" title="On" prop:checked=enabled on:change=move |ev| {
+                                        let (id, on) = (id1.clone(), event_target_checked(&ev));
+                                        spawn_local(async move {
+                                            let _ = api::update_automation(id, c6_api::AutomationEdit { enabled: Some(on), ..Default::default() }).await;
+                                            list.refetch();
+                                        });
+                                    } />
+                                    <span class="font-medium">{a.name.clone()}</span>
+                                    <span class="font-mono text-xs text-zinc-500">{format!("→ {} · {what}", a.template)}</span>
+                                    <span class="flex-1"></span>
+                                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                        let id = id2.clone();
+                                        spawn_local(async move {
+                                            match api::run_automation(id).await {
+                                                Ok(r) => { list.refetch(); open_run(r.run_id); }
+                                                Err(e) => status.set(Some(Err(e))),
+                                            }
+                                        });
+                                    }>"Run now"</button>
+                                    {(a.trigger == "webhook").then(|| view! {
+                                        <button class=format!("{BUTTON_QUIET} text-xs") title="A new URL; the old one stops working" on:click=move |_| {
+                                            let id = id3.clone();
+                                            spawn_local(async move {
+                                                match api::rotate_automation(id).await {
+                                                    Ok(a) => show_url(&a),
+                                                    Err(e) => status.set(Some(Err(e))),
+                                                }
+                                            });
+                                        }>"New URL"</button>
+                                    })}
+                                    <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                        let id = id4.clone();
+                                        spawn_local(async move {
+                                            let _ = api::delete_automation(id).await;
+                                            list.refetch();
+                                        });
+                                    }>"Delete"</button>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2 pl-6 text-xs text-zinc-500">
+                                    {a.last_run_at.map(|t| format!("last ran {}", when(t)))}
+                                    {last.map(|run| {
+                                        let r = run.clone();
+                                        view! { <button class="underline" on:click=move |_| open_run(r.clone())>{format!("see run:{run}")}</button> }
+                                    })}
+                                    {a.last_error.clone().map(|e| view! { <span class="text-red-600">{e}</span> })}
+                                </div>
+                            </div>
+                        }
+                    }).collect_view().into_any(),
+                })}
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. Morning health check" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Template"</span>
+                    <select class=format!("{INPUT} py-1 text-sm") prop:value=move || template.get() on:change=move |ev| template.set(event_target_value(&ev))>
+                        <option value="">"Choose…"</option>
+                        {move || templates.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <option value=t.name.clone()>{t.name.clone()}</option> }).collect_view()}
+                    </select>
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Trigger"</span>
+                    <select class=format!("{INPUT} py-1 text-sm") prop:value=move || trigger.get() on:change=move |ev| trigger.set(event_target_value(&ev))>
+                        <option value="schedule">"On a schedule"</option>
+                        <option value="webhook">"When a webhook is called"</option>
+                    </select>
+                </label>
+                <label class="space-y-0.5" class:hidden=move || trigger.get() != "schedule">
+                    <span class="text-xs text-zinc-500">"Schedule (cron: minute hour day month weekday)"</span>
+                    <div class="flex gap-1">
+                        <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="0 8 * * mon-fri" prop:value=move || cron.get() on:input=move |ev| cron.set(event_target_value(&ev)) />
+                        <select class=format!("{INPUT} w-auto! py-1 text-xs") on:change=move |ev| { let v = event_target_value(&ev); if !v.is_empty() { cron.set(v); } }>
+                            <option value="">"Presets…"</option>
+                            {SCHEDULE_PRESETS.iter().map(|(l, c)| view! { <option value=*c>{*l}</option> }).collect_view()}
+                        </select>
+                    </div>
+                </label>
+                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule">
+                    <span class="text-xs text-zinc-500">"Input (the template's {{input}})"</span>
+                    <input class=format!("{INPUT} py-1 text-sm") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
+                </label>
+            </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=create>"Add automation"</button>
             </div>
         </section>
     }
