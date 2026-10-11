@@ -45,9 +45,13 @@ pub fn auto_labels(worker: &str, repo: &str, folder: &str, home: &str, model: &s
     out
 }
 
-/// Whether one selector label matches a session with `labels`.
+/// Whether one selector label matches a session with `labels`. `key:`
+/// alone matches any value (`host:`: every SSH session).
 pub fn label_matches(selector: &str, labels: &[String]) -> bool {
     let selector = selector.trim();
+    if selector.len() > 1 && selector.ends_with(':') && !selector[..selector.len() - 1].contains(':') {
+        return labels.iter().any(|l| l.starts_with(selector));
+    }
     match selector.split_once(':') {
         Some((key @ ("folder" | "repo"), want)) => {
             let want = want.trim_end_matches('/');
@@ -122,6 +126,8 @@ mod tests {
     fn matching() {
         let mut labels = auto_labels("darkstar", "github.com/acme/app", "/Users/v/code/app/web", "/Users/v", "qwen3.6:27b", "");
         assert!(auto_labels("w", "", "/root", "/root", "m", "admin@web1:2222").contains(&"host:web1".to_owned()));
+        assert!(label_matches("host:", &auto_labels("w", "", "", "", "", "web1")), "any host");
+        assert!(!label_matches("host:", &auto_labels("w", "", "", "", "", "")));
         labels.push("rust".into());
         assert!(labels.contains(&"folder:~/code/app/web".to_owned()));
         let yes = |s: &[&str]| applies(&s.iter().map(|x| x.to_string()).collect::<Vec<_>>(), &labels);

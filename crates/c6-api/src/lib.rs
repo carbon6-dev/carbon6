@@ -153,7 +153,12 @@ pub struct CreateSideChat {
 pub struct CreateSession {
     pub worker_id: Uuid,
     pub cwd: String,
+    /// Empty: the matching routing rule's, or the first connection.
+    #[serde(default)]
     pub connection_id: String,
+    /// Empty: the matching routing rule's, else the connection's default
+    /// model, else the model of your latest session on that connection.
+    #[serde(default)]
     pub model: String,
     pub title: Option<String>,
     /// First message, sent right after creation.
@@ -827,6 +832,30 @@ pub struct Policy {
     /// Shown to you and to the agent.
     #[serde(default)]
     pub message: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// A routing rule (`/api/v1/settings/routes`): the connection and model for
+/// new sessions with its labels that are started without a model. The
+/// first enabled rule that matches wins.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Route {
+    pub name: String,
+    /// Labels a session must all have; empty: every session.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    /// A connection name or id; empty: the session's connection (else that
+    /// of your latest session, else the first).
+    #[serde(default)]
+    pub connection: String,
+    pub model: String,
+    /// Reasoning effort, unless the session asks for one.
+    #[serde(default)]
+    pub effort: String,
+    /// A cheaper model for subagents (Task tool); empty: the session's.
+    #[serde(default)]
+    pub subagent_model: String,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
 }

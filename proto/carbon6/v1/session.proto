@@ -387,6 +387,9 @@ message CreateSession {
   // Policies (JSON array of c6_api::Policy); the worker applies those whose
   // labels match the session's.
   string policies_json = 15;
+  // The model for subagents (Task tool) from a routing rule; empty: the
+  // session's own. A named agent's model still wins.
+  string subagent_model = 16;
 }
 
 message ModelSpec {

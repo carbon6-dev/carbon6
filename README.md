@@ -132,6 +132,15 @@ Policies (**Settings → Policies**) are rules for the agent's tool calls in ses
 - **Presets:** ask before any change on `env:prod`, never run destructive commands on prod, ask before package changes or `git push`, keep `research` sessions read-only.
 - **Scope:** policies apply to subagents' calls too. Claude Code sessions aren't covered.
 
+### Model routing
+
+Routing rules (**Settings → Model routing**) choose the connection and model for sessions started without one: from the new-session form on **Auto**, `c6 run` without `--model`, and templates or automations that leave the model empty.
+
+- **A rule:** labels it applies to (yours, or `worker:`, `folder:`, `host:`, `template:`; a bare `host:` means any SSH host), a connection (optional), a model, an effort and, optionally, a cheaper model for subagents. A named agent's own model still wins.
+- **Order:** the first enabled rule that matches wins. A session started on a given connection only takes rules for that connection (or for any).
+- **No match:** the connection of your latest session (if you didn't pick one), its default model, else the model of your latest session on it.
+- **Presets:** Opus with Haiku subagents everywhere, remote hosts on a fast model at low effort, research at high effort, a template on a local model.
+
 ### Templates and fleet runs
 
 A template (**Settings → Templates**) is a saved way to start a session:

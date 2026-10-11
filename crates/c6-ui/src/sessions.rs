@@ -124,9 +124,20 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         let w = worker.get();
         live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online))
     };
-    let connection = RwSignal::new(
-        storage_get("c6.connection").filter(|c| connections.iter().any(|x| &x.id == c)).unwrap_or_else(|| connections[0].id.clone()),
-    );
+    // Empty: "Auto", your routing rules choose the connection and model.
+    let remembered_connection = storage_get("c6.connection").filter(|c| c.is_empty() || connections.iter().any(|x| &x.id == c));
+    let connection = RwSignal::new(remembered_connection.clone().unwrap_or_else(|| connections[0].id.clone()));
+    let has_routes = RwSignal::new(false);
+    spawn_local(async move {
+        let routes = api::get_setting("routes").await.ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+        let any = routes.iter().any(|r| r["enabled"].as_bool() != Some(false));
+        has_routes.set(any);
+        // First time here with rules set up: start on Auto.
+        if any && remembered_connection.is_none() {
+            connection.set(String::new());
+        }
+    });
+    let auto = move || connection.get().is_empty();
     let model = RwSignal::new(String::new());
     let effort = RwSignal::new(storage_get("c6.effort").unwrap_or_default());
     let worktree = RwSignal::new(storage_get("c6.worktree").as_deref() == Some("1"));
@@ -137,6 +148,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
     // Effort only where the connection passes it on to the model.
+    // On Auto, the rule sets it.
     let effort_supported = move || conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).is_some_and(|c| c.supports_effort));
 
     // Pick a worker once the fleet loads: the last one used if it is online,
@@ -178,9 +190,16 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         labels.set(storage_get(&format!("c6.labels.{w}.{c}")).unwrap_or_default());
     });
     // Default model per connection; offer the provider's model list.
-    let models = LocalResource::new(move || api::models(connection.get()));
+    let models = LocalResource::new(move || {
+        let c = connection.get();
+        async move { if c.is_empty() { Ok(Vec::new()) } else { api::models(c).await } }
+    });
     Effect::new(move || {
         let c = connection.get();
+        if c.is_empty() {
+            model.set(String::new());
+            return;
+        }
         let default = conns.with_value(|cs| cs.iter().find(|x| x.id == c).and_then(|x| x.default_model.clone()));
         model.set(storage_get(&format!("c6.model.{c}")).or(default).unwrap_or_default());
     });
@@ -231,7 +250,9 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
         storage_set(&format!("c6.labels.{}.{}", req.worker_id, req.cwd), &req.labels.join(", "));
         storage_set("c6.connection", &req.connection_id);
-        storage_set(&format!("c6.model.{}", req.connection_id), &req.model);
+        if !req.connection_id.is_empty() {
+            storage_set(&format!("c6.model.{}", req.connection_id), &req.model);
+        }
         pending.set(true);
         spawn_local(async move {
             match api::create_session(req).await {
@@ -297,12 +318,18 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 <label class="block text-xs text-zinc-500">
                     "Connection"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| connection.set(event_target_value(&ev)) prop:value=move || connection.get()>
+                        {move || (has_routes.get() || auto()).then(|| view! { <option value="">"Auto (your routing rules)"</option> })}
                         {conns.get_value().into_iter().map(|c| view! { <option value=c.id.clone()>{c.name.clone()}</option> }).collect_view()}
                     </select>
                 </label>
-                <label class="block text-xs text-zinc-500">
+                {move || auto().then(|| view! {
+                    <p class="text-xs text-zinc-500">
+                        "The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."
+                    </p>
+                })}
+                <label class="block text-xs text-zinc-500" class:hidden=auto>
                     "Model"
-                    <input class=format!("mt-1 font-mono {INPUT}") list="c6-models" placeholder="model id"
+                    <input class=format!("mt-1 font-mono {INPUT}") list="c6-models" placeholder="model id (empty: routing rules, else the default)"
                         prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
                     <datalist id="c6-models">
                         {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}

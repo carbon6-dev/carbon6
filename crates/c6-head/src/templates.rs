@@ -68,17 +68,20 @@ pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String]) -> 
     if workers.is_empty() {
         return Err(bad_request(format!("template {name:?}: no worker is online")));
     }
-    let connections = st.store.connections().await?;
-    let conn = if t.connection.trim().is_empty() {
-        connections.first()
+    // Without a connection or model, routing rules choose (by the labels
+    // below, which include template:<name>).
+    let connection_id = if t.connection.trim().is_empty() {
+        String::new()
     } else {
-        connections.iter().find(|c| c.name == t.connection || c.id == t.connection)
-    }
-    .ok_or_else(|| bad_request(format!("template {name:?}: no connection {:?}", t.connection)))?;
-    let model = Some(t.model.trim().to_owned())
-        .filter(|m| !m.is_empty())
-        .or_else(|| conn.default_model.clone())
-        .ok_or_else(|| bad_request(format!("template {name:?}: choose a model (connection {} has no default)", conn.name)))?;
+        let connections = st.store.connections().await?;
+        connections
+            .iter()
+            .find(|c| c.name == t.connection || c.id == t.connection)
+            .ok_or_else(|| bad_request(format!("template {name:?}: no connection {:?}", t.connection)))?
+            .id
+            .clone()
+    };
+    let model = t.model.trim().to_owned();
 
     let run_id = uuid::Uuid::now_v7().simple().to_string()[24..].to_owned();
     let mut session_labels = t.labels.clone();
@@ -104,7 +107,7 @@ pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String]) -> 
         let req = api::CreateSession {
             worker_id: w.id,
             cwd: t.cwd.clone(),
-            connection_id: conn.id.clone(),
+            connection_id: connection_id.clone(),
             model: model.clone(),
             title: Some(if fleet { format!("{name} · {target}") } else { name.to_owned() }),
             prompt: Some(fill(&t.prompt, input, &target)),

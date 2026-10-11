@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, TurnConfig, run_turn};
 use c6_llm::{Block, Message, ModelClient, Role};
-use c6_proto::{CreateSession, SessionEvent, SessionStarted, UserMessage, session_event};
+use c6_proto::{CreateSession, ModelSpec, SessionEvent, SessionStarted, UserMessage, session_event};
 use c6_tools::{AgentDef, SessionTools, Subagents, Task, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -65,6 +65,9 @@ impl Subagents for Runner {
         let p = &self.parent;
         let tools: Vec<Arc<dyn Tool>> = self.tools.iter().filter(|t| agent.is_none_or(|a| a.allows(&t.spec().name))).cloned().collect();
         let mut cfg = TurnConfig { cache_key: child_id.clone(), ..self.cfg.clone() };
+        if !p.spec.subagent_model.trim().is_empty() {
+            cfg.model = p.spec.subagent_model.trim().to_owned();
+        }
         if let Some(a) = agent {
             // The agent's instructions are its system prompt.
             cfg.system_prompt = format!(
@@ -87,6 +90,7 @@ impl Subagents for Runner {
             parent_call_id: parent_call_id.to_owned(),
             tools: tools.iter().map(|t| t.spec().name).collect(),
             system_prompt: if agent.is_some() { cfg.system_prompt.clone() } else { p.started.system_prompt.clone() },
+            model: p.started.model.clone().map(|m| ModelSpec { model: cfg.model.clone(), ..m }),
             ..p.started.clone()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };

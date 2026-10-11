@@ -97,6 +97,14 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 fields=POLICY_FIELDS
                 examples=policy_examples
             />
+            <ListSetting
+                name="routes"
+                title="Model routing"
+                noun="rule"
+                help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent model, if set, runs the Task tool's subagents (a named agent's own model still wins)."
+                fields=ROUTE_FIELDS
+                examples=route_examples
+            />
             <AutomationsSetting />
             <HooksSetting />
             <SecretsSetting />
@@ -765,14 +773,43 @@ fn policy_examples() -> Vec<(&'static str, serde_json::Value)> {
     ]
 }
 
+const ROUTE_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. Ops on the cheap model", kind: FieldKind::Line },
+    Field {
+        key: "applies_to",
+        label: "Applies to",
+        placeholder: "every session, or labels, e.g. host:, template:triage",
+        kind: FieldKind::Labels,
+    },
+    Field { key: "connection", label: "Connection", placeholder: "the session's (or your latest)", kind: FieldKind::Line },
+    Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-5-5", kind: FieldKind::Mono },
+    Field { key: "effort", label: "Effort", placeholder: "the model's default; or low, medium, high, xhigh, max", kind: FieldKind::Mono },
+    Field { key: "subagent_model", label: "Subagent model", placeholder: "the session's; or e.g. claude-haiku-4-5", kind: FieldKind::Mono },
+];
+
+fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let r = |name: &str, labels: &[&str], model: &str, effort: &str, sub: &str| {
+        let mut v = item(&[("name", name), ("connection", ""), ("model", model), ("effort", effort), ("subagent_model", sub)]);
+        v["applies_to"] = serde_json::json!(labels);
+        v
+    };
+    vec![
+        ("Empty", r("", &[], "", "", "")),
+        ("Default: Opus, Haiku subagents", r("Default", &[], "claude-opus-5-5", "", "claude-haiku-4-5")),
+        ("Remote hosts on a fast model", r("Ops over SSH", &["host:"], "claude-sonnet-5-5", "low", "")),
+        ("Research at high effort", r("Research", &["research"], "claude-opus-5-5", "high", "claude-sonnet-5-5")),
+        ("A template on a local model", r("Triage locally", &["template:triage"], "qwen3.6:27b", "", "")),
+    ]
+}
+
 const TEMPLATE_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. disk-check", kind: FieldKind::Mono },
     Field { key: "description", label: "Description", placeholder: "what it is for", kind: FieldKind::Line },
     Field { key: "workers", label: "Workers", placeholder: "the online one; or names; * for every online worker", kind: FieldKind::Labels },
     Field { key: "ssh", label: "SSH hosts", placeholder: "none; or user@host, … (one session each)", kind: FieldKind::Labels },
     Field { key: "cwd", label: "Folder", placeholder: "scratch workspace (or home on SSH hosts)", kind: FieldKind::Mono },
-    Field { key: "connection", label: "Connection", placeholder: "the first one", kind: FieldKind::Line },
-    Field { key: "model", label: "Model", placeholder: "the connection's default", kind: FieldKind::Mono },
+    Field { key: "connection", label: "Connection", placeholder: "by routing rules", kind: FieldKind::Line },
+    Field { key: "model", label: "Model", placeholder: "by routing rules (Settings → Model routing)", kind: FieldKind::Mono },
     Field { key: "labels", label: "Labels", placeholder: "e.g. ops, daily", kind: FieldKind::Labels },
     Field { key: "prompt", label: "Prompt", placeholder: "Check {{target}} for … {{input}}", kind: FieldKind::Text },
 ];

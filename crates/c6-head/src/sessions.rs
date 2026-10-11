@@ -26,6 +26,7 @@ pub const COMMANDS: &str = "commands";
 pub const AGENTS: &str = "agents";
 pub const WEB_SEARCH: &str = "web_search";
 pub const POLICIES: &str = "policies";
+pub const ROUTES: &str = "routes";
 
 /// Per-session broadcast channels for stream subscribers.
 #[derive(Default)]
@@ -70,10 +71,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     if worker.revoked_at.is_some() {
         return Err(bad_request("worker is revoked"));
     }
-    let effort = check_effort(req.effort.clone())?;
-    if req.model.trim().is_empty() {
-        return Err(bad_request("a model is required"));
-    }
+    let mut effort = check_effort(req.effort.clone())?;
     // No folder: the worker gives the session a scratch workspace.
     if req.cwd.trim().is_empty() && req.worktree && req.ssh.is_none() {
         return Err(bad_request("a git worktree needs a folder"));
@@ -88,6 +86,16 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         }
     }
     let labels = check_labels(&req.labels)?;
+    let cwd = req.cwd.trim().to_owned();
+    let (connection_id, model, subagent_model) = {
+        let mut route_labels = labels.clone();
+        route_labels.extend(api::labels::auto_labels(&worker.name, "", if cwd.starts_with('/') { &cwd } else { "" }, "", "", &ssh));
+        let routed = route(st, &req.connection_id, &req.model, &route_labels).await?;
+        if effort.is_none() {
+            effort = check_effort(Some(routed.effort))?;
+        }
+        (routed.connection, routed.model, routed.subagent_model)
+    };
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let files = attachments(&req.attachments)?;
@@ -99,9 +107,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         id: Uuid::now_v7().to_string(),
         worker_id: worker_id.to_string(),
         title,
-        cwd: req.cwd.trim().to_owned(),
-        connection_id: req.connection_id.clone(),
-        model: req.model.trim().to_owned(),
+        cwd,
+        connection_id,
+        model,
         status: "starting".into(),
         error: None,
         effort,
@@ -119,6 +127,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         home: String::new(),
         ssh_target: ssh.clone(),
         awaiting: 0,
+        subagent_model,
     };
     let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
@@ -170,6 +179,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         home: parent.home.clone(),
         ssh_target: parent.ssh_target.clone(),
         awaiting: 0,
+        subagent_model: parent.subagent_model.clone(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -219,6 +229,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
         memories_json: crate::memory::for_sessions(st).await?,
         policies_json: st.store.setting(POLICIES).await?.unwrap_or_default(),
+        subagent_model: row.subagent_model.clone(),
         seed,
     })
 }
@@ -568,6 +579,97 @@ pub async fn decide(st: &HeadState, session_id: &str, call_id: &str, allow: bool
         kind: Some(session_command::Kind::Approve(c6_proto::Approve { call_id: call_id.to_owned(), allow })),
     };
     Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+}
+
+/// Where a new session runs: the connection, model, effort and subagent
+/// model.
+#[derive(Debug, Default)]
+struct Routed {
+    connection: String,
+    model: String,
+    effort: String,
+    subagent_model: String,
+}
+
+/// Fills in what a new session left out. A model given: as is (on the
+/// given connection, or the first). Otherwise the first enabled routing
+/// rule matching `labels` on that connection (any, if none was given);
+/// then the connection of your latest session (if none was given) and
+/// its default model, or the model of your latest session on it.
+async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String]) -> anyhow::Result<Routed> {
+    let connections = st.store.connections().await?;
+    let connection = connection.trim();
+    let model = model.trim();
+    if !connection.is_empty() && !connections.iter().any(|c| c.id == connection) {
+        return Err(bad_request("no such connection"));
+    }
+    let first = || connections.first().map(|c| c.id.clone()).ok_or_else(|| bad_request("add a connection first (Settings → Connections)"));
+    if !model.is_empty() {
+        let connection = if connection.is_empty() { first()? } else { connection.to_owned() };
+        return Ok(Routed { connection, model: model.to_owned(), ..Default::default() });
+    }
+    let routes: Vec<api::Route> = serde_json::from_str(&st.store.setting(ROUTES).await?.unwrap_or_default()).unwrap_or_default();
+    // A rule's connection, by name or id: None when it names one that is gone.
+    let rule_connection = |r: &api::Route| -> Option<String> {
+        let want = r.connection.trim();
+        if want.is_empty() {
+            return Some(String::new());
+        }
+        connections.iter().find(|c| c.id == want || c.name == want).map(|c| c.id.clone())
+    };
+    let hit = routes.into_iter().filter(|r| r.enabled && api::labels::applies(&r.applies_to, labels)).find_map(|r| {
+        let rc = rule_connection(&r)?;
+        (connection.is_empty() || rc.is_empty() || rc == connection).then_some((rc, r))
+    });
+    if let Some((rc, r)) = hit {
+        let connection = match (connection, rc.as_str()) {
+            ("", "") => match st.store.latest_model("").await? {
+                Some((latest, _)) => latest,
+                None => first()?,
+            },
+            ("", rc) => rc.to_owned(),
+            (c, _) => c.to_owned(),
+        };
+        return Ok(Routed {
+            connection,
+            model: r.model.trim().to_owned(),
+            effort: r.effort,
+            subagent_model: r.subagent_model.trim().to_owned(),
+        });
+    }
+    let connection = match (connection, st.store.latest_model("").await?) {
+        ("", Some((latest, _))) => latest,
+        ("", None) => first()?,
+        (c, _) => c.to_owned(),
+    };
+    let row = connections.iter().find(|c| c.id == connection);
+    if let Some(m) = row.and_then(|c| c.default_model.clone()).filter(|m| !m.trim().is_empty()) {
+        return Ok(Routed { connection, model: m.trim().to_owned(), ..Default::default() });
+    }
+    if let Some((_, m)) = st.store.latest_model(&connection).await? {
+        return Ok(Routed { connection, model: m, ..Default::default() });
+    }
+    Err(bad_request("pick a model: there is no routing rule for this session and the connection has no default model"))
+}
+
+/// Checks routing rules before they are saved.
+pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Result<()> {
+    let connections = st.store.connections().await?;
+    for r in routes {
+        if r.name.trim().is_empty() {
+            return Err(bad_request("a routing rule needs a name"));
+        }
+        if r.model.trim().is_empty() {
+            return Err(bad_request(format!("routing rule {:?}: a model is required", r.name)));
+        }
+        let want = r.connection.trim();
+        if !want.is_empty() && !connections.iter().any(|c| c.id == want || c.name == want) {
+            return Err(bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)));
+        }
+        check_effort(Some(r.effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: {e}", r.name)))?;
+        check_selector(&r.applies_to)?;
+    }
+    Ok(())
 }
 
 /// Checks policies before they are saved.

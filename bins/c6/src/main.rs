@@ -60,11 +60,12 @@ enum Command {
         /// ssh_config alias); -C is then a folder there (default: home).
         #[arg(long, conflicts_with = "scratch")]
         ssh: Option<String>,
-        /// Connection name or id (default: that of your latest session).
+        /// Connection name or id (default: from your routing rules, else
+        /// that of your latest session).
         #[arg(short, long)]
         connection: Option<String>,
-        /// Model (default: that of your latest session on the connection,
-        /// else the connection's default).
+        /// Model (default: from your routing rules, else the connection's
+        /// default, else that of your latest session on the connection).
         #[arg(short, long)]
         model: Option<String>,
         #[arg(long)]
@@ -277,9 +278,15 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 None if scratch || ssh.is_some() => String::new(),
                 None => std::env::current_dir()?.display().to_string(),
             };
-            let connections: Vec<Connection> = c.get("/connections").await?;
-            let sessions: Vec<Session> = c.get("/sessions").await?;
-            let (connection, model) = pick_model(&connections, &sessions, connection.as_deref(), model)?;
+            let connection = match connection {
+                Some(w) => {
+                    let connections: Vec<Connection> = c.get("/connections").await?;
+                    connections.iter().find(|x| x.name == w || x.id == w).with_context(|| format!("no connection named {w}"))?.id.clone()
+                }
+                None => String::new(),
+            };
+            // Empty: the head routes it.
+            let model = model.unwrap_or_default();
             let s: Session = c
                 .post(
                     "/sessions",
@@ -397,27 +404,6 @@ fn pick_worker<'a>(workers: &'a [Worker], wanted: Option<&str>) -> anyhow::Resul
             many.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ")
         ),
     }
-}
-
-fn pick_model(
-    connections: &[Connection],
-    sessions: &[Session],
-    wanted: Option<&str>,
-    model: Option<String>,
-) -> anyhow::Result<(String, String)> {
-    let latest = sessions.iter().filter(|s| s.parent_id.is_none()).max_by_key(|s| s.created_at);
-    let conn = match wanted {
-        Some(w) => connections.iter().find(|c| c.name == w || c.id == w).with_context(|| format!("no connection named {w}"))?,
-        None => match latest.and_then(|s| connections.iter().find(|c| c.id == s.connection_id)) {
-            Some(c) => c,
-            None => connections.first().context("no LLM connection: add one in the web UI under Settings")?,
-        },
-    };
-    let model = model
-        .or_else(|| latest.filter(|s| s.connection_id == conn.id).map(|s| s.model.clone()))
-        .or_else(|| conn.default_model.clone())
-        .with_context(|| format!("pick a model for {} with --model", conn.name))?;
-    Ok((conn.id.clone(), model))
 }
 
 fn status_word(s: SessionStatus) -> &'static str {

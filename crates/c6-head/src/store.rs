@@ -179,6 +179,19 @@ impl Store {
         Ok(sqlx::query_as("SELECT * FROM connections ORDER BY name").fetch_all(&self.pool).await?)
     }
 
+    /// The connection and model of your latest session (on a connection, or
+    /// on any).
+    pub async fn latest_model(&self, connection_id: &str) -> anyhow::Result<Option<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT connection_id, model FROM sessions WHERE (? = '' OR connection_id = ?) AND parent_id IS NULL AND model != '' \
+             AND connection_id IN (SELECT id FROM connections) ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(connection_id)
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn connection(&self, id: &str) -> anyhow::Result<Option<ConnectionRow>> {
         Ok(sqlx::query_as("SELECT * FROM connections WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
@@ -222,6 +235,8 @@ pub struct SessionRow {
     pub ssh_target: String,
     /// Tool calls waiting for approval.
     pub awaiting: i64,
+    /// The model for subagents, from a routing rule; empty: `model`.
+    pub subagent_model: String,
 }
 
 impl SessionRow {
@@ -275,7 +290,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -292,6 +307,7 @@ impl Store {
         .bind(&s.labels)
         .bind(&s.worker_name)
         .bind(&s.ssh_target)
+        .bind(&s.subagent_model)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -591,7 +607,7 @@ async fn create_subagent_session(
     .bind(if s.title.is_empty() { "Subagent" } else { &s.title })
     .bind(&s.cwd)
     .bind(parent.get::<String, _>("connection_id"))
-    .bind(parent.get::<String, _>("model"))
+    .bind(s.model.as_ref().map(|m| m.model.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| parent.get::<String, _>("model")))
     .bind(now)
     .bind(now)
     .bind(parent.get::<Option<String>, _>("effort"))
