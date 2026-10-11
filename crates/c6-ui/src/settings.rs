@@ -109,11 +109,12 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 name="channels"
                 title="Notifications"
                 noun="channel"
-                help="Where carbon6 tells you about your sessions while you are away: ntfy (a phone app; the URL is your topic, e.g. https://ntfy.sh/a-long-random-name), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Events: approval (with a link to Allow or Deny that works without signing in, for an hour), failed, finished, notice (the agent's notify tool), output, automation, budget; empty means approval, failed, notice, automation and budget. Applies to: only sessions with these labels. Tokens and SMTP passwords are secrets (Settings → Secrets)."
+                help="Where carbon6 tells you about your sessions while you are away: push (your browsers and phones, turned on below on each device), ntfy (a phone app; the URL is your topic, e.g. https://ntfy.sh/a-long-random-name), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Events: approval (with a link to Allow or Deny that works without signing in, for an hour), failed, finished, notice (the agent's notify tool), output, automation, budget; empty means approval, failed, notice, automation and budget. Applies to: only sessions with these labels. Tokens and SMTP passwords are secrets (Settings → Secrets)."
                 fields=CHANNEL_FIELDS
                 examples=channel_examples
             />
             <NotifyExtras />
+            <crate::push::PushSetting />
             <ListSetting
                 name="prices"
                 title="Prices"
@@ -1031,7 +1032,12 @@ fn budget_examples() -> Vec<(&'static str, serde_json::Value)> {
 
 const CHANNEL_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. phone", kind: FieldKind::Line },
-    Field { key: "kind", label: "Kind", placeholder: "", kind: FieldKind::Choice(&["ntfy", "slack", "discord", "webhook", "email"]) },
+    Field {
+        key: "kind",
+        label: "Kind",
+        placeholder: "",
+        kind: FieldKind::Choice(&["push", "ntfy", "slack", "discord", "webhook", "email"]),
+    },
     Field {
         key: "url",
         label: "URL (email: SMTP server)",
@@ -1067,6 +1073,7 @@ fn channel_examples() -> Vec<(&'static str, serde_json::Value)> {
     email["to"] = "you@gmail.com".into();
     vec![
         ("Empty", c("", "ntfy", "", "", &[], &[])),
+        ("This browser and phone (web push): approvals and problems", c("devices", "push", "", "", &[], &[])),
         ("Phone (ntfy): approvals and problems", c("phone", "ntfy", "https://ntfy.sh/pick-a-long-random-topic", "", &[], &[])),
         (
             "Slack: automation results",

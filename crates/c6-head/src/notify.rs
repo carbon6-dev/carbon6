@@ -118,6 +118,8 @@ pub fn check_channels(channels: &[api::Channel]) -> anyhow::Result<()> {
             return Err(bad_request("a channel needs a name"));
         }
         match c.kind.as_str() {
+            // Your subscribed browsers and phones; nothing to set here.
+            "push" => {}
             "ntfy" | "slack" | "discord" | "webhook" => {
                 let u = url::Url::parse(c.url.trim()).map_err(|_| what("the URL is not valid"))?;
                 if !matches!(u.scheme(), "http" | "https") {
@@ -135,7 +137,7 @@ pub fn check_channels(channels: &[api::Channel]) -> anyhow::Result<()> {
                     return Err(what("email needs a user (the sender's address) and a recipient"));
                 }
             }
-            _ => return Err(what("the kind is ntfy, slack, discord, webhook or email")),
+            _ => return Err(what("the kind is push, ntfy, slack, discord, webhook or email")),
         }
         for e in c.events.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
             if !api::NOTIFY_EVENTS.iter().any(|(n, _)| *n == e) {
@@ -212,6 +214,13 @@ async fn deliver(st: &HeadState, ch: &api::Channel, note: &Note, links: &Links) 
         anyhow::Ok(())
     };
     match ch.kind.as_str() {
+        "push" => {
+            // A tap opens the approval page, else the session, else the head.
+            let open = approve_url.clone().or_else(|| session_url.clone()).unwrap_or_else(|| "/".into());
+            let payload = json!({"title": note.title, "body": note.message.chars().take(1000).collect::<String>(), "url": open,
+                                 "tag": format!("{}:{}", note.event, note.session_id.as_deref().unwrap_or(""))});
+            crate::push::send_all(st, &payload, note.priority == "high").await
+        }
         "ntfy" => {
             // JSON publishing (to the server root) carries Unicode titles.
             let u = url::Url::parse(ch.url.trim())?;

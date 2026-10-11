@@ -291,7 +291,7 @@ fn MissionCard(id: String) -> impl IntoView {
     };
     let open_id = id.clone();
     view! {
-        <div class="flex h-64 flex-col rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+        <div class="flex h-48 flex-col rounded-lg border sm:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
             <div class="flex items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
                 {move || session.get().map(|s| view! { <span class=dot(s.status, tracked())></span> })}
                 <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">

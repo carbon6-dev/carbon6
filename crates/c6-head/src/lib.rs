@@ -14,6 +14,7 @@ pub mod memory;
 pub mod notify;
 pub mod oauth;
 pub mod pki;
+pub mod push;
 pub mod registry;
 pub mod search;
 pub mod secrets;

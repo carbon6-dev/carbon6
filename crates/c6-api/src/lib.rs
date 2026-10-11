@@ -1014,7 +1014,8 @@ pub struct Route {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
     pub name: String,
-    /// "ntfy", "slack", "discord", "webhook" or "email".
+    /// "push" (your browsers and phones, see Settings), "ntfy", "slack",
+    /// "discord", "webhook" or "email".
     pub kind: String,
     /// ntfy: the topic URL (https://ntfy.sh/my-topic); Slack, Discord,
     /// webhook: the webhook URL; email: the SMTP server, host[:port] (465:
@@ -1208,6 +1209,45 @@ pub struct UsageReport {
     /// Models used without a price.
     pub unpriced_models: Vec<String>,
     pub budgets: Vec<BudgetStatus>,
+}
+
+/// A browser's push subscription (`POST /api/v1/push/subscriptions`), as
+/// `PushSubscription.toJSON()` gives it, plus a name for the device.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PushSubscription {
+    pub endpoint: String,
+    pub keys: PushKeys,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PushKeys {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+/// A subscribed device (`GET /api/v1/push/subscriptions`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PushDevice {
+    pub id: String,
+    pub name: String,
+    /// Where the push service takes its messages (this device's, if it
+    /// matches the browser's own subscription).
+    pub endpoint: String,
+    /// The push service's host (e.g. fcm.googleapis.com).
+    pub service: String,
+    pub created_at: UnixMs,
+    #[serde(default)]
+    pub last_sent_at: Option<UnixMs>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// `GET /api/v1/push/key`: the head's public key for subscribing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PushKey {
+    pub key: String,
 }
 
 /// `POST /api/v1/settings/channels/test`.

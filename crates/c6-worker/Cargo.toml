@@ -42,7 +42,7 @@ uuid = { version = "1.28.0", features = ["v7"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
-base64 = "0.23.1"
+base64 = "0.23"
 axum = "0.8"
 c6-api.workspace = true
 c6-core.workspace = true
@@ -58,3 +58,4 @@ tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.20"
 tracing-subscriber = "0.3.23"
+ring = "0.17"

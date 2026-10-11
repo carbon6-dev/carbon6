@@ -304,6 +304,22 @@ pub async fn decide_workflow_step(run: String, step: String, allow: bool) -> Res
     .await
 }
 
+pub async fn push_key() -> Result<c6_api::PushKey, String> {
+    json(Request::get("/api/v1/push/key").send().await).await
+}
+
+pub async fn push_devices() -> Result<Vec<c6_api::PushDevice>, String> {
+    json(Request::get("/api/v1/push/subscriptions").send().await).await
+}
+
+pub async fn push_subscribe(s: c6_api::PushSubscription) -> Result<c6_api::PushDevice, String> {
+    send_json(Request::post("/api/v1/push/subscriptions"), &s).await
+}
+
+pub async fn push_unsubscribe(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/push/subscriptions/{id}")).send().await).await
+}
+
 pub async fn test_channel(name: String) -> Result<(), String> {
     let body = c6_api::TestChannel { name };
     empty(Request::post("/api/v1/settings/channels/test").json(&body).map_err(|e| e.to_string())?.send().await).await

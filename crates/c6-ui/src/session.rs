@@ -1507,6 +1507,8 @@ fn Composer(
 ) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
+    // The model row, on phones (always shown on wider screens).
+    let model_open = RwSignal::new(false);
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
     // @-mention completion: (where the @ is, query), the matches, and the
@@ -1802,7 +1804,12 @@ fn Composer(
                     }}
                 </div>
                 {model.map(|m| view! {
-                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                    // Folded away on phones until asked for.
+                    <button class="self-start text-xs text-zinc-500 sm:hidden" class:hidden=move || model_open.get()
+                        on:click=move |_| model_open.set(true)>
+                        {move || format!("Model: {} ▾", m.model.get())}
+                    </button>
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500 sm:flex" class:hidden=move || !model_open.get()>
                         <span>"Model"</span>
                         <ModelPicker connection=m.connection model=m.model effort=m.effort />
                         {move || {

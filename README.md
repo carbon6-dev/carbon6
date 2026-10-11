@@ -148,12 +148,20 @@ Where the worker's machine has Chrome, Chromium, Brave or Edge (or `C6_CHROME` n
 
 Channels (**Settings → Notifications**) tell you about your sessions while you're away.
 
-- **Kinds:** ntfy (a phone app; the URL is your topic), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Tokens and SMTP passwords are secrets.
+- **Kinds:** push (your own browsers and phones, see below), ntfy (a phone app; the URL is your topic), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Tokens and SMTP passwords are secrets.
 - **Events:** `approval`, `failed`, `finished`, `notice`, `output`, `automation`, `budget`. A channel without a list gets approvals, failures, notices, automation failures and budgets.
 - **Scope:** `applies_to` labels limit a channel to matching sessions (`env:prod`, `automation:`).
 - **Approvals from your phone:** an approval notification links to a page showing the held call with **Allow** / **Deny**. The link is signed, works without signing in, and expires after an hour; answering takes a button press, so chat link previews can't answer for you. Links use the address under the channel list (taken from your browser the first time you save a channel).
 - **The agent's `notify` tool:** agents can send you a notice (a title, a few lines, a priority), for example from an automation that finds a problem.
 - **Testing:** **Send a test** sends a message on a channel and shows any error.
+
+**Web push (no third party):** on each device, **Settings → Notifications → Turn on here**, then add a channel of kind `push`. The head encrypts each message for each device and sends it to the browser's own push service, signed with its own key. Tapping a notification opens the session, or for an approval its Allow / Deny page.
+
+- **Requirements:** HTTPS, or `localhost`. With the head's own certificate authority, that means a device that trusts `/ca.pem`.
+- **iPhone and iPad:** add carbon6 to the Home Screen (Share → Add to Home Screen) and open it from there; iOS only allows web push for home-screen apps.
+- **Devices:** listed with when they last got a message. A subscription the push service says is gone is removed.
+
+**On a phone:** the head works as a home-screen app (manifest, icon, standalone). Fields use 16px text so iOS doesn't zoom in on them, the composer folds its model picker away, and Usage and mission control fit small screens.
 
 ### Hosts
 

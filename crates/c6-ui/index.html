@@ -3,7 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="carbon6" />
     <title>carbon6</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <link data-trunk rel="copy-file" href="pwa/sw.js" />
+    <link data-trunk rel="copy-file" href="pwa/manifest.webmanifest" />
+    <link data-trunk rel="copy-file" href="pwa/icon-192.png" />
+    <link data-trunk rel="copy-file" href="pwa/icon-512.png" />
     <link data-trunk rel="tailwind-css" href="style/input.css" />
     <link data-trunk rel="copy-dir" href="vendor" />
     <link data-trunk rel="copy-dir" href="js" />
@@ -14,6 +24,7 @@
     <script src="/js/passkey.js"></script>
     <script src="/js/search.js"></script>
     <script src="/js/files.js"></script>
+    <script src="/js/push.js"></script>
     <link data-trunk rel="rust" data-wasm-opt="z" />
   </head>
   <body class="bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 antialiased"></body>

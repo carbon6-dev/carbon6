@@ -63,7 +63,7 @@ fn Report(r: UsageReport) -> impl IntoView {
     // Without prices, bars show calls.
     let by_cost = max_day > 0.0;
     view! {
-        <div class="grid gap-3 sm:grid-cols-4">
+        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="Cost" value=usd(t.cost) />
             <Stat label="Model calls" value=t.calls.to_string() />
             <Stat label="Input tokens" value=format!("{} (+{} cached)", tokens(t.input), tokens(t.cache_read)) />
@@ -155,7 +155,7 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
                 view! { <p class="text-xs text-zinc-500">"Nothing yet."</p> }.into_any()
             } else {
                 view! {
-                    <table class="w-full text-xs">
+                    <div class="overflow-x-auto"><table class="w-full text-xs">
                         <thead class="text-zinc-500"><tr>
                             <th class="pb-1 text-left font-normal"></th>
                             <th class="pb-1 text-right font-normal">"Calls"</th>
@@ -182,7 +182,7 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
                                 }
                             }).collect_view()}
                         </tbody>
-                    </table>
+                    </table></div>
                 }.into_any()
             }}
         </section>

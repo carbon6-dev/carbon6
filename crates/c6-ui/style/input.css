@@ -1,6 +1,12 @@
 @import "tailwindcss";
 @source "../src/**/*.rs";
 
+/* Phones: iOS zooms into fields with text under 16px when they get
+   focus, which throws the layout off; give them 16px there. */
+@media (max-width: 639px) {
+  input, textarea, select { font-size: 16px !important; }
+}
+
 /* Rendered markdown from model output. */
 @layer components {
   .md { @apply text-sm leading-relaxed; }

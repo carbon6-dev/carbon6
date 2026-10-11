@@ -79,6 +79,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/budgets", get(get_budgets).put(put_budgets))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/settings/channels/test", post(test_channel))
+        .route("/api/v1/push/key", get(push_key))
+        .route("/api/v1/push/subscriptions", get(push_devices).post(push_subscribe))
+        .route("/api/v1/push/subscriptions/{id}", delete(push_unsubscribe))
         .route("/api/v1/settings/public_url", get(get_public_url).put(put_public_url))
         .route("/approve/{token}", get(crate::notify::approve_page).post(crate::notify::approve_answer))
         .route("/api/v1/sessions/{id}/config", get(session_config))
@@ -1124,6 +1127,22 @@ async fn put_channels(State(st): State<Arc<HeadState>>, headers: HeaderMap, Json
         st.store.set_setting(crate::notify::PUBLIC_URL, origin).await?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn push_key(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::PushKey>> {
+    Ok(Json(api::PushKey { key: crate::push::public_key(&st).await? }))
+}
+
+async fn push_devices(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::PushDevice>>> {
+    Ok(Json(crate::push::devices(&st).await?))
+}
+
+async fn push_subscribe(State(st): State<Arc<HeadState>>, Json(s): Json<api::PushSubscription>) -> ApiResult<Json<api::PushDevice>> {
+    Ok(Json(crate::push::subscribe(&st, &s).await?))
+}
+
+async fn push_unsubscribe(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    if crate::push::unsubscribe(&st, &id).await? { Ok(StatusCode::NO_CONTENT) } else { Err(crate::not_found("no such device").into()) }
 }
 
 async fn test_channel(State(st): State<Arc<HeadState>>, Json(t): Json<api::TestChannel>) -> ApiResult<StatusCode> {

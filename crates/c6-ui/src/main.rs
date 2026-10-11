@@ -9,6 +9,7 @@ mod labels;
 mod markdown;
 mod notify;
 mod outputs;
+mod push;
 mod search;
 mod session;
 mod sessions;
