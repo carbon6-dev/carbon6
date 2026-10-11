@@ -140,7 +140,7 @@ async fn read(m: &Memex, task: &Task, kind: &str, items: &[String]) -> anyhow::R
     };
     let owner: Vec<String> = m.accounts().iter().map(|a| a.email.clone()).collect();
     let prompt = format!("{}\n\n{text}", ask.replace("OWNER", &owner.join(", ")));
-    let answer = llm::ask(&m.link, task, SYSTEM, vec![Block::Text(prompt)], 1200).await?;
+    let answer = llm::ask(&m.link, task, SYSTEM, vec![Block::Text(prompt)], 3000).await?;
     let v = llm::json_of(&answer)?;
     apply(m, task, kind, items, &v).await
 }
@@ -341,7 +341,7 @@ pub async fn summarize(m: &Memex, key: &str) -> anyhow::Result<String> {
         thing.kind,
         clip(&text, MAX_INPUT)
     );
-    let answer = llm::ask(&m.link, &task, SYSTEM, vec![Block::Text(prompt)], 1500).await?;
+    let answer = llm::ask(&m.link, &task, SYSTEM, vec![Block::Text(prompt)], 4000).await?;
     let summary = llm::json_of(&answer).ok().and_then(|v| v["summary"].as_str().map(str::to_owned)).unwrap_or(answer);
     let item = api::MemexItemIn {
         kind: "note".into(),

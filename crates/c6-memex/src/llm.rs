@@ -35,7 +35,9 @@ pub async fn ask(link: &Arc<HeadLink>, task: &Task, system: &str, user: Vec<Bloc
         acc.push(&ev?);
     }
     let msg = acc.finish(true);
-    Ok(msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect())
+    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+    anyhow::ensure!(!text.trim().is_empty(), "{} gave no answer (a thinking model may have spent its output tokens thinking)", task.model);
+    Ok(text)
 }
 
 /// The first JSON object in a model's answer (it may wrap it in prose or a
