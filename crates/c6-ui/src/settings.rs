@@ -48,8 +48,9 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             <ChatGptSignIn on_added=move || connections.refetch() />
             <JsonSetting
                 name="mcp-servers"
-                title="MCP servers"
-                help="Started for each new session: stdio servers run on the worker in the session's directory; HTTP servers are reached from the worker. Their tools appear as mcp__<server>__<tool>."
+                title="MCP servers (connectors)"
+                help="Started for each new session: stdio servers run on the worker in the session's directory; HTTP servers are reached from the worker. Their tools appear as mcp__<server>__<tool>. ${NAME} in a command, argument, env value, URL or bearer token is replaced by that secret (Settings → Secrets); \"applies_to\": [labels] limits a server to matching sessions. Start from a connector preset below."
+                presets=connector_presets
                 example=r#"[
   {"name": "github", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "…"}},
   {"name": "docs", "transport": "http", "url": "http://10.0.0.5:8080/mcp"}
@@ -357,9 +358,54 @@ fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
     }
 }
 
+/// A ready-made entry: (label, what it needs, the entry).
+type Preset = (&'static str, &'static str, serde_json::Value);
+
+/// Ready-made MCP servers: (label, the secrets it needs, its config).
+fn connector_presets() -> Vec<Preset> {
+    use serde_json::json;
+    vec![
+        (
+            "GitHub (issues, PRs, code)",
+            "GITHUB_TOKEN: a personal access token",
+            json!({"name": "github", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+                   "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}}),
+        ),
+        (
+            "Slack (read and post messages)",
+            "SLACK_BOT_TOKEN (xoxb-…) and SLACK_TEAM_ID",
+            json!({"name": "slack", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-slack"],
+                   "env": {"SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}", "SLACK_TEAM_ID": "${SLACK_TEAM_ID}"}}),
+        ),
+        (
+            "PostgreSQL (read-only queries)",
+            "DATABASE_URL: postgres://user:password@host/db",
+            json!({"name": "postgres", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-postgres", "${DATABASE_URL}"]}),
+        ),
+        (
+            "Browser (headless Chromium, for research and web tasks)",
+            "nothing (needs Node on the worker; downloads a browser on first use)",
+            json!({"name": "browser", "transport": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"]}),
+        ),
+        (
+            "Remote MCP server (HTTP, bearer token)",
+            "a secret with the server's token, e.g. MCP_TOKEN",
+            json!({"name": "remote", "transport": "http", "url": "https://example.com/mcp", "bearer": "${MCP_TOKEN}"}),
+        ),
+    ]
+}
+
 /// A JSON-array setting edited as text, validated by the head on save.
 #[component]
-fn JsonSetting(name: &'static str, title: &'static str, help: &'static str, example: &'static str) -> impl IntoView {
+fn JsonSetting(
+    name: &'static str,
+    title: &'static str,
+    help: &'static str,
+    example: &'static str,
+    /// Entries to add from a menu: (label, what it needs, entry).
+    #[prop(optional)]
+    presets: Option<fn() -> Vec<Preset>>,
+) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let status = RwSignal::new(None::<Result<&'static str, String>>);
     let loaded = LocalResource::new(move || api::get_setting(name));
@@ -390,6 +436,27 @@ fn JsonSetting(name: &'static str, title: &'static str, help: &'static str, exam
             <p class="text-sm text-zinc-500">{help}</p>
             <textarea class=format!("{INPUT} min-h-40 font-mono text-xs") placeholder=example
                 prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
+            {presets.map(|presets| {
+                let needs = RwSignal::new(None::<String>);
+                view! {
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select class=format!("{INPUT} w-auto! py-1 text-sm") on:change=move |ev| {
+                            let label = event_target_value(&ev);
+                            if let Some((l, need, entry)) = presets().into_iter().find(|(l, _, _)| *l == label) {
+                                // Append to the list being edited.
+                                let mut list = serde_json::from_str::<Vec<serde_json::Value>>(&text.get_untracked()).unwrap_or_default();
+                                list.push(entry);
+                                text.set(serde_json::to_string_pretty(&list).unwrap_or_default());
+                                needs.set(Some(format!("Added {l}. It needs {need}. Save to use it in new sessions.")));
+                            }
+                        }>
+                            <option value="">"Add a connector…"</option>
+                            {presets().into_iter().map(|(l, _, _)| view! { <option value=l>{l}</option> }).collect_view()}
+                        </select>
+                        {move || needs.get().map(|n| view! { <span class="text-xs text-zinc-500">{n}</span> })}
+                    </div>
+                }
+            })}
             <div class="flex items-center justify-end gap-3">
                 {move || status.get().map(|r| match r {
                     Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),

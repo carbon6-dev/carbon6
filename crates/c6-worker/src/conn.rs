@@ -139,7 +139,33 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     let uploads = CancellationToken::new();
     let _stop_uploads = uploads.clone().drop_guard();
     // A separate task so a slow uplink never stops us reading acks and commands.
-    tokio::spawn(upload(worker.journal.clone(), tx.clone(), uploads));
+    tokio::spawn(upload(worker.journal.clone(), tx.clone(), uploads.clone()));
+    // Commands are applied in order by their own task, so the read loop
+    // keeps going while one waits on the head (e.g. for a credential, whose
+    // reply arrives on this very stream).
+    let (commands, mut queue) = mpsc::unbounded_channel::<c6_proto::SessionCommand>();
+    {
+        let (worker, tx, stop) = (worker.clone(), tx.clone(), uploads.clone());
+        tokio::spawn(async move {
+            loop {
+                let cmd = tokio::select! {
+                    _ = stop.cancelled() => return,
+                    c = queue.recv() => match c {
+                        Some(c) => c,
+                        None => return,
+                    },
+                };
+                let (command_id, session_id) = (cmd.command_id.clone(), cmd.session_id.clone());
+                if let Err(reason) = worker.sessions.handle(cmd).await {
+                    warn!(session = %session_id, %reason, "command rejected");
+                    let rejected = CommandRejected { command_id, session_id, reason };
+                    if tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) }).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
 
     let mut pings = tokio::time::interval(PING_INTERVAL);
     let mut nonce = 0u64;
@@ -178,13 +204,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                             }
                         }
                         head_msg::Msg::Command(cmd) => {
-                            let (command_id, session_id) = (cmd.command_id.clone(), cmd.session_id.clone());
-                            if let Err(reason) = worker.sessions.handle(cmd).await {
-                                warn!(session = %session_id, %reason, "command rejected");
-                                let rejected = CommandRejected { command_id, session_id, reason };
-                                if tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) }).await.is_err() {
-                                    return Ended::Retry(anyhow::anyhow!("outbound stream closed"));
-                                }
+                            if commands.send(cmd).is_err() {
+                                return Ended::Retry(anyhow::anyhow!("command queue closed"));
                             }
                         }
                         head_msg::Msg::Credential(grant) => worker.link.on_grant(grant),

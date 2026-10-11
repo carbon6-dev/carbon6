@@ -71,6 +71,15 @@ async fn secrets_reach_commands_but_not_the_model() {
     assert!(!list.to_string().contains("dk-9f8e7d6c5b"), "values are never listed: {list}");
     assert_eq!(list[0]["description"], "Deploys to staging (rotated monthly)");
 
+    // An MCP server that needs a secret this session lacks is not started,
+    // and the session says why.
+    let r = http
+        .put(format!("{api}/settings/mcp-servers"))
+        .json(&json!([{"name": "needy", "transport": "stdio", "command": "true", "env": {"TOKEN": "${MISSING_TOKEN}"}}]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
     mock.push(Reply::ToolCalls(vec![(
         "bash".into(),
         r#"{"command":"test ${#DEPLOY_KEY} -eq 13 && echo has-key; echo leak=$DEPLOY_KEY; echo py=${PY_ONLY:-unset}"}"#.into(),
@@ -90,6 +99,11 @@ async fn secrets_reach_commands_but_not_the_model() {
     assert!(!all.contains("dk-9f8e7d6c5b"), "the value never reaches the model");
     let second = reqs[1]["messages"].to_string();
     assert!(second.contains("has-key") && second.contains("leak=[secret:DEPLOY_KEY]") && second.contains("py=unset"), "{second}");
+
+    let sessions: Vec<Value> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
+    let id = sessions[0]["id"].as_str().unwrap();
+    let evs: Value = http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap();
+    assert!(evs.to_string().contains("MCP server needy not started: it needs the secret MISSING_TOKEN"), "{evs}");
 
     stop.cancel();
     head.shutdown().await.unwrap();

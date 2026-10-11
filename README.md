@@ -137,6 +137,20 @@ An automation (**Settings → Automations**) starts a template:
 
 **Runs:** each run is labelled `automation:<name>` and `run:<id>` and lands in your inbox when it finishes. Every automation shows its last run, any error, and **Run now**. Times missed while the head was down are skipped, not made up.
 
+### Connectors (MCP servers)
+
+**Settings → MCP servers** has an **Add a connector…** menu:
+
+- **GitHub:** issues, PRs, code.
+- **Slack:** read and post messages.
+- **PostgreSQL:** read-only queries.
+- **A headless browser:** Playwright, for research and web tasks.
+- **A generic remote HTTP server** with a bearer token.
+
+**Secrets in configs:** `${NAME}` anywhere in a server's command, arguments, environment, URL or bearer token is filled in from that secret, so tokens stay in the secret store. A server that needs a secret the session doesn't have isn't started, and the session says which secret is missing.
+
+**Scoping:** `"applies_to": [labels]` limits a server to matching sessions, like other settings.
+
 ### Outputs: decks, reports and other deliverables
 
 When the agent finishes a deliverable (a slide deck, a report, a chart, a document), it publishes it with the `publish_file` tool, and it appears in the session's **Outputs** tab:

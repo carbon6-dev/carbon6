@@ -349,7 +349,10 @@ impl SessionManager {
             (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
         } else {
             let profile = model_info(provider, &model.model).tool_profile;
-            let built = build_tools(&spec, &local, profile, &labels).await;
+            // Secrets go into MCP servers' configs (and, per turn, commands).
+            let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
+            let (secret_values, _) = fetch_secrets(&self.link, &names).await;
+            let built = build_tools(&spec, &local, profile, &labels, &secret_values).await;
             setup_errors = built.errors;
             let mut prompt = system_prompt;
             if let Some(h) = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels)
@@ -526,7 +529,9 @@ impl SessionManager {
             None => {
                 let labels =
                     session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
-                build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels).await.tools
+                let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
+                let (secret_values, _) = fetch_secrets(&self.link, &names).await;
+                build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels, &secret_values).await.tools
             }
         };
         let started_cwd = started.cwd.clone();
@@ -1166,7 +1171,13 @@ fn applicable<T>(items: Vec<T>, name: impl Fn(&T) -> &str, applies_to: impl Fn(&
     items.into_iter().zip(keep).filter_map(|(it, k)| k.then_some(it)).collect()
 }
 
-pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, profile: ToolProfile, labels: &[String]) -> BuiltTools {
+pub(crate) async fn build_tools(
+    spec: &CreateSession,
+    cwd: &std::path::Path,
+    profile: ToolProfile,
+    labels: &[String],
+    secrets: &[(String, String)],
+) -> BuiltTools {
     let mut tools = c6_tools::tools_for(profile);
     let mut errors = Vec::new();
     // Deliverables for the Outputs panel.
@@ -1238,7 +1249,23 @@ pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, pro
         tools.push(Arc::new(c6_tools::WebSearch::new(profile == ToolProfile::Claude, search)));
     }
 
-    let servers: Vec<c6_mcp::ServerConfig> = serde_json::from_str(&spec.mcp_servers_json).unwrap_or_default();
+    // MCP servers that apply here, with ${SECRET} references filled in.
+    let mut servers: Vec<c6_mcp::ServerConfig> = Vec::new();
+    for s in serde_json::from_str::<Vec<c6_mcp::ServerConfig>>(&spec.mcp_servers_json).unwrap_or_default() {
+        if !c6_api::labels::applies(&s.applies_to, labels) {
+            continue;
+        }
+        match s.with_secrets(secrets) {
+            Ok(s) => servers.push(s),
+            Err(missing) => errors.push(format!(
+                "MCP server {} not started: it needs the secret{} {} (add {} under Settings → Secrets, applying to this session)",
+                s.name,
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", "),
+                if missing.len() == 1 { "it" } else { "them" }
+            )),
+        }
+    }
     if !servers.is_empty() {
         let (set, errs) = c6_mcp::McpSet::connect(&servers, cwd).await;
         errors.extend(errs.into_iter().map(|e| format!("MCP server unavailable: {e}")));

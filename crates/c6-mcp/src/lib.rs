@@ -27,6 +27,55 @@ pub struct ServerConfig {
     pub name: String,
     #[serde(flatten)]
     pub transport: Transport,
+    /// Labels a session must all have for the server to start in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
+}
+
+impl ServerConfig {
+    /// The config with `${NAME}` replaced by the secrets' values (in the
+    /// command, arguments, environment, URL and bearer token). Err with the
+    /// names of secrets it needs that are not given.
+    pub fn with_secrets(&self, secrets: &[(String, String)]) -> Result<ServerConfig, Vec<String>> {
+        let mut missing = Vec::new();
+        let mut sub = |s: &str| -> String {
+            let mut out = String::new();
+            let mut rest = s;
+            while let Some(i) = rest.find("${") {
+                out.push_str(&rest[..i]);
+                let after = &rest[i + 2..];
+                match after.find('}') {
+                    Some(j) => {
+                        let name = &after[..j];
+                        match secrets.iter().find(|(n, _)| n == name) {
+                            Some((_, v)) => out.push_str(v),
+                            None => {
+                                if !missing.contains(&name.to_owned()) {
+                                    missing.push(name.to_owned());
+                                }
+                            }
+                        }
+                        rest = &after[j + 1..];
+                    }
+                    None => {
+                        out.push_str(&rest[i..]);
+                        rest = "";
+                    }
+                }
+            }
+            out.push_str(rest);
+            out
+        };
+        let transport = match &self.transport {
+            Transport::Stdio { command, args, env } => Transport::Stdio {
+                command: sub(command),
+                args: args.iter().map(|a| sub(a)).collect(),
+                env: env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
+            },
+            Transport::Http { url, bearer } => Transport::Http { url: sub(url), bearer: bearer.as_deref().map(&mut sub) },
+        };
+        if missing.is_empty() { Ok(ServerConfig { transport, ..self.clone() }) } else { Err(missing) }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -41,6 +90,9 @@ pub enum Transport {
     },
     Http {
         url: String,
+        /// Sent as `Authorization: Bearer …` (usually `${SOME_SECRET}`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer: Option<String>,
     },
 }
 
@@ -109,9 +161,13 @@ async fn connect_one(s: &ServerConfig, cwd: &std::path::Path) -> anyhow::Result<
             let transport = TokioChildProcess::new(cmd).with_context(|| format!("starting {command}"))?;
             Ok(().serve(transport).await.context("MCP handshake")?)
         }
-        Transport::Http { url } => {
+        Transport::Http { url, bearer } => {
             c6_llm::install_crypto_provider();
-            let transport = StreamableHttpClientTransport::from_uri(url.clone());
+            let mut config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.clone());
+            if let Some(b) = bearer {
+                config = config.auth_header(b.clone());
+            }
+            let transport = StreamableHttpClientTransport::from_config(config);
             Ok(().serve(transport).await.context("MCP handshake")?)
         }
     }
@@ -174,5 +230,28 @@ impl Tool for McpTool {
                 ToolOutput::limited(parts.join("\n"), r.is_error.unwrap_or(false))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_fill_in_configs() {
+        let cfg: ServerConfig = serde_json::from_str(
+            r#"{"name":"gh","transport":"stdio","command":"npx","args":["-y","x","${DB}"],"env":{"TOKEN":"${GH_TOKEN}","PLAIN":"v"}}"#,
+        )
+        .unwrap();
+        let secrets = vec![("GH_TOKEN".to_owned(), "t0k".to_owned()), ("DB".to_owned(), "postgres://x".to_owned())];
+        let Transport::Stdio { args, env, .. } = cfg.with_secrets(&secrets).unwrap().transport else { panic!() };
+        assert_eq!(args, ["-y", "x", "postgres://x"]);
+        assert_eq!((env["TOKEN"].as_str(), env["PLAIN"].as_str()), ("t0k", "v"));
+        assert_eq!(cfg.with_secrets(&[]).unwrap_err(), ["DB", "GH_TOKEN"]);
+        let http: ServerConfig =
+            serde_json::from_str(r#"{"name":"h","transport":"http","url":"https://x/mcp","bearer":"${K}","applies_to":["ops"]}"#).unwrap();
+        assert_eq!(http.applies_to, ["ops"]);
+        let Transport::Http { bearer, .. } = http.with_secrets(&[("K".into(), "kv".into())]).unwrap().transport else { panic!() };
+        assert_eq!(bearer.as_deref(), Some("kv"));
     }
 }
