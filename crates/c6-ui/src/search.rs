@@ -91,13 +91,15 @@ pub fn SearchPage(q: String, kind: String, worker: String) -> impl IntoView {
     let kind = move || kind0.get_value();
     let worker = move || worker0.get_value();
     let text = RwSignal::new(q());
+    // The shared label filter (as in the session list and inbox).
+    let filter = crate::labels::use_filter().0;
     let results = LocalResource::new(move || {
-        let (q, kind, worker) = (q(), kind(), worker());
+        let (q, kind, worker, labels) = (q(), kind(), worker(), filter.get());
         async move {
             if q.trim().is_empty() {
                 return Ok(None);
             }
-            api::search(q, kind, worker).await.map(Some)
+            api::search(q, kind, worker, labels).await.map(Some)
         }
     });
     let go = move |q: String, kind: String, worker: String| {
@@ -130,13 +132,14 @@ pub fn SearchPage(q: String, kind: String, worker: String) -> impl IntoView {
                     }).collect_view()}
                 </select>
             </div>
+            <crate::labels::LabelFilterBar />
             <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Searching…"</p> }>
                 {move || results.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(None) => view! { <p class="text-sm text-zinc-500">"Search every message, tool call and tool output in your sessions."</p> }.into_any(),
                     Ok(Some(r)) if r.results.is_empty() => view! {
                         <Ignored words=r.ignored.clone() />
-                        <p class="text-sm text-zinc-500">"No matches."</p>
+                        <p class="text-sm text-zinc-500">{move || if filter.with(Vec::is_empty) { "No matches." } else { "No matches in sessions with these labels." }}</p>
                     }.into_any(),
                     Ok(Some(r)) => {
                         let q = q();

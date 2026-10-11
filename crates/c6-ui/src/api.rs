@@ -357,8 +357,11 @@ pub async fn rename_passkey(id: String, name: String) -> Result<(), String> {
     .await
 }
 
-pub async fn search(q: String, kind: String, worker: String) -> Result<c6_api::SearchResponse, String> {
+pub async fn search(q: String, kind: String, worker: String, labels: Vec<String>) -> Result<c6_api::SearchResponse, String> {
     let mut params = vec![("q", q)];
+    if !labels.is_empty() {
+        params.push(("labels", labels.join(",")));
+    }
     if !kind.is_empty() {
         params.push(("kind", kind));
     }

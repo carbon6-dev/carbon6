@@ -679,6 +679,10 @@ pub struct SearchQuery {
     #[serde(default)]
     pub worker: Option<Uuid>,
     /// Sessions to return (default 30).
+    /// Comma-separated labels a session must all have (yours or automatic;
+    /// `repo:` and `folder:` match path prefixes). Empty: all sessions.
+    #[serde(default)]
+    pub labels: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
 }

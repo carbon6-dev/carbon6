@@ -102,7 +102,12 @@ enum Command {
         label: Vec<String>,
     },
     /// Search all sessions.
-    Search { query: Vec<String> },
+    Search {
+        query: Vec<String>,
+        /// Only sessions with this label (repeatable).
+        #[arg(short, long = "label")]
+        label: Vec<String>,
+    },
     /// List workers.
     Workers,
 }
@@ -300,8 +305,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             Ok(0)
         }
-        Command::Search { query } => {
-            let r: SearchResponse = c.send(c.http.get(format!("{}/search", c.api)).query(&[("q", query.join(" "))])).await?.json().await?;
+        Command::Search { query, label } => {
+            let labels = c6_api::labels::parse_labels(&label.join(",")).join(",");
+            let r: SearchResponse =
+                c.send(c.http.get(format!("{}/search", c.api)).query(&[("q", query.join(" ")), ("labels", labels)])).await?.json().await?;
             if !r.ignored.is_empty() {
                 eprintln!("(ignored short words: {})", r.ignored.join(", "));
             }

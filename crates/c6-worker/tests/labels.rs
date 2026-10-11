@@ -148,6 +148,17 @@ async fn labels_scope_settings() {
     let text = mock.requests()[1]["messages"].to_string();
     assert!(text.contains("Hello generic Bob"), "{text}");
 
+    // Search narrowed by labels: automatic ones (prefixes too) and yours.
+    let found = async |labels: &str| -> usize {
+        let r: Value =
+            http.get(format!("{api}/search")).query(&[("q", "greet"), ("labels", labels)]).send().await.unwrap().json().await.unwrap();
+        r["results"].as_array().unwrap().len()
+    };
+    assert_eq!(found("").await, 1);
+    assert_eq!(found("repo:github.com/acme").await, 1, "an org-wide repo prefix");
+    assert_eq!(found("python").await, 0);
+    assert_eq!(found("client:acme").await, 0, "the label was removed above");
+
     stop.cancel();
     head.shutdown().await.unwrap();
 }

@@ -406,9 +406,16 @@ pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api
         }
     }
     let limit = req.limit.unwrap_or(30).clamp(1, 100) as usize;
+    let wanted = c6_api::labels::parse_labels(req.labels.as_deref().unwrap_or(""));
     let mut results = Vec::new();
-    for sid in order.into_iter().take(limit) {
+    for sid in order {
+        if results.len() == limit {
+            break;
+        }
         let Some(row) = store.session(&sid).await? else { continue };
+        if !c6_api::labels::applies(&wanted, &row.all_labels()) {
+            continue;
+        }
         let worker_name = match store.worker(row.worker_id.parse()?).await? {
             Some(w) => w.name,
             None => String::new(),
