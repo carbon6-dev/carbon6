@@ -127,6 +127,8 @@ enum ActorMsg {
     StopTask(String),
     /// Task ids up to bg{n} were used before a restart.
     Reserve(u64),
+    /// The agent published a file.
+    Published(c6_tools::Published),
 }
 
 /// Background-task notices may start this many turns per hour in an idle
@@ -536,6 +538,17 @@ impl SessionManager {
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
         if started.tool_profile != crate::claude_code::PROFILE {
             session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
+            // Published files go to the actor, which logs them.
+            let (pub_tx, mut pub_rx) = mpsc::unbounded_channel();
+            session_tools.set_publisher(Some(pub_tx));
+            let actor_tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(p) = pub_rx.recv().await {
+                    if actor_tx.send(ActorMsg::Published(p)).is_err() {
+                        break;
+                    }
+                }
+            });
             // Background tasks report to the actor.
             let (task_tx, mut task_rx) = mpsc::unbounded_channel();
             session_tools.background.set_sink(Some(task_tx));
@@ -799,6 +812,13 @@ impl Actor {
                         self.session_tools.background.kill_by_user(&id);
                     }
                     Some(ActorMsg::Reserve(n)) => self.session_tools.background.reserve_ids(n),
+                    Some(ActorMsg::Published(p)) => {
+                        let output = c6_proto::Output { name: p.name, title: p.title, mime: p.mime, data: p.data };
+                        if let Err(e) = self.writer.append(session_event::Kind::Output(output)).await {
+                            error!(session = %self.writer.session_id, "recording an output: {e:#}");
+                            return;
+                        }
+                    }
                     Some(ActorMsg::Rewind { command_id, to_seq, restore_files }) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
                         rewind = Some((command_id, to_seq, restore_files));
@@ -942,6 +962,7 @@ impl Actor {
             link: self.link.clone(),
             hooks: self.session_tools.hooks(),
             secrets: self.session_tools.secrets().clone(),
+            publisher: self.session_tools.publisher(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -1148,6 +1169,8 @@ fn applicable<T>(items: Vec<T>, name: impl Fn(&T) -> &str, applies_to: impl Fn(&
 pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, profile: ToolProfile, labels: &[String]) -> BuiltTools {
     let mut tools = c6_tools::tools_for(profile);
     let mut errors = Vec::new();
+    // Deliverables for the Outputs panel.
+    tools.push(Arc::new(c6_tools::Publish::new(profile == ToolProfile::Claude)));
     // Named agents (from the head's settings) become Task's subagent types.
     #[derive(serde::Deserialize)]
     struct HeadAgent {

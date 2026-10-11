@@ -8,6 +8,7 @@ mod fleet;
 mod labels;
 mod markdown;
 mod notify;
+mod outputs;
 mod search;
 mod session;
 mod sessions;

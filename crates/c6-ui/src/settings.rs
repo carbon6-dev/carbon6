@@ -733,6 +733,38 @@ fn skill_examples() -> Vec<(&'static str, serde_json::Value)> {
                 ("body", "1. Update CHANGELOG.md.\n2. Bump the version.\n3. Tag vX.Y.Z and push the tag."),
             ]),
         ),
+        (
+            "Slide deck (HTML)",
+            item(&[
+                ("name", "slide-deck"),
+                ("description", "Making a slide deck or presentation"),
+                (
+                    "body",
+                    "Make the deck as ONE self-contained HTML file (deck.html): no external scripts, fonts or images, so it works offline and in a sandbox (embed images as data: URLs or inline SVG).\n\n\
+                     - Each slide is a <section> sized 16:9 (e.g. 1280x720), centered, one idea per slide: a title and at most 5 short bullets, or one chart or diagram.\n\
+                     - A clean theme with CSS variables, large type (title 48px, body 28px), generous spacing, consistent accent colour.\n\
+                     - Navigation: arrow keys and space move between slides, a slide counter in a corner, the URL hash tracks the slide.\n\
+                     - Printing: @media print puts each slide on its own landscape page, so Print → Save as PDF gives a PDF deck.\n\
+                     - Start with a title slide, end with a summary or next steps; put details in speaker notes (<aside class=notes>, hidden).\n\n\
+                     Check it renders (the HTML is valid and every slide fits), then publish it with the publish tool, titled after the talk. On changes, edit the same file and publish again.",
+                ),
+            ]),
+        ),
+        (
+            "Research report",
+            item(&[
+                ("name", "research-report"),
+                ("description", "Researching a topic and writing up the findings"),
+                (
+                    "body",
+                    "1. Restate the question and what a good answer needs; split it into 3-6 sub-questions.\n\
+                     2. For each, search the web (several phrasings), read the most promising primary sources with the fetch tool, and note facts with their URLs. For independent sub-questions, use background subagents.\n\
+                     3. Cross-check important claims in at least two sources; note disagreements and dates.\n\
+                     4. Write report.md: a summary up front (the answer in a few sentences), then a section per sub-question, numbered citations [1] after the claims they support, and a Sources list (title, URL, date) at the end. Say plainly what is uncertain.\n\
+                     5. Publish report.md with the publish tool.",
+                ),
+            ]),
+        ),
     ]
 }
 

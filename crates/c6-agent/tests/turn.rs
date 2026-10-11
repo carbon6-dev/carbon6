@@ -150,5 +150,6 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::Checkpoint(_) => "checkpoint",
         session_event::Kind::Rewound(_) => "rewound",
         session_event::Kind::BackgroundTask(_) => "background_task",
+        session_event::Kind::Output(_) => "output",
     }
 }

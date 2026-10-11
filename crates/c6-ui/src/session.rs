@@ -363,6 +363,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                         <crate::fleet::TabButton tab label="Files" value="files" />
                                     })}
                                     <crate::fleet::TabButton tab label="Terminal" value="terminal" />
+                                    {move || (events.with(|e| crate::outputs::count(e)) > 0).then(|| view! { <crate::fleet::TabButton tab label="Outputs" value="outputs" /> })}
                                     <crate::fleet::TabButton tab label="Config" value="config" />
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
                                         tab.set("transcript");
@@ -405,6 +406,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     }
                     ("transcript", _, _) => ().into_any(),
                     ("config", _, _) => view! { <crate::labels::SessionConfig session=id_stored.get_value() /> }.into_any(),
+                    ("outputs", _, _) => view! { <crate::outputs::Outputs session=id_stored.get_value() events /> }.into_any(),
                     _ => view! { <p class="py-6 text-center text-sm text-zinc-500">"Available once the session has started."</p> }.into_any(),
                 }
             }}
@@ -1099,6 +1101,7 @@ fn render_event(
             </details>
         }
         .into_any(),
+        EventKind::Output { name, title, size, .. } => crate::outputs::published_line(session, e.seq, name, title, *size),
         EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, .. } => {
             crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
         }

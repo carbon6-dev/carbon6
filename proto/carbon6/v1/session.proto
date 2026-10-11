@@ -24,7 +24,17 @@ message SessionEvent {
     Checkpoint checkpoint = 20;
     Rewound rewound = 21;
     BackgroundTask background_task = 22;
+    Output output = 23;
   }
+}
+
+// A deliverable the agent published (publish_file): the file's content as
+// it was then. The same name again is a new version.
+message Output {
+  string name = 1;
+  string title = 2;
+  string mime = 3;
+  bytes data = 4;
 }
 
 // A background task (a shell command or subagent) started or ended.

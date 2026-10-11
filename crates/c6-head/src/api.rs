@@ -50,6 +50,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
+        .route("/api/v1/sessions/{id}/outputs/{seq}", get(output))
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
         .route("/api/v1/sessions/{id}/config", get(session_config))
@@ -778,6 +779,45 @@ async fn set_session_labels(
 
 async fn session_config(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::EffectiveConfig>> {
     Ok(Json(crate::sessions::effective_config(&st, &id).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct Download {
+    #[serde(default)]
+    download: Option<String>,
+}
+
+/// A published output's content. Pages the agent wrote (HTML, SVG) are
+/// served sandboxed: an origin of their own, so they cannot act as you.
+async fn output(State(st): State<Arc<HeadState>>, Path((id, seq)): Path<(String, u64)>, Query(q): Query<Download>) -> ApiResult<Response> {
+    let ev = st.store.events_after(&id, seq.saturating_sub(1), 1).await?;
+    let Some(c6_proto::session_event::Kind::Output(o)) = ev.into_iter().find(|e| e.seq == seq).and_then(|e| e.kind) else {
+        return Err(ApiErr(StatusCode::NOT_FOUND, "no such output".into()));
+    };
+    let file = o.name.rsplit('/').next().unwrap_or("output").replace('"', "");
+    let mut headers = vec![
+        (header::CONTENT_TYPE, if o.mime.starts_with("text/") { format!("{}; charset=utf-8", o.mime) } else { o.mime.clone() }),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+        (header::CACHE_CONTROL, "private, max-age=31536000, immutable".to_owned()),
+    ];
+    // Anything that could run script (HTML, SVG, unknown types) gets an
+    // origin of its own. PDFs, images and text cannot, and Chrome does not
+    // show PDFs in a sandbox.
+    let inert = o.mime == "application/pdf" || (o.mime.starts_with("image/") && o.mime != "image/svg+xml") || o.mime == "text/plain";
+    if !inert {
+        headers.push((
+            header::CONTENT_SECURITY_POLICY,
+            "sandbox allow-scripts allow-popups allow-forms allow-modals allow-downloads".to_owned(),
+        ));
+    }
+    if q.download.is_some() {
+        headers.push((header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\"")));
+    }
+    let mut resp = o.data.into_response();
+    for (k, v) in headers {
+        resp.headers_mut().insert(k, v.parse().map_err(anyhow::Error::from)?);
+    }
+    Ok(resp)
 }
 
 /// The session as a Markdown file.

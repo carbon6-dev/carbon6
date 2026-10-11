@@ -8,6 +8,7 @@ pub mod hooks;
 mod patch;
 mod plan;
 pub mod profiles;
+pub mod publish;
 pub mod remote;
 mod search;
 mod util;
@@ -31,6 +32,7 @@ pub use hooks::Hooks;
 pub use patch::ApplyPatch;
 pub use plan::Plan;
 pub use profiles::tools_for;
+pub use publish::{Publish, PublishSink, Published};
 pub use search::{Glob, Grep};
 pub use web::{SearchConfig, WebFetch, WebSearch};
 
@@ -109,6 +111,8 @@ pub struct SessionTools {
     secrets: Secrets,
     /// The machine the session works on over SSH, if not this one.
     ssh: Option<Arc<remote::SshHost>>,
+    /// Where published files go (the session's log).
+    publisher: Mutex<Option<PublishSink>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -131,7 +135,16 @@ impl SessionTools {
             hooks: Mutex::default(),
             secrets,
             ssh,
+            publisher: Mutex::default(),
         }
+    }
+
+    pub fn set_publisher(&self, p: Option<PublishSink>) {
+        *self.publisher.lock().unwrap() = p;
+    }
+
+    pub fn publisher(&self) -> Option<PublishSink> {
+        self.publisher.lock().unwrap().clone()
     }
 
     pub fn ssh(&self) -> Option<Arc<remote::SshHost>> {

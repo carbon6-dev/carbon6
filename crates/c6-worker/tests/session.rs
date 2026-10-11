@@ -210,5 +210,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::Checkpoint { .. } => "checkpoint",
         EventKind::Rewound { .. } => "rewound",
         EventKind::BackgroundTask { .. } => "background_task",
+        EventKind::Output { .. } => "output",
     }
 }

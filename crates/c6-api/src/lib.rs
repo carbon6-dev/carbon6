@@ -360,6 +360,14 @@ pub enum EventKind {
         #[serde(default)]
         notify: bool,
     },
+    /// A deliverable the agent published. Its content:
+    /// `GET /api/v1/sessions/{id}/outputs/{seq}` (`?download=1` to save).
+    Output {
+        name: String,
+        title: String,
+        mime: String,
+        size: u64,
+    },
     /// From here on the session runs on this model.
     ModelSwitched {
         connection_id: String,

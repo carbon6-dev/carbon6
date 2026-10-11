@@ -112,6 +112,16 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Outputs: decks, reports and other deliverables
+
+When the agent finishes a deliverable (a slide deck, a report, a chart, a document), it publishes it with the `publish_file` tool, and it appears in the session's **Outputs** tab:
+
+- **Preview by type:** HTML pages (decks included) in a sandbox, PDFs, images, Markdown and text. Anything else is offered for download.
+- **Versions:** every publish is kept as a version, with a picker. Open and Download are next to the preview.
+- **In the transcript:** a "📦 Published …" line marks each publish.
+- **Where content lives:** each version's content is stored in the session itself (up to 20 MB), so it's still there when the worker is offline or the file has changed since.
+- **Getting started:** Settings → Skills has examples to start from. **Slide deck** builds one self-contained HTML deck that prints to PDF. **Research report** searches, cross-checks and writes a cited Markdown report.
+
 ### Web search with any model
 
 Claude and OpenAI models search the web through their own provider. For the rest (Ollama and other OpenAI-compatible servers), choose a provider under **Settings → Web search**, and sessions get a `web_search` tool. The options:
