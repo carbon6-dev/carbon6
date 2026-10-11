@@ -654,6 +654,13 @@ pub(crate) struct BuiltTools {
 pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, profile: ToolProfile) -> BuiltTools {
     let mut tools = c6_tools::tools_for(profile);
     let mut errors = Vec::new();
+    // Named agents (.claude/agents) become Task's subagent types.
+    let agents = c6_tools::AgentDef::discover(cwd);
+    if !agents.is_empty()
+        && let Some(i) = tools.iter().position(|t| c6_tools::Task::is_task(&t.spec().name))
+    {
+        tools[i] = Arc::new(c6_tools::Task::with_agents(profile == ToolProfile::Claude, agents));
+    }
 
     #[derive(serde::Deserialize)]
     struct HeadSkill {

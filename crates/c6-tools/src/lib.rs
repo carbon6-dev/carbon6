@@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-pub use agents::{Skill, SkillTool, Subagents, Task};
+pub use agents::{AgentDef, Skill, SkillTool, Subagents, Task};
 pub use background::{Background, BashOutput, KillShell};
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};

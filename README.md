@@ -97,6 +97,10 @@ Type `/` in the message box for the command list.
 - **Your own**, in Claude Code's format: Markdown files in `.claude/commands/` (in the repository, from its root down to the session's folder) or `~/.claude/commands/`. `frontend/component.md` is `/frontend:component`. Frontmatter can set `description` and `argument-hint`. In the body, `$ARGUMENTS` and `$1`…`$9` take the arguments, `` !`cmd` `` the output of a shell command run in the session's folder, and `@path` attaches a file. A project command replaces a built-in or personal one of the same name.
 - Skills in `.claude/skills/*/SKILL.md` and CLAUDE.md/AGENTS.md files are read too (see Configuration).
 
+### Custom agents
+
+Agents in Claude Code's format, `.claude/agents/<name>.md` (in the repository, or `~/.claude/agents/`), become subagent types the model can launch with the Task tool: frontmatter `name`, `description` (the model reads it to pick one), optional `tools` (comma-separated, Claude Code's names, e.g. `Read, Grep, Glob`; all tools when absent) and `model` (`inherit`, `opus`, `sonnet`, `haiku` or a model id; honored on Anthropic connections), and the body as the agent's instructions (its system prompt).
+
 ### Workspace
 
 The UI is a workspace of up to four tiles side by side, each a stack of columns:

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, TurnConfig, run_turn};
 use c6_llm::{Block, Message, ModelClient, Role};
 use c6_proto::{CreateSession, SessionEvent, SessionStarted, UserMessage, session_event};
-use c6_tools::{SessionTools, Subagents, Task, Tool};
+use c6_tools::{AgentDef, SessionTools, Subagents, Task, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -45,14 +45,40 @@ impl Runner {
 
 #[async_trait]
 impl Subagents for Runner {
-    async fn run(&self, parent_call_id: &str, description: &str, prompt: &str, cancel: CancellationToken) -> Result<String, String> {
+    async fn run(
+        &self,
+        parent_call_id: &str,
+        description: &str,
+        prompt: &str,
+        agent: Option<&AgentDef>,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
         let child_id = uuid::Uuid::now_v7().to_string();
         let p = &self.parent;
+        let tools: Vec<Arc<dyn Tool>> = self.tools.iter().filter(|t| agent.is_none_or(|a| a.allows(&t.spec().name))).cloned().collect();
+        let mut cfg = TurnConfig { cache_key: child_id.clone(), ..self.cfg.clone() };
+        if let Some(a) = agent {
+            // The agent's instructions are its system prompt.
+            cfg.system_prompt = format!(
+                "{}\n\n# Environment\n\nWorking directory: {}\nToday's date: {}",
+                a.prompt,
+                p.started.cwd,
+                time::OffsetDateTime::now_utc().date()
+            );
+            let kind = p.spec.model.as_ref().map(|m| m.connection_kind.as_str()).unwrap_or_default();
+            if let Some(model) = agent_model(&a.model, kind) {
+                cfg.model = model;
+            }
+        }
         let started = SessionStarted {
-            title: description.to_owned(),
+            title: match agent {
+                Some(a) => format!("{description} ({})", a.name),
+                None => description.to_owned(),
+            },
             parent_session_id: p.session_id.clone(),
             parent_call_id: parent_call_id.to_owned(),
-            tools: self.tools.iter().map(|t| t.spec().name).collect(),
+            tools: tools.iter().map(|t| t.spec().name).collect(),
+            system_prompt: if agent.is_some() { cfg.system_prompt.clone() } else { p.started.system_prompt.clone() },
             ..p.started.clone()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
@@ -73,10 +99,9 @@ impl Subagents for Runner {
             .await
             .map_err(|e| format!("{e:#}"))?;
 
-        let cfg = TurnConfig { cache_key: child_id.clone(), ..self.cfg.clone() };
         let session_tools = Arc::new(SessionTools::new(std::path::PathBuf::from(&started.cwd)));
         let mut conv = Conversation { history: vec![Message::user_text(text)], context_tokens: 0 };
-        let reason = run_turn(1, &cfg, self.client.as_ref(), &self.tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
+        let reason = run_turn(1, &cfg, self.client.as_ref(), &tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
             .await
             .map_err(|e| format!("{e:#}"))?;
         let answer: Vec<String> = conv
@@ -90,5 +115,21 @@ impl Subagents for Runner {
             return Err(format!("the subagent ended ({reason:?}) without a report"));
         }
         Ok(format!("{}\n\n[subagent session {child_id}]", answer.join("\n")))
+    }
+}
+
+/// The model a named agent asks for, where it can have it: Claude aliases
+/// and ids on an Anthropic connection. Otherwise it runs on the parent's.
+fn agent_model(wanted: &str, connection_kind: &str) -> Option<String> {
+    if connection_kind != "anthropic" {
+        return None;
+    }
+    match wanted.trim() {
+        "" | "inherit" => None,
+        "opus" => Some("claude-opus-5-5".into()),
+        "sonnet" => Some("claude-sonnet-5-5".into()),
+        "haiku" => Some("claude-haiku-4-5".into()),
+        id if id.starts_with("claude-") => Some(id.into()),
+        _ => None,
     }
 }
