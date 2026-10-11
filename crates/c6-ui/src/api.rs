@@ -408,3 +408,8 @@ pub async fn set_labels(id: String, labels: Vec<String>) -> Result<Session, Stri
 pub async fn session_config(id: String) -> Result<c6_api::EffectiveConfig, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}/config")).send().await).await
 }
+
+/// Stops a session's background task.
+pub async fn stop_task(id: String, task: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/tasks/{task}/stop")).send().await).await
+}

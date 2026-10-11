@@ -13,6 +13,10 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
     let mut tools = std::collections::HashMap::new();
     for ev in &c6_agent::effective_events(events) {
         match &ev.kind {
+            Some(Kind::User(u)) if u.command == "task-notification" || u.command == "stop-hook" => {
+                let what = if u.command == "stop-hook" { "Stop hook" } else { "Background task ended" };
+                out.push_str(&format!("\n> **{what}**\n>\n{}\n", u.text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")))
+            }
             Some(Kind::User(u)) if !u.blocked.is_empty() => {
                 out.push_str(&format!("\n## You\n\n~~{}~~\n\n> Blocked by a hook: {}\n", u.text, u.blocked))
             }

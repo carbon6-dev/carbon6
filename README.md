@@ -112,6 +112,17 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Background tasks
+
+The agent can start work in the background and carry on: long builds, test suites, servers (`bash` with `run_in_background`), and subagents (Task with `run_in_background`).
+
+- **When a task ends, the agent is told.** It gets the exit code, how long the task ran and the end of its output (for a subagent, its report). If a turn is running, the agent sees it at its next step. If the session is idle, a new turn starts so the agent can react by itself. "Start the build and tell me when it's done" works without you checking back.
+- **Opting out.** A task started with `notify: false` doesn't wake anyone. Use it for servers and watchers meant to keep running.
+- **The running-tasks control.** The session header shows **⚙ N running**: each task, how long it has run, and a **Stop** button. The agent is told when you stop one.
+- **In the transcript**, each ending appears as a one-line entry, with the agent's notice folded underneath.
+- **Limit.** Notices start at most 20 turns per hour in an idle session. Beyond that they're held until your next message, and the session says so.
+- **Worker restarts.** Tasks die with the worker; the agent is told they were lost, and a command left running by the old worker process is stopped.
+
 ### Rewind and edit
 
 Hover one of your messages: **↶ Rewind** takes the conversation back to before it, and **✎ Edit** changes it and sends it again. Either can also restore files: before each turn the worker snapshots the session's folder into a private repository in its state directory (your own git repository, if any, is never touched; folders without git work too; `node_modules/`, `target/` and the like are skipped, as are files your `.gitignore` ignores). Rewound messages stay in the transcript, folded under a marker.

@@ -365,6 +365,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                         tab.set("transcript");
                                         find_open.set(true);
                                     }>"Find"</button>
+                                    <crate::tasks::RunningTasks session=id_stored.get_value() events />
                                     {move || view! { <StatusPill status=status.get() /> }}
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
                                         spawn_local(async move {
@@ -1084,6 +1085,17 @@ fn render_event(
             <details class="text-xs text-zinc-500">
                 <summary class="cursor-pointer select-none">{format!("Session started · {} tools", tools.len())}</summary>
                 <pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{system_prompt.clone()}</pre>
+            </details>
+        }
+        .into_any(),
+        EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, .. } => {
+            crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
+        }
+        // What the agent was told about a task: folded.
+        EventKind::User { text, command, .. } if command == "task-notification" => view! {
+            <details class="text-xs text-zinc-500">
+                <summary class="cursor-pointer select-none">"↳ the agent was told"</summary>
+                <pre class="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-2 font-mono text-[11px] dark:bg-zinc-900">{text.clone()}</pre>
             </details>
         }
         .into_any(),

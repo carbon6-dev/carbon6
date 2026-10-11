@@ -520,6 +520,17 @@ pub async fn interrupt(st: &HeadState, session_id: &str) -> anyhow::Result<bool>
     Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
 }
 
+/// Stops a session's background task. `false`: its worker is not connected.
+pub async fn stop_task(st: &HeadState, session_id: &str, task_id: &str) -> anyhow::Result<bool> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let cmd = SessionCommand {
+        command_id: Uuid::now_v7().to_string(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::StopTask(c6_proto::StopTask { task_id: task_id.to_owned() })),
+    };
+    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+}
+
 pub async fn publish_queue(st: &HeadState, session_id: &str) {
     match st.store.queued_inputs(session_id).await {
         Ok(rows) => st.hub.publish(session_id, api::StreamMsg::Queue { queued: rows.iter().map(convert::queued).collect() }),

@@ -334,6 +334,22 @@ pub enum EventKind {
         #[serde(default)]
         restore_error: String,
     },
+    /// A background task (shell command or subagent) started or ended.
+    BackgroundTask {
+        task_id: String,
+        /// "shell" or "agent".
+        kind: String,
+        description: String,
+        /// "started", "finished", "stopped" (by the agent),
+        /// "stopped_by_user" or "lost" (the worker restarted).
+        state: String,
+        #[serde(default)]
+        exit_code: i32,
+        #[serde(default)]
+        elapsed_ms: u64,
+        #[serde(default)]
+        notify: bool,
+    },
     /// From here on the session runs on this model.
     ModelSwitched {
         connection_id: String,

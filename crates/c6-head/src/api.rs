@@ -48,6 +48,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
+        .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
         .route("/api/v1/sessions/{id}/config", get(session_config))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
@@ -761,6 +762,14 @@ async fn rewind_session(
 ) -> ApiResult<StatusCode> {
     crate::sessions::rewind(&st, &id, &req).await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn stop_task(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    if crate::sessions::stop_task(&st, &id, &task).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
+    }
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

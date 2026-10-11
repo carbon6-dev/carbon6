@@ -209,5 +209,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::ModelSwitched { .. } => "model_switched",
         EventKind::Checkpoint { .. } => "checkpoint",
         EventKind::Rewound { .. } => "rewound",
+        EventKind::BackgroundTask { .. } => "background_task",
     }
 }

@@ -149,5 +149,6 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::ModelSwitched(_) => "model_switched",
         session_event::Kind::Checkpoint(_) => "checkpoint",
         session_event::Kind::Rewound(_) => "rewound",
+        session_event::Kind::BackgroundTask(_) => "background_task",
     }
 }

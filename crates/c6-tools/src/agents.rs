@@ -91,7 +91,8 @@ impl Tool for Task {
             .to_owned();
         let mut properties = json!({
             "description": {"type": "string", "description": "A short (3-5 word) description of the task"},
-            "prompt": {"type": "string", "description": "The complete task for the subagent"}
+            "prompt": {"type": "string", "description": "The complete task for the subagent"},
+            "run_in_background": {"type": "boolean", "description": "Start it in the background and continue; its report arrives as a notice when it finishes (stop it with the kill tool)"}
         });
         if !self.agents.is_empty() {
             description.push_str("\n\nSpecialized agents (set subagent_type; omit it, or use general-purpose, for a general one):\n");
@@ -129,6 +130,18 @@ impl Tool for Task {
                 }
             },
         };
+        if input["run_in_background"].as_bool() == Some(true) {
+            let (id, cancel) = ctx.session.background.start_agent(description, true);
+            let (session, call_id, description, prompt, agent, task) =
+                (ctx.session.clone(), ctx.call_id.clone(), description.to_owned(), prompt.to_owned(), agent.cloned(), id.clone());
+            tokio::spawn(async move {
+                let result = agents.run(&call_id, &description, &prompt, agent.as_ref(), cancel).await;
+                session.background.finish_agent(&task, result);
+            });
+            return ToolOutput::ok(format!(
+                "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
+            ));
+        }
         match agents.run(&ctx.call_id, description, prompt, agent, ctx.cancel.clone()).await {
             Ok(answer) => ToolOutput::limited(answer, false),
             Err(e) => ToolOutput::err(format!("subagent failed: {e}")),

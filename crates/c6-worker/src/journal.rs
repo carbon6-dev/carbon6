@@ -183,6 +183,12 @@ impl Journal {
     }
 
     /// Sessions left mid-turn by a crash: (session id, last seq, open turn).
+    /// Sessions with background tasks that never ended.
+    pub async fn sessions_with_open_tasks(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM sessions WHERE open_tasks > 0").fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| r.get("id")).collect())
+    }
+
     pub async fn open_turns(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
         let rows = sqlx::query("SELECT id, last_seq, open_turn FROM sessions WHERE open_turn IS NOT NULL").fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|r| (r.get("id"), r.get::<i64, _>("last_seq") as u64, r.get::<i64, _>("open_turn") as u64)).collect())
@@ -224,6 +230,14 @@ async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &Se
     };
     // Without its row the event would never be uploaded.
     anyhow::ensure!(updated.rows_affected() == 1, "session {session_id} is not in the journal");
+    if let Some(session_event::Kind::BackgroundTask(t)) = &event.kind {
+        let delta = if t.state == "started" { 1 } else { -1 };
+        sqlx::query("UPDATE sessions SET open_tasks = MAX(open_tasks + ?, 0) WHERE id = ?")
+            .bind(delta)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let command_id = match &event.kind {
         Some(session_event::Kind::User(u)) => Some(&u.command_id),
         Some(session_event::Kind::Started(s)) => Some(&s.command_id),

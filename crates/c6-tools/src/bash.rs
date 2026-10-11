@@ -31,6 +31,13 @@ struct BashInput {
     timeout_ms: Option<u64>,
     #[serde(default)]
     run_in_background: bool,
+    /// With run_in_background: tell the agent when it ends.
+    #[serde(default = "yes")]
+    notify: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[async_trait]
@@ -48,7 +55,8 @@ impl Tool for Bash {
                 "properties": {
                     "command": {"type": "string", "description": "The command to run"},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Timeout in milliseconds"},
-                    "run_in_background": {"type": "boolean", "description": "Start the command in the background (servers, watchers, long builds) and return an id for bash_output / kill_shell"}
+                    "run_in_background": {"type": "boolean", "description": "Start the command in the background (servers, watchers, long builds) and return an id for bash_output / kill_shell. You are told when it finishes, so you need not poll."},
+                    "notify": {"type": "boolean", "description": "With run_in_background: be told when it finishes (default true). Set false for servers and watchers meant to keep running."}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -66,10 +74,14 @@ impl Tool for Bash {
             Err(e) => return e,
         };
         if input.run_in_background {
-            return match ctx.session.background.spawn(&input.command, &ctx.session.cwd()) {
-                Ok(id) => ToolOutput::ok(format!(
-                    "Started in the background as {id}. Read its output with the output tool and stop it with the kill tool."
-                )),
+            return match ctx.session.background.spawn(&input.command, &ctx.session.cwd(), input.notify) {
+                Ok(id) => ToolOutput::ok(if input.notify {
+                    format!(
+                        "Started in the background as {id}. You will be told when it finishes (with the end of its output); meanwhile, read its output with the output tool or stop it with the kill tool."
+                    )
+                } else {
+                    format!("Started in the background as {id}. Read its output with the output tool and stop it with the kill tool.")
+                }),
                 Err(e) => ToolOutput::err(format!("failed to start: {e}")),
             };
         }
@@ -273,5 +285,42 @@ mod tests {
         let r = Bash.call(&ctx, json!({"command": "(sleep 5 &) ; echo started"})).await;
         assert_eq!(r.content, "started\n");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn background_tasks_report_when_they_end() {
+        use crate::{KillShell, TaskKind, TaskState};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), Default::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.session.background.set_sink(Some(tx));
+        let next = async |rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::TaskEvent>| {
+            tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap()
+        };
+
+        Bash.call(&ctx, json!({"command": "for i in 1 2 3; do echo line $i; done; exit 3", "run_in_background": true})).await;
+        let started = next(&mut rx).await;
+        assert_eq!((started.id.as_str(), started.kind, started.state, started.notify), ("bg1", TaskKind::Shell, TaskState::Started, true));
+        let done = next(&mut rx).await;
+        assert_eq!((done.state, done.exit_code), (TaskState::Finished, Some(3)));
+        assert_eq!(done.output, "line 1\nline 2\nline 3", "the end of its output");
+
+        // Stopped by the agent, or by the user; a quiet one says so.
+        Bash.call(&ctx, json!({"command": "sleep 30", "run_in_background": true, "notify": false})).await;
+        assert!(!next(&mut rx).await.notify);
+        KillShell::generic().call(&ctx, json!({"id": "bg2"})).await;
+        assert_eq!(next(&mut rx).await.state, TaskState::Stopped);
+        Bash.call(&ctx, json!({"command": "sleep 30", "run_in_background": true})).await;
+        next(&mut rx).await;
+        assert_eq!(ctx.session.background.kill_by_user("bg3"), Some(true));
+        assert_eq!(next(&mut rx).await.state, TaskState::StoppedByUser);
+        assert!(ctx.session.background.list().iter().all(|t| !t.running));
+
+        // A background subagent's report.
+        let (id, _cancel) = ctx.session.background.start_agent("look around", true);
+        assert_eq!(next(&mut rx).await.kind, TaskKind::Agent);
+        ctx.session.background.finish_agent(&id, Ok("found it".into()));
+        let done = next(&mut rx).await;
+        assert_eq!((done.state, done.exit_code, done.output.as_str()), (TaskState::Finished, Some(0), "found it"));
     }
 }

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
 use c6_llm::{Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
-    Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Rewound, SessionActivity, SessionCommand,
-    SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, session_command, session_event,
+    BackgroundTask, Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Rewound, SessionActivity,
+    SessionCommand, SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, session_command, session_event,
 };
 use c6_tools::{SessionTools, Skill, SkillTool, Tool};
 use tokio::sync::mpsc;
@@ -100,7 +100,25 @@ enum ActorMsg {
     /// what is needed to pick the variant of a custom command it invokes.
     Input(Box<PendingInput>, Option<ModelSpec>, Box<CommandChoice>),
     Interrupt,
+    /// A background task started or ended.
+    Task(c6_tools::TaskEvent),
+    /// A background task that was running when the worker restarted.
+    Lost {
+        task_id: String,
+        kind: String,
+        description: String,
+        notify: bool,
+        pgid: i32,
+    },
+    /// Stop a background task (the user asked).
+    StopTask(String),
+    /// Task ids up to bg{n} were used before a restart.
+    Reserve(u64),
 }
+
+/// Background-task notices may start this many turns per hour in an idle
+/// session; beyond that they wait for your next message.
+const AUTO_TURNS_PER_HOUR: usize = 20;
 
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
@@ -123,6 +141,13 @@ impl SessionManager {
                 kind: Some(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::WorkerRestarted as i32 })),
             };
             self.journal.append(&session_id, &ev).await?;
+        }
+        // Background tasks died with the previous process: resuming those
+        // sessions reports them as lost.
+        for session_id in self.journal.sessions_with_open_tasks().await? {
+            if let Err(e) = self.actor(&session_id).await {
+                warn!(session = %session_id, "resuming for lost background tasks: {e:#}");
+            }
         }
         Ok(())
     }
@@ -179,6 +204,13 @@ impl SessionManager {
             Some(session_command::Kind::Interrupt(_)) => {
                 if let Some(a) = self.actors.lock().unwrap().get(&cmd.session_id) {
                     let _ = a.send(ActorMsg::Interrupt);
+                }
+                Ok(())
+            }
+            Some(session_command::Kind::StopTask(t)) => {
+                // Without a live actor no task of the session is running.
+                if let Some(a) = self.actors.lock().unwrap().get(&cmd.session_id) {
+                    let _ = a.send(ActorMsg::StopTask(t.task_id));
                 }
                 Ok(())
             }
@@ -321,7 +353,25 @@ impl SessionManager {
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
         let mut spec = spec;
         let conv = conversation_from_log(&mut spec, &events);
-        Ok(Some(self.spawn(session_id, spec, started, conv, next_seq, turns, None).await))
+        let tx = self.spawn(session_id, spec, started, conv, next_seq, turns, None).await;
+        // Background tasks still running when the worker stopped are gone.
+        let mut open: Vec<c6_proto::BackgroundTask> = Vec::new();
+        let mut highest = 0u64;
+        for e in &events {
+            if let Some(session_event::Kind::BackgroundTask(t)) = &e.kind {
+                highest = highest.max(t.task_id.trim_start_matches("bg").parse().unwrap_or(0));
+                open.retain(|o| o.task_id != t.task_id);
+                if t.state == "started" {
+                    open.push(t.clone());
+                }
+            }
+        }
+        let _ = tx.send(ActorMsg::Reserve(highest));
+        for t in open {
+            let _ =
+                tx.send(ActorMsg::Lost { task_id: t.task_id, kind: t.kind, description: t.description, notify: t.notify, pgid: t.pgid });
+        }
+        Ok(Some(tx))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -358,6 +408,17 @@ impl SessionManager {
         let session_tools = Arc::new(SessionTools::new(PathBuf::from(&started.cwd)));
         if started.tool_profile != crate::claude_code::PROFILE {
             session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
+            // Background tasks report to the actor.
+            let (task_tx, mut task_rx) = mpsc::unbounded_channel();
+            session_tools.background.set_sink(Some(task_tx));
+            let actor_tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = task_rx.recv().await {
+                    if actor_tx.send(ActorMsg::Task(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
         }
         let actor = Actor {
             spec,
@@ -372,6 +433,8 @@ impl SessionManager {
             link: self.link.clone(),
             inbox: Arc::default(),
             checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, Path::new(&started_cwd))),
+            auto_turns: VecDeque::new(),
+            deferred: Vec::new(),
         };
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), tx.clone());
@@ -483,6 +546,10 @@ struct Actor {
     tools: Vec<Arc<dyn Tool>>,
     inbox: Arc<Mutex<Inbox>>,
     checkpoints: Arc<Checkpoints>,
+    /// When background-task notices started turns (for the hourly limit).
+    auto_turns: VecDeque<std::time::Instant>,
+    /// Notices held back by that limit, delivered with your next message.
+    deferred: Vec<PendingInput>,
 }
 
 impl Actor {
@@ -549,11 +616,56 @@ impl Actor {
                                 input.prompt = format!("{}\n\n<user-prompt-submit-hook>\n{context}\n</user-prompt-submit-hook>", input.model_text());
                             }
                         }
-                        self.inbox.lock().unwrap().push(*input, model)
+                        let held: Vec<PendingInput> = std::mem::take(&mut self.deferred);
+                        let mut inbox = self.inbox.lock().unwrap();
+                        for n in held {
+                            inbox.push(n, None);
+                        }
+                        inbox.push(*input, model)
                     }
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
                     }
+                    Some(ActorMsg::Task(ev)) => {
+                        let state = match ev.state {
+                            c6_tools::TaskState::Started => "started",
+                            c6_tools::TaskState::Finished => "finished",
+                            c6_tools::TaskState::Stopped => "stopped",
+                            c6_tools::TaskState::StoppedByUser => "stopped_by_user",
+                        };
+                        let record = BackgroundTask {
+                            task_id: ev.id.clone(),
+                            kind: ev.kind.as_str().into(),
+                            description: ev.description.clone(),
+                            state: state.into(),
+                            exit_code: ev.exit_code.unwrap_or(0),
+                            elapsed_ms: ev.elapsed.as_millis() as u64,
+                            notify: ev.notify,
+                            pgid: ev.pgid.unwrap_or(0),
+                        };
+                        // The agent stopped it itself: nothing to tell it.
+                        let notice = (ev.notify && !matches!(ev.state, c6_tools::TaskState::Started | c6_tools::TaskState::Stopped))
+                            .then(|| task_notice(&record, &ev.output));
+                        if let Err(e) = self.task_event(record, notice, running.is_some()).await {
+                            error!(session = %self.writer.session_id, "recording a background task: {e:#}");
+                            return;
+                        }
+                    }
+                    Some(ActorMsg::Lost { task_id, kind, description, notify, pgid }) => {
+                        // It may outlive the worker (its own process group):
+                        // stop it, since nothing reads its output any more.
+                        stop_orphan(pgid, &description);
+                        let record = BackgroundTask { task_id, kind, description, state: "lost".into(), notify, ..Default::default() };
+                        let notice = notify.then(|| task_notice(&record, ""));
+                        if let Err(e) = self.task_event(record, notice, running.is_some()).await {
+                            error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
+                            return;
+                        }
+                    }
+                    Some(ActorMsg::StopTask(id)) => {
+                        self.session_tools.background.kill_by_user(&id);
+                    }
+                    Some(ActorMsg::Reserve(n)) => self.session_tools.background.reserve_ids(n),
                     Some(ActorMsg::Rewind { command_id, to_seq, restore_files }) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
                         rewind = Some((command_id, to_seq, restore_files));
@@ -577,6 +689,50 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Logs a background task's start or end and, for an end the agent
+    /// should hear about, queues the notice: it reaches a running turn at
+    /// its next step, and starts a turn in an idle session (within the
+    /// hourly limit; beyond it the notice waits for your next message).
+    async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool) -> anyhow::Result<()> {
+        let task_id = record.task_id.clone();
+        self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
+        let Some(text) = notice else { return Ok(()) };
+        let input = PendingInput {
+            command_id: format!("task:{}", uuid::Uuid::now_v7()),
+            text,
+            command: "task-notification".into(),
+            ..Default::default()
+        };
+        let now = std::time::Instant::now();
+        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(3600)) {
+            self.auto_turns.pop_front();
+        }
+        let held = {
+            let mut inbox = self.inbox.lock().unwrap();
+            if busy || !inbox.queue.is_empty() {
+                inbox.push(input, None);
+                None
+            } else if self.auto_turns.len() < AUTO_TURNS_PER_HOUR {
+                self.auto_turns.push_back(now);
+                inbox.push(input, None);
+                None
+            } else {
+                Some(input)
+            }
+        };
+        let Some(input) = held else { return Ok(()) };
+        warn!(session = %self.writer.session_id, task = %task_id, "background-task notice held: too many automatic turns this hour");
+        self.deferred.push(input);
+        self.writer
+            .append(session_event::Kind::Error(ErrorEvent {
+                message: format!(
+                    "Background task {task_id} ended. The agent will hear about it with your next message: notices already started {AUTO_TURNS_PER_HOUR} turns in the last hour."
+                ),
+            }))
+            .await?;
+        Ok(())
     }
 
     /// Rewinds the conversation to before event `to_seq`, restoring files
@@ -892,6 +1048,57 @@ impl EventSink for Writer {
     }
 }
 
+/// Stops a background command left running by a previous worker process,
+/// if process group `pgid` still runs that command (pids get reused).
+fn stop_orphan(pgid: i32, command: &str) {
+    if pgid <= 0 {
+        return;
+    }
+    let args = std::process::Command::new("ps").args(["-o", "args=", "-p", &pgid.to_string()]).output();
+    let Ok(out) = args else { return };
+    let line = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() && line.contains(command.trim()) {
+        warn!(pgid, %command, "stopping a background command left by the previous worker");
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGTERM);
+    }
+}
+
+/// What the agent is told when a background task ends.
+fn task_notice(t: &BackgroundTask, output: &str) -> String {
+    let secs = t.elapsed_ms / 1000;
+    let elapsed = if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
+    } else if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    let agent = t.kind == "agent";
+    let status = match t.state.as_str() {
+        "finished" if agent && t.exit_code == 0 => "finished".to_owned(),
+        "finished" if agent => "failed".to_owned(),
+        "finished" => format!("exited with code {}", t.exit_code),
+        "stopped_by_user" => "stopped by the user".to_owned(),
+        "lost" => "lost: the worker restarted while it was running; it has been stopped and its output is gone".to_owned(),
+        other => other.to_owned(),
+    };
+    let mut s =
+        format!("<background-task id=\"{}\" kind=\"{}\" status=\"{status}\"", t.task_id, if agent { "subagent" } else { "command" });
+    if t.state != "lost" {
+        s.push_str(&format!(" elapsed=\"{elapsed}\""));
+    }
+    s.push_str(">\n");
+    s.push_str(&format!("{}: {}\n", if agent { "Task" } else { "Command" }, t.description));
+    if !output.trim().is_empty() {
+        s.push_str(&format!("{}:\n{}\n", if agent { "Report" } else { "Last output" }, output.trim_end()));
+    }
+    s.push_str("</background-task>");
+    if !agent && t.state != "lost" {
+        s.push_str(&format!("\n(Full output: the output tool with id {}.)", t.task_id));
+    }
+    s
+}
+
 #[cfg(test)]
 mod label_tests {
     use super::*;
@@ -921,5 +1128,25 @@ mod label_tests {
         assert_eq!(repo_slug(d).await, "example.com/team/tool");
         git(&["remote", "add", "origin", "https://github.com/acme/app.git"]);
         assert_eq!(repo_slug(d).await, "github.com/acme/app", "origin wins");
+    }
+
+    #[test]
+    fn stops_orphaned_background_commands() {
+        use std::os::unix::process::CommandExt;
+        let spawn = |cmd: &str| std::process::Command::new("/bin/sh").args(["-c", cmd]).process_group(0).spawn().unwrap();
+        let mut orphan = spawn("sleep 77; echo orphan-test");
+        let mut other = spawn("sleep 78; echo other-test");
+        let pid = |c: &std::process::Child| c.id() as i32;
+        // A different command under that pid is left alone.
+        stop_orphan(pid(&other), "sleep 77; echo orphan-test");
+        stop_orphan(pid(&orphan), "sleep 77; echo orphan-test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while orphan.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the orphan was not stopped");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(other.try_wait().unwrap().is_none(), "another command was stopped");
+        other.kill().unwrap();
+        let _ = other.wait();
     }
 }

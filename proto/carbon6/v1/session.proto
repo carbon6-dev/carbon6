@@ -23,7 +23,27 @@ message SessionEvent {
     ModelSwitched model_switched = 19;
     Checkpoint checkpoint = 20;
     Rewound rewound = 21;
+    BackgroundTask background_task = 22;
   }
+}
+
+// A background task (a shell command or subagent) started or ended.
+message BackgroundTask {
+  string task_id = 1;
+  // "shell" or "agent".
+  string kind = 2;
+  // The command, or the subagent's description.
+  string description = 3;
+  // "started", "finished", "stopped" (by the agent), "stopped_by_user", or
+  // "lost" (the worker restarted while it ran).
+  string state = 4;
+  // When it finished.
+  int32 exit_code = 5;
+  uint64 elapsed_ms = 6;
+  // The agent is told when it ends.
+  bool notify = 7;
+  // A shell task's process group, so a restarted worker can stop it.
+  int32 pgid = 8;
 }
 
 // A snapshot of the session's working directory, taken before a turn's
@@ -259,7 +279,13 @@ message SessionCommand {
     Interrupt interrupt = 12;
     Restore restore = 13;
     Rewind rewind = 14;
+    StopTask stop_task = 15;
   }
+}
+
+// Stops a session's background task (from the UI).
+message StopTask {
+  string task_id = 1;
 }
 
 // Rewinds the conversation to before event `to_seq` (a user message),

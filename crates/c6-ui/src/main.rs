@@ -12,6 +12,7 @@ mod search;
 mod session;
 mod sessions;
 mod settings;
+mod tasks;
 mod term;
 mod util;
 mod workspace;

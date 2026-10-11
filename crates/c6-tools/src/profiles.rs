@@ -122,7 +122,8 @@ fn claude() -> Vec<Arc<dyn Tool>> {
                     "command": {"type": "string", "description": "The command to execute"},
                     "timeout": {"type": "number", "description": "Optional timeout in milliseconds (max 600000)"},
                     "description": {"type": "string", "description": "Clear, concise description of what this command does in 5-10 words"},
-                    "run_in_background": {"type": "boolean", "description": "Run in the background; read output later with BashOutput"}
+                    "run_in_background": {"type": "boolean", "description": "Run in the background; read output later with BashOutput. You are told when it finishes."},
+                    "notify": {"type": "boolean", "description": "With run_in_background: be told when it finishes (default true). Set false for servers and watchers meant to keep running."}
                 }, "required": ["command"], "additionalProperties": false}),
             },
             inner: Arc::new(Bash),

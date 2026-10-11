@@ -24,7 +24,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub use agents::{AgentDef, Skill, SkillTool, Subagents, Task};
-pub use background::{Background, BashOutput, KillShell};
+pub use background::{Background, BashOutput, KillShell, TaskEvent, TaskInfo, TaskKind, TaskSink, TaskState};
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};
 pub use hooks::Hooks;

@@ -90,6 +90,15 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         Kind::Error(e) => api::EventKind::Error { message: e.message.clone() },
         Kind::Compaction(c) => api::EventKind::Compaction { summary: c.summary.clone(), tokens_before: c.tokens_before },
         Kind::Checkpoint(c) => api::EventKind::Checkpoint { error: c.error.clone() },
+        Kind::BackgroundTask(t) => api::EventKind::BackgroundTask {
+            task_id: t.task_id.clone(),
+            kind: t.kind.clone(),
+            description: t.description.clone(),
+            state: t.state.clone(),
+            exit_code: t.exit_code,
+            elapsed_ms: t.elapsed_ms,
+            notify: t.notify,
+        },
         Kind::Rewound(r) => {
             api::EventKind::Rewound { to_seq: r.to_seq, restored_files: r.restored_files, restore_error: r.restore_error.clone() }
         }
