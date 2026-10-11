@@ -337,7 +337,9 @@ pub fn MobileBar() -> impl IntoView {
                 .collect::<Vec<_>>()
         })
     });
-    let count = move || ws.attention.with(Vec::len);
+    let filter = crate::labels::use_filter().0;
+    let counts = Memo::new(move |_| crate::labels::attention_counts(ws, live, &filter.get()));
+    let count = move || counts.get().0;
     view! {
         <nav class="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-zinc-200 bg-zinc-50 px-2 py-1.5 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
             {move || tiles.get().into_iter().map(|(i, label, focused)| view! {
@@ -350,7 +352,9 @@ pub fn MobileBar() -> impl IntoView {
                 <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
             })}
             <span class="flex-1"></span>
-            <button class="relative shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" on:click=move |_| ws.open(None, View::Inbox, How::Beside)>
+            <button class="relative shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400"
+                title=move || { let (s, h) = counts.get(); crate::labels::attention_title(s, h) }
+                on:click=move |_| ws.open(None, View::Inbox, How::Beside)>
                 "Inbox"
                 {move || (count() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{count()}</span> })}
             </button>

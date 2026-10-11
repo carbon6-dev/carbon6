@@ -37,6 +37,26 @@ pub fn matches(s: &c6_api::Session, filter: &[String]) -> bool {
     c6_api::labels::applies(filter, &all)
 }
 
+/// Sessions needing attention: (shown by the label filter, hidden by it).
+/// A session not in the list yet counts as shown.
+pub fn attention_counts(ws: crate::workspace::Workspace, live: api::LiveFeed, filter: &[String]) -> (usize, usize) {
+    let ids = ws.attention.get();
+    live.sessions.with(|ss| {
+        ids.iter().fold((0, 0), |(shown, hidden), id| match ss.iter().find(|s| &s.id == id) {
+            Some(s) if !matches(s, filter) => (shown, hidden + 1),
+            _ => (shown + 1, hidden),
+        })
+    })
+}
+
+/// The inbox badge's tooltip.
+pub fn attention_title(shown: usize, hidden: usize) -> String {
+    match (shown, hidden) {
+        (_, 0) => "Needs attention, running and pinned sessions".to_owned(),
+        (s, h) => format!("{s} need attention; {h} more hidden by the label filter"),
+    }
+}
+
 /// The labels of your sessions, for suggestions: yours first, then the
 /// automatic ones (folders in their ~/ form).
 fn known_labels(sessions: &[c6_api::Session]) -> Vec<String> {

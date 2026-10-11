@@ -67,7 +67,10 @@ fn Main() -> impl IntoView {
     provide_context(ws);
     ws.watch(live);
     notify::watch_sessions(live, ws);
-    let attention = move || ws.attention.with(Vec::len);
+    // Needing attention, as the label filter shows it.
+    let filter = labels::use_filter().0;
+    let counts = Memo::new(move |_| labels::attention_counts(ws, live, &filter.get()));
+    let attention = move || counts.get().0;
     let tiles = move || ws.layout.with(|l| l.tiles.len());
     view! {
         <div class="flex h-dvh flex-col">
@@ -77,9 +80,11 @@ fn Main() -> impl IntoView {
                 <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
                     <NavLink to=View::Sessions label="Sessions" />
                     <NavLink to=View::Workers label="Workers" />
-                    <Go to=View::Inbox class=NAV title="Needs attention, running and pinned sessions">
-                        "Inbox"
-                        {move || (attention() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention()}</span> })}
+                    <Go to=View::Inbox class=NAV>
+                        <span title=move || { let (s, h) = counts.get(); labels::attention_title(s, h) }>
+                            "Inbox"
+                            {move || (attention() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention()}</span> })}
+                        </span>
                     </Go>
                     <span class="hidden sm:contents"><NavLink to=View::Mission label="Mission" /></span>
                     <NavLink to=View::Settings { note: None } label="Settings" />
