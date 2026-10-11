@@ -11,6 +11,8 @@ use c6_proto::{CredentialGrant, CredentialRequest, EphemeralEvent, WorkerMsg, ep
 use tokio::sync::{mpsc, oneshot};
 
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Calls to the head (and through it, to the memex).
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Refresh credentials this long before they expire.
 const EXPIRY_MARGIN_MS: i64 = 60_000;
 
@@ -27,6 +29,7 @@ pub struct HeadLink {
     /// In memory only: credentials are never written to disk on workers.
     cache: Mutex<HashMap<String, CredentialGrant>>,
     next_request: AtomicU64,
+    calls: Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>,
 }
 
 impl HeadLink {
@@ -37,6 +40,37 @@ impl HeadLink {
     pub(crate) fn disconnected(&self) {
         *self.outbound.lock().unwrap() = None;
         self.waiters.lock().unwrap().clear(); // waiters see a closed channel
+        self.calls.lock().unwrap().clear();
+    }
+
+    /// Calls the head: `method` with JSON `params`. What a node may call
+    /// depends on its role (see the head's `fabric`).
+    pub async fn call(&self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let tx = self.outbound.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the head"))?;
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (done, wait) = oneshot::channel();
+        self.calls.lock().unwrap().insert(id, done);
+        let call = c6_proto::HeadCall { id, method: method.to_owned(), params_json: serde_json::to_vec(&params)? };
+        tx.send(WorkerMsg { msg: Some(worker_msg::Msg::HeadCall(call)) }).await.map_err(|_| anyhow!("head connection closed"))?;
+        match tokio::time::timeout(CALL_TIMEOUT, wait).await {
+            Ok(Ok(r)) => r.map_err(|e| anyhow!(e)),
+            Ok(Err(_)) => bail!("head connection closed during {method}"),
+            Err(_) => {
+                self.calls.lock().unwrap().remove(&id);
+                bail!("no answer from the head to {method} in {}s", CALL_TIMEOUT.as_secs())
+            }
+        }
+    }
+
+    pub(crate) fn on_call_reply(&self, reply: c6_proto::HeadCallReply) {
+        if let Some(w) = self.calls.lock().unwrap().remove(&reply.id) {
+            let r = if reply.error.is_empty() {
+                serde_json::from_slice(&reply.result_json).map_err(|e| format!("bad reply from the head: {e}"))
+            } else {
+                Err(reply.error)
+            };
+            let _ = w.send(r);
+        }
     }
 
     pub fn is_connected(&self) -> bool {

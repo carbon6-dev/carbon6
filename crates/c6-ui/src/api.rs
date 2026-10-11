@@ -320,6 +320,32 @@ pub async fn push_unsubscribe(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/push/subscriptions/{id}")).send().await).await
 }
 
+pub async fn memex_status() -> Result<c6_api::MemexStatus, String> {
+    json(Request::get("/api/v1/memex/status").send().await).await
+}
+
+pub async fn memex_search(q: String, kinds: Vec<String>) -> Result<Vec<c6_api::MemexHit>, String> {
+    let url = format!(
+        "/api/v1/memex/search?q={}&kinds={}&limit=30",
+        js_sys::encode_uri_component(&q),
+        js_sys::encode_uri_component(&kinds.join(","))
+    );
+    json(Request::get(&url).send().await).await
+}
+
+/// An item (`{"item": …}`) or a thing (`{"thing": …}`).
+pub async fn memex_get(id: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/memex/get?id={}", js_sys::encode_uri_component(&id))).send().await).await
+}
+
+pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::Value, String> {
+    send_json(Request::post("/api/v1/memex/notes"), &c6_api::MemexNoteIn { text, about }).await
+}
+
+pub async fn memex_delete(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/memex/items/{id}")).send().await).await
+}
+
 pub async fn test_channel(name: String) -> Result<(), String> {
     let body = c6_api::TestChannel { name };
     empty(Request::post("/api/v1/settings/channels/test").json(&body).map_err(|e| e.to_string())?.send().await).await

@@ -71,6 +71,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     if worker.revoked_at.is_some() {
         return Err(bad_request("worker is revoked"));
     }
+    if worker.role == "memex" {
+        return Err(bad_request(format!("{} is the memex, which runs no sessions; pick a worker", worker.name)));
+    }
     let mut effort = check_effort(req.effort.clone())?;
     // No folder: the worker gives the session a scratch workspace.
     if req.cwd.trim().is_empty() && req.worktree && req.ssh.is_none() {
@@ -140,7 +143,18 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         awaiting: 0,
         subagent_model,
     };
-    let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
+    let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
+    // Context from the memex, for what is known at creation.
+    let mut brief_labels = labels.clone();
+    brief_labels.extend(api::labels::auto_labels(
+        &worker.name,
+        "",
+        if row.cwd.starts_with('/') { &row.cwd } else { "" },
+        "",
+        "",
+        &row.ssh_target,
+    ));
+    spec.memex_brief = crate::memex::brief(st, &brief_labels, prompt.unwrap_or("")).await;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
 }
 
@@ -241,6 +255,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         memories_json: crate::memory::for_sessions(st).await?,
         policies_json: st.store.setting(POLICIES).await?.unwrap_or_default(),
         subagent_model: row.subagent_model.clone(),
+        memex_brief: String::new(),
+        memex_tools: st.registry.memex().is_some(),
         seed,
     })
 }
@@ -742,6 +758,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
         st.registry.bump();
     }
     notify_events(st, &batch.session_id, &ing.events).await;
+    crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.
     for ev in &ing.events {
         if let Some(c6_proto::session_event::Kind::TurnEnded(t)) = &ev.kind {

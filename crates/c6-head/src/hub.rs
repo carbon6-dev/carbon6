@@ -123,6 +123,25 @@ impl WorkerHub for HubSvc {
             )));
         }
         let Hello { hostname, os, arch, version, .. } = &hello;
+        // A node's role is what it says the first time, then fixed: a
+        // worker cannot later claim to be the memex, or the reverse.
+        let says = if hello.capabilities.iter().any(|c| c == "memex") { "memex" } else { "worker" };
+        let role = if row.role.is_empty() {
+            st.store.set_worker_role(worker_id, says).await.map_err(internal)?;
+            says.to_owned()
+        } else if row.role != says {
+            return Err(Status::failed_precondition(format!(
+                "this node was enrolled as a {}; enroll the {says} with a new token",
+                row.role
+            )));
+        } else {
+            row.role.clone()
+        };
+        if role == "memex"
+            && let Some(other) = st.registry.memex().filter(|o| *o != worker_id)
+        {
+            return Err(Status::failed_precondition(format!("another memex ({other}) is connected; one memex per head")));
+        }
         st.store.worker_attached(worker_id, hostname, os, arch, version, now_ms()).await.map_err(internal)?;
 
         let session_ids: Vec<String> = hello.sessions.iter().map(|c| c.session_id.clone()).collect();
@@ -138,7 +157,10 @@ impl WorkerHub for HubSvc {
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 
         tokio::spawn(async move {
-            let guard = st.registry.attach(worker_id, now_ms(), tx.clone(), hello.capabilities.clone());
+            let guard = st.registry.attach(worker_id, now_ms(), tx.clone(), hello.capabilities.clone(), &role);
+            if role == "memex" {
+                st.memex_feed.wake();
+            }
             info!(worker = %worker_id, name = %row.name, version = %hello.version, "worker attached");
             let reason = serve_worker(&st, &guard, &mut inbound, &tx).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();
@@ -150,7 +172,7 @@ impl WorkerHub for HubSvc {
 }
 
 async fn serve_worker(
-    st: &HeadState,
+    st: &Arc<HeadState>,
     guard: &crate::registry::ConnGuard<'_>,
     inbound: &mut Streaming<WorkerMsg>,
     tx: &mpsc::Sender<Result<HeadMsg, Status>>,
@@ -213,6 +235,22 @@ async fn serve_worker(
                 }
             }
             worker_msg::Msg::RpcResponse(resp) => guard.rpc_response(resp),
+            worker_msg::Msg::HeadCall(call) => {
+                // Off the read loop: a relayed call waits on another node.
+                let st = st.clone();
+                tokio::spawn(async move {
+                    let params = serde_json::from_slice(&call.params_json).unwrap_or(serde_json::Value::Null);
+                    let reply = match crate::fabric::handle(&st, worker_id, &call.method, params).await {
+                        Ok(v) => c6_proto::HeadCallReply {
+                            id: call.id,
+                            result_json: serde_json::to_vec(&v).unwrap_or_default(),
+                            error: String::new(),
+                        },
+                        Err(e) => c6_proto::HeadCallReply { id: call.id, result_json: Vec::new(), error: format!("{e:#}") },
+                    };
+                    st.registry.reply(worker_id, reply).await;
+                });
+            }
             worker_msg::Msg::CredentialRequest(req) => {
                 let grant = sessions::credential(st, worker_id, req).await;
                 if tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await.is_err() {

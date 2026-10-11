@@ -28,6 +28,16 @@ pub use identity::Identity;
 /// Idle, synced sessions stay in the journal this long.
 const JOURNAL_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
 
+/// More of what a node does, beyond running sessions: its own RPC methods
+/// and capabilities (the memex is a node like this).
+#[async_trait::async_trait]
+pub trait Extension: Send + Sync {
+    /// Added to the Hello (e.g. "memex").
+    fn capabilities(&self) -> Vec<String>;
+    /// Handles a method the worker itself does not; None: not ours either.
+    async fn handle(&self, method: &str, params: serde_json::Value) -> Option<anyhow::Result<serde_json::Value>>;
+}
+
 /// Everything a running worker shares between its connection and sessions.
 pub struct Worker {
     pub identity: Identity,
@@ -38,6 +48,7 @@ pub struct Worker {
     pub terminals: pty::Terminals,
     /// The live connection to the head, for opening extra streams.
     channel: Mutex<Option<tonic::transport::Channel>>,
+    extension: Mutex<Option<Arc<dyn Extension>>>,
     /// Held for the process lifetime: one worker per state directory.
     _lock: std::fs::File,
 }
@@ -73,8 +84,19 @@ impl Worker {
             sessions,
             terminals: pty::Terminals::default(),
             channel: Mutex::new(None),
+            extension: Mutex::new(None),
             _lock: lock,
         }))
+    }
+
+    /// Adds an extension (before connecting, so its capabilities are in the
+    /// Hello).
+    pub fn set_extension(&self, ext: Arc<dyn Extension>) {
+        *self.extension.lock().unwrap() = Some(ext);
+    }
+
+    pub fn extension(&self) -> Option<Arc<dyn Extension>> {
+        self.extension.lock().unwrap().clone()
     }
 
     pub fn channel(&self) -> Option<tonic::transport::Channel> {

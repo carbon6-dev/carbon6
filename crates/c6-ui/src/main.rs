@@ -7,6 +7,7 @@ mod files;
 mod fleet;
 mod labels;
 mod markdown;
+mod memex;
 mod notify;
 mod outputs;
 mod push;
@@ -135,6 +136,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Memex class=MENU>"Memex"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None } class=MENU>"Settings"</Go>
                 </div>

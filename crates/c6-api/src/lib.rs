@@ -32,6 +32,10 @@ pub struct Worker {
     /// Optional features of a connected worker, e.g. `claude_code`.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// "worker", or "memex" for the knowledge service (which runs no
+    /// sessions); empty until it first connects.
+    #[serde(default)]
+    pub role: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1434,4 +1438,184 @@ pub struct SessionMatch {
     /// Side chats to expand first, outermost first.
     pub open: Vec<String>,
     pub kind: String,
+}
+
+// ---------------------------------------------------------------------------
+// The memex (knowledge service): see docs/memex.md.
+// ---------------------------------------------------------------------------
+
+/// What kinds of items there are. Sessions see the default kinds, plus what
+/// their scope rules add.
+pub const MEMEX_KINDS: [&str; 8] = ["session", "output", "web", "note", "document", "paper", "email", "photo"];
+/// What every session may search unless a scope rule says more.
+pub const MEMEX_DEFAULT_SCOPE: [&str; 6] = ["session", "output", "web", "note", "document", "paper"];
+
+/// An item to store (head → memex `memex.ingest`). The same source and
+/// external id again replaces it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexItemIn {
+    pub kind: String,
+    /// Where it comes from: "carbon6", "memory", "you", a session, ….
+    pub source: String,
+    pub external_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// When it happened; default: now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<UnixMs>,
+    /// carbon6 labels it is about; each becomes (or is) a thing in the graph.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+
+/// `memex.search` (and `GET /api/v1/memex/search`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexQuery {
+    pub query: String,
+    /// Only these kinds; empty: all the caller may see.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Only items about all of these things (labels or thing ids).
+    #[serde(default)]
+    pub about: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexHit {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    /// The best matching passage.
+    pub snippet: String,
+    pub created_at: UnixMs,
+    pub source: String,
+    pub external_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub score: f64,
+    /// "keyword", "meaning" or both.
+    pub matched: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexThingRef {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    /// The carbon6 label it stands for, if any.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// An item, in full (`memex.get` of an item id).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub text: String,
+    pub created_at: UnixMs,
+    pub added_at: UnixMs,
+    pub source: String,
+    pub external_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub about: Vec<MemexThingRef>,
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+
+/// A thing in the graph with what is known about it (`memex.get` of a
+/// thing id or label).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexThing {
+    pub thing: MemexThingRef,
+    /// Notes about it, newest first.
+    pub notes: Vec<MemexHit>,
+    /// Items about it, newest first.
+    pub items: Vec<MemexHit>,
+    /// Things that share items with it, most shared first.
+    pub related: Vec<(MemexThingRef, u32)>,
+}
+
+/// `memex.brief`: context for a session about these labels.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexBrief {
+    pub text: String,
+    /// The items it draws on.
+    pub refs: Vec<String>,
+}
+
+/// The memex's state (`GET /api/v1/memex/status`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexStatus {
+    pub connected: bool,
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Items per kind.
+    #[serde(default)]
+    pub items: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub things: u64,
+    #[serde(default)]
+    pub passages: u64,
+    /// Passages with a vector for the current embedding model.
+    #[serde(default)]
+    pub embedded: u64,
+    #[serde(default)]
+    pub embedding_model: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Waiting to be sent to the memex.
+    #[serde(default)]
+    pub outbox: u64,
+}
+
+/// A model for one of the memex's tasks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexModel {
+    /// A connection name or id.
+    pub connection: String,
+    pub model: String,
+}
+
+/// `GET`/`PUT /api/v1/settings/memex`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexSettings {
+    /// Turns text into vectors for search by meaning; none: keyword search
+    /// only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<MemexModel>,
+    /// The size of a session's context brief, in characters (default 4000;
+    /// 0: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_chars: Option<u32>,
+}
+
+/// A scope rule (`/api/v1/settings/memex_scopes`): sessions with these
+/// labels may also see these kinds of items.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemexScope {
+    pub name: String,
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    pub kinds: Vec<String>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// A note you write (`POST /api/v1/memex/notes`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexNoteIn {
+    pub text: String,
+    /// Labels or thing ids it is about.
+    #[serde(default)]
+    pub about: Vec<String>,
 }

@@ -73,6 +73,22 @@ message RpcResponse {
   string error = 3; // set on failure
 }
 
+// Node -> head request with a JSON payload; answered by HeadCallReply. What
+// a node may call depends on its role (worker or memex): workers reach the
+// memex through the head this way, and the memex asks the head for its
+// settings or to notify you.
+message HeadCall {
+  uint64 id = 1;
+  string method = 2;
+  bytes params_json = 3;
+}
+
+message HeadCallReply {
+  uint64 id = 1;
+  bytes result_json = 2;
+  string error = 3; // set on failure
+}
+
 message WorkerMsg {
   oneof msg {
     Hello hello = 1; // must be first
@@ -82,6 +98,7 @@ message WorkerMsg {
     CommandRejected rejected = 5;
     CredentialRequest credential_request = 6;
     RpcResponse rpc_response = 7;
+    HeadCall head_call = 8;
   }
 }
 
@@ -93,6 +110,7 @@ message HeadMsg {
     SessionCommand command = 4;
     CredentialGrant credential = 5;
     RpcRequest rpc_request = 6;
+    HeadCallReply head_call_reply = 7;
   }
 }
 

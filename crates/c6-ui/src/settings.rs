@@ -153,6 +153,15 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             />
             <WorkflowRunsPanel />
             <AutomationsSetting />
+            <crate::memex::MemexSettings />
+            <ListSetting
+                name="memex_scopes"
+                title="Memex scopes"
+                noun="rule"
+                help="What sessions may see in the memex. Every session sees sessions, outputs, web pages, notes, documents and papers; a rule lets sessions with its labels also see more kinds (email, photo). You, in the UI, see everything."
+                fields=SCOPE_FIELDS
+                examples=scope_examples
+            />
             <HooksSetting />
             <SecretsSetting />
             <WebSearchSetting />
@@ -1027,6 +1036,26 @@ fn budget_examples() -> Vec<(&'static str, serde_json::Value)> {
         ("Automations: $5 a day, then stop", b("Automations per day", &["automation:"], "day", "5", "block")),
         ("Everything: tell me past $100 a month", b("Monthly total", &[], "month", "100", "notify")),
         ("A client: $50 a week", b("Acme per week", &["client:acme"], "week", "50", "block")),
+    ]
+}
+
+const SCOPE_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. Mail sessions see email", kind: FieldKind::Line },
+    Field { key: "applies_to", label: "Sessions with labels", placeholder: "e.g. mail", kind: FieldKind::Labels },
+    Field { key: "kinds", label: "May also see", placeholder: "email, photo", kind: FieldKind::Labels },
+];
+
+fn scope_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let r = |name: &str, labels: &[&str], kinds: &[&str]| {
+        let mut v = item(&[("name", name)]);
+        v["applies_to"] = serde_json::json!(labels);
+        v["kinds"] = serde_json::json!(kinds);
+        v
+    };
+    vec![
+        ("Empty", r("", &[], &[])),
+        ("Mail sessions see email", r("Mail sessions see email", &["mail"], &["email"])),
+        ("Photo sessions see photos", r("Photo sessions see photos", &["photos"], &["photo"])),
     ]
 }
 

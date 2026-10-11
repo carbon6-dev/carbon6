@@ -104,7 +104,13 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         hostname: crate::hostname(),
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
-        capabilities: crate::claude_code::find_claude().map(|_| "claude_code".to_owned()).into_iter().collect(),
+        capabilities: {
+            let mut c: Vec<String> = crate::claude_code::find_claude().map(|_| "claude_code".to_owned()).into_iter().collect();
+            if let Some(ext) = worker.extension() {
+                c.extend(ext.capabilities());
+            }
+            c
+        },
         sessions: match worker.journal.unacked().await {
             Ok(cursors) => cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq }).collect(),
             Err(e) => return Ended::Retry(e.context("reading journal")),
@@ -209,6 +215,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                             }
                         }
                         head_msg::Msg::Credential(grant) => worker.link.on_grant(grant),
+                        head_msg::Msg::HeadCallReply(reply) => worker.link.on_call_reply(reply),
                         head_msg::Msg::RpcRequest(req) => {
                             // Off the read loop: requests may take a while (git, big files).
                             let (w, tx) = (worker.clone(), tx.clone());

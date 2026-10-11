@@ -157,7 +157,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     // otherwise an online one. A worker the user picks by hand is kept.
     let chosen_by_hand = RwSignal::new(false);
     Effect::new(move || {
-        let ws = live.workers.get();
+        // The memex is a node, not a worker: it runs no sessions.
+        let ws: Vec<c6_api::Worker> = live.workers.get().into_iter().filter(|w| w.role != "memex").collect();
         if chosen_by_hand.get_untracked() {
             return;
         }
@@ -284,7 +285,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 <label class="block text-xs text-zinc-500">
                     "Worker"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
-                        {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked).map(|w| {
+                        {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked && w.role != "memex").map(|w| {
                             let label = if w.status == WorkerStatus::Online { w.name.clone() } else { format!("{} (offline)", w.name) };
                             view! { <option value=w.id.to_string()>{label}</option> }
                         }).collect_view()}

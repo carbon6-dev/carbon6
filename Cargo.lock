@@ -536,6 +536,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "c6-memex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "c6-api",
+ "c6-core",
+ "c6-head",
+ "c6-testkit",
+ "c6-worker",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "c6-proto"
 version = "0.1.0"
 dependencies = [
@@ -663,6 +685,20 @@ dependencies = [
  "c6-head",
  "clap",
  "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "c6m"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "c6-core",
+ "c6-memex",
+ "c6-worker",
+ "clap",
+ "tokio",
+ "tokio-util",
  "tracing-subscriber",
 ]
 

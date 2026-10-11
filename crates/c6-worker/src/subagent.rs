@@ -36,6 +36,8 @@ pub struct Parent {
     pub memory: Option<c6_tools::MemorySink>,
     /// And its notices.
     pub notices: Option<c6_tools::NoticeSink>,
+    /// And its way to the head (the memex tools, in its scope).
+    pub head: Option<Arc<dyn c6_tools::HeadCaller>>,
 }
 
 pub struct Runner {
@@ -119,6 +121,7 @@ impl Subagents for Runner {
         session_tools.set_publisher(p.publisher.clone());
         session_tools.set_memory(p.memory.clone());
         session_tools.set_notices(p.notices.clone());
+        session_tools.set_head(p.head.clone());
         let mut conv = Conversation { history: vec![Message::user_text(text)], context_tokens: 0 };
         let reason = run_turn(1, &cfg, self.client.as_ref(), &tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
             .await

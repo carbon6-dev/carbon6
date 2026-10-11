@@ -378,7 +378,14 @@ impl SessionManager {
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
             }
-            prompt.push_str(&memory_section(&spec, &labels));
+            // With a memex, its brief (which holds your notes) replaces the
+            // memory section.
+            if spec.memex_brief.trim().is_empty() {
+                prompt.push_str(&memory_section(&spec, &labels));
+            } else {
+                prompt.push_str("\n\n# Memex\n\n");
+                prompt.push_str(spec.memex_brief.trim());
+            }
             let secrets = applicable_secrets(&spec, &labels);
             if !secrets.is_empty() {
                 prompt.push_str(
@@ -561,6 +568,7 @@ impl SessionManager {
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
         session_tools.browser.set_profile(self.state_dir.join("browser").join(session_id));
+        session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: session_id.to_owned() })));
         let mut policies = None;
         if started.tool_profile != crate::claude_code::PROFILE {
             // Policies first (a denial wins), then your hooks.
@@ -1068,6 +1076,7 @@ impl Actor {
             publisher: self.session_tools.publisher(),
             memory: self.session_tools.memory(),
             notices: self.session_tools.notices(),
+            head: self.session_tools.head(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -1329,6 +1338,11 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::Remember::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Forget::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Notify::new(profile == ToolProfile::Claude)));
+    if spec.memex_tools {
+        tools.push(Arc::new(c6_tools::memex::MemexSearch::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::MemexNote::new(profile == ToolProfile::Claude)));
+    }
     // A browser, where this machine has one (it runs here, also for SSH
     // sessions).
     if let Some(chrome) = c6_tools::browser::find_chrome() {
@@ -1498,6 +1512,24 @@ fn task_notice(t: &BackgroundTask, output: &str) -> String {
         s.push_str(&format!("\n(Full output: the output tool with id {}.)", t.task_id));
     }
     s
+}
+
+/// Calls to the head on a session's behalf: the head checks the session is
+/// ours and applies its scope.
+struct SessionHead {
+    link: Arc<HeadLink>,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl c6_tools::HeadCaller for SessionHead {
+    async fn call(&self, method: &str, mut params: serde_json::Value) -> Result<serde_json::Value, String> {
+        if !params.is_object() {
+            params = serde_json::json!({});
+        }
+        params["session_id"] = serde_json::json!(self.session_id);
+        self.link.call(method, params).await.map_err(|e| format!("{e:#}"))
+    }
 }
 
 /// Removes sessions' browser profiles unused for `age` (sign-ins and

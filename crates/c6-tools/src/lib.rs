@@ -6,6 +6,7 @@ mod bash;
 pub mod browser;
 mod files;
 pub mod hooks;
+pub mod memex;
 pub mod memory;
 pub mod notify;
 mod patch;
@@ -105,6 +106,12 @@ impl Secrets {
     }
 }
 
+/// Calls the head on the session's behalf (the memex tools use it).
+#[async_trait]
+pub trait HeadCaller: Send + Sync {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, String>;
+}
+
 /// State shared by every tool call in a session.
 pub struct SessionTools {
     cwd: Mutex<PathBuf>,
@@ -124,6 +131,7 @@ pub struct SessionTools {
     notices: Mutex<Option<NoticeSink>>,
     /// The session's web browser, started on first use.
     pub browser: browser::BrowserSlot,
+    head: Mutex<Option<Arc<dyn HeadCaller>>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -150,6 +158,7 @@ impl SessionTools {
             memory: Mutex::default(),
             notices: Mutex::default(),
             browser: Default::default(),
+            head: Mutex::default(),
         }
     }
 
@@ -159,6 +168,14 @@ impl SessionTools {
 
     pub fn memory(&self) -> Option<MemorySink> {
         self.memory.lock().unwrap().clone()
+    }
+
+    pub fn set_head(&self, h: Option<Arc<dyn HeadCaller>>) {
+        *self.head.lock().unwrap() = h;
+    }
+
+    pub fn head(&self) -> Option<Arc<dyn HeadCaller>> {
+        self.head.lock().unwrap().clone()
     }
 
     pub fn set_notices(&self, n: Option<NoticeSink>) {

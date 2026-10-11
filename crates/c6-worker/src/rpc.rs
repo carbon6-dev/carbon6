@@ -52,7 +52,13 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
             });
             Ok(json!({}))
         }
-        _ => bail!("unknown method {method}"),
+        _ => match worker.extension() {
+            Some(ext) => match ext.handle(method, params).await {
+                Some(r) => r,
+                None => bail!("unknown method {method}"),
+            },
+            None => bail!("unknown method {method}"),
+        },
     }
 }
 

@@ -25,6 +25,8 @@ pub struct WorkerRow {
     pub enrolled_at: i64,
     pub last_seen: Option<i64>,
     pub revoked_at: Option<i64>,
+    /// "worker" or "memex"; empty until it first attaches.
+    pub role: String,
 }
 
 impl WorkerRow {
@@ -113,6 +115,11 @@ impl Store {
     }
 
     /// Records facts from a worker's `Hello`.
+    pub async fn set_worker_role(&self, id: WorkerId, role: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE workers SET role = ? WHERE id = ?").bind(role).bind(id.to_string()).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn worker_attached(&self, id: WorkerId, hostname: &str, os: &str, arch: &str, version: &str, now: i64) -> anyhow::Result<()> {
         sqlx::query("UPDATE workers SET hostname = ?, os = ?, arch = ?, version = ?, last_seen = ? WHERE id = ?")
             .bind(hostname)

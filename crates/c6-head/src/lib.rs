@@ -7,9 +7,11 @@ pub mod config;
 mod convert;
 mod cron;
 mod export;
+pub mod fabric;
 pub mod guard;
 pub mod hosts;
 pub mod hub;
+pub mod memex;
 pub mod memory;
 pub mod notify;
 pub mod oauth;
@@ -92,6 +94,8 @@ pub struct HeadState {
     pub notifier: notify::Notifier,
     /// Workflow runs to drive.
     pub workflows: workflows::Runner,
+    /// Wakes what sends the memex its updates.
+    pub memex_feed: memex::Feed,
     pub shutdown: CancellationToken,
 }
 
@@ -181,6 +185,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         worker_url,
         notifier: Default::default(),
         workflows: Default::default(),
+        memex_feed: Default::default(),
         shutdown: shutdown.clone(),
     });
 
@@ -192,6 +197,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     usage::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());
     workflows::spawn(state.clone());
+    memex::spawn(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

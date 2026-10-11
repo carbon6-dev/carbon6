@@ -1,0 +1,14 @@
+[package]
+name = "c6m"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+c6-core.workspace = true
+c6-memex.workspace = true
+c6-worker.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-util = "0.7.20"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

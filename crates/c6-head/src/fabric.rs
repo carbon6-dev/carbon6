@@ -1,0 +1,49 @@
+//! Calls nodes make to the head (`HeadCall`), by role. Workers reach the
+//! memex through here, with their session's scope stamped on by the head;
+//! the memex asks for its settings and to notify you.
+
+use c6_core::WorkerId;
+use serde_json::{Value, json};
+
+use crate::{HeadState, bad_request};
+
+/// What a session's tools may ask the memex.
+const SESSION_METHODS: [&str; 5] = ["memex.search", "memex.get", "memex.related", "memex.note", "memex.timeline"];
+
+pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Value) -> anyhow::Result<Value> {
+    let role = st.registry.get(from).map(|l| l.role).unwrap_or_default();
+    if role == "memex" {
+        return match method {
+            "config.get" => crate::memex::config(st).await,
+            "notify" => {
+                let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
+                st.notifier.send(crate::notify::Note {
+                    event: "notice",
+                    title: s("title"),
+                    message: s("message"),
+                    priority: if s("priority") == "high" { "high" } else { "normal" },
+                    labels: vec!["memex".into()],
+                    ..Default::default()
+                });
+                Ok(json!({}))
+            }
+            other => Err(bad_request(format!("the memex may not call {other}"))),
+        };
+    }
+    if !SESSION_METHODS.contains(&method) {
+        return Err(bad_request(format!("a worker may not call {method}")));
+    }
+    // On behalf of one of this worker's sessions, which decides the scope.
+    let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();
+    let session = st.store.session(&session_id).await?.ok_or_else(|| bad_request("no such session"))?;
+    if session.worker_id != from.to_string() {
+        return Err(bad_request("that session is not on this worker"));
+    }
+    let labels = session.all_labels();
+    params["scope"] = json!(crate::memex::scope_for(st, &labels).await);
+    params["made_by"] = json!(format!("session:{session_id}"));
+    if method == "memex.note" && params["labels"].as_array().is_none_or(|a| a.is_empty()) {
+        params["labels"] = json!(labels.into_iter().filter(|l| !l.starts_with("model:")).collect::<Vec<_>>());
+    }
+    crate::memex::call(st, method, params).await
+}

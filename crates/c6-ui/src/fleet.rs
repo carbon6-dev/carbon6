@@ -227,6 +227,9 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
                 <div class="flex items-center gap-2">
                     <span class=format!("h-2 w-2 shrink-0 rounded-full {dot}") title=label></span>
                     <crate::workspace::Go to=crate::workspace::View::Worker { id: w.id.to_string() } class="font-medium hover:underline">{w.name.clone()}</crate::workspace::Go>
+                    {(w.role == "memex").then(|| view! {
+                        <crate::workspace::Go to=crate::workspace::View::Memex class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">"memex"</crate::workspace::Go>
+                    })}
                 </div>
             </td>
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{w.hostname}</td>

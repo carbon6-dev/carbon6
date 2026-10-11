@@ -46,6 +46,7 @@ impl MockLlm {
         let app = Router::new()
             .route("/v1/chat/completions", post(completions))
             .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "mock-1"}, {"id": "mock-2"}]})) }))
+            .route("/v1/embeddings", post(embeddings))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -72,6 +73,30 @@ impl MockLlm {
     pub fn requests(&self) -> Vec<Value> {
         self.inner.requests.lock().unwrap().clone()
     }
+}
+
+/// Embeddings by hashed words (64 dimensions): texts sharing words are
+/// near each other, which is enough to test search by meaning. Words are
+/// cut to 5 letters, so "deployment" and "deploying" count as one.
+async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
+    let inputs: Vec<String> = match &body["input"] {
+        Value::Array(a) => a.iter().map(|v| v.as_str().unwrap_or("").to_owned()).collect(),
+        v => vec![v.as_str().unwrap_or("").to_owned()],
+    };
+    let data: Vec<Value> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut v = [0f32; 64];
+            for w in t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2) {
+                let stem: String = w.chars().take(5).collect();
+                let h = stem.bytes().fold(5381u64, |h, b| h.wrapping_mul(33) ^ b as u64);
+                v[(h % 64) as usize] += 1.0;
+            }
+            json!({"index": i, "embedding": v.to_vec()})
+        })
+        .collect();
+    Json(json!({"data": data, "model": body["model"]}))
 }
 
 async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -> Response {

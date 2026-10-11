@@ -400,6 +400,12 @@ message CreateSession {
   // The model for subagents (Task tool) from a routing rule; empty: the
   // session's own. A named agent's model still wins.
   string subagent_model = 16;
+  // Context from the memex for this session (its labels and first
+  // message), for the system prompt; replaces the memory section.
+  string memex_brief = 17;
+  // A memex is connected: offer the memex tools (they call it through the
+  // head, which applies the session's scope).
+  bool memex_tools = 18;
 }
 
 message ModelSpec {

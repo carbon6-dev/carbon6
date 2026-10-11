@@ -70,6 +70,14 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/prices", get(get_prices).put(put_prices))
         .route("/api/v1/settings/hosts", get(get_hosts_setting).put(put_hosts))
         .route("/api/v1/settings/workflows", get(get_workflows).put(put_workflows))
+        .route("/api/v1/settings/memex", get(get_memex_settings).put(put_memex_settings))
+        .route("/api/v1/settings/memex_scopes", get(get_memex_scopes).put(put_memex_scopes))
+        .route("/api/v1/memex/status", get(memex_status))
+        .route("/api/v1/memex/search", get(memex_search))
+        .route("/api/v1/memex/get", get(memex_get))
+        .route("/api/v1/memex/mentions", get(memex_mentions))
+        .route("/api/v1/memex/notes", post(memex_note))
+        .route("/api/v1/memex/items/{id}", delete(memex_delete))
         .route("/api/v1/workflows/runs", get(list_workflow_runs))
         .route("/api/v1/workflows/runs/{id}", get(get_workflow_run))
         .route("/api/v1/workflows/runs/{id}/steps/{step}/decide", post(decide_workflow_step))
@@ -157,6 +165,7 @@ pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>
                 connected_since: live.as_ref().map(|l| l.connected_since),
                 rtt_us: live.as_ref().and_then(|l| l.rtt_us),
                 capabilities: live.map(|l| l.capabilities).unwrap_or_default(),
+                role: r.role,
             })
         })
         .collect())
@@ -997,6 +1006,82 @@ async fn decide_approval(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+async fn get_memex_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::MemexSettings>> {
+    Ok(Json(crate::memex::settings(&st).await?))
+}
+
+async fn put_memex_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::MemexSettings>) -> ApiResult<StatusCode> {
+    crate::memex::check_settings(&st, &s).await?;
+    st.store.set_setting(crate::memex::SETTINGS, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_memex_scopes(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::MemexScope>>> {
+    Ok(Json(crate::memex::scopes(&st).await?))
+}
+
+async fn put_memex_scopes(State(st): State<Arc<HeadState>>, Json(s): Json<Vec<api::MemexScope>>) -> ApiResult<StatusCode> {
+    crate::memex::check_scopes(&s)?;
+    st.store.set_setting(crate::memex::SCOPES, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn memex_status(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::MemexStatus>> {
+    Ok(Json(crate::memex::status(&st).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct MemexSearchQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    kinds: String,
+    #[serde(default)]
+    about: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Comma-separated list.
+fn list_param(s: &str) -> Vec<String> {
+    s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()
+}
+
+async fn memex_search(State(st): State<Arc<HeadState>>, Query(q): Query<MemexSearchQuery>) -> ApiResult<Json<Vec<api::MemexHit>>> {
+    let query = api::MemexQuery { query: q.q, kinds: list_param(&q.kinds), about: list_param(&q.about), limit: q.limit };
+    let v = crate::memex::call(&st, "memex.search", serde_json::to_value(query).map_err(anyhow::Error::from)?).await?;
+    Ok(Json(serde_json::from_value(v).map_err(anyhow::Error::from)?))
+}
+
+#[derive(serde::Deserialize)]
+struct IdQuery {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    q: String,
+}
+
+async fn memex_get(State(st): State<Arc<HeadState>>, Query(q): Query<IdQuery>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call(&st, "memex.get", serde_json::json!({"id": q.id})).await?))
+}
+
+async fn memex_mentions(State(st): State<Arc<HeadState>>, Query(q): Query<IdQuery>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call(&st, "memex.mention", serde_json::json!({"q": q.q})).await?))
+}
+
+async fn memex_note(State(st): State<Arc<HeadState>>, Json(n): Json<api::MemexNoteIn>) -> ApiResult<Json<serde_json::Value>> {
+    if n.text.trim().is_empty() {
+        return Err(crate::bad_request("a note needs text").into());
+    }
+    let params = serde_json::json!({"text": n.text, "labels": n.about, "made_by": "you"});
+    Ok(Json(crate::memex::call(&st, "memex.note", params).await?))
+}
+
+async fn memex_delete(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let v = crate::memex::call(&st, "memex.delete", serde_json::json!({"id": id})).await?;
+    if v["deleted"].as_bool() == Some(true) { Ok(StatusCode::NO_CONTENT) } else { Err(crate::not_found("no such item").into()) }
 }
 
 async fn get_workflows(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Workflow>>> {

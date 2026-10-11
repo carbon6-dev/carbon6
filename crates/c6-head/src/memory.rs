@@ -53,6 +53,7 @@ pub async fn put(st: &HeadState, mut m: api::Memory) -> anyhow::Result<api::Memo
         m.id = uuid::Uuid::now_v7().simple().to_string()[20..].to_owned();
     }
     upsert(&st.store.pool, &m.id, &m.scope, &m.text, None).await?;
+    crate::memex::enqueue(st, "memex.ingest", serde_json::json!(crate::memex::memory_item(&m.id, &m.scope, &m.text))).await;
     Ok(list(st).await?.into_iter().find(|x| x.id == m.id).unwrap_or(m))
 }
 
@@ -60,6 +61,7 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     if sqlx::query("DELETE FROM memories WHERE id = ?").bind(id).execute(&st.store.pool).await?.rows_affected() == 0 {
         return Err(not_found("no such note"));
     }
+    crate::memex::enqueue(st, "memex.delete", serde_json::json!({"source": "memory", "external_id": id})).await;
     Ok(())
 }
 

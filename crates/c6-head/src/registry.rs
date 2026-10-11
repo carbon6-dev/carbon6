@@ -19,6 +19,8 @@ pub struct LiveWorker {
     pub last_seen: i64,
     pub rtt_us: Option<u32>,
     pub capabilities: Vec<String>,
+    /// "worker" or "memex".
+    pub role: String,
     cancel: CancellationToken,
     tx: HeadTx,
     /// Requests awaiting this connection's response; dropped with it.
@@ -84,7 +86,7 @@ impl Registry {
 
     /// Registers a connection. A previous connection for the same worker is
     /// cancelled: the newest one wins.
-    pub fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx, capabilities: Vec<String>) -> ConnGuard<'_> {
+    pub fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx, capabilities: Vec<String>, role: &str) -> ConnGuard<'_> {
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let cancel = self.shutdown.child_token();
         let deliver = Arc::new(Notify::new());
@@ -95,6 +97,7 @@ impl Registry {
             last_seen: now,
             rtt_us: None,
             capabilities,
+            role: role.to_owned(),
             cancel: cancel.clone(),
             tx,
             rpc_waiters: rpc_waiters.clone(),
@@ -174,6 +177,19 @@ impl Registry {
         self.conns.lock().unwrap().get(&worker_id).cloned()
     }
 
+    /// The connected memex, if any.
+    pub fn memex(&self) -> Option<WorkerId> {
+        self.conns.lock().unwrap().iter().find(|(_, c)| c.role == "memex").map(|(id, _)| *id)
+    }
+
+    /// Replies to a node's call to the head.
+    pub async fn reply(&self, worker_id: WorkerId, reply: c6_proto::HeadCallReply) {
+        let tx = self.conns.lock().unwrap().get(&worker_id).map(|c| c.tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send(Ok(HeadMsg { msg: Some(head_msg::Msg::HeadCallReply(reply)) })).await;
+        }
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
@@ -192,8 +208,8 @@ mod tests {
         let reg = Registry::new(CancellationToken::new());
         let id = WorkerId::new();
         let tx = mpsc::channel(1).0;
-        let first = reg.attach(id, 1, tx.clone(), vec![]);
-        let second = reg.attach(id, 2, tx, vec![]);
+        let first = reg.attach(id, 1, tx.clone(), vec![], "worker");
+        let second = reg.attach(id, 2, tx, vec![], "worker");
         assert!(first.cancel.is_cancelled());
         drop(first); // must not unregister the newer connection
         assert_eq!(reg.get(id).unwrap().conn_id, second.conn_id);
