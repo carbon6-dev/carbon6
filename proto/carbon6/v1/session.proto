@@ -290,6 +290,8 @@ message CreateSession {
   repeated SessionEvent seed = 7;
   // Hooks from the head's settings (JSON array of c6_api::Hook).
   string hooks_json = 8;
+  // Named agents for the Task tool (JSON array of c6_api::AgentDef).
+  string agents_json = 9;
 }
 
 message ModelSpec {
@@ -308,6 +310,10 @@ message UserInput {
   repeated Attachment attachments = 3;
   // Set to switch the session to this model from this message on.
   ModelSpec model = 2;
+  // A custom slash command the text invokes (from the head's settings):
+  // its name and template. The worker fills in the arguments.
+  string command = 4;
+  string command_template = 5;
 }
 
 message Interrupt {}

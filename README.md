@@ -89,7 +89,7 @@ c6 login https://head.example:7700 --token c6_… --ca carbon6-ca.pem   # --ca o
   - Or set `ui_tls_cert`/`ui_tls_key` to PEM files. With HTTPS on, plain HTTP on the UI port redirects to the HTTPS name.
   - Sign-in is on by default; `auth = false` turns it off.
   - Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
-  - MCP servers and skills are configured in the UI.
+  - MCP servers, slash commands, agents, skills and hooks are configured in the UI (Settings) and stored on the head.
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
@@ -106,12 +106,20 @@ Paste, drop or pick (📎) images and text files into the message box; they go w
 Type `/` in the message box for the command list.
 
 - **Built in:** `/compact [focus]` summarizes the conversation so far (optionally focused on something) to free context; `/init` writes an AGENTS.md describing the codebase; `/review [what]` reviews the uncommitted changes, or a branch or PR you name; `/clear` starts a fresh session in the same folder with the same model; `/export` downloads the conversation as Markdown.
-- **Your own**, in Claude Code's format: Markdown files in `.claude/commands/` (in the repository, from its root down to the session's folder) or `~/.claude/commands/`. `frontend/component.md` is `/frontend:component`. Frontmatter can set `description` and `argument-hint`. In the body, `$ARGUMENTS` and `$1`…`$9` take the arguments, `` !`cmd` `` the output of a shell command run in the session's folder, and `@path` attaches a file. A project command replaces a built-in or personal one of the same name.
-- Skills in `.claude/skills/*/SKILL.md` and CLAUDE.md/AGENTS.md files are read too (see Configuration).
+- **Your own**, under **Settings → Slash commands**: a name, a description, an arguments hint and the prompt. In the prompt, `$ARGUMENTS` and `$1`…`$9` take the arguments, `` !`cmd` `` the output of a shell command run in the session's folder, and `@path` attaches a file. Changes apply to the next message, and a command named like a built-in replaces it. Start from an example (fix a GitHub issue, write a commit message, explain code).
 
-### Custom agents
+### Agents and skills
 
-Agents in Claude Code's format, `.claude/agents/<name>.md` (in the repository, or `~/.claude/agents/`), become subagent types the model can launch with the Task tool: frontmatter `name`, `description` (the model reads it to pick one), optional `tools` (comma-separated, Claude Code's names, e.g. `Read, Grep, Glob`; all tools when absent) and `model` (`inherit`, `opus`, `sonnet`, `haiku` or a model id; honored on Anthropic connections), and the body as the agent's instructions (its system prompt).
+Both live in Settings and are copied into each new session.
+
+- **Agents** (**Settings → Agents**) are specialized subagents the model can launch with the Task tool. Each has:
+  - a name;
+  - a description, which the model reads to pick one;
+  - optionally, the tools it may use (Claude Code's names, e.g. `Read, Grep, Glob`, work with every model; all tools when empty);
+  - optionally, a model (`opus`, `sonnet`, `haiku` or a model id; honored on Anthropic connections);
+  - its instructions, which become its system prompt.
+- **Skills** (**Settings → Skills**) are instructions the agent loads by name when they apply. Only the name and description sit in its prompt until then.
+- **On/off.** Each command, agent and skill can be switched off without deleting it.
 
 ### Hooks
 

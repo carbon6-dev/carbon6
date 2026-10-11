@@ -22,6 +22,8 @@ use crate::{HeadState, bad_request, convert, not_found};
 pub const MCP_SERVERS: &str = "mcp_servers";
 pub const SKILLS: &str = "skills";
 pub const HOOKS: &str = "hooks";
+pub const COMMANDS: &str = "commands";
+pub const AGENTS: &str = "agents";
 
 /// Per-session broadcast channels for stream subscribers.
 #[derive(Default)]
@@ -179,6 +181,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
         skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting(HOOKS).await?.unwrap_or_else(|| "[]".into()),
+        agents_json: st.store.setting(AGENTS).await?.unwrap_or_else(|| "[]".into()),
         seed,
     })
 }
@@ -233,7 +236,11 @@ async fn insert(
             id: &input_id,
             session_id: &session_id,
             worker_id,
-            data: input_command(&input_id, &session_id, UserInput { text: text.to_owned(), attachments, ..Default::default() }),
+            data: input_command(
+                &input_id,
+                &session_id,
+                with_command(st, UserInput { text: text.to_owned(), attachments, ..Default::default() }).await?,
+            ),
             text: Some(text),
         });
     }
@@ -286,6 +293,27 @@ fn attachments(uploads: &[api::AttachmentUpload]) -> anyhow::Result<Vec<c6_proto
     Ok(out)
 }
 
+/// The enabled custom slash commands in the head's settings.
+pub async fn custom_commands(st: &HeadState) -> anyhow::Result<Vec<api::CommandDef>> {
+    let raw = st.store.setting(COMMANDS).await?.unwrap_or_else(|| "[]".into());
+    Ok(serde_json::from_str::<Vec<api::CommandDef>>(&raw).unwrap_or_default().into_iter().filter(|c| c.enabled).collect())
+}
+
+/// Attaches the template of the custom command the text invokes, if any:
+/// commands apply as they are when the message is sent.
+async fn with_command(st: &HeadState, mut input: UserInput) -> anyhow::Result<UserInput> {
+    let Some(rest) = input.text.strip_prefix('/') else { return Ok(input) };
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    if !api::valid_command_name(name) {
+        return Ok(input);
+    }
+    if let Some(c) = custom_commands(st).await?.into_iter().find(|c| c.name == name) {
+        input.command = c.name;
+        input.command_template = c.body;
+    }
+    Ok(input)
+}
+
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
     let text = req.text.trim();
     let files = attachments(&req.attachments)?;
@@ -308,7 +336,8 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     let id = Uuid::now_v7().to_string();
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
-    let data = input_command(&id, session_id, UserInput { text: text.to_owned(), model, attachments: files });
+    let input = with_command(st, UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() }).await?;
+    let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);

@@ -1,4 +1,4 @@
-//! Named agents (.claude/agents): Task's subagent_type runs one with its
+//! Named agents (from the head's settings): Task's subagent_type runs one with its
 //! own instructions and only the tools it lists.
 
 use std::time::Duration;
@@ -56,12 +56,16 @@ async fn named_agents_run_with_their_prompt_and_tools() {
         .unwrap();
     let p = project.path();
 
-    std::fs::create_dir_all(p.join(".claude/agents")).unwrap();
-    std::fs::write(
-        p.join(".claude/agents/finder.md"),
-        "---\nname: finder\ndescription: Finds things in the code\ntools: Read, Grep\n---\nYou are FINDER. Search, never edit.",
-    )
-    .unwrap();
+    let r = http
+        .put(format!("{api}/settings/agents"))
+        .json(&json!([
+            {"name": "finder", "description": "Finds things in the code", "tools": "Read, Grep", "prompt": "You are FINDER. Search, never edit."},
+            {"name": "sleepy", "description": "Disabled", "prompt": "zzz", "enabled": false}
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
     let wid = worker.identity.meta.worker_id.0;
 
     mock.push(Reply::ToolCalls(vec![(
@@ -84,7 +88,8 @@ async fn named_agents_run_with_their_prompt_and_tools() {
     let reqs = mock.requests();
     // The parent's Task tool offers the agent.
     let task = reqs[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task").unwrap().clone();
-    assert!(task["function"]["description"].as_str().unwrap().contains("- finder: Finds things in the code"));
+    let offered = task["function"]["description"].as_str().unwrap();
+    assert!(offered.contains("- finder: Finds things in the code") && !offered.contains("sleepy"), "{offered}");
     // The agent: its own system prompt, and only the tools it lists.
     let child = &reqs[1];
     let system = child["messages"][0]["content"].as_str().unwrap();

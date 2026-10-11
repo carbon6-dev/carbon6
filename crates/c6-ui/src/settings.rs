@@ -55,13 +55,29 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
   {"name": "docs", "transport": "http", "url": "http://10.0.0.5:8080/mcp"}
 ]"#
             />
-            <JsonSetting
+            <ListSetting
+                name="commands"
+                title="Slash commands"
+                noun="command"
+                help="Your own /commands, offered when you type / in a message. Changes apply to the next message. In the prompt, $ARGUMENTS (or $1…$9) takes what follows the command, !`cmd` the output of a shell command run in the session's folder, and @path attaches a file. A command named like a built-in one replaces it."
+                fields=COMMAND_FIELDS
+                examples=command_examples
+            />
+            <ListSetting
+                name="agents"
+                title="Agents"
+                noun="agent"
+                help="Specialized subagents the model can launch (with the Task tool), each with its own instructions and, optionally, a limited set of tools. The model picks one by its description. New sessions pick up changes."
+                fields=AGENT_FIELDS
+                examples=agent_examples
+            />
+            <ListSetting
                 name="skills"
                 title="Skills"
-                help="Instructions the agent loads on demand by name. Skills in a repository's .claude/skills or .agents/skills directories are found automatically and take precedence."
-                example=r#"[
-  {"name": "release", "description": "How to cut a release", "body": "1. Update CHANGELOG.md…"}
-]"#
+                noun="skill"
+                help="Instructions the agent loads by name when they apply; only the name and description sit in its prompt until then. New sessions pick up changes."
+                fields=SKILL_FIELDS
+                examples=skill_examples
             />
             <HooksSetting />
         </main>
@@ -550,6 +566,262 @@ fn HookRow(hook: RwSignal<Hook>, on_remove: impl Fn() + Copy + Send + Sync + 'st
                     prop:value=move || hook.with(|h| h.command.clone())
                     on:input=move |ev| hook.update(|h| h.command = event_target_value(&ev))></textarea>
             </label>
+        </div>
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FieldKind {
+    /// One line.
+    Line,
+    /// One line, monospace.
+    Mono,
+    /// Several lines.
+    Text,
+}
+
+/// A field of a list setting's items. The first is the item's name, shown
+/// in its header.
+struct Field {
+    key: &'static str,
+    label: &'static str,
+    placeholder: &'static str,
+    kind: FieldKind,
+}
+
+const COMMAND_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "name, typed as /name", kind: FieldKind::Mono },
+    Field { key: "description", label: "Description", placeholder: "shown in the / list", kind: FieldKind::Line },
+    Field { key: "argument_hint", label: "Arguments hint", placeholder: "e.g. <issue> [priority]", kind: FieldKind::Mono },
+    Field { key: "body", label: "Prompt", placeholder: "Fix issue #$1. Here it is: !`gh issue view $1`", kind: FieldKind::Text },
+];
+
+const AGENT_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. code-reviewer", kind: FieldKind::Mono },
+    Field { key: "description", label: "When to use it", placeholder: "the model reads this to pick the agent", kind: FieldKind::Line },
+    Field { key: "tools", label: "Tools", placeholder: "all, or e.g. Read, Grep, Glob", kind: FieldKind::Mono },
+    Field { key: "model", label: "Model", placeholder: "same as the session (or opus, sonnet, haiku on Anthropic)", kind: FieldKind::Mono },
+    Field { key: "prompt", label: "Instructions", placeholder: "You are a … Your job is …", kind: FieldKind::Text },
+];
+
+const SKILL_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. release", kind: FieldKind::Mono },
+    Field { key: "description", label: "When to use it", placeholder: "the agent reads this to decide to load it", kind: FieldKind::Line },
+    Field { key: "body", label: "Instructions", placeholder: "1. …", kind: FieldKind::Text },
+];
+
+fn item(pairs: &[(&str, &str)]) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in pairs {
+        m.insert((*k).into(), serde_json::Value::String((*v).into()));
+    }
+    m.insert("enabled".into(), serde_json::Value::Bool(true));
+    serde_json::Value::Object(m)
+}
+
+fn command_examples() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("Empty", item(&[("name", ""), ("body", "")])),
+        (
+            "Fix a GitHub issue",
+            item(&[
+                ("name", "fix-issue"),
+                ("description", "Fix a GitHub issue"),
+                ("argument_hint", "<issue number>"),
+                ("body", "Fix GitHub issue #$1.\n\n!`gh issue view $1`\n\nFind the cause, fix it, add a test, and run the tests."),
+            ]),
+        ),
+        (
+            "Write a commit message",
+            item(&[
+                ("name", "commit-message"),
+                ("description", "Write a commit message for the staged changes"),
+                ("body", "Write a commit message for these staged changes: a short summary line, then why.\n\n!`git diff --staged`"),
+            ]),
+        ),
+        (
+            "Explain code",
+            item(&[
+                ("name", "explain"),
+                ("description", "Explain a file or function"),
+                ("argument_hint", "<file or symbol>"),
+                ("body", "Explain how $ARGUMENTS works: its purpose, the main flow, and anything surprising. Read the code first."),
+            ]),
+        ),
+    ]
+}
+
+fn agent_examples() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("Empty", item(&[("name", ""), ("prompt", "")])),
+        (
+            "Code reviewer",
+            item(&[
+                ("name", "code-reviewer"),
+                ("description", "Reviews changes for bugs, security problems and missing tests. Use after writing code."),
+                ("tools", "Read, Grep, Glob, Bash"),
+                (
+                    "prompt",
+                    "You are a careful code reviewer. Read the changes (git diff) and enough surrounding code to be sure. Report real problems only, most severe first, each with file, line, what goes wrong and a fix. Do not edit files.",
+                ),
+            ]),
+        ),
+        (
+            "Test runner",
+            item(&[
+                ("name", "test-runner"),
+                ("description", "Runs the tests and fixes failures. Use when tests need running or are failing."),
+                ("tools", "Bash, Read, Edit, Grep, Glob"),
+                (
+                    "prompt",
+                    "Run the project's tests. For each failure, find the cause and fix the code (not the test, unless the test is wrong). Report what failed and what you changed.",
+                ),
+            ]),
+        ),
+        (
+            "Researcher",
+            item(&[
+                ("name", "researcher"),
+                ("description", "Answers questions about the codebase or the web without changing anything."),
+                ("tools", "Read, Grep, Glob, WebFetch"),
+                (
+                    "prompt",
+                    "Investigate the question thoroughly and report what you found, with file paths and links. Do not change anything.",
+                ),
+            ]),
+        ),
+    ]
+}
+
+fn skill_examples() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("Empty", item(&[("name", ""), ("body", "")])),
+        (
+            "Cut a release",
+            item(&[
+                ("name", "release"),
+                ("description", "How to cut a release of this project"),
+                ("body", "1. Update CHANGELOG.md.\n2. Bump the version.\n3. Tag vX.Y.Z and push the tag."),
+            ]),
+        ),
+    ]
+}
+
+/// A list setting (commands, agents, skills) edited item by item and saved
+/// to the head, which checks it.
+#[component]
+fn ListSetting(
+    name: &'static str,
+    title: &'static str,
+    noun: &'static str,
+    help: &'static str,
+    fields: &'static [Field],
+    examples: fn() -> Vec<(&'static str, serde_json::Value)>,
+) -> impl IntoView {
+    let rows = RwSignal::new(Vec::<(u64, RwSignal<serde_json::Map<String, serde_json::Value>>)>::new());
+    let next = StoredValue::new(0u64);
+    let add = move |v: serde_json::Value| {
+        let serde_json::Value::Object(m) = v else { return };
+        let id = next.get_value();
+        next.set_value(id + 1);
+        rows.update(|r| r.push((id, RwSignal::new(m))));
+    };
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let loaded = LocalResource::new(move || api::get_setting(name));
+    Effect::new(move || {
+        if let Some(Ok(serde_json::Value::Array(items))) = loaded.get() {
+            rows.set(Vec::new());
+            for v in items {
+                add(v);
+            }
+        }
+    });
+    let save = move |_| {
+        let items: Vec<serde_json::Value> =
+            rows.get_untracked().iter().map(|(_, m)| serde_json::Value::Object(m.get_untracked())).collect();
+        spawn_local(async move {
+            let r = api::put_setting(name, serde_json::Value::Array(items)).await.map(|_| "Saved.");
+            status.set(Some(r));
+        });
+    };
+    let picked = RwSignal::new(String::new());
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">{title}</h2>
+                <p class="text-sm text-zinc-500">{help}</p>
+            </div>
+            <div class="space-y-3">
+                <For each=move || rows.get() key=|(id, _)| *id let:row>
+                    <ListItem item=row.1 fields on_remove=move || rows.update(|r| r.retain(|(id, _)| *id != row.0)) />
+                </For>
+                {move || rows.with(Vec::is_empty).then(|| view! { <p class="text-sm text-zinc-500">{format!("No {noun}s.")}</p> })}
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <select class=format!("{INPUT} w-auto!") prop:value=move || picked.get()
+                    on:change=move |ev| {
+                        let label = event_target_value(&ev);
+                        if let Some((_, v)) = examples().into_iter().find(|(l, _)| *l == label) {
+                            add(v);
+                        }
+                        picked.set(String::new());
+                    }>
+                    <option value="">{format!("Add {} {noun}…", if noun.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" })}</option>
+                    {examples().into_iter().map(|(l, _)| view! { <option value=l>{l}</option> }).collect_view()}
+                </select>
+                <div class="flex items-center gap-3">
+                    {move || status.get().map(|r| match r {
+                        Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                        Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                    })}
+                    <button class=BUTTON on:click=save>"Save"</button>
+                </div>
+            </div>
+        </section>
+    }
+}
+
+#[component]
+fn ListItem(
+    item: RwSignal<serde_json::Map<String, serde_json::Value>>,
+    fields: &'static [Field],
+    on_remove: impl Fn() + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    let get = move |k: &'static str| move || item.with(|m| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned());
+    let set = move |k: &'static str, v: String| {
+        item.update(|m| {
+            m.insert(k.into(), serde_json::Value::String(v));
+        })
+    };
+    let enabled = move || item.with(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true));
+    let (first, rest) = fields.split_first().expect("a name field");
+    let lines: Vec<&'static Field> = rest.iter().filter(|f| f.kind != FieldKind::Text).collect();
+    let texts: Vec<&'static Field> = rest.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    let input_class = |f: &Field| format!("{INPUT} py-1 {}", if f.kind == FieldKind::Mono { "font-mono text-xs" } else { "text-sm" });
+    view! {
+        <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if enabled() { "" } else { "opacity-60" })>
+            <div class="flex items-center gap-2">
+                <input type="checkbox" title="Enabled" prop:checked=enabled
+                    on:change=move |ev| item.update(|m| { m.insert("enabled".into(), serde_json::Value::Bool(event_target_checked(&ev))); }) />
+                <input class=format!("{} w-auto! min-w-0 flex-1", input_class(first)) placeholder=first.placeholder prop:value=get(first.key)
+                    on:input=move |ev| set(first.key, event_target_value(&ev)) />
+                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+                {lines.into_iter().map(|f| view! {
+                    <label class="space-y-0.5">
+                        <span class="text-xs text-zinc-500">{f.label}</span>
+                        <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key) on:input=move |ev| set(f.key, event_target_value(&ev)) />
+                    </label>
+                }).collect_view()}
+            </div>
+            {texts.into_iter().map(|f| view! {
+                <label class="block space-y-0.5">
+                    <span class="text-xs text-zinc-500">{f.label}</span>
+                    <textarea class=format!("{INPUT} min-h-24 font-mono text-xs") placeholder=f.placeholder prop:value=get(f.key)
+                        on:input=move |ev| set(f.key, event_target_value(&ev))></textarea>
+                </label>
+            }).collect_view()}
         </div>
     }
 }

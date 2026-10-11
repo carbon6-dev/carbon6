@@ -39,6 +39,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/mcp-servers", get(get_mcp_servers).put(put_mcp_servers))
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/settings/hooks", get(get_hooks).put(put_hooks))
+        .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
+        .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
+        .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
@@ -49,7 +52,6 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
         .route("/api/v1/workers/{id}/fs/read", get(fs_read))
         .route("/api/v1/workers/{id}/fs/find", get(fs_find))
-        .route("/api/v1/workers/{id}/commands", get(commands))
         .route("/api/v1/workers/{id}/fs/mkdir", post(fs_mkdir))
         .route("/api/v1/workers/{id}/git/status", get(git_status))
         .route("/api/v1/workers/{id}/git/diff", get(git_diff))
@@ -543,24 +545,87 @@ async fn put_mcp_servers(State(st): State<Arc<HeadState>>, Json(servers): Json<V
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-struct SkillDef {
-    name: String,
-    #[serde(default)]
-    description: String,
-    body: String,
-}
-
 async fn get_skills(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
     get_setting(&st, crate::sessions::SKILLS).await
 }
 
-async fn put_skills(State(st): State<Arc<HeadState>>, Json(skills): Json<Vec<SkillDef>>) -> ApiResult<StatusCode> {
-    if skills.iter().any(|s| s.name.trim().is_empty() || s.body.trim().is_empty()) {
-        return Err(ApiErr(StatusCode::BAD_REQUEST, "each skill needs a name and a body".into()));
+/// Names in a list must be valid and unique.
+fn check_names<'a>(what: &str, names: impl Iterator<Item = &'a str>, valid: impl Fn(&str) -> bool) -> ApiResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for n in names {
+        if !valid(n) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{what} name {n:?} is not valid")));
+        }
+        if !seen.insert(n) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("two {what}s are named {n:?}")));
+        }
+    }
+    Ok(())
+}
+
+fn plain_name(n: &str) -> bool {
+    !n.trim().is_empty() && n.len() <= 80 && n.chars().all(|c| c.is_alphanumeric() || "_-:.".contains(c))
+}
+
+async fn put_skills(State(st): State<Arc<HeadState>>, Json(skills): Json<Vec<api::SkillDef>>) -> ApiResult<StatusCode> {
+    check_names("skill", skills.iter().map(|s| s.name.as_str()), plain_name)?;
+    if let Some(s) = skills.iter().find(|s| s.body.trim().is_empty()) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, format!("skill {:?} needs instructions", s.name)));
     }
     st.store.set_setting(crate::sessions::SKILLS, &serde_json::to_string(&skills).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_commands_setting(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    get_setting(&st, crate::sessions::COMMANDS).await
+}
+
+async fn put_commands(State(st): State<Arc<HeadState>>, Json(commands): Json<Vec<api::CommandDef>>) -> ApiResult<StatusCode> {
+    check_names("command", commands.iter().map(|c| c.name.as_str()), api::valid_command_name)?;
+    if let Some(c) = commands.iter().find(|c| c.body.trim().is_empty()) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, format!("/{} needs a prompt", c.name)));
+    }
+    st.store.set_setting(crate::sessions::COMMANDS, &serde_json::to_string(&commands).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_agents(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    get_setting(&st, crate::sessions::AGENTS).await
+}
+
+async fn put_agents(State(st): State<Arc<HeadState>>, Json(agents): Json<Vec<api::AgentDef>>) -> ApiResult<StatusCode> {
+    check_names("agent", agents.iter().map(|a| a.name.as_str()), |n| plain_name(n) && n != "general-purpose")?;
+    if let Some(a) = agents.iter().find(|a| a.prompt.trim().is_empty()) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, format!("agent {:?} needs instructions", a.name)));
+    }
+    st.store.set_setting(crate::sessions::AGENTS, &serde_json::to_string(&agents).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The slash commands the composer offers: built-ins and the enabled custom
+/// ones (a custom command replaces a built-in of the same name).
+async fn list_commands(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::CommandInfo>>> {
+    let custom = crate::sessions::custom_commands(&st).await?;
+    let mut out: Vec<api::CommandInfo> = api::BUILTIN_COMMANDS
+        .iter()
+        .filter(|(n, _, _)| !custom.iter().any(|c| c.name == *n))
+        .map(|(n, d, h)| api::CommandInfo {
+            name: (*n).into(),
+            description: (*d).into(),
+            argument_hint: (*h).into(),
+            source: "built-in".into(),
+        })
+        .collect();
+    out.extend(custom.into_iter().map(|c| {
+        let description = if c.description.trim().is_empty() {
+            c.body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim_start_matches('#').trim().chars().take(100).collect()
+        } else {
+            c.description
+        };
+        api::CommandInfo { name: c.name, description, argument_hint: c.argument_hint, source: "custom".into() }
+    }));
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(out))
 }
 
 async fn get_hooks(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
@@ -767,11 +832,6 @@ async fn fs_list(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query
 
 async fn fs_find(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
     worker_call(&st, &id, "fs.find", params_json(q)).await
-}
-
-/// The slash commands available in a folder (`?root=`).
-async fn commands(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
-    worker_call(&st, &id, "commands.list", params_json(q)).await
 }
 
 async fn fs_read(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {

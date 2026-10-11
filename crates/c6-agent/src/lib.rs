@@ -35,6 +35,8 @@ pub struct PendingInput {
     pub attachments: Vec<c6_proto::Attachment>,
     /// The slash command it invoked, if any.
     pub command: String,
+    /// A custom command's template (from the head), to expand; not logged.
+    pub template: String,
     /// What the model gets instead of the text, when a command expanded it.
     pub prompt: String,
     /// Why a UserPromptSubmit hook blocked it, if one did.

@@ -1416,25 +1416,10 @@ fn download(url: &str) {
     }
 }
 
-/// Commands the UI runs itself.
-fn ui_commands(inline: bool) -> Vec<api::CommandInfo> {
-    let c = |name: &str, description: &str| api::CommandInfo {
-        name: name.into(),
-        description: description.into(),
-        argument_hint: String::new(),
-        source: "built-in".into(),
-    };
-    let mut v = vec![c("export", "Download this conversation as Markdown")];
-    if !inline {
-        v.push(c("clear", "Start a fresh session in the same folder, with the same model"));
-    }
-    v
-}
-
 #[derive(Clone, PartialEq)]
 enum Suggestion {
     File(String, bool),
-    Command(api::CommandInfo),
+    Command(c6_api::CommandInfo),
 }
 
 /// The `@` mention being typed at the caret: (where the @ is, the query).
@@ -1480,19 +1465,13 @@ fn Composer(
             }
         }
     });
-    // Slash commands: the query, and the commands where the session runs.
+    // Slash commands: the query, and the commands the head offers.
     let command = RwSignal::new(None::<String>);
-    let commands = LocalResource::new(move || {
-        let place = files.and_then(|f| f.get());
-        async move {
-            let mut list = match place {
-                Some((worker, root)) => api::commands(worker, root).await.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            list.extend(ui_commands(inline));
-            list.sort_by(|a, b| a.name.cmp(&b.name));
-            list
-        }
+    let commands = LocalResource::new(move || async move {
+        let mut list = api::commands().await.unwrap_or_default();
+        // A side chat has no /clear.
+        list.retain(|c| !(inline && c.name == "clear" && c.source == "built-in"));
+        list
     });
     let suggestions = move || -> Vec<Suggestion> {
         if let Some(q) = command.get() {
@@ -1571,15 +1550,18 @@ fn Composer(
         if (t.trim().is_empty() && uploads.is_empty()) || disabled.get_untracked() {
             return;
         }
-        // Commands the UI runs.
+        // Commands the UI runs (unless a custom command took the name).
+        let custom = |n: &str| {
+            commands.get_untracked().and_then(|l| l.into_iter().find(|c| c.name == n).map(|c| c.source == "custom")).unwrap_or(false)
+        };
         match t.trim() {
-            "/export" => {
+            "/export" if !custom("export") => {
                 text.set(String::new());
                 command.set(None);
                 download(&format!("/api/v1/sessions/{}/export", id.get_value()));
                 return;
             }
-            "/clear" if !inline => {
+            "/clear" if !inline && !custom("clear") => {
                 let (Some((worker, cwd)), Some(m)) = (files.and_then(|f| f.get_untracked()), model) else { return };
                 text.set(String::new());
                 command.set(None);

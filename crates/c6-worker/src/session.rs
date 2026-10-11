@@ -82,8 +82,14 @@ impl SessionManager {
                     return Ok(());
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                let pending =
-                    PendingInput { command_id: cmd.command_id, text: input.text, attachments: input.attachments, ..Default::default() };
+                let pending = PendingInput {
+                    command_id: cmd.command_id,
+                    text: input.text,
+                    attachments: input.attachments,
+                    command: input.command,
+                    template: input.command_template,
+                    ..Default::default()
+                };
                 let _ = actor.send(ActorMsg::Input(Box::new(pending), input.model));
                 Ok(())
             }
@@ -683,11 +689,39 @@ pub(crate) struct BuiltTools {
     pub errors: Vec<String>,
 }
 
+fn yes() -> bool {
+    true
+}
+
 pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, profile: ToolProfile) -> BuiltTools {
     let mut tools = c6_tools::tools_for(profile);
     let mut errors = Vec::new();
-    // Named agents (.claude/agents) become Task's subagent types.
-    let agents = c6_tools::AgentDef::discover(cwd);
+    // Named agents (from the head's settings) become Task's subagent types.
+    #[derive(serde::Deserialize)]
+    struct HeadAgent {
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        tools: String,
+        #[serde(default)]
+        model: String,
+        prompt: String,
+        #[serde(default = "yes")]
+        enabled: bool,
+    }
+    let agents: Vec<c6_tools::AgentDef> = serde_json::from_str::<Vec<HeadAgent>>(&spec.agents_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.enabled && !a.prompt.trim().is_empty())
+        .map(|a| c6_tools::AgentDef {
+            name: a.name,
+            description: a.description,
+            tools: a.tools.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect(),
+            model: a.model,
+            prompt: a.prompt,
+        })
+        .collect();
     if !agents.is_empty()
         && let Some(i) = tools.iter().position(|t| c6_tools::Task::is_task(&t.spec().name))
     {
@@ -700,17 +734,15 @@ pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, pro
         #[serde(default)]
         description: String,
         body: String,
+        #[serde(default = "yes")]
+        enabled: bool,
     }
     let mut skills: Vec<Skill> = serde_json::from_str::<Vec<HeadSkill>>(&spec.skills_json)
         .unwrap_or_default()
         .into_iter()
+        .filter(|s| s.enabled)
         .map(|s| Skill { name: s.name, description: s.description, body: s.body, dir: None })
         .collect();
-    // Repo skills override head skills of the same name.
-    for s in Skill::discover(cwd) {
-        skills.retain(|k| k.name != s.name);
-        skills.push(s);
-    }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     if !skills.is_empty() {
         tools.push(Arc::new(SkillTool::new(profile == ToolProfile::Claude, Arc::new(skills.clone()))));

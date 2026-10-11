@@ -1,4 +1,4 @@
-//! Subagents (Task), named agents (`.claude/agents`) and skills (Skill).
+//! Subagents (Task), named agents and skills (Skill).
 
 use std::sync::Arc;
 
@@ -25,22 +25,8 @@ pub trait Subagents: Send + Sync {
     ) -> Result<String, String>;
 }
 
-/// The frontmatter (between `---` lines) and body of a Markdown file.
-pub fn frontmatter(text: &str) -> (&str, &str) {
-    match text.strip_prefix("---").and_then(|r| r.split_once("\n---")) {
-        Some((front, body)) => (front, body.trim_start_matches(['-', '\n', '\r'])),
-        None => ("", text),
-    }
-}
-
-/// A `key: value` from frontmatter, unquoted.
-pub fn front_field(front: &str, key: &str) -> Option<String> {
-    front.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(':')).map(|v| v.trim().trim_matches('"').to_owned()))
-}
-
-/// A named subagent, in Claude Code's format: `.claude/agents/<name>.md`
-/// with `name`, `description`, optional `tools` (comma-separated; all
-/// when absent) and `model` frontmatter, and its instructions as the body.
+/// A named subagent (from the head's settings): its instructions, the tools
+/// it may use and the model it asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentDef {
     pub name: String,
@@ -54,56 +40,6 @@ pub struct AgentDef {
 }
 
 impl AgentDef {
-    pub fn parse(text: &str, fallback_name: &str) -> Option<Self> {
-        let (front, body) = frontmatter(text);
-        let name = front_field(front, "name").filter(|n| !n.is_empty()).unwrap_or_else(|| fallback_name.to_owned());
-        let tools = front_field(front, "tools")
-            .map(|t| {
-                t.trim_matches(['[', ']'])
-                    .split(',')
-                    .map(|s| s.trim().trim_matches(['"', '\'']).to_owned())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let prompt = body.trim().to_owned();
-        (!prompt.is_empty()).then(|| Self {
-            name,
-            description: front_field(front, "description").unwrap_or_default(),
-            tools,
-            model: front_field(front, "model").unwrap_or_default(),
-            prompt,
-        })
-    }
-
-    /// Agents in `~/.claude/agents`, then `.claude/agents` from the repo
-    /// root down to `cwd` (later ones replace earlier ones of the same name).
-    pub fn discover(cwd: &std::path::Path) -> Vec<AgentDef> {
-        let mut dirs = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(std::path::PathBuf::from(home).join(".claude/agents"));
-        }
-        let root = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd);
-        let mut repo: Vec<_> = cwd.ancestors().take_while(|d| d.starts_with(root)).map(|d| d.join(".claude/agents")).collect();
-        repo.reverse();
-        dirs.extend(repo);
-        let mut out: Vec<AgentDef> = Vec::new();
-        for dir in dirs {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-            let mut files: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
-            files.sort();
-            for path in files {
-                let fallback = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-                if let Some(a) = std::fs::read_to_string(&path).ok().and_then(|t| AgentDef::parse(&t, &fallback)) {
-                    out.retain(|k| k.name != a.name);
-                    out.push(a);
-                }
-            }
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
-    }
-
     /// Whether it may use the tool called `name` (in any profile's naming).
     pub fn allows(&self, name: &str) -> bool {
         fn canonical(n: &str) -> String {
@@ -211,42 +147,6 @@ pub struct Skill {
 }
 
 impl Skill {
-    /// Parses `SKILL.md` with `name:` / `description:` frontmatter.
-    pub fn parse(text: &str, fallback_name: &str, dir: Option<String>) -> Option<Self> {
-        let rest = text.strip_prefix("---")?;
-        let (front, body) = rest.split_once("\n---")?;
-        let field = |k: &str| {
-            front.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.strip_prefix(':')).map(|v| v.trim().trim_matches('"').to_owned()))
-        };
-        let name = field("name").filter(|n| !n.is_empty()).unwrap_or_else(|| fallback_name.to_owned());
-        let description = field("description").unwrap_or_default();
-        Some(Self { name, description, body: body.trim_start_matches(['-', '\n', '\r']).trim().to_owned(), dir })
-    }
-
-    /// Skills from `.claude/skills/*/SKILL.md` and `.agents/skills/*/SKILL.md`
-    /// between the repo root and `cwd`.
-    pub fn discover(cwd: &std::path::Path) -> Vec<Skill> {
-        let root = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd);
-        let mut out = Vec::new();
-        for dir in cwd.ancestors().take_while(|d| d.starts_with(root)) {
-            for sub in [".claude/skills", ".agents/skills"] {
-                let Ok(rd) = std::fs::read_dir(dir.join(sub)) else { continue };
-                for e in rd.flatten() {
-                    let path = e.path().join("SKILL.md");
-                    if let Ok(text) = std::fs::read_to_string(&path) {
-                        let fallback = e.file_name().to_string_lossy().into_owned();
-                        if let Some(s) = Skill::parse(&text, &fallback, Some(e.path().display().to_string())) {
-                            out.push(s);
-                        }
-                    }
-                }
-            }
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out.dedup_by(|a, b| a.name == b.name);
-        out
-    }
-
     /// The index placed in the system prompt.
     pub fn index(skills: &[Skill], tool_name: &str) -> String {
         let mut s = format!(
@@ -310,41 +210,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_discovers_skills() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        let s = dir.path().join(".claude/skills/release");
-        std::fs::create_dir_all(&s).unwrap();
-        std::fs::write(s.join("SKILL.md"), "---\nname: release\ndescription: \"Cut a release\"\n---\n\n1. Bump the version.\n").unwrap();
-        let found = Skill::discover(dir.path());
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            (found[0].name.as_str(), found[0].description.as_str(), found[0].body.as_str()),
-            ("release", "Cut a release", "1. Bump the version.")
-        );
-        assert!(Skill::index(&found, "Skill").contains("- release: Cut a release"));
+    fn skills_index() {
+        let skills = vec![Skill { name: "release".into(), description: "Cut a release".into(), body: "1. Bump.".into(), dir: None }];
+        assert!(Skill::index(&skills, "Skill").contains("- release: Cut a release"));
     }
 
     #[test]
-    fn parses_and_discovers_agents() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        let a = dir.path().join(".claude/agents");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::write(
-            a.join("reviewer.md"),
-            "---\nname: code-reviewer\ndescription: Reviews code\ntools: Read, Grep, Glob\nmodel: sonnet\n---\nYou review code.\n",
-        )
-        .unwrap();
-        std::fs::write(a.join("empty.md"), "---\nname: nothing\n---\n").unwrap();
-        let found: Vec<AgentDef> =
-            AgentDef::discover(dir.path()).into_iter().filter(|a| a.name == "code-reviewer" || a.name == "nothing").collect();
-        assert_eq!(found.len(), 1, "an agent needs instructions");
-        let r = &found[0];
-        assert_eq!((r.description.as_str(), r.model.as_str(), r.prompt.as_str()), ("Reviews code", "sonnet", "You review code."));
+    fn named_agents() {
+        let r = AgentDef {
+            name: "code-reviewer".into(),
+            description: "Reviews code".into(),
+            tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+            model: "sonnet".into(),
+            prompt: "You review code.".into(),
+        };
         assert!(r.allows("Read") && r.allows("read") && r.allows("read_file") && r.allows("grep"));
         assert!(!r.allows("Bash") && !r.allows("shell") && !r.allows("Write"));
-        let spec = Task::with_agents(true, found.clone()).spec();
+        let spec = Task::with_agents(true, vec![r]).spec();
         assert!(spec.description.contains("- code-reviewer: Reviews code"));
         assert_eq!(spec.parameters["properties"]["subagent_type"]["enum"], json!(["general-purpose", "code-reviewer"]));
     }

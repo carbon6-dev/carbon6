@@ -1,4 +1,4 @@
-//! Slash commands: a project command expands for the model, /compact
+//! Slash commands: a custom command (from the head's settings) expands for the model, /compact
 //! summarizes on request, and a session exports as Markdown.
 
 use std::time::Duration;
@@ -56,24 +56,28 @@ async fn slash_commands_compact_and_export() {
         .unwrap();
     let p = project.path();
 
+    // Commands live in the head's settings; files are not read.
     std::fs::create_dir_all(p.join(".claude/commands")).unwrap();
-    std::fs::write(p.join(".claude/commands/greet.md"), "---\ndescription: Say hello\n---\nSay hello to $ARGUMENTS in French.").unwrap();
-    let wid = worker.identity.meta.worker_id.0;
-
-    // The composer's list: built-ins and the project's.
-    let list: serde_json::Value = http
-        .get(format!("{api}/workers/{wid}/commands"))
-        .query(&[("root", p.display().to_string())])
+    std::fs::write(p.join(".claude/commands/fromfile.md"), "never used").unwrap();
+    let r = http.put(format!("{api}/settings/commands")).json(&json!([{"name": "bad name", "body": "x"}])).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    let r = http
+        .put(format!("{api}/settings/commands"))
+        .json(&json!([
+            {"name": "greet", "description": "Say hello", "argument_hint": "<name>", "body": "Say hello to $ARGUMENTS in French."},
+            {"name": "off", "body": "disabled", "enabled": false}
+        ]))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    // (Ignoring this machine's own ~/.claude/commands.)
-    let names: Vec<&str> =
-        list["commands"].as_array().unwrap().iter().filter(|c| c["source"] != "user").map(|c| c["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["compact", "greet", "init", "review"]);
+    assert!(r.status().is_success());
+    let wid = worker.identity.meta.worker_id.0;
+
+    // The composer's list: built-ins and the enabled custom ones.
+    let list: serde_json::Value = http.get(format!("{api}/commands")).send().await.unwrap().json().await.unwrap();
+    let names: Vec<&str> = list.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["clear", "compact", "export", "greet", "init", "review"]);
+    assert_eq!(list[3]["argument_hint"], "<name>");
 
     mock.push(Reply::Text("Bonjour, Ada !".into()));
     let s: Session = http

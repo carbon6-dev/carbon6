@@ -507,6 +507,83 @@ fn enabled_default() -> bool {
     true
 }
 
+/// A custom slash command (`GET`/`PUT /api/v1/settings/commands`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandDef {
+    /// Typed as `/name`; letters, digits, `-`, `_`, `:` and `.`.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Shown after the name while typing, e.g. `<issue> [priority]`.
+    #[serde(default)]
+    pub argument_hint: String,
+    /// The prompt: `$ARGUMENTS` and `$1`…`$9` take the arguments,
+    /// `` !`cmd` `` a shell command's output (run in the session's folder),
+    /// `@path` attaches a file.
+    pub body: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// A named agent the Task tool can launch (`/api/v1/settings/agents`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentDef {
+    pub name: String,
+    /// When to use it; the model reads this to pick an agent.
+    #[serde(default)]
+    pub description: String,
+    /// Comma-separated tool names it may use (Claude Code names work with
+    /// every model); empty: all.
+    #[serde(default)]
+    pub tools: String,
+    /// `inherit` (or empty), `opus`, `sonnet`, `haiku` or a model id
+    /// (Anthropic connections only).
+    #[serde(default)]
+    pub model: String,
+    /// Its instructions (system prompt).
+    pub prompt: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// A skill: instructions the agent loads by name (`/api/v1/settings/skills`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub body: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// The commands built into carbon6: (name, description, argument hint).
+/// `compact`, `init` and `review` run on the worker; `clear` and `export`
+/// in the UI.
+pub const BUILTIN_COMMANDS: [(&str, &str, &str); 5] = [
+    ("compact", "Summarize the conversation so far to free context", "[what to focus on]"),
+    ("init", "Write an AGENTS.md describing this codebase", ""),
+    ("review", "Review the changes (uncommitted, or a branch or PR)", "[what to review]"),
+    ("clear", "Start a fresh session in the same folder, with the same model", ""),
+    ("export", "Download this conversation as Markdown", ""),
+];
+
+/// A command as the composer lists it (`GET /api/v1/commands`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub argument_hint: String,
+    /// "built-in" or "custom".
+    pub source: String,
+}
+
+/// Whether `name` can be a slash command's name.
+pub fn valid_command_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || "_-:.".contains(c))
+}
+
 pub const HOOK_EVENTS: [&str; 5] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"];
 
 /// A signed-in browser.
