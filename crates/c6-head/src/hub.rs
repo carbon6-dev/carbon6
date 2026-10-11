@@ -104,7 +104,7 @@ impl WorkerHub for HubSvc {
             .and_then(|c| crate::pki::worker_identity(c))
             .ok_or_else(|| Status::unauthenticated("certificate has no worker identity"))?;
         let row = st.store.worker(worker_id).await.map_err(internal)?.ok_or_else(|| Status::permission_denied("unknown worker"))?;
-        if row.revoked_at.is_some() || row.cert_serial != serial {
+        if row.revoked_at.is_some() || !crate::pki::same_serial(&row.cert_serial, &serial) {
             return Err(Status::permission_denied("worker revoked"));
         }
 

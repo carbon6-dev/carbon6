@@ -148,9 +148,26 @@ pub(crate) fn set_validity(params: &mut CertificateParams, lifetime: Duration) {
     params.not_after = now + lifetime;
 }
 
+/// Whether two serials (hex) are the same number. Leading zero bytes are
+/// ignored: DER drops them, and certificates issued before serials avoided
+/// them were enrolled with the zero byte.
+pub fn same_serial(a: &str, b: &str) -> bool {
+    fn trim(s: &str) -> &str {
+        let mut s = s;
+        while s.len() > 2 && s.starts_with("00") {
+            s = &s[2..];
+        }
+        s
+    }
+    trim(&a.to_ascii_lowercase()) == trim(&b.to_ascii_lowercase())
+}
+
+/// A random positive serial whose first byte is never zero, so its DER
+/// encoding is exactly these 16 bytes (DER drops a leading zero byte, which
+/// would make the serial read back from the certificate differ).
 pub(crate) fn random_serial() -> SerialNumber {
     let mut bytes: [u8; 16] = rand::random();
-    bytes[0] &= 0x7f; // keep it positive
+    bytes[0] = (bytes[0] & 0x7f).max(1);
     SerialNumber::from_slice(&bytes)
 }
 
@@ -194,5 +211,24 @@ mod tests {
         // Reloading keeps the same CA.
         let again = Pki::load_or_create(dir.path(), &[], &[]).unwrap();
         assert_eq!(again.ca_sha256(), pki.ca_sha256());
+    }
+
+    /// Every issued serial reads back the same from the certificate, so no
+    /// worker is ever taken for a revoked one. (A serial starting with a
+    /// zero byte used to lose it in the DER encoding: about 1 in 256.)
+    #[test]
+    fn serials_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = Pki::load_or_create(dir.path(), &["127.0.0.1".parse().unwrap()], &["localhost".into()]).unwrap();
+        let worker_key = KeyPair::generate().unwrap();
+        let csr = CertificateParams::new(vec![]).unwrap().serialize_request(&worker_key).unwrap().pem().unwrap();
+        for _ in 0..1000 {
+            let issued = pki.issue_worker_cert(&csr, WorkerId::new()).unwrap();
+            let (_, serial) = worker_identity(&pem_to_der(&issued.cert_pem).unwrap()).unwrap();
+            assert!(same_serial(&serial, &issued.serial_hex), "{serial} vs {}", issued.serial_hex);
+            assert_eq!(serial, issued.serial_hex);
+        }
+        // Workers enrolled before the fix still match.
+        assert!(same_serial("00a1b2", "a1b2") && same_serial("a1b2", "00a1b2") && !same_serial("a1b2", "a1b3"));
     }
 }
