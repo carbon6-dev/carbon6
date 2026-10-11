@@ -347,7 +347,7 @@ fn esc(s: &str) -> String {
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <meta name=referrer content=no-referrer><title>{t}</title><style>\
+         <meta name=referrer content=same-origin><title>{t}</title><style>\
          body{{font:16px system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem;color:#18181b;background:#fff}}\
          @media(prefers-color-scheme:dark){{body{{color:#f4f4f5;background:#09090b}}pre{{background:#18181b!important}}}}\
          pre{{background:#f4f4f5;padding:.75rem;border-radius:.5rem;white-space:pre-wrap;word-break:break-word;font-size:13px}}\

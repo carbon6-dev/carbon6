@@ -165,7 +165,8 @@ async fn channels_and_approval_links() {
     assert!(page.contains("Approve bash?") && page.contains("echo cleaned-up") && page.contains("Ask on ops"), "{page}");
     let forged = format!("{}x", &link[..link.len() - 1]);
     assert!(http.get(&forged).send().await.unwrap().text().await.unwrap().contains("not valid"));
-    let answer = http.post(&link).form(&[("allow", "1")]).send().await.unwrap().text().await.unwrap();
+    // As a browser posts the page's form (with its Origin).
+    let answer = http.post(&link).header("origin", &base).form(&[("allow", "1")]).send().await.unwrap().text().await.unwrap();
     assert!(answer.contains("Sent"), "{answer}");
 
     // Slack: the notice, then the finished turn with its reply.

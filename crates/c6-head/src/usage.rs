@@ -361,9 +361,11 @@ pub async fn cost_of(st: &HeadState, session_ids: &[String]) -> anyhow::Result<(
     Ok((cost, rows.len() as u64))
 }
 
-/// Labels worth a row in the report: yours and host:, worker:, repo:.
+/// Labels worth a row in the report: yours (but not each run's) and
+/// host:, worker:, repo:.
 fn report_label(l: &str) -> bool {
     match l.split_once(':') {
+        Some(("run", _)) => false,
         Some((k, _)) => matches!(k, "host" | "worker" | "repo") || !api::labels::AUTO_KEYS.contains(&k),
         None => true,
     }

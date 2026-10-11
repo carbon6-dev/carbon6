@@ -36,6 +36,19 @@ pub enum Kind {
     Dir,
 }
 
+/// What to pass ssh for a target: `user@host:port` is not something ssh
+/// takes, but `ssh://user@host:port` is (OpenSSH 7.7+).
+pub fn destination(target: &str) -> String {
+    match target.rsplit_once(':') {
+        Some((host, port))
+            if !target.contains("://") && !host.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            format!("ssh://{target}")
+        }
+        _ => target.to_owned(),
+    }
+}
+
 impl SshHost {
     pub fn new(target: &str, home: &str) -> Self {
         // Unix socket paths are short (about 104 bytes on macOS): keep the
@@ -63,7 +76,7 @@ impl SshHost {
             .arg("-o")
             .arg(format!("ControlPath={}/%C", self.control_dir.display()))
             .args(["-o", "ControlPersist=600"])
-            .arg(&self.target)
+            .arg(destination(&self.target))
             .arg(remote)
             .kill_on_drop(true);
         c
@@ -200,6 +213,16 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{Bash, BashOutput, Edit, Glob, Grep, Read, SessionTools, Tool, ToolCtx, Write};
+
+    #[test]
+    fn destinations() {
+        assert_eq!(destination("admin@web1:2222"), "ssh://admin@web1:2222");
+        assert_eq!(destination("web1:22"), "ssh://web1:22");
+        assert_eq!(destination("admin@web1"), "admin@web1");
+        assert_eq!(destination("my-alias"), "my-alias");
+        assert_eq!(destination("ssh://a@b:1"), "ssh://a@b:1");
+        assert_eq!(destination("fe80::1"), "fe80::1", "a bare IPv6 address");
+    }
 
     #[test]
     fn quoting() {
