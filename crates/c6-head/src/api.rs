@@ -42,6 +42,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/secrets", get(list_secrets))
         .route("/api/v1/settings/templates", get(get_templates).put(put_templates))
         .route("/api/v1/templates/{name}/run", post(run_template))
+        .route("/api/v1/memories", get(list_memories).post(create_memory))
+        .route("/api/v1/memories/{id}", put(update_memory).delete(delete_memory))
         .route("/api/v1/automations", get(list_automations).post(create_automation))
         .route("/api/v1/automations/{id}", axum::routing::patch(update_automation).delete(delete_automation))
         .route("/api/v1/automations/{id}/run", post(run_automation))
@@ -715,6 +717,29 @@ async fn get_templates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<a
 async fn put_templates(State(st): State<Arc<HeadState>>, Json(templates): Json<Vec<api::Template>>) -> ApiResult<StatusCode> {
     crate::templates::check(&templates)?;
     st.store.set_setting(crate::templates::TEMPLATES, &serde_json::to_string(&templates).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_memories(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Memory>>> {
+    Ok(Json(crate::memory::list(&st).await?))
+}
+
+async fn create_memory(State(st): State<Arc<HeadState>>, Json(mut m): Json<api::Memory>) -> ApiResult<Json<api::Memory>> {
+    m.id = String::new();
+    Ok(Json(crate::memory::put(&st, m).await?))
+}
+
+async fn update_memory(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(mut m): Json<api::Memory>,
+) -> ApiResult<Json<api::Memory>> {
+    m.id = id;
+    Ok(Json(crate::memory::put(&st, m).await?))
+}
+
+async fn delete_memory(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::memory::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

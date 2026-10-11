@@ -1102,6 +1102,14 @@ fn render_event(
         }
         .into_any(),
         EventKind::Output { name, title, size, .. } => crate::outputs::published_line(session, e.seq, name, title, *size),
+        EventKind::Memory { op, id, scope, text } => {
+            let what = if op == "forget" {
+                format!("Forgot note {id}")
+            } else {
+                format!("Remembered ({}): {text}", if scope.is_empty() { "every session" } else { scope })
+            };
+            view! { <p class="flex items-start gap-2 text-xs text-zinc-500"><span>"🧠"</span><span class="whitespace-pre-wrap">{what}</span></p> }.into_any()
+        }
         EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, .. } => {
             crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
         }

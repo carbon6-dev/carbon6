@@ -112,6 +112,14 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Memory
+
+Notes kept across sessions (**Settings → Memory**). Each has a scope: one label, like `host:web1`, `repo:github.com/acme/app` or `client:acme`, or none for every session.
+
+- **Where they go:** a new session gets the notes for its labels in its instructions, most specific and newest first.
+- **The agent keeps them current:** it saves durable facts with `remember` (how a machine is set up, where things are, your preferences), corrects a note by replacing it, and removes stale ones with `forget`. Each change shows in the transcript.
+- **Editing:** you can add, edit and delete notes in Settings. Notes written by an agent link to the session that wrote them.
+
 ### Templates and fleet runs
 
 A template (**Settings → Templates**) is a saved way to start a session:

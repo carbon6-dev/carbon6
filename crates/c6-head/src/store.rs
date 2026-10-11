@@ -479,6 +479,7 @@ impl Store {
                     .await?;
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
+                Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(_)) => status = "idle".into(),

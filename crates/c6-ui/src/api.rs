@@ -461,3 +461,19 @@ pub async fn run_automation(id: String) -> Result<c6_api::TemplateRun, String> {
 pub async fn rotate_automation(id: String) -> Result<c6_api::Automation, String> {
     json(Request::post(&format!("/api/v1/automations/{id}/rotate")).send().await).await
 }
+
+pub async fn memories() -> Result<Vec<c6_api::Memory>, String> {
+    json(Request::get("/api/v1/memories").send().await).await
+}
+
+pub async fn save_memory(m: c6_api::Memory) -> Result<c6_api::Memory, String> {
+    if m.id.is_empty() {
+        send_json(Request::post("/api/v1/memories"), &m).await
+    } else {
+        send_json(Request::put(&format!("/api/v1/memories/{}", m.id)), &m).await
+    }
+}
+
+pub async fn delete_memory(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/memories/{id}")).send().await).await
+}

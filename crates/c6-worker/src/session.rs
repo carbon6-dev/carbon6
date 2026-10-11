@@ -129,6 +129,8 @@ enum ActorMsg {
     Reserve(u64),
     /// The agent published a file.
     Published(c6_tools::Published),
+    /// The agent changed a memory note.
+    Memory(c6_tools::MemoryChange),
 }
 
 /// Background-task notices may start this many turns per hour in an idle
@@ -360,6 +362,7 @@ impl SessionManager {
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
             }
+            prompt.push_str(&memory_section(&spec, &labels));
             let secrets = applicable_secrets(&spec, &labels);
             if !secrets.is_empty() {
                 prompt.push_str(
@@ -543,6 +546,18 @@ impl SessionManager {
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
         if started.tool_profile != crate::claude_code::PROFILE {
             session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
+            // Memory changes go to the actor, which logs them (the head
+            // applies them).
+            let (mem_tx, mut mem_rx) = mpsc::unbounded_channel();
+            session_tools.set_memory(Some(mem_tx));
+            let actor_tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(m) = mem_rx.recv().await {
+                    if actor_tx.send(ActorMsg::Memory(m)).is_err() {
+                        break;
+                    }
+                }
+            });
             // Published files go to the actor, which logs them.
             let (pub_tx, mut pub_rx) = mpsc::unbounded_channel();
             session_tools.set_publisher(Some(pub_tx));
@@ -817,6 +832,13 @@ impl Actor {
                         self.session_tools.background.kill_by_user(&id);
                     }
                     Some(ActorMsg::Reserve(n)) => self.session_tools.background.reserve_ids(n),
+                    Some(ActorMsg::Memory(m)) => {
+                        let update = c6_proto::MemoryUpdate { op: m.op, id: m.id, scope: m.scope, text: m.text };
+                        if let Err(e) = self.writer.append(session_event::Kind::Memory(update)).await {
+                            error!(session = %self.writer.session_id, "recording a memory change: {e:#}");
+                            return;
+                        }
+                    }
                     Some(ActorMsg::Published(p)) => {
                         let output = c6_proto::Output { name: p.name, title: p.title, mime: p.mime, data: p.data };
                         if let Err(e) = self.writer.append(session_event::Kind::Output(output)).await {
@@ -968,6 +990,7 @@ impl Actor {
             hooks: self.session_tools.hooks(),
             secrets: self.session_tools.secrets().clone(),
             publisher: self.session_tools.publisher(),
+            memory: self.session_tools.memory(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -1120,6 +1143,50 @@ fn yes() -> bool {
     true
 }
 
+/// The memory section of a new session's system prompt: the notes whose
+/// scope matches its labels (most specific first, newest first, within a
+/// budget), and how to keep them current.
+pub(crate) fn memory_section(spec: &CreateSession, labels: &[String]) -> String {
+    const BUDGET: usize = 8000;
+    #[derive(serde::Deserialize)]
+    struct Note {
+        id: String,
+        #[serde(default)]
+        scope: String,
+        text: String,
+        #[serde(default)]
+        updated_at: i64,
+    }
+    let mut notes: Vec<Note> = serde_json::from_str::<Vec<Note>>(&spec.memories_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.scope.is_empty() || c6_api::labels::label_matches(&n.scope, labels))
+        .collect();
+    notes.sort_by_key(|n| (n.scope.is_empty(), std::cmp::Reverse(n.updated_at)));
+    let shown: Vec<String> = c6_api::labels::display_labels(labels);
+    let mut s = format!(
+        "\n\n# Memory\n\nNotes kept across sessions. They may be out of date: trust what you observe, and keep them current. When you learn \
+         something durable (how a machine or project is set up, where things are, the user's preferences), save it with the remember \
+         tool, scoped to one of this session's labels ({}) or to every session; correct a note by passing its id as replaces, and \
+         remove wrong ones with forget.\n",
+        shown.join(", ")
+    );
+    if notes.is_empty() {
+        s.push_str("\n(No notes yet.)\n");
+    }
+    let mut used = 0;
+    for n in notes {
+        let line = format!("- [{}] ({}) {}\n", n.id, if n.scope.is_empty() { "all" } else { &n.scope }, n.text.replace('\n', " "));
+        used += line.len();
+        if used > BUDGET {
+            s.push_str("- (more notes not shown)\n");
+            break;
+        }
+        s.push_str(&line);
+    }
+    s
+}
+
 /// The head's secrets that apply to a session with `labels`: (name,
 /// description).
 pub(crate) fn applicable_secrets(spec: &CreateSession, labels: &[String]) -> Vec<(String, String)> {
@@ -1180,8 +1247,10 @@ pub(crate) async fn build_tools(
 ) -> BuiltTools {
     let mut tools = c6_tools::tools_for(profile);
     let mut errors = Vec::new();
-    // Deliverables for the Outputs panel.
+    // Deliverables for the Outputs panel; memory across sessions.
     tools.push(Arc::new(c6_tools::Publish::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::Remember::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::Forget::new(profile == ToolProfile::Claude)));
     // Named agents (from the head's settings) become Task's subagent types.
     #[derive(serde::Deserialize)]
     struct HeadAgent {

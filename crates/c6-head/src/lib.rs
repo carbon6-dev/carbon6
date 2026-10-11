@@ -9,6 +9,7 @@ mod cron;
 mod export;
 pub mod guard;
 pub mod hub;
+pub mod memory;
 pub mod oauth;
 pub mod pki;
 pub mod registry;

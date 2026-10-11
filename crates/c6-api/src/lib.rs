@@ -368,6 +368,13 @@ pub enum EventKind {
         mime: String,
         size: u64,
     },
+    /// The agent changed a memory note.
+    Memory {
+        op: String,
+        id: String,
+        scope: String,
+        text: String,
+    },
     /// From here on the session runs on this model.
     ModelSwitched {
         connection_id: String,
@@ -767,6 +774,24 @@ pub struct AutomationEdit {
     pub input: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// A memory note: kept across sessions, given to those whose labels match
+/// its scope (`/api/v1/memories`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Memory {
+    #[serde(default)]
+    pub id: String,
+    /// A label (e.g. host:db-2, repo:github.com/acme/app, client:acme);
+    /// empty: every session.
+    #[serde(default)]
+    pub scope: String,
+    pub text: String,
+    /// The session that wrote it, if an agent did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub updated_at: UnixMs,
 }
 
 /// The commands built into carbon6: (name, description, argument hint).

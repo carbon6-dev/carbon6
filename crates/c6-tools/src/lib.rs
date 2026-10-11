@@ -5,6 +5,7 @@ mod background;
 mod bash;
 mod files;
 pub mod hooks;
+pub mod memory;
 mod patch;
 mod plan;
 pub mod profiles;
@@ -29,6 +30,7 @@ pub use background::{Background, BashOutput, KillShell, TaskEvent, TaskInfo, Tas
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};
 pub use hooks::Hooks;
+pub use memory::{Forget, MemoryChange, MemorySink, Remember};
 pub use patch::ApplyPatch;
 pub use plan::Plan;
 pub use profiles::tools_for;
@@ -113,6 +115,8 @@ pub struct SessionTools {
     ssh: Option<Arc<remote::SshHost>>,
     /// Where published files go (the session's log).
     publisher: Mutex<Option<PublishSink>>,
+    /// Where memory changes go (the session's log, then the head).
+    memory: Mutex<Option<MemorySink>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -136,7 +140,16 @@ impl SessionTools {
             secrets,
             ssh,
             publisher: Mutex::default(),
+            memory: Mutex::default(),
         }
+    }
+
+    pub fn set_memory(&self, m: Option<MemorySink>) {
+        *self.memory.lock().unwrap() = m;
+    }
+
+    pub fn memory(&self) -> Option<MemorySink> {
+        self.memory.lock().unwrap().clone()
     }
 
     pub fn set_publisher(&self, p: Option<PublishSink>) {

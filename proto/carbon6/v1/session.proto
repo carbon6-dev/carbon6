@@ -25,7 +25,18 @@ message SessionEvent {
     Rewound rewound = 21;
     BackgroundTask background_task = 22;
     Output output = 23;
+    MemoryUpdate memory = 24;
   }
+}
+
+// The agent changed a memory note (remember/forget); the head applies it.
+message MemoryUpdate {
+  // "remember" (add or replace) or "forget".
+  string op = 1;
+  string id = 2;
+  // A label the note applies to; empty: every session.
+  string scope = 3;
+  string text = 4;
 }
 
 // A deliverable the agent published (publish_file): the file's content as
@@ -349,6 +360,9 @@ message CreateSession {
   // The head's web search setting (JSON object of c6_tools::SearchConfig;
   // the API key is a secret, named here).
   string web_search_json = 13;
+  // Memory notes (JSON array of c6_api::Memory); the worker keeps those
+  // whose scope matches the session's labels.
+  string memories_json = 14;
 }
 
 message ModelSpec {

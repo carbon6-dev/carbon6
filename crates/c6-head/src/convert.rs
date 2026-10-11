@@ -90,6 +90,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         Kind::Error(e) => api::EventKind::Error { message: e.message.clone() },
         Kind::Compaction(c) => api::EventKind::Compaction { summary: c.summary.clone(), tokens_before: c.tokens_before },
         Kind::Checkpoint(c) => api::EventKind::Checkpoint { error: c.error.clone() },
+        Kind::Memory(m) => api::EventKind::Memory { op: m.op.clone(), id: m.id.clone(), scope: m.scope.clone(), text: m.text.clone() },
         Kind::Output(o) => {
             api::EventKind::Output { name: o.name.clone(), title: o.title.clone(), mime: o.mime.clone(), size: o.data.len() as u64 }
         }

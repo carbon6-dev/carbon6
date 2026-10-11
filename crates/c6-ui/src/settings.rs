@@ -88,6 +88,7 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 fields=TEMPLATE_FIELDS
                 examples=template_examples
             />
+            <MemorySetting />
             <AutomationsSetting />
             <HooksSetting />
             <SecretsSetting />
@@ -1432,6 +1433,90 @@ fn AutomationsSetting() -> impl IntoView {
                     Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
                 })}
                 <button class=BUTTON on:click=create>"Add automation"</button>
+            </div>
+        </section>
+    }
+}
+
+/// Settings: memory notes, by scope.
+#[component]
+fn MemorySetting() -> impl IntoView {
+    let list = LocalResource::new(api::memories);
+    let (scope, text) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let editing = RwSignal::new(None::<String>);
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let save = move |_| {
+        let m = c6_api::Memory {
+            id: editing.get_untracked().unwrap_or_default(),
+            scope: scope.get_untracked(),
+            text: text.get_untracked(),
+            ..Default::default()
+        };
+        spawn_local(async move {
+            match api::save_memory(m).await {
+                Ok(_) => {
+                    status.set(Some(Ok("Saved.")));
+                    text.set(String::new());
+                    editing.set(None);
+                    list.refetch();
+                }
+                Err(e) => status.set(Some(Err(e))),
+            }
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Memory"</h2>
+                <p class="text-sm text-zinc-500">
+                    "Notes kept across sessions. Each has a scope, one label (host:web1, repo:github.com/acme/app, client:acme) or none for every session; new sessions get the notes for their labels in their instructions. Agents add and correct notes as they learn (remember / forget); you can edit them here."
+                </p>
+            </div>
+            <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                {move || list.get().map(|r| match r {
+                    Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No notes yet."</p> }.into_any(),
+                    Ok(v) => v.into_iter().map(|m| {
+                        let (edit, del) = (m.clone(), m.id.clone());
+                        view! {
+                            <div class="flex items-start gap-2 py-2 text-sm">
+                                {if m.scope.is_empty() {
+                                    view! { <span class="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-500 dark:bg-zinc-800">"all"</span> }.into_any()
+                                } else {
+                                    view! { <crate::labels::LabelChip label=m.scope.clone() auto=true stay=true /> }.into_any()
+                                }}
+                                <span class="min-w-0 flex-1 whitespace-pre-wrap">{m.text.clone()}</span>
+                                {m.session_id.clone().map(|s| view! { <crate::workspace::Go to=crate::workspace::View::session(s) class="shrink-0 text-xs text-zinc-500 underline">"by an agent"</crate::workspace::Go> })}
+                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                    scope.set(edit.scope.clone());
+                                    text.set(edit.text.clone());
+                                    editing.set(Some(edit.id.clone()));
+                                }>"Edit"</button>
+                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                    let id = del.clone();
+                                    spawn_local(async move {
+                                        let _ = api::delete_memory(id).await;
+                                        list.refetch();
+                                    });
+                                }>"Delete"</button>
+                            </div>
+                        }
+                    }).collect_view().into_any(),
+                })}
+            </div>
+            <div class="grid gap-2 sm:grid-cols-[14rem_1fr]">
+                <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="scope: a label, or empty for all" prop:value=move || scope.get()
+                    on:input=move |ev| scope.set(event_target_value(&ev)) />
+                <textarea class=format!("{INPUT} min-h-10 text-sm") rows="2" placeholder="e.g. web1 runs Ubuntu 24.04; nginx is managed by docker compose in /srv/web"
+                    prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
+            </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                {move || editing.get().is_some().then(|| view! { <button class=BUTTON_QUIET on:click=move |_| { editing.set(None); text.set(String::new()); }>"Cancel"</button> })}
+                <button class=BUTTON on:click=save>{move || if editing.get().is_some() { "Save note" } else { "Add note" }}</button>
             </div>
         </section>
     }

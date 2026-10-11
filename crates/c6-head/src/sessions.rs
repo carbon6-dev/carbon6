@@ -214,6 +214,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
+        memories_json: crate::memory::for_sessions(st).await?,
         seed,
     })
 }
