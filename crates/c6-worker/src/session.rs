@@ -30,6 +30,65 @@ pub struct SessionManager {
     actors: Mutex<HashMap<String, mpsc::UnboundedSender<ActorMsg>>>,
 }
 
+struct CommandChoice {
+    /// The command's variants from the head: [{applies_to, body}].
+    candidates_json: String,
+    /// The session's labels from the head as of the message.
+    labels: Vec<String>,
+}
+
+/// A session's labels: the head's (yours, worker:) and the automatic ones
+/// only the worker knows (repo:, folder:) or that change (model:).
+pub(crate) fn session_labels(head_labels: &[String], repo: &str, cwd: &str, home: &str, model: &str) -> Vec<String> {
+    let mut l = head_labels.to_vec();
+    l.extend(c6_api::labels::auto_labels("", repo, cwd, home, model));
+    l
+}
+
+/// The repository's git remote (origin, else the first) as
+/// host/owner/name; empty outside a repository or without a remote.
+pub(crate) async fn repo_slug(cwd: &Path) -> String {
+    let git = |args: &'static [&'static str]| {
+        let mut c = tokio::process::Command::new("git");
+        c.arg("-C").arg(cwd).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        c
+    };
+    let url = match git(&["remote", "get-url", "origin"]).output().await {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        _ => match git(&["remote"]).output().await {
+            Ok(o) if o.status.success() => {
+                let first = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_owned();
+                if first.is_empty() {
+                    return String::new();
+                }
+                match tokio::process::Command::new("git").arg("-C").arg(cwd).args(["remote", "get-url", &first]).output().await {
+                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+                    _ => return String::new(),
+                }
+            }
+            _ => return String::new(),
+        },
+    };
+    normalize_remote(&url)
+}
+
+/// `git@github.com:acme/app.git`, `https://user@github.com/acme/app` and
+/// `ssh://git@github.com:22/acme/app.git` are all `github.com/acme/app`.
+pub(crate) fn normalize_remote(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let (host, path) = if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        (host.split(':').next().unwrap_or(host).to_owned(), path.to_owned())
+    } else if let Some((authority, path)) = url.split_once(':').filter(|(a, _)| !a.contains('/')) {
+        (authority.rsplit('@').next().unwrap_or(authority).to_owned(), path.to_owned())
+    } else {
+        return url.to_owned(); // a local path
+    };
+    format!("{}/{}", host.to_ascii_lowercase(), path.trim_start_matches('/'))
+}
+
 enum ActorMsg {
     /// Rewind the conversation (after interrupting a running turn).
     Rewind {
@@ -37,8 +96,9 @@ enum ActorMsg {
         to_seq: u64,
         restore_files: bool,
     },
-    /// An input, possibly switching the session's model from it on.
-    Input(Box<PendingInput>, Option<ModelSpec>),
+    /// An input, possibly switching the session's model from it on, and
+    /// what is needed to pick the variant of a custom command it invokes.
+    Input(Box<PendingInput>, Option<ModelSpec>, Box<CommandChoice>),
     Interrupt,
 }
 
@@ -87,10 +147,10 @@ impl SessionManager {
                     text: input.text,
                     attachments: input.attachments,
                     command: input.command,
-                    template: input.command_template,
                     ..Default::default()
                 };
-                let _ = actor.send(ActorMsg::Input(Box::new(pending), input.model));
+                let choice = CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels };
+                let _ = actor.send(ActorMsg::Input(Box::new(pending), input.model, Box::new(choice)));
                 Ok(())
             }
             Some(session_command::Kind::Restore(r)) => {
@@ -139,6 +199,10 @@ impl SessionManager {
             (cwd, String::new(), String::new())
         };
         let date = time::OffsetDateTime::now_utc().date().to_string();
+        let repo = repo_slug(&cwd).await;
+        let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+        let model_name = spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default();
+        let labels = session_labels(&spec.labels, &repo, &cwd.display().to_string(), &home, &model_name);
         let system_prompt = build_system_prompt(&spec.base_prompt, &cwd, &date);
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
@@ -150,10 +214,10 @@ impl SessionManager {
             (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
         } else {
             let profile = model_info(provider, &model.model).tool_profile;
-            let built = build_tools(&spec, &cwd, profile).await;
+            let built = build_tools(&spec, &cwd, profile, &labels).await;
             setup_errors = built.errors;
             let mut prompt = system_prompt;
-            if let Some(h) = crate::hooks::HookRunner::new(session_id, &cwd, &spec.hooks_json)
+            if let Some(h) = crate::hooks::HookRunner::new(session_id, &cwd, &spec.hooks_json, &labels)
                 && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": "startup"})).await.context
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
@@ -176,6 +240,8 @@ impl SessionManager {
             worktree_branch,
             repo_root,
             context_window,
+            repo,
+            home,
             ..Default::default()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
@@ -279,12 +345,16 @@ impl SessionManager {
         let tools = match tools {
             Some(t) => t,
             None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
-            None => build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile)).await.tools,
+            None => {
+                let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec));
+                build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile), &labels).await.tools
+            }
         };
         let started_cwd = started.cwd.clone();
         // The head's hooks. Claude Code sessions get them as Claude Code
         // settings and run them itself.
-        let hooks = crate::hooks::HookRunner::new(session_id, Path::new(&started.cwd), &spec.hooks_json).map(Arc::new);
+        let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec));
+        let hooks = crate::hooks::HookRunner::new(session_id, Path::new(&started.cwd), &spec.hooks_json, &labels).map(Arc::new);
         let session_tools = Arc::new(SessionTools::new(PathBuf::from(&started.cwd)));
         if started.tool_profile != crate::claude_code::PROFILE {
             session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
@@ -441,10 +511,27 @@ impl Actor {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
-                    Some(ActorMsg::Input(mut input, model)) => {
-                        // Expand a slash command and attach the files it
-                        // mentions, as they are now.
+                    Some(ActorMsg::Input(mut input, model, choice)) => {
+                        // Pick the custom command's variant for this
+                        // session, expand the command and attach the files
+                        // it mentions, as they are now.
                         let cwd = Path::new(&self.started.cwd);
+                        if !choice.candidates_json.is_empty() {
+                            #[derive(serde::Deserialize)]
+                            struct Variant {
+                                #[serde(default)]
+                                applies_to: Vec<String>,
+                                body: String,
+                            }
+                            let head = if choice.labels.is_empty() { &self.spec.labels } else { &choice.labels };
+                            let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
+                            let labels = session_labels(head, &self.started.repo, &self.started.cwd, &self.started.home, model);
+                            let variants: Vec<Variant> = serde_json::from_str(&choice.candidates_json).unwrap_or_default();
+                            match c6_api::labels::best(variants.iter(), |v| &v.applies_to, &labels) {
+                                Some(v) => input.template = v.body.clone(),
+                                None => input.command.clear(), // none applies here: plain text
+                            }
+                        }
                         crate::commands::expand(cwd, &mut input).await;
                         crate::mentions::resolve(cwd, &mut input);
                         if let Some(h) = self.hooks.as_ref().filter(|_| self.started.tool_profile != crate::claude_code::PROFILE) {
@@ -693,7 +780,25 @@ fn yes() -> bool {
     true
 }
 
-pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, profile: ToolProfile) -> BuiltTools {
+fn spawn_model(spec: &CreateSession) -> String {
+    spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default()
+}
+
+/// Of named settings, those that apply to a session with `labels`: for each
+/// name, the most specific match.
+fn applicable<T>(items: Vec<T>, name: impl Fn(&T) -> &str, applies_to: impl Fn(&T) -> &[String], labels: &[String]) -> Vec<T> {
+    let keep: Vec<bool> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let same: Vec<(usize, &T)> = items.iter().enumerate().filter(|(_, x)| name(x) == name(it)).collect();
+            c6_api::labels::best(same.iter(), |(_, x)| applies_to(x), labels).is_some_and(|(j, _)| *j == i)
+        })
+        .collect();
+    items.into_iter().zip(keep).filter_map(|(it, k)| k.then_some(it)).collect()
+}
+
+pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, profile: ToolProfile, labels: &[String]) -> BuiltTools {
     let mut tools = c6_tools::tools_for(profile);
     let mut errors = Vec::new();
     // Named agents (from the head's settings) become Task's subagent types.
@@ -709,11 +814,16 @@ pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, pro
         prompt: String,
         #[serde(default = "yes")]
         enabled: bool,
+        #[serde(default)]
+        applies_to: Vec<String>,
     }
-    let agents: Vec<c6_tools::AgentDef> = serde_json::from_str::<Vec<HeadAgent>>(&spec.agents_json)
+    let all: Vec<HeadAgent> = serde_json::from_str::<Vec<HeadAgent>>(&spec.agents_json)
         .unwrap_or_default()
         .into_iter()
         .filter(|a| a.enabled && !a.prompt.trim().is_empty())
+        .collect();
+    let agents: Vec<c6_tools::AgentDef> = applicable(all, |a| &a.name, |a| &a.applies_to, labels)
+        .into_iter()
         .map(|a| c6_tools::AgentDef {
             name: a.name,
             description: a.description,
@@ -736,11 +846,13 @@ pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, pro
         body: String,
         #[serde(default = "yes")]
         enabled: bool,
+        #[serde(default)]
+        applies_to: Vec<String>,
     }
-    let mut skills: Vec<Skill> = serde_json::from_str::<Vec<HeadSkill>>(&spec.skills_json)
-        .unwrap_or_default()
+    let all: Vec<HeadSkill> =
+        serde_json::from_str::<Vec<HeadSkill>>(&spec.skills_json).unwrap_or_default().into_iter().filter(|s| s.enabled).collect();
+    let mut skills: Vec<Skill> = applicable(all, |s| &s.name, |s| &s.applies_to, labels)
         .into_iter()
-        .filter(|s| s.enabled)
         .map(|s| Skill { name: s.name, description: s.description, body: s.body, dir: None })
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -777,5 +889,37 @@ impl EventSink for Writer {
 
     fn ephemeral(&self, kind: ephemeral_event::Kind) {
         self.link.ephemeral(EphemeralEvent { session_id: self.session_id.clone(), kind: Some(kind) });
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_remotes() {
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://user@GitHub.com/acme/app.git/",
+            "ssh://git@github.com:22/acme/app.git",
+        ] {
+            assert_eq!(normalize_remote(url), "github.com/acme/app", "{url}");
+        }
+        assert_eq!(normalize_remote("/srv/git/app.git"), "/srv/git/app");
+    }
+
+    #[tokio::test]
+    async fn finds_the_repo_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert_eq!(repo_slug(d).await, "", "not a repository");
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(d).args(args).output().unwrap();
+        git(&["init", "-q"]);
+        assert_eq!(repo_slug(d).await, "", "no remote");
+        git(&["remote", "add", "upstream", "git@example.com:team/tool.git"]);
+        assert_eq!(repo_slug(d).await, "example.com/team/tool");
+        git(&["remote", "add", "origin", "https://github.com/acme/app.git"]);
+        assert_eq!(repo_slug(d).await, "github.com/acme/app", "origin wins");
     }
 }

@@ -7,7 +7,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
@@ -47,6 +47,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
+        .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
+        .route("/api/v1/sessions/{id}/config", get(session_config))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
@@ -549,15 +551,19 @@ async fn get_skills(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_js
     get_setting(&st, crate::sessions::SKILLS).await
 }
 
-/// Names in a list must be valid and unique.
-fn check_names<'a>(what: &str, names: impl Iterator<Item = &'a str>, valid: impl Fn(&str) -> bool) -> ApiResult<()> {
+/// Names in a list must be valid, and two items of the same name must apply
+/// to different labels (the more specific one wins where both match).
+fn check_names<'a>(what: &str, items: impl Iterator<Item = (&'a str, &'a [String])>, valid: impl Fn(&str) -> bool) -> ApiResult<()> {
     let mut seen = std::collections::HashSet::new();
-    for n in names {
+    for (n, applies_to) in items {
         if !valid(n) {
             return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{what} name {n:?} is not valid")));
         }
-        if !seen.insert(n) {
-            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("two {what}s are named {n:?}")));
+        let mut key: Vec<String> = applies_to.iter().map(|s| s.trim().trim_end_matches('/').to_owned()).filter(|s| !s.is_empty()).collect();
+        key.sort();
+        key.dedup();
+        if !seen.insert((n, key)) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("two {what}s named {n:?} apply to the same labels")));
         }
     }
     Ok(())
@@ -568,7 +574,7 @@ fn plain_name(n: &str) -> bool {
 }
 
 async fn put_skills(State(st): State<Arc<HeadState>>, Json(skills): Json<Vec<api::SkillDef>>) -> ApiResult<StatusCode> {
-    check_names("skill", skills.iter().map(|s| s.name.as_str()), plain_name)?;
+    check_names("skill", skills.iter().map(|s| (s.name.as_str(), s.applies_to.as_slice())), plain_name)?;
     if let Some(s) = skills.iter().find(|s| s.body.trim().is_empty()) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, format!("skill {:?} needs instructions", s.name)));
     }
@@ -581,7 +587,7 @@ async fn get_commands_setting(State(st): State<Arc<HeadState>>) -> ApiResult<Jso
 }
 
 async fn put_commands(State(st): State<Arc<HeadState>>, Json(commands): Json<Vec<api::CommandDef>>) -> ApiResult<StatusCode> {
-    check_names("command", commands.iter().map(|c| c.name.as_str()), api::valid_command_name)?;
+    check_names("command", commands.iter().map(|c| (c.name.as_str(), c.applies_to.as_slice())), api::valid_command_name)?;
     if let Some(c) = commands.iter().find(|c| c.body.trim().is_empty()) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, format!("/{} needs a prompt", c.name)));
     }
@@ -594,7 +600,7 @@ async fn get_agents(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_js
 }
 
 async fn put_agents(State(st): State<Arc<HeadState>>, Json(agents): Json<Vec<api::AgentDef>>) -> ApiResult<StatusCode> {
-    check_names("agent", agents.iter().map(|a| a.name.as_str()), |n| plain_name(n) && n != "general-purpose")?;
+    check_names("agent", agents.iter().map(|a| (a.name.as_str(), a.applies_to.as_slice())), |n| plain_name(n) && n != "general-purpose")?;
     if let Some(a) = agents.iter().find(|a| a.prompt.trim().is_empty()) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, format!("agent {:?} needs instructions", a.name)));
     }
@@ -604,8 +610,42 @@ async fn put_agents(State(st): State<Arc<HeadState>>, Json(agents): Json<Vec<api
 
 /// The slash commands the composer offers: built-ins and the enabled custom
 /// ones (a custom command replaces a built-in of the same name).
-async fn list_commands(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::CommandInfo>>> {
-    let custom = crate::sessions::custom_commands(&st).await?;
+#[derive(serde::Deserialize)]
+struct ForSession {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// `?session=`: only the commands that apply to that session (by its labels),
+/// the most specific variant of each name.
+async fn list_commands(State(st): State<Arc<HeadState>>, Query(q): Query<ForSession>) -> ApiResult<Json<Vec<api::CommandInfo>>> {
+    let all = crate::sessions::custom_commands(&st).await?;
+    let custom: Vec<api::CommandDef> = match &q.session {
+        Some(id) => {
+            let row = st.store.session(id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
+            let labels = row.all_labels();
+            let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+            names.dedup();
+            let mut out = Vec::new();
+            for n in names {
+                if !out.iter().any(|c: &api::CommandDef| c.name == n)
+                    && let Some(c) = c6_api::labels::best(all.iter().filter(|c| c.name == n), |c| &c.applies_to, &labels)
+                {
+                    out.push(c.clone());
+                }
+            }
+            out
+        }
+        None => {
+            let mut out: Vec<api::CommandDef> = Vec::new();
+            for c in &all {
+                if !out.iter().any(|x| x.name == c.name) {
+                    out.push(c.clone());
+                }
+            }
+            out
+        }
+    };
     let mut out: Vec<api::CommandInfo> = api::BUILTIN_COMMANDS
         .iter()
         .filter(|(n, _, _)| !custom.iter().any(|c| c.name == *n))
@@ -668,6 +708,18 @@ async fn attachment(State(st): State<Arc<HeadState>>, Path((id, seq, index)): Pa
     // Text is served as plain text, never as something a browser would run.
     let mime = if a.mime.starts_with("image/") { a.mime } else { "text/plain; charset=utf-8".into() };
     Ok(([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into())], a.data).into_response())
+}
+
+async fn set_session_labels(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::SetLabels>,
+) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::sessions::set_labels(&st, &id, &req.labels).await?))
+}
+
+async fn session_config(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::EffectiveConfig>> {
+    Ok(Json(crate::sessions::effective_config(&st, &id).await?))
 }
 
 /// The session as a Markdown file.

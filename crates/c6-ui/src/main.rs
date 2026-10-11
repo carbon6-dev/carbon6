@@ -5,6 +5,7 @@ mod api;
 mod auth;
 mod files;
 mod fleet;
+mod labels;
 mod markdown;
 mod notify;
 mod search;
@@ -51,6 +52,7 @@ fn App() -> impl IntoView {
 fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
+    provide_context(labels::LabelFilter(RwSignal::new(Vec::new())));
     // A signed-in browser opening a login link (to sign in again).
     if window().location().pathname().unwrap_or_default().starts_with("/login/") {
         return view! {

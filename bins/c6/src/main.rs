@@ -63,6 +63,9 @@ enum Command {
         /// Run in a new git worktree.
         #[arg(long)]
         worktree: bool,
+        /// A label for the session (repeatable, or comma-separated).
+        #[arg(short, long = "label")]
+        label: Vec<String>,
         /// Print events as JSON lines instead of text.
         #[arg(long)]
         json: bool,
@@ -94,6 +97,9 @@ enum Command {
     Sessions {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        /// Only sessions with this label (repeatable; e.g. repo:github.com/acme).
+        #[arg(short, long = "label")]
+        label: Vec<String>,
     },
     /// Search all sessions.
     Search { query: Vec<String> },
@@ -224,7 +230,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     let c = Client::new(cli.url.as_deref().unwrap_or(&cfg.url), &cfg.token, cfg.ca.as_ref())?;
     match cli.command {
         Command::Login { .. } => unreachable!(),
-        Command::Run { prompt, worker, cwd, connection, model, effort, title, worktree, json, detach } => {
+        Command::Run { prompt, worker, cwd, connection, model, effort, title, worktree, label, json, detach } => {
+            let labels = c6_api::labels::parse_labels(&label.join(","));
             let text = prompt_text(&prompt)?;
             let workers: Vec<Worker> = c.get("/workers").await?;
             let worker = pick_worker(&workers, worker.as_deref())?;
@@ -239,7 +246,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 .post(
                     "/sessions",
                     &json!({"worker_id": worker.id, "cwd": cwd, "connection_id": connection, "model": model,
-                            "title": title, "prompt": text, "effort": effort, "worktree": worktree}),
+                            "title": title, "prompt": text, "effort": effort, "worktree": worktree, "labels": labels}),
                 )
                 .await?;
             if detach {
@@ -279,11 +286,17 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             c.send(c.http.post(format!("{}/sessions/{id}/interrupt", c.api))).await?;
             Ok(0)
         }
-        Command::Sessions { limit } => {
+        Command::Sessions { limit, label } => {
+            let wanted = c6_api::labels::parse_labels(&label.join(","));
             let mut all: Vec<Session> = c.get("/sessions").await?;
             all.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-            for s in all.iter().filter(|s| s.parent_id.is_none()).take(limit) {
-                println!("{}  {:<8} {:<22} {}", &s.id[..13], status_word(s.status), trim(&s.model, 22), s.title);
+            let matching = all.iter().filter(|s| {
+                let labels: Vec<String> = s.labels.iter().chain(s.auto_labels.iter()).cloned().collect();
+                s.parent_id.is_none() && c6_api::labels::applies(&wanted, &labels)
+            });
+            for s in matching.take(limit) {
+                let tags = if s.labels.is_empty() { String::new() } else { format!("  [{}]", s.labels.join(", ")) };
+                println!("{}  {:<8} {:<22} {}{tags}", &s.id[..13], status_word(s.status), trim(&s.model, 22), s.title);
             }
             Ok(0)
         }

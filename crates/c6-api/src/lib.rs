@@ -1,6 +1,7 @@
 //! JSON types for the head's `/api/v1`, shared by `c6h` and the web UI.
 //! Must stay wasm-compatible: no tokio, no std-only dependencies.
 
+pub mod labels;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -120,6 +121,12 @@ pub struct Session {
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
     pub last_seq: u64,
+    /// Labels you attached.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Automatic labels: worker:, repo:, folder: (absolute and ~/), model:.
+    #[serde(default)]
+    pub auto_labels: Vec<String>,
 }
 
 /// A side chat: a new session that branches from `anchor_seq` of a session
@@ -146,6 +153,9 @@ pub struct CreateSession {
     /// Images and text files sent with the first message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentUpload>,
+    /// Your labels for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     /// Reasoning effort: low, medium, high, xhigh, max. Default: per model.
     #[serde(default)]
     pub effort: Option<String>,
@@ -501,6 +511,9 @@ pub struct Hook {
     pub timeout_s: Option<u64>,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Labels a session must all have for this to apply; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
 }
 
 fn enabled_default() -> bool {
@@ -523,6 +536,9 @@ pub struct CommandDef {
     pub body: String,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Labels a session must all have for this to apply; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
 }
 
 /// A named agent the Task tool can launch (`/api/v1/settings/agents`).
@@ -544,6 +560,9 @@ pub struct AgentDef {
     pub prompt: String,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Labels a session must all have for this to apply; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
 }
 
 /// A skill: instructions the agent loads by name (`/api/v1/settings/skills`).
@@ -555,6 +574,9 @@ pub struct SkillDef {
     pub body: String,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Labels a session must all have for this to apply; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
 }
 
 /// The commands built into carbon6: (name, description, argument hint).
@@ -585,6 +607,33 @@ pub fn valid_command_name(name: &str) -> bool {
 }
 
 pub const HOOK_EVENTS: [&str; 5] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"];
+
+/// `PUT /api/v1/sessions/{id}/labels`: the labels you attach to a session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetLabels {
+    pub labels: Vec<String>,
+}
+
+/// `GET /api/v1/sessions/{id}/config`: what applies to a session, from the
+/// head's current settings and the session's labels.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveConfig {
+    pub labels: Vec<String>,
+    pub commands: Vec<Applied>,
+    pub agents: Vec<Applied>,
+    pub skills: Vec<Applied>,
+    pub hooks: Vec<Applied>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Applied {
+    pub name: String,
+    pub applies_to: Vec<String>,
+    /// Set when it does not apply here: why (e.g. "needs repo:…", "off",
+    /// "replaced by a more specific one").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+}
 
 /// A signed-in browser.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

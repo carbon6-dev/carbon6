@@ -16,8 +16,8 @@
 //!
 //! Matchers (tool events) are regular expressions matched against the whole
 //! tool name, ours or its Claude Code name (`shell` is also `Bash`); empty
-//! or `*` matches every tool. A hook with a folder applies only to sessions
-//! in it.
+//! or `*` matches every tool. A hook applies only to sessions with all the
+//! labels in its `applies_to` (see `c6_api::labels`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,8 @@ struct Command {
     timeout_s: Option<u64>,
     #[serde(default = "yes")]
     enabled: bool,
+    #[serde(default)]
+    applies_to: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -69,9 +71,9 @@ pub struct Verdict {
 }
 
 impl HookRunner {
-    /// The enabled hooks in `hooks_json` that apply in `cwd`; `None` when
-    /// there are none.
-    pub fn new(session_id: &str, cwd: &Path, hooks_json: &str) -> Option<Self> {
+    /// The enabled hooks in `hooks_json` that apply to a session with
+    /// `labels` in `cwd`; `None` when there are none.
+    pub fn new(session_id: &str, cwd: &Path, hooks_json: &str, labels: &[String]) -> Option<Self> {
         let project_dir = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd).to_owned();
         let hooks: Vec<Command> = serde_json::from_str(hooks_json).unwrap_or_else(|e| {
             if !hooks_json.trim().is_empty() {
@@ -81,7 +83,12 @@ impl HookRunner {
         });
         let mut events: HashMap<String, Vec<Command>> = HashMap::new();
         for h in hooks {
-            let applies = h.folder.trim().is_empty() || cwd.starts_with(crate::expand_home(h.folder.trim()));
+            // `folder` is the older form of a `folder:` label.
+            let mut selector = h.applies_to.clone();
+            if !h.folder.trim().is_empty() {
+                selector.push(format!("folder:{}", h.folder.trim()));
+            }
+            let applies = c6_api::labels::applies(&selector, labels);
             if h.enabled && applies && !h.command.trim().is_empty() {
                 events.entry(h.event.clone()).or_default().push(h);
             }
@@ -264,16 +271,20 @@ mod tests {
             {"event": "UserPromptSubmit", "command": "echo \"branch: main ($C6_PROJECT_DIR)\""},
             {"event": "Stop", "command": "exit 3"},
             {"event": "Stop", "command": "echo off >&2; exit 2", "enabled": false},
-            {"event": "PreToolUse", "command": "exit 2", "folder": "/somewhere/else"}
+            {"event": "PreToolUse", "command": "exit 2", "folder": "/somewhere/else"},
+            {"event": "PreToolUse", "command": "exit 2", "applies_to": ["python"]},
+            {"event": "PostToolUse", "command": "echo rusty >&2; exit 2", "applies_to": ["rust", "repo:github.com/acme"]}
         ])
         .to_string();
-        let h = HookRunner::new("s1", d, &hooks).unwrap();
+        let mut labels = c6_api::labels::auto_labels("w", "github.com/acme/app", &d.display().to_string(), "", "m");
+        labels.push("rust".into());
+        let h = HookRunner::new("s1", d, &hooks, &labels).unwrap();
 
         // `shell` (Codex) is Bash too.
         assert_eq!(h.pre_tool_use("shell", &json!({"command": "rm -rf /"})).await.as_deref(), Some("no rm -rf"));
-        assert_eq!(h.pre_tool_use("bash", &json!({"command": "ls"})).await, None, "a hook for another folder does not apply");
+        assert_eq!(h.pre_tool_use("bash", &json!({"command": "ls"})).await, None, "hooks for another folder or label do not apply");
         assert_eq!(h.pre_tool_use("read", &json!({"path": "x"})).await, None, "the matcher does not apply");
-        assert_eq!(h.post_tool_use("apply_patch", &json!({}), "ok", false).await.as_deref(), Some("run the formatter"));
+        assert_eq!(h.post_tool_use("apply_patch", &json!({}), "ok", false).await.as_deref(), Some("run the formatter\nrusty"));
         let v = h.run("UserPromptSubmit", None, json!({"prompt": "hi"})).await;
         assert_eq!(v.context, Some(format!("branch: main ({})", d.display())));
         // A failing hook (not exit 2) blocks nothing; a disabled one is not run.
@@ -281,6 +292,6 @@ mod tests {
         // Claude Code gets them as its own settings.
         let cc: Value = serde_json::from_str(&h.claude_settings()).unwrap();
         assert_eq!(cc["hooks"]["PreToolUse"][0]["matcher"], "Bash");
-        assert!(HookRunner::new("s1", d, "[]").is_none());
+        assert!(HookRunner::new("s1", d, "[]", &labels).is_none());
     }
 }

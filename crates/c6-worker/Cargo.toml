@@ -10,6 +10,7 @@ async-trait = "0.1.92"
 base64 = "0.23.1"
 bytes = "1.12.1"
 c6-agent.workspace = true
+c6-api.workspace = true
 c6-core.workspace = true
 c6-llm.workspace = true
 c6-mcp.workspace = true

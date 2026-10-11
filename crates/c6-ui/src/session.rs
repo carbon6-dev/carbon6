@@ -353,12 +353,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                         })}
                                         <span>{move || { let m = model_label.get(); if m.is_empty() { s.model.clone() } else { m } }}</span>
                                     </div>
+                                    <crate::labels::SessionLabels session=s.id.clone() labels=s.labels.clone() auto_labels=s.auto_labels.clone() />
                                 </div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <crate::fleet::TabButton tab label="Transcript" value="transcript" />
                                     <crate::fleet::TabButton tab label="Changes" value="changes" />
                                     <crate::fleet::TabButton tab label="Files" value="files" />
                                     <crate::fleet::TabButton tab label="Terminal" value="terminal" />
+                                    <crate::fleet::TabButton tab label="Config" value="config" />
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
                                         tab.set("transcript");
                                         find_open.set(true);
@@ -395,6 +397,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     ("files", Some(w), Some(c)) => view! { <crate::files::FileBrowser worker_id=w root=c /> }.into_any(),
                     ("terminal", Some(w), Some(c)) => view! { <crate::term::Terminals worker_id=w default_cwd=c /> }.into_any(),
                     ("transcript", _, _) => ().into_any(),
+                    ("config", _, _) => view! { <crate::labels::SessionConfig session=id_stored.get_value() /> }.into_any(),
                     _ => view! { <p class="py-6 text-center text-sm text-zinc-500">"Available once the session has started."</p> }.into_any(),
                 }
             }}
@@ -1468,7 +1471,7 @@ fn Composer(
     // Slash commands: the query, and the commands the head offers.
     let command = RwSignal::new(None::<String>);
     let commands = LocalResource::new(move || async move {
-        let mut list = api::commands().await.unwrap_or_default();
+        let mut list = api::commands(id.get_value()).await.unwrap_or_default();
         // A side chat has no /clear.
         list.retain(|c| !(inline && c.name == "clear" && c.source == "built-in"));
         list
@@ -1566,7 +1569,10 @@ fn Composer(
                 text.set(String::new());
                 command.set(None);
                 spawn_local(async move {
+                    // The fresh session keeps this one's labels.
+                    let labels = api::session(id.get_value()).await.map(|d| d.session.labels).unwrap_or_default();
                     let req = c6_api::CreateSession {
+                        labels,
                         worker_id: match worker.parse() {
                             Ok(w) => w,
                             Err(_) => return,

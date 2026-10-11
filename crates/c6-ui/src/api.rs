@@ -393,7 +393,18 @@ pub async fn fs_find(worker: String, root: String, q: String) -> Result<Vec<(Str
         .unwrap_or_default())
 }
 
-/// The slash commands the composer offers (built-in and custom).
-pub async fn commands() -> Result<Vec<c6_api::CommandInfo>, String> {
-    json(Request::get("/api/v1/commands").send().await).await
+/// The slash commands the composer offers in a session (built-in, and the
+/// custom ones that apply to it).
+pub async fn commands(session: String) -> Result<Vec<c6_api::CommandInfo>, String> {
+    json(Request::get("/api/v1/commands").query([("session", session)]).send().await).await
+}
+
+/// Replaces the labels you attached to a session.
+pub async fn set_labels(id: String, labels: Vec<String>) -> Result<Session, String> {
+    send_json(Request::put(&format!("/api/v1/sessions/{id}/labels")), &c6_api::SetLabels { labels }).await
+}
+
+/// What applies to a session (commands, agents, skills, hooks) and why not.
+pub async fn session_config(id: String) -> Result<c6_api::EffectiveConfig, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/config")).send().await).await
 }

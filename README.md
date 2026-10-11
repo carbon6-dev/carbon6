@@ -93,6 +93,25 @@ c6 login https://head.example:7700 --token c6_… --ca carbon6-ca.pem   # --ca o
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
+### Labels
+
+Sessions carry labels, which group them and decide which settings apply.
+
+- **Automatic labels:**
+  - `worker:<name>`;
+  - `repo:<host/owner/name>`, from the git remote, so a repository is the same on every machine;
+  - `folder:<path>`;
+  - `model:<model>`.
+- **Your own labels:** anything else, like `client:acme`, `spike` or `rust`. Add them when starting a session (they're remembered per folder), in a session's header with **+ label**, or with `c6 run -l`. A side chat keeps its parent's labels, and `/clear` keeps them for the fresh session.
+- **Finding sessions.** Click any label to list the sessions that have it. The session list's search also matches labels, and `c6 sessions -l <label>` filters on the command line.
+- **"Applies to".** Commands, agents, skills and hooks each have an **Applies to** field in Settings:
+  - empty means everywhere;
+  - otherwise, labels a session must *all* have, e.g. `repo:github.com/acme/app` or `client:acme, rust`;
+  - `repo:` and `folder:` match path prefixes, so `repo:github.com/acme` covers a whole organization and `folder:~/code` everything under it.
+- **Same name, different labels.** Several commands, agents or skills can share a name if their labels differ; a session gets the most specific one that matches. Every matching hook runs.
+- **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
+- **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
+
 ### Rewind and edit
 
 Hover one of your messages: **↶ Rewind** takes the conversation back to before it, and **✎ Edit** changes it and sends it again. Either can also restore files: before each turn the worker snapshots the session's folder into a private repository in its state directory (your own git repository, if any, is never touched; folders without git work too; `node_modules/`, `target/` and the like are skipped, as are files your `.gitignore` ignores). Rewound messages stay in the transcript, folded under a marker.

@@ -15,6 +15,7 @@ pub fn SessionsPage() -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let query = RwSignal::new(String::new());
     let status_filter = RwSignal::new(String::new());
+    let label_filter = crate::labels::use_filter().0;
 
     view! {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-6">
@@ -33,7 +34,7 @@ pub fn SessionsPage() -> impl IntoView {
             <section class="space-y-2">
                 <div class="flex flex-wrap items-center gap-2">
                     <h2 class="flex-1 text-sm font-medium text-zinc-500">"Sessions"</h2>
-                    <input class=format!("{INPUT} w-56") placeholder="Search titles, workers, paths" prop:value=move || query.get()
+                    <input class=format!("{INPUT} w-56") placeholder="Search titles, labels, workers, paths" prop:value=move || query.get()
                         on:input=move |ev| query.set(event_target_value(&ev)) />
                     <select class=format!("{INPUT} w-32") prop:value=move || status_filter.get() on:change=move |ev| status_filter.set(event_target_value(&ev))>
                         <option value="">"All"</option>
@@ -42,24 +43,46 @@ pub fn SessionsPage() -> impl IntoView {
                         <option value="failed">"Failed"</option>
                     </select>
                 </div>
+                {move || (!label_filter.with(Vec::is_empty)).then(|| view! {
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                        "With labels"
+                        {label_filter.get().into_iter().map(|l| {
+                            let gone = l.clone();
+                            view! {
+                                <span class="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 font-mono text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">
+                                    {l}
+                                    <button title="Remove this filter" on:click=move |_| label_filter.update(|f| f.retain(|x| *x != gone))>"×"</button>
+                                </span>
+                            }
+                        }).collect_view()}
+                        <button class="underline" on:click=move |_| label_filter.set(Vec::new())>"show all"</button>
+                    </div>
+                })}
                 <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || {
                         let q = query.get().to_lowercase();
                         let st = status_filter.get();
+                        let wanted = label_filter.get();
                         let sessions: Vec<Session> = live
                             .sessions
                             .get()
                             .into_iter()
                             .filter(|s| st.is_empty() || serde_json::to_value(s.status).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
                             .filter(|s| {
+                                let all: Vec<String> = s.labels.iter().chain(s.auto_labels.iter()).cloned().collect();
+                                c6_api::labels::applies(&wanted, &all)
+                            })
+                            .filter(|s| {
                                 q.is_empty()
+                                    || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
                                     || s.title.to_lowercase().contains(&q)
                                     || s.cwd.to_lowercase().contains(&q)
                                     || live.worker_name(&s.worker_id.to_string()).to_lowercase().contains(&q)
                             })
                             .collect();
                         if sessions.is_empty() {
-                            view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">"No sessions yet."</p> }.into_any()
+                            let msg = if wanted.is_empty() && q.is_empty() { "No sessions yet." } else { "No sessions match." };
+                            view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">{msg}</p> }.into_any()
                         } else {
                             sessions.into_iter().map(|s| view! { <SessionRow s now /> }).collect_view().into_any()
                         }
@@ -82,6 +105,12 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                 <div class="truncate text-xs text-zinc-500">
                     {worker} " · " <span class="font-mono">{s.cwd.clone()}</span> " · " {s.model.clone()}
                 </div>
+                {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
+                    <div class="mt-1 flex flex-wrap gap-1">
+                        {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true /> }).collect_view()}
+                        {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l /> }).collect_view()}
+                    </div>
+                })}
             </div>
             <StatusPill status=s.status />
             <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
@@ -108,6 +137,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let effort = RwSignal::new(storage_get("c6.effort").unwrap_or_default());
     let worktree = RwSignal::new(storage_get("c6.worktree").as_deref() == Some("1"));
     let prompt = RwSignal::new(String::new());
+    // Your labels for the session (remembered per folder).
+    let labels = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
@@ -148,6 +179,10 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             });
         }
     });
+    Effect::new(move || {
+        let (w, c) = (worker.get(), cwd.get());
+        labels.set(storage_get(&format!("c6.labels.{w}.{c}")).unwrap_or_default());
+    });
     // Default model per connection; offer the provider's model list.
     let models = LocalResource::new(move || api::models(connection.get()));
     Effect::new(move || {
@@ -176,6 +211,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             title: None,
             prompt: Some(prompt.get_untracked()).filter(|p| !p.trim().is_empty()),
             attachments: Vec::new(),
+            labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked(),
         };
@@ -183,6 +219,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         storage_set("c6.effort", &effort.get_untracked());
         storage_set("c6.worker", &req.worker_id.to_string());
         storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
+        storage_set(&format!("c6.labels.{}.{}", req.worker_id, req.cwd), &req.labels.join(", "));
         storage_set("c6.connection", &req.connection_id);
         storage_set(&format!("c6.model.{}", req.connection_id), &req.model);
         pending.set(true);
@@ -257,6 +294,11 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                     </select>
                 </label>
             </div>
+            <label class="block text-xs text-zinc-500">
+                "Labels"
+                <input class=format!("mt-1 font-mono {INPUT}") placeholder="optional, e.g. client:acme, spike (repo, folder, worker and model are added automatically)"
+                    prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
+            </label>
             <textarea class=format!("{INPUT} min-h-24 resize-y") placeholder="What should the agent do? (⌘/Ctrl+Enter to start)"
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))

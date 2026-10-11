@@ -400,6 +400,7 @@ fn hook_examples() -> Vec<(&'static str, Hook)> {
         command: command.into(),
         timeout_s: None,
         enabled: true,
+        applies_to: Vec::new(),
     };
     vec![
         ("Empty", h("", "PreToolUse", "", "")),
@@ -458,7 +459,12 @@ fn HooksSetting() -> impl IntoView {
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             rows.set(Vec::new());
-            for h in serde_json::from_value::<Vec<Hook>>(v).unwrap_or_default() {
+            for mut h in serde_json::from_value::<Vec<Hook>>(v).unwrap_or_default() {
+                // A folder is now a folder: label.
+                if !h.folder.trim().is_empty() {
+                    h.applies_to.push(format!("folder:{}", h.folder.trim()));
+                    h.folder.clear();
+                }
                 add(h);
             }
         }
@@ -548,10 +554,11 @@ fn HookRow(hook: RwSignal<Hook>, on_remove: impl Fn() + Copy + Send + Sync + 'st
                         on:input=move |ev| hook.update(|h| h.matcher = event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class=label>"Folder"</span>
-                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="all sessions, or e.g. ~/code/app"
-                        prop:value=move || hook.with(|h| h.folder.clone())
-                        on:input=move |ev| hook.update(|h| h.folder = event_target_value(&ev)) />
+                    <span class=label>"Applies to"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="everywhere, or labels, e.g. repo:github.com/me/app"
+                        title="Sessions with all of these labels: yours, or worker:, repo:, folder: (a path prefix) and model:"
+                        prop:value=move || hook.with(|h| h.applies_to.join(", "))
+                        on:change=move |ev| hook.update(|h| h.applies_to = c6_api::labels::parse_labels(&event_target_value(&ev))) />
                 </label>
                 <label class="space-y-0.5">
                     <span class=label>"Timeout (s)"</span>
@@ -578,6 +585,8 @@ enum FieldKind {
     Mono,
     /// Several lines.
     Text,
+    /// Labels, typed separated by commas; stored as a list.
+    Labels,
 }
 
 /// A field of a list setting's items. The first is the item's name, shown
@@ -593,6 +602,12 @@ const COMMAND_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "name, typed as /name", kind: FieldKind::Mono },
     Field { key: "description", label: "Description", placeholder: "shown in the / list", kind: FieldKind::Line },
     Field { key: "argument_hint", label: "Arguments hint", placeholder: "e.g. <issue> [priority]", kind: FieldKind::Mono },
+    Field {
+        key: "applies_to",
+        label: "Applies to",
+        placeholder: "everywhere, or labels: e.g. repo:github.com/me/app, client:acme",
+        kind: FieldKind::Labels,
+    },
     Field { key: "body", label: "Prompt", placeholder: "Fix issue #$1. Here it is: !`gh issue view $1`", kind: FieldKind::Text },
 ];
 
@@ -601,12 +616,24 @@ const AGENT_FIELDS: &[Field] = &[
     Field { key: "description", label: "When to use it", placeholder: "the model reads this to pick the agent", kind: FieldKind::Line },
     Field { key: "tools", label: "Tools", placeholder: "all, or e.g. Read, Grep, Glob", kind: FieldKind::Mono },
     Field { key: "model", label: "Model", placeholder: "same as the session (or opus, sonnet, haiku on Anthropic)", kind: FieldKind::Mono },
+    Field {
+        key: "applies_to",
+        label: "Applies to",
+        placeholder: "everywhere, or labels: e.g. repo:github.com/me/app, client:acme",
+        kind: FieldKind::Labels,
+    },
     Field { key: "prompt", label: "Instructions", placeholder: "You are a … Your job is …", kind: FieldKind::Text },
 ];
 
 const SKILL_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. release", kind: FieldKind::Mono },
     Field { key: "description", label: "When to use it", placeholder: "the agent reads this to decide to load it", kind: FieldKind::Line },
+    Field {
+        key: "applies_to",
+        label: "Applies to",
+        placeholder: "everywhere, or labels: e.g. repo:github.com/me/app, client:acme",
+        kind: FieldKind::Labels,
+    },
     Field { key: "body", label: "Instructions", placeholder: "1. …", kind: FieldKind::Text },
 ];
 
@@ -787,17 +814,34 @@ fn ListItem(
     fields: &'static [Field],
     on_remove: impl Fn() + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
-    let get = move |k: &'static str| move || item.with(|m| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned());
+    // Labels fields hold lists, shown as comma-separated text.
+    let get = move |k: &'static str| {
+        move || {
+            item.with(|m| match m.get(k) {
+                Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+                Some(v) => v.as_str().unwrap_or("").to_owned(),
+                None => String::new(),
+            })
+        }
+    };
     let set = move |k: &'static str, v: String| {
+        let labels = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Labels);
         item.update(|m| {
-            m.insert(k.into(), serde_json::Value::String(v));
+            let value = if labels {
+                serde_json::Value::Array(c6_api::labels::parse_labels(&v).into_iter().map(serde_json::Value::String).collect())
+            } else {
+                serde_json::Value::String(v)
+            };
+            m.insert(k.into(), value);
         })
     };
     let enabled = move || item.with(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true));
     let (first, rest) = fields.split_first().expect("a name field");
     let lines: Vec<&'static Field> = rest.iter().filter(|f| f.kind != FieldKind::Text).collect();
     let texts: Vec<&'static Field> = rest.iter().filter(|f| f.kind == FieldKind::Text).collect();
-    let input_class = |f: &Field| format!("{INPUT} py-1 {}", if f.kind == FieldKind::Mono { "font-mono text-xs" } else { "text-sm" });
+    let input_class = |f: &Field| {
+        format!("{INPUT} py-1 {}", if matches!(f.kind, FieldKind::Mono | FieldKind::Labels) { "font-mono text-xs" } else { "text-sm" })
+    };
     view! {
         <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if enabled() { "" } else { "opacity-60" })>
             <div class="flex items-center gap-2">
@@ -808,11 +852,23 @@ fn ListItem(
                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
-                {lines.into_iter().map(|f| view! {
-                    <label class="space-y-0.5">
-                        <span class="text-xs text-zinc-500">{f.label}</span>
-                        <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key) on:input=move |ev| set(f.key, event_target_value(&ev)) />
-                    </label>
+                {lines.into_iter().map(|f| if f.kind == FieldKind::Labels {
+                    // Parsed when you leave the field, so typing is not reformatted.
+                    view! {
+                        <label class="space-y-0.5 sm:col-span-2">
+                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key)
+                                title="Sessions with all of these labels: yours, or worker:, repo:, folder: (a path prefix) and model:"
+                                on:change=move |ev| set(f.key, event_target_value(&ev)) />
+                        </label>
+                    }.into_any()
+                } else {
+                    view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key) on:input=move |ev| set(f.key, event_target_value(&ev)) />
+                        </label>
+                    }.into_any()
                 }).collect_view()}
             </div>
             {texts.into_iter().map(|f| view! {

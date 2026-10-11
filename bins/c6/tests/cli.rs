@@ -78,7 +78,7 @@ async fn headless_cli() {
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hi"}"#.into())]));
     mock.push(Reply::Text("All done here.".into()));
     let cwd = project.path().display().to_string();
-    let run = c6(h, &["run", "-C", &cwd, "-m", "m", "--title", "cli test", "say", "hi"]).await;
+    let run = c6(h, &["run", "-C", &cwd, "-m", "m", "--title", "cli test", "-l", "team:core,cli", "say", "hi"]).await;
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(run.stdout.trim(), "All done here.");
     assert!(run.stderr.contains("→ bash"), "{}", run.stderr);
@@ -101,7 +101,11 @@ async fn headless_cli() {
 
     // sessions, show, search.
     let list = c6(h, &["sessions"]).await;
-    assert!(list.stdout.contains("cli test"), "{}", list.stdout);
+    assert!(list.stdout.contains("cli test") && list.stdout.contains("[team:core, cli]"), "{}", list.stdout);
+    let by_label = c6(h, &["sessions", "-l", "team:core"]).await;
+    assert!(by_label.stdout.contains("cli test"), "{}", by_label.stdout);
+    let none = c6(h, &["sessions", "-l", "team:other"]).await;
+    assert!(none.stdout.trim().is_empty(), "{}", none.stdout);
     let show = c6(h, &["show", &id]).await;
     assert!(show.stdout.contains("## You\n\nsay hi") && show.stdout.contains("Second answer."), "{}", show.stdout);
     let found = c6(h, &["search", "Second answer"]).await;

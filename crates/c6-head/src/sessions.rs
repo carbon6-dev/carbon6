@@ -72,6 +72,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     if req.cwd.trim().is_empty() || req.model.trim().is_empty() {
         return Err(bad_request("cwd and model are required"));
     }
+    let labels = check_labels(&req.labels)?;
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let files = attachments(&req.attachments)?;
@@ -96,6 +97,11 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         updated_at: now,
         last_seq: 0,
         archived: 0,
+        labels: serde_json::to_string(&labels)?,
+        worker_name: worker.name.clone(),
+        repo: String::new(),
+        folder: String::new(),
+        home: String::new(),
     };
     let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
@@ -139,6 +145,12 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         updated_at: now,
         last_seq: 0,
         archived: 0,
+        // A side chat has its parent's labels.
+        labels: parent.labels.clone(),
+        worker_name: parent.worker_name.clone(),
+        repo: parent.repo.clone(),
+        folder: parent.folder.clone(),
+        home: parent.home.clone(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -182,6 +194,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting(HOOKS).await?.unwrap_or_else(|| "[]".into()),
         agents_json: st.store.setting(AGENTS).await?.unwrap_or_else(|| "[]".into()),
+        labels: row.head_labels(),
         seed,
     })
 }
@@ -226,6 +239,7 @@ async fn insert(
 ) -> anyhow::Result<api::Session> {
     let worker_id: WorkerId = row.worker_id.parse()?;
     let session_id = row.id.clone();
+    let labels = row.head_labels();
     let create_id = Uuid::now_v7().to_string();
     let create =
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
@@ -239,7 +253,7 @@ async fn insert(
             data: input_command(
                 &input_id,
                 &session_id,
-                with_command(st, UserInput { text: text.to_owned(), attachments, ..Default::default() }).await?,
+                with_command(st, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() }).await?,
             ),
             text: Some(text),
         });
@@ -299,19 +313,118 @@ pub async fn custom_commands(st: &HeadState) -> anyhow::Result<Vec<api::CommandD
     Ok(serde_json::from_str::<Vec<api::CommandDef>>(&raw).unwrap_or_default().into_iter().filter(|c| c.enabled).collect())
 }
 
-/// Attaches the template of the custom command the text invokes, if any:
-/// commands apply as they are when the message is sent.
-async fn with_command(st: &HeadState, mut input: UserInput) -> anyhow::Result<UserInput> {
+/// Attaches the variants of the custom command the text invokes, if any,
+/// and the session's labels, so the worker can pick the variant for the
+/// session: commands apply as they are when the message is sent.
+async fn with_command(st: &HeadState, labels: Vec<String>, mut input: UserInput) -> anyhow::Result<UserInput> {
+    input.labels = labels;
     let Some(rest) = input.text.strip_prefix('/') else { return Ok(input) };
     let name = rest.split(char::is_whitespace).next().unwrap_or("");
     if !api::valid_command_name(name) {
         return Ok(input);
     }
-    if let Some(c) = custom_commands(st).await?.into_iter().find(|c| c.name == name) {
-        input.command = c.name;
-        input.command_template = c.body;
+    let variants: Vec<serde_json::Value> = custom_commands(st)
+        .await?
+        .into_iter()
+        .filter(|c| c.name == name)
+        .map(|c| serde_json::json!({"applies_to": c.applies_to, "body": c.body}))
+        .collect();
+    if !variants.is_empty() {
+        input.command = name.to_owned();
+        input.command_candidates_json = serde_json::to_string(&variants)?;
     }
     Ok(input)
+}
+
+/// Your labels, checked and deduplicated.
+pub fn check_labels(labels: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for l in labels.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        c6_api::labels::check_user_label(l).map_err(bad_request)?;
+        if !out.iter().any(|x| x == l) {
+            out.push(l.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Replaces the labels you attached to a session (and its side chats keep
+/// theirs).
+pub async fn set_labels(st: &HeadState, session_id: &str, labels: &[String]) -> anyhow::Result<api::Session> {
+    let labels = check_labels(labels)?;
+    if !st.store.set_session_labels(session_id, &labels).await? {
+        return Err(not_found("no such session"));
+    }
+    st.registry.bump();
+    let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(crate::convert::session(&row))
+}
+
+/// What applies to a session now: the head's current settings matched
+/// against its labels.
+pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Result<api::EffectiveConfig> {
+    use c6_api::labels::{applies, best};
+    let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let labels = row.all_labels();
+    let setting = |key: &'static str| async move {
+        anyhow::Ok(
+            serde_json::from_str::<serde_json::Value>(&st.store.setting(key).await?.unwrap_or_else(|| "[]".into())).unwrap_or_default(),
+        )
+    };
+    // (name, enabled, applies_to) of each item, in order.
+    type Item = (String, bool, Vec<String>);
+    fn items(v: &serde_json::Value, name_key: &str) -> Vec<(String, bool, Vec<String>)> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| {
+                let mut applies_to: Vec<String> =
+                    i["applies_to"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect();
+                if let Some(f) = i["folder"].as_str().filter(|f| !f.trim().is_empty()) {
+                    applies_to.push(format!("folder:{}", f.trim()));
+                }
+                let name = i[name_key].as_str().unwrap_or("").to_owned();
+                (name, i["enabled"].as_bool().unwrap_or(true), applies_to)
+            })
+            .collect()
+    }
+    let judge = |list: Vec<(String, bool, Vec<String>)>, named: bool| -> Vec<api::Applied> {
+        let indexed: Vec<(usize, &Item)> = list.iter().enumerate().collect();
+        list.iter()
+            .enumerate()
+            .map(|(i, (name, enabled, applies_to))| {
+                let skipped = if !enabled {
+                    Some("off".to_owned())
+                } else if !applies(applies_to, &labels) {
+                    let missing: Vec<&str> =
+                        applies_to.iter().filter(|s| !c6_api::labels::label_matches(s, &labels)).map(String::as_str).collect();
+                    Some(format!("needs {}", missing.join(", ")))
+                } else if named
+                    && best(indexed.iter().filter(|(_, (n, e, _))| n == name && *e), |x| &x.1.2, &labels).is_some_and(|(j, _)| *j != i)
+                {
+                    Some("replaced by a more specific one".to_owned())
+                } else {
+                    None
+                };
+                api::Applied { name: name.clone(), applies_to: applies_to.clone(), skipped }
+            })
+            .collect()
+    };
+    let hooks = items(&setting(HOOKS).await?, "event")
+        .into_iter()
+        .zip(setting(HOOKS).await?.as_array().cloned().unwrap_or_default())
+        .map(|((event, enabled, applies_to), h)| {
+            let name = h["name"].as_str().filter(|n| !n.is_empty()).map(|n| format!("{n} ({event})")).unwrap_or(event);
+            (name, enabled, applies_to)
+        })
+        .collect();
+    Ok(api::EffectiveConfig {
+        labels: c6_api::labels::display_labels(&labels),
+        commands: judge(items(&setting(COMMANDS).await?, "name"), true),
+        agents: judge(items(&setting(AGENTS).await?, "name"), true),
+        skills: judge(items(&setting(SKILLS).await?, "name"), true),
+        hooks: judge(hooks, false),
+    })
 }
 
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
@@ -336,7 +449,9 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     let id = Uuid::now_v7().to_string();
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
-    let input = with_command(st, UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() }).await?;
+    let input =
+        with_command(st, session.head_labels(), UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() })
+            .await?;
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;

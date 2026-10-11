@@ -137,6 +137,8 @@ pub fn session(r: &SessionRow) -> api::Session {
         created_at: r.created_at,
         updated_at: r.updated_at,
         last_seq: r.last_seq as u64,
+        labels: r.user_labels(),
+        auto_labels: r.all_labels().split_off(r.user_labels().len()),
     }
 }
 

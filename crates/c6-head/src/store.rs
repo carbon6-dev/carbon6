@@ -213,6 +213,35 @@ pub struct SessionRow {
     pub updated_at: i64,
     pub last_seq: i64,
     pub archived: i64,
+    /// Your labels, as a JSON array.
+    pub labels: String,
+    pub worker_name: String,
+    pub repo: String,
+    pub folder: String,
+    pub home: String,
+}
+
+impl SessionRow {
+    pub fn user_labels(&self) -> Vec<String> {
+        serde_json::from_str(&self.labels).unwrap_or_default()
+    }
+
+    /// All its labels: yours, then the automatic ones.
+    pub fn all_labels(&self) -> Vec<String> {
+        let folder = if self.folder.is_empty() && self.cwd.starts_with('/') { &self.cwd } else { &self.folder };
+        let mut l = self.user_labels();
+        l.extend(c6_api::labels::auto_labels(&self.worker_name, &self.repo, folder, &self.home, &self.model));
+        l
+    }
+
+    /// The labels the head passes to the worker (which adds the rest).
+    pub fn head_labels(&self) -> Vec<String> {
+        let mut l = self.user_labels();
+        if !self.worker_name.is_empty() {
+            l.push(format!("worker:{}", self.worker_name));
+        }
+        l
+    }
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -241,8 +270,8 @@ impl Store {
     pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
+             labels, worker_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -256,6 +285,8 @@ impl Store {
         .bind(&s.effort)
         .bind(&s.parent_id)
         .bind(s.fork_seq)
+        .bind(&s.labels)
+        .bind(&s.worker_name)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -278,6 +309,16 @@ impl Store {
 
     pub async fn child_sessions(&self, parent_id: &str) -> anyhow::Result<Vec<SessionRow>> {
         Ok(sqlx::query_as("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at").bind(parent_id).fetch_all(&self.pool).await?)
+    }
+
+    pub async fn set_session_labels(&self, id: &str, labels: &[String]) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE sessions SET labels = ?, updated_at = ? WHERE id = ?")
+            .bind(serde_json::to_string(labels)?)
+            .bind(c6_core::now_ms())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     pub async fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -367,6 +408,13 @@ impl Store {
                 Some(Kind::Started(s)) => {
                     status = "idle".into();
                     done.push(s.command_id.clone());
+                    sqlx::query("UPDATE sessions SET repo = ?, folder = ?, home = ? WHERE id = ?")
+                        .bind(&s.repo)
+                        .bind(&s.cwd)
+                        .bind(&s.home)
+                        .bind(session_id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
@@ -449,7 +497,7 @@ async fn create_subagent_session(
     if s.parent_session_id.is_empty() {
         return Ok(false);
     }
-    let parent = sqlx::query("SELECT connection_id, model, effort FROM sessions WHERE id = ? AND worker_id = ?")
+    let parent = sqlx::query("SELECT connection_id, model, effort, labels, worker_name FROM sessions WHERE id = ? AND worker_id = ?")
         .bind(&s.parent_session_id)
         .bind(worker_id.to_string())
         .fetch_optional(&mut *tx)
@@ -457,8 +505,8 @@ async fn create_subagent_session(
     let Some(parent) = parent else { return Ok(false) };
     let now = c6_core::now_ms();
     sqlx::query(
-        "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id) \
-         VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
+         labels, worker_name) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -471,6 +519,8 @@ async fn create_subagent_session(
     .bind(parent.get::<Option<String>, _>("effort"))
     .bind(&s.parent_session_id)
     .bind(&s.parent_call_id)
+    .bind(parent.get::<String, _>("labels"))
+    .bind(parent.get::<String, _>("worker_name"))
     .execute(&mut *tx)
     .await?;
     Ok(true)
