@@ -43,21 +43,7 @@ pub fn SessionsPage() -> impl IntoView {
                         <option value="failed">"Failed"</option>
                     </select>
                 </div>
-                {move || (!label_filter.with(Vec::is_empty)).then(|| view! {
-                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-                        "With labels"
-                        {label_filter.get().into_iter().map(|l| {
-                            let gone = l.clone();
-                            view! {
-                                <span class="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 font-mono text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">
-                                    {l}
-                                    <button title="Remove this filter" on:click=move |_| label_filter.update(|f| f.retain(|x| *x != gone))>"×"</button>
-                                </span>
-                            }
-                        }).collect_view()}
-                        <button class="underline" on:click=move |_| label_filter.set(Vec::new())>"show all"</button>
-                    </div>
-                })}
+                <crate::labels::LabelFilterBar />
                 <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || {
                         let q = query.get().to_lowercase();
@@ -68,10 +54,7 @@ pub fn SessionsPage() -> impl IntoView {
                             .get()
                             .into_iter()
                             .filter(|s| st.is_empty() || serde_json::to_value(s.status).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
-                            .filter(|s| {
-                                let all: Vec<String> = s.labels.iter().chain(s.auto_labels.iter()).cloned().collect();
-                                c6_api::labels::applies(&wanted, &all)
-                            })
+                            .filter(|s| crate::labels::matches(s, &wanted))
                             .filter(|s| {
                                 q.is_empty()
                                     || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
@@ -107,8 +90,8 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                 </div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-1">
-                        {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true /> }).collect_view()}
-                        {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l /> }).collect_view()}
+                        {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
+                        {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
                     </div>
                 })}
             </div>

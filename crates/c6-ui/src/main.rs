@@ -53,7 +53,7 @@ fn App() -> impl IntoView {
 fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
-    provide_context(labels::LabelFilter(RwSignal::new(Vec::new())));
+    provide_context(labels::LabelFilter::restored());
     // A signed-in browser opening a login link (to sign in again).
     if window().location().pathname().unwrap_or_default().starts_with("/login/") {
         return view! {

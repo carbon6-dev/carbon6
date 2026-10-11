@@ -13,13 +13,104 @@ use crate::workspace::{How, View, use_workspace};
 #[derive(Clone, Copy)]
 pub struct LabelFilter(pub RwSignal<Vec<String>>);
 
+impl LabelFilter {
+    /// The filter as it was last left (kept in this browser).
+    pub fn restored() -> Self {
+        const KEY: &str = "c6.labelfilter";
+        let saved = crate::util::storage_get(KEY).map(|s| c6_api::labels::parse_labels(&s)).unwrap_or_default();
+        let filter = RwSignal::new(saved);
+        Effect::new(move || crate::util::storage_set(KEY, &filter.get().join(",")));
+        Self(filter)
+    }
+}
+
 pub fn use_filter() -> LabelFilter {
     use_context::<LabelFilter>().expect("LabelFilter is provided at the root")
 }
 
-/// A label; clicking it lists the sessions that have it.
+/// Whether a session has every label in `filter`.
+pub fn matches(s: &c6_api::Session, filter: &[String]) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let all: Vec<String> = s.labels.iter().chain(s.auto_labels.iter()).cloned().collect();
+    c6_api::labels::applies(filter, &all)
+}
+
+/// The labels of your sessions, for suggestions: yours first, then the
+/// automatic ones (folders in their ~/ form).
+fn known_labels(sessions: &[c6_api::Session]) -> Vec<String> {
+    let mut mine: Vec<String> = Vec::new();
+    let mut auto: Vec<String> = Vec::new();
+    for s in sessions {
+        mine.extend(s.labels.iter().cloned());
+        auto.extend(c6_api::labels::display_labels(&s.auto_labels));
+    }
+    mine.sort();
+    mine.dedup();
+    auto.sort();
+    auto.dedup();
+    mine.into_iter().chain(auto).collect()
+}
+
+/// The shared label filter of the session list, inbox and mission control:
+/// its labels (removable), a field to add one (with suggestions), and a way
+/// to show everything again.
 #[component]
-pub fn LabelChip(label: String, #[prop(optional)] auto: bool, #[prop(optional)] on_remove: Option<Callback<()>>) -> impl IntoView {
+pub fn LabelFilterBar() -> impl IntoView {
+    let filter = use_filter().0;
+    let live = api::live();
+    let draft = RwSignal::new(String::new());
+    let list_id = format!("c6-labels-{}", js_sys::Math::random().to_bits());
+    let add = move || {
+        let new = c6_api::labels::parse_labels(&draft.get_untracked());
+        if !new.is_empty() {
+            filter.update(|f| {
+                for l in new {
+                    if !f.contains(&l) {
+                        f.push(l);
+                    }
+                }
+            });
+        }
+        draft.set(String::new());
+    };
+    view! {
+        <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <span>"Labels"</span>
+            {move || filter.get().into_iter().map(|l| {
+                let gone = l.clone();
+                view! {
+                    <span class="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 font-mono text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">
+                        {l}
+                        <button title="Remove this filter" on:click=move |_| filter.update(|f| f.retain(|x| *x != gone))>"×"</button>
+                    </span>
+                }
+            }).collect_view()}
+            <input class=format!("{INPUT} w-48! py-0.5 font-mono text-xs") list=list_id.clone()
+                placeholder=move || if filter.with(Vec::is_empty) { "filter by label…" } else { "and…" }
+                prop:value=move || draft.get() on:input=move |ev| draft.set(event_target_value(&ev))
+                on:change=move |_| add()
+                on:keydown=move |ev| if ev.key() == "Enter" { ev.prevent_default(); add(); } />
+            <datalist id=list_id>
+                {move || live.sessions.with(|ss| known_labels(ss)).into_iter().map(|l| view! { <option value=l></option> }).collect_view()}
+            </datalist>
+            {move || (!filter.with(Vec::is_empty)).then(|| view! {
+                <button class="underline" on:click=move |_| filter.set(Vec::new())>"show all"</button>
+            })}
+        </div>
+    }
+}
+
+/// A label; clicking it lists the sessions that have it (`stay`: filters
+/// the list it is in instead of opening the session list).
+#[component]
+pub fn LabelChip(
+    label: String,
+    #[prop(optional)] auto: bool,
+    #[prop(optional)] stay: bool,
+    #[prop(optional)] on_remove: Option<Callback<()>>,
+) -> impl IntoView {
     let filter = use_filter();
     let ws = use_workspace();
     let l = label.clone();
@@ -34,7 +125,9 @@ pub fn LabelChip(label: String, #[prop(optional)] auto: bool, #[prop(optional)] 
                 ev.stop_propagation();
                 ev.prevent_default();
                 filter.0.set(vec![l.clone()]);
-                ws.open(None, View::Sessions, How::Beside);
+                if !stay {
+                    ws.open(None, View::Sessions, How::Beside);
+                }
             }>{label}</button>
             {on_remove.map(|cb| view! {
                 <button class="opacity-60 hover:opacity-100" title="Remove this label" on:click=move |ev| { ev.stop_propagation(); cb.run(()); }>"×"</button>

@@ -103,7 +103,7 @@ Sessions carry labels, which group them and decide which settings apply.
   - `folder:<path>`;
   - `model:<model>`.
 - **Your own labels:** anything else, like `client:acme`, `spike` or `rust`. Add them when starting a session (they're remembered per folder), in a session's header with **+ label**, or with `c6 run -l`. A side chat keeps its parent's labels, and `/clear` keeps them for the fresh session.
-- **Finding sessions.** Click any label to list the sessions that have it. The session list's search also matches labels, and `c6 sessions -l <label>` filters on the command line.
+- **Finding sessions.** The session list, the inbox and mission control share one label filter, kept in your browser. Type labels into it (suggestions come from your sessions; `repo:github.com/acme` covers the whole org), or click any label on a session. The inbox notes how many sessions the filter hides, and mission control falls back to the most recent matching sessions. The session list's search also matches labels, and `c6 sessions -l <label>` filters on the command line.
 - **"Applies to".** Commands, agents, skills and hooks each have an **Applies to** field in Settings:
   - empty means everywhere;
   - otherwise, labels a session must *all* have, e.g. `repo:github.com/acme/app` or `client:acme, rust`;

@@ -82,7 +82,11 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
 pub fn InboxPage() -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let items = Memo::new(move |_| ws.tracked(&live));
+    let filter = crate::labels::use_filter().0;
+    let items = Memo::new(move |_| {
+        let f = filter.get();
+        ws.tracked(&live).into_iter().filter(|(s, _)| crate::labels::matches(s, &f)).collect::<Vec<_>>()
+    });
     let section = move |title: &'static str, which: Tracked, empty: &'static str| {
         view! {
             <section class="space-y-2">
@@ -104,6 +108,15 @@ pub fn InboxPage() -> impl IntoView {
     };
     view! {
         <main class="mx-auto max-w-3xl space-y-6 px-4 py-6">
+            <crate::labels::LabelFilterBar />
+            {move || {
+                // Sessions the filter hides, so an empty inbox is not misread.
+                let f = filter.get();
+                let hidden = if f.is_empty() { 0 } else { ws.tracked(&live).into_iter().filter(|(s, _)| !crate::labels::matches(s, &f)).count() };
+                (hidden > 0).then(|| view! {
+                    <p class="-mt-4 text-xs text-zinc-500">{format!("{hidden} more without these labels.")}</p>
+                })
+            }}
             {section("Needs attention", Tracked::Attention, "Nothing finished while you were elsewhere.")}
             {section("Running", Tracked::Running, "No sessions are running.")}
             {section("Pinned", Tracked::Pinned, "Pin a session with ☆ in its header to keep it here.")}
@@ -123,6 +136,12 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="truncate text-xs text-zinc-500">{format!("{} · {} · {}", what(s.status, t), worker, ago(now_ms() - s.updated_at))}</div>
+                {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
+                    <div class="mt-1 flex flex-wrap gap-1">
+                        {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
+                        {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
+                    </div>
+                })}
             </Go>
             {(t == Tracked::Attention).then(|| view! {
                 <button class="rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| ws.dismiss(&dismiss_id)>"Dismiss"</button>
@@ -139,18 +158,23 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
 pub fn MissionPage() -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
+    let filter = crate::labels::use_filter().0;
     let ids = Memo::new(move |_| {
-        let tracked: Vec<String> = ws.tracked(&live).into_iter().map(|(s, _)| s.id).collect();
+        let f = filter.get();
+        let tracked: Vec<String> =
+            ws.tracked(&live).into_iter().filter(|(s, _)| crate::labels::matches(s, &f)).map(|(s, _)| s.id).collect();
         if !tracked.is_empty() {
             return tracked;
         }
-        let mut recent = live.sessions.get();
+        let mut recent: Vec<Session> = live.sessions.get().into_iter().filter(|s| crate::labels::matches(s, &f)).collect();
         recent.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         recent.into_iter().take(6).map(|s| s.id).collect()
     });
     view! {
         <main class="space-y-3 px-4 py-4">
             <p class="text-xs text-zinc-500">"Running, finished-unseen and pinned sessions (or your most recent), live. Reply from a card, or open it beside this view."</p>
+            <crate::labels::LabelFilterBar />
+            {move || ids.with(Vec::is_empty).then(|| view! { <p class="text-sm text-zinc-500">"No sessions with these labels."</p> })}
             <div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(20rem,1fr))]">
                 <For each=move || ids.get() key=|id| id.clone() let:id>
                     <MissionCard id />
