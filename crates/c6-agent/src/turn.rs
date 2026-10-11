@@ -414,7 +414,12 @@ async fn run_one(
             (Some(tool), Ok(value)) => {
                 let hooks = session_tools.hooks();
                 let blocked = match &hooks {
-                    Some(h) => h.pre_tool_use(name, &value).await,
+                    // It may wait for the user's approval; an interrupt
+                    // ends the wait.
+                    Some(h) => tokio::select! {
+                        r = h.pre_tool_use(id, name, &value) => r,
+                        _ = cancel.cancelled() => Some("not run: the turn was interrupted".into()),
+                    },
                     None => None,
                 };
                 if let Some(reason) = blocked {

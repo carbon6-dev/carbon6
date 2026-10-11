@@ -151,8 +151,8 @@ struct SubagentHooks(Arc<dyn c6_tools::Hooks>);
 
 #[async_trait]
 impl c6_tools::Hooks for SubagentHooks {
-    async fn pre_tool_use(&self, tool: &str, input: &serde_json::Value) -> Option<String> {
-        self.0.pre_tool_use(tool, input).await
+    async fn pre_tool_use(&self, call_id: &str, tool: &str, input: &serde_json::Value) -> Option<String> {
+        self.0.pre_tool_use(call_id, tool, input).await
     }
 
     async fn post_tool_use(&self, tool: &str, input: &serde_json::Value, output: &str, is_error: bool) -> Option<String> {

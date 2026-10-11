@@ -62,6 +62,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/outputs/{seq}", get(output))
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
+        .route("/api/v1/sessions/{id}/approvals/{call_id}", post(decide_approval))
+        .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
         .route("/api/v1/sessions/{id}/config", get(session_config))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
@@ -963,6 +965,29 @@ async fn stop_task(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(Str
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+async fn decide_approval(
+    State(st): State<Arc<HeadState>>,
+    Path((id, call_id)): Path<(String, String)>,
+    Json(d): Json<api::ApprovalDecision>,
+) -> ApiResult<StatusCode> {
+    if crate::sessions::decide(&st, &id, &call_id, d.allow).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
+    }
+}
+
+async fn get_policies(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Policy>>> {
+    let raw = st.store.setting(crate::sessions::POLICIES).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+async fn put_policies(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::Policy>>) -> ApiResult<StatusCode> {
+    crate::sessions::check_policies(&p)?;
+    st.store.set_setting(crate::sessions::POLICIES, &serde_json::to_string(&p).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

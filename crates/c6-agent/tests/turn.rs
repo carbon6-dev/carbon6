@@ -152,5 +152,6 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::BackgroundTask(_) => "background_task",
         session_event::Kind::Output(_) => "output",
         session_event::Kind::Memory(_) => "memory",
+        session_event::Kind::Approval(_) => "approval",
     }
 }

@@ -18,6 +18,7 @@ fn enabled() -> bool {
 /// for the sessions the label filter shows.
 pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: crate::labels::LabelFilter) {
     let previous = StoredValue::new(HashMap::<String, SessionStatus>::new());
+    let waiting = StoredValue::new(Vec::<String>::new());
     Effect::new(move || {
         let sessions = live.sessions.get();
         let hidden = document().hidden();
@@ -27,11 +28,24 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
             for s in &sessions {
                 let was = prev.insert(s.id.clone(), s.status);
                 let finished = was == Some(SessionStatus::Running) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed);
-                if finished && hidden && enabled() && crate::labels::matches(s, &wanted) {
+                // Starting to wait for your approval is worth a notice too.
+                let asks = s.awaiting_approval && !waiting.with_value(|w| w.contains(&s.id));
+                if asks {
+                    waiting.update_value(|w| w.push(s.id.clone()));
+                } else if !s.awaiting_approval {
+                    waiting.update_value(|w| w.retain(|x| *x != s.id));
+                }
+                if (finished || asks) && hidden && enabled() && crate::labels::matches(s, &wanted) {
                     let opts = NotificationOptions::new();
                     opts.set_body(&format!(
                         "{} on {}",
-                        if s.status == SessionStatus::Failed { "Failed" } else { "Finished" },
+                        if asks {
+                            "Needs your approval"
+                        } else if s.status == SessionStatus::Failed {
+                            "Failed"
+                        } else {
+                            "Finished"
+                        },
                         live.worker_name(&s.worker_id.to_string())
                     ));
                     opts.set_tag(&s.id);

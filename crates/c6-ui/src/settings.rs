@@ -89,6 +89,14 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 examples=template_examples
             />
             <MemorySetting />
+            <ListSetting
+                name="policies"
+                title="Policies"
+                noun="policy"
+                help="Rules for the agent's tool calls in sessions with given labels: deny them, or have them wait for your approval (in the transcript, the inbox and a notification; an hour without an answer means no). Tools is a regular expression over tool names (Bash, Edit, Write, … work with every model); Pattern one over the call's input. The first matching policy applies. Claude Code sessions are not covered."
+                fields=POLICY_FIELDS
+                examples=policy_examples
+            />
             <AutomationsSetting />
             <HooksSetting />
             <SecretsSetting />
@@ -666,6 +674,8 @@ enum FieldKind {
     Text,
     /// Labels, typed separated by commas; stored as a list.
     Labels,
+    /// One of these values.
+    Choice(&'static [&'static str]),
 }
 
 /// A field of a list setting's items. The first is the item's name, shown
@@ -703,6 +713,57 @@ const AGENT_FIELDS: &[Field] = &[
     },
     Field { key: "prompt", label: "Instructions", placeholder: "You are a … Your job is …", kind: FieldKind::Text },
 ];
+
+const POLICY_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. Ask before changes on prod", kind: FieldKind::Line },
+    Field { key: "applies_to", label: "Applies to", placeholder: "everywhere, or labels, e.g. env:prod", kind: FieldKind::Labels },
+    Field { key: "action", label: "Action", placeholder: "", kind: FieldKind::Choice(&["ask", "deny"]) },
+    Field { key: "tools", label: "Tools (regex)", placeholder: "every tool, or e.g. Bash|Write|Edit", kind: FieldKind::Mono },
+    Field { key: "pattern", label: "Input pattern (regex)", placeholder: "any input, or e.g. rm\\s+-rf", kind: FieldKind::Mono },
+    Field { key: "message", label: "Message", placeholder: "why (shown to you and the agent)", kind: FieldKind::Line },
+];
+
+fn policy_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let p = |name: &str, labels: &[&str], action: &str, tools: &str, pattern: &str, message: &str| {
+        let mut v = item(&[("name", name), ("action", action), ("tools", tools), ("pattern", pattern), ("message", message)]);
+        v["applies_to"] = serde_json::json!(labels);
+        v
+    };
+    vec![
+        ("Empty", p("", &[], "ask", "", "", "")),
+        (
+            "Ask before any change on prod",
+            p("Ask before changes on prod", &["env:prod"], "ask", "Bash|Write|Edit", "", "Production: every command and edit needs a yes."),
+        ),
+        (
+            "Never rm -rf or wipe disks on prod",
+            p(
+                "No destructive commands on prod",
+                &["env:prod"],
+                "deny",
+                "Bash",
+                r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f|mkfs|dd\s+if=|DROP\s+(TABLE|DATABASE)",
+                "Too destructive for production; do it by hand.",
+            ),
+        ),
+        (
+            "Ask before installing or removing packages",
+            p(
+                "Ask before package changes",
+                &[],
+                "ask",
+                "Bash",
+                r"(apt|apt-get|dnf|yum|brew|pip|npm)\s+(-\S+\s+)*(install|remove|purge|uninstall|upgrade)",
+                "",
+            ),
+        ),
+        ("Ask before git push", p("Ask before git push", &[], "ask", "Bash", r"git\s+push", "")),
+        (
+            "Read-only research sessions",
+            p("Research is read-only", &["research"], "deny", "Write|Edit|Bash", "", "Research sessions only read and report."),
+        ),
+    ]
+}
 
 const TEMPLATE_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. disk-check", kind: FieldKind::Mono },
@@ -1029,7 +1090,16 @@ fn ListItem(
                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
-                {lines.into_iter().map(|f| if f.kind == FieldKind::Labels {
+                {lines.into_iter().map(|f| if let FieldKind::Choice(options) = f.kind {
+                    view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <select class=format!("{INPUT} py-1 text-sm") prop:value=get(f.key) on:change=move |ev| set(f.key, event_target_value(&ev))>
+                                {options.iter().map(|o| view! { <option value=*o>{*o}</option> }).collect_view()}
+                            </select>
+                        </label>
+                    }.into_any()
+                } else if f.kind == FieldKind::Labels {
                     // Parsed when you leave the field, so typing is not reformatted.
                     view! {
                         <label class="space-y-0.5 sm:col-span-2">

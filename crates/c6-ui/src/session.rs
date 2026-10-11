@@ -1102,6 +1102,17 @@ fn render_event(
         }
         .into_any(),
         EventKind::Output { name, title, size, .. } => crate::outputs::published_line(session, e.seq, name, title, *size),
+        EventKind::Approval { call_id, state, tool, input, policy, message } => match state.as_str() {
+            "requested" => view! { <ApprovalCard session=session.to_owned() call_id=call_id.clone() tool=tool.clone() input=input.clone() policy=policy.clone() message=message.clone() /> }.into_any(),
+            s => {
+                let (icon, what, tone) = match s {
+                    "allowed" => ("✓", "Approved", "text-emerald-700 dark:text-emerald-400"),
+                    "denied" => ("✗", "Denied", "text-red-600 dark:text-red-400"),
+                    _ => ("⌛", "No answer: not run", "text-zinc-500"),
+                };
+                view! { <p class=format!("flex items-center gap-2 text-xs {tone}")><span>{icon}</span><span>{what}</span></p> }.into_any()
+            }
+        },
         EventKind::Memory { op, id, scope, text } => {
             let what = if op == "forget" {
                 format!("Forgot note {id}")
@@ -1791,6 +1802,51 @@ fn Composer(
                     </div>
                 })}
             </div>
+        </div>
+    }
+}
+
+/// A tool call held for your approval: what it would do, and Allow / Deny
+/// while the session still waits.
+#[component]
+fn ApprovalCard(session: String, call_id: String, tool: String, input: String, policy: String, message: String) -> impl IntoView {
+    let live = api::live();
+    let sid = StoredValue::new(session);
+    let call = StoredValue::new(call_id);
+    let sent = RwSignal::new(None::<Result<bool, String>>);
+    let waiting = move || live.sessions.with(|ss| ss.iter().any(|s| s.id == sid.get_value() && s.awaiting_approval));
+    // A shell command reads best as itself.
+    let shown = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|v| v["command"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| input.clone());
+    let answer = move |allow: bool| {
+        spawn_local(async move {
+            sent.set(Some(api::decide(sid.get_value(), call.get_value(), allow).await.map(|_| allow)));
+        });
+    };
+    view! {
+        <div class="space-y-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/60">
+            <div class="flex flex-wrap items-center gap-2">
+                <span>"⚠"</span>
+                <span class="font-medium">"Waiting for your approval"</span>
+                <span class="text-xs text-zinc-500">{format!("policy “{policy}”")}</span>
+            </div>
+            {(!message.is_empty()).then(|| view! { <p class="text-xs text-zinc-600 dark:text-zinc-400">{message.clone()}</p> })}
+            <div class="text-xs text-zinc-500">{tool}</div>
+            <pre class="max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{shown}</pre>
+            {move || match sent.get() {
+                Some(Ok(true)) => view! { <p class="text-xs text-emerald-700">"Approved."</p> }.into_any(),
+                Some(Ok(false)) => view! { <p class="text-xs text-red-600">"Denied."</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="text-xs text-red-600">{e}</p> }.into_any(),
+                None if waiting() => view! {
+                    <div class="flex gap-2">
+                        <button class=BUTTON on:click=move |_| answer(true)>"Allow"</button>
+                        <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" on:click=move |_| answer(false)>"Deny"</button>
+                    </div>
+                }.into_any(),
+                None => ().into_any(),
+            }}
         </div>
     }
 }

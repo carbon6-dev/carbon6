@@ -25,6 +25,7 @@ pub const HOOKS: &str = "hooks";
 pub const COMMANDS: &str = "commands";
 pub const AGENTS: &str = "agents";
 pub const WEB_SEARCH: &str = "web_search";
+pub const POLICIES: &str = "policies";
 
 /// Per-session broadcast channels for stream subscribers.
 #[derive(Default)]
@@ -117,6 +118,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         folder: String::new(),
         home: String::new(),
         ssh_target: ssh.clone(),
+        awaiting: 0,
     };
     let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
@@ -167,6 +169,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         folder: parent.folder.clone(),
         home: parent.home.clone(),
         ssh_target: parent.ssh_target.clone(),
+        awaiting: 0,
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -215,6 +218,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
         memories_json: crate::memory::for_sessions(st).await?,
+        policies_json: st.store.setting(POLICIES).await?.unwrap_or_default(),
         seed,
     })
 }
@@ -552,6 +556,38 @@ pub async fn interrupt(st: &HeadState, session_id: &str) -> anyhow::Result<bool>
         kind: Some(session_command::Kind::Interrupt(Default::default())),
     };
     Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+}
+
+/// Your answer to a tool call waiting for approval. `false`: its worker is
+/// not connected.
+pub async fn decide(st: &HeadState, session_id: &str, call_id: &str, allow: bool) -> anyhow::Result<bool> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let cmd = SessionCommand {
+        command_id: Uuid::now_v7().to_string(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::Approve(c6_proto::Approve { call_id: call_id.to_owned(), allow })),
+    };
+    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+}
+
+/// Checks policies before they are saved.
+pub fn check_policies(policies: &[api::Policy]) -> anyhow::Result<()> {
+    for p in policies {
+        if p.name.trim().is_empty() {
+            return Err(bad_request("a policy needs a name"));
+        }
+        if !matches!(p.action.as_str(), "ask" | "deny") {
+            return Err(bad_request(format!("policy {:?}: the action is ask or deny", p.name)));
+        }
+        for (what, re) in [("tools", &p.tools), ("pattern", &p.pattern)] {
+            if !re.trim().is_empty()
+                && let Err(e) = regex::Regex::new(re)
+            {
+                return Err(bad_request(format!("policy {:?}: {what} is not a valid regular expression: {e}", p.name)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Stops a session's background task. `false`: its worker is not connected.

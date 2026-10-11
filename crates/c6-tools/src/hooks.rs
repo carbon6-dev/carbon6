@@ -6,9 +6,10 @@ use serde_json::Value;
 
 #[async_trait]
 pub trait Hooks: Send + Sync {
-    /// Before a tool runs: `Some(reason)` blocks the call, and the model
-    /// gets the reason instead of a result.
-    async fn pre_tool_use(&self, tool: &str, input: &Value) -> Option<String>;
+    /// Before a tool runs (`call_id`: the model's id for the call):
+    /// `Some(reason)` blocks the call, and the model gets the reason instead
+    /// of a result. It may wait (e.g. for the user's approval).
+    async fn pre_tool_use(&self, call_id: &str, tool: &str, input: &Value) -> Option<String>;
 
     /// After a tool ran: `Some(feedback)` is added to the result the model
     /// sees.

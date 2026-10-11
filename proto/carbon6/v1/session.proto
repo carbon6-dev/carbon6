@@ -26,7 +26,21 @@ message SessionEvent {
     BackgroundTask background_task = 22;
     Output output = 23;
     MemoryUpdate memory = 24;
+    Approval approval = 25;
   }
+}
+
+// A tool call a policy holds for your approval, and what became of it.
+message Approval {
+  string call_id = 1;
+  // "requested", "allowed", "denied" or "expired" (no answer in time, or
+  // the turn was interrupted).
+  string state = 2;
+  string tool = 3;
+  // The call's input (JSON, shortened).
+  string input = 4;
+  string policy = 5;
+  string message = 6;
 }
 
 // The agent changed a memory note (remember/forget); the head applies it.
@@ -304,7 +318,14 @@ message SessionCommand {
     Restore restore = 13;
     Rewind rewind = 14;
     StopTask stop_task = 15;
+    Approve approve = 16;
   }
+}
+
+// Your answer to an approval request.
+message Approve {
+  string call_id = 1;
+  bool allow = 2;
 }
 
 // Stops a session's background task (from the UI).
@@ -363,6 +384,9 @@ message CreateSession {
   // Memory notes (JSON array of c6_api::Memory); the worker keeps those
   // whose scope matches the session's labels.
   string memories_json = 14;
+  // Policies (JSON array of c6_api::Policy); the worker applies those whose
+  // labels match the session's.
+  string policies_json = 15;
 }
 
 message ModelSpec {

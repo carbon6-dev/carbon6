@@ -212,5 +212,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::BackgroundTask { .. } => "background_task",
         EventKind::Output { .. } => "output",
         EventKind::Memory { .. } => "memory",
+        EventKind::Approval { .. } => "approval",
     }
 }

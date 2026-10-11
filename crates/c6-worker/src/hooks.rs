@@ -219,7 +219,7 @@ fn claude_name(tool: &str) -> &str {
     }
 }
 
-fn matches(matcher: &str, tool: &str) -> bool {
+pub(crate) fn matches(matcher: &str, tool: &str) -> bool {
     let m = matcher.trim();
     if m.is_empty() || m == "*" {
         return true;
@@ -232,7 +232,7 @@ fn matches(matcher: &str, tool: &str) -> bool {
 
 #[async_trait]
 impl c6_tools::Hooks for HookRunner {
-    async fn pre_tool_use(&self, tool: &str, input: &Value) -> Option<String> {
+    async fn pre_tool_use(&self, _call_id: &str, tool: &str, input: &Value) -> Option<String> {
         self.run("PreToolUse", Some(tool), json!({"tool_name": tool, "tool_input": input})).await.blocked
     }
 
@@ -281,9 +281,9 @@ mod tests {
         let h = HookRunner::new("s1", d, &hooks, &labels).unwrap();
 
         // `shell` (Codex) is Bash too.
-        assert_eq!(h.pre_tool_use("shell", &json!({"command": "rm -rf /"})).await.as_deref(), Some("no rm -rf"));
-        assert_eq!(h.pre_tool_use("bash", &json!({"command": "ls"})).await, None, "hooks for another folder or label do not apply");
-        assert_eq!(h.pre_tool_use("read", &json!({"path": "x"})).await, None, "the matcher does not apply");
+        assert_eq!(h.pre_tool_use("c", "shell", &json!({"command": "rm -rf /"})).await.as_deref(), Some("no rm -rf"));
+        assert_eq!(h.pre_tool_use("c", "bash", &json!({"command": "ls"})).await, None, "hooks for another folder or label do not apply");
+        assert_eq!(h.pre_tool_use("c", "read", &json!({"path": "x"})).await, None, "the matcher does not apply");
         assert_eq!(h.post_tool_use("apply_patch", &json!({}), "ok", false).await.as_deref(), Some("run the formatter\nrusty"));
         let v = h.run("UserPromptSubmit", None, json!({"prompt": "hi"})).await;
         assert_eq!(v.context, Some(format!("branch: main ({})", d.display())));

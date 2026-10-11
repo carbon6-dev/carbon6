@@ -11,6 +11,7 @@ use crate::workspace::{Go, How, MAX_TILES, Tracked, View, use_workspace};
 
 fn dot(status: SessionStatus, tracked: Tracked) -> &'static str {
     match (status, tracked) {
+        (_, Tracked::Approval) => "h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500",
         (SessionStatus::Running, _) => "h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500",
         (SessionStatus::Failed, _) => "h-2 w-2 shrink-0 rounded-full bg-red-500",
         (_, Tracked::Attention) => "h-2 w-2 shrink-0 rounded-full bg-amber-500",
@@ -20,6 +21,7 @@ fn dot(status: SessionStatus, tracked: Tracked) -> &'static str {
 
 fn what(status: SessionStatus, tracked: Tracked) -> &'static str {
     match (status, tracked) {
+        (_, Tracked::Approval) => "needs your approval",
         (SessionStatus::Running, _) => "running",
         (SessionStatus::Failed, _) => "failed",
         (_, Tracked::Attention) => "finished",
@@ -138,6 +140,7 @@ pub fn InboxPage() -> impl IntoView {
                     <p class="-mt-4 text-xs text-zinc-500">{format!("{hidden} more without these labels.")}</p>
                 })
             }}
+            {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Approval)).then(|| section("Needs your approval", Tracked::Approval, ""))}
             {section("Needs attention", Tracked::Attention, "Nothing finished while you were elsewhere.")}
             {section("Running", Tracked::Running, "No sessions are running.")}
             {section("Pinned", Tracked::Pinned, "Pin a session with ☆ in its header to keep it here.")}

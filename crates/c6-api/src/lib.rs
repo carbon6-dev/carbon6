@@ -132,6 +132,9 @@ pub struct Session {
     /// worker itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
+    /// A tool call is waiting for your approval.
+    #[serde(default)]
+    pub awaiting_approval: bool,
 }
 
 /// A side chat: a new session that branches from `anchor_seq` of a session
@@ -367,6 +370,16 @@ pub enum EventKind {
         title: String,
         mime: String,
         size: u64,
+    },
+    /// A tool call held for your approval by a policy, or its outcome.
+    Approval {
+        call_id: String,
+        /// "requested", "allowed", "denied" or "expired".
+        state: String,
+        tool: String,
+        input: String,
+        policy: String,
+        message: String,
     },
     /// The agent changed a memory note.
     Memory {
@@ -792,6 +805,36 @@ pub struct Memory {
     pub session_id: Option<String>,
     #[serde(default)]
     pub updated_at: UnixMs,
+}
+
+/// A policy: what happens to matching tool calls in sessions with its
+/// labels (`/api/v1/settings/policies`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Policy {
+    pub name: String,
+    /// Labels a session must all have; empty: every session.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    /// A regular expression over tool names (Claude Code's names, like
+    /// Bash or Edit, work with every model); empty: every tool.
+    #[serde(default)]
+    pub tools: String,
+    /// A regular expression over the call's input (as JSON); empty: any.
+    #[serde(default)]
+    pub pattern: String,
+    /// "ask" (wait for your approval) or "deny".
+    pub action: String,
+    /// Shown to you and to the agent.
+    #[serde(default)]
+    pub message: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// `POST /api/v1/sessions/{id}/approvals/{call_id}`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApprovalDecision {
+    pub allow: bool,
 }
 
 /// The commands built into carbon6: (name, description, argument hint).

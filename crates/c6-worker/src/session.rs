@@ -131,6 +131,13 @@ enum ActorMsg {
     Published(c6_tools::Published),
     /// The agent changed a memory note.
     Memory(c6_tools::MemoryChange),
+    /// A tool call held for approval, or what became of it.
+    Approval(crate::policy::ApprovalEvent),
+    /// Your answer for a held tool call.
+    Decide {
+        call_id: String,
+        allow: bool,
+    },
 }
 
 /// Background-task notices may start this many turns per hour in an idle
@@ -221,6 +228,12 @@ impl SessionManager {
             Some(session_command::Kind::Interrupt(_)) => {
                 if let Some(a) = self.actors.lock().unwrap().get(&cmd.session_id) {
                     let _ = a.send(ActorMsg::Interrupt);
+                }
+                Ok(())
+            }
+            Some(session_command::Kind::Approve(a)) => {
+                if let Some(actor) = self.actors.lock().unwrap().get(&cmd.session_id) {
+                    let _ = actor.send(ActorMsg::Decide { call_id: a.call_id, allow: a.allow });
                 }
                 Ok(())
             }
@@ -544,8 +557,31 @@ impl SessionManager {
         let hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
+        let mut policies = None;
         if started.tool_profile != crate::claude_code::PROFILE {
-            session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
+            // Policies first (a denial wins), then your hooks.
+            let (ap_tx, mut ap_rx) = mpsc::unbounded_channel();
+            policies = crate::policy::Policies::new(&spec.policies_json, &labels, ap_tx);
+            let actor_tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(e) = ap_rx.recv().await {
+                    if actor_tx.send(ActorMsg::Approval(e)).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut chain: Vec<Arc<dyn c6_tools::Hooks>> = Vec::new();
+            if let Some(p) = &policies {
+                chain.push(p.clone());
+            }
+            if let Some(h) = &hooks {
+                chain.push(h.clone());
+            }
+            session_tools.set_hooks(match chain.len() {
+                0 => None,
+                1 => chain.pop(),
+                _ => Some(Arc::new(crate::policy::Chain(chain))),
+            });
             // Memory changes go to the actor, which logs them (the head
             // applies them).
             let (mem_tx, mut mem_rx) = mpsc::unbounded_channel();
@@ -585,6 +621,7 @@ impl SessionManager {
             spec,
             session_tools,
             hooks,
+            policies,
             tools,
             journal: self.journal.clone(),
             started,
@@ -699,6 +736,7 @@ struct Actor {
     started: SessionStarted,
     session_tools: Arc<SessionTools>,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
+    policies: Option<Arc<crate::policy::Policies>>,
     /// `None` while a turn task holds it.
     conv: Option<Conversation>,
     turns: u64,
@@ -832,6 +870,22 @@ impl Actor {
                         self.session_tools.background.kill_by_user(&id);
                     }
                     Some(ActorMsg::Reserve(n)) => self.session_tools.background.reserve_ids(n),
+                    Some(ActorMsg::Approval(e)) => {
+                        let a = c6_proto::Approval { call_id: e.call_id, state: e.state.into(), tool: e.tool, input: e.input, policy: e.policy, message: e.message };
+                        if let Err(e) = self.writer.append(session_event::Kind::Approval(a)).await {
+                            error!(session = %self.writer.session_id, "recording an approval: {e:#}");
+                            return;
+                        }
+                    }
+                    Some(ActorMsg::Decide { call_id, allow }) => {
+                        if self.policies.as_ref().is_some_and(|p| p.decide(&call_id, allow)) {
+                            let a = c6_proto::Approval { call_id, state: if allow { "allowed" } else { "denied" }.into(), ..Default::default() };
+                            if let Err(e) = self.writer.append(session_event::Kind::Approval(a)).await {
+                                error!(session = %self.writer.session_id, "recording an approval: {e:#}");
+                                return;
+                            }
+                        }
+                    }
                     Some(ActorMsg::Memory(m)) => {
                         let update = c6_proto::MemoryUpdate { op: m.op, id: m.id, scope: m.scope, text: m.text };
                         if let Err(e) = self.writer.append(session_event::Kind::Memory(update)).await {

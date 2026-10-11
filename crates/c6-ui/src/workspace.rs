@@ -570,6 +570,10 @@ impl Workspace {
                 out.push((s, how));
             }
         };
+        // Waiting on you comes first.
+        for s in sessions.iter().filter(|s| s.awaiting_approval) {
+            push(s.clone(), Tracked::Approval, &mut out);
+        }
         for id in self.pinned.get() {
             if let Some(s) = find(&id) {
                 push(s, Tracked::Pinned, &mut out);
@@ -589,6 +593,8 @@ impl Workspace {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tracked {
+    /// A tool call waits for your approval.
+    Approval,
     Pinned,
     Running,
     Attention,

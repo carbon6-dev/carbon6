@@ -90,6 +90,14 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         Kind::Error(e) => api::EventKind::Error { message: e.message.clone() },
         Kind::Compaction(c) => api::EventKind::Compaction { summary: c.summary.clone(), tokens_before: c.tokens_before },
         Kind::Checkpoint(c) => api::EventKind::Checkpoint { error: c.error.clone() },
+        Kind::Approval(a) => api::EventKind::Approval {
+            call_id: a.call_id.clone(),
+            state: a.state.clone(),
+            tool: a.tool.clone(),
+            input: a.input.clone(),
+            policy: a.policy.clone(),
+            message: a.message.clone(),
+        },
         Kind::Memory(m) => api::EventKind::Memory { op: m.op.clone(), id: m.id.clone(), scope: m.scope.clone(), text: m.text.clone() },
         Kind::Output(o) => {
             api::EventKind::Output { name: o.name.clone(), title: o.title.clone(), mime: o.mime.clone(), size: o.data.len() as u64 }
@@ -153,6 +161,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         labels: r.user_labels(),
         auto_labels: r.all_labels().split_off(r.user_labels().len()),
         ssh: Some(r.ssh_target.clone()).filter(|t| !t.is_empty()),
+        awaiting_approval: r.awaiting > 0,
     }
 }
 

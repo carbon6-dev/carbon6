@@ -220,6 +220,8 @@ pub struct SessionRow {
     pub folder: String,
     pub home: String,
     pub ssh_target: String,
+    /// Tool calls waiting for approval.
+    pub awaiting: i64,
 }
 
 impl SessionRow {
@@ -480,9 +482,21 @@ impl Store {
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
                 Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
+                Some(Kind::Approval(a)) => {
+                    let delta = if a.state == "requested" { 1 } else { -1 };
+                    sqlx::query("UPDATE sessions SET awaiting = MAX(awaiting + ?, 0) WHERE id = ?")
+                        .bind(delta)
+                        .bind(session_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
-                Some(Kind::TurnEnded(_)) => status = "idle".into(),
+                Some(Kind::TurnEnded(_)) => {
+                    status = "idle".into();
+                    // Nothing waits past its turn.
+                    sqlx::query("UPDATE sessions SET awaiting = 0 WHERE id = ?").bind(session_id).execute(&mut *tx).await?;
+                }
                 Some(Kind::ModelSwitched(m)) => {
                     let spec = m.model.clone().unwrap_or_default();
                     sqlx::query("UPDATE sessions SET connection_id = ?, model = ?, effort = ? WHERE id = ?")

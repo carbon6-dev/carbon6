@@ -477,3 +477,13 @@ pub async fn save_memory(m: c6_api::Memory) -> Result<c6_api::Memory, String> {
 pub async fn delete_memory(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/memories/{id}")).send().await).await
 }
+
+/// Your answer for a tool call waiting for approval.
+pub async fn decide(id: String, call_id: String, allow: bool) -> Result<(), String> {
+    let resp = Request::post(&format!("/api/v1/sessions/{id}/approvals/{call_id}"))
+        .json(&c6_api::ApprovalDecision { allow })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await;
+    empty(resp).await
+}

@@ -120,6 +120,18 @@ Notes kept across sessions (**Settings → Memory**). Each has a scope: one labe
 - **The agent keeps them current:** it saves durable facts with `remember` (how a machine is set up, where things are, your preferences), corrects a note by replacing it, and removes stale ones with `forget`. Each change shows in the transcript.
 - **Editing:** you can add, edit and delete notes in Settings. Notes written by an agent link to the session that wrote them.
 
+### Policies and approvals
+
+Policies (**Settings → Policies**) are rules for the agent's tool calls in sessions with given labels.
+
+- **What a rule matches:** a tool-name pattern (`Bash|Write|Edit`; Claude Code's names work with every model) and an optional pattern over the call's input (`rm\s+-rf`, `git\s+push`).
+- **What it does:**
+  - **deny:** the agent is told why.
+  - **ask:** the call waits for you. The transcript shows what it would run with **Allow** / **Deny**. The session moves to **Needs your approval** at the top of the inbox and the badge, the dock marks it, and a notification fires if the tab is in the background. Denying tells the agent you said no; an hour with no answer counts as no.
+- **Order:** the first matching policy applies.
+- **Presets:** ask before any change on `env:prod`, never run destructive commands on prod, ask before package changes or `git push`, keep `research` sessions read-only.
+- **Scope:** policies apply to subagents' calls too. Claude Code sessions aren't covered.
+
 ### Templates and fleet runs
 
 A template (**Settings → Templates**) is a saved way to start a session:

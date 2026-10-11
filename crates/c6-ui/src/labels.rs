@@ -40,7 +40,15 @@ pub fn matches(s: &c6_api::Session, filter: &[String]) -> bool {
 /// Sessions needing attention: (shown by the label filter, hidden by it).
 /// A session not in the list yet counts as shown.
 pub fn attention_counts(ws: crate::workspace::Workspace, live: api::LiveFeed, filter: &[String]) -> (usize, usize) {
-    let ids = ws.attention.get();
+    let mut ids = ws.attention.get();
+    // Sessions waiting for your approval count too.
+    live.sessions.with(|ss| {
+        for s in ss.iter().filter(|s| s.awaiting_approval) {
+            if !ids.contains(&s.id) {
+                ids.push(s.id.clone());
+            }
+        }
+    });
     live.sessions.with(|ss| {
         ids.iter().fold((0, 0), |(shown, hidden), id| match ss.iter().find(|s| &s.id == id) {
             Some(s) if !matches(s, filter) => (shown, hidden + 1),
