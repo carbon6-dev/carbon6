@@ -7,9 +7,11 @@ pub mod calendar;
 pub mod contacts;
 pub mod docs;
 pub mod embed;
+pub mod faces;
 pub mod google;
 pub mod llm;
 pub mod mail;
+pub mod media;
 pub mod review;
 pub mod store;
 pub mod understand;
@@ -56,6 +58,16 @@ pub struct Memex {
     pub wake: tokio::sync::Notify,
     /// Re-reads the settings now (the head says they changed).
     reload: tokio::sync::Notify,
+    /// Cities, for naming where photos were taken.
+    pub places: Mutex<Option<media::Places>>,
+    /// Face models (and the paths they came from), and each person's faces.
+    face_model: Mutex<Option<Arc<dyn faces::FaceModel>>>,
+    face_paths: Mutex<Option<(String, String)>>,
+    pub(crate) face_index: Mutex<Option<faces::Index>>,
+    /// Photos or videos came or went: make events again.
+    pub media_changed: std::sync::atomic::AtomicBool,
+    /// A folder scan is under way (events wait for it).
+    pub scanning: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -91,6 +103,12 @@ impl Memex {
             tasks: Mutex::default(),
             wake: tokio::sync::Notify::new(),
             reload: tokio::sync::Notify::new(),
+            places: Mutex::default(),
+            face_model: Mutex::default(),
+            face_paths: Mutex::default(),
+            face_index: Mutex::default(),
+            media_changed: Default::default(),
+            scanning: Default::default(),
         }))
     }
 
@@ -100,6 +118,7 @@ impl Memex {
         self.spawn_scanner();
         self.spawn_google();
         understand::spawn(self.clone());
+        media::spawn(self.clone());
         let m = self.clone();
         tokio::spawn(async move {
             let mut refreshed: Option<std::time::Instant> = None;
@@ -123,6 +142,17 @@ impl Memex {
                                 transcription: task_of(&c["transcription"]),
                                 per_day: c["calls_per_day"].as_u64().unwrap_or(500) as u32,
                             };
+                            let places = c["places_file"].as_str().filter(|p| !p.is_empty()).map(str::to_owned);
+                            let current = m.places.lock().unwrap().as_ref().map(|p| p.file.clone());
+                            if places != current {
+                                m.set_places(places).await;
+                            }
+                            faces::configure(
+                                &m,
+                                c["face_detector"].as_str().filter(|p| !p.is_empty()).map(str::to_owned),
+                                c["face_embedder"].as_str().filter(|p| !p.is_empty()).map(str::to_owned),
+                            )
+                            .await;
                             if *m.tasks.lock().unwrap() != tasks {
                                 *m.tasks.lock().unwrap() = tasks;
                                 m.wake.notify_waiters();
@@ -223,6 +253,42 @@ impl Memex {
         self.wake.notify_waiters();
     }
 
+    /// Uses these face models (tests; normally from the settings).
+    pub fn set_face_model(&self, model: Option<Arc<dyn faces::FaceModel>>) {
+        *self.face_model.lock().unwrap() = model;
+        *self.face_index.lock().unwrap() = None;
+        self.wake.notify_waiters();
+    }
+
+    /// Loads a GeoNames file (None: no places), and places what is here.
+    pub async fn set_places(&self, file: Option<String>) {
+        let loaded = match &file {
+            Some(f) => {
+                let f2 = f.clone();
+                match tokio::task::spawn_blocking(move || media::Places::load(&f2)).await {
+                    Ok(Ok(p)) => {
+                        info!(file = %f, places = p.len(), "places loaded");
+                        Some(p)
+                    }
+                    Ok(Err(e)) => {
+                        *self.last_error.lock().unwrap() = Some(format!("places: {e:#}"));
+                        None
+                    }
+                    Err(e) => {
+                        *self.last_error.lock().unwrap() = Some(format!("places: {e}"));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let any = loaded.is_some();
+        *self.places.lock().unwrap() = loaded;
+        if any && let Err(e) = media::place_all(self).await {
+            warn!("placing photos: {e:#}");
+        }
+    }
+
     /// The understanding model and the day's budget, if there is one.
     pub fn understanding(&self) -> Option<(llm::Task, u32)> {
         let t = self.tasks();
@@ -289,6 +355,14 @@ impl Memex {
 
     /// Reads new and changed files in a folder, and forgets removed ones.
     pub async fn scan(&self, f: &api::MemexFolder) -> anyhow::Result<usize> {
+        self.scanning.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = self.scan_inner(f).await;
+        self.scanning.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.wake.notify_waiters();
+        r
+    }
+
+    async fn scan_inner(&self, f: &api::MemexFolder) -> anyhow::Result<usize> {
         let root = c6_worker::expand_home(&f.path);
         anyhow::ensure!(root.is_dir(), "{} is not a folder on this machine", f.path);
         let root_str = root.display().to_string();
@@ -309,7 +383,8 @@ impl Memex {
                     continue;
                 }
                 let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-                if !docs::EXTENSIONS.contains(&ext.as_str()) || meta.len() > MAX_FILE {
+                let media_kind = media::kind_of(&ext);
+                if media_kind.is_none() && (!docs::EXTENSIONS.contains(&ext.as_str()) || meta.len() > MAX_FILE) {
                     continue;
                 }
                 let p = path.display().to_string();
@@ -323,12 +398,15 @@ impl Memex {
                     self.store.touch_file(&p).await?;
                     continue;
                 }
-                let result = match tokio::fs::read(&path).await {
-                    Ok(data) => self.add_document(&name, &data, "folder", &p, &f.labels, Some(mtime)).await,
-                    Err(e) => Err(e.into()),
+                let result = match media_kind {
+                    Some(kind) => media::add(self, &path, kind, mtime, meta.len(), &f.labels).await,
+                    None => match tokio::fs::read(&path).await {
+                        Ok(data) => self.add_document(&name, &data, "folder", &p, &f.labels, Some(mtime)).await.map(|r| r.0),
+                        Err(e) => Err(e.into()),
+                    },
                 };
                 match result {
-                    Ok((id, _, _)) => {
+                    Ok(id) => {
                         self.store.set_file(&p, mtime, meta.len() as i64, Some(&id), None).await?;
                         n += 1;
                     }
@@ -342,6 +420,7 @@ impl Memex {
         for (path, item) in self.store.files_gone(&root_str, started).await? {
             if let Some(id) = item {
                 self.store.delete(&id).await?;
+                self.media_changed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             self.store.forget_file(&path).await?;
         }
@@ -352,7 +431,7 @@ impl Memex {
     }
 
     /// Stores a file's bytes by their hash; the hash.
-    pub(crate) async fn put_blob(&self, data: &[u8]) -> anyhow::Result<String> {
+    pub async fn put_blob(&self, data: &[u8]) -> anyhow::Result<String> {
         let hash = c6_core::sha256_hex(data);
         let path = self.blob_path(&hash);
         if !path.exists() {
@@ -364,7 +443,7 @@ impl Memex {
         Ok(hash)
     }
 
-    pub(crate) fn blob_path(&self, hash: &str) -> std::path::PathBuf {
+    pub fn blob_path(&self, hash: &str) -> std::path::PathBuf {
         self.dir.join("blobs").join(&hash[..2]).join(&hash[2..])
     }
 
@@ -617,7 +696,9 @@ impl Memex {
                 review::suggest(&self.store).await?;
                 Ok(json!(review::list(&self.store, params["limit"].as_u64().unwrap_or(50) as u32).await?))
             }
+            m if m.starts_with("memex.media.") => self.media_method(m, &params, &allowed).await,
             "memex.review_decide" => {
+                *self.face_index.lock().unwrap() = None;
                 review::decide(
                     &self.store,
                     params["id"].as_i64().unwrap_or(0),
@@ -639,6 +720,7 @@ impl Memex {
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("no such thing to merge into"))?;
                 review::merge(&self.store, &from.id, &into.id).await?;
+                *self.face_index.lock().unwrap() = None;
                 Ok(json!({}))
             }
             "memex.summarize" => Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default()).await?})),
@@ -656,8 +738,29 @@ impl Memex {
                 let mut s = self.store.status(&self.embed.space()).await?;
                 s.last_error = self.last_error.lock().unwrap().clone();
                 understand::status(self, &mut s).await?;
+                media::status(self, &mut s).await?;
                 Ok(json!(s))
             }
+            other => anyhow::bail!("the memex has no method {other}"),
+        }
+    }
+
+    async fn media_method(&self, method: &str, params: &Value, allowed: &[String]) -> anyhow::Result<Value> {
+        use base64::Engine;
+        let id = params["id"].as_str().unwrap_or_default();
+        let b64 = |data: Vec<u8>| json!({"mime": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(data)});
+        match method {
+            "memex.media.list" => media::list(self, params, allowed).await,
+            "memex.media.get" => media::get(self, id, allowed).await,
+            "memex.media.thumb" => {
+                anyhow::ensure!(self.store.item(id, allowed).await?.is_some(), "no photo {id:?}");
+                Ok(b64(media::thumb(self, id, params["frame"].as_u64().map(|n| n as usize)).await?))
+            }
+            "memex.media.face" => {
+                anyhow::ensure!(allowed.iter().any(|k| k == "photo"), "photos are outside what this caller may see");
+                Ok(b64(faces::picture(self, id).await?))
+            }
+            "memex.media.facets" => media::facets(self).await,
             other => anyhow::bail!("the memex has no method {other}"),
         }
     }

@@ -147,6 +147,8 @@ pub async fn merge(store: &Store, from: &str, into: &str) -> anyhow::Result<()> 
         sqlx::query("INSERT OR REPLACE INTO thing_keys (key, thing_id) VALUES (?, ?)").bind(k).bind(into).execute(&mut *tx).await?;
     }
     sqlx::query("UPDATE trail_steps SET target = ?1 WHERE target = ?2").bind(into).bind(from).execute(&mut *tx).await?;
+    sqlx::query("UPDATE faces SET person = ?1 WHERE person = ?2").bind(into).bind(from).execute(&mut *tx).await?;
+    sqlx::query("UPDATE media SET place = ?1 WHERE place = ?2").bind(into).bind(from).execute(&mut *tx).await?;
     // Its name, as an alias (and the name, if `into` had none but an address).
     sqlx::query(
         "UPDATE things SET aliases = json_insert(aliases, '$[#]', ?1), \

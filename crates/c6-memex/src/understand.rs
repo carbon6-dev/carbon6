@@ -64,14 +64,14 @@ async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String
 }
 
 /// Calls left today.
-async fn budget_left(m: &Memex, per_day: u32) -> anyhow::Result<u32> {
+pub(crate) async fn budget_left(m: &Memex, per_day: u32) -> anyhow::Result<u32> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let used: i64 =
         sqlx::query_scalar("SELECT calls FROM model_calls WHERE day = ?").bind(&today).fetch_optional(&m.store.pool).await?.unwrap_or(0);
     Ok(per_day.saturating_sub(used as u32))
 }
 
-async fn count_call(m: &Memex) -> anyhow::Result<()> {
+pub(crate) async fn count_call(m: &Memex) -> anyhow::Result<()> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     sqlx::query("INSERT INTO model_calls (day, calls) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET calls = calls + 1")
         .bind(today)

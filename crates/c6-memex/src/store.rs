@@ -120,9 +120,36 @@ impl Store {
         Ok(id)
     }
 
+    /// Replaces an item's title and text (a caption, a transcript), with
+    /// its passages.
+    pub async fn set_text(&self, id: &str, title: &str, text: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE items SET title = ?, body = ?, updated_at = ? WHERE id = ?")
+            .bind(title)
+            .bind(text)
+            .bind(c6_core::now_ms())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM vectors WHERE part_id IN (SELECT id FROM parts WHERE item_id = ?)").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM parts WHERE item_id = ?").bind(id).execute(&mut *tx).await?;
+        for (i, p) in chunk(&format!("{title}\n\n{text}")).into_iter().enumerate() {
+            sqlx::query("INSERT INTO parts (item_id, ordinal, text) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(i as i64)
+                .bind(p)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Deletes an item and what derives from it. False: no such item.
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM faces WHERE item_id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM media WHERE item_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM vectors WHERE part_id IN (SELECT id FROM parts WHERE item_id = ?)").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM parts WHERE item_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM evidence WHERE item_id = ?").bind(id).execute(&mut *tx).await?;

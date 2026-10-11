@@ -13,6 +13,7 @@ mod markdown;
 mod memex;
 mod notify;
 mod outputs;
+mod photos;
 mod push;
 mod search;
 mod session;
@@ -143,6 +144,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Mail class=MENU>"Mail"</Go>
                     <Go to=View::Calendar class=MENU>"Calendar"</Go>
                     <Go to=View::Contacts class=MENU>"Contacts"</Go>
+                    <Go to=View::Photos class=MENU>"Photos"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None } class=MENU>"Settings"</Go>

@@ -86,6 +86,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/memex/items/{id}/content", get(memex_content))
         .route("/api/v1/memex/upload", post(memex_upload).layer(axum::extract::DefaultBodyLimit::max(80 * 1024 * 1024)))
         .route("/api/v1/memex/scan", post(memex_scan))
+        .route("/api/v1/memex/media/{id}/thumb", get(memex_thumb))
+        .route("/api/v1/memex/face/{id}", get(memex_face))
         .route("/api/v1/memex/rpc", post(memex_rpc).layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)))
         .route("/api/v1/mail/attachment", get(mail_attachment))
         .route("/api/v1/memex/trails", get(memex_trails).post(memex_trail_append))
@@ -1203,6 +1205,29 @@ async fn mail_attachment(State(st): State<Arc<HeadState>>, Query(q): Query<Attac
 async fn memex_upload(State(st): State<Arc<HeadState>>, Json(u): Json<api::MemexUpload>) -> ApiResult<Json<serde_json::Value>> {
     crate::sessions::check_labels(&u.labels)?;
     Ok(Json(crate::memex::call(&st, "memex.upload", serde_json::to_value(u).map_err(anyhow::Error::from)?).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct FrameQuery {
+    frame: Option<u32>,
+}
+
+/// A photo's thumbnail (or a video's keyframe), as JPEG.
+async fn memex_thumb(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Query<FrameQuery>) -> ApiResult<Response> {
+    let v = crate::memex::call(&st, "memex.media.thumb", serde_json::json!({"id": id, "frame": q.frame})).await?;
+    jpeg_response(&v)
+}
+
+/// The clearest face of a person, as JPEG.
+async fn memex_face(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Response> {
+    let v = crate::memex::call(&st, "memex.media.face", serde_json::json!({"id": id})).await?;
+    jpeg_response(&v)
+}
+
+fn jpeg_response(v: &serde_json::Value) -> ApiResult<Response> {
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or_default()).map_err(anyhow::Error::from)?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=3600")], data).into_response())
 }
 
 async fn memex_scan(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {

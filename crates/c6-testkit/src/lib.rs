@@ -47,6 +47,7 @@ impl MockLlm {
             .route("/v1/chat/completions", post(completions))
             .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "mock-1"}, {"id": "mock-2"}]})) }))
             .route("/v1/embeddings", post(embeddings))
+            .route("/v1/audio/transcriptions", post(transcriptions))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -73,6 +74,14 @@ impl MockLlm {
     pub fn requests(&self) -> Vec<Value> {
         self.inner.requests.lock().unwrap().clone()
     }
+}
+
+/// A transcript (whatever the audio), with timestamps.
+async fn transcriptions(body: axum::body::Bytes) -> Json<Value> {
+    let multipart = String::from_utf8_lossy(&body).contains("name=\"file\"");
+    Json(
+        json!({"text": "hello from paris", "segments": [{"start": 0.0, "text": " hello"}, {"start": 61.5, "text": " from paris"}], "multipart": multipart}),
+    )
 }
 
 /// Embeddings by hashed words (64 dimensions): texts sharing words are

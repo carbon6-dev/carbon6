@@ -59,6 +59,7 @@ pub enum View {
     Mail,
     Calendar,
     Contacts,
+    Photos,
 }
 
 /// A place in a session: the transcript element to reveal, the side chats
@@ -116,6 +117,7 @@ impl View {
             View::Mail => "/mail".into(),
             View::Calendar => "/calendar".into(),
             View::Contacts => "/contacts".into(),
+            View::Photos => "/photos".into(),
         }
     }
 
@@ -169,6 +171,7 @@ impl View {
             ["mail"] => View::Mail,
             ["calendar"] => View::Calendar,
             ["contacts"] => View::Contacts,
+            ["photos"] => View::Photos,
             _ => View::Sessions,
         }
     }
@@ -194,6 +197,7 @@ impl View {
             View::Mail => "Mail".into(),
             View::Calendar => "Calendar".into(),
             View::Contacts => "Contacts".into(),
+            View::Photos => "Photos".into(),
         }
     }
 
@@ -939,6 +943,7 @@ fn render_view(view: View) -> AnyView {
                     View::Mail => view! { <crate::mail::MailPage /> }.into_any(),
                     View::Calendar => view! { <crate::calendar::CalendarPage /> }.into_any(),
                     View::Contacts => view! { <crate::contacts::ContactsPage /> }.into_any(),
+                    View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>

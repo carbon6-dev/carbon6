@@ -197,6 +197,10 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
             return Err(bad_request(format!("choose a model for {what}")));
         }
     }
+    if s.face_detector.as_deref().is_some_and(|p| !p.trim().is_empty()) != s.face_embedder.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return Err(bad_request("faces need both models: a detector and an embedder"));
+    }
     if s.calls_per_day == Some(0) {
         return Err(bad_request("calls a day: at least 1 (or leave the model unset to turn it off)"));
     }
@@ -251,6 +255,9 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "vision": task(&s.vision),
         "transcription": task(&s.transcription),
         "calls_per_day": s.calls_per_day.unwrap_or(500),
+        "places_file": s.places_file,
+        "face_detector": s.face_detector,
+        "face_embedder": s.face_embedder,
     }))
 }
 

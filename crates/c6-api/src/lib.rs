@@ -1691,6 +1691,16 @@ pub struct MemexSettings {
     /// Transcribes videos' speech (an OpenAI-style /audio/transcriptions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcription: Option<MemexModel>,
+    /// A GeoNames cities file on the memex's machine (e.g. cities1000.txt),
+    /// for naming where photos were taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub places_file: Option<String>,
+    /// Face models (ONNX files on the memex's machine): a detector
+    /// (UltraFace-style) and an embedder (ArcFace or MobileFaceNet-style).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_detector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_embedder: Option<String>,
 }
 
 /// A scope rule (`/api/v1/settings/memex_scopes`): sessions with these

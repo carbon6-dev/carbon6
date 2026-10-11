@@ -379,6 +379,44 @@ carbon6 replaces the mail client, the calendar and the address book, starting wi
 - **Search** works by person, place, time, object, description ("the whiteboard photo from the Acme offsite") or similarity.
 - **Trips and events** are suggested as event things from clusters in time and place.
 
+### 7.1 As built (step 5)
+
+- **Sources:**
+  - Photos and videos in memex folders (Settings → Memex folders) are read in place. Only thumbnails, face crops and keyframes are stored.
+  - Photo types: JPEG, PNG, WebP, GIF, TIFF, plus HEIC via macOS `sips`.
+  - Video types: MOV, MP4, M4V and 3GP. AVI and MKV are listed by file only.
+  - Deleting a file removes its item.
+- **What the file gives:**
+  - EXIF: time (with its offset, else the machine's zone), GPS and camera, plus the orientation, used for the thumbnail.
+  - A video's container: duration, creation time and location (ISO 6709, from `©xyz` or Apple's key).
+- **Places:** set "Places (GeoNames file)" to a cities file on the memex's machine, such as `cities1000.txt` from GeoNames.
+  - Nothing is downloaded for you.
+  - The nearest city within 50 km becomes a `place:geonames:<id>` thing, linked with `at`.
+  - Setting the file places existing photos too.
+- **Events and trips:** photos and videos with gaps under 6 hours form a group.
+  - A group of 10 or more is an event thing (`event:photos:<first item>`), linked with `part_of` (inferred).
+  - It is a trip when it spans more than 20 hours and goes beyond 100 km of home, home being the most common place.
+  - Events are rebuilt after scans.
+- **Vision:** the vision task (Settings → Memex) sees the thumbnail, or up to 4 keyframes of a video. It returns a caption, which becomes the title, plus the scene, objects and any text in the picture.
+  - All of these are searchable.
+  - Objects become `object:<name>` things, linked with `shows` (inferred).
+  - Newest first, within the shared daily budget.
+- **Faces:** you supply two ONNX files on the memex's machine:
+  - an UltraFace-style detector (input 1×3×H×W, outputs scores N×2 and boxes N×4);
+  - an ArcFace- or MobileFaceNet-style embedder (1×3×112×112).
+  - They run on the CPU with tract.
+  - A face joins the person whose average face is closest (cosine ≥ 0.45). Otherwise it becomes a new "Unnamed person N".
+  - After 3 photos, an unnamed person goes to the review queue with their face. Naming them merges them into the person of that name, if there is exactly one (for example, the person you email); otherwise a new person is made.
+  - Photos link to people with `depicts` (inferred).
+- **Videos:** with ffmpeg on the memex's machine (or `C6_FFMPEG`), a video gets up to 6 keyframes (the first frame and scene changes).
+  - With a transcription task, its sound goes to an OpenAI-style `/audio/transcriptions` (up to 90 minutes), and the timestamped transcript joins its text.
+- **Photos page:**
+  - a grid by month;
+  - search by description;
+  - people (with faces), places and events as filters;
+  - a photo view with face boxes, its things, a map link and keyframes;
+  - images through `/api/v1/memex/media/{id}/thumb` and `/api/v1/memex/face/{person}`.
+
 ## 8. UI
 
 - **Memex** in the menu:
@@ -423,7 +461,7 @@ Each step is usable on its own:
    - People sync and contacts built from mail;
    - triage, drafting, scheduling and meeting-prep workflows, memex event triggers, and inbox integration.
 4. **Understanding tiers:** summaries, topics, commitments, the graph explorer and timelines. (Built: see 5.1.)
-5. **Photos and videos:** EXIF and places, captions, objects, faces and naming, transcripts.
+5. **Photos and videos:** EXIF and places, captions, objects, faces and naming, transcripts. (Built: see 7.1.)
 
 ## 11. Decisions
 

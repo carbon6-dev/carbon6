@@ -486,6 +486,9 @@ pub fn MemexSettings() -> impl IntoView {
     let tasks: [(&'static str, RwSignal<String>, RwSignal<String>); 3] =
         ["understanding", "vision", "transcription"].map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new())));
     let per_day = RwSignal::new(String::new());
+    // Files on the memex's machine: places, face models.
+    let files: [(&'static str, RwSignal<String>); 3] =
+        ["places_file", "face_detector", "face_embedder"].map(|k| (k, RwSignal::new(String::new())));
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             auto.set(v["contacts_auto"].as_bool().unwrap_or(false));
@@ -498,6 +501,9 @@ pub fn MemexSettings() -> impl IntoView {
                 m.set(v[k]["model"].as_str().unwrap_or_default().to_owned());
             }
             per_day.set(v["calls_per_day"].as_u64().map(|n| n.to_string()).unwrap_or_default());
+            for (k, f) in files {
+                f.set(v[k].as_str().unwrap_or_default().to_owned());
+            }
         }
     });
     let token = RwSignal::new(None::<String>);
@@ -529,6 +535,12 @@ pub fn MemexSettings() -> impl IntoView {
         }
         if let Ok(n) = per_day.get_untracked().trim().parse::<u32>() {
             v["calls_per_day"] = n.into();
+        }
+        for (k, f) in files {
+            let path = f.get_untracked().trim().to_owned();
+            if !path.is_empty() {
+                v[k] = path.into();
+            }
         }
         spawn_local(async move {
             note.set(Some(
@@ -600,6 +612,20 @@ pub fn MemexSettings() -> impl IntoView {
                     }
                 }).collect_view()}
                 <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
+                {files.into_iter().map(|(k, f)| {
+                    let (title, hint) = match k {
+                        "places_file" => ("Places (GeoNames file)", "e.g. ~/memex/cities1000.txt"),
+                        "face_detector" => ("Face detector (ONNX)", "e.g. ~/memex/version-RFB-320.onnx"),
+                        _ => ("Face embedder (ONNX)", "e.g. ~/memex/arcface.onnx"),
+                    };
+                    view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">{title}</span>
+                            <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=hint prop:value=move || f.get() on:input=move |ev| f.set(event_target_value(&ev)) />
+                        </label>
+                    }
+                }).collect_view()}
+                <p class="text-xs text-zinc-500 sm:col-span-3">"Photos and videos in memex folders are read in place. Files above are paths on the memex's machine; nothing is downloaded for you. Places: a GeoNames cities file names where photos were taken. Faces: an UltraFace-style detector and an ArcFace- or MobileFaceNet-style embedder; faces are grouped and you name them in Review. Videos get keyframes and transcripts when ffmpeg is installed there."</p>
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Model calls a day"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />
