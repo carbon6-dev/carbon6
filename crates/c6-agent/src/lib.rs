@@ -11,10 +11,11 @@ use c6_proto::{ephemeral_event, session_event};
 
 pub use base_prompt::BASE_PROMPT;
 pub use history::{
-    compacted_context, effective_events, history_from_events, portable_events, portable_messages, transcript_text, user_blocks, user_text,
+    compacted_context, effective_events, history_from_events, model_text, portable_events, portable_messages, transcript_text, user_blocks,
+    user_text,
 };
 pub use prompt::build_system_prompt;
-pub use turn::{Conversation, TurnConfig, run_turn};
+pub use turn::{Conversation, TurnConfig, compact_turn, run_turn};
 
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.
@@ -32,6 +33,10 @@ pub struct PendingInput {
     pub text: String,
     /// Images and files sent with it, and files it mentions (@path).
     pub attachments: Vec<c6_proto::Attachment>,
+    /// The slash command it invoked, if any.
+    pub command: String,
+    /// What the model gets instead of the text, when a command expanded it.
+    pub prompt: String,
 }
 
 impl PendingInput {
@@ -41,11 +46,22 @@ impl PendingInput {
             command_id: self.command_id.clone(),
             text: self.text.clone(),
             attachments: self.attachments.clone(),
+            command: self.command.clone(),
+            prompt: self.prompt.clone(),
         })
     }
 
-    /// What the model gets: the text, then each attachment.
+    /// What the model gets: the text (or its expansion), then each attachment.
     pub fn blocks(&self) -> Vec<c6_llm::Block> {
-        history::user_blocks(&self.text, &self.attachments)
+        history::user_blocks(self.model_text(), &self.attachments)
+    }
+
+    pub fn model_text(&self) -> &str {
+        if self.prompt.is_empty() { &self.text } else { &self.prompt }
+    }
+
+    /// `/compact`: summarize the conversation instead of running a turn.
+    pub fn is_compact(&self) -> bool {
+        self.command == "compact"
     }
 }

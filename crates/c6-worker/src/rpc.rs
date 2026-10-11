@@ -22,6 +22,10 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
         "fs.mkdir" => fs_mkdir(&path_param(&params)?).await,
         "fs.find" => fs_find(serde_json::from_value(params)?).await,
+        "commands.list" => {
+            let root = crate::expand_home(params["root"].as_str().filter(|p| !p.is_empty()).context("root required")?);
+            Ok(json!({"commands": crate::commands::discover(&root)}))
+        }
         // Outside a repository, git methods answer `{"repo": false}` rather
         // than failing, so the UI can say so plainly.
         "git.status" | "git.diff" | "git.log" => {

@@ -82,7 +82,8 @@ impl SessionManager {
                     return Ok(());
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                let pending = PendingInput { command_id: cmd.command_id, text: input.text, attachments: input.attachments };
+                let pending =
+                    PendingInput { command_id: cmd.command_id, text: input.text, attachments: input.attachments, ..Default::default() };
                 let _ = actor.send(ActorMsg::Input(pending, input.model));
                 Ok(())
             }
@@ -367,10 +368,14 @@ impl Inbox {
         self.queue.front_mut().and_then(|(_, m)| m.take())
     }
 
-    /// Inputs up to the next model switch: a switch waits for a turn of its
-    /// own rather than joining a running one.
+    /// Inputs up to the next model switch or `/compact`: those wait for a
+    /// turn of their own rather than joining a running one. A `/compact`
+    /// at the front is its own turn.
     fn drain(&mut self) -> Vec<PendingInput> {
-        let n = self.queue.iter().position(|(_, m)| m.is_some()).unwrap_or(self.queue.len());
+        if self.queue.front().is_some_and(|(i, _)| i.is_compact()) {
+            return self.queue.pop_front().map(|(i, _)| i).into_iter().collect();
+        }
+        let n = self.queue.iter().position(|(i, m)| m.is_some() || i.is_compact()).unwrap_or(self.queue.len());
         self.queue.drain(..n).map(|(i, _)| i).collect()
     }
 }
@@ -417,8 +422,11 @@ impl Actor {
                 msg = rx.recv() => match msg {
                     None => return,
                     Some(ActorMsg::Input(mut input, model)) => {
-                        // Attach the files it mentions, as they are now.
-                        crate::mentions::resolve(Path::new(&self.started.cwd), &mut input);
+                        // Expand a slash command and attach the files it
+                        // mentions, as they are now.
+                        let cwd = Path::new(&self.started.cwd);
+                        crate::commands::expand(cwd, &mut input).await;
+                        crate::mentions::resolve(cwd, &mut input);
                         self.inbox.lock().unwrap().push(input, model)
                     }
                     Some(ActorMsg::Interrupt) => {
@@ -599,10 +607,13 @@ async fn run_session_turn(
     sub: crate::subagent::Parent,
 ) -> anyhow::Result<()> {
     let first = inbox.lock().unwrap().drain();
+    let compact = first.first().filter(|i| i.is_compact()).map(|i| i.text.trim_start_matches("/compact").trim().to_owned());
     let mut blocks = Vec::new();
     for input in first {
         sink.append(input.event()).await?;
-        blocks.extend(input.blocks());
+        if !input.is_compact() {
+            blocks.extend(input.blocks());
+        }
     }
     match conv.history.last_mut() {
         Some(m) if m.role == Role::User => m.blocks.extend(blocks),
@@ -620,6 +631,10 @@ async fn run_session_turn(
                 return Ok(());
             }
         };
+    if let Some(focus) = compact {
+        c6_agent::compact_turn(turn, cfg, client.as_ref(), tools, sink, conv, &focus, cancel).await?;
+        return Ok(());
+    }
     let mut pending = || inbox.lock().unwrap().drain();
     session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, cfg, client.clone(), tools))));
     let result = run_turn(turn, cfg, client.as_ref(), tools, session_tools, sink, conv, &mut pending, cancel).await;

@@ -50,7 +50,7 @@ pub async fn run_turn(
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
-    let texts: Vec<String> = inputs.iter().map(|i| c6_agent::user_text(&i.text, &i.attachments)).collect();
+    let texts: Vec<String> = inputs.iter().map(|i| c6_agent::user_text(i.model_text(), &i.attachments)).collect();
     let prompt: Vec<&str> = preamble.into_iter().chain(texts.iter().map(String::as_str)).collect();
     let prompt = prompt.join("\n\n");
     for input in inputs {

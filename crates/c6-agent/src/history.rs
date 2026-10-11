@@ -11,8 +11,10 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
     let mut msgs: Vec<Message> = Vec::new();
     for ev in &effective_events(events) {
         match &ev.kind {
+            // `/compact` itself is not part of the conversation.
+            Some(session_event::Kind::User(u)) if u.command == "compact" => {}
             Some(session_event::Kind::User(u)) => {
-                for b in user_blocks(&u.text, &u.attachments) {
+                for b in user_blocks(model_text(u), &u.attachments) {
                     push_user_block(&mut msgs, b);
                 }
             }
@@ -35,6 +37,12 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
 
 /// A user message as model blocks: its text, then each attachment (images
 /// as images; anything else as a file in text).
+/// What the model got for a user message: its text, or the expansion of
+/// the slash command it invoked.
+pub fn model_text(u: &c6_proto::UserMessage) -> &str {
+    if u.prompt.is_empty() { &u.text } else { &u.prompt }
+}
+
 pub fn user_blocks(text: &str, attachments: &[c6_proto::Attachment]) -> Vec<Block> {
     let mut out = vec![Block::Text(text.to_owned())];
     for a in attachments {
@@ -128,7 +136,7 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
     let mut out = String::new();
     for ev in events {
         match &ev.kind {
-            Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", user_text(&u.text, &u.attachments))),
+            Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", user_text(model_text(u), &u.attachments))),
             Some(session_event::Kind::Assistant(a)) => {
                 for b in &a.blocks {
                     match &b.block {

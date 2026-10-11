@@ -42,11 +42,13 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
+        .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
         .route("/api/v1/workers/{id}/fs/read", get(fs_read))
         .route("/api/v1/workers/{id}/fs/find", get(fs_find))
+        .route("/api/v1/workers/{id}/commands", get(commands))
         .route("/api/v1/workers/{id}/fs/mkdir", post(fs_mkdir))
         .route("/api/v1/workers/{id}/git/status", get(git_status))
         .route("/api/v1/workers/{id}/git/diff", get(git_diff))
@@ -581,6 +583,38 @@ async fn attachment(State(st): State<Arc<HeadState>>, Path((id, seq, index)): Pa
     Ok(([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into())], a.data).into_response())
 }
 
+/// The session as a Markdown file.
+async fn export_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Response> {
+    let session = st.store.session(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let mut events = Vec::new();
+    loop {
+        let page = st.store.events_after(&id, events.last().map_or(0, |e: &c6_proto::SessionEvent| e.seq), EVENT_PAGE).await?;
+        let done = (page.len() as i64) < EVENT_PAGE;
+        events.extend(page);
+        if done {
+            break;
+        }
+    }
+    let name: String = session
+        .title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(60)
+        .collect();
+    let name = if name.is_empty() { "session".to_owned() } else { name };
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8".to_owned()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.md\"")),
+        ],
+        crate::export::markdown(&session, &events),
+    )
+        .into_response())
+}
+
 async fn rewind_session(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
@@ -711,6 +745,11 @@ async fn fs_list(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query
 
 async fn fs_find(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
     worker_call(&st, &id, "fs.find", params_json(q)).await
+}
+
+/// The slash commands available in a folder (`?root=`).
+async fn commands(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "commands.list", params_json(q)).await
 }
 
 async fn fs_read(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {

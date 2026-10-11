@@ -380,3 +380,20 @@ pub async fn fs_find(worker: String, root: String, q: String) -> Result<Vec<(Str
         .map(|a| a.iter().filter_map(|p| Some((p["path"].as_str()?.to_owned(), p["dir"].as_bool().unwrap_or(false)))).collect())
         .unwrap_or_default())
 }
+
+/// A slash command (from the worker: built-in, the project's or the user's).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub argument_hint: String,
+    pub source: String,
+}
+
+/// The slash commands available in `root`.
+pub async fn commands(worker: String, root: String) -> Result<Vec<CommandInfo>, String> {
+    let v: serde_json::Value =
+        json(Request::get(&format!("/api/v1/workers/{worker}/commands")).query([("root", root)]).send().await).await?;
+    serde_json::from_value(v["commands"].clone()).map_err(|e| e.to_string())
+}

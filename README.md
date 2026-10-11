@@ -89,6 +89,14 @@ Hover one of your messages: **↶ Rewind** takes the conversation back to before
 
 Paste, drop or pick (📎) images and text files into the message box; they go with the message (images as images, for models that see them; text files inline). Type `@` to mention a file or folder in the session's folder: a fuzzy finder completes the path, and the worker attaches the file (or a folder's listing) when the message arrives, so the model has it without a tool call. Files over 256 KB are mentioned but not inlined. Limits: 10 MB per upload, 20 MB per message. The Claude Code backend gets text only.
 
+### Slash commands
+
+Type `/` in the message box for the command list.
+
+- **Built in:** `/compact [focus]` summarizes the conversation so far (optionally focused on something) to free context; `/init` writes an AGENTS.md describing the codebase; `/review [what]` reviews the uncommitted changes, or a branch or PR you name; `/clear` starts a fresh session in the same folder with the same model; `/export` downloads the conversation as Markdown.
+- **Your own**, in Claude Code's format: Markdown files in `.claude/commands/` (in the repository, from its root down to the session's folder) or `~/.claude/commands/`. `frontend/component.md` is `/frontend:component`. Frontmatter can set `description` and `argument-hint`. In the body, `$ARGUMENTS` and `$1`…`$9` take the arguments, `` !`cmd` `` the output of a shell command run in the session's folder, and `@path` attaches a file. A project command replaces a built-in or personal one of the same name.
+- Skills in `.claude/skills/*/SKILL.md` and CLAUDE.md/AGENTS.md files are read too (see Configuration).
+
 ### Workspace
 
 The UI is a workspace of up to four tiles side by side, each a stack of columns:

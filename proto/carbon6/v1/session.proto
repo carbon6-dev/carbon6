@@ -80,6 +80,12 @@ message UserMessage {
   // Images and files sent with the message, and files it mentions with
   // @path (read when it was received, so replays see what the model saw).
   repeated Attachment attachments = 3;
+  // The slash command the text invoked ("review", "frontend:component"),
+  // if any.
+  string command = 4;
+  // What the model gets in place of the text, when a slash command
+  // expanded it (empty: the text itself).
+  string prompt = 5;
 }
 
 message Attachment {

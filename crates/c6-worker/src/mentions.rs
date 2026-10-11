@@ -25,9 +25,10 @@ fn image_type(path: &Path) -> Option<&'static str> {
 /// Attaches what the message's `@path` tokens name, relative to `cwd` (or
 /// absolute). Tokens that name nothing are left as text.
 pub fn resolve(cwd: &Path, input: &mut PendingInput) {
-    let tokens: Vec<String> = input
-        .text
-        .split_whitespace()
+    // A slash command's expansion can mention files too.
+    let tokens: Vec<String> = [input.text.as_str(), input.prompt.as_str()]
+        .into_iter()
+        .flat_map(str::split_whitespace)
         .filter_map(|w| w.strip_prefix('@'))
         .map(|t| t.trim_end_matches([',', '.', ';', ':', ')', '!', '?', '"', '\'', '`']).to_owned())
         .filter(|t| !t.is_empty())

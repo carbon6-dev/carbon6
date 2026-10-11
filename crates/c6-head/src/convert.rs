@@ -30,6 +30,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 .iter()
                 .map(|a| api::AttachmentInfo { name: a.name.clone(), mime: a.mime.clone(), size: a.data.len() as u64 })
                 .collect(),
+            command: u.command.clone(),
+            prompt: u.prompt.clone(),
         },
         Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn },
         Kind::Assistant(a) => api::EventKind::Assistant {

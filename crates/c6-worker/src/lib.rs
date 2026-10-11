@@ -3,6 +3,7 @@
 
 pub mod checkpoint;
 pub mod claude_code;
+pub mod commands;
 pub mod conn;
 pub mod enroll;
 pub mod identity;

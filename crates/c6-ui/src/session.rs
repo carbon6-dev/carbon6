@@ -1084,7 +1084,7 @@ fn render_event(
             </details>
         }
         .into_any(),
-        EventKind::User { text, attachments, .. } => {
+        EventKind::User { text, attachments, command, prompt, .. } => {
             let url = |i: usize| format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq);
             let shown = attachments
                 .iter()
@@ -1113,6 +1113,12 @@ fn render_event(
                     {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
                     {(!text.is_empty()).then(|| view! {
                         <div class="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800">{text.clone()}</div>
+                    })}
+                    {(!prompt.is_empty()).then(|| view! {
+                        <details class="max-w-[85%] text-xs text-zinc-500">
+                            <summary class="cursor-pointer select-none text-right">{format!("/{command} expanded to")}</summary>
+                            <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
+                        </details>
                     })}
                 </div>
             }
@@ -1382,6 +1388,48 @@ extern "C" {
     async fn js_read_files(ev: &web_sys::Event) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
 }
 
+/// The slash command being typed: the text up to the caret, while it is
+/// still the first word.
+fn command_at(text: &str, caret: usize) -> Option<String> {
+    let before: String = text.chars().take(caret).collect();
+    let q = before.strip_prefix('/')?;
+    (!q.contains(char::is_whitespace) && !q.contains('/')).then(|| q.to_owned())
+}
+
+/// Starts a browser download of `url`.
+fn download(url: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
+    if let Ok(a) = doc.create_element("a") {
+        let _ = a.set_attribute("href", url);
+        let _ = a.set_attribute("download", "");
+        if let Ok(a) = a.dyn_into::<web_sys::HtmlElement>() {
+            a.click();
+        }
+    }
+}
+
+/// Commands the UI runs itself.
+fn ui_commands(inline: bool) -> Vec<api::CommandInfo> {
+    let c = |name: &str, description: &str| api::CommandInfo {
+        name: name.into(),
+        description: description.into(),
+        argument_hint: String::new(),
+        source: "built-in".into(),
+    };
+    let mut v = vec![c("export", "Download this conversation as Markdown")];
+    if !inline {
+        v.push(c("clear", "Start a fresh session in the same folder, with the same model"));
+    }
+    v
+}
+
+#[derive(Clone, PartialEq)]
+enum Suggestion {
+    File(String, bool),
+    Command(api::CommandInfo),
+}
+
 /// The `@` mention being typed at the caret: (where the @ is, the query).
 fn mention_at(text: &str, caret: usize) -> Option<(usize, String)> {
     let before: String = text.chars().take(caret).collect();
@@ -1425,16 +1473,61 @@ fn Composer(
             }
         }
     });
-    let suggestions = move || if mention.with(Option::is_some) { matches.get().unwrap_or_default() } else { Vec::new() };
+    // Slash commands: the query, and the commands where the session runs.
+    let command = RwSignal::new(None::<String>);
+    let commands = LocalResource::new(move || {
+        let place = files.and_then(|f| f.get());
+        async move {
+            let mut list = match place {
+                Some((worker, root)) => api::commands(worker, root).await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            list.extend(ui_commands(inline));
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            list
+        }
+    });
+    let suggestions = move || -> Vec<Suggestion> {
+        if let Some(q) = command.get() {
+            let q = q.to_lowercase();
+            let all = commands.get().unwrap_or_default();
+            let (mut starts, contains): (Vec<_>, Vec<_>) =
+                all.into_iter().filter(|c| c.name.to_lowercase().contains(&q)).partition(|c| c.name.to_lowercase().starts_with(&q));
+            starts.extend(contains);
+            return starts.into_iter().map(Suggestion::Command).collect();
+        }
+        if mention.with(Option::is_some) {
+            matches.get().unwrap_or_default().into_iter().map(|(p, d)| Suggestion::File(p, d)).collect()
+        } else {
+            Vec::new()
+        }
+    };
     let update_mention = move || {
         if let Some(el) = area.get_untracked() {
             let caret = el.selection_start().ok().flatten().unwrap_or(0) as usize;
-            let m = mention_at(&text.get_untracked(), caret);
-            if m.as_ref().map(|x| &x.1) != mention.get_untracked().as_ref().map(|x| &x.1) {
+            let t = text.get_untracked();
+            let m = mention_at(&t, caret);
+            let c = command_at(&t, caret);
+            if m.as_ref().map(|x| &x.1) != mention.get_untracked().as_ref().map(|x| &x.1) || c != command.get_untracked() {
                 picked.set(0);
             }
             mention.set(m);
+            command.set(c);
         }
+    };
+    let complete_command = move |name: String| {
+        let t = text.get_untracked();
+        let rest = t.split_once(char::is_whitespace).map(|(_, r)| r.trim_start().to_owned()).unwrap_or_default();
+        let insert = format!("/{name} ");
+        let caret = insert.chars().count() as u32;
+        text.set(insert + &rest);
+        command.set(None);
+        request_animation_frame(move || {
+            if let Some(el) = area.get_untracked() {
+                let _ = el.focus();
+                let _ = el.set_selection_range(caret, caret);
+            }
+        });
     };
     let complete = move |path: String, dir: bool| {
         let Some((at, query)) = mention.get_untracked() else { return };
@@ -1464,21 +1557,62 @@ fn Composer(
             }
         });
     };
+    let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace());
     let send = move || {
         let t = text.get_untracked();
-        let files = attachments.get_untracked();
-        if (t.trim().is_empty() && files.is_empty()) || disabled.get_untracked() {
+        let uploads = attachments.get_untracked();
+        if (t.trim().is_empty() && uploads.is_empty()) || disabled.get_untracked() {
             return;
+        }
+        // Commands the UI runs.
+        match t.trim() {
+            "/export" => {
+                text.set(String::new());
+                command.set(None);
+                download(&format!("/api/v1/sessions/{}/export", id.get_value()));
+                return;
+            }
+            "/clear" if !inline => {
+                let (Some((worker, cwd)), Some(m)) = (files.and_then(|f| f.get_untracked()), model) else { return };
+                text.set(String::new());
+                command.set(None);
+                spawn_local(async move {
+                    let req = c6_api::CreateSession {
+                        worker_id: match worker.parse() {
+                            Ok(w) => w,
+                            Err(_) => return,
+                        },
+                        cwd,
+                        connection_id: m.connection.get_untracked(),
+                        model: m.model.get_untracked(),
+                        title: None,
+                        prompt: None,
+                        attachments: Vec::new(),
+                        effort: Some(m.effort.get_untracked()).filter(|e| !e.is_empty()),
+                        worktree: false,
+                    };
+                    match api::create_session(req).await {
+                        Ok(s) => match col {
+                            Some(c) => c.replace(crate::workspace::View::session(s.id)),
+                            None => ws.open(None, crate::workspace::View::session(s.id), crate::workspace::How::Beside),
+                        },
+                        Err(e) => error.set(Some(e)),
+                    }
+                });
+                return;
+            }
+            _ => {}
         }
         let switch = model.and_then(|m| m.switch());
         text.set(String::new());
         attachments.set(Vec::new());
         mention.set(None);
+        command.set(None);
         spawn_local(async move {
-            if let Err(e) = api::send_message(id.get_value(), t.clone(), switch, files.clone()).await {
+            if let Err(e) = api::send_message(id.get_value(), t.clone(), switch, uploads.clone()).await {
                 error.set(Some(e));
                 text.set(t);
-                attachments.set(files);
+                attachments.set(uploads);
             } else {
                 error.set(None);
             }
@@ -1530,13 +1664,28 @@ fn Composer(
                         let list = suggestions();
                         (!list.is_empty()).then(|| view! {
                             <div class="absolute bottom-full left-0 z-30 mb-1 max-h-64 w-full max-w-lg overflow-y-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-                                {list.into_iter().enumerate().map(|(i, (path, dir))| {
-                                    let (p2, d2) = (path.clone(), dir);
-                                    view! {
-                                        <button
-                                            class=move || format!("block w-full truncate px-3 py-1 text-left font-mono {}", if picked.get() == i { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
-                                            on:mousedown=move |ev| { ev.prevent_default(); complete(p2.clone(), d2); }
-                                        >{if dir { format!("{path}/") } else { path }}</button>
+                                {list.into_iter().enumerate().map(|(i, s)| {
+                                    let row = move || format!("block w-full truncate px-3 py-1 text-left {}", if picked.get() == i { "bg-zinc-100 dark:bg-zinc-800" } else { "" });
+                                    match s {
+                                        Suggestion::File(path, dir) => {
+                                            let p2 = path.clone();
+                                            view! {
+                                                <button class=move || format!("{} font-mono", row()) on:mousedown=move |ev| { ev.prevent_default(); complete(p2.clone(), dir); }>
+                                                    {if dir { format!("{path}/") } else { path }}
+                                                </button>
+                                            }.into_any()
+                                        }
+                                        Suggestion::Command(c) => {
+                                            let n2 = c.name.clone();
+                                            view! {
+                                                <button class=row on:mousedown=move |ev| { ev.prevent_default(); complete_command(n2.clone()); }>
+                                                    <span class="font-mono">{format!("/{}", c.name)}</span>
+                                                    {(!c.argument_hint.is_empty()).then(|| view! { <span class="ml-1 font-mono text-zinc-400">{c.argument_hint.clone()}</span> })}
+                                                    <span class="ml-2 text-zinc-500">{c.description.clone()}</span>
+                                                    {(c.source != "built-in").then(|| view! { <span class="ml-2 rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800">{c.source.clone()}</span> })}
+                                                </button>
+                                            }.into_any()
+                                        }
                                     }
                                 }).collect_view()}
                             </div>
@@ -1549,7 +1698,7 @@ fn Composer(
                         node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat (@ to mention a file)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file)" }
+                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat (@ to mention a file, / for commands)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file, / for commands)" }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
@@ -1568,12 +1717,22 @@ fn Composer(
                                     "ArrowDown" => { ev.prevent_default(); picked.update(|p| *p = (*p + 1) % list.len()); return; }
                                     "ArrowUp" => { ev.prevent_default(); picked.update(|p| *p = (*p + list.len() - 1) % list.len()); return; }
                                     "Enter" | "Tab" => {
+                                        let s = list[picked.get_untracked().min(list.len() - 1)].clone();
+                                        match s {
+                                            Suggestion::File(path, dir) => complete(path, dir),
+                                            // Enter on a command already typed in full sends it.
+                                            Suggestion::Command(c) if ev.key() == "Enter" && command.get_untracked().as_deref() == Some(c.name.as_str()) => {
+                                                ev.prevent_default();
+                                                command.set(None);
+                                                send();
+                                                return;
+                                            }
+                                            Suggestion::Command(c) => complete_command(c.name),
+                                        }
                                         ev.prevent_default();
-                                        let (path, dir) = list[picked.get_untracked().min(list.len() - 1)].clone();
-                                        complete(path, dir);
                                         return;
                                     }
-                                    "Escape" => { ev.prevent_default(); ev.stop_propagation(); mention.set(None); return; }
+                                    "Escape" => { ev.prevent_default(); ev.stop_propagation(); mention.set(None); command.set(None); return; }
                                     _ => {}
                                 }
                             }

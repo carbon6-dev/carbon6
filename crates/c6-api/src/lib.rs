@@ -265,6 +265,12 @@ pub enum EventKind {
         /// The bytes: `GET /api/v1/sessions/{id}/attachments/{seq}/{index}`.
         #[serde(default)]
         attachments: Vec<AttachmentInfo>,
+        /// The slash command it invoked, if any.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        command: String,
+        /// What the model got instead of the text, when a command expanded it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        prompt: String,
     },
     TurnStarted {
         turn: u64,

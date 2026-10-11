@@ -23,8 +23,9 @@ const MAX_STEPS: usize = 500;
 /// Compact once the context reaches this share of the window.
 const COMPACT_AT: f64 = 0.85;
 const COMPACT_MAX_OUTPUT: u32 = 16_000;
-const COMPACT_PROMPT: &str = "Your context window is nearly full, so this conversation will be replaced by a summary that you write now. \
-Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
+const COMPACT_WHY: &str = "Your context window is nearly full, so this conversation will be replaced by a summary that you write now.";
+const COMPACT_WHY_ASKED: &str = "The user asked to compact this conversation: it will be replaced by a summary that you write now.";
+const COMPACT_PROMPT: &str = "Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
 (quote any precise instructions), key decisions and their reasons, files examined and changed with their paths, the current state \
 of the work, errors encountered and how they were resolved, and the exact next steps. Do not call any tools; reply with only the summary.";
 
@@ -65,6 +66,34 @@ pub async fn run_turn(
     sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
     let t = Turn { turn, cfg, client, specs: tools.iter().map(|t| t.spec()).collect(), sink, cancel };
     let reason = t.run(tools, session_tools, conv, pending).await?;
+    sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+    Ok(reason)
+}
+
+/// `/compact [focus]`: a turn that only summarizes the conversation, which
+/// then replaces it.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_turn(
+    turn: u64,
+    cfg: &TurnConfig,
+    client: &dyn ModelClient,
+    tools: &[Arc<dyn Tool>],
+    sink: &Arc<dyn EventSink>,
+    conv: &mut Conversation,
+    focus: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<TurnEndReason> {
+    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+    let t = Turn { turn, cfg, client, specs: tools.iter().map(|t| t.spec()).collect(), sink, cancel };
+    let reason = if conv.history.is_empty() {
+        t.fail("there is nothing to compact yet".into()).await?
+    } else {
+        match t.compact(conv, COMPACT_WHY_ASKED, focus).await? {
+            Ok(()) => TurnEndReason::Completed,
+            Err(_) if cancel.is_cancelled() => TurnEndReason::Interrupted,
+            Err(e) => t.fail(format!("compaction failed: {e}")).await?,
+        }
+    };
     sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
     Ok(reason)
 }
@@ -162,7 +191,7 @@ impl Turn<'_> {
             }
             if self.cfg.context_window > 0
                 && conv.context_tokens as f64 > self.cfg.context_window as f64 * COMPACT_AT
-                && let Err(e) = self.compact(conv).await?
+                && let Err(e) = self.compact(conv, COMPACT_WHY, "").await?
             {
                 return self.fail(format!("compaction failed: {e}")).await;
             }
@@ -172,7 +201,7 @@ impl Turn<'_> {
                 Ok(r) => r,
                 Err(LlmError::ContextOverflow(_)) if !compacted_for_overflow => {
                     compacted_for_overflow = true;
-                    if let Err(e) = self.compact(conv).await? {
+                    if let Err(e) = self.compact(conv, COMPACT_WHY, "").await? {
                         return self.fail(format!("context window exceeded and compaction failed: {e}")).await;
                     }
                     continue;
@@ -283,11 +312,15 @@ impl Turn<'_> {
     /// replaces the whole history. Nothing older is replayed, so no earlier
     /// reasoning blocks are sent again. The outer `Result` is a journal
     /// failure; the inner one a compaction failure.
-    async fn compact(&self, conv: &mut Conversation) -> anyhow::Result<Result<(), String>> {
+    async fn compact(&self, conv: &mut Conversation, why: &str, focus: &str) -> anyhow::Result<Result<(), String>> {
+        let mut prompt = format!("{why} {COMPACT_PROMPT}");
+        if !focus.trim().is_empty() {
+            prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {}", focus.trim()));
+        }
         let mut msgs = conv.history.clone();
         match msgs.last_mut() {
-            Some(m) if m.role == Role::User => m.blocks.push(Block::Text(COMPACT_PROMPT.into())),
-            _ => msgs.push(Message::user_text(COMPACT_PROMPT)),
+            Some(m) if m.role == Role::User => m.blocks.push(Block::Text(prompt)),
+            _ => msgs.push(Message::user_text(prompt)),
         }
         let req = self.request(msgs, Some(COMPACT_MAX_OUTPUT));
         let resp = match self.call(&req, false).await {
