@@ -149,6 +149,7 @@ const AUTO_TURNS_PER_HOUR: usize = 20;
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
+        prune_browser_profiles(&state_dir.join("browser"), std::time::Duration::from_secs(30 * 24 * 3600));
         Self { journal, link, worktrees, state_dir, actors: Mutex::default() }
     }
 
@@ -559,6 +560,7 @@ impl SessionManager {
         let hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
+        session_tools.browser.set_profile(self.state_dir.join("browser").join(session_id));
         let mut policies = None;
         if started.tool_profile != crate::claude_code::PROFILE {
             // Policies first (a denial wins), then your hooks.
@@ -1327,6 +1329,11 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::Remember::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Forget::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Notify::new(profile == ToolProfile::Claude)));
+    // A browser, where this machine has one (it runs here, also for SSH
+    // sessions).
+    if let Some(chrome) = c6_tools::browser::find_chrome() {
+        tools.push(Arc::new(c6_tools::browser::BrowserTool::new(profile == ToolProfile::Claude, chrome)));
+    }
     // Named agents (from the head's settings) become Task's subagent types.
     #[derive(serde::Deserialize)]
     struct HeadAgent {
@@ -1491,6 +1498,18 @@ fn task_notice(t: &BackgroundTask, output: &str) -> String {
         s.push_str(&format!("\n(Full output: the output tool with id {}.)", t.task_id));
     }
     s
+}
+
+/// Removes sessions' browser profiles unused for `age` (sign-ins and
+/// caches of sessions long done).
+fn prune_browser_profiles(dir: &Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d > age);
+        if old && let Err(err) = std::fs::remove_dir_all(e.path()) {
+            warn!(path = %e.path().display(), "removing an old browser profile: {err}");
+        }
+    }
 }
 
 #[cfg(test)]

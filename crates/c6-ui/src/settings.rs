@@ -800,6 +800,17 @@ fn policy_examples() -> Vec<(&'static str, serde_json::Value)> {
         ),
         ("Ask before git push", p("Ask before git push", &[], "ask", "Bash", r"git\s+push", "")),
         (
+            "Ask before the browser fills in forms",
+            p(
+                "Ask before browser input",
+                &[],
+                "ask",
+                "browser|Browser",
+                r#""action":"(type|select)""#,
+                "The agent wants to type into a web page.",
+            ),
+        ),
+        (
             "Read-only research sessions",
             p("Research is read-only", &["research"], "deny", "Write|Edit|Bash", "", "Research sessions only read and report."),
         ),

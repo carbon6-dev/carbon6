@@ -132,6 +132,18 @@ Policies (**Settings → Policies**) are rules for the agent's tool calls in ses
 - **Presets:** ask before any change on `env:prod`, never run destructive commands on prod, ask before package changes or `git push`, keep `research` sessions read-only.
 - **Scope:** policies apply to subagents' calls too. Claude Code sessions aren't covered.
 
+### Browser
+
+Where the worker's machine has Chrome, Chromium, Brave or Edge (or `C6_CHROME` names one), sessions get a `browser` tool: a headless browser of their own.
+
+- **Actions:** open, read, click, type, select, press, scroll, back, screenshot, evaluate, close.
+- **Reading:** a page comes back as its text plus a numbered list of links, buttons and fields, which the agent clicks and types into by number.
+- **Secrets:** `type` with `secret: NAME` types a secret's value without the model ever seeing it. Secret values are also hidden from everything the browser returns.
+- **Profiles:** each session has its own profile under the worker's state folder, so sign-ins last while it works. Profiles unused for 30 days are removed, and a browser idle for 10 minutes is closed (and reopens on the next action).
+- **Screenshots** go to the session's Outputs.
+- **Policies** apply as to any tool. The presets include asking before the browser types into or picks options in a page.
+- **SSH sessions:** the browser runs on the worker, not on the target.
+
 ### Notifications
 
 Channels (**Settings → Notifications**) tell you about your sessions while you're away.

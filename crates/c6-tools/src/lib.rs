@@ -3,6 +3,7 @@
 pub mod agents;
 mod background;
 mod bash;
+pub mod browser;
 mod files;
 pub mod hooks;
 pub mod memory;
@@ -121,6 +122,8 @@ pub struct SessionTools {
     memory: Mutex<Option<MemorySink>>,
     /// Where notices go (the session's log, then your channels).
     notices: Mutex<Option<NoticeSink>>,
+    /// The session's web browser, started on first use.
+    pub browser: browser::BrowserSlot,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -146,6 +149,7 @@ impl SessionTools {
             publisher: Mutex::default(),
             memory: Mutex::default(),
             notices: Mutex::default(),
+            browser: Default::default(),
         }
     }
 
