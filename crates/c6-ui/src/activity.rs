@@ -28,25 +28,46 @@ fn what(status: SessionStatus, tracked: Tracked) -> &'static str {
     }
 }
 
-/// Running, finished-unseen and pinned sessions, always in view (desktop).
+/// Running, finished-unseen and pinned sessions, always in view (desktop),
+/// narrowed by the shared label filter (which it shows, with what it hides).
 #[component]
 pub fn Dock() -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let items = Memo::new(move |_| ws.tracked(&live));
+    let filter = crate::labels::use_filter().0;
+    let all = Memo::new(move |_| ws.tracked(&live));
+    let items = Memo::new(move |_| {
+        let f = filter.get();
+        all.get().into_iter().filter(|(s, _)| crate::labels::matches(s, &f)).collect::<Vec<_>>()
+    });
     view! {
         <aside class="hidden w-56 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 lg:flex dark:border-zinc-800 dark:bg-zinc-950">
             <div class="flex items-center justify-between px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
                 "Activity"
                 <Go to=View::Mission class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mission control">"⊞ all"</Go>
             </div>
+            {move || (!filter.with(Vec::is_empty)).then(|| {
+                let hidden = all.with(Vec::len) - items.with(Vec::len);
+                view! {
+                    <div class="mx-1.5 mb-1 space-y-1 rounded-md bg-sky-50 px-2 py-1.5 text-[11px] text-sky-900 dark:bg-sky-950 dark:text-sky-200">
+                        <div class="flex flex-wrap items-center gap-1">
+                            {filter.get().into_iter().map(|l| view! { <span class="rounded bg-sky-100 px-1 font-mono dark:bg-sky-900">{l}</span> }).collect_view()}
+                            <button class="ml-auto underline" title="Show all sessions again" on:click=move |_| filter.set(Vec::new())>"clear"</button>
+                        </div>
+                        {(hidden > 0).then(|| view! { <div class="text-sky-700 dark:text-sky-400">{format!("{hidden} hidden by the filter")}</div> })}
+                    </div>
+                }
+            })}
             <div class="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3">
                 {move || {
                     let items = items.get();
                     if items.is_empty() {
-                        return view! {
-                            <p class="px-2 py-2 text-xs text-zinc-500">"Running sessions, ones that finish while you're elsewhere, and ones you pin (☆) show here."</p>
-                        }.into_any();
+                        let msg = if filter.with(Vec::is_empty) {
+                            "Running sessions, ones that finish while you're elsewhere, and ones you pin (☆) show here."
+                        } else {
+                            "Nothing with these labels is running, finished or pinned."
+                        };
+                        return view! { <p class="px-2 py-2 text-xs text-zinc-500">{msg}</p> }.into_any();
                     }
                     items.into_iter().map(|(s, t)| view! { <DockItem s t /> }).collect_view().into_any()
                 }}
