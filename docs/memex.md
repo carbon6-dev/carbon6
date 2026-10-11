@@ -266,7 +266,14 @@ carbon6 replaces the mail client, the calendar and the address book, starting wi
 - **Gmail stays the source of truth.** Changes sync both ways: labels (including Inbox, Starred, Important, Spam and Trash), read state, archive, and drafts.
 - **No exclusions:** everything is brought in, including Spam and Trash. Spam is marked as such and never reaches agents' context.
 - **Multiple accounts** appear in one unified inbox or one at a time. Replies default to the account and address the thread came to.
-- **Archives no longer on Gmail** can be imported from mbox, Maildir or Google Takeout files. They're marked as imported, not synced.
+- **Archives no longer on Gmail** can be imported from mbox, Maildir or Google Takeout files. They're marked as imported, not synced, and deduplicated against synced mail by Message-ID.
+  - **Thunderbird:** point the importer at a Thunderbird profile, which `c6m` reads in place, on its own machine or on a worker:
+    - mbox files under `Mail/` and `ImapMail/`, each with a sibling `.msf` index that is ignored;
+    - or Maildir folders, for profiles set up that way;
+    - folder names become labels;
+    - a message Thunderbird marked deleted but hasn't compacted away (`X-Mozilla-Status` flags) is skipped.
+
+    This comes after Gmail sync.
 
 ### 6.3 The mail client, in carbon6's UI
 
@@ -403,9 +410,13 @@ Each step is usable on its own:
 | Media | Faces, places, objects and scenes |
 | Where `c6m` runs | This Mac first, with nothing assuming it |
 | Exclusions | None: everything is brought in (Spam is kept out of agents' context) |
+| Google Cloud project | You have one; adding an account asks for its OAuth client |
+| Old mail | Backfill from Thunderbird (mbox or Maildir) after Gmail sync, deduplicated by Message-ID |
 | Encryption at rest | Left to the disks |
 
 ## 12. Open questions
 
-1. **Before mail is built:** do you already have a Google Cloud project to put the OAuth client in? Or should carbon6 guide you through creating one when you add the first account?
-2. **How to treat old Takeout or mbox archives** that duplicate what's still in Gmail: deduplicate them by Message-ID (the default), or keep both?
+None blocking. To revisit when we reach them:
+
+- Which Thunderbird profile and folders to backfill from.
+- Where your photo and video libraries live.
