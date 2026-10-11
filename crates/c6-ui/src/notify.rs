@@ -14,17 +14,20 @@ fn enabled() -> bool {
     Notification::permission() == NotificationPermission::Granted && storage_get("c6.notify").as_deref() != Some("0")
 }
 
-/// Watches the live session list and notifies on running → idle/failed.
-pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace) {
+/// Watches the live session list and notifies on running → idle/failed,
+/// for the sessions the label filter shows.
+pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: crate::labels::LabelFilter) {
     let previous = StoredValue::new(HashMap::<String, SessionStatus>::new());
     Effect::new(move || {
         let sessions = live.sessions.get();
         let hidden = document().hidden();
+        // Read without tracking: a filter change is not a reason to notify.
+        let wanted = filter.0.get_untracked();
         previous.update_value(|prev| {
             for s in &sessions {
                 let was = prev.insert(s.id.clone(), s.status);
                 let finished = was == Some(SessionStatus::Running) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed);
-                if finished && hidden && enabled() {
+                if finished && hidden && enabled() && crate::labels::matches(s, &wanted) {
                     let opts = NotificationOptions::new();
                     opts.set_body(&format!(
                         "{} on {}",
@@ -50,6 +53,13 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace) {
 #[component]
 pub fn NotifyToggle() -> impl IntoView {
     let state = RwSignal::new(enabled());
+    let filter = crate::labels::use_filter().0;
+    let title = move || {
+        let base = "Notify me when a session finishes while this tab is in the background";
+        filter.with(|f| {
+            if f.is_empty() { base.to_owned() } else { format!("{base} (only sessions with labels {}, as filtered)", f.join(", ")) }
+        })
+    };
     let click = move |_| {
         if state.get_untracked() {
             storage_set("c6.notify", "0");
@@ -67,8 +77,12 @@ pub fn NotifyToggle() -> impl IntoView {
         }
     };
     view! {
-        <button class="hidden text-xs text-zinc-500 hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title="Notify me when a session finishes while this tab is in the background" on:click=click>
-            {move || if state.get() { "🔔 on" } else { "🔕 off" }}
+        <button class="hidden text-xs text-zinc-500 hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title on:click=click>
+            {move || match (state.get(), filter.with(Vec::is_empty)) {
+                (true, true) => "🔔 on",
+                (true, false) => "🔔 filtered",
+                _ => "🔕 off",
+            }}
         </button>
     }
 }

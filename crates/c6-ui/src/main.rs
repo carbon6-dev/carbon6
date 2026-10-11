@@ -66,7 +66,7 @@ fn Main() -> impl IntoView {
     let ws = workspace::Workspace::restore();
     provide_context(ws);
     ws.watch(live);
-    notify::watch_sessions(live, ws);
+    notify::watch_sessions(live, ws, labels::use_filter());
     // Needing attention, as the label filter shows it.
     let filter = labels::use_filter().0;
     let counts = Memo::new(move |_| labels::attention_counts(ws, live, &filter.get()));
