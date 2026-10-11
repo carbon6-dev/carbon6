@@ -21,10 +21,11 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
                 out.push_str(&format!("\n## You\n\n~~{}~~\n\n> Blocked by a hook: {}\n", u.text, u.blocked))
             }
             Some(Kind::User(u)) if u.prompt.is_empty() => out.push_str(&format!("\n## You\n\n{}\n", u.text)),
-            Some(Kind::User(u)) => out.push_str(&format!(
-                "\n## You\n\n{}\n\n<details><summary>Expanded /{}</summary>\n\n{}\n\n</details>\n",
-                u.text, u.command, u.prompt
-            )),
+            Some(Kind::User(u)) => {
+                // A slash command's expansion, or context a hook added.
+                let what = if u.command.is_empty() { "Sent to the model as".to_owned() } else { format!("Expanded /{}", u.command) };
+                out.push_str(&format!("\n## You\n\n{}\n\n<details><summary>{what}</summary>\n\n{}\n\n</details>\n", u.text, u.prompt))
+            }
             Some(Kind::Assistant(a)) => {
                 let mut said = false;
                 for b in &a.blocks {
