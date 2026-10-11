@@ -1207,6 +1207,14 @@ pub(crate) async fn build_tools(spec: &CreateSession, cwd: &std::path::Path, pro
         tools.push(Arc::new(SkillTool::new(profile == ToolProfile::Claude, Arc::new(skills.clone()))));
     }
 
+    // Web search through the head's provider: for models whose provider
+    // has none of its own (or every model, if so set).
+    let search: c6_tools::SearchConfig = serde_json::from_str(&spec.web_search_json).unwrap_or_default();
+    let own_search = spec.model.as_ref().and_then(|m| Provider::from_kind(&m.connection_kind)).is_some_and(|p| p != Provider::OpenAiChat);
+    if !search.provider.is_empty() && (search.always || !own_search) {
+        tools.push(Arc::new(c6_tools::WebSearch::new(profile == ToolProfile::Claude, search)));
+    }
+
     let servers: Vec<c6_mcp::ServerConfig> = serde_json::from_str(&spec.mcp_servers_json).unwrap_or_default();
     if !servers.is_empty() {
         let (set, errs) = c6_mcp::McpSet::connect(&servers, cwd).await;

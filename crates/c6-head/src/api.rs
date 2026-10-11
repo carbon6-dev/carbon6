@@ -40,6 +40,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/settings/hooks", get(get_hooks).put(put_hooks))
         .route("/api/v1/settings/secrets", get(list_secrets))
+        .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
@@ -669,6 +670,34 @@ async fn list_commands(State(st): State<Arc<HeadState>>, Query(q): Query<ForSess
     }));
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(out))
+}
+
+async fn get_web_search(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::WebSearchSetting>> {
+    let raw = st.store.setting(crate::sessions::WEB_SEARCH).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api::WebSearchSetting>) -> ApiResult<StatusCode> {
+    s.provider = s.provider.trim().to_owned();
+    s.url = s.url.trim().to_owned();
+    s.secret = s.secret.trim().to_owned();
+    let bad = |m: &str| Err(ApiErr(StatusCode::BAD_REQUEST, m.into()));
+    match s.provider.as_str() {
+        "" => {}
+        "brave" | "tavily" if s.secret.is_empty() => return bad("choose the secret that holds the API key"),
+        "brave" | "tavily" => {
+            if !st.store.secrets().await?.iter().any(|x| x.name == s.secret) {
+                return bad("no secret by that name (add it under Secrets first)");
+            }
+        }
+        "searxng" if !(s.url.starts_with("http://") || s.url.starts_with("https://")) => {
+            return bad("SearXNG needs the instance's http(s) URL");
+        }
+        "searxng" => {}
+        _ => return bad("the provider is brave, tavily or searxng"),
+    }
+    st.store.set_setting(crate::sessions::WEB_SEARCH, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_secrets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::SecretInfo>>> {

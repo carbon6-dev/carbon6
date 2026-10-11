@@ -638,6 +638,24 @@ pub fn valid_secret_name(name: &str) -> bool {
         && name.len() <= 64
 }
 
+/// The web search provider for models whose own provider has none
+/// (`GET`/`PUT /api/v1/settings/web-search`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WebSearchSetting {
+    /// "brave", "tavily", "searxng"; empty: off.
+    #[serde(default)]
+    pub provider: String,
+    /// SearXNG: the instance's URL.
+    #[serde(default)]
+    pub url: String,
+    /// The secret holding the API key (Brave, Tavily).
+    #[serde(default)]
+    pub secret: String,
+    /// Offer it to every model, even those with a web search of their own.
+    #[serde(default)]
+    pub always: bool,
+}
+
 /// The commands built into carbon6: (name, description, argument hint).
 /// `compact`, `init` and `review` run on the worker; `clear` and `export`
 /// in the UI.

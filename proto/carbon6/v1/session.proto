@@ -336,6 +336,9 @@ message CreateSession {
   // Work on another machine over SSH through this worker: user@host or an
   // ssh_config alias; `cwd` is a folder there.
   string ssh_target = 12;
+  // The head's web search setting (JSON object of c6_tools::SearchConfig;
+  // the API key is a secret, named here).
+  string web_search_json = 13;
 }
 
 message ModelSpec {

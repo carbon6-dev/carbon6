@@ -32,7 +32,7 @@ pub use patch::ApplyPatch;
 pub use plan::Plan;
 pub use profiles::tools_for;
 pub use search::{Glob, Grep};
-pub use web::WebFetch;
+pub use web::{SearchConfig, WebFetch, WebSearch};
 
 /// Output kept inline for the model; the rest is elided from the middle.
 pub const MAX_OUTPUT_CHARS: usize = 30_000;
@@ -75,6 +75,11 @@ pub struct Secrets(Arc<Mutex<Vec<(String, String)>>>);
 impl Secrets {
     pub fn env(&self) -> Vec<(String, String)> {
         self.0.lock().unwrap().clone()
+    }
+
+    /// A secret's value, if it applies to the session.
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.0.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
     }
 
     /// `text` with every secret's value replaced by `[secret:NAME]`.

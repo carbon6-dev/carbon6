@@ -112,6 +112,15 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Web search with any model
+
+Claude and OpenAI models search the web through their own provider. For the rest (Ollama and other OpenAI-compatible servers), choose a provider under **Settings → Web search**, and sessions get a `web_search` tool. The options:
+
+- **Brave Search API** or **Tavily:** the API key is a secret, picked by name.
+- **SearXNG:** self-hosted, so it needs only its URL, with the JSON format enabled.
+
+To give every model the same search, tick "Offer it to every model".
+
 ### Remote machines over SSH
 
 For a machine you can reach by SSH but don't want to install `c6w` on, start a session there *through* a worker. In the new-session form choose **SSH host, through the worker** and enter `user@host` (or an alias from the worker's `~/.ssh/config`) and a folder there (default: home). On the command line: `c6 run --ssh admin@web1 "install and start nginx"`.

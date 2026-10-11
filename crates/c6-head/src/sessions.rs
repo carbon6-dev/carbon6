@@ -24,6 +24,7 @@ pub const SKILLS: &str = "skills";
 pub const HOOKS: &str = "hooks";
 pub const COMMANDS: &str = "commands";
 pub const AGENTS: &str = "agents";
+pub const WEB_SEARCH: &str = "web_search";
 
 /// Per-session broadcast channels for stream subscribers.
 #[derive(Default)]
@@ -212,6 +213,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         secrets_json: serde_json::to_string(&st.store.secrets().await?)?,
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
+        web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
         seed,
     })
 }

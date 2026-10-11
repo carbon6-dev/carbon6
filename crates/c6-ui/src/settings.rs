@@ -81,6 +81,7 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             />
             <HooksSetting />
             <SecretsSetting />
+            <WebSearchSetting />
         </main>
     }
 }
@@ -990,6 +991,82 @@ fn SecretsSetting() -> impl IntoView {
                 })}
                 {move || editing.get().then(|| view! { <button class=BUTTON_QUIET on:click=move |_| reset()>"Cancel"</button> })}
                 <button class=BUTTON on:click=save>{move || if editing.get() { "Save changes" } else { "Add secret" }}</button>
+            </div>
+        </section>
+    }
+}
+
+/// Settings: the web search provider for models without one of their own.
+#[component]
+fn WebSearchSetting() -> impl IntoView {
+    let setting = RwSignal::new(c6_api::WebSearchSetting::default());
+    let loaded = LocalResource::new(move || api::get_setting("web-search"));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            setting.set(serde_json::from_value(v).unwrap_or_default());
+        }
+    });
+    let secrets = LocalResource::new(api::secrets);
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let save = move |_| {
+        let v = serde_json::to_value(setting.get_untracked()).unwrap_or_default();
+        spawn_local(async move {
+            status.set(Some(api::put_setting("web-search", v).await.map(|_| "Saved. New sessions will use it.")));
+        });
+    };
+    let provider = move || setting.with(|s| s.provider.clone());
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Web search"</h2>
+                <p class="text-sm text-zinc-500">
+                    "Claude and OpenAI models search the web through their own provider. Others (Ollama, other OpenAI-compatible servers) get a web_search tool through the provider chosen here. Brave and Tavily need an API key, kept as a secret (it must apply to the sessions that search); SearXNG is self-hosted and needs only its URL (with the JSON format enabled)."
+                </p>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Provider"</span>
+                    <select class=format!("{INPUT} py-1") prop:value=provider on:change=move |ev| setting.update(|s| s.provider = event_target_value(&ev))>
+                        <option value="">"Off"</option>
+                        <option value="brave">"Brave Search API"</option>
+                        <option value="tavily">"Tavily"</option>
+                        <option value="searxng">"SearXNG (self-hosted)"</option>
+                    </select>
+                </label>
+                {move || match provider().as_str() {
+                    "searxng" => view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">"Instance URL"</span>
+                            <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="http://10.0.0.5:8888"
+                                prop:value=move || setting.with(|s| s.url.clone()) on:input=move |ev| setting.update(|s| s.url = event_target_value(&ev)) />
+                        </label>
+                    }.into_any(),
+                    "brave" | "tavily" => view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">"API key (a secret)"</span>
+                            <select class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || setting.with(|s| s.secret.clone())
+                                on:change=move |ev| setting.update(|s| s.secret = event_target_value(&ev))>
+                                <option value="">"Choose a secret…"</option>
+                                {move || secrets.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|s| {
+                                    let n = s.name.clone();
+                                    view! { <option value=n.clone()>{format!("${n}")}</option> }
+                                }).collect_view()}
+                            </select>
+                        </label>
+                    }.into_any(),
+                    _ => ().into_any(),
+                }}
+            </div>
+            <label class="flex items-center gap-2 text-sm" class:hidden=move || provider().is_empty()>
+                <input type="checkbox" prop:checked=move || setting.with(|s| s.always) on:change=move |ev| setting.update(|s| s.always = event_target_checked(&ev)) />
+                "Offer it to every model, even those with a web search of their own"
+            </label>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=save>"Save"</button>
             </div>
         </section>
     }
