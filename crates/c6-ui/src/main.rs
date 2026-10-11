@@ -15,6 +15,7 @@ mod sessions;
 mod settings;
 mod tasks;
 mod term;
+mod usage;
 mod util;
 mod workspace;
 
@@ -133,6 +134,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None } class=MENU>"Settings"</Go>
                 </div>
             </div>

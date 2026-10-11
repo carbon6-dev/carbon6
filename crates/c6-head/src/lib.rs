@@ -23,6 +23,7 @@ pub mod templates;
 pub mod terminals;
 pub mod tls;
 pub mod ui_ca;
+pub mod usage;
 mod webauthn;
 
 use std::net::{IpAddr, SocketAddr};
@@ -182,6 +183,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     // Scheduled automations.
     automations::spawn_scheduler(state.clone());
     notify::spawn(state.clone());
+    usage::spawn_backfill(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

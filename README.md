@@ -143,6 +143,16 @@ Channels (**Settings → Notifications**) tell you about your sessions while you
 - **The agent's `notify` tool:** agents can send you a notice (a title, a few lines, a priority), for example from an automation that finds a problem.
 - **Testing:** **Send a test** sends a message on a channel and shows any error.
 
+### Usage and budgets
+
+**Usage and budgets** (in the ☰ menu) shows tokens and cost for the sessions matching the label filter, over today or the last 7, 30 or 90 days: totals, a daily chart, and breakdowns by model, connection, label, and the most expensive sessions (subagents count toward the session that started them).
+
+- **Prices** (**Settings → Prices**): USD per million tokens, per model id or prefix (`claude-sonnet-*`); cache reads and writes default to the input price. Models without a price count as $0, and Usage lists them.
+- **Budgets** (**Settings → Budgets**): a limit per day, week or month for sessions with given labels (`automation:`, `client:acme`, or everything).
+  - **notify:** a `budget` notification once per period when it's used up.
+  - **block:** the notification, plus running turns with those labels are stopped, and new sessions and messages with them are refused until the period ends.
+- Usage from before this existed is filled in from the session logs once.
+
 ### Model routing
 
 Routing rules (**Settings → Model routing**) choose the connection and model for sessions started without one: from the new-session form on **Auto**, `c6 run` without `--model`, and templates or automations that leave the model empty.

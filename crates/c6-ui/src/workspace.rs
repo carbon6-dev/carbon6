@@ -54,6 +54,7 @@ pub enum View {
     },
     Inbox,
     Mission,
+    Usage,
 }
 
 /// A place in a session: the transcript element to reveal, the side chats
@@ -106,6 +107,7 @@ impl View {
             View::Settings { .. } => "/settings".into(),
             View::Inbox => "/inbox".into(),
             View::Mission => "/mission".into(),
+            View::Usage => "/usage".into(),
         }
     }
 
@@ -154,6 +156,7 @@ impl View {
             },
             ["inbox"] => View::Inbox,
             ["mission"] => View::Mission,
+            ["usage"] => View::Usage,
             _ => View::Sessions,
         }
     }
@@ -174,6 +177,7 @@ impl View {
             View::Settings { .. } => "Settings".into(),
             View::Inbox => "Inbox".into(),
             View::Mission => "Mission control".into(),
+            View::Usage => "Usage".into(),
         }
     }
 
@@ -914,6 +918,7 @@ fn render_view(view: View) -> AnyView {
                     View::Settings { note } => view! { <crate::settings::SettingsPage note /> }.into_any(),
                     View::Inbox => view! { <crate::activity::InboxPage /> }.into_any(),
                     View::Mission => view! { <crate::activity::MissionPage /> }.into_any(),
+                    View::Usage => view! { <crate::usage::UsagePage /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>

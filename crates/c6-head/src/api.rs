@@ -66,6 +66,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
         .route("/api/v1/settings/routes", get(get_routes).put(put_routes))
         .route("/api/v1/settings/channels", get(get_channels).put(put_channels))
+        .route("/api/v1/settings/prices", get(get_prices).put(put_prices))
+        .route("/api/v1/settings/budgets", get(get_budgets).put(put_budgets))
+        .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/settings/channels/test", post(test_channel))
         .route("/api/v1/settings/public_url", get(get_public_url).put(put_public_url))
         .route("/approve/{token}", get(crate::notify::approve_page).post(crate::notify::approve_answer))
@@ -982,6 +985,39 @@ async fn decide_approval(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+async fn get_prices(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Price>>> {
+    Ok(Json(crate::usage::prices(&st).await?))
+}
+
+async fn put_prices(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::Price>>) -> ApiResult<StatusCode> {
+    crate::usage::check_prices(&p)?;
+    st.store.set_setting(crate::usage::PRICES, &serde_json::to_string(&p).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_budgets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Budget>>> {
+    Ok(Json(crate::usage::budgets(&st).await?))
+}
+
+async fn put_budgets(State(st): State<Arc<HeadState>>, Json(b): Json<Vec<api::Budget>>) -> ApiResult<StatusCode> {
+    crate::usage::check_budgets(&b)?;
+    st.store.set_setting(crate::usage::BUDGETS, &serde_json::to_string(&b).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct UsageQuery {
+    #[serde(default)]
+    days: Option<u32>,
+    #[serde(default)]
+    labels: String,
+}
+
+async fn get_usage(State(st): State<Arc<HeadState>>, Query(q): Query<UsageQuery>) -> ApiResult<Json<api::UsageReport>> {
+    let filter = api::labels::parse_labels(&q.labels);
+    Ok(Json(crate::usage::report(&st, q.days.unwrap_or(30), &filter).await?))
 }
 
 async fn get_channels(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Channel>>> {

@@ -90,6 +90,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     let (connection_id, model, subagent_model) = {
         let mut route_labels = labels.clone();
         route_labels.extend(api::labels::auto_labels(&worker.name, "", if cwd.starts_with('/') { &cwd } else { "" }, "", "", &ssh));
+        if let Some(why) = crate::usage::blocked(st, &route_labels).await? {
+            return Err(bad_request(format!("not started: {why}")));
+        }
         let routed = route(st, &req.connection_id, &req.model, &route_labels).await?;
         if effort.is_none() {
             effort = check_effort(Some(routed.effort))?;
@@ -486,6 +489,9 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     if session.parent_call_id.is_some() {
         return Err(bad_request("subagent sessions run once and cannot take messages"));
     }
+    if let Some(why) = crate::usage::blocked(st, &session.all_labels()).await? {
+        return Err(bad_request(format!("not sent: {why}")));
+    }
     if session.status == "failed" {
         return Err(bad_request(format!("session failed to start: {}", session.error.unwrap_or_default())));
     }
@@ -728,6 +734,9 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
         st.registry.bump();
     }
     notify_events(st, &batch.session_id, &ing.events).await;
+    if ing.events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::Usage(_)))) {
+        crate::usage::after_calls(st, &batch.session_id).await;
+    }
     let ended: Vec<u64> =
         ing.events.iter().filter(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_)))).map(|e| e.seq).collect();
     if st.otlp.is_some() && !ended.is_empty() {

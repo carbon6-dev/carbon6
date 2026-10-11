@@ -107,6 +107,22 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             />
             <NotifyExtras />
             <ListSetting
+                name="prices"
+                title="Prices"
+                noun="price"
+                help="What model calls cost, in USD per million tokens, for Usage and budgets. A model is an exact id or a prefix ending in * (claude-sonnet-*); the most specific entry wins. Cache read and write default to the input price. Copy the numbers from your provider's price list; models without a price count as $0 (Usage lists them)."
+                fields=PRICE_FIELDS
+                examples=price_examples
+            />
+            <ListSetting
+                name="budgets"
+                title="Budgets"
+                noun="budget"
+                help="Spending limits per day, week (from Monday) or month, for sessions with given labels (e.g. automation:, template:triage, client:acme; empty: everything). Notify tells you once per period when one is used up (as a budget notification); block also stops running turns and refuses new sessions and messages until the period ends. See where each stands under Usage."
+                fields=BUDGET_FIELDS
+                examples=budget_examples
+            />
+            <ListSetting
                 name="routes"
                 title="Model routing"
                 noun="rule"
@@ -782,6 +798,47 @@ fn policy_examples() -> Vec<(&'static str, serde_json::Value)> {
     ]
 }
 
+const PRICE_FIELDS: &[Field] = &[
+    Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-* or gpt-5.5", kind: FieldKind::Mono },
+    Field { key: "input", label: "Input ($/M tokens)", placeholder: "e.g. 3", kind: FieldKind::Mono },
+    Field { key: "output", label: "Output ($/M tokens)", placeholder: "e.g. 15", kind: FieldKind::Mono },
+    Field { key: "cache_read", label: "Cache read ($/M)", placeholder: "the input price", kind: FieldKind::Mono },
+    Field { key: "cache_write", label: "Cache write ($/M)", placeholder: "the input price", kind: FieldKind::Mono },
+];
+
+fn price_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let p = |model: &str, i: &str, o: &str, cr: &str, cw: &str| {
+        item(&[("model", model), ("input", i), ("output", o), ("cache_read", cr), ("cache_write", cw)])
+    };
+    vec![
+        ("Empty", p("", "", "", "", "")),
+        ("A family by prefix (fill in its prices)", p("claude-sonnet-*", "", "", "", "")),
+        ("Local models are free", p("qwen*", "0", "0", "", "")),
+    ]
+}
+
+const BUDGET_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. Automations per day", kind: FieldKind::Line },
+    Field { key: "applies_to", label: "Applies to", placeholder: "everything, or labels, e.g. automation:", kind: FieldKind::Labels },
+    Field { key: "period", label: "Period", placeholder: "", kind: FieldKind::Choice(&["day", "week", "month"]) },
+    Field { key: "limit", label: "Limit (USD)", placeholder: "e.g. 5", kind: FieldKind::Mono },
+    Field { key: "action", label: "When used up", placeholder: "", kind: FieldKind::Choice(&["notify", "block"]) },
+];
+
+fn budget_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let b = |name: &str, labels: &[&str], period: &str, limit: &str, action: &str| {
+        let mut v = item(&[("name", name), ("period", period), ("limit", limit), ("action", action)]);
+        v["applies_to"] = serde_json::json!(labels);
+        v
+    };
+    vec![
+        ("Empty", b("", &[], "day", "", "notify")),
+        ("Automations: $5 a day, then stop", b("Automations per day", &["automation:"], "day", "5", "block")),
+        ("Everything: tell me past $100 a month", b("Monthly total", &[], "month", "100", "notify")),
+        ("A client: $50 a week", b("Acme per week", &["client:acme"], "week", "50", "block")),
+    ]
+}
+
 const CHANNEL_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. phone", kind: FieldKind::Line },
     Field { key: "kind", label: "Kind", placeholder: "", kind: FieldKind::Choice(&["ntfy", "slack", "discord", "webhook", "email"]) },
@@ -1219,6 +1276,7 @@ fn ListItem(
         move || {
             item.with(|m| match m.get(k) {
                 Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+                Some(serde_json::Value::Number(n)) => n.to_string(),
                 Some(v) => v.as_str().unwrap_or("").to_owned(),
                 None => String::new(),
             })

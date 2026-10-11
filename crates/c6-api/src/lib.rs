@@ -913,6 +913,115 @@ pub const NOTIFY_EVENTS: [(&str, &str); 7] = [
 /// The events a channel without a list carries.
 pub const DEFAULT_NOTIFY_EVENTS: [&str; 5] = ["approval", "failed", "notice", "automation", "budget"];
 
+/// A model's price in USD per million tokens (`/api/v1/settings/prices`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Price {
+    /// A model id, or a prefix ending in `*` (`claude-sonnet-*`).
+    pub model: String,
+    #[serde(deserialize_with = "number")]
+    pub input: f64,
+    #[serde(deserialize_with = "number")]
+    pub output: f64,
+    /// Default: the input price.
+    #[serde(default, deserialize_with = "maybe_number", skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    /// Default: the input price.
+    #[serde(default, deserialize_with = "maybe_number", skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+/// A number, or a string holding one (as the settings editor saves it).
+fn maybe_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum N {
+        Num(f64),
+        Text(String),
+        Null(()),
+    }
+    match N::deserialize(d)? {
+        N::Num(n) => Ok(Some(n)),
+        N::Null(()) => Ok(None),
+        N::Text(s) if s.trim().is_empty() => Ok(None),
+        N::Text(s) => {
+            s.trim().trim_start_matches('$').parse().map(Some).map_err(|_| serde::de::Error::custom(format!("{s:?} is not a number")))
+        }
+    }
+}
+
+fn number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    maybe_number(d)?.ok_or_else(|| serde::de::Error::custom("a number is required"))
+}
+
+/// A spending limit for sessions with given labels
+/// (`/api/v1/settings/budgets`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Budget {
+    pub name: String,
+    /// Labels a session must all have; empty: every session.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    /// "day", "week" (from Monday) or "month", in the head's time zone.
+    pub period: String,
+    /// USD.
+    #[serde(deserialize_with = "number")]
+    pub limit: f64,
+    /// "notify" (tell you once per period) or "block" (also stop running
+    /// turns and refuse new work until the period ends).
+    pub action: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// Tokens and cost for one group of model calls.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageRow {
+    /// The group: a day (YYYY-MM-DD), model, connection id, label or
+    /// session id.
+    pub key: String,
+    /// What to show for it (a connection's or session's name).
+    pub name: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// USD, for calls on models with a price.
+    pub cost: f64,
+    /// Model calls.
+    pub calls: u64,
+    /// Calls on models without a price.
+    pub unpriced_calls: u64,
+}
+
+/// A budget and where it stands this period.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BudgetStatus {
+    pub name: String,
+    pub period: String,
+    pub limit: f64,
+    pub spent: f64,
+    pub action: String,
+    /// Used up and blocking new work.
+    pub blocking: bool,
+}
+
+/// `GET /api/v1/usage?days=N&labels=a,b`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageReport {
+    pub since_ms: i64,
+    pub total: UsageRow,
+    pub by_day: Vec<UsageRow>,
+    pub by_model: Vec<UsageRow>,
+    pub by_connection: Vec<UsageRow>,
+    /// Your labels and host:, template:, automation: (most expensive first).
+    pub by_label: Vec<UsageRow>,
+    /// The most expensive sessions (subagents count toward their parent).
+    pub top_sessions: Vec<UsageRow>,
+    /// Models used without a price.
+    pub unpriced_models: Vec<String>,
+    pub budgets: Vec<BudgetStatus>,
+}
+
 /// `POST /api/v1/settings/channels/test`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TestChannel {

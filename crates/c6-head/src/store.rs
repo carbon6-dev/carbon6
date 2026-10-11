@@ -498,6 +498,7 @@ impl Store {
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
                 Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
+                Some(Kind::Usage(u)) => crate::usage::record(&mut tx, session_id, ev.seq, ev.ts_ms, u).await?,
                 Some(Kind::Approval(a)) => {
                     let delta = if a.state == "requested" { 1 } else { -1 };
                     sqlx::query("UPDATE sessions SET awaiting = MAX(awaiting + ?, 0) WHERE id = ?")
