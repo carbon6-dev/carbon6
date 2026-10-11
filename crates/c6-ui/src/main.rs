@@ -20,6 +20,7 @@ mod sessions;
 mod settings;
 mod tasks;
 mod term;
+mod understanding;
 mod usage;
 mod util;
 mod workspace;

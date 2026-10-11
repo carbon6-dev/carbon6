@@ -1,0 +1,58 @@
+//! Asking a model (the understanding task's, or the vision task's), once,
+//! through one of carbon6's connections.
+
+use std::sync::Arc;
+
+use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
+use c6_worker::link::HeadLink;
+use futures_util::StreamExt;
+use serde_json::Value;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Task {
+    pub connection_id: String,
+    pub model: String,
+}
+
+/// The model's text answer to `system` and the user's blocks (text and
+/// images).
+pub async fn ask(link: &Arc<HeadLink>, task: &Task, system: &str, user: Vec<Block>, max_tokens: u32) -> anyhow::Result<String> {
+    let grant = link.credential(&task.connection_id).await?;
+    let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
+    let req = ModelRequest {
+        model: task.model.clone(),
+        system: system.to_owned(),
+        messages: vec![Message { role: Role::User, blocks: user }],
+        tools: Vec::new(),
+        max_output_tokens: Some(max_tokens),
+        cache_key: None,
+        effort: Some("low".into()),
+        web_search: false,
+    };
+    let mut stream = client.stream(&req).await?;
+    let mut acc = Accumulator::default();
+    while let Some(ev) = stream.next().await {
+        acc.push(&ev?);
+    }
+    let msg = acc.finish(true);
+    Ok(msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect())
+}
+
+/// The first JSON object in a model's answer (it may wrap it in prose or a
+/// code fence).
+pub fn json_of(text: &str) -> anyhow::Result<Value> {
+    let start = text.find('{').ok_or_else(|| anyhow::anyhow!("no JSON in the answer"))?;
+    let end = text.rfind('}').ok_or_else(|| anyhow::anyhow!("no JSON in the answer"))?;
+    anyhow::ensure!(end > start, "no JSON in the answer");
+    Ok(serde_json::from_str(&text[start..=end])?)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_in_prose() {
+        let v = super::json_of("Sure! ```json\n{\"summary\": \"ok\", \"topics\": [\"a\"]}\n```").unwrap();
+        assert_eq!(v["topics"][0], "a");
+        assert!(super::json_of("no json here").is_err());
+    }
+}

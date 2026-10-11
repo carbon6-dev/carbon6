@@ -1576,6 +1576,79 @@ pub struct MemexStatus {
     /// Waiting to be sent to the memex.
     #[serde(default)]
     pub outbox: u64,
+    /// Items and threads the understanding model has read (this version).
+    #[serde(default)]
+    pub understood: u64,
+    /// Model calls today, and the day's budget.
+    #[serde(default)]
+    pub calls_today: u64,
+    #[serde(default)]
+    pub calls_per_day: u64,
+    /// Photos and videos, and how many have been looked at.
+    #[serde(default)]
+    pub media: u64,
+    #[serde(default)]
+    pub media_seen: u64,
+    /// Suggestions waiting for you.
+    #[serde(default)]
+    pub review: u64,
+}
+
+/// Who owes what, by when (`/api/v1/memex/commitments`), read from mail and
+/// sessions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Commitment {
+    pub id: i64,
+    pub item_id: String,
+    #[serde(default)]
+    pub item_title: String,
+    /// "me", or a person's address or name.
+    pub who: String,
+    pub what: String,
+    #[serde(default)]
+    pub due: Option<UnixMs>,
+    /// open, done or dropped.
+    pub status: String,
+}
+
+/// A suggestion for you to decide (`/api/v1/memex/review`): two things that
+/// may be the same (`merge`), or a face to name (`face`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexReview {
+    pub id: i64,
+    pub kind: String,
+    pub a: MemexThingRef,
+    #[serde(default)]
+    pub b: Option<MemexThingRef>,
+    pub reason: String,
+    /// A picture to show with it (a face's crop), as a media URL path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    pub created_at: UnixMs,
+}
+
+/// A thing's neighbourhood (`memex.graph`): things linked to it directly or
+/// through items, with how strongly.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexGraph {
+    pub center: MemexThingRef,
+    pub nodes: Vec<MemexGraphNode>,
+    /// Links among the neighbours (ids into `nodes`), for drawing.
+    #[serde(default)]
+    pub edges: Vec<(String, String, u32)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexGraphNode {
+    pub thing: MemexThingRef,
+    /// Direct relations to the centre (e.g. member_of), if any.
+    #[serde(default)]
+    pub rels: Vec<String>,
+    /// Items both are in.
+    pub shared: u32,
+    /// The most recent of those.
+    #[serde(default)]
+    pub last: Option<UnixMs>,
 }
 
 /// A model for one of the memex's tasks.
@@ -1605,6 +1678,19 @@ pub struct MemexSettings {
     /// (default on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_needs_approval: Option<bool>,
+    /// Reads mail threads, sessions, documents and papers: summaries,
+    /// topics, commitments, claims. None: no understanding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub understanding: Option<MemexModel>,
+    /// Model calls a day for understanding and vision (default 500).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_per_day: Option<u32>,
+    /// Looks at photos (and video frames): captions, objects, scenes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<MemexModel>,
+    /// Transcribes videos' speech (an OpenAI-style /audio/transcriptions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<MemexModel>,
 }
 
 /// A scope rule (`/api/v1/settings/memex_scopes`): sessions with these

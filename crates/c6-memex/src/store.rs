@@ -474,6 +474,36 @@ impl Store {
         Ok(())
     }
 
+    /// A link a model inferred, with how sure it is and what supports it.
+    pub async fn link_inferred(
+        &self,
+        item: &str,
+        rel: &str,
+        thing: &str,
+        confidence: f64,
+        made_by: &str,
+        quote: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO links (src_item, rel, dst_thing, basis, confidence, made_by, created_at) VALUES (?, ?, ?, 'inferred', ?, ?, ?) RETURNING id",
+        )
+        .bind(item)
+        .bind(rel)
+        .bind(thing)
+        .bind(confidence)
+        .bind(made_by)
+        .bind(c6_core::now_ms())
+        .fetch_one(&self.pool)
+        .await?;
+        sqlx::query("INSERT INTO evidence (link_id, item_id, quote) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(item)
+            .bind(quote)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Removes the links an item's analysis made (before making them again).
     pub async fn clear_links(&self, item: &str, made_by: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM evidence WHERE link_id IN (SELECT id FROM links WHERE src_item = ? AND made_by = ?)")

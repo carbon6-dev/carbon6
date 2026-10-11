@@ -240,6 +240,33 @@ Jobs live in a durable queue in the memex database, each with a priority, a budg
   - Built-in ONNX models run in `c6m` on its CPU or GPU, or on a worker that advertises the capability `memex-compute`, for media too large to move.
 - **Versioning:** each derived row and inferred link records the pipeline and model version. Upgrading a task's model re-queues its tier for the affected items.
 
+### 5.1 Understanding, as built (step 4)
+
+- **Settings → Memex** picks a connection and model for three tasks: understanding, vision and transcription. A fourth setting, "model calls a day", is one budget shared by understanding and vision (default 500). The memex calls the model directly with a credential from the head; Claude Code connections can't be used for these tasks.
+- **What gets read**, newest first:
+  - email threads, as one unit, and again when a thread has new mail; mailing lists, spam, trash and drafts are skipped;
+  - sessions, documents, papers and web pages.
+- **What comes back**, as JSON:
+  - a summary (`items.summary`);
+  - topics (`topic:<slug>` things, linked `about`);
+  - for threads and sessions, commitments: who, what, and by when;
+  - for papers, claims: `claim:<hash>` things linked as `claims`, `uses_method` or `has_limitation`, with the sentence kept as evidence.
+- **Everything is inferred:** `basis = inferred`, `made_by = understand-v1@<model>`.
+  - Changing the model re-reads everything and replaces the old model's links.
+  - Commitments you marked done or dropped are kept.
+- **Inputs are observed items only.**
+  - A model never reads another model's output.
+  - "Summarize what I know" about a thing reads the items about it, then saves a note marked inferred, listing its sources.
+- **Review queue:**
+  - People with the same full name, such as a paper's author and someone you write to, are suggested as merges.
+  - Merging moves links, keys and trail steps, keeps the old name as an alias, and deletes the duplicate.
+  - The old key still finds the merged person.
+  - Nothing is merged automatically.
+- **Graph and timeline:**
+  - `memex.graph` returns a thing's neighbours (things it shares items with, and things it links to directly) and the links among them. The UI draws it radially; closer and larger means more in common.
+  - `memex.months` returns items per month, for the timeline.
+  - Both are on every thing's page, under the Memex page's Review and Commitments tabs.
+
 ## 6. Mail, calendar and contacts
 
 carbon6 replaces the mail client, the calendar and the address book, starting with Google: any number of Gmail and Google Workspace accounts. The provider layer is an interface, so IMAP/SMTP, JMAP, CalDAV and CardDAV can be added later without changing the rest.
@@ -395,7 +422,7 @@ Each step is usable on its own:
    - Calendar sync and UI, invites and RSVP;
    - People sync and contacts built from mail;
    - triage, drafting, scheduling and meeting-prep workflows, memex event triggers, and inbox integration.
-4. **Understanding tiers:** summaries, topics, commitments, the graph explorer and timelines.
+4. **Understanding tiers:** summaries, topics, commitments, the graph explorer and timelines. (Built: see 5.1.)
 5. **Photos and videos:** EXIF and places, captions, objects, faces and naming, transcripts.
 
 ## 11. Decisions

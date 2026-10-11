@@ -1029,6 +1029,7 @@ async fn get_memex_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<
 async fn put_memex_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::MemexSettings>) -> ApiResult<StatusCode> {
     crate::memex::check_settings(&st, &s).await?;
     st.store.set_setting(crate::memex::SETTINGS, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    crate::memex::reload(&st).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1137,11 +1138,27 @@ struct RpcIn {
     params: serde_json::Value,
 }
 
-/// The mail client, calendar and contacts call the memex through here (you,
-/// signed in: everything is in scope).
+/// The mail client, calendar, contacts, photos and the memex's review,
+/// commitments and graph call the memex through here (you, signed in:
+/// everything is in scope).
 async fn memex_rpc(State(st): State<Arc<HeadState>>, Json(r): Json<RpcIn>) -> ApiResult<Json<serde_json::Value>> {
     let ok = ["memex.mail.", "memex.calendar.", "memex.contacts."].iter().any(|p| r.method.starts_with(p))
-        || matches!(r.method.as_str(), "memex.google" | "memex.google_sync");
+        || r.method.starts_with("memex.media.")
+        || matches!(
+            r.method.as_str(),
+            "memex.google"
+                | "memex.google_sync"
+                | "memex.commitments"
+                | "memex.commitment"
+                | "memex.review"
+                | "memex.review_decide"
+                | "memex.merge"
+                | "memex.summarize"
+                | "memex.graph"
+                | "memex.months"
+                | "memex.timeline"
+                | "memex.related"
+        );
     if !ok {
         return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
     }
@@ -1275,6 +1292,7 @@ async fn get_memex_folders(State(st): State<Arc<HeadState>>) -> ApiResult<Json<V
 async fn put_memex_folders(State(st): State<Arc<HeadState>>, Json(f): Json<Vec<api::MemexFolder>>) -> ApiResult<StatusCode> {
     crate::memex::check_folders(&f)?;
     st.store.set_setting(crate::memex::FOLDERS, &serde_json::to_string(&f).map_err(anyhow::Error::from)?).await?;
+    crate::memex::reload(&st).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

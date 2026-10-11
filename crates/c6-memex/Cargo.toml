@@ -11,9 +11,11 @@ async-trait = "0.1.92"
 base64 = "0.23"
 c6-api.workspace = true
 c6-core.workspace = true
+c6-llm = { version = "0.1.0", path = "../c6-llm" }
 c6-worker.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"
+futures-util = "0.3.34"
 htmd = "0.5.5"
 mail-builder = "1.0.0"
 mail-parser = "0.11.9"

@@ -72,13 +72,15 @@ pub fn MemexPage() -> impl IntoView {
     view! {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-4">
             <div class="flex gap-1 text-sm">
-                {[("search", "Search"), ("trails", "Trails"), ("add", "Add files")].into_iter().map(|(t, label)| view! {
+                {[("search", "Search"), ("review", "Review"), ("commitments", "Commitments"), ("trails", "Trails"), ("add", "Add files")].into_iter().map(|(t, label)| view! {
                     <button class=move || format!("rounded-md px-3 py-1 {}", if tab.get() == t { "bg-zinc-200 dark:bg-zinc-800" } else { "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-900" })
                         on:click=move |_| tab.set(t)>{label}</button>
                 }).collect_view()}
             </div>
             {move || match tab.get() {
                 "trails" => view! { <Trails open /> }.into_any(),
+                "review" => view! { <crate::understanding::Review open /> }.into_any(),
+                "commitments" => view! { <crate::understanding::Commitments open /> }.into_any(),
                 "add" => view! { <AddFiles /> }.into_any(),
                 _ => ().into_any(),
             }}
@@ -403,6 +405,7 @@ fn thing_view(t: Value, open: RwSignal<Option<String>>) -> impl IntoView {
     let list = |key: &str| -> Vec<MemexHit> { serde_json::from_value(t[key].clone()).unwrap_or_default() };
     let (notes, items) = (list("notes"), list("items"));
     let related = t["related"].as_array().cloned().unwrap_or_default();
+    let key = thing["id"].as_str().unwrap_or_default().to_owned();
     let rows = move |hits: Vec<MemexHit>| {
         hits.into_iter()
             .map(|h| {
@@ -429,6 +432,7 @@ fn thing_view(t: Value, open: RwSignal<Option<String>>) -> impl IntoView {
             <h3 class="text-xs font-medium uppercase text-zinc-500">"Related"</h3>
             <div class="flex flex-wrap gap-1">{chips(related.iter().map(|p| p[0].clone()).collect::<Vec<_>>(), open)}</div>
         })}
+        <crate::understanding::ThingMore key open />
     }
 }
 
@@ -478,6 +482,10 @@ pub fn MemexSettings() -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let (conn, model, chars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let (auto, approve) = (RwSignal::new(false), RwSignal::new(true));
+    // Model tasks: (connection, model) for understanding, vision, transcription.
+    let tasks: [(&'static str, RwSignal<String>, RwSignal<String>); 3] =
+        ["understanding", "vision", "transcription"].map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new())));
+    let per_day = RwSignal::new(String::new());
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             auto.set(v["contacts_auto"].as_bool().unwrap_or(false));
@@ -485,6 +493,11 @@ pub fn MemexSettings() -> impl IntoView {
             conn.set(v["embedding"]["connection"].as_str().unwrap_or_default().to_owned());
             model.set(v["embedding"]["model"].as_str().unwrap_or_default().to_owned());
             chars.set(v["brief_chars"].as_u64().map(|n| n.to_string()).unwrap_or_default());
+            for (k, c, m) in tasks {
+                c.set(v[k]["connection"].as_str().unwrap_or_default().to_owned());
+                m.set(v[k]["model"].as_str().unwrap_or_default().to_owned());
+            }
+            per_day.set(v["calls_per_day"].as_u64().map(|n| n.to_string()).unwrap_or_default());
         }
     });
     let token = RwSignal::new(None::<String>);
@@ -509,6 +522,14 @@ pub fn MemexSettings() -> impl IntoView {
         }
         v["contacts_auto"] = auto.get_untracked().into();
         v["send_needs_approval"] = approve.get_untracked().into();
+        for (k, c, m) in tasks {
+            if !c.get_untracked().is_empty() {
+                v[k] = serde_json::json!({"connection": c.get_untracked(), "model": m.get_untracked().trim()});
+            }
+        }
+        if let Ok(n) = per_day.get_untracked().trim().parse::<u32>() {
+            v["calls_per_day"] = n.into();
+        }
         spawn_local(async move {
             note.set(Some(
                 api::put_setting("memex", v)
@@ -555,6 +576,33 @@ pub fn MemexSettings() -> impl IntoView {
                 <label class="flex items-center gap-2 text-sm sm:col-span-3">
                     <input type="checkbox" prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
                     "Agents' mail and calendar invitations wait for my approval"
+                </label>
+                {tasks.into_iter().map(|(k, c, m)| {
+                    let (title, hint) = match k {
+                        "understanding" => ("Understanding", "e.g. claude-haiku-4-5, gpt-5-mini, qwen3:8b"),
+                        "vision" => ("Vision (photos)", "e.g. claude-haiku-4-5, gpt-5-mini, qwen2.5vl"),
+                        _ => ("Transcription (videos)", "e.g. whisper-1, gpt-4o-mini-transcribe"),
+                    };
+                    view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">{format!("{title}: connection")}</span>
+                            <select class=format!("{INPUT} py-1 text-sm") prop:value=move || c.get() on:change=move |ev| c.set(event_target_value(&ev))>
+                                <option value="">"None (off)"</option>
+                                {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
+                                    .filter(|x| x.kind != "claude_code" && (k != "transcription" || x.kind != "anthropic"))
+                                    .map(|x| view! { <option value=x.name.clone()>{x.name.clone()}</option> }).collect_view()}
+                            </select>
+                        </label>
+                        <label class="space-y-0.5 sm:col-span-2">
+                            <span class="text-xs text-zinc-500">{format!("{title}: model")}</span>
+                            <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=hint prop:value=move || m.get() on:input=move |ev| m.set(event_target_value(&ev)) />
+                        </label>
+                    }
+                }).collect_view()}
+                <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Model calls a day"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Brief size (characters)"</span>

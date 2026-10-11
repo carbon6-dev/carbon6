@@ -8,8 +8,11 @@ pub mod contacts;
 pub mod docs;
 pub mod embed;
 pub mod google;
+pub mod llm;
 pub mod mail;
+pub mod review;
 pub mod store;
+pub mod understand;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -46,6 +49,25 @@ pub struct Memex {
     contacts_auto: std::sync::atomic::AtomicBool,
     /// Wakes the Google sync.
     resync: tokio::sync::Notify,
+    /// The models for understanding, vision and transcription, and model
+    /// calls a day.
+    tasks: Mutex<Tasks>,
+    /// Wakes understanding and media work (their models changed).
+    pub wake: tokio::sync::Notify,
+    /// Re-reads the settings now (the head says they changed).
+    reload: tokio::sync::Notify,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tasks {
+    pub understanding: Option<llm::Task>,
+    pub vision: Option<llm::Task>,
+    pub transcription: Option<llm::Task>,
+    pub per_day: u32,
+}
+
+fn task_of(v: &Value) -> Option<llm::Task> {
+    Some(llm::Task { connection_id: v["connection_id"].as_str()?.to_owned(), model: v["model"].as_str().unwrap_or_default().to_owned() })
 }
 
 /// Files larger than this are not read.
@@ -66,6 +88,9 @@ impl Memex {
             accounts: Mutex::default(),
             contacts_auto: Default::default(),
             resync: tokio::sync::Notify::new(),
+            tasks: Mutex::default(),
+            wake: tokio::sync::Notify::new(),
+            reload: tokio::sync::Notify::new(),
         }))
     }
 
@@ -74,6 +99,7 @@ impl Memex {
     pub fn spawn_jobs(self: &Arc<Self>) {
         self.spawn_scanner();
         self.spawn_google();
+        understand::spawn(self.clone());
         let m = self.clone();
         tokio::spawn(async move {
             let mut refreshed: Option<std::time::Instant> = None;
@@ -90,6 +116,16 @@ impl Memex {
                             *m.accounts.lock().unwrap() = accounts;
                             if let Some(p) = c["google_people"].as_str() {
                                 *m.google.people.lock().unwrap() = p.to_owned();
+                            }
+                            let tasks = Tasks {
+                                understanding: task_of(&c["understanding"]),
+                                vision: task_of(&c["vision"]),
+                                transcription: task_of(&c["transcription"]),
+                                per_day: c["calls_per_day"].as_u64().unwrap_or(500) as u32,
+                            };
+                            if *m.tasks.lock().unwrap() != tasks {
+                                *m.tasks.lock().unwrap() = tasks;
+                                m.wake.notify_waiters();
                             }
                             m.contacts_auto.store(c["contacts_auto"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
                             if new_accounts {
@@ -115,7 +151,10 @@ impl Memex {
                         Duration::from_secs(30)
                     }
                 };
-                tokio::time::sleep(wait).await;
+                tokio::select! {
+                    _ = m.reload.notified() => refreshed = None,
+                    _ = tokio::time::sleep(wait) => {}
+                }
             }
         });
     }
@@ -172,6 +211,22 @@ impl Memex {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
+    }
+
+    pub fn tasks(&self) -> Tasks {
+        self.tasks.lock().unwrap().clone()
+    }
+
+    /// Sets the model tasks (tests; normally from the head's settings).
+    pub fn set_tasks(&self, t: Tasks) {
+        *self.tasks.lock().unwrap() = t;
+        self.wake.notify_waiters();
+    }
+
+    /// The understanding model and the day's budget, if there is one.
+    pub fn understanding(&self) -> Option<(llm::Task, u32)> {
+        let t = self.tasks();
+        t.understanding.map(|u| (u, t.per_day))
     }
 
     pub fn accounts(&self) -> Vec<google::Account> {
@@ -553,10 +608,54 @@ impl Memex {
             {
                 self.google_method(m, params, &allowed).await
             }
+            "memex.commitments" => Ok(json!(understand::commitments(self, params["status"].as_str().unwrap_or("open")).await?)),
+            "memex.commitment" => {
+                understand::set_commitment(self, params["id"].as_i64().unwrap_or(0), params["status"].as_str().unwrap_or("")).await?;
+                Ok(json!({}))
+            }
+            "memex.review" => {
+                review::suggest(&self.store).await?;
+                Ok(json!(review::list(&self.store, params["limit"].as_u64().unwrap_or(50) as u32).await?))
+            }
+            "memex.review_decide" => {
+                review::decide(
+                    &self.store,
+                    params["id"].as_i64().unwrap_or(0),
+                    params["accept"].as_bool().unwrap_or(false),
+                    params["name"].as_str(),
+                )
+                .await?;
+                Ok(json!({}))
+            }
+            "memex.merge" => {
+                let from = self
+                    .store
+                    .thing(params["from"].as_str().unwrap_or_default())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("no such thing to merge"))?;
+                let into = self
+                    .store
+                    .thing(params["into"].as_str().unwrap_or_default())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("no such thing to merge into"))?;
+                review::merge(&self.store, &from.id, &into.id).await?;
+                Ok(json!({}))
+            }
+            "memex.summarize" => Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default()).await?})),
+            "memex.graph" => {
+                let limit = params["limit"].as_u64().unwrap_or(40).min(150) as u32;
+                Ok(json!(review::graph(&self.store, params["id"].as_str().unwrap_or_default(), &allowed, limit).await?))
+            }
+            "memex.months" => Ok(review::histogram(&self.store, params["id"].as_str().unwrap_or_default(), &allowed).await?),
+            "memex.reload" => {
+                self.reload.notify_one();
+                Ok(json!({}))
+            }
             "memex.mention" => Ok(json!(self.store.find_things(params["q"].as_str().unwrap_or(""), 20).await?)),
             "memex.status" => {
                 let mut s = self.store.status(&self.embed.space()).await?;
                 s.last_error = self.last_error.lock().unwrap().clone();
+                understand::status(self, &mut s).await?;
                 Ok(json!(s))
             }
             other => anyhow::bail!("the memex has no method {other}"),

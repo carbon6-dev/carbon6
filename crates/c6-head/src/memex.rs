@@ -53,6 +53,13 @@ pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result
     })
 }
 
+/// Tells the memex its settings changed (if one is connected).
+pub async fn reload(st: &HeadState) {
+    if st.registry.memex().is_some() {
+        let _ = call(st, "memex.reload", serde_json::json!({})).await;
+    }
+}
+
 /// Queues a call for the memex; it is delivered in order, when one is
 /// connected, and kept until then.
 pub async fn enqueue(st: &HeadState, method: &str, params: Value) {
@@ -173,6 +180,26 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
             return Err(bad_request("choose an embedding model"));
         }
     }
+    let connections = st.store.connections().await?;
+    for (what, m) in [("understanding", &s.understanding), ("vision", &s.vision), ("transcription", &s.transcription)] {
+        let Some(m) = m else { continue };
+        let c = connections
+            .iter()
+            .find(|c| c.id == m.connection || c.name == m.connection)
+            .ok_or_else(|| bad_request(format!("{what}: no connection {:?}", m.connection)))?;
+        if c.kind == "claude_code" {
+            return Err(bad_request(format!("{what}: the memex calls models directly; choose an API connection, not {}", c.name)));
+        }
+        if what == "transcription" && c.kind == "anthropic" {
+            return Err(bad_request("transcription: choose an OpenAI or OpenAI-compatible connection (one with /audio/transcriptions)"));
+        }
+        if m.model.trim().is_empty() {
+            return Err(bad_request(format!("choose a model for {what}")));
+        }
+    }
+    if s.calls_per_day == Some(0) {
+        return Err(bad_request("calls a day: at least 1 (or leave the model unset to turn it off)"));
+    }
     Ok(())
 }
 
@@ -203,16 +230,16 @@ pub fn check_scopes(scopes: &[api::MemexScope]) -> anyhow::Result<()> {
 /// (it fetches credentials for them like a worker does).
 pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
     let s = settings(st).await?;
-    let embedding = match &s.embedding {
-        Some(m) => {
-            let connections = st.store.connections().await?;
+    let connections = st.store.connections().await?;
+    let task = |m: &Option<api::MemexModel>| {
+        m.as_ref().and_then(|m| {
             connections
                 .iter()
                 .find(|c| c.id == m.connection || c.name == m.connection)
                 .map(|c| json!({"connection_id": c.id, "kind": c.kind, "model": m.model}))
-        }
-        None => None,
+        })
     };
+    let embedding = task(&s.embedding);
     let folders: Vec<api::MemexFolder> = serde_json::from_str(&st.store.setting(FOLDERS).await?.unwrap_or_default()).unwrap_or_default();
     Ok(json!({
         "embedding": embedding,
@@ -220,6 +247,10 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "google": crate::google::for_memex(st).await,
         "google_people": crate::google::endpoints().people,
         "contacts_auto": s.contacts_auto.unwrap_or(false),
+        "understanding": task(&s.understanding),
+        "vision": task(&s.vision),
+        "transcription": task(&s.transcription),
+        "calls_per_day": s.calls_per_day.unwrap_or(500),
     }))
 }
 

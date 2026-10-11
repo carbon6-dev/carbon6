@@ -176,6 +176,7 @@ async fn finish(st: &HeadState, code: &str, redirect: &str) -> anyhow::Result<St
     .bind(c6_core::now_ms())
     .execute(&st.store.pool)
     .await?;
+    crate::memex::reload(st).await;
     Ok(email)
 }
 
@@ -191,6 +192,7 @@ pub async fn remove(st: &HeadState, id: &str) -> anyhow::Result<()> {
     if sqlx::query("DELETE FROM google_accounts WHERE id = ?").bind(id).execute(&st.store.pool).await?.rows_affected() == 0 {
         return Err(not_found("no such account"));
     }
+    crate::memex::reload(st).await;
     Ok(())
 }
 
