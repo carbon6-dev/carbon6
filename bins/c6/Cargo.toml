@@ -1,0 +1,23 @@
+[package]
+name = "c6"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+c6-api.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "json", "query"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["full"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+c6-head.workspace = true
+c6-testkit.workspace = true
+c6-worker.workspace = true
+tempfile = "3.27.0"
+tokio-util = "0.7.20"

@@ -3,7 +3,9 @@
 //!
 //! A signed-in browser holds a random session token in an HttpOnly cookie;
 //! the head stores its SHA-256. Every `/api/` request needs a session
-//! except the sign-in endpoints themselves. Static assets are public, and
+//! except the sign-in endpoints themselves. Scripts and the `c6` CLI use
+//! API tokens instead (`Authorization: Bearer c6_…`), which reach
+//! everything but sign-in management (`/api/v1/auth/`). Static assets are public, and
 //! the ChatGPT OAuth callback is protected by its own `state`.
 
 use std::collections::HashMap;
@@ -115,6 +117,12 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     })
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let t = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))?.trim();
+    (!t.is_empty()).then(|| t.to_owned())
+}
+
 fn session_cookie(token: &str, secure: bool, max_age_s: i64) -> String {
     format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_s}{}", if secure { "; Secure" } else { "" })
 }
@@ -213,6 +221,50 @@ impl Store {
         Ok(true)
     }
 
+    /// A new API token; the secret is returned once.
+    pub async fn create_api_token(&self, name: &str) -> anyhow::Result<api::ApiToken> {
+        let token = format!("c6_{}", new_token());
+        let id = uuid::Uuid::now_v7().to_string();
+        let now = now_ms();
+        sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at) VALUES (?, ?, ?, ?)")
+            .bind(&id)
+            .bind(name)
+            .bind(sha256_hex(&token))
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(api::ApiToken { id, name: name.to_owned(), created_at: now, last_used_at: None, token: Some(token) })
+    }
+
+    async fn check_api_token(&self, token: &str) -> anyhow::Result<bool> {
+        let hash = sha256_hex(token);
+        let now = now_ms();
+        let Some(row) =
+            sqlx::query("SELECT last_used_at FROM api_tokens WHERE token_hash = ?").bind(&hash).fetch_optional(&self.pool).await?
+        else {
+            return Ok(false);
+        };
+        if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
+            sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
+        }
+        Ok(true)
+    }
+
+    async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
+        let rows =
+            sqlx::query("SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY created_at").fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| api::ApiToken {
+                id: r.get("id"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+                last_used_at: r.get("last_used_at"),
+                token: None,
+            })
+            .collect())
+    }
+
     async fn delete_auth_session(&self, id_prefix: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM auth_sessions WHERE substr(token_hash, 1, 16) = ?").bind(id_prefix).execute(&self.pool).await?;
         Ok(())
@@ -282,6 +334,20 @@ pub async fn require(State(st): State<Arc<HeadState>>, req: Request, next: Next)
     if !st.auth.required || !path.starts_with("/api/") || PUBLIC.contains(&path) {
         return next.run(req).await;
     }
+    if let Some(token) = bearer_token(req.headers()) {
+        // API tokens cannot manage sign-in (no minting codes, tokens or
+        // passkeys with one).
+        let ok = !path.starts_with("/api/v1/auth/")
+            && st.store.check_api_token(&token).await.unwrap_or_else(|e| {
+                tracing::warn!("checking API token: {e:#}");
+                false
+            });
+        return if ok {
+            next.run(req).await
+        } else {
+            (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response()
+        };
+    }
     let ok = match cookie_token(req.headers()) {
         Some(t) => st.store.check_auth_session(&t).await.unwrap_or_else(|e| {
             tracing::warn!("checking session: {e:#}");
@@ -313,6 +379,8 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/auth/passkeys/{id}", delete(delete_passkey).patch(rename_passkey))
         .route("/api/v1/auth/sessions", get(list_sessions))
         .route("/api/v1/auth/sessions/{id}", delete(delete_session))
+        .route("/api/v1/auth/tokens", get(list_tokens).post(create_token))
+        .route("/api/v1/auth/tokens/{id}", delete(delete_token))
 }
 
 type Res<T> = Result<T, crate::api::ApiErr>;
@@ -588,6 +656,23 @@ async fn delete_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_tokens(State(st): State<Arc<HeadState>>) -> Res<Json<Vec<api::ApiToken>>> {
+    Ok(Json(st.store.api_tokens().await?))
+}
+
+async fn create_token(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateApiToken>) -> Res<(StatusCode, Json<api::ApiToken>)> {
+    let name = req.name.trim().chars().take(80).collect::<String>();
+    if name.is_empty() {
+        return Err(bad_request("a token needs a name").into());
+    }
+    Ok((StatusCode::CREATED, Json(st.store.create_api_token(&name).await?)))
+}
+
+async fn delete_token(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> Res<StatusCode> {
+    sqlx::query("DELETE FROM api_tokens WHERE id = ?").bind(&id).execute(&st.store.pool).await.map_err(anyhow::Error::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
@@ -738,6 +823,55 @@ mod tests {
         assert_eq!(st["passkeys_here"], false);
         let r = reqwest::Client::new().post(format!("{api}/auth/passkeys/login/begin")).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let api = format!("http://localhost:{}/api/v1", head.ui_addrs[0].port());
+        let http = reqwest::Client::new();
+        // A browser session (from a login link) creates a token.
+        let link = head.state.store.create_login_link().await.unwrap();
+        let r = http.post(format!("{api}/auth/link")).json(&json!({"token": link})).send().await.unwrap();
+        let c = cookie(&r);
+        let created: Value = http
+            .post(format!("{api}/auth/tokens"))
+            .header("cookie", &c)
+            .json(&json!({"name": "ci"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = created["token"].as_str().unwrap().to_owned();
+        assert!(token.starts_with("c6_"));
+
+        let with = |path: &str, t: &str| http.get(format!("{api}{path}")).bearer_auth(t).send();
+        assert_eq!(with("/sessions", &token).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(with("/sessions", "c6_wrong").await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // Not sign-in management.
+        assert_eq!(with("/auth/tokens", &token).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let r = http.post(format!("{api}/auth/codes")).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        // Listed without the secret; revoked, it stops working.
+        let list: Value = http.get(format!("{api}/auth/tokens")).header("cookie", &c).send().await.unwrap().json().await.unwrap();
+        assert_eq!(list[0]["name"], "ci");
+        assert!(list[0].get("token").is_none());
+        let id = list[0]["id"].as_str().unwrap();
+        http.delete(format!("{api}/auth/tokens/{id}")).header("cookie", &c).send().await.unwrap();
+        assert_eq!(with("/sessions", &token).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         head.shutdown().await.unwrap();
     }
 }

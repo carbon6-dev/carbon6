@@ -296,6 +296,13 @@ pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> 
     Ok(bases.into_iter().map(|b| format!("{b}/login/{token}")).collect())
 }
 
+/// A new API token, minted on the head machine (`c6h api-token`).
+pub async fn offline_api_token(cfg: HeadConfig, name: &str) -> anyhow::Result<String> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
+    Ok(store.create_api_token(name).await?.token.unwrap_or_default())
+}
+
 pub async fn offline_enrollment(mut cfg: HeadConfig, name: Option<&str>) -> anyhow::Result<c6_api::Enrollment> {
     cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;

@@ -318,6 +318,7 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                 </div>
             })}
             <OtherDevice />
+            <ApiTokens />
             <h3 class="pt-2 text-sm font-semibold">"Signed-in browsers"</h3>
             <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 text-sm dark:divide-zinc-800 dark:border-zinc-800">
                 {move || sessions.get().map(|r| match r {
@@ -347,6 +348,82 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                 })}
             </div>
         </section>
+    }
+}
+
+/// Settings: API tokens for scripts and the `c6` CLI.
+#[component]
+fn ApiTokens() -> impl IntoView {
+    let tokens = LocalResource::new(api::api_tokens);
+    let name = RwSignal::new(String::new());
+    let created = RwSignal::new(None::<c6_api::ApiToken>);
+    let error = RwSignal::new(None::<String>);
+    let create = move || {
+        let n = name.get_untracked();
+        if n.trim().is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            match api::create_api_token(n).await {
+                Ok(t) => {
+                    error.set(None);
+                    name.set(String::new());
+                    created.set(Some(t));
+                    tokens.refetch();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let origin = window().location().origin().unwrap_or_default();
+    view! {
+        <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
+            <div class="font-medium">"API tokens"</div>
+            <p class="text-zinc-500">
+                "For scripts and the "<code>"c6"</code>" command line. A token can do anything but manage sign-in. It is shown once."
+            </p>
+            <form class="mt-2 flex gap-2" on:submit=move |ev| { ev.prevent_default(); create(); }>
+                <input class=format!("{INPUT} flex-1") placeholder="What it is for, e.g. laptop CLI" prop:value=move || name.get()
+                    on:input=move |ev| name.set(event_target_value(&ev)) />
+                <button class=format!("{BUTTON} shrink-0") type="submit">"Create a token"</button>
+            </form>
+            {move || error.get().map(|e| view! { <div class="mt-2"><ErrorBox message=e /></div> })}
+            {move || created.get().and_then(|t| t.token).map(|t| {
+                let login = format!("c6 login {origin} --token {t}");
+                view! {
+                    <div class="mt-2 space-y-1 rounded-md bg-zinc-100 p-3 dark:bg-zinc-900">
+                        <div class="select-all break-all font-mono text-xs">{t.clone()}</div>
+                        <p class="text-xs text-zinc-500">"Copy it now; it is not shown again. To set up the CLI:"</p>
+                        <div class="select-all break-all font-mono text-xs">{login}</div>
+                    </div>
+                }
+            })}
+            <div class="mt-2 divide-y divide-zinc-200 dark:divide-zinc-800">
+                {move || tokens.get().map(|r| match r {
+                    Ok(ts) => ts.into_iter().map(|t| {
+                        let id = t.id.clone();
+                        view! {
+                            <div class="flex items-center justify-between gap-3 py-1.5">
+                                <div class="min-w-0">
+                                    <div class="truncate">{t.name.clone()}</div>
+                                    <div class="text-xs text-zinc-500">{format!("created {} · {}", ago(now_ms() - t.created_at), t.last_used_at.map_or("never used".to_owned(), |u| format!("used {}", ago(now_ms() - u))))}</div>
+                                </div>
+                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                    let id = id.clone();
+                                    spawn_local(async move {
+                                        match api::delete_api_token(id).await {
+                                            Ok(()) => tokens.refetch(),
+                                            Err(e) => error.set(Some(e)),
+                                        }
+                                    });
+                                }>"Revoke"</button>
+                            </div>
+                        }
+                    }).collect_view().into_any(),
+                    Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                })}
+            </div>
+        </div>
     }
 }
 

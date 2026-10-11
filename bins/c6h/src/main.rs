@@ -30,6 +30,13 @@ enum Command {
     /// for 15 minutes). Use it to sign in the first time, then add a passkey
     /// under Settings, or to recover after losing your passkeys.
     LoginLink,
+    /// Print a new API token for scripts and the `c6` CLI. It is shown once;
+    /// revoke it under Settings → Sign-in.
+    ApiToken {
+        /// What it is for.
+        #[arg(default_value = "c6 CLI")]
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -61,6 +68,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("{url}");
             }
             eprintln!("Open one of these within 15 minutes; it works once. Then add a passkey under Settings → Sign-in.");
+            Ok(())
+        }
+        Command::ApiToken { name } => {
+            println!("{}", c6_head::offline_api_token(cfg, &name).await.context("creating API token")?);
             Ok(())
         }
         Command::EnrollToken { name } => {

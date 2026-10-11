@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "bins/*"]
-default-members = ["crates/c6-proto", "crates/c6-core", "crates/c6-api", "crates/c6-llm", "crates/c6-agent", "crates/c6-tools", "crates/c6-mcp", "crates/c6-testkit", "crates/c6-head", "crates/c6-worker", "bins/c6h", "bins/c6w"]
+default-members = ["crates/c6-proto", "crates/c6-core", "crates/c6-api", "crates/c6-llm", "crates/c6-agent", "crates/c6-tools", "crates/c6-mcp", "crates/c6-testkit", "crates/c6-head", "crates/c6-worker", "bins/c6h", "bins/c6w", "bins/c6"]
 
 [workspace.package]
 version = "0.1.0"

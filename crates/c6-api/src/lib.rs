@@ -462,6 +462,23 @@ pub struct Passkey {
     pub last_used_at: Option<UnixMs>,
 }
 
+/// An API token (for scripts and the `c6` CLI). The secret is only in the
+/// response that creates it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub id: String,
+    pub name: String,
+    pub created_at: UnixMs,
+    pub last_used_at: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateApiToken {
+    pub name: String,
+}
+
 /// A signed-in browser.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthSession {

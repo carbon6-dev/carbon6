@@ -63,6 +63,18 @@ c6w enroll c6e1.…
 c6w run
 ```
 
+### Command line (`c6`)
+
+`c6` runs sessions headless, for scripts and terminals. It signs in with an API token: create one under **Settings → Sign-in → API tokens** (or with `c6h api-token` on the head), then:
+
+```bash
+c6 login https://head.example:7700 --token c6_… --ca carbon6-ca.pem   # --ca only if the head signs its own certificate
+```
+
+- **`c6 run "fix the failing test"`** starts a session in the current folder on the only online worker (or `--worker`, `-C <dir>`, `-c <connection>`, `-m <model>`; the model defaults to your latest session's). It prints the reply as the agent works, with tool calls on stderr, and exits 0 when the turn completes, 1 when it fails, or 130 when interrupted (Ctrl-C interrupts it). The prompt can come from stdin, and `--json` prints events as JSON lines.
+- **`c6 send <id> "…"`** continues a session (a unique id prefix is enough). Also: `c6 wait`, `c6 show` (Markdown), `c6 stop`, `c6 sessions`, `c6 search` and `c6 workers`.
+- **API tokens** reach the whole API except sign-in management. Revoke them in Settings. `C6_URL`, `C6_TOKEN` and `C6_CA` override the saved login.
+
 ### Configuration
 
 - **Head:** `c6h.toml`, optional (see `crates/c6-head/src/config.rs`): `~/Library/Application Support/c6h/c6h.toml` on macOS, `~/.config/c6h/c6h.toml` on Linux, or `--config`.

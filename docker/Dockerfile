@@ -2,7 +2,7 @@
 #
 # Builds carbon6 with no local toolchain. Stages:
 #   toolchain  Rust + wasm target + Trunk (Tailwind and wasm-bindgen are fetched by Trunk)
-#   build      web UI, then release c6h, c6w, c6-eval
+#   build      web UI, then release c6h, c6w, c6, c6-eval
 #   artifacts  just the binaries (use with --output)
 #   test       runs the test suite
 #   c6h        runtime image for the head
@@ -26,8 +26,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cache/trunk \
     cd crates/c6-ui && trunk build --release && cd /src \
- && cargo build --release --locked -p c6h -p c6w -p c6-eval \
- && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6-eval /out/
+ && cargo build --release --locked -p c6h -p c6w -p c6 -p c6-eval \
+ && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6 target/release/c6-eval /out/
 
 FROM scratch AS artifacts
 COPY --from=build /out/ /

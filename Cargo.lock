@@ -365,6 +365,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "c6"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "c6-api",
+ "c6-head",
+ "c6-testkit",
+ "c6-worker",
+ "clap",
+ "dirs",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
 name = "c6-agent"
 version = "0.1.0"
 dependencies = [

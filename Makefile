@@ -65,7 +65,7 @@ docker-login-link: ## Print a one-time web UI login link from the running head c
 ui: ## Build the web UI into crates/c6-ui/dist (embedded into c6h)
 	cd crates/c6-ui && trunk build --release
 
-build: ui ## Build release binaries into target/release
+build: ui ## Build release binaries (c6h, c6w, c6) into target/release
 	cargo build --release
 
 test: ## Run the test suite
