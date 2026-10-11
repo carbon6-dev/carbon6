@@ -89,7 +89,86 @@ async fn check(st: &HeadState, name: &str, template: &str, trigger: &str, cron: 
     match trigger {
         "schedule" => Schedule::parse(cron).map(drop).map_err(bad_request),
         "webhook" => Ok(()),
-        _ => Err(bad_request("the trigger is schedule or webhook")),
+        "memex" => EventFilter::parse(cron).map(drop).map_err(bad_request),
+        _ => Err(bad_request("the trigger is schedule, webhook or memex")),
+    }
+}
+
+/// What a memex trigger waits for: an event type and conditions, e.g.
+/// `mail.received from:alice@acme.com` or `mail.received from:@acme.com
+/// subject:invoice` (all must hold; case-insensitive).
+#[derive(Debug, PartialEq)]
+pub struct EventFilter {
+    pub kind: String,
+    pub conditions: Vec<(String, String)>,
+}
+
+pub const MEMEX_EVENTS: [&str; 1] = ["mail.received"];
+
+impl EventFilter {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let mut words = s.split_whitespace();
+        let kind = words.next().ok_or("say which event, e.g. mail.received from:alice@acme.com")?.to_owned();
+        if !MEMEX_EVENTS.contains(&kind.as_str()) {
+            return Err(format!("{kind:?} is not an event ({})", MEMEX_EVENTS.join(", ")));
+        }
+        let mut conditions = Vec::new();
+        for w in words {
+            let (k, v) = w.split_once(':').ok_or_else(|| format!("{w:?}: conditions are key:value (from:, to:, subject:, account:)"))?;
+            if !matches!(k, "from" | "to" | "subject" | "account") {
+                return Err(format!("{k:?} is not a condition (from, to, subject, account)"));
+            }
+            conditions.push((k.to_owned(), v.to_lowercase()));
+        }
+        Ok(Self { kind, conditions })
+    }
+
+    pub fn matches(&self, kind: &str, data: &serde_json::Value) -> bool {
+        self.kind == kind
+            && self.conditions.iter().all(|(k, v)| {
+                let field = data[k.as_str()].as_str().unwrap_or_default().to_lowercase();
+                match k.as_str() {
+                    // The addresses in "Name <a@b>, c@d"; from:@acme.com is a
+                    // domain.
+                    "from" | "to" => field
+                        .split(',')
+                        .map(|p| p.rsplit_once('<').map(|(_, a)| a.trim_end_matches(['>', ' '])).unwrap_or(p).trim())
+                        .any(|a| if v.starts_with('@') { a.ends_with(v.as_str()) } else { a.contains(v.as_str()) }),
+                    _ => field.contains(v),
+                }
+            })
+    }
+}
+
+/// The memex reported an event: runs the automations waiting for it, with
+/// the event as their input.
+pub async fn on_memex_event(st: &HeadState, kind: &str, data: &serde_json::Value) {
+    let all = match list(st).await {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("loading automations: {e:#}");
+            return;
+        }
+    };
+    for a in all.into_iter().filter(|a| a.enabled && a.trigger == "memex") {
+        if EventFilter::parse(&a.cron).is_ok_and(|f| f.matches(kind, data)) {
+            let input = match kind {
+                "mail.received" => format!(
+                    "New email from {} to {}\nSubject: {}\n\n{}\n\n(memex item {}; thread {} in account {})",
+                    data["from"].as_str().unwrap_or(""),
+                    data["to"].as_str().unwrap_or(""),
+                    data["subject"].as_str().unwrap_or(""),
+                    data["snippet"].as_str().unwrap_or(""),
+                    data["item_id"].as_str().unwrap_or(""),
+                    data["thread_id"].as_str().unwrap_or(""),
+                    data["account"].as_str().unwrap_or("")
+                ),
+                _ => data.to_string(),
+            };
+            if let Err(e) = fire(st, &a, &input, "memex").await {
+                warn!(automation = %a.name, "memex event: {e:#}");
+            }
+        }
     }
 }
 
@@ -485,6 +564,22 @@ pub fn spawn_scheduler(st: Arc<HeadState>) {
 /// Whether a schedule had a time in (`last`, `now`].
 fn due(cron: &str, last: chrono::DateTime<Local>, now: chrono::DateTime<Local>) -> bool {
     Schedule::parse(cron).ok().and_then(|s| s.next_after(last)).is_some_and(|t| t <= now)
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::EventFilter;
+
+    #[test]
+    fn filters() {
+        let f = EventFilter::parse("mail.received from:@acme.com subject:invoice").unwrap();
+        let d = serde_json::json!({"from": "Alice <alice@acme.com>", "subject": "Invoice 7"});
+        assert!(f.matches("mail.received", &d));
+        assert!(!f.matches("mail.received", &serde_json::json!({"from": "Eve <eve@acme.com.evil.org>", "subject": "invoice"})));
+        assert!(!f.matches("mail.sent", &d));
+        assert!(EventFilter::parse("mail.received size:big").is_err());
+        assert!(EventFilter::parse("calendar.changed").is_err());
+    }
 }
 
 #[cfg(test)]

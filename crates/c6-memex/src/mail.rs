@@ -1,0 +1,657 @@
+//! Gmail: history import (newest first, resumable), then incremental sync
+//! from the history id; the mail store behind the mail client (threads,
+//! views, labels); changes back to Gmail; drafts; and sending, held a few
+//! seconds so it can be undone (or until a time you choose).
+
+use base64::Engine;
+use c6_api as api;
+use mail_parser::MimeHeaders;
+use serde_json::{Value, json};
+use sqlx::Row;
+use tracing::{info, warn};
+
+use crate::Memex;
+use crate::google::{self, Account, status_of};
+use crate::store::clip;
+
+const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+/// Messages fetched per import round.
+const IMPORT_PAGE: u32 = 100;
+/// How long a sent message waits, so it can be undone.
+pub const UNDO_MS: i64 = 10_000;
+
+fn b64url_decode(s: &str) -> anyhow::Result<Vec<u8>> {
+    // Gmail uses URL-safe base64, sometimes padded.
+    Ok(B64URL.decode(s.trim_end_matches('=').as_bytes())?)
+}
+
+/// One round of a mail account's sync: what changed since the last one,
+/// then (while importing) another page of history.
+pub async fn sync(m: &Memex, acct: &Account) -> anyhow::Result<()> {
+    let g = &m.google;
+    let mut st = google::state(&m.store, &acct.id, "mail").await?;
+    if st.cursor.is_none() {
+        let profile = g.get(&acct.id, "/gmail/v1/users/me/profile", &[]).await?;
+        st.cursor = profile["historyId"].as_str().map(str::to_owned).or_else(|| profile["historyId"].as_u64().map(|n| n.to_string()));
+        st.phase = "import".into();
+        google::save_state(&m.store, &acct.id, "mail", &st, None).await?;
+        labels(m, acct).await?;
+    }
+    // Changes since the cursor.
+    let mut page: Option<String> = None;
+    loop {
+        let mut q = vec![("startHistoryId", st.cursor.clone().unwrap_or_default())];
+        for t in ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"] {
+            q.push(("historyTypes", t.into()));
+        }
+        if let Some(p) = &page {
+            q.push(("pageToken", p.clone()));
+        }
+        let h = match g.get(&acct.id, "/gmail/v1/users/me/history", &q).await {
+            Ok(h) => h,
+            Err(e) if status_of(&e) == Some(404) => {
+                // Too old: import again (what is here already is kept).
+                warn!(account = %acct.email, "Gmail history expired; importing again");
+                st = google::SyncState { phase: "import".into(), ..Default::default() };
+                google::save_state(&m.store, &acct.id, "mail", &st, None).await?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        for rec in h["history"].as_array().into_iter().flatten() {
+            for a in rec["messagesAdded"].as_array().into_iter().flatten() {
+                let msg = &a["message"];
+                let id = msg["id"].as_str().unwrap_or_default();
+                if m.mail_item(&acct.id, id).await?.is_none()
+                    && let Some(item) = fetch(m, acct, id).await?
+                    && st.phase == "live"
+                    && labels_of(msg).iter().any(|l| l == "INBOX")
+                {
+                    {
+                        let r =
+                            sqlx::query("SELECT from_addr, from_name, to_json, subject, snippet, thread_id FROM mail WHERE item_id = ?")
+                                .bind(&item)
+                                .fetch_one(&m.store.pool)
+                                .await?;
+                        let to: Vec<(String, String)> = serde_json::from_str(&r.get::<String, _>("to_json")).unwrap_or_default();
+                        let data = json!({
+                            "account": acct.email, "item_id": item, "thread_id": r.get::<String, _>("thread_id"),
+                            "from": format!("{} <{}>", r.get::<String, _>("from_name"), r.get::<String, _>("from_addr")),
+                            "to": to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "),
+                            "subject": r.get::<String, _>("subject"), "snippet": r.get::<String, _>("snippet"),
+                        });
+                        m.emit("mail.received", data).await;
+                    }
+                }
+            }
+            for d in rec["messagesDeleted"].as_array().into_iter().flatten() {
+                if let Some(item) = m.mail_item(&acct.id, d["message"]["id"].as_str().unwrap_or_default()).await? {
+                    m.store.delete(&item).await?;
+                    sqlx::query("DELETE FROM mail WHERE item_id = ?").bind(&item).execute(&m.store.pool).await?;
+                    sqlx::query("DELETE FROM mail_labels WHERE item_id = ?").bind(&item).execute(&m.store.pool).await?;
+                }
+            }
+            for key in ["labelsAdded", "labelsRemoved"] {
+                for c in rec[key].as_array().into_iter().flatten() {
+                    let msg = &c["message"];
+                    if let Some(item) = m.mail_item(&acct.id, msg["id"].as_str().unwrap_or_default()).await? {
+                        set_labels(m, &item, &labels_of(msg)).await?;
+                    }
+                }
+            }
+        }
+        if let Some(id) = h["historyId"].as_str().map(str::to_owned).or_else(|| h["historyId"].as_u64().map(|n| n.to_string())) {
+            st.cursor = Some(id);
+        }
+        page = h["nextPageToken"].as_str().map(str::to_owned);
+        if page.is_none() {
+            break;
+        }
+    }
+    // History import: a page at a time, newest first.
+    if st.phase == "import" {
+        let mut q = vec![("maxResults", IMPORT_PAGE.to_string()), ("includeSpamTrash", "true".into())];
+        if let Some(p) = &st.page_token {
+            q.push(("pageToken", p.clone()));
+        }
+        let list = g.get(&acct.id, "/gmail/v1/users/me/messages", &q).await?;
+        for msg in list["messages"].as_array().into_iter().flatten() {
+            let id = msg["id"].as_str().unwrap_or_default();
+            if m.mail_item(&acct.id, id).await?.is_none() {
+                match fetch(m, acct, id).await {
+                    Ok(_) => st.done += 1,
+                    Err(e) => warn!(account = %acct.email, message = %id, "not imported: {e:#}"),
+                }
+            }
+        }
+        st.page_token = list["nextPageToken"].as_str().map(str::to_owned);
+        if st.page_token.is_none() {
+            st.phase = "live".into();
+            info!(account = %acct.email, messages = st.done, "Gmail import finished");
+        }
+    }
+    google::save_state(&m.store, &acct.id, "mail", &st, None).await
+}
+
+fn labels_of(msg: &Value) -> Vec<String> {
+    msg["labelIds"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+}
+
+/// Gmail's labels for an account (names for the user's own).
+pub async fn labels(m: &Memex, acct: &Account) -> anyhow::Result<()> {
+    let v = m.google.get(&acct.id, "/gmail/v1/users/me/labels", &[]).await?;
+    for l in v["labels"].as_array().into_iter().flatten() {
+        sqlx::query("INSERT OR REPLACE INTO label_names (account, id, name, type) VALUES (?, ?, ?, ?)")
+            .bind(&acct.id)
+            .bind(l["id"].as_str().unwrap_or_default())
+            .bind(l["name"].as_str().unwrap_or_default())
+            .bind(l["type"].as_str().unwrap_or("user"))
+            .execute(&m.store.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Fetches a message in full and stores it; its item id.
+async fn fetch(m: &Memex, acct: &Account, id: &str) -> anyhow::Result<Option<String>> {
+    let v = match m.google.get(&acct.id, &format!("/gmail/v1/users/me/messages/{id}"), &[("format", "raw".into())]).await {
+        Ok(v) => v,
+        Err(e) if status_of(&e) == Some(404) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let raw = b64url_decode(v["raw"].as_str().unwrap_or_default())?;
+    let date = v["internalDate"].as_str().and_then(|d| d.parse().ok()).unwrap_or_else(c6_core::now_ms);
+    Ok(Some(store_message(m, acct, id, v["threadId"].as_str().unwrap_or(id), &labels_of(&v), date, &raw).await?))
+}
+
+/// Stores a message: the item (its text searchable), the mail row, its
+/// labels, and links to the people it is from and to.
+pub async fn store_message(
+    m: &Memex,
+    acct: &Account,
+    gmail_id: &str,
+    thread_id: &str,
+    labels: &[String],
+    date: i64,
+    raw: &[u8],
+) -> anyhow::Result<String> {
+    let msg = mail_parser::MessageParser::default().parse(raw).ok_or_else(|| anyhow::anyhow!("not a mail message"))?;
+    let addrs = |a: Option<&mail_parser::Address>| -> Vec<(String, String)> {
+        a.map(|a| a.iter().filter_map(|x| Some((x.address()?.to_lowercase(), x.name().unwrap_or("").to_owned()))).collect())
+            .unwrap_or_default()
+    };
+    let from = addrs(msg.from()).into_iter().next().unwrap_or_default();
+    let (to, cc) = (addrs(msg.to()), addrs(msg.cc()));
+    let subject = msg.subject().unwrap_or("").trim().to_owned();
+    let body = match msg.body_text(0) {
+        Some(t) if !t.trim().is_empty() => t.into_owned(),
+        _ => msg.body_html(0).map(|h| htmd::convert(&h).unwrap_or_default()).unwrap_or_default(),
+    };
+    let attachments: Vec<Value> = msg
+        .attachments()
+        .enumerate()
+        .map(|(i, a)| {
+            json!({"index": i, "name": a.attachment_name().unwrap_or("attachment"), "size": a.contents().len(),
+                              "mime": a.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or(""))).unwrap_or_default()})
+        })
+        .collect();
+    let list = msg.header_raw("List-Unsubscribe").is_some()
+        || msg.header_raw("List-Id").is_some()
+        || from.0.contains("noreply")
+        || from.0.contains("no-reply");
+    let blob = m.put_blob(raw).await?;
+    let spam = labels.iter().any(|l| l == "SPAM");
+    let who = |v: &[(String, String)]| {
+        v.iter().map(|(a, n)| if n.is_empty() { a.clone() } else { format!("{n} <{a}>") }).collect::<Vec<_>>().join(", ")
+    };
+    let item = api::MemexItemIn {
+        kind: if spam { "spam" } else { "email" }.into(),
+        source: format!("gmail:{}", acct.id),
+        external_id: gmail_id.into(),
+        title: if subject.is_empty() { "(no subject)".into() } else { subject.clone() },
+        text: format!(
+            "From: {}\nTo: {}\n{}\n{}",
+            who(std::slice::from_ref(&from)),
+            who(&to),
+            if cc.is_empty() { String::new() } else { format!("Cc: {}\n", who(&cc)) },
+            clip(&body, 100_000)
+        ),
+        created_at: Some(date),
+        meta: json!({"account": acct.email, "thread_id": thread_id, "from": from.0, "attachments": attachments.len()}),
+        ..Default::default()
+    };
+    let item_id = m.store.put(&item, &item.source).await?;
+    let has = |l: &str| labels.iter().any(|x| x == l) as i64;
+    sqlx::query(
+        "INSERT INTO mail (item_id, account, gmail_id, thread_id, rfc_id, date, from_addr, from_name, to_json, cc_json, subject, snippet, labels, \
+         unread, starred, inbox, spam, trash, sent, draft, list, attachments, blob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET labels = excluded.labels, unread = excluded.unread, starred = excluded.starred, inbox = excluded.inbox, \
+         spam = excluded.spam, trash = excluded.trash, sent = excluded.sent, draft = excluded.draft",
+    )
+    .bind(&item_id)
+    .bind(&acct.id)
+    .bind(gmail_id)
+    .bind(thread_id)
+    .bind(msg.message_id().unwrap_or(""))
+    .bind(date)
+    .bind(&from.0)
+    .bind(&from.1)
+    .bind(json!(to).to_string())
+    .bind(json!(cc).to_string())
+    .bind(&subject)
+    .bind(clip(&body.split_whitespace().collect::<Vec<_>>().join(" "), 200))
+    .bind(json!(labels).to_string())
+    .bind(has("UNREAD"))
+    .bind(has("STARRED"))
+    .bind(has("INBOX"))
+    .bind(has("SPAM"))
+    .bind(has("TRASH"))
+    .bind(has("SENT"))
+    .bind(has("DRAFT"))
+    .bind(list as i64)
+    .bind(attachments.len() as i64)
+    .bind(&blob)
+    .execute(&m.store.pool)
+    .await?;
+    set_labels(m, &item_id, labels).await?;
+    // The people, as observed links.
+    m.store.clear_links(&item_id, "mail").await?;
+    if !from.0.is_empty() {
+        let p = google::person(&m.store, &from.0, &from.1).await?;
+        m.store.link(&item_id, "from", &p, "observed", "mail", None).await?;
+    }
+    for (rel, list) in [("to", &to), ("cc", &cc)] {
+        for (a, n) in list.iter() {
+            let p = google::person(&m.store, a, n).await?;
+            m.store.link(&item_id, rel, &p, "observed", "mail", None).await?;
+        }
+    }
+    Ok(item_id)
+}
+
+async fn set_labels(m: &Memex, item: &str, labels: &[String]) -> anyhow::Result<()> {
+    let has = |l: &str| labels.iter().any(|x| x == l) as i64;
+    sqlx::query(
+        "UPDATE mail SET labels = ?, unread = ?, starred = ?, inbox = ?, spam = ?, trash = ?, sent = ?, draft = ? WHERE item_id = ?",
+    )
+    .bind(json!(labels).to_string())
+    .bind(has("UNREAD"))
+    .bind(has("STARRED"))
+    .bind(has("INBOX"))
+    .bind(has("SPAM"))
+    .bind(has("TRASH"))
+    .bind(has("SENT"))
+    .bind(has("DRAFT"))
+    .bind(item)
+    .execute(&m.store.pool)
+    .await?;
+    sqlx::query("DELETE FROM mail_labels WHERE item_id = ?").bind(item).execute(&m.store.pool).await?;
+    for l in labels {
+        sqlx::query("INSERT OR IGNORE INTO mail_labels (item_id, label) VALUES (?, ?)").bind(item).bind(l).execute(&m.store.pool).await?;
+    }
+    // Spam stays out of sessions' reach.
+    sqlx::query("UPDATE items SET kind = CASE WHEN ? THEN 'spam' ELSE 'email' END WHERE id = ? AND kind IN ('email', 'spam')")
+        .bind(has("SPAM") == 1)
+        .bind(item)
+        .execute(&m.store.pool)
+        .await?;
+    Ok(())
+}
+
+/// Threads in a view, newest first: inbox, needs_reply, waiting, starred,
+/// sent, drafts, archive, spam, trash, all, or label:<id>.
+pub async fn threads(
+    m: &Memex,
+    view: &str,
+    account: Option<&str>,
+    before: Option<i64>,
+    limit: u32,
+) -> anyhow::Result<Vec<api::MailThread>> {
+    let me: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
+    let now = c6_core::now_ms();
+    let month = now - 30 * 86_400_000;
+    // The view's condition on a thread's messages.
+    let (cond, label): (&str, Option<String>) = match view {
+        "inbox" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0", None),
+        "starred" => ("m.starred = 1 AND m.trash = 0", None),
+        "sent" => ("m.sent = 1 AND m.trash = 0", None),
+        "drafts" => ("m.draft = 1 AND m.trash = 0", None),
+        "archive" => ("m.inbox = 0 AND m.trash = 0 AND m.spam = 0 AND m.sent = 0 AND m.draft = 0", None),
+        "spam" => ("m.spam = 1", None),
+        "trash" => ("m.trash = 1", None),
+        "all" => ("m.trash = 0 AND m.spam = 0", None),
+        // The latest message is from someone else, to you directly, in the
+        // inbox, not a list, this month.
+        "needs_reply" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0 AND m.list = 0", None),
+        // The latest message is yours, sent over two days ago, this month.
+        "waiting" => ("m.trash = 0 AND m.spam = 0", None),
+        v => match v.strip_prefix("label:") {
+            Some(l) => ("m.trash = 0", Some(l.to_owned())),
+            None => anyhow::bail!("no mail view {v:?}"),
+        },
+    };
+    let sql = format!(
+        "SELECT m.account AS account, m.thread_id AS thread_id, MAX(m.date) AS date, COUNT(*) AS n, MAX(m.unread) AS unread, MAX(m.starred) AS starred, \
+         MAX(m.attachments) AS attachments FROM mail m WHERE {cond} AND (?1 IS NULL OR m.account = ?1) AND (?2 IS NULL OR m.date < ?2) \
+         AND (?4 IS NULL OR m.item_id IN (SELECT item_id FROM mail_labels WHERE label = ?4)) \
+         GROUP BY m.account, m.thread_id ORDER BY date DESC LIMIT ?3"
+    );
+    // Over-fetch for the views that look at each thread's latest message.
+    let fetch = if matches!(view, "needs_reply" | "waiting") { limit * 5 } else { limit };
+    let rows =
+        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(account).bind(before).bind(fetch as i64).bind(label).fetch_all(&m.store.pool).await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (acct, thread): (String, String) = (r.get("account"), r.get("thread_id"));
+        let msgs = sqlx::query("SELECT * FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
+            .bind(&acct)
+            .bind(&thread)
+            .fetch_all(&m.store.pool)
+            .await?;
+        let Some(last) = msgs.last() else { continue };
+        let last_from: String = last.get("from_addr");
+        let mine = me.contains(&last_from);
+        let date: i64 = r.get("date");
+        let keep = match view {
+            "needs_reply" => {
+                let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
+                !mine && date > month && to.iter().any(|(a, _)| me.contains(a))
+            }
+            // Yours, unanswered: sent to someone else.
+            "waiting" => {
+                let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
+                mine && date < now - 2 * 86_400_000 && date > month && to.iter().any(|(a, _)| !me.contains(a))
+            }
+            _ => true,
+        };
+        if !keep {
+            continue;
+        }
+        let mut people: Vec<String> = Vec::new();
+        for x in &msgs {
+            let n: String = x.get("from_name");
+            let a: String = x.get("from_addr");
+            let label = if me.contains(&a) {
+                "me".to_owned()
+            } else if n.is_empty() {
+                a
+            } else {
+                n
+            };
+            if !people.contains(&label) {
+                people.push(label);
+            }
+        }
+        out.push(api::MailThread {
+            account: acct,
+            thread_id: thread,
+            subject: last.get::<String, _>("subject"),
+            snippet: last.get("snippet"),
+            date,
+            count: r.get::<i64, _>("n") as u32,
+            unread: r.get::<i64, _>("unread") != 0,
+            starred: r.get::<i64, _>("starred") != 0,
+            attachments: r.get::<i64, _>("attachments") != 0,
+            people,
+            labels: serde_json::from_str(&last.get::<String, _>("labels")).unwrap_or_default(),
+        });
+        if out.len() as u32 >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// A thread's messages, with each one's HTML (if any) and attachments.
+pub async fn thread(m: &Memex, account: &str, thread_id: &str) -> anyhow::Result<Vec<api::MailMessage>> {
+    let rows = sqlx::query("SELECT * FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
+        .bind(account)
+        .bind(thread_id)
+        .fetch_all(&m.store.pool)
+        .await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let raw = tokio::fs::read(m.blob_path(&r.get::<String, _>("blob"))).await.unwrap_or_default();
+        let msg = mail_parser::MessageParser::default().parse(&raw);
+        let (text, html, attachments) = match &msg {
+            Some(p) => (
+                p.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+                p.body_html(0).map(|t| t.into_owned()),
+                p.attachments()
+                    .enumerate()
+                    .map(|(i, a)| api::MailAttachment {
+                        index: i as u32,
+                        name: a.attachment_name().unwrap_or("attachment").to_owned(),
+                        mime: a.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or(""))).unwrap_or_default(),
+                        size: a.contents().len() as u64,
+                    })
+                    .collect(),
+            ),
+            None => (String::new(), None, Vec::new()),
+        };
+        out.push(api::MailMessage {
+            item_id: r.get("item_id"),
+            gmail_id: r.get("gmail_id"),
+            from: r.get("from_addr"),
+            from_name: r.get("from_name"),
+            to: serde_json::from_str(&r.get::<String, _>("to_json")).unwrap_or_default(),
+            cc: serde_json::from_str(&r.get::<String, _>("cc_json")).unwrap_or_default(),
+            date: r.get("date"),
+            subject: r.get("subject"),
+            text,
+            html,
+            attachments,
+            labels: serde_json::from_str(&r.get::<String, _>("labels")).unwrap_or_default(),
+            unread: r.get::<i64, _>("unread") != 0,
+        });
+    }
+    Ok(out)
+}
+
+/// A message's attachment: (name, mime, bytes).
+pub async fn attachment(m: &Memex, item_id: &str, index: usize) -> anyhow::Result<(String, String, Vec<u8>)> {
+    let blob: String = sqlx::query_scalar("SELECT blob FROM mail WHERE item_id = ?")
+        .bind(item_id)
+        .fetch_optional(&m.store.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no such message"))?;
+    let raw = tokio::fs::read(m.blob_path(&blob)).await?;
+    let msg = mail_parser::MessageParser::default().parse(&raw).ok_or_else(|| anyhow::anyhow!("unreadable message"))?;
+    let a = msg.attachments().nth(index).ok_or_else(|| anyhow::anyhow!("no attachment {index}"))?;
+    Ok((
+        a.attachment_name().unwrap_or("attachment").to_owned(),
+        a.content_type()
+            .map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("")))
+            .unwrap_or_else(|| "application/octet-stream".into()),
+        a.contents().to_vec(),
+    ))
+}
+
+/// Adds and removes labels on a thread (in Gmail, then here): read and
+/// unread (UNREAD), archive (−INBOX), star (STARRED), trash (TRASH).
+pub async fn modify(m: &Memex, account: &str, thread_id: &str, add: &[String], remove: &[String]) -> anyhow::Result<()> {
+    let body = json!({"addLabelIds": add, "removeLabelIds": remove});
+    m.google.call(account, reqwest::Method::POST, &format!("/gmail/v1/users/me/threads/{thread_id}/modify"), &[], Some(&body)).await?;
+    let rows = sqlx::query("SELECT item_id, labels FROM mail WHERE account = ? AND thread_id = ?")
+        .bind(account)
+        .bind(thread_id)
+        .fetch_all(&m.store.pool)
+        .await?;
+    for r in rows {
+        let mut labels: Vec<String> = serde_json::from_str(&r.get::<String, _>("labels")).unwrap_or_default();
+        labels.retain(|l| !remove.contains(l));
+        for a in add {
+            if !labels.contains(a) {
+                labels.push(a.clone());
+            }
+        }
+        set_labels(m, &r.get::<String, _>("item_id"), &labels).await?;
+    }
+    Ok(())
+}
+
+/// A message to send (or keep as a draft), as RFC 822 in base64url, and
+/// the thread it continues.
+async fn compose(m: &Memex, d: &api::MailDraft) -> anyhow::Result<(String, Option<String>)> {
+    let acct = m.account(&d.account)?;
+    let mut b = mail_builder::MessageBuilder::new()
+        .from((acct.name.clone(), acct.email.clone()))
+        .to(d.to.iter().map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect::<Vec<_>>())
+        .subject(d.subject.clone());
+    if !d.cc.is_empty() {
+        b = b.cc(d.cc.clone());
+    }
+    if !d.bcc.is_empty() {
+        b = b.bcc(d.bcc.clone());
+    }
+    let mut thread = None;
+    if let Some(reply) = &d.reply_to {
+        let r = sqlx::query("SELECT thread_id, rfc_id FROM mail WHERE item_id = ?").bind(reply).fetch_optional(&m.store.pool).await?;
+        if let Some(r) = r {
+            let rfc: String = r.get("rfc_id");
+            if !rfc.is_empty() {
+                b = b.in_reply_to(rfc.clone()).references(rfc);
+            }
+            thread = Some(r.get("thread_id"));
+        }
+    }
+    let html = markdown_html(&d.body);
+    b = b.text_body(d.body.clone()).html_body(html);
+    for a in &d.attachments {
+        let data = base64::engine::general_purpose::STANDARD.decode(a.data.as_bytes())?;
+        b = b.attachment(if a.mime.is_empty() { "application/octet-stream".to_owned() } else { a.mime.clone() }, a.name.clone(), data);
+    }
+    let raw = b.write_to_vec()?;
+    Ok((B64URL.encode(raw), thread))
+}
+
+fn markdown_html(md: &str) -> String {
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, pulldown_cmark::Parser::new(md));
+    html
+}
+
+/// Saves a draft in Gmail (new, or replacing `draft_id`); its id.
+pub async fn draft(m: &Memex, d: &api::MailDraft) -> anyhow::Result<String> {
+    let (raw, thread) = compose(m, d).await?;
+    let acct = m.account_id(&d.account)?;
+    let mut message = json!({"raw": raw});
+    if let Some(t) = thread {
+        message["threadId"] = json!(t);
+    }
+    let v = match &d.draft_id {
+        Some(id) => {
+            m.google
+                .call(&acct, reqwest::Method::PUT, &format!("/gmail/v1/users/me/drafts/{id}"), &[], Some(&json!({"message": message})))
+                .await?
+        }
+        None => m.google.call(&acct, reqwest::Method::POST, "/gmail/v1/users/me/drafts", &[], Some(&json!({"message": message}))).await?,
+    };
+    Ok(v["id"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Queues a message: sent after the undo window, or at `send_at`.
+pub async fn queue(m: &Memex, d: &api::MailDraft, made_by: &str) -> anyhow::Result<api::Outgoing> {
+    anyhow::ensure!(!d.to.is_empty(), "a message needs a recipient");
+    let (raw, thread) = compose(m, d).await?;
+    let acct = m.account_id(&d.account)?;
+    let now = c6_core::now_ms();
+    let send_at = d.send_at.filter(|t| *t > now).unwrap_or(now + UNDO_MS);
+    let id = uuid::Uuid::now_v7().simple().to_string();
+    sqlx::query("INSERT INTO outgoing (id, account, raw, thread_id, send_at, status, subject, to_json, made_by, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)")
+        .bind(&id)
+        .bind(&acct)
+        .bind(&raw)
+        .bind(&thread)
+        .bind(send_at)
+        .bind(&d.subject)
+        .bind(json!(d.to).to_string())
+        .bind(made_by)
+        .bind(now)
+        .execute(&m.store.pool)
+        .await?;
+    Ok(api::Outgoing { id, send_at, status: "pending".into(), subject: d.subject.clone(), to: d.to.clone(), error: None })
+}
+
+/// Cancels a queued message, if it has not gone yet.
+pub async fn cancel(m: &Memex, id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query("UPDATE outgoing SET status = 'cancelled' WHERE id = ? AND status = 'pending'")
+        .bind(id)
+        .execute(&m.store.pool)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+pub async fn outgoing(m: &Memex) -> anyhow::Result<Vec<api::Outgoing>> {
+    let rows = sqlx::query("SELECT * FROM outgoing WHERE status IN ('pending', 'failed') OR created_at > ? ORDER BY send_at DESC LIMIT 50")
+        .bind(c6_core::now_ms() - 86_400_000)
+        .fetch_all(&m.store.pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| api::Outgoing {
+            id: r.get("id"),
+            send_at: r.get("send_at"),
+            status: r.get("status"),
+            subject: r.get("subject"),
+            to: serde_json::from_str(&r.get::<String, _>("to_json")).unwrap_or_default(),
+            error: r.get("error"),
+        })
+        .collect())
+}
+
+/// Sends what is due.
+pub async fn send_due(m: &Memex) -> anyhow::Result<()> {
+    let due = sqlx::query("SELECT * FROM outgoing WHERE status = 'pending' AND send_at <= ? ORDER BY send_at")
+        .bind(c6_core::now_ms())
+        .fetch_all(&m.store.pool)
+        .await?;
+    for r in due {
+        let id: String = r.get("id");
+        // Claimed first, so it is sent once.
+        if sqlx::query("UPDATE outgoing SET status = 'sending' WHERE id = ? AND status = 'pending'")
+            .bind(&id)
+            .execute(&m.store.pool)
+            .await?
+            .rows_affected()
+            == 0
+        {
+            continue;
+        }
+        let mut body = json!({"raw": r.get::<String, _>("raw")});
+        if let Some(t) = r.get::<Option<String>, _>("thread_id") {
+            body["threadId"] = json!(t);
+        }
+        let account: String = r.get("account");
+        let result = m.google.call(&account, reqwest::Method::POST, "/gmail/v1/users/me/messages/send", &[], Some(&body)).await;
+        let (status, error) = match &result {
+            Ok(_) => ("sent", None),
+            Err(e) => ("failed", Some(format!("{e:#}"))),
+        };
+        sqlx::query("UPDATE outgoing SET status = ?, error = ? WHERE id = ?")
+            .bind(status)
+            .bind(&error)
+            .bind(&id)
+            .execute(&m.store.pool)
+            .await?;
+        match result {
+            Ok(_) => info!(subject = %r.get::<String, _>("subject"), "mail sent"),
+            Err(e) => warn!("sending mail: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Gmail's labels for the mail client's sidebar: (account, id, name).
+pub async fn label_list(m: &Memex) -> anyhow::Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as("SELECT account, id, name FROM label_names WHERE type = 'user' ORDER BY name").fetch_all(&m.store.pool).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn markdown() {
+        assert_eq!(super::markdown_html("Hi **there**"), "<p>Hi <strong>there</strong></p>\n");
+    }
+}

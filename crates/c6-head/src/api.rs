@@ -28,6 +28,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
         .route("/auth/callback", get(chatgpt_callback))
+        .route("/auth/google/callback", get(crate::google::callback))
+        .route("/api/v1/google/client", get(get_google_client).put(put_google_client))
+        .route("/api/v1/google/connect", post(google_connect))
+        .route("/api/v1/google/accounts", get(google_accounts))
+        .route("/api/v1/google/accounts/{id}", delete(google_remove))
         .route("/ca.pem", get(ui_ca_pem))
         .route("/ca.crt", get(ui_ca_crt))
         .route("/ca.mobileconfig", get(ui_ca_profile))
@@ -78,6 +83,15 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/memex/mentions", get(memex_mentions))
         .route("/api/v1/memex/notes", post(memex_note))
         .route("/api/v1/memex/items/{id}", delete(memex_delete))
+        .route("/api/v1/memex/items/{id}/content", get(memex_content))
+        .route("/api/v1/memex/upload", post(memex_upload).layer(axum::extract::DefaultBodyLimit::max(80 * 1024 * 1024)))
+        .route("/api/v1/memex/scan", post(memex_scan))
+        .route("/api/v1/memex/rpc", post(memex_rpc).layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)))
+        .route("/api/v1/mail/attachment", get(mail_attachment))
+        .route("/api/v1/memex/trails", get(memex_trails).post(memex_trail_append))
+        .route("/api/v1/memex/trails/{id}", get(memex_trail).patch(memex_trail_update).delete(memex_trail_delete))
+        .route("/api/v1/memex/trails/{id}/steps/{step}", delete(memex_trail_remove_step))
+        .route("/api/v1/settings/memex_folders", get(get_memex_folders).put(put_memex_folders))
         .route("/api/v1/workflows/runs", get(list_workflow_runs))
         .route("/api/v1/workflows/runs/{id}", get(get_workflow_run))
         .route("/api/v1/workflows/runs/{id}/steps/{step}/decide", post(decide_workflow_step))
@@ -1077,6 +1091,191 @@ async fn memex_note(State(st): State<Arc<HeadState>>, Json(n): Json<api::MemexNo
     }
     let params = serde_json::json!({"text": n.text, "labels": n.about, "made_by": "you"});
     Ok(Json(crate::memex::call(&st, "memex.note", params).await?))
+}
+
+async fn get_google_client(State(st): State<Arc<HeadState>>, headers: HeaderMap) -> ApiResult<Json<api::GoogleClient>> {
+    let mut c = crate::google::get_client(&st).await?;
+    c.redirect_uri =
+        crate::google::redirect_uri(&st, headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).or(origin_of(&headers).as_deref()))
+            .await;
+    Ok(Json(c))
+}
+
+/// The page's origin, from Host (GET requests carry no Origin).
+fn origin_of(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let proto = headers.get("x-forwarded-proto").and_then(|p| p.to_str().ok()).unwrap_or("http");
+    Some(format!("{proto}://{host}"))
+}
+
+async fn put_google_client(State(st): State<Arc<HeadState>>, Json(c): Json<api::GoogleClientIn>) -> ApiResult<StatusCode> {
+    if c.client_id.trim().is_empty() {
+        return Err(crate::bad_request("the client ID is required").into());
+    }
+    crate::google::set_client(&st, &c).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn google_connect(State(st): State<Arc<HeadState>>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
+    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
+    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, origin.as_deref()).await?})))
+}
+
+async fn google_accounts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::GoogleAccount>>> {
+    Ok(Json(crate::google::accounts(&st).await?))
+}
+
+async fn google_remove(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::google::remove(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct RpcIn {
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// The mail client, calendar and contacts call the memex through here (you,
+/// signed in: everything is in scope).
+async fn memex_rpc(State(st): State<Arc<HeadState>>, Json(r): Json<RpcIn>) -> ApiResult<Json<serde_json::Value>> {
+    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts."].iter().any(|p| r.method.starts_with(p))
+        || matches!(r.method.as_str(), "memex.google" | "memex.google_sync");
+    if !ok {
+        return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
+    }
+    let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
+    params["made_by"] = serde_json::json!("you");
+    Ok(Json(crate::memex::call(&st, &r.method, params).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct AttachmentQuery {
+    item: String,
+    #[serde(default)]
+    index: u32,
+}
+
+/// A mail attachment, served like an output (nosniff; sandboxed when it
+/// could run script) and as a download unless it is an image or PDF.
+async fn mail_attachment(State(st): State<Arc<HeadState>>, Query(q): Query<AttachmentQuery>) -> ApiResult<Response> {
+    use base64::Engine;
+    let v = crate::memex::call(&st, "memex.mail.attachment", serde_json::json!({"item_id": q.item, "index": q.index})).await?;
+    let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(anyhow::Error::from)?;
+    let name = v["name"].as_str().unwrap_or("attachment").replace(['"', '\\', '\n', '\r'], "_");
+    let mime = v["mime"].as_str().unwrap_or("application/octet-stream").to_owned();
+    let inline = mime.starts_with("image/") && !mime.contains("svg") || mime == "application/pdf";
+    let disposition = format!("{}; filename=\"{name}\"", if inline { "inline" } else { "attachment" });
+    let mut resp = (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::HeaderName::from_static("x-content-type-options"), "nosniff".to_owned()),
+        ],
+        data,
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"),
+    );
+    Ok(resp)
+}
+
+async fn memex_upload(State(st): State<Arc<HeadState>>, Json(u): Json<api::MemexUpload>) -> ApiResult<Json<serde_json::Value>> {
+    crate::sessions::check_labels(&u.labels)?;
+    Ok(Json(crate::memex::call(&st, "memex.upload", serde_json::to_value(u).map_err(anyhow::Error::from)?).await?))
+}
+
+async fn memex_scan(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call(&st, "memex.scan", serde_json::json!({})).await?))
+}
+
+/// An item's original (a document's file), served like an output: never
+/// sniffed, and sandboxed when it could run script.
+async fn memex_content(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<Response> {
+    use base64::Engine;
+    let v = crate::memex::call(&st, "memex.content", serde_json::json!({"id": id})).await?;
+    let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(anyhow::Error::from)?;
+    let name = v["name"].as_str().unwrap_or("file").replace(['"', '\\', '\n', '\r'], "_");
+    let mime = v["mime"].as_str().unwrap_or("application/octet-stream").to_owned();
+    let disposition =
+        if q.contains_key("download") { format!("attachment; filename=\"{name}\"") } else { format!("inline; filename=\"{name}\"") };
+    let mut resp = (
+        [
+            (header::CONTENT_TYPE, mime.clone()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::HeaderName::from_static("x-content-type-options"), "nosniff".to_owned()),
+        ],
+        data,
+    )
+        .into_response();
+    if mime.contains("html") || mime.contains("svg") || mime == "application/octet-stream" {
+        resp.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static("sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"),
+        );
+    }
+    Ok(resp)
+}
+
+async fn memex_trails(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call(&st, "memex.trails", serde_json::json!({})).await?))
+}
+
+async fn memex_trail(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call(&st, "memex.trail", serde_json::json!({"id": id})).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct TrailStepIn {
+    trail: String,
+    target: String,
+    #[serde(default)]
+    comment: String,
+}
+
+async fn memex_trail_append(State(st): State<Arc<HeadState>>, Json(s): Json<TrailStepIn>) -> ApiResult<Json<serde_json::Value>> {
+    let params = serde_json::json!({"trail": s.trail, "target": s.target, "comment": s.comment, "made_by": "you"});
+    Ok(Json(crate::memex::call(&st, "memex.trail_append", params).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct TrailEdit {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn memex_trail_update(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Json(e): Json<TrailEdit>) -> ApiResult<StatusCode> {
+    crate::memex::call(&st, "memex.trail_update", serde_json::json!({"id": id, "name": e.name, "description": e.description})).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn memex_trail_delete(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::memex::call(&st, "memex.trail_delete", serde_json::json!({"id": id})).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn memex_trail_remove_step(State(st): State<Arc<HeadState>>, Path((_, step)): Path<(String, i64)>) -> ApiResult<StatusCode> {
+    crate::memex::call(&st, "memex.trail_remove_step", serde_json::json!({"step": step})).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_memex_folders(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::MemexFolder>>> {
+    Ok(Json(serde_json::from_str(&st.store.setting(crate::memex::FOLDERS).await?.unwrap_or_default()).unwrap_or_default()))
+}
+
+async fn put_memex_folders(State(st): State<Arc<HeadState>>, Json(f): Json<Vec<api::MemexFolder>>) -> ApiResult<StatusCode> {
+    crate::memex::check_folders(&f)?;
+    st.store.set_setting(crate::memex::FOLDERS, &serde_json::to_string(&f).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn memex_delete(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

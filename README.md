@@ -148,8 +148,45 @@ The memex is your knowledge store: a separate service, `c6m`, on the same fabric
   - **Briefs:** a new session starts with a brief from the memex about its labels and its first message (notes, recent sessions about the same things, what else matches), in place of the memory section.
   - **Tools:** agents get `memex_search` (keywords and meaning), `memex_get` (an item in full, or a thing with its notes, items and related things) and `memex_note`.
 - **@-mentions:** typing `@` in a message also offers things from the memex (people, clients, hosts, topics); `@memex:client:acme` attaches what the memex knows about it to the message.
+- **Documents and papers:** add files on the Memex page (**Add files**) or keep folders in sync (**Settings → Memex folders**, on the memex's machine).
+  - **Formats:** PDF, Word (.docx), Markdown, HTML and text are read.
+  - **Papers** are recognized, with their title, authors, DOI or arXiv id, and the papers they cite. Cited papers become things too, so the memex holds a citation graph. For example, a paper's page lists the papers in your memex that cite it.
+  - **Originals** open from the item.
+- **Trails:** named paths through items and things, each step with a note on why it matters. Add steps from any item, or have agents add them with `memex_trail`. See them under **Memex → Trails**.
 - **Search by meaning:** **Settings → Memex** picks an embedding model from one of your connections (Ollama's `nomic-embed-text`, OpenAI's `text-embedding-3-small`, …). Without one, search is by keywords.
 - **Scopes:** sessions see sessions, outputs, web pages, notes, documents and papers. **Settings → Memex scopes** lets sessions with given labels see more (email, photos, once those are in). You see everything on the **Memex** page, where you can also search, open items and things, delete items, and write notes.
+
+### Mail, calendar and contacts
+
+With a memex connected, carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**).
+
+- **Setup** (**Settings → Mail & calendar**):
+  - Create an OAuth client in your Google Cloud project (Web application, with the redirect URI shown).
+  - Enable the Gmail, Calendar and People APIs.
+  - Set the app to "In production", or "Internal" for Workspace.
+  - Paste the client ID and secret, then **Add Google account**.
+
+  The head keeps the sign-in encrypted; the memex gets short-lived access only.
+- **Mail:**
+  - **Import:** your whole mailbox is imported, newest first and resumable, then kept in sync every minute. Labels, read state, archive and drafts sync both ways.
+  - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
+  - **Reading:** conversations, with HTML sandboxed and remote images off until you allow them.
+  - **Writing:** Markdown compose, reply and reply all, attachments, drafts, **send later**, and **undo** (messages wait 10 seconds).
+  - **In the graph:** every message is in the memex. Senders and recipients become people (one person across all their addresses), and company domains become organizations.
+  - **Inbox:** carbon6's inbox shows mail that needs a reply.
+- **Calendar:**
+  - **Sync:** every calendar on every account, synced both ways.
+  - **Views:** agenda, week and month, with recurring events expanded (exceptions included).
+  - **Events:** details, RSVP, delete (this event, this and following, or all), and new events with invitations.
+- **Contacts:**
+  - Synced both ways.
+  - People you write to (and hear from) but who aren't contacts are listed, and **Add to Google contacts** files them in a `carbon6` group. **Settings → Memex** can do this on its own.
+- **Agents:** sessions whose scope includes email (**Settings → Memex scopes**, for example labels `mail`) get:
+  - `mail_threads`, `mail_thread` (mail is marked as untrusted data, never instructions), `mail_draft` and `mail_send`;
+  - `calendar_events` (with free/busy), `calendar_create` and `calendar_rsvp`.
+
+  A built-in policy holds `mail_send`, `calendar_create` and `calendar_rsvp` for your approval (switch it off in **Settings → Memex**).
+- **Automations on mail:** the trigger **When mail arrives** starts a template or workflow for matching mail (`mail.received from:@acme.com subject:invoice`), with the message as its input.
 
 ### Browser
 

@@ -3,9 +3,12 @@
 mod activity;
 mod api;
 mod auth;
+mod calendar;
+mod contacts;
 mod files;
 mod fleet;
 mod labels;
+mod mail;
 mod markdown;
 mod memex;
 mod notify;
@@ -136,6 +139,9 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Mail class=MENU>"Mail"</Go>
+                    <Go to=View::Calendar class=MENU>"Calendar"</Go>
+                    <Go to=View::Contacts class=MENU>"Contacts"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None } class=MENU>"Settings"</Go>

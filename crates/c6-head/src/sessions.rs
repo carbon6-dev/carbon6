@@ -229,7 +229,28 @@ look at files and run read-only commands as needed, but do not change files unle
 
 /// The worker-side spec of a session, from its row. `seed` is the branched-
 /// from conversation of a side chat.
+/// Your policies, after the built-in one: agents' mail and invitations
+/// wait for your approval (unless you turned that off).
+async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
+    let on = crate::memex::settings(st).await.ok().and_then(|s| s.send_needs_approval).unwrap_or(true);
+    let mut list: Vec<serde_json::Value> = serde_json::from_str(&yours).unwrap_or_default();
+    if on {
+        list.insert(
+            0,
+            serde_json::json!({
+                "name": "Sending mail and invitations needs your approval",
+                "tools": "^(mail_send|MailSend|calendar_create|CalendarCreate|calendar_rsvp|CalendarRsvp)$",
+                "action": "ask",
+                "message": "An agent wants to send mail or answer or send an invitation in your name.",
+            }),
+        );
+    }
+    serde_json::to_string(&list).unwrap_or(yours)
+}
+
 async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Vec<SessionEvent>) -> anyhow::Result<CreateSession> {
+    let memex = st.registry.memex().is_some();
+    let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
     let base_prompt =
         if row.fork_seq.is_some() { format!("{}\n\n{SIDE_CHAT_NOTE}", c6_agent::BASE_PROMPT) } else { c6_agent::BASE_PROMPT.into() };
@@ -253,10 +274,12 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
         memories_json: crate::memory::for_sessions(st).await?,
-        policies_json: st.store.setting(POLICIES).await?.unwrap_or_default(),
+        policies_json: with_builtin_policies(st, st.store.setting(POLICIES).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
         memex_brief: String::new(),
-        memex_tools: st.registry.memex().is_some(),
+        memex_tools: memex,
+        memex_mail: memex && scope.iter().any(|k| k == "email"),
+        memex_calendar: memex && scope.iter().any(|k| k == "event"),
         seed,
     })
 }
@@ -1036,6 +1059,24 @@ pub async fn credential(st: &HeadState, worker_id: WorkerId, req: CredentialRequ
     if let Some(name) = req.connection_id.strip_prefix("secret:") {
         let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
         return secret_credential(st, &worker_name, name, grant).await;
+    }
+    // Google accounts: for the memex only (it syncs mail, calendars and
+    // contacts); workers reach them through the memex.
+    if let Some(account) = req.connection_id.strip_prefix("google:") {
+        if st.registry.get(worker_id).map(|l| l.role).as_deref() != Some("memex") {
+            grant.error = "Google accounts are for the memex".into();
+            return grant;
+        }
+        match crate::google::access_token(st, account).await {
+            Ok((token, expires)) => {
+                grant.kind = "google".into();
+                grant.base_url = crate::google::endpoints().api;
+                grant.bearer = token;
+                grant.expires_at_ms = expires;
+            }
+            Err(e) => grant.error = format!("Google sign-in needs attention: {e:#}"),
+        }
+        return grant;
     }
     let conn = match st.store.connection(&req.connection_id).await {
         Ok(Some(c)) => c,

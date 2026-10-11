@@ -342,6 +342,65 @@ pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::
     send_json(Request::post("/api/v1/memex/notes"), &c6_api::MemexNoteIn { text, about }).await
 }
 
+/// Mail, calendars and contacts: a memex method (see the head's /memex/rpc).
+pub async fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_json(Request::post("/api/v1/memex/rpc"), &serde_json::json!({"method": method, "params": params})).await
+}
+
+pub async fn rpc_as<T: serde::de::DeserializeOwned>(method: &str, params: serde_json::Value) -> Result<T, String> {
+    serde_json::from_value(rpc(method, params).await?).map_err(|e| e.to_string())
+}
+
+pub async fn google_client() -> Result<c6_api::GoogleClient, String> {
+    json(Request::get("/api/v1/google/client").send().await).await
+}
+
+pub async fn set_google_client(client_id: String, client_secret: Option<String>) -> Result<(), String> {
+    let body = c6_api::GoogleClientIn { client_id, client_secret };
+    empty(Request::put("/api/v1/google/client").json(&body).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn google_connect() -> Result<String, String> {
+    let v: serde_json::Value = json(Request::post("/api/v1/google/connect").send().await).await?;
+    Ok(v["authorize_url"].as_str().unwrap_or_default().to_owned())
+}
+
+pub async fn google_accounts() -> Result<Vec<c6_api::GoogleAccount>, String> {
+    json(Request::get("/api/v1/google/accounts").send().await).await
+}
+
+pub async fn google_remove(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/google/accounts/{id}")).send().await).await
+}
+
+pub async fn memex_upload(u: c6_api::MemexUpload) -> Result<serde_json::Value, String> {
+    send_json(Request::post("/api/v1/memex/upload"), &u).await
+}
+
+pub async fn memex_trails() -> Result<Vec<c6_api::MemexTrail>, String> {
+    json(Request::get("/api/v1/memex/trails").send().await).await
+}
+
+pub async fn memex_trail(id: String) -> Result<c6_api::MemexTrail, String> {
+    json(Request::get(&format!("/api/v1/memex/trails/{}", js_sys::encode_uri_component(&id))).send().await).await
+}
+
+pub async fn memex_trail_append(trail: String, target: String, comment: String) -> Result<serde_json::Value, String> {
+    send_json(Request::post("/api/v1/memex/trails"), &serde_json::json!({"trail": trail, "target": target, "comment": comment})).await
+}
+
+pub async fn memex_trail_remove(trail: String, step: i64) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/memex/trails/{trail}/steps/{step}")).send().await).await
+}
+
+pub async fn memex_trail_delete(trail: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/memex/trails/{trail}")).send().await).await
+}
+
+pub async fn memex_scan() -> Result<serde_json::Value, String> {
+    json(Request::post("/api/v1/memex/scan").send().await).await
+}
+
 pub async fn memex_mentions(q: String) -> Result<Vec<c6_api::MemexThingRef>, String> {
     json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).send().await).await
 }

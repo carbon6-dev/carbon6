@@ -132,6 +132,7 @@ pub fn InboxPage() -> impl IntoView {
     view! {
         <main class="mx-auto max-w-3xl space-y-6 px-4 py-6">
             <crate::labels::LabelFilterBar />
+            <MailNeedsReply />
             {move || {
                 // Sessions the filter hides, so an empty inbox is not misread.
                 let f = filter.get();
@@ -362,5 +363,28 @@ pub fn MobileBar() -> impl IntoView {
                 {move || (count() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{count()}</span> })}
             </button>
         </nav>
+    }
+}
+
+/// Mail that needs a reply (when a memex with Google accounts is there).
+#[component]
+fn MailNeedsReply() -> impl IntoView {
+    let threads = LocalResource::new(|| {
+        api::rpc_as::<Vec<c6_api::MailThread>>("memex.mail.threads", serde_json::json!({"view": "needs_reply", "limit": 6}))
+    });
+    view! {
+        {move || threads.get().and_then(Result::ok).filter(|t| !t.is_empty()).map(|t| view! {
+            <section class="space-y-2">
+                <h2 class="text-sm font-semibold text-zinc-500">"Mail that needs a reply"</h2>
+                <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
+                    {t.into_iter().map(|x| view! {
+                        <crate::workspace::Go to=crate::workspace::View::Mail class="block px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+                            <span class="font-medium">{x.people.join(", ")}</span>
+                            <span class="ml-2 text-zinc-600 dark:text-zinc-400">{x.subject.clone()}</span>
+                        </crate::workspace::Go>
+                    }).collect_view()}
+                </div>
+            </section>
+        })}
     }
 }

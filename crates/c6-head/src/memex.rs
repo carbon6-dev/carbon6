@@ -19,6 +19,7 @@ use crate::{HeadState, bad_request};
 /// Settings keys.
 pub const SETTINGS: &str = "memex";
 pub const SCOPES: &str = "memex_scopes";
+pub const FOLDERS: &str = "memex_folders";
 const MEMORIES_SENT: &str = "memex_memories_sent";
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,7 +43,14 @@ impl Feed {
 /// Calls the memex now. Err if none is connected.
 pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
     let id = st.registry.memex().ok_or_else(|| bad_request("no memex is connected (Settings → Memex)"))?;
-    st.registry.call(id, method, params, CALL_TIMEOUT).await.map_err(|e| anyhow::anyhow!("memex: {e}"))
+    st.registry.call(id, method, params, CALL_TIMEOUT).await.map_err(|e| {
+        // What the memex refuses is about the request; losing it is not.
+        if e.contains("not connected") || e.contains("disconnected") || e.contains("in time") {
+            anyhow::anyhow!("memex: {e}")
+        } else {
+            bad_request(format!("memex: {e}"))
+        }
+    })
 }
 
 /// Queues a call for the memex; it is delivered in order, when one is
@@ -168,6 +176,16 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
     Ok(())
 }
 
+pub fn check_folders(folders: &[api::MemexFolder]) -> anyhow::Result<()> {
+    for f in folders {
+        if !f.path.starts_with('/') && !f.path.starts_with('~') {
+            return Err(bad_request(format!("{:?}: a folder is a full path on the memex's machine", f.path)));
+        }
+        crate::sessions::check_labels(&f.labels)?;
+    }
+    Ok(())
+}
+
 pub fn check_scopes(scopes: &[api::MemexScope]) -> anyhow::Result<()> {
     for s in scopes {
         if s.name.trim().is_empty() {
@@ -195,7 +213,14 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         }
         None => None,
     };
-    Ok(json!({"embedding": embedding}))
+    let folders: Vec<api::MemexFolder> = serde_json::from_str(&st.store.setting(FOLDERS).await?.unwrap_or_default()).unwrap_or_default();
+    Ok(json!({
+        "embedding": embedding,
+        "folders": folders,
+        "google": crate::google::for_memex(st).await,
+        "google_people": crate::google::endpoints().people,
+        "contacts_auto": s.contacts_auto.unwrap_or(false),
+    }))
 }
 
 /// The kinds a session with `labels` may see.

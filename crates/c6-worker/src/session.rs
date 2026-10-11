@@ -1342,6 +1342,19 @@ pub(crate) async fn build_tools(
         tools.push(Arc::new(c6_tools::memex::MemexSearch::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexNote::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::MemexTrail::new(profile == ToolProfile::Claude)));
+    }
+    let claude = profile == ToolProfile::Claude;
+    if spec.memex_mail {
+        tools.push(Arc::new(c6_tools::memex::MailThreads::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::MailThread::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::MailDraft::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::MailSend::new(claude)));
+    }
+    if spec.memex_calendar {
+        tools.push(Arc::new(c6_tools::memex::CalendarEvents::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::CalendarCreate::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::CalendarRsvp::new(claude)));
     }
     // A browser, where this machine has one (it runs here, also for SSH
     // sessions).

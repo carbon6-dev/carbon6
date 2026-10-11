@@ -8,6 +8,7 @@ mod convert;
 mod cron;
 mod export;
 pub mod fabric;
+pub mod google;
 pub mod guard;
 pub mod hosts;
 pub mod hub;

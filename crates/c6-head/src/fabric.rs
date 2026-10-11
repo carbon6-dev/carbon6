@@ -8,13 +8,35 @@ use serde_json::{Value, json};
 use crate::{HeadState, bad_request};
 
 /// What a session's tools may ask the memex.
-const SESSION_METHODS: [&str; 5] = ["memex.search", "memex.get", "memex.related", "memex.note", "memex.timeline"];
+const SESSION_METHODS: [&str; 15] = [
+    "memex.search",
+    "memex.get",
+    "memex.related",
+    "memex.note",
+    "memex.timeline",
+    "memex.trail_append",
+    "memex.trail",
+    // Mail and calendars: within the session's scope (email, event).
+    "memex.mail.threads",
+    "memex.mail.thread",
+    "memex.mail.draft",
+    "memex.mail.send",
+    "memex.calendar.events",
+    "memex.calendar.busy",
+    "memex.calendar.create",
+    "memex.calendar.rsvp",
+];
 
 pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Value) -> anyhow::Result<Value> {
     let role = st.registry.get(from).map(|l| l.role).unwrap_or_default();
     if role == "memex" {
         return match method {
             "config.get" => crate::memex::config(st).await,
+            "event" => {
+                let kind = params["type"].as_str().unwrap_or_default().to_owned();
+                crate::automations::on_memex_event(st, &kind, &params["data"]).await;
+                Ok(json!({}))
+            }
             "notify" => {
                 let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
                 st.notifier.send(crate::notify::Note {

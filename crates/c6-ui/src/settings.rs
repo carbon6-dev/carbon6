@@ -153,7 +153,16 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             />
             <WorkflowRunsPanel />
             <AutomationsSetting />
+            <crate::mail::GoogleSettings />
             <crate::memex::MemexSettings />
+            <ListSetting
+                name="memex_folders"
+                title="Memex folders"
+                noun="folder"
+                help="Folders on the memex's machine that it keeps in sync: documents and papers (PDF, Word, Markdown, HTML, text) in them and their subfolders are read, changes are picked up every few minutes, and removed files leave the memex. Hidden files are skipped."
+                fields=FOLDER_FIELDS
+                examples=folder_examples
+            />
             <ListSetting
                 name="memex_scopes"
                 title="Memex scopes"
@@ -1037,6 +1046,20 @@ fn budget_examples() -> Vec<(&'static str, serde_json::Value)> {
         ("Everything: tell me past $100 a month", b("Monthly total", &[], "month", "100", "notify")),
         ("A client: $50 a week", b("Acme per week", &["client:acme"], "week", "50", "block")),
     ]
+}
+
+const FOLDER_FIELDS: &[Field] = &[
+    Field { key: "path", label: "Folder", placeholder: "e.g. ~/Documents/Papers (on the memex's machine)", kind: FieldKind::Mono },
+    Field { key: "labels", label: "Labels", placeholder: "e.g. research", kind: FieldKind::Labels },
+];
+
+fn folder_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let f = |path: &str, labels: &[&str]| {
+        let mut v = item(&[("path", path)]);
+        v["labels"] = serde_json::json!(labels);
+        v
+    };
+    vec![("Empty", f("", &[])), ("Research papers", f("~/Documents/Papers", &["research"])), ("Notes", f("~/Documents/Notes", &[]))]
 }
 
 const SCOPE_FIELDS: &[Field] = &[
@@ -1990,6 +2013,7 @@ fn AutomationsSetting() -> impl IntoView {
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || trigger.get() on:change=move |ev| trigger.set(event_target_value(&ev))>
                         <option value="schedule">"On a schedule"</option>
                         <option value="webhook">"When a webhook is called"</option>
+                        <option value="memex">"When mail arrives (memex)"</option>
                     </select>
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "schedule">
@@ -2008,6 +2032,11 @@ fn AutomationsSetting() -> impl IntoView {
                         on:change=move |ev| disable_after.set(event_target_value(&ev).parse().unwrap_or(0))>
                         {[0u32, 1, 2, 3, 5, 10].into_iter().map(|n| view! { <option value=n.to_string()>{if n == 0 { "never".to_owned() } else { format!("{n} failed runs in a row") }}</option> }).collect_view()}
                     </select>
+                </label>
+                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "memex">
+                    <span class="text-xs text-zinc-500">"Which mail (the message becomes the template's {{input}})"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="mail.received from:@acme.com subject:invoice (from:, to:, subject:, account:)"
+                        prop:value=move || cron.get() on:input=move |ev| cron.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule">
                     <span class="text-xs text-zinc-500">"Input (the template's {{input}})"</span>

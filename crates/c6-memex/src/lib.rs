@@ -3,7 +3,12 @@
 //! keeps items, passages, vectors and a graph of things, and answers the
 //! head's `memex.*` calls. See docs/memex.md.
 
+pub mod calendar;
+pub mod contacts;
+pub mod docs;
 pub mod embed;
+pub mod google;
+pub mod mail;
 pub mod store;
 
 use std::collections::HashMap;
@@ -28,17 +33,47 @@ pub struct Memex {
     pub embed: embed::Embedder,
     link: Arc<HeadLink>,
     last_error: Mutex<Option<String>>,
+    /// The memex's folder: its database and blobs.
+    dir: std::path::PathBuf,
+    /// Watched folders, from the head's settings.
+    folders: Mutex<Vec<api::MemexFolder>>,
+    /// Wakes the folder scanner (settings changed).
+    rescan: tokio::sync::Notify,
+    pub google: google::Google,
+    /// Google accounts to sync, from the head's settings.
+    accounts: Mutex<Vec<google::Account>>,
+    /// Write people you correspond with back to Google Contacts.
+    contacts_auto: std::sync::atomic::AtomicBool,
+    /// Wakes the Google sync.
+    resync: tokio::sync::Notify,
 }
+
+/// Files larger than this are not read.
+const MAX_FILE: u64 = 50 * 1024 * 1024;
 
 impl Memex {
     pub async fn open(dir: &Path, link: Arc<HeadLink>) -> anyhow::Result<Arc<Self>> {
         let store = Store::open(&dir.join("memex.db")).await?;
-        Ok(Arc::new(Self { store, embed: embed::Embedder::new(link.clone()), link, last_error: Mutex::new(None) }))
+        Ok(Arc::new(Self {
+            store,
+            embed: embed::Embedder::new(link.clone()),
+            google: google::Google::new(link.clone()),
+            link,
+            last_error: Mutex::new(None),
+            dir: dir.to_owned(),
+            folders: Mutex::default(),
+            rescan: tokio::sync::Notify::new(),
+            accounts: Mutex::default(),
+            contacts_auto: Default::default(),
+            resync: tokio::sync::Notify::new(),
+        }))
     }
 
     /// Background work: keeps the settings fresh from the head, and embeds
     /// passages that have no vector yet.
     pub fn spawn_jobs(self: &Arc<Self>) {
+        self.spawn_scanner();
+        self.spawn_google();
         let m = self.clone();
         tokio::spawn(async move {
             let mut refreshed: Option<std::time::Instant> = None;
@@ -50,6 +85,22 @@ impl Memex {
                                 connection_id: id.to_owned(),
                                 model: c["embedding"]["model"].as_str().unwrap_or_default().to_owned(),
                             }));
+                            let accounts: Vec<google::Account> = serde_json::from_value(c["google"].clone()).unwrap_or_default();
+                            let new_accounts = *m.accounts.lock().unwrap() != accounts;
+                            *m.accounts.lock().unwrap() = accounts;
+                            if let Some(p) = c["google_people"].as_str() {
+                                *m.google.people.lock().unwrap() = p.to_owned();
+                            }
+                            m.contacts_auto.store(c["contacts_auto"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
+                            if new_accounts {
+                                m.resync.notify_one();
+                            }
+                            let folders: Vec<api::MemexFolder> = serde_json::from_value(c["folders"].clone()).unwrap_or_default();
+                            let changed = *m.folders.lock().unwrap() != folders;
+                            *m.folders.lock().unwrap() = folders;
+                            if changed {
+                                m.rescan.notify_one();
+                            }
                             refreshed = Some(std::time::Instant::now());
                         }
                         Err(e) => warn!("memex settings from the head: {e:#}"),
@@ -67,6 +118,263 @@ impl Memex {
                 tokio::time::sleep(wait).await;
             }
         });
+    }
+
+    /// Syncs Google accounts: mail every minute (and while importing, as
+    /// fast as it goes), calendars every 3 minutes, contacts every 10; and
+    /// sends mail when it is due.
+    pub fn spawn_google(self: &Arc<Self>) {
+        let m = self.clone();
+        tokio::spawn(async move {
+            let mut round: u64 = 0;
+            loop {
+                let accounts = m.accounts();
+                let mut importing = false;
+                if m.link.is_connected() {
+                    for a in &accounts {
+                        let r = mail::sync(&m, a).await;
+                        let st = google::state(&m.store, &a.id, "mail").await.ok();
+                        importing |= st.as_ref().is_some_and(|s| s.phase == "import");
+                        if let Err(e) = r {
+                            warn!(account = %a.email, "mail sync: {e:#}");
+                            let _ = google::set_error(&m.store, &a.id, "mail", Some(&format!("{e:#}"))).await;
+                        }
+                        if round.is_multiple_of(3)
+                            && let Err(e) = calendar::sync(&m, a).await
+                        {
+                            warn!(account = %a.email, "calendar sync: {e:#}");
+                            let _ = google::set_error(&m.store, &a.id, "calendars", Some(&format!("{e:#}"))).await;
+                        }
+                        if round.is_multiple_of(10)
+                            && let Err(e) = contacts::sync(&m, a).await
+                        {
+                            warn!(account = %a.email, "contacts sync: {e:#}");
+                            let _ = google::set_error(&m.store, &a.id, "contacts", Some(&format!("{e:#}"))).await;
+                        }
+                    }
+                }
+                round += 1;
+                let wait = if importing { Duration::from_millis(200) } else { Duration::from_secs(60) };
+                tokio::select! {
+                    _ = m.resync.notified() => round = 0,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+        });
+        let m = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if m.link.is_connected()
+                    && let Err(e) = mail::send_due(&m).await
+                {
+                    warn!("sending mail: {e:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    pub fn accounts(&self) -> Vec<google::Account> {
+        self.accounts.lock().unwrap().clone()
+    }
+
+    /// An account by id or address.
+    pub fn account(&self, id_or_email: &str) -> anyhow::Result<google::Account> {
+        let accounts = self.accounts();
+        match accounts.iter().find(|a| a.id == id_or_email || a.email.eq_ignore_ascii_case(id_or_email)) {
+            Some(a) => Ok(a.clone()),
+            None if id_or_email.is_empty() && accounts.len() == 1 => Ok(accounts[0].clone()),
+            None => anyhow::bail!("no Google account {id_or_email:?}"),
+        }
+    }
+
+    pub fn account_id(&self, id_or_email: &str) -> anyhow::Result<String> {
+        Ok(self.account(id_or_email)?.id)
+    }
+
+    pub fn contacts_auto(&self) -> bool {
+        self.contacts_auto.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The item of a Gmail message, if it is here.
+    pub async fn mail_item(&self, account: &str, gmail_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT item_id FROM mail WHERE account = ? AND gmail_id = ?")
+            .bind(account)
+            .bind(gmail_id)
+            .fetch_optional(&self.store.pool)
+            .await?)
+    }
+
+    /// Tells the head something happened (automations can start on it).
+    pub async fn emit(&self, kind: &str, data: Value) {
+        if let Err(e) = self.link.call("event", json!({"type": kind, "data": data})).await {
+            warn!(%kind, "telling the head: {e:#}");
+        }
+    }
+
+    /// Scans watched folders every few minutes (and when they change).
+    pub fn spawn_scanner(self: &Arc<Self>) {
+        let m = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = m.rescan.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                }
+                let folders: Vec<api::MemexFolder> = m.folders.lock().unwrap().clone();
+                for f in folders.iter().filter(|f| f.enabled) {
+                    if let Err(e) = m.scan(f).await {
+                        warn!(folder = %f.path, "scanning: {e:#}");
+                        *m.last_error.lock().unwrap() = Some(format!("{}: {e:#}", f.path));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Reads new and changed files in a folder, and forgets removed ones.
+    pub async fn scan(&self, f: &api::MemexFolder) -> anyhow::Result<usize> {
+        let root = c6_worker::expand_home(&f.path);
+        anyhow::ensure!(root.is_dir(), "{} is not a folder on this machine", f.path);
+        let root_str = root.display().to_string();
+        let started = c6_core::now_ms();
+        let mut stack = vec![root.clone()];
+        let mut n = 0;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+                if !docs::EXTENSIONS.contains(&ext.as_str()) || meta.len() > MAX_FILE {
+                    continue;
+                }
+                let p = path.display().to_string();
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                if self.store.file_state(&p).await? == Some((mtime, meta.len() as i64)) {
+                    self.store.touch_file(&p).await?;
+                    continue;
+                }
+                let result = match tokio::fs::read(&path).await {
+                    Ok(data) => self.add_document(&name, &data, "folder", &p, &f.labels, Some(mtime)).await,
+                    Err(e) => Err(e.into()),
+                };
+                match result {
+                    Ok((id, _, _)) => {
+                        self.store.set_file(&p, mtime, meta.len() as i64, Some(&id), None).await?;
+                        n += 1;
+                    }
+                    Err(e) => {
+                        info!(file = %p, "not read: {e:#}");
+                        self.store.set_file(&p, mtime, meta.len() as i64, None, Some(&format!("{e:#}"))).await?;
+                    }
+                }
+            }
+        }
+        for (path, item) in self.store.files_gone(&root_str, started).await? {
+            if let Some(id) = item {
+                self.store.delete(&id).await?;
+            }
+            self.store.forget_file(&path).await?;
+        }
+        if n > 0 {
+            info!(folder = %f.path, files = n, "folder read");
+        }
+        Ok(n)
+    }
+
+    /// Stores a file's bytes by their hash; the hash.
+    pub(crate) async fn put_blob(&self, data: &[u8]) -> anyhow::Result<String> {
+        let hash = c6_core::sha256_hex(data);
+        let path = self.blob_path(&hash);
+        if !path.exists() {
+            tokio::fs::create_dir_all(path.parent().expect("blob dir")).await?;
+            let tmp = path.with_extension("tmp");
+            tokio::fs::write(&tmp, data).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+        }
+        Ok(hash)
+    }
+
+    pub(crate) fn blob_path(&self, hash: &str) -> std::path::PathBuf {
+        self.dir.join("blobs").join(&hash[..2]).join(&hash[2..])
+    }
+
+    /// Adds a document (or paper) from a file: its text, and for a paper
+    /// its identity, authors and citations as links. (id, kind, title).
+    pub async fn add_document(
+        &self,
+        name: &str,
+        data: &[u8],
+        source: &str,
+        external_id: &str,
+        labels: &[String],
+        created_at: Option<i64>,
+    ) -> anyhow::Result<(String, String, String)> {
+        let (text, meta_title) = docs::extract(name, data)?;
+        anyhow::ensure!(!text.trim().is_empty(), "no text in {name} (a scan? images are read in a later step)");
+        let blob = if source == "folder" { None } else { Some(self.put_blob(data).await?) };
+        let is_pdf = name.to_lowercase().ends_with(".pdf");
+        let paper = if is_pdf { docs::analyze(&text, meta_title.as_deref()) } else { None };
+        let title = paper
+            .as_ref()
+            .map(|p| p.title.clone())
+            .filter(|t| !t.is_empty())
+            .or(meta_title)
+            .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_owned());
+        let kind = if paper.is_some() { "paper" } else { "document" };
+        let mut meta = json!({"name": name, "size": data.len(), "mime": mime_of(name)});
+        if let Some(b) = &blob {
+            meta["blob"] = json!(b);
+        }
+        if source == "folder" {
+            meta["path"] = json!(external_id);
+        }
+        if let Some(p) = &paper {
+            meta["paper"] = json!({"doi": p.doi, "arxiv": p.arxiv, "authors": p.authors, "year": p.year, "references": p.references.len()});
+        }
+        let item = api::MemexItemIn {
+            kind: kind.into(),
+            source: source.into(),
+            external_id: external_id.into(),
+            title: title.clone(),
+            text,
+            created_at,
+            labels: labels.to_vec(),
+            meta,
+            ..Default::default()
+        };
+        let id = self.store.put(&item, source).await?;
+        self.store.clear_links(&id, "docs").await?;
+        if let Some(p) = paper {
+            let me = self.store.ensure_thing(&docs::paper_key(p.doi.as_deref(), p.arxiv.as_deref(), &p.title), "paper", &p.title).await?;
+            self.store.link(&id, "is", &me, "observed", "docs", None).await?;
+            for a in &p.authors {
+                let key = format!("person:name:{}", a.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-"));
+                let person = self.store.ensure_thing(&key, "person", a).await?;
+                self.store.link(&id, "authored_by", &person, "observed", "docs", None).await?;
+            }
+            for r in &p.references {
+                let cited = self.store.ensure_thing(&r.key(), "paper", &r.title).await?;
+                if cited != me {
+                    self.store.link(&id, "cites", &cited, "observed", "docs", Some(&r.text)).await?;
+                }
+            }
+        }
+        Ok((id, kind.into(), title))
     }
 
     /// Embeds a batch of passages; how many.
@@ -170,6 +478,81 @@ impl Memex {
                 let chars = params["chars"].as_u64().unwrap_or(4000) as usize;
                 Ok(json!(self.brief(&labels, params["text"].as_str().unwrap_or(""), chars, &allowed).await?))
             }
+            "memex.upload" => {
+                use base64::Engine;
+                let u: api::MemexUpload = serde_json::from_value(params)?;
+                let data = base64::engine::general_purpose::STANDARD.decode(u.data.as_bytes())?;
+                anyhow::ensure!(data.len() as u64 <= MAX_FILE, "files up to 50 MB");
+                let hash = c6_core::sha256_hex(&data);
+                let (id, kind, title) = self.add_document(&u.name, &data, "upload", &hash, &u.labels, None).await?;
+                Ok(json!({"id": id, "kind": kind, "title": title}))
+            }
+            "memex.content" => {
+                use base64::Engine;
+                let id = params["id"].as_str().unwrap_or_default();
+                let item = self.store.item(id, &allowed).await?.ok_or_else(|| anyhow::anyhow!("no item {id:?}"))?;
+                let data = match (item.meta["blob"].as_str(), item.meta["path"].as_str()) {
+                    (Some(b), _) => tokio::fs::read(self.blob_path(b)).await?,
+                    (None, Some(p)) => tokio::fs::read(p).await?,
+                    _ => item.text.into_bytes(),
+                };
+                Ok(json!({
+                    "name": item.meta["name"].as_str().unwrap_or(&item.title),
+                    "mime": item.meta["mime"].as_str().unwrap_or("text/plain"),
+                    "data": base64::engine::general_purpose::STANDARD.encode(data),
+                }))
+            }
+            "memex.trails" => Ok(json!(self.store.trails().await?)),
+            "memex.trail" => {
+                let id = params["id"].as_str().unwrap_or_default();
+                let mut t = self.store.trail(id).await?.ok_or_else(|| anyhow::anyhow!("no trail {id:?}"))?;
+                for s in t.steps.iter_mut() {
+                    (s.kind, s.title) = self.store.describe(&s.target).await?;
+                }
+                Ok(json!(t))
+            }
+            "memex.trail_append" => {
+                let trail = params["trail"].as_str().unwrap_or_default().trim().to_owned();
+                let target = params["target"].as_str().unwrap_or_default().trim().to_owned();
+                anyhow::ensure!(
+                    !trail.is_empty() && !target.is_empty(),
+                    "a trail step needs a trail (name or id) and a target (item id or thing)"
+                );
+                anyhow::ensure!(self.store.describe(&target).await?.0 != "missing", "nothing in the memex is {target:?}");
+                let made_by = params["made_by"].as_str().unwrap_or("you");
+                let id = self.store.trail_append(&trail, &target, params["comment"].as_str().unwrap_or(""), made_by).await?;
+                Ok(json!({"id": id}))
+            }
+            "memex.trail_update" => {
+                self.store
+                    .trail_update(params["id"].as_str().unwrap_or_default(), params["name"].as_str(), params["description"].as_str())
+                    .await?;
+                Ok(json!({}))
+            }
+            "memex.trail_remove_step" => {
+                self.store.trail_remove_step(params["step"].as_i64().unwrap_or(0)).await?;
+                Ok(json!({}))
+            }
+            "memex.trail_delete" => {
+                self.store.trail_delete(params["id"].as_str().unwrap_or_default()).await?;
+                Ok(json!({}))
+            }
+            "memex.scan" => {
+                let folders: Vec<api::MemexFolder> = self.folders.lock().unwrap().clone();
+                let mut n = 0;
+                for f in folders.iter().filter(|f| f.enabled) {
+                    n += self.scan(f).await?;
+                }
+                Ok(json!({"read": n}))
+            }
+            m if m.starts_with("memex.mail.")
+                || m.starts_with("memex.calendar.")
+                || m.starts_with("memex.contacts.")
+                || m == "memex.google"
+                || m == "memex.google_sync" =>
+            {
+                self.google_method(m, params, &allowed).await
+            }
             "memex.mention" => Ok(json!(self.store.find_things(params["q"].as_str().unwrap_or(""), 20).await?)),
             "memex.status" => {
                 let mut s = self.store.status(&self.embed.space()).await?;
@@ -178,6 +561,96 @@ impl Memex {
             }
             other => anyhow::bail!("the memex has no method {other}"),
         }
+    }
+
+    async fn google_method(&self, method: &str, params: Value, allowed: &[String]) -> anyhow::Result<Value> {
+        use base64::Engine;
+        let need = |kind: &str| -> anyhow::Result<()> {
+            anyhow::ensure!(allowed.iter().any(|k| k == kind), "{kind} is outside what this session may see");
+            Ok(())
+        };
+        if method.starts_with("memex.mail.") || method.starts_with("memex.contacts.") {
+            need("email")?;
+        } else if method.starts_with("memex.calendar.") {
+            need("event")?;
+        }
+        let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
+        let made_by = params["made_by"].as_str().unwrap_or("you").to_owned();
+        Ok(match method {
+            "memex.google" => {
+                json!({"accounts": self.accounts().iter().map(|a| json!({"id": a.id, "email": a.email})).collect::<Vec<_>>(), "sync": google::states(&self.store).await?})
+            }
+            "memex.google_sync" => {
+                self.resync.notify_one();
+                json!({})
+            }
+            "memex.mail.threads" => {
+                let account = params["account"].as_str().filter(|a| !a.is_empty()).map(|a| self.account_id(a)).transpose()?;
+                let view = params["view"].as_str().unwrap_or("inbox");
+                json!(
+                    mail::threads(
+                        self,
+                        view,
+                        account.as_deref(),
+                        params["before"].as_i64(),
+                        params["limit"].as_u64().unwrap_or(50).min(200) as u32
+                    )
+                    .await?
+                )
+            }
+            "memex.mail.thread" => json!(mail::thread(self, &self.account_id(&s("account"))?, &s("thread_id")).await?),
+            "memex.mail.modify" => {
+                let list = |k: &str| -> Vec<String> {
+                    params[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+                };
+                mail::modify(self, &self.account_id(&s("account"))?, &s("thread_id"), &list("add"), &list("remove")).await?;
+                json!({})
+            }
+            "memex.mail.attachment" => {
+                let (name, mime, data) = mail::attachment(self, &s("item_id"), params["index"].as_u64().unwrap_or(0) as usize).await?;
+                json!({"name": name, "mime": mime, "data": base64::engine::general_purpose::STANDARD.encode(data)})
+            }
+            "memex.mail.draft" => {
+                let d: api::MailDraft = serde_json::from_value(params)?;
+                json!({"draft_id": mail::draft(self, &d).await?})
+            }
+            "memex.mail.send" => {
+                let d: api::MailDraft = serde_json::from_value(params)?;
+                json!(mail::queue(self, &d, &made_by).await?)
+            }
+            "memex.mail.cancel" => json!({"cancelled": mail::cancel(self, &s("id")).await?}),
+            "memex.mail.outgoing" => json!(mail::outgoing(self).await?),
+            "memex.mail.labels" => json!(mail::label_list(self).await?),
+            "memex.calendar.calendars" => json!(calendar::calendars(self).await?),
+            "memex.calendar.select" => {
+                calendar::select(self, &self.account_id(&s("account"))?, &s("id"), params["on"].as_bool().unwrap_or(true)).await?;
+                json!({})
+            }
+            "memex.calendar.events" => {
+                json!(calendar::events(self, params["from"].as_i64().unwrap_or(0), params["to"].as_i64().unwrap_or(0)).await?)
+            }
+            "memex.calendar.busy" => {
+                json!(calendar::busy(self, params["from"].as_i64().unwrap_or(0), params["to"].as_i64().unwrap_or(0)).await?)
+            }
+            "memex.calendar.create" => json!(calendar::create(self, &serde_json::from_value(params)?).await?),
+            "memex.calendar.update" => {
+                calendar::update(self, &serde_json::from_value(params)?).await?;
+                json!({})
+            }
+            "memex.calendar.delete" => {
+                calendar::delete(self, &serde_json::from_value(params)?).await?;
+                json!({})
+            }
+            "memex.calendar.rsvp" => {
+                calendar::rsvp(self, &s("account"), &s("calendar_id"), &s("event_id"), params["instance_start"].as_i64(), &s("response"))
+                    .await?;
+                json!({})
+            }
+            "memex.contacts.list" => json!(contacts::list(self, &s("q")).await?),
+            "memex.contacts.candidates" => json!(contacts::candidates(self).await?),
+            "memex.contacts.create" => json!(contacts::create(self, &s("account"), &s("name"), &s("email")).await?),
+            other => anyhow::bail!("the memex has no method {other}"),
+        })
     }
 
     /// Keyword and meaning search, merged by reciprocal rank.
@@ -354,5 +827,15 @@ impl c6_worker::Extension for Memex {
             info!(%method, "memex call failed: {e:#}");
         }
         Some(r)
+    }
+}
+
+fn mime_of(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "md" | "markdown" => "text/markdown",
+        "html" | "htm" => "text/html",
+        _ => "text/plain",
     }
 }

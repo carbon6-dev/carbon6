@@ -158,6 +158,7 @@ async fn memex_round_trip() {
     mock.push(Reply::ToolCalls(vec![("memex_note".into(), r#"{"text": "Acme's staging gate needs a sign-off from Priya"}"#.into())]));
     mock.push(Reply::Text("Done.".into()));
     let s2 = create(json!(["client:acme"]), "Prepare the Acme deploy").await;
+    eventually("session 2's three model calls", async || (mock.requests().len() >= requests_before + 3).then_some(())).await;
     idle(s2.id.clone()).await;
     let reqs = mock.requests();
     let system = reqs[requests_before]["messages"][0]["content"].to_string();

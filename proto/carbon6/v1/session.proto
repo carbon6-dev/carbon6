@@ -406,6 +406,10 @@ message CreateSession {
   // A memex is connected: offer the memex tools (they call it through the
   // head, which applies the session's scope).
   bool memex_tools = 18;
+  // The session's scope includes mail (email) and calendars (event): offer
+  // the mail and calendar tools.
+  bool memex_mail = 19;
+  bool memex_calendar = 20;
 }
 
 message ModelSpec {

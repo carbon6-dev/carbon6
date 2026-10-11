@@ -1446,7 +1446,7 @@ pub struct SessionMatch {
 
 /// What kinds of items there are. Sessions see the default kinds, plus what
 /// their scope rules add.
-pub const MEMEX_KINDS: [&str; 8] = ["session", "output", "web", "note", "document", "paper", "email", "photo"];
+pub const MEMEX_KINDS: [&str; 11] = ["session", "output", "web", "note", "document", "paper", "email", "event", "photo", "video", "spam"];
 /// What every session may search unless a scope rule says more.
 pub const MEMEX_DEFAULT_SCOPE: [&str; 6] = ["session", "output", "web", "note", "document", "paper"];
 
@@ -1597,6 +1597,14 @@ pub struct MemexSettings {
     /// 0: none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief_chars: Option<u32>,
+    /// Write people you correspond with (written to twice, heard from) back
+    /// to Google Contacts, in a carbon6 group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contacts_auto: Option<bool>,
+    /// Agents' mail_send and calendar invitations wait for your approval
+    /// (default on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_needs_approval: Option<bool>,
 }
 
 /// A scope rule (`/api/v1/settings/memex_scopes`): sessions with these
@@ -1618,4 +1626,282 @@ pub struct MemexNoteIn {
     /// Labels or thing ids it is about.
     #[serde(default)]
     pub about: Vec<String>,
+}
+
+/// An associative trail: a named path through items and things, with
+/// comments (`/api/v1/memex/trails`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexTrail {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub made_by: String,
+    pub updated_at: UnixMs,
+    #[serde(default)]
+    pub step_count: u32,
+    #[serde(default)]
+    pub steps: Vec<MemexTrailStep>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemexTrailStep {
+    pub id: i64,
+    /// An item id, or a thing (id or label).
+    pub target: String,
+    #[serde(default)]
+    pub comment: String,
+    pub made_by: String,
+    pub created_at: UnixMs,
+    /// What the target is now (filled in when read).
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// A file to add (`POST /api/v1/memex/upload`): base64 data.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MemexUpload {
+    pub name: String,
+    #[serde(default)]
+    pub mime: String,
+    pub data: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// A folder the memex watches (`/api/v1/settings/memex_folders`), on the
+/// machine the memex runs on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemexFolder {
+    pub path: String,
+    /// Labels for what is found there (e.g. research, client:acme).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// Your Google OAuth client (`/api/v1/google/client`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GoogleClient {
+    pub client_id: String,
+    pub has_secret: bool,
+    /// The redirect URI to register with Google for this head.
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GoogleClientIn {
+    pub client_id: String,
+    /// Kept as is when absent.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+/// A connected Google account (`/api/v1/google/accounts`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GoogleAccount {
+    pub id: String,
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    pub added_at: UnixMs,
+}
+
+// --- Mail, calendar and contacts (through the memex) ---
+
+/// A conversation in a mail view (`GET /api/v1/mail/threads`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MailThread {
+    pub account: String,
+    pub thread_id: String,
+    pub subject: String,
+    pub snippet: String,
+    /// Its latest message's.
+    pub date: UnixMs,
+    pub count: u32,
+    pub unread: bool,
+    pub starred: bool,
+    pub attachments: bool,
+    /// Who wrote in it ("me" for you), in order.
+    pub people: Vec<String>,
+    /// Gmail label ids of its latest message.
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MailMessage {
+    pub item_id: String,
+    pub gmail_id: String,
+    pub from: String,
+    pub from_name: String,
+    /// (address, name).
+    pub to: Vec<(String, String)>,
+    pub cc: Vec<(String, String)>,
+    pub date: UnixMs,
+    pub subject: String,
+    pub text: String,
+    /// Shown sandboxed, remote images off until you allow them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    pub attachments: Vec<MailAttachment>,
+    pub labels: Vec<String>,
+    pub unread: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MailAttachment {
+    pub index: u32,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// A message to send or keep as a draft (`POST /api/v1/mail/send`,
+/// `/api/v1/mail/drafts`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MailDraft {
+    /// The account's id or address.
+    pub account: String,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    #[serde(default)]
+    pub subject: String,
+    /// Markdown (sent as text and HTML).
+    #[serde(default)]
+    pub body: String,
+    /// The message this answers (an item id): same thread, In-Reply-To.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentUpload>,
+    /// Send later; default: after the undo window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_at: Option<UnixMs>,
+    /// Replace this draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_id: Option<String>,
+}
+
+/// A message on its way out (undo while pending).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Outgoing {
+    pub id: String,
+    pub send_at: UnixMs,
+    /// pending, sending, sent, cancelled, failed.
+    pub status: String,
+    pub subject: String,
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Calendar {
+    pub account: String,
+    pub id: String,
+    pub summary: String,
+    pub color: String,
+    pub primary: bool,
+    pub writable: bool,
+    pub selected: bool,
+}
+
+/// An event, or one instance of a recurring one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    pub account: String,
+    pub calendar_id: String,
+    pub event_id: String,
+    /// For an instance of a recurring event: its start (to change "this"
+    /// or "following").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_start: Option<UnixMs>,
+    pub summary: String,
+    pub description: String,
+    pub location: String,
+    pub start: UnixMs,
+    pub end: UnixMs,
+    pub all_day: bool,
+    pub recurring: bool,
+    pub attendees: Vec<Attendee>,
+    /// Your answer: accepted, declined, tentative, needsAction; "" when not
+    /// invited (your own event).
+    pub my_status: String,
+    pub conference: String,
+    pub html_link: String,
+    /// Counts as busy (not free time, not declined).
+    pub busy: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Attendee {
+    pub email: String,
+    pub name: String,
+    pub response: String,
+    pub me: bool,
+}
+
+/// Creating or changing an event (`/api/v1/calendar/events`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventEdit {
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// "this", "following" or "all" (for recurring events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_start: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<UnixMs>,
+    #[serde(default)]
+    pub all_day: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attendees: Option<Vec<String>>,
+    /// RRULE etc. lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Contact {
+    pub account: String,
+    pub resource: String,
+    pub name: String,
+    pub emails: Vec<String>,
+    pub phones: Vec<String>,
+    pub orgs: Vec<String>,
+    pub photo: String,
+    /// The person in the memex's graph.
+    #[serde(default)]
+    pub thing_id: Option<String>,
+}
+
+/// Someone you write to who is not a contact yet.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContactCandidate {
+    pub email: String,
+    pub name: String,
+    /// Messages you sent them, and they sent you.
+    pub sent: u32,
+    pub received: u32,
 }

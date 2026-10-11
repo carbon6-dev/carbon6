@@ -6,11 +6,19 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::Value;
 
+use wasm_bindgen::prelude::*;
+
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, View};
 
-const KINDS: [(&str, &str); 8] = [
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(catch, js_namespace = c6Files, js_name = read)]
+    async fn js_read_files(ev: &web_sys::Event) -> Result<JsValue, JsValue>;
+}
+
+const KINDS: [(&str, &str); 10] = [
     ("session", "Sessions"),
     ("note", "Notes"),
     ("web", "Web pages"),
@@ -18,7 +26,9 @@ const KINDS: [(&str, &str); 8] = [
     ("document", "Documents"),
     ("paper", "Papers"),
     ("email", "Email"),
+    ("event", "Events"),
     ("photo", "Photos"),
+    ("video", "Videos"),
 ];
 
 fn kind_tone(kind: &str) -> &'static str {
@@ -58,8 +68,22 @@ pub fn MemexPage() -> impl IntoView {
         open.set(None);
         asked.set(Some((query.get_untracked(), kinds.get_untracked())));
     };
+    let tab = RwSignal::new("search");
     view! {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-4">
+            <div class="flex gap-1 text-sm">
+                {[("search", "Search"), ("trails", "Trails"), ("add", "Add files")].into_iter().map(|(t, label)| view! {
+                    <button class=move || format!("rounded-md px-3 py-1 {}", if tab.get() == t { "bg-zinc-200 dark:bg-zinc-800" } else { "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-900" })
+                        on:click=move |_| tab.set(t)>{label}</button>
+                }).collect_view()}
+            </div>
+            {move || match tab.get() {
+                "trails" => view! { <Trails open /> }.into_any(),
+                "add" => view! { <AddFiles /> }.into_any(),
+                _ => ().into_any(),
+            }}
+            {move || open.get().filter(|_| tab.get() != "search").map(|id| view! { <Detail id open /> })}
+            <div class="space-y-4" class:hidden=move || tab.get() != "search">
             <Suspense fallback=|| ()>
                 {move || status.get().map(|r| match r {
                     Ok(s) => view! { <StatusLine s /> }.into_any(),
@@ -99,7 +123,167 @@ pub fn MemexPage() -> impl IntoView {
                 })}
             </Suspense>
             {move || open.get().map(|id| view! { <Detail id open /> })}
+            </div>
         </main>
+    }
+}
+
+/// Upload documents and papers.
+#[component]
+fn AddFiles() -> impl IntoView {
+    let labels = RwSignal::new(String::new());
+    let log = RwSignal::new(Vec::<Result<String, String>>::new());
+    let pick = move |ev: web_sys::Event| {
+        let labels = c6_api::labels::parse_labels(&labels.get_untracked());
+        spawn_local(async move {
+            let files: Vec<c6_api::AttachmentUpload> = match js_read_files(&ev).await.ok().and_then(|v| v.as_string()) {
+                Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+                None => return,
+            };
+            for f in files {
+                let name = f.name.clone();
+                log.update(|l| l.push(Ok(format!("Reading {name}…"))));
+                let r = api::memex_upload(c6_api::MemexUpload { name: f.name, mime: f.mime, data: f.data, labels: labels.clone() }).await;
+                log.update(|l| {
+                    l.pop();
+                    l.push(
+                        r.map(|v| {
+                            format!(
+                                "{name}: added as {} \u{201c}{}\u{201d}",
+                                v["kind"].as_str().unwrap_or(""),
+                                v["title"].as_str().unwrap_or("")
+                            )
+                        })
+                        .map_err(|e| format!("{name}: {e}")),
+                    );
+                });
+            }
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <p class="text-sm text-zinc-500">"PDF, Word (.docx), Markdown, HTML or text, up to 50 MB each. Research papers are recognized: their title, authors, identifiers and the papers they cite join the graph. To keep a folder in sync instead, add it under Settings → Memex folders."</p>
+            <input class=format!("{INPUT} font-mono text-xs") placeholder="labels for these files, e.g. research, client:acme" prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
+            <input type="file" multiple accept=".pdf,.docx,.md,.markdown,.txt,.html,.htm,.rst" class="text-sm" on:change=pick />
+            <ul class="space-y-1 text-sm">
+                {move || log.get().into_iter().map(|r| match r {
+                    Ok(m) => view! { <li class="text-zinc-600 dark:text-zinc-400">{m}</li> }.into_any(),
+                    Err(e) => view! { <li class="text-red-600">{e}</li> }.into_any(),
+                }).collect_view()}
+            </ul>
+        </section>
+    }
+}
+
+/// Trails: named paths through items and things.
+#[component]
+fn Trails(open: RwSignal<Option<String>>) -> impl IntoView {
+    let list = LocalResource::new(api::memex_trails);
+    let shown = RwSignal::new(None::<String>);
+    view! {
+        <section class="space-y-3">
+            <p class="text-sm text-zinc-500">"Trails are paths through what you know, step by step, each with a note on why it matters. Add a step from any item (\u{201c}Add to a trail\u{201d}); agents add steps with memex_trail."</p>
+            {move || list.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"No trails yet."</p> }.into_any(),
+                Ok(v) => view! {
+                    <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
+                        {v.into_iter().map(|t| {
+                            let id = t.id.clone();
+                            view! {
+                                <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900" on:click=move |_| shown.set(Some(id.clone()))>
+                                    <span class="font-medium">{t.name.clone()}</span>
+                                    <span class="text-xs text-zinc-500">{format!("{} steps · {}", t.step_count, when(t.updated_at))}</span>
+                                </button>
+                            }
+                        }).collect_view()}
+                    </div>
+                }.into_any(),
+            })}
+            {move || shown.get().map(|id| view! { <TrailView id open on_change=move || list.refetch() /> })}
+        </section>
+    }
+}
+
+#[component]
+fn TrailView(id: String, open: RwSignal<Option<String>>, on_change: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
+    let tid = StoredValue::new(id.clone());
+    let trail = LocalResource::new(move || api::memex_trail(tid.get_value()));
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || trail.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(t) => view! {
+                    <div class="flex items-center gap-2">
+                        <h2 class="font-medium">{t.name.clone()}</h2>
+                        <span class="flex-1"></span>
+                        <button class="text-xs text-red-600 hover:underline" on:click=move |_| {
+                            if !window().confirm_with_message("Delete this trail? (Its items stay.)").unwrap_or(false) { return; }
+                            spawn_local(async move {
+                                match api::memex_trail_delete(tid.get_value()).await { Ok(()) => on_change(), Err(e) => error.set(Some(e)) }
+                            });
+                        }>"Delete trail"</button>
+                    </div>
+                    <ol class="space-y-2">
+                        {t.steps.into_iter().enumerate().map(|(i, s)| {
+                            let (target, step) = (s.target.clone(), s.id);
+                            view! {
+                                <li class="rounded-md bg-zinc-50 p-2 text-sm dark:bg-zinc-900">
+                                    <div class="flex flex-wrap items-center gap-2">
+                                        <span class="text-xs text-zinc-400">{i + 1}"."</span>
+                                        <span class=format!("rounded px-1.5 text-[11px] {}", kind_tone(&s.kind))>{s.kind.clone()}</span>
+                                        <button class="font-medium hover:underline" on:click=move |_| open.set(Some(target.clone()))>{s.title.clone()}</button>
+                                        <span class="text-xs text-zinc-500">{format!("by {}", s.made_by)}</span>
+                                        <span class="flex-1"></span>
+                                        <button class="text-xs text-zinc-500 hover:text-red-600" title="Remove this step" on:click=move |_| {
+                                            spawn_local(async move {
+                                                match api::memex_trail_remove(tid.get_value(), step).await { Ok(()) => trail.refetch(), Err(e) => error.set(Some(e)) }
+                                            });
+                                        }>"✕"</button>
+                                    </div>
+                                    {(!s.comment.is_empty()).then(|| view! { <p class="mt-1 text-zinc-600 dark:text-zinc-400">{s.comment.clone()}</p> })}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ol>
+                }.into_any(),
+            })}
+        </section>
+    }
+}
+
+/// Add an item or thing to a trail.
+#[component]
+fn AddToTrail(target: String) -> impl IntoView {
+    let target = StoredValue::new(target);
+    let (trail, comment) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let open = RwSignal::new(false);
+    let note = RwSignal::new(None::<Result<String, String>>);
+    let trails = LocalResource::new(api::memex_trails);
+    let add = move |_| {
+        let t = trail.get_untracked();
+        if t.trim().is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            note.set(Some(
+                api::memex_trail_append(t.clone(), target.get_value(), comment.get_untracked()).await.map(|_| format!("Added to {t}.")),
+            ));
+        });
+    };
+    view! {
+        <div class="text-xs">
+            <button class="text-sky-700 hover:underline dark:text-sky-400" class:hidden=move || open.get() on:click=move |_| open.set(true)>"Add to a trail"</button>
+            <div class="flex flex-wrap items-center gap-2" class:hidden=move || !open.get()>
+                <input class=format!("{INPUT} w-48 py-1 text-xs") list="c6-trails" placeholder="trail (new or existing)" prop:value=move || trail.get() on:input=move |ev| trail.set(event_target_value(&ev)) />
+                <datalist id="c6-trails">{move || trails.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <option value=t.name.clone()></option> }).collect_view()}</datalist>
+                <input class=format!("{INPUT} min-w-0 flex-1 py-1 text-xs") placeholder="why it matters" prop:value=move || comment.get() on:input=move |ev| comment.set(event_target_value(&ev)) />
+                <button class=BUTTON_QUIET on:click=add>"Add"</button>
+                {move || note.get().map(|r| match r { Ok(m) => view! { <span class="text-emerald-600">{m}</span> }.into_any(), Err(e) => view! { <span class="text-red-600">{e}</span> }.into_any() })}
+            </div>
+        </div>
     }
 }
 
@@ -183,6 +367,9 @@ fn chips(about: Vec<Value>, open: RwSignal<Option<String>>) -> impl IntoView {
 fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<String>>) -> impl IntoView {
     let s = |k: &str| it[k].as_str().unwrap_or_default().to_owned();
     let id = s("id");
+    let has_original = it["meta"]["blob"].is_string() || it["meta"]["path"].is_string();
+    let original = format!("/api/v1/memex/items/{id}/content");
+    let trail_target = id.clone();
     let about = it["about"].as_array().cloned().unwrap_or_default();
     let remove = move |_| {
         if !window().confirm_with_message("Delete this from the memex? (The original, if any, is not touched.)").unwrap_or(false) {
@@ -202,9 +389,11 @@ fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<S
             <h2 class="font-medium">{s("title")}</h2>
             <span class="text-xs text-zinc-500">{format!("{} · from {}", when(it["created_at"].as_i64().unwrap_or(0)), s("source"))}</span>
             <span class="flex-1"></span>
+            {has_original.then(|| view! { <a href=original.clone() target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original ↗"</a> })}
             <button class="text-xs text-red-600 hover:underline" on:click=remove>"Delete"</button>
         </div>
         <div class="flex flex-wrap gap-1">{chips(about, open)}</div>
+        <AddToTrail target=trail_target />
         <pre class="max-h-[32rem] overflow-auto whitespace-pre-wrap rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900">{s("text")}</pre>
     }
 }
@@ -288,8 +477,11 @@ pub fn MemexSettings() -> impl IntoView {
     let loaded = LocalResource::new(move || api::get_setting("memex"));
     let connections = LocalResource::new(api::connections);
     let (conn, model, chars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let (auto, approve) = (RwSignal::new(false), RwSignal::new(true));
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
+            auto.set(v["contacts_auto"].as_bool().unwrap_or(false));
+            approve.set(v["send_needs_approval"].as_bool().unwrap_or(true));
             conn.set(v["embedding"]["connection"].as_str().unwrap_or_default().to_owned());
             model.set(v["embedding"]["model"].as_str().unwrap_or_default().to_owned());
             chars.set(v["brief_chars"].as_u64().map(|n| n.to_string()).unwrap_or_default());
@@ -315,6 +507,8 @@ pub fn MemexSettings() -> impl IntoView {
         if let Ok(n) = chars.get_untracked().trim().parse::<u32>() {
             v["brief_chars"] = n.into();
         }
+        v["contacts_auto"] = auto.get_untracked().into();
+        v["send_needs_approval"] = approve.get_untracked().into();
         spawn_local(async move {
             note.set(Some(
                 api::put_setting("memex", v)
@@ -354,6 +548,14 @@ pub fn MemexSettings() -> impl IntoView {
                     <span class="text-xs text-zinc-500">"Embedding model"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="e.g. nomic-embed-text, text-embedding-3-small" prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
                 </label>
+                <label class="flex items-center gap-2 text-sm sm:col-span-3">
+                    <input type="checkbox" prop:checked=move || auto.get() on:change=move |ev| auto.set(event_target_checked(&ev)) />
+                    "Add people you correspond with (written to twice, heard from) to Google Contacts, in a carbon6 group"
+                </label>
+                <label class="flex items-center gap-2 text-sm sm:col-span-3">
+                    <input type="checkbox" prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
+                    "Agents' mail and calendar invitations wait for my approval"
+                </label>
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Brief size (characters)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="4000; 0 for none" prop:value=move || chars.get() on:input=move |ev| chars.set(event_target_value(&ev)) />
@@ -364,6 +566,11 @@ pub fn MemexSettings() -> impl IntoView {
                     Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
                     Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
                 })}
+                <button class=BUTTON_QUIET on:click=move |_| {
+                    spawn_local(async move {
+                        note.set(Some(api::memex_scan().await.map(|v| format!("Scanned the memex folders: {} files read.", v["read"].as_u64().unwrap_or(0)))));
+                    });
+                }>"Scan folders now"</button>
                 <button class=BUTTON on:click=save>"Save"</button>
             </div>
         </section>

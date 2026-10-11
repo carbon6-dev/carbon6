@@ -144,11 +144,12 @@ impl Store {
     pub async fn things_for(&self, refs: &[String]) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
         for r in refs {
-            let id: Option<String> = sqlx::query_scalar("SELECT id FROM things WHERE key = ? OR id = ?")
-                .bind(r.trim())
-                .bind(r.trim())
-                .fetch_optional(&self.pool)
-                .await?;
+            let id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM things WHERE key = ?1 OR id = ?1 UNION SELECT thing_id FROM thing_keys WHERE key = ?1 LIMIT 1",
+            )
+            .bind(r.trim())
+            .fetch_optional(&self.pool)
+            .await?;
             if let Some(id) = id.filter(|i| !out.contains(i)) {
                 out.push(id);
             }
@@ -266,7 +267,7 @@ impl Store {
         let rows = match thing {
             Some(t) => {
                 sqlx::query(
-                    "SELECT DISTINCT i.* FROM items i JOIN links l ON l.src_item = i.id WHERE l.rel = 'about' AND l.dst_thing = ? \
+                    "SELECT DISTINCT i.* FROM items i JOIN links l ON l.src_item = i.id WHERE l.dst_thing = ? \
                      AND i.kind IN (SELECT value FROM json_each(?)) ORDER BY i.created_at DESC LIMIT ?",
                 )
                 .bind(t)
@@ -334,17 +335,19 @@ impl Store {
     }
 
     pub async fn thing(&self, key_or_id: &str) -> anyhow::Result<Option<api::MemexThingRef>> {
-        let r =
-            sqlx::query("SELECT * FROM things WHERE id = ? OR key = ?").bind(key_or_id).bind(key_or_id).fetch_optional(&self.pool).await?;
+        let r = sqlx::query("SELECT * FROM things WHERE id = ?1 OR key = ?1 OR id = (SELECT thing_id FROM thing_keys WHERE key = ?1)")
+            .bind(key_or_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(r.as_ref().map(thing_ref))
     }
 
     /// Things sharing items with `thing`, most shared first.
     pub async fn related(&self, thing: &str, kinds: &[String], limit: u32) -> anyhow::Result<Vec<(api::MemexThingRef, u32)>> {
         let rows = sqlx::query(
-            "SELECT t.*, COUNT(DISTINCT a.src_item) AS shared FROM links a JOIN links b ON b.src_item = a.src_item AND b.rel = 'about' \
+            "SELECT t.*, COUNT(DISTINCT a.src_item) AS shared FROM links a JOIN links b ON b.src_item = a.src_item \
              JOIN things t ON t.id = b.dst_thing JOIN items i ON i.id = a.src_item \
-             WHERE a.rel = 'about' AND a.dst_thing = ? AND b.dst_thing != ? AND i.kind IN (SELECT value FROM json_each(?)) \
+             WHERE a.dst_thing = ? AND b.dst_thing != ? AND b.rel != 'cites' AND i.kind IN (SELECT value FROM json_each(?)) \
              GROUP BY t.id ORDER BY shared DESC LIMIT ?",
         )
         .bind(thing)
@@ -367,6 +370,298 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(thing_ref).collect())
+    }
+
+    /// The thing a key leads to: its own key, or one of its other keys.
+    pub async fn thing_by_key(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT id FROM things WHERE key = ?1 UNION SELECT thing_id FROM thing_keys WHERE key = ?1 LIMIT 1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Another key for a thing (a person's other address).
+    pub async fn add_key(&self, key: &str, thing: &str) -> anyhow::Result<()> {
+        if self.thing_by_key(key).await?.as_deref() == Some(thing) {
+            return Ok(());
+        }
+        sqlx::query("INSERT OR REPLACE INTO thing_keys (key, thing_id) VALUES (?, ?)").bind(key).bind(thing).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Names a thing still called by its address.
+    pub async fn rename_if_unnamed(&self, id: &str, name: &str, placeholder: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE things SET name = ? WHERE id = ? AND (name = ? OR name = '' OR name LIKE '%@%')")
+            .bind(name)
+            .bind(id)
+            .bind(placeholder)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A link between two things (once).
+    pub async fn link_things(&self, src: &str, rel: &str, dst: &str, basis: &str, made_by: &str) -> anyhow::Result<()> {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM links WHERE src_thing = ? AND rel = ? AND dst_thing = ?")
+            .bind(src)
+            .bind(rel)
+            .bind(dst)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            sqlx::query("INSERT INTO links (src_thing, rel, dst_thing, basis, made_by, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+                .bind(src)
+                .bind(rel)
+                .bind(dst)
+                .bind(basis)
+                .bind(made_by)
+                .bind(c6_core::now_ms())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The thing with this key, made (or named) if need be.
+    pub async fn ensure_thing(&self, key: &str, kind: &str, name: &str) -> anyhow::Result<String> {
+        if let Some(id) =
+            sqlx::query_scalar::<_, String>("SELECT thing_id FROM thing_keys WHERE key = ?").bind(key).fetch_optional(&self.pool).await?
+        {
+            return Ok(id);
+        }
+        if let Some((id, old)) =
+            sqlx::query_as::<_, (String, String)>("SELECT id, name FROM things WHERE key = ?").bind(key).fetch_optional(&self.pool).await?
+        {
+            // A better name than a key-derived one.
+            // (or a citation's whole text, once its title is known).
+            let better = old.is_empty() || key.ends_with(&old) || (old.len() > name.len() && old.contains(name));
+            if !name.is_empty() && better && old != name {
+                sqlx::query("UPDATE things SET name = ? WHERE id = ?").bind(name).bind(&id).execute(&self.pool).await?;
+            }
+            return Ok(id);
+        }
+        let id = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO things (id, kind, name, key, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(&id)
+            .bind(kind)
+            .bind(if name.is_empty() { key } else { name })
+            .bind(key)
+            .bind(c6_core::now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    /// Links an item to a thing, with what supports it (a quote).
+    pub async fn link(&self, item: &str, rel: &str, thing: &str, basis: &str, made_by: &str, quote: Option<&str>) -> anyhow::Result<()> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO links (src_item, rel, dst_thing, basis, made_by, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(item)
+        .bind(rel)
+        .bind(thing)
+        .bind(basis)
+        .bind(made_by)
+        .bind(c6_core::now_ms())
+        .fetch_one(&self.pool)
+        .await?;
+        sqlx::query("INSERT INTO evidence (link_id, item_id, quote) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(item)
+            .bind(quote)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes the links an item's analysis made (before making them again).
+    pub async fn clear_links(&self, item: &str, made_by: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM evidence WHERE link_id IN (SELECT id FROM links WHERE src_item = ? AND made_by = ?)")
+            .bind(item)
+            .bind(made_by)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM links WHERE src_item = ? AND made_by = ?").bind(item).bind(made_by).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// How a thing is linked from items: (relation, count).
+    pub async fn rels_to(&self, thing: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as("SELECT rel, COUNT(*) FROM links WHERE dst_thing = ? GROUP BY rel ORDER BY 2 DESC")
+            .bind(thing)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    // --- Watched files ---
+
+    pub async fn file_state(&self, path: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        Ok(sqlx::query_as("SELECT mtime, size FROM files WHERE path = ?").bind(path).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn set_file(&self, path: &str, mtime: i64, size: i64, item: Option<&str>, error: Option<&str>) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO files (path, mtime, size, item_id, error, seen_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET \
+             mtime = excluded.mtime, size = excluded.size, item_id = excluded.item_id, error = excluded.error, seen_at = excluded.seen_at",
+        )
+        .bind(path)
+        .bind(mtime)
+        .bind(size)
+        .bind(item)
+        .bind(error)
+        .bind(c6_core::now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Files under `root` not seen since `before` (gone from disk): their
+    /// items.
+    pub async fn files_gone(&self, root: &str, before: i64) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        Ok(sqlx::query_as("SELECT path, item_id FROM files WHERE path LIKE ? AND seen_at < ?")
+            .bind(format!("{}%", root.trim_end_matches('/')))
+            .bind(before)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    pub async fn forget_file(&self, path: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM files WHERE path = ?").bind(path).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn touch_file(&self, path: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE files SET seen_at = ? WHERE path = ?").bind(c6_core::now_ms()).bind(path).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // --- Trails ---
+
+    pub async fn trails(&self) -> anyhow::Result<Vec<api::MemexTrail>> {
+        let rows = sqlx::query(
+            "SELECT t.*, (SELECT COUNT(*) FROM trail_steps s WHERE s.trail_id = t.id) AS steps FROM trails t ORDER BY t.updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| api::MemexTrail {
+                id: r.get("id"),
+                name: r.get("name"),
+                description: r.get("description"),
+                made_by: r.get("made_by"),
+                updated_at: r.get("updated_at"),
+                steps: Vec::new(),
+                step_count: r.get::<i64, _>("steps") as u32,
+            })
+            .collect())
+    }
+
+    /// A trail by id or name, with its steps.
+    pub async fn trail(&self, id_or_name: &str) -> anyhow::Result<Option<api::MemexTrail>> {
+        let Some(r) = sqlx::query("SELECT * FROM trails WHERE id = ? OR name = ?")
+            .bind(id_or_name)
+            .bind(id_or_name)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let id: String = r.get("id");
+        let steps = sqlx::query("SELECT * FROM trail_steps WHERE trail_id = ? ORDER BY ordinal").bind(&id).fetch_all(&self.pool).await?;
+        Ok(Some(api::MemexTrail {
+            id: id.clone(),
+            name: r.get("name"),
+            description: r.get("description"),
+            made_by: r.get("made_by"),
+            updated_at: r.get("updated_at"),
+            step_count: steps.len() as u32,
+            steps: steps
+                .iter()
+                .map(|s| api::MemexTrailStep {
+                    id: s.get("id"),
+                    target: s.get("target"),
+                    comment: s.get("comment"),
+                    made_by: s.get("made_by"),
+                    created_at: s.get("created_at"),
+                    title: String::new(),
+                    kind: String::new(),
+                })
+                .collect(),
+        }))
+    }
+
+    /// Adds a step to a trail, making the trail if need be. The trail's id.
+    pub async fn trail_append(&self, trail: &str, target: &str, comment: &str, made_by: &str) -> anyhow::Result<String> {
+        let now = c6_core::now_ms();
+        let id = match sqlx::query_scalar::<_, String>("SELECT id FROM trails WHERE id = ? OR name = ?")
+            .bind(trail)
+            .bind(trail)
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::now_v7().to_string();
+                sqlx::query("INSERT INTO trails (id, name, made_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+                    .bind(&id)
+                    .bind(trail.trim())
+                    .bind(made_by)
+                    .bind(now)
+                    .bind(now)
+                    .execute(&self.pool)
+                    .await?;
+                id
+            }
+        };
+        let next: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(ordinal), 0) + 1 FROM trail_steps WHERE trail_id = ?")
+            .bind(&id)
+            .fetch_one(&self.pool)
+            .await?;
+        sqlx::query("INSERT INTO trail_steps (trail_id, ordinal, target, comment, made_by, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&id)
+            .bind(next)
+            .bind(target)
+            .bind(comment)
+            .bind(made_by)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE trails SET updated_at = ? WHERE id = ?").bind(now).bind(&id).execute(&self.pool).await?;
+        Ok(id)
+    }
+
+    pub async fn trail_update(&self, id: &str, name: Option<&str>, description: Option<&str>) -> anyhow::Result<()> {
+        if let Some(n) = name {
+            sqlx::query("UPDATE trails SET name = ? WHERE id = ?").bind(n).bind(id).execute(&self.pool).await?;
+        }
+        if let Some(d) = description {
+            sqlx::query("UPDATE trails SET description = ? WHERE id = ?").bind(d).bind(id).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn trail_remove_step(&self, step: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM trail_steps WHERE id = ?").bind(step).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn trail_delete(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM trail_steps WHERE trail_id = ?").bind(id).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM trails WHERE id = ?").bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// (kind, title) of a trail step's target: an item, or a thing.
+    pub async fn describe(&self, target: &str) -> anyhow::Result<(String, String)> {
+        if let Some(r) = sqlx::query_as::<_, (String, String)>("SELECT kind, title FROM items WHERE id = ?")
+            .bind(target)
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            return Ok(r);
+        }
+        Ok(self.thing(target).await?.map(|t| (t.kind, t.name)).unwrap_or_else(|| ("missing".into(), target.into())))
     }
 
     pub async fn status(&self, space: &str) -> anyhow::Result<api::MemexStatus> {

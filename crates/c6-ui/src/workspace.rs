@@ -56,6 +56,9 @@ pub enum View {
     Mission,
     Usage,
     Memex,
+    Mail,
+    Calendar,
+    Contacts,
 }
 
 /// A place in a session: the transcript element to reveal, the side chats
@@ -110,6 +113,9 @@ impl View {
             View::Mission => "/mission".into(),
             View::Usage => "/usage".into(),
             View::Memex => "/memex".into(),
+            View::Mail => "/mail".into(),
+            View::Calendar => "/calendar".into(),
+            View::Contacts => "/contacts".into(),
         }
     }
 
@@ -160,6 +166,9 @@ impl View {
             ["mission"] => View::Mission,
             ["usage"] => View::Usage,
             ["memex"] => View::Memex,
+            ["mail"] => View::Mail,
+            ["calendar"] => View::Calendar,
+            ["contacts"] => View::Contacts,
             _ => View::Sessions,
         }
     }
@@ -182,6 +191,9 @@ impl View {
             View::Mission => "Mission control".into(),
             View::Usage => "Usage".into(),
             View::Memex => "Memex".into(),
+            View::Mail => "Mail".into(),
+            View::Calendar => "Calendar".into(),
+            View::Contacts => "Contacts".into(),
         }
     }
 
@@ -924,6 +936,9 @@ fn render_view(view: View) -> AnyView {
                     View::Mission => view! { <crate::activity::MissionPage /> }.into_any(),
                     View::Usage => view! { <crate::usage::UsagePage /> }.into_any(),
                     View::Memex => view! { <crate::memex::MemexPage /> }.into_any(),
+                    View::Mail => view! { <crate::mail::MailPage /> }.into_any(),
+                    View::Calendar => view! { <crate::calendar::CalendarPage /> }.into_any(),
+                    View::Contacts => view! { <crate::contacts::ContactsPage /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>
