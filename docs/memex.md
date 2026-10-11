@@ -1,6 +1,6 @@
 # Memex — Design
 
-Status: draft v0.1 (2026-10-11). For review before phase 6 is built.
+Status: draft v0.2 (2026-10-11). For review before phase 6 is built. v0.2 adds Google accounts, calendar and contacts, and records the decisions in section 11.
 
 > "A memex is a device in which an individual stores all his books, records, and communications, and which is mechanized so that it may be consulted with exceeding speed and flexibility." (Vannevar Bush, *As We May Think*, 1945)
 
@@ -21,7 +21,7 @@ The memex is your personal knowledge store, and it holds the context carbon6 wor
 - **Context flows both ways:**
   - carbon6's work becomes knowledge in the memex;
   - the memex supplies context to sessions, and its events start agents.
-- **carbon6 becomes your email client,** with the memex as its mail store and context.
+- **carbon6 replaces your email client, calendar and address book,** for any number of Google accounts (Gmail and Google Workspace), with the memex as their store and context.
 - **Media understanding:** faces (named people), places, objects and scenes in photos and videos.
 
 **Not goals:**
@@ -46,6 +46,7 @@ The memex is your personal knowledge store, and it holds the context carbon6 wor
 ### 2.1 A separate service on the fabric
 
 - **`c6m`** is a new binary and a new crate, `c6-memex`. It runs anywhere: the head's machine, a home server or a NAS. It can be placed wherever the disk and the GPU are.
+  - It starts on the same Mac as the head, but nothing may assume that. It reaches the head only over the fabric, has its own data directory, refers to media by location (`worker:<name>:<path>` or `memex:<path>`), and reaches models through carbon6 connections. Moving it to another machine is a re-enrollment plus copying its data directory.
 - **It joins the fabric the way workers do:**
   - it enrolls with a token from the head (Settings → Memex → "Connect a memex");
   - it receives a client certificate from the head's CA, with the role `memex` in its subject;
@@ -239,31 +240,81 @@ Jobs live in a durable queue in the memex database, each with a priority, a budg
   - Built-in ONNX models run in `c6m` on its CPU or GPU, or on a worker that advertises the capability `memex-compute`, for media too large to move.
 - **Versioning:** each derived row and inferred link records the pipeline and model version. Upgrading a task's model re-queues its tier for the affected items.
 
-## 6. Email: carbon6 as your mail client
+## 6. Mail, calendar and contacts
 
-### 6.1 Accounts and sync
+carbon6 replaces the mail client, the calendar and the address book, starting with Google: any number of Gmail and Google Workspace accounts. The provider layer is an interface, so IMAP/SMTP, JMAP, CalDAV and CardDAV can be added later without changing the rest.
 
-- **Protocols:** IMAP (with IDLE) and SMTP for most hosts; the Gmail API for Gmail, which handles labels, threads and history IDs better than its IMAP; JMAP for Fastmail and similar hosts.
-- **Sign-in:** OAuth sign-in for Gmail and Microsoft, through the head's existing OAuth broker. App passwords are kept as secrets.
-- **The mail host stays the source of truth.** Sync goes both ways: read and unread, flags, labels and folders, archive, trash, and drafts.
-- **History import:** the full mailbox through the API, or mbox, Maildir or Google Takeout files for archives that are no longer on a server.
-- **Multiple accounts and identities.** You choose the default per reply, by the recipient's history.
+### 6.1 Google accounts
 
-### 6.2 The client, in carbon6's UI
+- **Adding an account:** Settings → Mail & calendar → Add Google account. This is OAuth through the head's existing broker (the same one used for ChatGPT sign-in), with the tokens stored encrypted on the head. The memex gets short-lived access tokens over the fabric (2.4) and never holds the refresh token.
+- **One-time setup:** Google requires an OAuth client from a Google Cloud project you own. carbon6 shows the steps:
+  - enable the Gmail, Calendar and People APIs;
+  - create a Web client with carbon6's redirect address, and paste in its client ID and secret, which are kept as secrets.
+  - **Personal Gmail:** set the app to "In production". In "Testing", Google expires refresh tokens after 7 days. You'll see Google's "unverified app" notice once, which is expected for an app you made for yourself.
+  - **Workspace:** an "Internal" app avoids both issues.
+- **Scopes:**
+  - `gmail.modify` (read, label, archive, drafts; no permanent deletion);
+  - `gmail.send`;
+  - `calendar` (calendars and events);
+  - `contacts` (read and write).
 
-- **Views:** Inbox, Needs reply, Waiting on others, Starred, Sent, Drafts, Archive, per label or folder, and Search.
+### 6.2 Mail sync
+
+- **Through the Gmail API:**
+  - history import of every message (`messages.list` and `get` in raw format, rate-limited and resumable; 20 years can take a day or more and fills in newest first);
+  - then incremental sync with `history.list` from the last history ID. Push through Pub/Sub would need a public endpoint, so the memex polls, every 30 seconds while the UI is open and every 2 minutes otherwise.
+- **Gmail stays the source of truth.** Changes sync both ways: labels (including Inbox, Starred, Important, Spam and Trash), read state, archive, and drafts.
+- **No exclusions:** everything is brought in, including Spam and Trash. Spam is marked as such and never reaches agents' context.
+- **Multiple accounts** appear in one unified inbox or one at a time. Replies default to the account and address the thread came to.
+- **Archives no longer on Gmail** can be imported from mbox, Maildir or Google Takeout files. They're marked as imported, not synced.
+
+### 6.3 The mail client, in carbon6's UI
+
+- **Views:** Inbox, Needs reply, Waiting on others, Starred, Sent, Drafts, Archive, per label, and Search.
 - **Threads** are shown as conversations.
 - **Reading:**
   - HTML mail is shown in a sandboxed iframe (no scripts, an opaque origin);
   - remote images are blocked until you allow them per sender, so tracking pixels don't load;
   - attachments are previewed the way Outputs are.
-- **Composing:** Markdown or plain text, sent as multipart (text and HTML). Includes signatures, attachments (from files, Outputs or the memex), undo send (a short hold), send later, and reminders to follow up.
-- **Rules:** filters on sender, recipient, subject and content (or an agent's classification) that apply labels, archive, set priority, or start a workflow.
+- **Composing:** Markdown or plain text, sent as multipart (text and HTML). Includes:
+  - signatures, per account;
+  - attachments from files, Outputs or the memex;
+  - undo send (a short hold), send later, and reminders to follow up.
+- **Rules:** filters on sender, recipient, subject and content (or an agent's classification) that apply labels, archive, set priority, or start a workflow. Gmail's own filters keep working on Gmail's side.
 - **Keyboard first** on desktop, and a phone layout (phase 5's work applies).
-- **Contacts** are person things in the graph, with addresses, organizations, history and photos.
-- **Calendar invites:** ICS parsing, with accept or decline as a later addition.
 
-### 6.3 Agents and mail
+### 6.4 Calendar
+
+- **Google Calendar API sync:**
+  - every calendar you own or subscribe to, per account;
+  - events, recurrences (with exceptions), attendees and responses, reminders, conference links;
+  - incremental sync with sync tokens, both ways.
+- **The calendar UI:** day, week, month and agenda views; several accounts and calendars overlaid, with per-calendar colors and visibility.
+  - **Events:** create, edit, move and delete, including recurring ones ("this one", "this and following", "all").
+  - **Invites:** RSVP to invites, from the calendar or from the invite email itself. ICS invites in mail are matched to the calendar event.
+  - **Free/busy** across accounts, for scheduling.
+- **In the graph,** events are event things, linked to their attendees (person things), places, and the mail threads and documents about them.
+  - Before a meeting, a brief can gather the attendees' recent threads, open commitments and related documents.
+- **Agents:**
+  - **Scheduling:** find times across your calendars and propose them in a reply.
+  - **Meeting preparation:** a workflow before each meeting, delivered as a notification.
+  - **Follow-up:** after the meeting, draft notes and commitments.
+  - Anything that writes to the calendar or sends an invite is held for your approval by default, like `mail_send`.
+- **Reminders** use carbon6's notifications, so web push reaches your phone.
+
+### 6.5 Contacts
+
+- **Google People API sync** of contacts and contact groups, per account, both ways, incremental with sync tokens.
+- **Contacts are person things** in the graph. Google contacts, other accounts' contacts, and people seen only in mail resolve into one person each, with all their addresses, phones, organizations and photos (including named face clusters).
+- **Contacts built from mail:**
+  - people you've exchanged mail with in both directions become contact candidates;
+  - so do details found in signatures (title, phone, company), as inferred facts with evidence.
+- **Writing back to Google:**
+  - candidates you confirm, or that pass a rule (for example "replied to at least twice"), are created in Google Contacts, in a contact group named `carbon6` so they stay separable;
+  - enrichments of existing contacts are written back only for observed facts, or ones you confirmed. Inferred guesses never overwrite what's in Google.
+- **Conflicts** are settled field by field: the most recent change wins. Changes you made in carbon6 win over carbon6's own inferences.
+
+### 6.6 Agents and mail
 
 - **Triage** (a workflow, on new mail or a schedule):
   - classify, summarize, extract commitments;
@@ -329,19 +380,32 @@ Each step is usable on its own:
    - scopes;
    - the Memex Search page.
 2. **Documents and papers:** extraction, passages, the citation graph, claims, notes and trails.
-3. **Mail:**
-   - archive import and the structure tier;
+3. **Mail, calendar and contacts (Google):**
+   - accounts and OAuth setup;
+   - Gmail history import and sync, and the structure tier;
    - identity resolution and the review queue;
-   - IMAP and Gmail sync;
-   - the client UI, sending with approval, rules;
-   - triage and drafting workflows, memex event triggers, and inbox integration.
+   - the mail client UI, sending with approval, rules;
+   - Calendar sync and UI, invites and RSVP;
+   - People sync and contacts built from mail;
+   - triage, drafting, scheduling and meeting-prep workflows, memex event triggers, and inbox integration.
 4. **Understanding tiers:** summaries, topics, commitments, the graph explorer and timelines.
 5. **Photos and videos:** EXIF and places, captions, objects, faces and naming, transcripts.
 
-## 11. Open questions
+## 11. Decisions
 
-1. **Mail hosts:** which providers and how many accounts (Gmail, Fastmail, Microsoft, another IMAP host)? And where the archives that are no longer on a server live, and in what format?
-2. **Where `c6m` runs first:** this Mac, or another machine? This decides the paths for media and where local models run.
-3. **Calendar:** in scope as part of replacing your mail client (invites only, or a full calendar)?
-4. **Contacts sync:** read your existing address book (CardDAV or Google Contacts), or build contacts from mail alone?
-5. **Retention:** anything that should never be ingested (folders, labels, senders)?
+| Question | Decision |
+|---|---|
+| Architecture | A separate service (`c6m`) with an API, reachable over the fabric from the head and workers, and able to call the head to start agents |
+| Models | You pick a model per task |
+| Mail | carbon6 replaces the mail client: Gmail and Google Workspace, any number of accounts |
+| Calendar | Full calendar, synced both ways |
+| Contacts | Synced both ways with Google Contacts, plus contacts built from mail and written back |
+| Media | Faces, places, objects and scenes |
+| Where `c6m` runs | This Mac first, with nothing assuming it |
+| Exclusions | None: everything is brought in (Spam is kept out of agents' context) |
+| Encryption at rest | Left to the disks |
+
+## 12. Open questions
+
+1. **Before mail is built:** do you already have a Google Cloud project to put the OAuth client in? Or should carbon6 guide you through creating one when you add the first account?
+2. **How to treat old Takeout or mbox archives** that duplicate what's still in Gmail: deduplicate them by Message-ID (the default), or keep both?
