@@ -79,6 +79,9 @@ impl Tool for Grep {
         };
         let cwd = ctx.session.cwd();
         let root = input.path.as_deref().map(|p| ctx.session.resolve(p)).unwrap_or_else(|| cwd.clone());
+        if let Some(host) = ctx.session.ssh() {
+            return grep_remote(&host, &input, &root, &cwd).await;
+        }
         let cancel = ctx.cancel.clone();
         tokio::task::spawn_blocking(move || grep(&input, &root, &cwd, &cancel))
             .await
@@ -230,6 +233,9 @@ impl Tool for Glob {
         };
         let cwd = ctx.session.cwd();
         let root = input.path.as_deref().map(|p| ctx.session.resolve(p)).unwrap_or_else(|| cwd.clone());
+        if let Some(host) = ctx.session.ssh() {
+            return glob_remote(&host, &input.pattern, &root, &cwd).await;
+        }
         let cancel = ctx.cancel.clone();
         tokio::task::spawn_blocking(move || glob(&input.pattern, &root, &cwd, &cancel))
             .await
@@ -264,6 +270,83 @@ fn glob(pattern: &str, root: &Path, cwd: &Path, cancel: &CancellationToken) -> T
     let mut out: Vec<String> = hits.iter().take(GLOB_LIMIT).map(|(_, p)| display_path(p, cwd)).collect();
     if total > GLOB_LIMIT {
         out.push(format!("\n({total} files matched; showing the {GLOB_LIMIT} most recently modified)"));
+    }
+    ToolOutput::ok(out.join("\n"))
+}
+
+/// `grep` on an SSH target: ripgrep when it is installed there, else grep
+/// (extended regular expressions).
+async fn grep_remote(host: &crate::remote::SshHost, input: &GrepInput, root: &Path, cwd: &Path) -> ToolOutput {
+    use crate::remote::quote;
+    let mode_rg = match input.output_mode {
+        OutputMode::FilesWithMatches => " -l",
+        OutputMode::Count => " -c",
+        OutputMode::Content => "",
+    };
+    let ctx_n = match (input.output_mode, input.context) {
+        (OutputMode::Content, Some(n)) if n > 0 => format!(" -C {n}"),
+        _ => String::new(),
+    };
+    let i = if input.case_insensitive { " -i" } else { "" };
+    let (rg_glob, grep_glob) = match &input.glob {
+        Some(g) => (format!(" --glob {}", quote(g)), format!(" --include={}", quote(g.rsplit('/').next().unwrap_or(g)))),
+        None => (String::new(), String::new()),
+    };
+    let (pat, path) = (quote(&input.pattern), quote(&root.display().to_string()));
+    let line = format!(
+        "if command -v rg >/dev/null 2>&1; then rg --no-heading --line-number --color never{i}{ctx_n}{rg_glob}{mode_rg} -e {pat} -- {path}; \
+         else grep -rnI -E{i}{ctx_n}{grep_glob}{mode_rg} -e {pat} -- {path}; fi"
+    );
+    let (code, out, err) = match host.run(&line, b"", std::time::Duration::from_secs(120)).await {
+        Ok(r) => r,
+        Err(e) => return ToolOutput::err(e),
+    };
+    match code {
+        0 => {}
+        1 => return ToolOutput::ok("No matches found"),
+        _ => return ToolOutput::err(format!("grep failed: {}", String::from_utf8_lossy(&err).trim())),
+    }
+    let cwd_prefix = format!("{}/", cwd.display());
+    let lines: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|l| !(input.output_mode == OutputMode::Count && l.ends_with(":0")))
+        .map(|l| l.strip_prefix(&cwd_prefix).unwrap_or(l).to_owned())
+        .collect();
+    if lines.is_empty() {
+        return ToolOutput::ok("No matches found");
+    }
+    let limit = input.head_limit.unwrap_or(250);
+    let mut text = lines.iter().take(limit).cloned().collect::<Vec<_>>().join("\n");
+    if lines.len() > limit {
+        text.push_str(&format!("\n\n({} results; showing the first {limit})", lines.len()));
+    }
+    ToolOutput::limited(text, false)
+}
+
+/// `glob` on an SSH target: files listed there with find, matched here.
+async fn glob_remote(host: &crate::remote::SshHost, pattern: &str, root: &Path, cwd: &Path) -> ToolOutput {
+    let matcher = match glob_matcher(pattern) {
+        Ok(m) => m,
+        Err(e) => return ToolOutput::err(e),
+    };
+    let line = format!(
+        "find {} -type f -not -path '*/.git/*' -not -path '*/node_modules/*' 2>/dev/null | head -200000",
+        crate::remote::quote(&root.display().to_string())
+    );
+    let out = match host.sh(&line, b"").await {
+        Ok(o) => o,
+        Err(e) => return ToolOutput::err(e),
+    };
+    let mut hits: Vec<PathBuf> =
+        String::from_utf8_lossy(&out).lines().map(PathBuf::from).filter(|p| matcher.is_match(p.strip_prefix(root).unwrap_or(p))).collect();
+    if hits.is_empty() {
+        return ToolOutput::ok("No files found");
+    }
+    hits.sort();
+    let total = hits.len();
+    let mut out: Vec<String> = hits.iter().take(GLOB_LIMIT).map(|p| display_path(p, cwd)).collect();
+    if total > GLOB_LIMIT {
+        out.push(format!("\n({total} files matched; showing the first {GLOB_LIMIT} by path)"));
     }
     ToolOutput::ok(out.join("\n"))
 }

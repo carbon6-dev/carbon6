@@ -73,8 +73,17 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         return Err(bad_request("a model is required"));
     }
     // No folder: the worker gives the session a scratch workspace.
-    if req.cwd.trim().is_empty() && req.worktree {
+    if req.cwd.trim().is_empty() && req.worktree && req.ssh.is_none() {
         return Err(bad_request("a git worktree needs a folder"));
+    }
+    let ssh = req.ssh.as_deref().map(str::trim).unwrap_or("").to_owned();
+    if !ssh.is_empty() {
+        if ssh.starts_with('-') || ssh.contains(char::is_whitespace) {
+            return Err(bad_request("an SSH target is user@host or a host alias"));
+        }
+        if req.worktree {
+            return Err(bad_request("git worktrees are for folders on the worker, not SSH targets"));
+        }
     }
     let labels = check_labels(&req.labels)?;
     let now = now_ms();
@@ -106,6 +115,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         repo: String::new(),
         folder: String::new(),
         home: String::new(),
+        ssh_target: ssh.clone(),
     };
     let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
@@ -155,6 +165,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         repo: parent.repo.clone(),
         folder: parent.folder.clone(),
         home: parent.home.clone(),
+        ssh_target: parent.ssh_target.clone(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -200,6 +211,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         agents_json: st.store.setting(AGENTS).await?.unwrap_or_else(|| "[]".into()),
         secrets_json: serde_json::to_string(&st.store.secrets().await?)?,
         labels: row.head_labels(),
+        ssh_target: row.ssh_target.clone(),
         seed,
     })
 }

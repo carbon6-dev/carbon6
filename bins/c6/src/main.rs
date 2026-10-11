@@ -52,6 +52,10 @@ enum Command {
         /// No folder: a scratch workspace of its own on the worker.
         #[arg(long, conflicts_with = "cwd")]
         scratch: bool,
+        /// Work on this machine over SSH, through the worker (user@host or an
+        /// ssh_config alias); -C is then a folder there (default: home).
+        #[arg(long, conflicts_with = "scratch")]
+        ssh: Option<String>,
         /// Connection name or id (default: that of your latest session).
         #[arg(short, long)]
         connection: Option<String>,
@@ -238,14 +242,14 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     let c = Client::new(cli.url.as_deref().unwrap_or(&cfg.url), &cfg.token, cfg.ca.as_ref())?;
     match cli.command {
         Command::Login { .. } => unreachable!(),
-        Command::Run { prompt, worker, cwd, scratch, connection, model, effort, title, worktree, label, json, detach } => {
+        Command::Run { prompt, worker, cwd, scratch, ssh, connection, model, effort, title, worktree, label, json, detach } => {
             let labels = c6_api::labels::parse_labels(&label.join(","));
             let text = prompt_text(&prompt)?;
             let workers: Vec<Worker> = c.get("/workers").await?;
             let worker = pick_worker(&workers, worker.as_deref())?;
             let cwd = match cwd {
                 Some(d) => d,
-                None if scratch => String::new(),
+                None if scratch || ssh.is_some() => String::new(),
                 None => std::env::current_dir()?.display().to_string(),
             };
             let connections: Vec<Connection> = c.get("/connections").await?;
@@ -255,7 +259,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 .post(
                     "/sessions",
                     &json!({"worker_id": worker.id, "cwd": cwd, "connection_id": connection, "model": model,
-                            "title": title, "prompt": text, "effort": effort, "worktree": worktree, "labels": labels}),
+                            "title": title, "prompt": text, "effort": effort, "worktree": worktree, "labels": labels, "ssh": ssh}),
                 )
                 .await?;
             if detach {

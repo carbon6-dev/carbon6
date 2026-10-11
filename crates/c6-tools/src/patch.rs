@@ -76,7 +76,7 @@ impl Tool for ApplyPatch {
             match op {
                 Op::Add { path, lines } => {
                     let p = ctx.session.resolve(&path);
-                    if p.exists() {
+                    if ctx.session.fs_stat(&p).await.0 != crate::remote::Kind::Missing {
                         return ToolOutput::err(format!("cannot add {path}: it already exists (use Update File)"));
                     }
                     writes.push((p, Some(join(&lines, true))));
@@ -84,7 +84,7 @@ impl Tool for ApplyPatch {
                 }
                 Op::Delete { path } => {
                     let p = ctx.session.resolve(&path);
-                    if !p.is_file() {
+                    if ctx.session.fs_stat(&p).await.0 != crate::remote::Kind::File {
                         return ToolOutput::err(format!("cannot delete {path}: no such file"));
                     }
                     writes.push((p, None));
@@ -92,10 +92,11 @@ impl Tool for ApplyPatch {
                 }
                 Op::Update { path, move_to, hunks } => {
                     let p = ctx.session.resolve(&path);
-                    let text = match std::fs::read_to_string(&p) {
-                        Ok(t) => t,
-                        Err(e) => return ToolOutput::err(format!("cannot read {path}: {e}")),
-                    };
+                    let text =
+                        match ctx.session.fs_read(&p).await.and_then(|b| String::from_utf8(b).map_err(|_| "not UTF-8 text".to_owned())) {
+                            Ok(t) => t,
+                            Err(e) => return ToolOutput::err(format!("cannot read {path}: {e}")),
+                        };
                     let updated = match apply_hunks(&text, &hunks) {
                         Ok(u) => u,
                         Err(e) => return ToolOutput::err(format!("{path}: {e}")),
@@ -116,8 +117,8 @@ impl Tool for ApplyPatch {
         }
         for (path, contents) in &writes {
             let result = match contents {
-                Some(c) => path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(path, c)),
-                None => std::fs::remove_file(path),
+                Some(c) => ctx.session.fs_write(path, c.as_bytes()).await,
+                None => ctx.session.fs_remove(path).await,
             };
             if let Err(e) = result {
                 return ToolOutput::err(format!(
@@ -126,7 +127,7 @@ impl Tool for ApplyPatch {
                 ));
             }
             if contents.is_some() {
-                ctx.session.mark_seen(path);
+                ctx.session.mark_seen(path).await;
             }
         }
         ToolOutput::ok(format!("Success. Updated the following files:\n{}", summary.join("\n")))

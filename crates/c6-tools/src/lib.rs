@@ -8,6 +8,7 @@ pub mod hooks;
 mod patch;
 mod plan;
 pub mod profiles;
+pub mod remote;
 mod search;
 mod util;
 mod web;
@@ -15,7 +16,6 @@ mod web;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use c6_llm::ToolSpec;
@@ -102,22 +102,76 @@ pub struct SessionTools {
     /// Secrets: environment variables for shell commands, redacted from
     /// their output.
     secrets: Secrets,
+    /// The machine the session works on over SSH, if not this one.
+    ssh: Option<Arc<remote::SshHost>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
-    seen: Mutex<HashMap<PathBuf, Option<SystemTime>>>,
+    seen: Mutex<HashMap<PathBuf, Option<i64>>>,
 }
 
 impl SessionTools {
     pub fn new(cwd: PathBuf) -> Self {
+        Self::with_ssh(cwd, None)
+    }
+
+    /// A session on another machine (`cwd` is a folder there).
+    pub fn with_ssh(cwd: PathBuf, ssh: Option<Arc<remote::SshHost>>) -> Self {
         let secrets = Secrets::default();
         Self {
             cwd: Mutex::new(cwd),
             seen: Mutex::default(),
-            background: Background::with_secrets(secrets.clone()),
+            background: Background::with_secrets(secrets.clone(), ssh.clone()),
             subagents: Mutex::default(),
             hooks: Mutex::default(),
             secrets,
+            ssh,
+        }
+    }
+
+    pub fn ssh(&self) -> Option<Arc<remote::SshHost>> {
+        self.ssh.clone()
+    }
+
+    /// Reads a file (here or on the SSH target).
+    pub(crate) async fn fs_read(&self, path: &Path) -> Result<Vec<u8>, String> {
+        match &self.ssh {
+            Some(h) => h.read(path).await,
+            None => tokio::fs::read(path).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Writes a file, creating its folder.
+    pub(crate) async fn fs_write(&self, path: &Path, data: &[u8]) -> Result<(), String> {
+        match &self.ssh {
+            Some(h) => h.write(path, data).await,
+            None => {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                }
+                tokio::fs::write(path, data).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    pub(crate) async fn fs_remove(&self, path: &Path) -> Result<(), String> {
+        match &self.ssh {
+            Some(h) => h.remove(path).await,
+            None => tokio::fs::remove_file(path).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    /// What is at `path`, and its modification time.
+    pub(crate) async fn fs_stat(&self, path: &Path) -> (remote::Kind, Option<i64>) {
+        match &self.ssh {
+            Some(h) => h.stat(path).await.unwrap_or((remote::Kind::Missing, None)),
+            None => match tokio::fs::metadata(path).await {
+                Err(_) => (remote::Kind::Missing, None),
+                Ok(m) => {
+                    let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as i64);
+                    (if m.is_dir() { remote::Kind::Dir } else { remote::Kind::File }, mtime)
+                }
+            },
         }
     }
 
@@ -156,28 +210,38 @@ impl SessionTools {
         *self.cwd.lock().unwrap() = cwd;
     }
 
-    /// Resolves a model-supplied path against the session's cwd.
+    /// Resolves a model-supplied path against the session's cwd (on the
+    /// SSH target, `~` is the remote home).
     pub fn resolve(&self, path: &str) -> PathBuf {
+        let home = match &self.ssh {
+            Some(h) => Some(PathBuf::from(&h.home)),
+            None => dirs::home_dir(),
+        };
         let p = if let Some(rest) = path.strip_prefix("~/") {
-            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(path))
+            home.map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(path))
+        } else if path == "~" {
+            home.unwrap_or_else(|| PathBuf::from(path))
         } else {
             PathBuf::from(path)
         };
         if p.is_absolute() { p } else { self.cwd().join(p) }
     }
 
-    pub(crate) fn mark_seen(&self, path: &Path) {
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    pub(crate) async fn mark_seen(&self, path: &Path) {
+        let (_, mtime) = self.fs_stat(path).await;
         self.seen.lock().unwrap().insert(path.to_owned(), mtime);
     }
 
     /// Err with a message for the model if `path` exists but may not be
     /// overwritten yet.
-    pub(crate) fn check_writable(&self, path: &Path) -> Result<(), String> {
-        let Ok(meta) = std::fs::metadata(path) else { return Ok(()) };
+    pub(crate) async fn check_writable(&self, path: &Path) -> Result<(), String> {
+        let (kind, mtime) = self.fs_stat(path).await;
+        if kind == remote::Kind::Missing {
+            return Ok(());
+        }
         match self.seen.lock().unwrap().get(path) {
             None => Err(format!("{} exists but has not been read in this session. Read it first.", path.display())),
-            Some(seen) if *seen != meta.modified().ok() => {
+            Some(seen) if *seen != mtime => {
                 Err(format!("{} has changed on disk since it was last read. Read it again first.", path.display()))
             }
             Some(_) => Ok(()),

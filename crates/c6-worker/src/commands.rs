@@ -42,12 +42,12 @@ suggested fix. Do not change any files.";
 /// If the message invokes a custom command (its template came with it) or
 /// a built-in one, records which and sets what the model gets. Unknown
 /// commands are left as text.
-pub async fn expand(cwd: &Path, input: &mut PendingInput) {
+pub async fn expand(cwd: &Path, ssh: Option<&c6_tools::remote::SshHost>, input: &mut PendingInput) {
     let Some(rest) = input.text.strip_prefix('/') else { return };
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let args = args.trim().to_owned();
     if !input.template.is_empty() {
-        input.prompt = substitute(&std::mem::take(&mut input.template), &args, cwd).await;
+        input.prompt = substitute(&std::mem::take(&mut input.template), &args, cwd, ssh).await;
         return;
     }
     let body = match name {
@@ -60,10 +60,10 @@ pub async fn expand(cwd: &Path, input: &mut PendingInput) {
         _ => return,
     };
     input.command = name.to_owned();
-    input.prompt = substitute(body, &args, cwd).await;
+    input.prompt = substitute(body, &args, cwd, ssh).await;
 }
 
-async fn substitute(body: &str, args: &str, cwd: &Path) -> String {
+async fn substitute(body: &str, args: &str, cwd: &Path, ssh: Option<&c6_tools::remote::SshHost>) -> String {
     let positional = split_args(args);
     let mut out = String::with_capacity(body.len());
     let mut chars = body.char_indices().peekable();
@@ -90,7 +90,7 @@ async fn substitute(body: &str, args: &str, cwd: &Path) -> String {
         if c == '!' && body[i + 1..].starts_with('`') {
             let start = i + 2;
             if let Some(len) = body[start..].find('`') {
-                out.push_str(&shell(&body[start..start + len], cwd).await);
+                out.push_str(&shell(&body[start..start + len], cwd, ssh).await);
                 while chars.peek().is_some_and(|&(j, _)| j <= start + len) {
                     chars.next();
                 }
@@ -134,7 +134,22 @@ fn split_args(args: &str) -> Vec<String> {
     out
 }
 
-async fn shell(cmd: &str, cwd: &Path) -> String {
+async fn shell(cmd: &str, cwd: &Path, ssh: Option<&c6_tools::remote::SshHost>) -> String {
+    // On an SSH target the command runs there.
+    if let Some(h) = ssh {
+        let line = format!("cd {} && {cmd}", c6_tools::remote::quote(&cwd.display().to_string()));
+        return match h.run(&line, b"", SHELL_TIMEOUT).await {
+            Ok((code, out, err)) => {
+                let mut t = String::from_utf8_lossy(&out).into_owned();
+                t.push_str(&String::from_utf8_lossy(&err));
+                if code != 0 {
+                    t.push_str(&format!("\n(exit status {code})"));
+                }
+                t.trim_end().to_owned()
+            }
+            Err(e) => format!("(`{cmd}` could not run: {e})"),
+        };
+    }
     let run = tokio::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).kill_on_drop(true).output();
     let text = match tokio::time::timeout(SHELL_TIMEOUT, run).await {
         Err(_) => format!("(`{cmd}` timed out)"),
@@ -176,31 +191,31 @@ mod tests {
         };
 
         let mut input = custom("/fix 123 \"very high\"", "Fix issue #$1 with priority $2. Branch: !`echo main`");
-        expand(d, &mut input).await;
+        expand(d, None, &mut input).await;
         assert_eq!((input.command.as_str(), input.prompt.as_str()), ("fix", "Fix issue #123 with priority very high. Branch: main"));
         assert!(input.template.is_empty(), "the template is not kept");
 
         // Arguments a template does not place are appended.
         let mut input = custom("/component a button", "# Make a component\nCreate it.");
-        expand(d, &mut input).await;
+        expand(d, None, &mut input).await;
         assert_eq!(input.prompt, "# Make a component\nCreate it.\n\nARGUMENTS: a button");
 
         // A custom command replaces a built-in of the same name.
         let mut input = custom("/review", "Our own review.");
-        expand(d, &mut input).await;
+        expand(d, None, &mut input).await;
         assert_eq!(input.prompt, "Our own review.");
 
         // Built-ins: /review expands; /compact keeps its focus in the text.
         let mut input = PendingInput { text: "/review the parser".into(), ..Default::default() };
-        expand(d, &mut input).await;
+        expand(d, None, &mut input).await;
         assert!(input.command == "review" && input.prompt.contains("Review the code changes. the parser"));
         let mut input = PendingInput { text: "/compact the API work".into(), ..Default::default() };
-        expand(d, &mut input).await;
+        expand(d, None, &mut input).await;
         assert!(input.is_compact() && input.prompt.is_empty());
         // Unknown commands and paths are left alone.
         for text in ["/nope x", "/usr/bin/env is a path", "no command"] {
             let mut input = PendingInput { text: text.into(), ..Default::default() };
-            expand(d, &mut input).await;
+            expand(d, None, &mut input).await;
             assert_eq!((input.command.as_str(), input.prompt.as_str()), ("", ""), "{text}");
         }
     }

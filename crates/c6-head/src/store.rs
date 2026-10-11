@@ -219,6 +219,7 @@ pub struct SessionRow {
     pub repo: String,
     pub folder: String,
     pub home: String,
+    pub ssh_target: String,
 }
 
 impl SessionRow {
@@ -228,9 +229,10 @@ impl SessionRow {
 
     /// All its labels: yours, then the automatic ones.
     pub fn all_labels(&self) -> Vec<String> {
-        let folder = if self.folder.is_empty() && self.cwd.starts_with('/') { &self.cwd } else { &self.folder };
+        let folder =
+            if self.folder.is_empty() && self.cwd.starts_with('/') && self.ssh_target.is_empty() { &self.cwd } else { &self.folder };
         let mut l = self.user_labels();
-        l.extend(c6_api::labels::auto_labels(&self.worker_name, &self.repo, folder, &self.home, &self.model));
+        l.extend(c6_api::labels::auto_labels(&self.worker_name, &self.repo, folder, &self.home, &self.model, &self.ssh_target));
         l
     }
 
@@ -271,7 +273,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -287,6 +289,7 @@ impl Store {
         .bind(s.fork_seq)
         .bind(&s.labels)
         .bind(&s.worker_name)
+        .bind(&s.ssh_target)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -556,16 +559,17 @@ async fn create_subagent_session(
     if s.parent_session_id.is_empty() {
         return Ok(false);
     }
-    let parent = sqlx::query("SELECT connection_id, model, effort, labels, worker_name FROM sessions WHERE id = ? AND worker_id = ?")
-        .bind(&s.parent_session_id)
-        .bind(worker_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
+    let parent =
+        sqlx::query("SELECT connection_id, model, effort, labels, worker_name, ssh_target FROM sessions WHERE id = ? AND worker_id = ?")
+            .bind(&s.parent_session_id)
+            .bind(worker_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
     let Some(parent) = parent else { return Ok(false) };
     let now = c6_core::now_ms();
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -580,6 +584,7 @@ async fn create_subagent_session(
     .bind(&s.parent_call_id)
     .bind(parent.get::<String, _>("labels"))
     .bind(parent.get::<String, _>("worker_name"))
+    .bind(parent.get::<String, _>("ssh_target"))
     .execute(&mut *tx)
     .await?;
     Ok(true)

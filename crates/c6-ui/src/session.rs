@@ -347,6 +347,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                             <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
                                             {d.worker_name.clone()}
                                         </span>
+                                        {s.ssh.clone().map(|t| view! { <span class="rounded bg-sky-100 px-1 font-mono text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Working on this machine over SSH, through the worker">{format!("⇄ {t}")}</span> })}
                                         <span class="break-all font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
                                         {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
                                             <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
@@ -357,8 +358,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                 </div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <crate::fleet::TabButton tab label="Transcript" value="transcript" />
-                                    <crate::fleet::TabButton tab label="Changes" value="changes" />
-                                    <crate::fleet::TabButton tab label="Files" value="files" />
+                                    {s.ssh.is_none().then(|| view! {
+                                        <crate::fleet::TabButton tab label="Changes" value="changes" />
+                                        <crate::fleet::TabButton tab label="Files" value="files" />
+                                    })}
                                     <crate::fleet::TabButton tab label="Terminal" value="terminal" />
                                     <crate::fleet::TabButton tab label="Config" value="config" />
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
@@ -396,7 +399,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 match (tab.get(), wid, cwd) {
                     ("changes", Some(w), Some(c)) => view! { <crate::files::Changes worker_id=w path=c /> }.into_any(),
                     ("files", Some(w), Some(c)) => view! { <crate::files::FileBrowser worker_id=w root=c /> }.into_any(),
-                    ("terminal", Some(w), Some(c)) => view! { <crate::term::Terminals worker_id=w default_cwd=c /> }.into_any(),
+                    ("terminal", Some(w), Some(c)) => {
+                        let ssh = detail.get().and_then(|d| d.ok()).and_then(|d| d.session.ssh);
+                        view! { <crate::term::Terminals worker_id=w default_cwd=c ssh /> }.into_any()
+                    }
                     ("transcript", _, _) => ().into_any(),
                     ("config", _, _) => view! { <crate::labels::SessionConfig session=id_stored.get_value() /> }.into_any(),
                     _ => view! { <p class="py-6 text-center text-sm text-zinc-500">"Available once the session has started."</p> }.into_any(),
@@ -410,7 +416,12 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         </ScrollBox>
             <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some())>
             <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice
-                files=Signal::derive(move || Some((detail.get().and_then(|d| d.ok())?.session.worker_id.to_string(), started.get()?.0))) />
+                files=Signal::derive(move || {
+                    // @-completion lists the worker's files: not for SSH sessions.
+                    let s = detail.get().and_then(|d| d.ok())?.session;
+                    let cwd = started.get()?.0;
+                    s.ssh.is_none().then_some((s.worker_id.to_string(), cwd))
+                }) />
             </Show>
         </div>
     }
@@ -1577,19 +1588,24 @@ fn Composer(
                 return;
             }
             "/clear" if !inline && !custom("clear") => {
-                let (Some((worker, cwd)), Some(m)) = (files.and_then(|f| f.get_untracked()), model) else { return };
+                let Some(m) = model else { return };
                 text.set(String::new());
                 command.set(None);
                 spawn_local(async move {
-                    // The fresh session keeps this one's labels.
-                    let labels = api::session(id.get_value()).await.map(|d| d.session.labels).unwrap_or_default();
+                    // The fresh session is where this one is (worker, folder,
+                    // SSH target), with its labels.
+                    let d = match api::session(id.get_value()).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            error.set(Some(e));
+                            return;
+                        }
+                    };
                     let req = c6_api::CreateSession {
-                        labels,
-                        worker_id: match worker.parse() {
-                            Ok(w) => w,
-                            Err(_) => return,
-                        },
-                        cwd,
+                        labels: d.session.labels,
+                        worker_id: d.session.worker_id,
+                        cwd: d.session.cwd,
+                        ssh: d.session.ssh,
                         connection_id: m.connection.get_untracked(),
                         model: m.model.get_untracked(),
                         title: None,

@@ -3,7 +3,8 @@
 //! A session's labels are the ones you attach (`client:acme`, `rust`) and
 //! automatic ones: `worker:<name>`, `repo:<host/owner/name>` (from the git
 //! remote, so a repository is the same on every machine), `folder:<path>`
-//! (absolute, and `~/…` when under the home folder) and `model:<model>`.
+//! (absolute, and `~/…` when under the home folder), `model:<model>`, and
+//! `host:<host>` for a session on another machine over SSH.
 //!
 //! A setting (command, agent, skill, hook) applies to a session when every
 //! label in its `applies_to` matches one of the session's: `folder:` and
@@ -12,13 +13,18 @@
 //! everywhere.
 
 /// Label keys the system sets; yours cannot use them.
-pub const AUTO_KEYS: [&str; 4] = ["worker", "repo", "folder", "model"];
+pub const AUTO_KEYS: [&str; 5] = ["worker", "repo", "folder", "model", "host"];
 
-/// A session's automatic labels.
-pub fn auto_labels(worker: &str, repo: &str, folder: &str, home: &str, model: &str) -> Vec<String> {
+/// A session's automatic labels (`ssh`: its SSH target, if any).
+pub fn auto_labels(worker: &str, repo: &str, folder: &str, home: &str, model: &str, ssh: &str) -> Vec<String> {
     let mut out = Vec::new();
     if !worker.is_empty() {
         out.push(format!("worker:{worker}"));
+    }
+    if !ssh.is_empty() {
+        // user@host:port → host
+        let host = ssh.rsplit('@').next().unwrap_or(ssh);
+        out.push(format!("host:{}", host.split(':').next().unwrap_or(host)));
     }
     if !repo.is_empty() {
         out.push(format!("repo:{repo}"));
@@ -114,7 +120,8 @@ mod tests {
 
     #[test]
     fn matching() {
-        let mut labels = auto_labels("darkstar", "github.com/acme/app", "/Users/v/code/app/web", "/Users/v", "qwen3.6:27b");
+        let mut labels = auto_labels("darkstar", "github.com/acme/app", "/Users/v/code/app/web", "/Users/v", "qwen3.6:27b", "");
+        assert!(auto_labels("w", "", "/root", "/root", "m", "admin@web1:2222").contains(&"host:web1".to_owned()));
         labels.push("rust".into());
         assert!(labels.contains(&"folder:~/code/app/web".to_owned()));
         let yes = |s: &[&str]| applies(&s.iter().map(|x| x.to_string()).collect::<Vec<_>>(), &labels);

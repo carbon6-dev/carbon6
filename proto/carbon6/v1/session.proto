@@ -96,6 +96,9 @@ message SessionStarted {
   // outside a repository or without a remote), and the worker's home folder.
   string repo = 13;
   string home = 14;
+  // On another machine over SSH: the target, and a line about its system.
+  string ssh_target = 15;
+  string system = 16;
 }
 
 message UserMessage {
@@ -330,6 +333,9 @@ message CreateSession {
   // descriptions, labels; no values). The worker fetches the values of
   // those that apply as credentials named "secret:<NAME>".
   string secrets_json = 11;
+  // Work on another machine over SSH through this worker: user@host or an
+  // ssh_config alias; `cwd` is a folder there.
+  string ssh_target = 12;
 }
 
 message ModelSpec {

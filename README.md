@@ -112,6 +112,17 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Remote machines over SSH
+
+For a machine you can reach by SSH but don't want to install `c6w` on, start a session there *through* a worker. In the new-session form choose **SSH host, through the worker** and enter `user@host` (or an alias from the worker's `~/.ssh/config`) and a folder there (default: home). On the command line: `c6 run --ssh admin@web1 "install and start nginx"`.
+
+- **What runs where.** The agent's shell commands, file reads and edits, grep and glob, and background commands all run on that machine.
+- **Connection.** The worker connects with its own SSH setup: keys, agent and `~/.ssh/config`, never passwords (BatchMode). It keeps one multiplexed connection per host.
+- **What the agent is told.** The session's system prompt names the machine and its OS. The agent is told it works non-interactively (`sudo -n`).
+- **Secrets** reach remote commands through stdin, never through a command line.
+- **Session view.** The session shows `⇄ user@host` and gets a `host:` label. Its **Terminal** tab opens an SSH shell in the session's folder there.
+- **What stays on the worker.** Hooks and MCP servers run on the worker. Files on the target aren't checkpointed for rewind, and @-mentions refer to the worker's files, so they're off for SSH sessions.
+
 ### Sessions without a folder
 
 Not every task belongs in a repository. Leave the folder empty when starting a session (or use `c6 run --scratch`), and the worker gives it a scratch workspace of its own, `scratch/<session>` in the worker's state directory. It's where the agent downloads, drafts and builds things for research, documents and one-off jobs.

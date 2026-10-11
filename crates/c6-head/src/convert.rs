@@ -148,6 +148,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         last_seq: r.last_seq as u64,
         labels: r.user_labels(),
         auto_labels: r.all_labels().split_off(r.user_labels().len()),
+        ssh: Some(r.ssh_target.clone()).filter(|t| !t.is_empty()),
     }
 }
 

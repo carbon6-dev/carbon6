@@ -39,10 +39,23 @@ struct CommandChoice {
 
 /// A session's labels: the head's (yours, worker:) and the automatic ones
 /// only the worker knows (repo:, folder:) or that change (model:).
-pub(crate) fn session_labels(head_labels: &[String], repo: &str, cwd: &str, home: &str, model: &str) -> Vec<String> {
+pub(crate) fn session_labels(head_labels: &[String], repo: &str, cwd: &str, home: &str, model: &str, ssh: &str) -> Vec<String> {
     let mut l = head_labels.to_vec();
-    l.extend(c6_api::labels::auto_labels("", repo, cwd, home, model));
+    l.extend(c6_api::labels::auto_labels("", repo, cwd, home, model, ssh));
     l
+}
+
+/// Where a new session works: its folder (on the SSH target, if any), the
+/// local folder for what runs on the worker, and what labels are made of.
+struct Place {
+    cwd: PathBuf,
+    local: PathBuf,
+    home: String,
+    repo: String,
+    worktree_branch: String,
+    repo_root: String,
+    ssh_target: String,
+    system: String,
 }
 
 /// The repository's git remote (origin, else the first) as
@@ -219,6 +232,9 @@ impl SessionManager {
     }
 
     async fn create(&self, session_id: &str, command_id: &str, spec: CreateSession) -> Result<(), String> {
+        if !spec.ssh_target.trim().is_empty() {
+            return self.create_remote(session_id, command_id, spec).await;
+        }
         // No folder: the session gets a scratch workspace of its own.
         let cwd = if spec.cwd.trim().is_empty() {
             if spec.worktree {
@@ -244,8 +260,83 @@ impl SessionManager {
         let repo = repo_slug(&cwd).await;
         let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
         let model_name = spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default();
-        let labels = session_labels(&spec.labels, &repo, &cwd.display().to_string(), &home, &model_name);
+        let labels = session_labels(&spec.labels, &repo, &cwd.display().to_string(), &home, &model_name, "");
         let system_prompt = build_system_prompt(&spec.base_prompt, &cwd, &date);
+        self.finish_create(
+            session_id,
+            command_id,
+            spec,
+            Place {
+                cwd: cwd.clone(),
+                local: cwd,
+                home,
+                repo,
+                worktree_branch,
+                repo_root,
+                ssh_target: String::new(),
+                system: String::new(),
+            },
+            labels,
+            system_prompt,
+        )
+        .await
+    }
+
+    /// A session on another machine over SSH: checks the target (and the
+    /// folder there), and describes it to the model.
+    async fn create_remote(&self, session_id: &str, command_id: &str, spec: CreateSession) -> Result<(), String> {
+        let target = spec.ssh_target.trim().to_owned();
+        if spec.model.as_ref().is_some_and(|m| m.connection_kind == "claude_code") {
+            return Err("Claude Code sessions run on the worker itself, not over SSH".into());
+        }
+        let host = c6_tools::remote::SshHost::new(&target, "");
+        let (home, cwd, system) = host.probe(&spec.cwd).await.map_err(|e| format!("cannot work on {target}: {e}"))?;
+        // Things that stay on the worker (hooks, MCP servers) run here.
+        let local = self.state_dir.join("scratch").join(session_id);
+        std::fs::create_dir_all(&local).map_err(|e| format!("creating a local folder: {e}"))?;
+        let repo = match host.sh(&format!("git -C {} remote get-url origin 2>/dev/null", c6_tools::remote::quote(&cwd)), b"").await {
+            Ok(out) => normalize_remote(&String::from_utf8_lossy(&out)),
+            Err(_) => String::new(),
+        };
+        let date = time::OffsetDateTime::now_utc().date().to_string();
+        let mut prompt = spec.base_prompt.trim_end().to_owned();
+        prompt.push_str(&format!(
+            "\n\n# Environment\n- You are working on the remote machine {target} over SSH: shell commands and file tools act on that machine, not on the one you are hosted on.\n\
+             - System: {system}\n- Working directory there: {cwd}\n- Home folder there: {home}\n- Session started: {date}\n\
+             - Commands run non-interactively (no password prompts): use sudo -n, and say so if a command needs a password or confirmation.\n"
+        ));
+        let instructions = host
+            .sh(&format!("cd {} && (cat AGENTS.md 2>/dev/null || cat CLAUDE.md 2>/dev/null)", c6_tools::remote::quote(&cwd)), b"")
+            .await
+            .unwrap_or_default();
+        if !instructions.is_empty() {
+            prompt.push_str(&format!("\n# Project instructions ({cwd})\n\n{}\n", String::from_utf8_lossy(&instructions).trim_end()));
+        }
+        let model_name = spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default();
+        let labels = session_labels(&spec.labels, &repo, &cwd, &home, &model_name, &target);
+        let place = Place {
+            cwd: PathBuf::from(&cwd),
+            local,
+            home,
+            repo,
+            worktree_branch: String::new(),
+            repo_root: String::new(),
+            ssh_target: target,
+            system,
+        };
+        self.finish_create(session_id, command_id, spec, place, labels, prompt).await
+    }
+
+    async fn finish_create(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        spec: CreateSession,
+        place: Place,
+        labels: Vec<String>,
+        system_prompt: String,
+    ) -> Result<(), String> {
+        let Place { cwd, local, home, repo, worktree_branch, repo_root, ssh_target, system } = place;
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
         let mut session_tools = Vec::new();
@@ -256,10 +347,10 @@ impl SessionManager {
             (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
         } else {
             let profile = model_info(provider, &model.model).tool_profile;
-            let built = build_tools(&spec, &cwd, profile, &labels).await;
+            let built = build_tools(&spec, &local, profile, &labels).await;
             setup_errors = built.errors;
             let mut prompt = system_prompt;
-            if let Some(h) = crate::hooks::HookRunner::new(session_id, &cwd, &spec.hooks_json, &labels)
+            if let Some(h) = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels)
                 && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": "startup"})).await.context
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
@@ -297,6 +388,8 @@ impl SessionManager {
             context_window,
             repo,
             home,
+            ssh_target,
+            system,
             ..Default::default()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
@@ -415,20 +508,32 @@ impl SessionManager {
             link: self.link.clone(),
             next_seq: tokio::sync::Mutex::new(next_seq),
         });
+        // On an SSH target, what runs on the worker (hooks, MCP servers)
+        // runs in a local folder of the session's.
+        let remote = !started.ssh_target.is_empty();
+        let local = if remote {
+            let dir = self.state_dir.join("scratch").join(session_id);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        } else {
+            PathBuf::from(&started.cwd)
+        };
         let tools = match tools {
             Some(t) => t,
             None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
             None => {
-                let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec));
-                build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile), &labels).await.tools
+                let labels =
+                    session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
+                build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels).await.tools
             }
         };
         let started_cwd = started.cwd.clone();
         // The head's hooks. Claude Code sessions get them as Claude Code
         // settings and run them itself.
-        let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec));
-        let hooks = crate::hooks::HookRunner::new(session_id, Path::new(&started.cwd), &spec.hooks_json, &labels).map(Arc::new);
-        let session_tools = Arc::new(SessionTools::new(PathBuf::from(&started.cwd)));
+        let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
+        let hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
+        let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
+        let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
         if started.tool_profile != crate::claude_code::PROFILE {
             session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
             // Background tasks report to the actor.
@@ -455,7 +560,8 @@ impl SessionManager {
             writer,
             link: self.link.clone(),
             inbox: Arc::default(),
-            checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, Path::new(&started_cwd))),
+            // Files on an SSH target are not checkpointed.
+            checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, if remote { &local } else { Path::new(&started_cwd) })),
             auto_turns: VecDeque::new(),
             deferred: Vec::new(),
         };
@@ -615,15 +721,19 @@ impl Actor {
                             }
                             let head = if choice.labels.is_empty() { &self.spec.labels } else { &choice.labels };
                             let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
-                            let labels = session_labels(head, &self.started.repo, &self.started.cwd, &self.started.home, model);
+                            let labels = session_labels(head, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
                             let variants: Vec<Variant> = serde_json::from_str(&choice.candidates_json).unwrap_or_default();
                             match c6_api::labels::best(variants.iter(), |v| &v.applies_to, &labels) {
                                 Some(v) => input.template = v.body.clone(),
                                 None => input.command.clear(), // none applies here: plain text
                             }
                         }
-                        crate::commands::expand(cwd, &mut input).await;
-                        crate::mentions::resolve(cwd, &mut input);
+                        let ssh = self.session_tools.ssh();
+                        crate::commands::expand(cwd, ssh.as_deref(), &mut input).await;
+                        // @paths name files here, not on an SSH target.
+                        if ssh.is_none() {
+                            crate::mentions::resolve(cwd, &mut input);
+                        }
                         if let Some(h) = self.hooks.as_ref().filter(|_| self.started.tool_profile != crate::claude_code::PROFILE) {
                             let v = h.run("UserPromptSubmit", None, serde_json::json!({"prompt": input.model_text()})).await;
                             if let Some(reason) = v.blocked {
@@ -840,8 +950,16 @@ impl Actor {
         let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
         let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
         let checkpoints = self.checkpoints.clone();
+        let remote_session = !self.started.ssh_target.is_empty();
         let secret_names: Vec<String> = {
-            let labels = session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, &model.model);
+            let labels = session_labels(
+                &self.spec.labels,
+                &self.started.repo,
+                &self.started.cwd,
+                &self.started.home,
+                &model.model,
+                &self.started.ssh_target,
+            );
             applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
         };
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
@@ -858,7 +976,11 @@ impl Actor {
             // The files as they are before this turn's messages, for
             // rewinding to before them. A failed snapshot does not stop the
             // turn; the rewind then cannot restore files.
-            let checkpoint = match checkpoints.snapshot().await {
+            let checkpoint = match if remote_session {
+                Err(anyhow::anyhow!("files on an SSH target are not checkpointed"))
+            } else {
+                checkpoints.snapshot().await
+            } {
                 Ok(commit) => Checkpoint { commit, error: String::new() },
                 Err(e) => {
                     warn!(session = %writer.session_id, "no checkpoint: {e:#}");

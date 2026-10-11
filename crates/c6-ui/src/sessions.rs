@@ -86,7 +86,11 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="truncate text-xs text-zinc-500">
-                    {worker} " · " <span class="font-mono">{if s.cwd.is_empty() { "scratch workspace".to_owned() } else { s.cwd.clone() }}</span> " · " {s.model.clone()}
+                    {worker} " · " <span class="font-mono">{match (&s.ssh, s.cwd.is_empty()) {
+                        (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
+                        (None, true) => "scratch workspace".to_owned(),
+                        (None, false) => s.cwd.clone(),
+                    }}</span> " · " {s.model.clone()}
                 </div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-1">
@@ -109,6 +113,13 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let worker = RwSignal::new(storage_get("c6.worker").unwrap_or_default());
     let cwd = RwSignal::new(String::new());
     let picking = RwSignal::new(false);
+    // Or on an SSH host, through the worker: the target and a folder there.
+    let remote = RwSignal::new(storage_get("c6.where").as_deref() == Some("ssh"));
+    let ssh = RwSignal::new(String::new());
+    let remote_dir = RwSignal::new(String::new());
+    let recent_ssh = move || -> Vec<String> {
+        storage_get(&format!("c6.ssh.{}", worker.get())).map(|s| c6_api::labels::parse_labels(&s)).unwrap_or_default()
+    };
     let worker_online = move || {
         let w = worker.get();
         live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online))
@@ -178,7 +189,13 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         if pending.get_untracked() {
             return;
         }
-        if cwd.get_untracked().is_empty() && worktree.get_untracked() {
+        let on_ssh = remote.get_untracked();
+        let target = ssh.get_untracked().trim().to_owned();
+        if on_ssh && target.is_empty() {
+            error.set(Some("Enter the SSH host (user@host, or an alias from the worker's ~/.ssh/config)".into()));
+            return;
+        }
+        if !on_ssh && cwd.get_untracked().is_empty() && worktree.get_untracked() {
             error.set(Some("A git worktree needs a folder".into()));
             return;
         }
@@ -188,7 +205,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         };
         let req = CreateSession {
             worker_id,
-            cwd: cwd.get_untracked(),
+            cwd: if on_ssh { remote_dir.get_untracked().trim().to_owned() } else { cwd.get_untracked() },
+            ssh: on_ssh.then(|| target.clone()),
             connection_id: connection.get_untracked(),
             model: model.get_untracked(),
             title: None,
@@ -196,8 +214,17 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             attachments: Vec::new(),
             labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
-            worktree: worktree.get_untracked(),
+            worktree: worktree.get_untracked() && !on_ssh,
         };
+        storage_set("c6.where", if on_ssh { "ssh" } else { "worker" });
+        if on_ssh {
+            // Recent targets of this worker, newest first.
+            let mut recent = recent_ssh();
+            recent.retain(|t| *t != target);
+            recent.insert(0, target.clone());
+            recent.truncate(10);
+            storage_set(&format!("c6.ssh.{}", req.worker_id), &recent.join(","));
+        }
         storage_set("c6.worktree", if worktree.get_untracked() { "1" } else { "0" });
         storage_set("c6.effort", &effort.get_untracked());
         storage_set("c6.worker", &req.worker_id.to_string());
@@ -241,8 +268,20 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                     </select>
                 </label>
                 <div class="block text-xs text-zinc-500 sm:col-span-2">
-                    "Working directory"
-                    <div class="mt-1 flex gap-2">
+                    <div class="flex items-center gap-3">
+                        <label class="flex items-center gap-1"><input type="radio" name="c6-where" prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
+                        <label class="flex items-center gap-1" title="Work on another machine over SSH, using the worker's keys and ~/.ssh/config">
+                            <input type="radio" name="c6-where" prop:checked=move || remote.get() on:change=move |_| remote.set(true) />"SSH host, through the worker"
+                        </label>
+                    </div>
+                    <div class="mt-1 flex gap-2" class:hidden=move || !remote.get()>
+                        <input class=format!("{INPUT} min-w-0 flex-1 font-mono") list="c6-ssh-recent" placeholder="user@host or an ssh_config alias"
+                            prop:value=move || ssh.get() on:input=move |ev| ssh.set(event_target_value(&ev)) />
+                        <datalist id="c6-ssh-recent">{move || recent_ssh().into_iter().map(|t| view! { <option value=t></option> }).collect_view()}</datalist>
+                        <input class=format!("{INPUT} w-40! font-mono") placeholder="folder there (~)"
+                            prop:value=move || remote_dir.get() on:input=move |ev| remote_dir.set(event_target_value(&ev)) />
+                    </div>
+                    <div class="mt-1 flex gap-2" class:hidden=move || remote.get()>
                         <button class=format!("{INPUT} min-w-0 flex-1 truncate text-left font-mono disabled:opacity-60")
                             disabled=move || !worker_online()
                             title=move || if worker_online() { "Choose a folder on the worker" } else { "The worker is offline" }
@@ -303,7 +342,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             }}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex items-center justify-end gap-4">
-                <label class="flex items-center gap-1.5 text-sm text-zinc-600 dark:text-zinc-400" title="Create a c6/… branch and a separate checkout for this session">
+                <label class="flex items-center gap-1.5 text-sm text-zinc-600 dark:text-zinc-400" class:hidden=move || remote.get() title="Create a c6/… branch and a separate checkout for this session">
                     <input type="checkbox" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
                     "New git worktree"
                 </label>

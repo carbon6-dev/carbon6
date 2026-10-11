@@ -44,6 +44,9 @@ pub struct Terminals {
 #[derive(Deserialize)]
 pub struct OpenParams {
     pub cwd: Option<String>,
+    /// A shell on this SSH target instead (`cwd` is a folder there).
+    #[serde(default)]
+    pub ssh: Option<String>,
     #[serde(default = "default_cols")]
     pub cols: u16,
     #[serde(default = "default_rows")]
@@ -60,15 +63,36 @@ fn default_rows() -> u16 {
 
 impl Terminals {
     pub fn open(&self, p: OpenParams) -> anyhow::Result<TerminalInfo> {
-        let cwd =
-            p.cwd.filter(|c| !c.is_empty()).map(|c| crate::expand_home(&c)).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"));
+        let ssh = p.ssh.filter(|t| !t.trim().is_empty());
+        let remote_dir = p.cwd.clone().unwrap_or_default();
+        let cwd = if ssh.is_some() {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+        } else {
+            p.cwd.filter(|c| !c.is_empty()).map(|c| crate::expand_home(&c)).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"))
+        };
         if !cwd.is_dir() {
             anyhow::bail!("{} is not a directory on this worker", cwd.display());
         }
         let pair = native_pty_system().openpty(PtySize { rows: p.rows, cols: p.cols, pixel_width: 0, pixel_height: 0 })?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.arg("-l");
+        let mut cmd = match &ssh {
+            // A login shell on the target, in the session's folder there.
+            Some(target) => {
+                let mut c = CommandBuilder::new(std::env::var("C6_SSH_BIN").unwrap_or_else(|_| "ssh".into()));
+                let start = if remote_dir.is_empty() {
+                    "exec \"${SHELL:-/bin/sh}\" -l".to_owned()
+                } else {
+                    format!("cd {} 2>/dev/null; exec \"${{SHELL:-/bin/sh}}\" -l", c6_tools::remote::quote(&remote_dir))
+                };
+                c.args(["-t", "-o", "ServerAliveInterval=30", target.as_str(), start.as_str()]);
+                c
+            }
+            None => {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+                let mut c = CommandBuilder::new(&shell);
+                c.arg("-l");
+                c
+            }
+        };
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -78,7 +102,11 @@ impl Terminals {
         let writer = pair.master.take_writer()?;
 
         let id = uuid::Uuid::now_v7().to_string();
-        let info = TerminalInfo { id: id.clone(), cwd: cwd.display().to_string(), created_at: c6_core::now_ms(), exited: None };
+        let shown = match &ssh {
+            Some(t) => format!("{t}:{remote_dir}"),
+            None => cwd.display().to_string(),
+        };
+        let info = TerminalInfo { id: id.clone(), cwd: shown, created_at: c6_core::now_ms(), exited: None };
         let term = Arc::new(Terminal {
             info: info.clone(),
             master: Mutex::new(pair.master),

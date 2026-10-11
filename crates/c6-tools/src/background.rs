@@ -86,6 +86,8 @@ pub struct BackgroundProc {
     stopped: Mutex<Option<TaskState>>,
     /// The output pipe reached its end.
     eof: AtomicBool,
+    /// On an SSH target: where it recorded its process group there.
+    remote: Option<(Arc<crate::remote::SshHost>, String)>,
 }
 
 #[derive(Default)]
@@ -110,6 +112,7 @@ impl BackgroundProc {
             status: Mutex::new(None),
             stopped: Mutex::new(None),
             eof: AtomicBool::new(false),
+            remote: None,
         }
     }
 
@@ -146,6 +149,8 @@ pub struct Background {
     next: std::sync::atomic::AtomicU64,
     sink: Arc<Mutex<Option<TaskSink>>>,
     secrets: crate::Secrets,
+    /// Commands run here, or on this SSH target.
+    ssh: Option<Arc<crate::remote::SshHost>>,
 }
 
 /// A running task, as the UI lists it.
@@ -174,8 +179,8 @@ fn emit(sink: &Mutex<Option<TaskSink>>, secrets: &crate::Secrets, id: &str, p: &
 }
 
 impl Background {
-    pub fn with_secrets(secrets: crate::Secrets) -> Self {
-        Self { secrets, ..Default::default() }
+    pub fn with_secrets(secrets: crate::Secrets, ssh: Option<Arc<crate::remote::SshHost>>) -> Self {
+        Self { secrets, ssh, ..Default::default() }
     }
 
     /// Where task starts and ends are reported.
@@ -197,23 +202,49 @@ impl Background {
     /// when it ends.
     pub fn spawn(&self, command: &str, cwd: &std::path::Path, notify: bool) -> std::io::Result<String> {
         let (reader, writer) = std::io::pipe()?;
-        let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
-        let mut child = tokio::process::Command::new(shell)
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
-            .env("PAGER", "cat")
-            .env("GIT_PAGER", "cat")
-            .env("NO_COLOR", "1")
-            .envs(self.secrets.env())
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(writer.try_clone()?))
-            .stderr(Stdio::from(writer))
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()?;
+        let (mut child, remote_pidfile) = match &self.ssh {
+            // On the SSH target: the script records its process group so
+            // stopping the task stops it there, not just the local ssh.
+            Some(h) => {
+                let pidfile = crate::remote::SshHost::pidfile();
+                let script = crate::remote::SshHost::script(command, cwd, &self.secrets.env(), false, &pidfile);
+                let mut child = h
+                    .command(crate::remote::SshHost::script_runner())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::from(writer.try_clone()?))
+                    .stderr(Stdio::from(writer))
+                    .process_group(0)
+                    .spawn()?;
+                let mut stdin = child.stdin.take().expect("piped");
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(script.as_bytes()).await;
+                });
+                (child, Some((h.clone(), pidfile)))
+            }
+            None => {
+                let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
+                let child = tokio::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(cwd)
+                    .env("PAGER", "cat")
+                    .env("GIT_PAGER", "cat")
+                    .env("NO_COLOR", "1")
+                    .envs(self.secrets.env())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(writer.try_clone()?))
+                    .stderr(Stdio::from(writer))
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()?;
+                (child, None)
+            }
+        };
         let id = self.new_id();
-        let proc = Arc::new(BackgroundProc::new(command, TaskKind::Shell, notify, child.id().map(|p| Pid::from_raw(p as i32)), None));
+        let mut proc = BackgroundProc::new(command, TaskKind::Shell, notify, child.id().map(|p| Pid::from_raw(p as i32)), None);
+        proc.remote = remote_pidfile;
+        let proc = Arc::new(proc);
         let p = proc.clone();
         std::thread::spawn(move || {
             let mut reader = reader;
@@ -319,7 +350,16 @@ impl Background {
             return Some(false);
         }
         *p.stopped.lock().unwrap() = Some(by);
-        if let Some(pg) = p.pgid {
+        if let Some((h, pidfile)) = &p.remote {
+            // Stop it on the target, then the local ssh carrying it.
+            let (h, pidfile, local) = (h.clone(), pidfile.clone(), p.pgid);
+            tokio::spawn(async move {
+                h.kill(&pidfile).await;
+                if let Some(pg) = local {
+                    let _ = killpg(pg, Signal::SIGTERM);
+                }
+            });
+        } else if let Some(pg) = p.pgid {
             let _ = killpg(pg, Signal::SIGTERM);
         }
         if let Some(c) = &p.cancel {

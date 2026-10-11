@@ -110,7 +110,12 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
 
 /// A worker's terminals: open new ones, switch, close.
 #[component]
-pub fn Terminals(worker_id: String, #[prop(optional)] default_cwd: Option<String>) -> impl IntoView {
+pub fn Terminals(
+    worker_id: String,
+    #[prop(optional)] default_cwd: Option<String>,
+    #[prop(default = None)] ssh: Option<String>,
+) -> impl IntoView {
+    let ssh = StoredValue::new(ssh);
     let wid = StoredValue::new(worker_id);
     let list = LocalResource::new(move || crate::api::terminals(wid.get_value()));
     let active = RwSignal::new(None::<String>);
@@ -129,7 +134,7 @@ pub fn Terminals(worker_id: String, #[prop(optional)] default_cwd: Option<String
 
     let open = move |_| {
         spawn_local(async move {
-            match crate::api::open_terminal(wid.get_value(), cwd.get_untracked()).await {
+            match crate::api::open_terminal(wid.get_value(), cwd.get_untracked(), ssh.get_value()).await {
                 Ok(t) => {
                     active.set(Some(t.id));
                     list.refetch();

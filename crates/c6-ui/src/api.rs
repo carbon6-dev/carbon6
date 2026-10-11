@@ -249,8 +249,9 @@ pub async fn terminals(worker: String) -> Result<Vec<TerminalInfo>, String> {
     json(Request::get(&format!("/api/v1/workers/{worker}/terminals")).send().await).await
 }
 
-pub async fn open_terminal(worker: String, cwd: String) -> Result<TerminalInfo, String> {
-    send_json(Request::post(&format!("/api/v1/workers/{worker}/terminals")), &serde_json::json!({"cwd": cwd})).await
+/// A terminal on a worker, or (`ssh`) on an SSH target through it.
+pub async fn open_terminal(worker: String, cwd: String, ssh: Option<String>) -> Result<TerminalInfo, String> {
+    send_json(Request::post(&format!("/api/v1/workers/{worker}/terminals")), &serde_json::json!({"cwd": cwd, "ssh": ssh})).await
 }
 
 pub async fn close_terminal(worker: String, id: String) -> Result<(), String> {

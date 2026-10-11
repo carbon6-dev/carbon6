@@ -276,7 +276,7 @@ mod tests {
             {"event": "PostToolUse", "command": "echo rusty >&2; exit 2", "applies_to": ["rust", "repo:github.com/acme"]}
         ])
         .to_string();
-        let mut labels = c6_api::labels::auto_labels("w", "github.com/acme/app", &d.display().to_string(), "", "m");
+        let mut labels = c6_api::labels::auto_labels("w", "github.com/acme/app", &d.display().to_string(), "", "m", "");
         labels.push("rust".into());
         let h = HookRunner::new("s1", d, &hooks, &labels).unwrap();
 

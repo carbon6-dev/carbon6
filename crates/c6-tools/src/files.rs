@@ -51,17 +51,17 @@ impl Tool for Read {
             Err(e) => return e,
         };
         let path = ctx.session.resolve(&input.path);
-        if path.is_dir() {
+        if ctx.session.fs_stat(&path).await.0 == crate::remote::Kind::Dir {
             return ToolOutput::err(format!("{} is a directory; use glob or bash `ls` to list it", path.display()));
         }
-        let bytes = match tokio::fs::read(&path).await {
+        let bytes = match ctx.session.fs_read(&path).await {
             Ok(b) => b,
             Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
         };
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return ToolOutput::err(format!("{} looks like a binary file", path.display()));
         }
-        ctx.session.mark_seen(&path);
+        ctx.session.mark_seen(&path).await;
         let text = String::from_utf8_lossy(&bytes);
         if text.is_empty() {
             return ToolOutput::ok("(empty file)");
@@ -129,19 +129,14 @@ impl Tool for Write {
             Err(e) => return e,
         };
         let path = ctx.session.resolve(&input.path);
-        if let Err(msg) = ctx.session.check_writable(&path) {
+        if let Err(msg) = ctx.session.check_writable(&path).await {
             return ToolOutput::err(msg);
         }
-        let existed = path.exists();
-        if let Some(parent) = path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            return ToolOutput::err(format!("cannot create {}: {e}", parent.display()));
-        }
-        if let Err(e) = tokio::fs::write(&path, &input.content).await {
+        let existed = ctx.session.fs_stat(&path).await.0 != crate::remote::Kind::Missing;
+        if let Err(e) = ctx.session.fs_write(&path, input.content.as_bytes()).await {
             return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
         }
-        ctx.session.mark_seen(&path);
+        ctx.session.mark_seen(&path).await;
         let lines = input.content.lines().count();
         ToolOutput::ok(format!("{} {} ({lines} lines)", if existed { "Overwrote" } else { "Created" }, path.display()))
     }
@@ -191,10 +186,10 @@ impl Tool for Edit {
             Err(e) => return e,
         };
         let path = ctx.session.resolve(&input.path);
-        if !path.exists() {
+        if ctx.session.fs_stat(&path).await.0 == crate::remote::Kind::Missing {
             return ToolOutput::err(format!("{} does not exist; use write to create it", path.display()));
         }
-        if let Err(msg) = ctx.session.check_writable(&path) {
+        if let Err(msg) = ctx.session.check_writable(&path).await {
             return ToolOutput::err(msg);
         }
         if input.old_string == input.new_string {
@@ -203,7 +198,7 @@ impl Tool for Edit {
         if input.old_string.is_empty() {
             return ToolOutput::err("old_string must not be empty");
         }
-        let text = match tokio::fs::read_to_string(&path).await {
+        let text = match ctx.session.fs_read(&path).await.and_then(|b| String::from_utf8(b).map_err(|_| "not UTF-8 text".to_owned())) {
             Ok(t) => t,
             Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
         };
@@ -218,10 +213,10 @@ impl Tool for Edit {
                 ));
             }
         };
-        if let Err(e) = tokio::fs::write(&path, &updated).await {
+        if let Err(e) = ctx.session.fs_write(&path, updated.as_bytes()).await {
             return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
         }
-        ctx.session.mark_seen(&path);
+        ctx.session.mark_seen(&path).await;
         ToolOutput::ok(format!("Edited {} ({count} replacement{})", path.display(), if count == 1 { "" } else { "s" }))
     }
 }

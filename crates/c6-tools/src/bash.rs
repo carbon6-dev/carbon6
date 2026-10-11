@@ -94,6 +94,9 @@ impl Tool for Bash {
 }
 
 async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result<ToolOutput> {
+    if let Some(host) = ctx.session.ssh() {
+        return run_remote(ctx, &host, command, timeout).await;
+    }
     let cwd = ctx.session.cwd();
     let cwd_file = std::env::temp_dir().join(format!("c6-cwd-{}-{}", std::process::id(), unique()));
     // The EXIT trap records the final directory even if the command calls `exit`.
@@ -184,6 +187,111 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
         },
         End::TimedOut => (format!("[timed out after {} ms; process group killed]", timeout.as_millis()), true),
         End::Cancelled => ("[interrupted; process group killed]".to_owned(), true),
+    };
+    if !suffix.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&suffix);
+    }
+    if text.is_empty() {
+        text = "(no output)".into();
+    }
+    Ok(ToolOutput::limited(text, is_error))
+}
+
+/// `run` on the session's SSH target: the same streaming, limits and
+/// exit-status reporting; the directory carries over between commands.
+async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str, timeout: Duration) -> std::io::Result<ToolOutput> {
+    use crate::remote::{CWD_MARK, SshHost};
+    use tokio::io::AsyncWriteExt;
+    let pidfile = SshHost::pidfile();
+    let script = SshHost::script(command, &ctx.session.cwd(), &ctx.session.secrets().env(), true, &pidfile);
+    let (reader, writer) = std::io::pipe()?;
+    let mut child = host
+        .command(SshHost::script_runner())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(writer.try_clone()?))
+        .stderr(Stdio::from(writer))
+        .process_group(0)
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes()).await?;
+    }
+    let pgid = child.id().map(|id| Pid::from_raw(id as i32));
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || read_pipe(reader, tx));
+
+    let started = Instant::now();
+    let mut captured = Vec::new();
+    let on_chunk = |chunk: Vec<u8>, captured: &mut Vec<u8>| {
+        let text = String::from_utf8_lossy(&chunk);
+        // The directory report is ours, not the command's.
+        let shown: String = text.lines().filter(|l| !l.starts_with(CWD_MARK)).collect::<Vec<_>>().join("\n");
+        if !shown.trim().is_empty() {
+            (ctx.output)(&ctx.session.secrets().redact(&shown));
+        }
+        let room = (MAX_CAPTURE + 4096).saturating_sub(captured.len());
+        captured.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    };
+    enum End {
+        Exited(std::process::ExitStatus),
+        TimedOut,
+        Cancelled,
+    }
+    let end = loop {
+        tokio::select! {
+            status = child.wait() => break End::Exited(status?),
+            Some(chunk) = rx.recv() => on_chunk(chunk, &mut captured),
+            _ = tokio::time::sleep(timeout.saturating_sub(started.elapsed())) => break End::TimedOut,
+            _ = ctx.cancel.cancelled() => break End::Cancelled,
+        }
+    };
+    if !matches!(end, End::Exited(_)) {
+        // Stop it on the target too, not just the local ssh.
+        host.kill(&pidfile).await;
+        if let Some(pgid) = pgid {
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
+        let _ = child.wait().await;
+    }
+    let grace = tokio::time::sleep(DRAIN_GRACE);
+    tokio::pin!(grace);
+    loop {
+        tokio::select! {
+            chunk = rx.recv() => match chunk {
+                Some(c) => on_chunk(c, &mut captured),
+                None => break,
+            },
+            _ = &mut grace => break,
+        }
+    }
+
+    let raw = String::from_utf8_lossy(&captured).into_owned();
+    let mut text = String::new();
+    for line in raw.split_inclusive('\n') {
+        match line.trim_end().strip_prefix(CWD_MARK) {
+            Some(dir) if !dir.is_empty() => ctx.session.set_cwd(PathBuf::from(dir)),
+            _ => text.push_str(line),
+        }
+    }
+    // The report starts on a line of its own.
+    if text.ends_with("\n\n") {
+        text.pop();
+    }
+    let mut text = ctx.session.secrets().redact(&text);
+    if captured.len() >= MAX_CAPTURE {
+        text.push_str("\n[output capture limit reached]");
+    }
+    let (suffix, is_error) = match end {
+        End::Exited(s) => match s.code() {
+            Some(0) => (String::new(), false),
+            Some(255) => (format!("[ssh to {} failed: exit code 255]", host.target), true),
+            Some(c) => (format!("[exit code {c}]"), false),
+            None => ("[terminated by signal]".to_owned(), false),
+        },
+        End::TimedOut => (format!("[timed out after {} ms; stopped on {}]", timeout.as_millis(), host.target), true),
+        End::Cancelled => (format!("[interrupted; stopped on {}]", host.target), true),
     };
     if !suffix.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {

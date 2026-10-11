@@ -124,9 +124,14 @@ pub struct Session {
     /// Labels you attached.
     #[serde(default)]
     pub labels: Vec<String>,
-    /// Automatic labels: worker:, repo:, folder: (absolute and ~/), model:.
+    /// Automatic labels: worker:, repo:, folder: (absolute and ~/), model:,
+    /// host:.
     #[serde(default)]
     pub auto_labels: Vec<String>,
+    /// The machine it works on over SSH (through its worker), if not the
+    /// worker itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
 }
 
 /// A side chat: a new session that branches from `anchor_seq` of a session
@@ -156,6 +161,11 @@ pub struct CreateSession {
     /// Your labels for it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Work on another machine over SSH, through the worker: `user@host`
+    /// or an alias from the worker's ~/.ssh/config. `cwd` is then a folder
+    /// there (default: the home folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
     /// Reasoning effort: low, medium, high, xhigh, max. Default: per model.
     #[serde(default)]
     pub effort: Option<String>,
