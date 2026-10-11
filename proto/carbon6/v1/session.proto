@@ -326,6 +326,10 @@ message CreateSession {
   // worker adds repo:, folder: and model:. Settings above are filtered by
   // them on the worker.
   repeated string labels = 10;
+  // The head's secrets (JSON array of c6_api::SecretInfo: names,
+  // descriptions, labels; no values). The worker fetches the values of
+  // those that apply as credentials named "secret:<NAME>".
+  string secrets_json = 11;
 }
 
 message ModelSpec {

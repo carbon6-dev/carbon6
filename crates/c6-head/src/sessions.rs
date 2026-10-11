@@ -194,6 +194,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting(HOOKS).await?.unwrap_or_else(|| "[]".into()),
         agents_json: st.store.setting(AGENTS).await?.unwrap_or_else(|| "[]".into()),
+        secrets_json: serde_json::to_string(&st.store.secrets().await?)?,
         labels: row.head_labels(),
         seed,
     })
@@ -334,6 +335,20 @@ async fn with_command(st: &HeadState, labels: Vec<String>, mut input: UserInput)
         input.command_candidates_json = serde_json::to_string(&variants)?;
     }
     Ok(input)
+}
+
+/// An "applies to" list: labels, deduplicated (automatic keys allowed).
+pub fn check_selector(labels: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for l in labels.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        if l.contains(char::is_whitespace) || l.contains(',') {
+            return Err(bad_request(format!("{l:?} is not a label")));
+        }
+        if !out.iter().any(|x| x == l) {
+            out.push(l.to_owned());
+        }
+    }
+    Ok(out)
 }
 
 /// Your labels, checked and deduplicated.
@@ -670,8 +685,47 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     Ok(true)
 }
 
-pub async fn credential(st: &HeadState, req: CredentialRequest) -> CredentialGrant {
+/// A secret's value for a worker, as a credential. A secret scoped to
+/// `worker:` labels is only given to those workers.
+async fn secret_credential(st: &HeadState, worker_name: &str, name: &str, mut grant: CredentialGrant) -> CredentialGrant {
+    let (blob, applies_to) = match st.store.secret(name).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            grant.error = format!("no secret named {name}");
+            return grant;
+        }
+        Err(e) => {
+            warn!("loading secret: {e:#}");
+            grant.error = "internal error".into();
+            return grant;
+        }
+    };
+    let worker_scopes: Vec<&String> = applies_to.iter().filter(|l| l.starts_with("worker:")).collect();
+    if !worker_scopes.is_empty() && !worker_scopes.iter().any(|l| l.as_str() == format!("worker:{worker_name}")) {
+        grant.error = format!("secret {name} is not for this worker");
+        return grant;
+    }
+    match st.secrets.decrypt(&blob) {
+        Ok(v) => {
+            grant.kind = "secret".into();
+            grant.bearer = v;
+            // Short-lived on the worker, so changes reach running sessions.
+            grant.expires_at_ms = now_ms() + 5 * 60 * 1000;
+        }
+        Err(e) => {
+            warn!(secret = %name, "decrypting: {e:#}");
+            grant.error = "secret unavailable".into();
+        }
+    }
+    grant
+}
+
+pub async fn credential(st: &HeadState, worker_id: WorkerId, req: CredentialRequest) -> CredentialGrant {
     let mut grant = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id.clone(), ..Default::default() };
+    if let Some(name) = req.connection_id.strip_prefix("secret:") {
+        let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
+        return secret_credential(st, &worker_name, name, grant).await;
+    }
     let conn = match st.store.connection(&req.connection_id).await {
         Ok(Some(c)) => c,
         Ok(None) => {

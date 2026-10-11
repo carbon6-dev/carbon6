@@ -416,3 +416,15 @@ pub async fn session_config(id: String) -> Result<c6_api::EffectiveConfig, Strin
 pub async fn stop_task(id: String, task: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/tasks/{task}/stop")).send().await).await
 }
+
+pub async fn secrets() -> Result<Vec<c6_api::SecretInfo>, String> {
+    json(Request::get("/api/v1/settings/secrets").send().await).await
+}
+
+pub async fn put_secret(name: String, req: c6_api::PutSecret) -> Result<(), String> {
+    empty(Request::put(&format!("/api/v1/settings/secrets/{name}")).json(&req).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn delete_secret(name: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/settings/secrets/{name}")).send().await).await
+}

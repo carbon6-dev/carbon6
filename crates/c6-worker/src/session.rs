@@ -254,6 +254,19 @@ impl SessionManager {
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
             }
+            let secrets = applicable_secrets(&spec, &labels);
+            if !secrets.is_empty() {
+                prompt.push_str(
+                    "\n\n# Secrets\n\nThese environment variables hold secrets for your shell commands. Use them by name (for example \"$NAME\"), never \
+                     print or echo them, and do not write them into files; their values are hidden from you and replaced by [secret:NAME] in output.\n",
+                );
+                for (name, description) in &secrets {
+                    prompt.push_str(&format!(
+                        "- {name}{}\n",
+                        if description.is_empty() { String::new() } else { format!(": {description}") }
+                    ));
+                }
+            }
             if !built.skills.is_empty() {
                 prompt.push_str("\n\n");
                 prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
@@ -808,6 +821,7 @@ impl Actor {
             journal: self.journal.clone(),
             link: self.link.clone(),
             hooks: self.session_tools.hooks(),
+            secrets: self.session_tools.secrets().clone(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -816,9 +830,21 @@ impl Actor {
         let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
         let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
         let checkpoints = self.checkpoints.clone();
+        let secret_names: Vec<String> = {
+            let labels = session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, &model.model);
+            applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
+        };
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
+            // Secrets for this turn's commands (values only in memory).
+            if !secret_names.is_empty() {
+                let (values, errors) = fetch_secrets(&link, &secret_names).await;
+                for e in errors {
+                    warn!(session = %writer.session_id, "secret unavailable: {e}");
+                }
+                session_tools.set_secrets(values);
+            }
             // The files as they are before this turn's messages, for
             // rewinding to before them. A failed snapshot does not stop the
             // turn; the rewind then cannot restore files.
@@ -934,6 +960,39 @@ pub(crate) struct BuiltTools {
 
 fn yes() -> bool {
     true
+}
+
+/// The head's secrets that apply to a session with `labels`: (name,
+/// description).
+pub(crate) fn applicable_secrets(spec: &CreateSession, labels: &[String]) -> Vec<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Info {
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        applies_to: Vec<String>,
+    }
+    serde_json::from_str::<Vec<Info>>(&spec.secrets_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| c6_api::labels::applies(&s.applies_to, labels))
+        .map(|s| (s.name, s.description))
+        .collect()
+}
+
+/// The values of the secrets that apply, from the head (cached on the
+/// worker for a few minutes, in memory only).
+async fn fetch_secrets(link: &HeadLink, names: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut values = Vec::new();
+    let mut errors = Vec::new();
+    for name in names {
+        match link.credential(&format!("secret:{name}")).await {
+            Ok(g) => values.push((name.clone(), g.bearer)),
+            Err(e) => errors.push(format!("{name}: {e:#}")),
+        }
+    }
+    (values, errors)
 }
 
 fn spawn_model(spec: &CreateSession) -> String {

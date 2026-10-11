@@ -595,6 +595,39 @@ pub struct SkillDef {
     pub applies_to: Vec<String>,
 }
 
+/// A secret: an environment variable for sessions' commands. Its value is
+/// write-only (`PUT /api/v1/settings/secrets/{name}`); lists never show it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SecretInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    #[serde(default)]
+    pub updated_at: UnixMs,
+}
+
+/// `PUT /api/v1/settings/secrets/{name}`: create or update a secret. A
+/// missing `value` keeps the current one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PutSecret {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+}
+
+/// Whether `name` can be a secret's name: an environment variable name.
+pub fn valid_secret_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && name.len() <= 64
+}
+
 /// The commands built into carbon6: (name, description, argument hint).
 /// `compact`, `init` and `review` run on the worker; `clear` and `export`
 /// in the UI.

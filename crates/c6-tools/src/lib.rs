@@ -68,12 +68,40 @@ impl ToolOutput {
     }
 }
 
+/// A session's secrets, shared with its background tasks.
+#[derive(Clone, Default)]
+pub struct Secrets(Arc<Mutex<Vec<(String, String)>>>);
+
+impl Secrets {
+    pub fn env(&self) -> Vec<(String, String)> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// `text` with every secret's value replaced by `[secret:NAME]`.
+    pub fn redact(&self, text: &str) -> String {
+        let secrets = self.0.lock().unwrap();
+        let mut out = text.to_owned();
+        // Longest first, so a value containing another is replaced whole.
+        let mut by_len: Vec<&(String, String)> = secrets.iter().filter(|(_, v)| v.len() >= 4).collect();
+        by_len.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        for (name, value) in by_len {
+            if out.contains(value.as_str()) {
+                out = out.replace(value.as_str(), &format!("[secret:{name}]"));
+            }
+        }
+        out
+    }
+}
+
 /// State shared by every tool call in a session.
 pub struct SessionTools {
     cwd: Mutex<PathBuf>,
     pub background: Background,
     subagents: Mutex<Option<Arc<dyn Subagents>>>,
     hooks: Mutex<Option<Arc<dyn Hooks>>>,
+    /// Secrets: environment variables for shell commands, redacted from
+    /// their output.
+    secrets: Secrets,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -82,13 +110,24 @@ pub struct SessionTools {
 
 impl SessionTools {
     pub fn new(cwd: PathBuf) -> Self {
+        let secrets = Secrets::default();
         Self {
             cwd: Mutex::new(cwd),
             seen: Mutex::default(),
-            background: Background::default(),
+            background: Background::with_secrets(secrets.clone()),
             subagents: Mutex::default(),
             hooks: Mutex::default(),
+            secrets,
         }
+    }
+
+    /// Sets the secrets shell commands get: (environment variable, value).
+    pub fn set_secrets(&self, secrets: Vec<(String, String)>) {
+        *self.secrets.0.lock().unwrap() = secrets;
+    }
+
+    pub fn secrets(&self) -> &Secrets {
+        &self.secrets
     }
 
     /// Sets the hooks run around this session's tool calls.

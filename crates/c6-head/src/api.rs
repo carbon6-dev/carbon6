@@ -39,6 +39,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/mcp-servers", get(get_mcp_servers).put(put_mcp_servers))
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/settings/hooks", get(get_hooks).put(put_hooks))
+        .route("/api/v1/settings/secrets", get(list_secrets))
+        .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
@@ -667,6 +669,32 @@ async fn list_commands(State(st): State<Arc<HeadState>>, Query(q): Query<ForSess
     }));
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(out))
+}
+
+async fn list_secrets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::SecretInfo>>> {
+    Ok(Json(st.store.secrets().await?))
+}
+
+async fn put_secret(State(st): State<Arc<HeadState>>, Path(name): Path<String>, Json(req): Json<api::PutSecret>) -> ApiResult<StatusCode> {
+    if !api::valid_secret_name(&name) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "a secret's name is an environment variable name: A-Z, 0-9 and _".into()));
+    }
+    let applies_to = crate::sessions::check_selector(&req.applies_to)?;
+    let value = match req.value.as_deref().filter(|v| !v.is_empty()) {
+        Some(v) => Some(st.secrets.encrypt(v)?),
+        None => None,
+    };
+    if !st.store.put_secret(&name, value, req.description.trim(), &applies_to).await? {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{name} is new: give it a value")));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_secret(State(st): State<Arc<HeadState>>, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    if !st.store.delete_secret(&name).await? {
+        return Err(ApiErr(StatusCode::NOT_FOUND, "no such secret".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_hooks(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {

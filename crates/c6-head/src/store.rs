@@ -311,6 +311,61 @@ impl Store {
         Ok(sqlx::query_as("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at").bind(parent_id).fetch_all(&self.pool).await?)
     }
 
+    pub async fn secrets(&self) -> anyhow::Result<Vec<c6_api::SecretInfo>> {
+        let rows = sqlx::query("SELECT name, description, applies_to, updated_at FROM secrets ORDER BY name").fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| c6_api::SecretInfo {
+                name: r.get("name"),
+                description: r.get("description"),
+                applies_to: serde_json::from_str(&r.get::<String, _>("applies_to")).unwrap_or_default(),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    /// (encrypted value, applies_to) of a secret.
+    pub async fn secret(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Vec<String>)>> {
+        let row = sqlx::query("SELECT value, applies_to FROM secrets WHERE name = ?").bind(name).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| (r.get("value"), serde_json::from_str(&r.get::<String, _>("applies_to")).unwrap_or_default())))
+    }
+
+    /// Creates or updates a secret; `value: None` keeps the current value
+    /// (and fails for a new secret).
+    pub async fn put_secret(&self, name: &str, value: Option<Vec<u8>>, description: &str, applies_to: &[String]) -> anyhow::Result<bool> {
+        let now = c6_core::now_ms();
+        let labels = serde_json::to_string(applies_to)?;
+        let done = match value {
+            Some(v) => sqlx::query(
+                "INSERT INTO secrets (name, value, description, applies_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(name) DO UPDATE SET value = excluded.value, description = excluded.description, \
+                 applies_to = excluded.applies_to, updated_at = excluded.updated_at",
+            )
+            .bind(name)
+            .bind(v)
+            .bind(description)
+            .bind(&labels)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            None => sqlx::query("UPDATE secrets SET description = ?, applies_to = ?, updated_at = ? WHERE name = ?")
+                .bind(description)
+                .bind(&labels)
+                .bind(now)
+                .bind(name)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        };
+        Ok(done > 0)
+    }
+
+    pub async fn delete_secret(&self, name: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("DELETE FROM secrets WHERE name = ?").bind(name).execute(&self.pool).await?.rows_affected() > 0)
+    }
+
     pub async fn set_session_labels(&self, id: &str, labels: &[String]) -> anyhow::Result<bool> {
         let r = sqlx::query("UPDATE sessions SET labels = ?, updated_at = ? WHERE id = ?")
             .bind(serde_json::to_string(labels)?)

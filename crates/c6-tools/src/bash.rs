@@ -111,6 +111,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
         .env("GIT_PAGER", "cat")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("NO_COLOR", "1")
+        .envs(ctx.session.secrets().env())
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer.try_clone()?))
         .stderr(Stdio::from(writer))
@@ -127,7 +128,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
     let started = Instant::now();
     let mut captured = Vec::new();
     let on_chunk = |chunk: Vec<u8>, captured: &mut Vec<u8>| {
-        (ctx.output)(&String::from_utf8_lossy(&chunk));
+        (ctx.output)(&ctx.session.secrets().redact(&String::from_utf8_lossy(&chunk)));
         let room = MAX_CAPTURE.saturating_sub(captured.len());
         captured.extend_from_slice(&chunk[..chunk.len().min(room)]);
     };
@@ -171,7 +172,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
     }
     let _ = std::fs::remove_file(&cwd_file);
 
-    let mut text = String::from_utf8_lossy(&captured).into_owned();
+    let mut text = ctx.session.secrets().redact(&String::from_utf8_lossy(&captured));
     if captured.len() >= MAX_CAPTURE {
         text.push_str("\n[output capture limit reached]");
     }
@@ -322,5 +323,19 @@ mod tests {
         ctx.session.background.finish_agent(&id, Ok("found it".into()));
         let done = next(&mut rx).await;
         assert_eq!((done.state, done.exit_code, done.output.as_str()), (TaskState::Finished, Some(0), "found it"));
+    }
+
+    #[tokio::test]
+    async fn secrets_are_usable_but_never_shown() {
+        use crate::BashOutput;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), Default::default());
+        ctx.session.set_secrets(vec![("API_TOKEN".into(), "s3cr3t-value-123".into())]);
+        let r = Bash.call(&ctx, json!({"command": "test \"$API_TOKEN\" = s3cr3t-value-123 && echo ok; echo token=$API_TOKEN"})).await;
+        assert_eq!(r.content, "ok\ntoken=[secret:API_TOKEN]\n", "{r:?}");
+        Bash.call(&ctx, json!({"command": "echo bg=$API_TOKEN", "run_in_background": true})).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = BashOutput::generic().call(&ctx, json!({"id": "bg1"})).await;
+        assert!(r.content.starts_with("bg=[secret:API_TOKEN]") && !r.content.contains("s3cr3t"), "{r:?}");
     }
 }

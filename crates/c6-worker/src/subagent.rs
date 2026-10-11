@@ -28,6 +28,8 @@ pub struct Parent {
     pub link: Arc<HeadLink>,
     /// Its hooks apply to the subagent's tool calls too.
     pub hooks: Option<Arc<dyn c6_tools::Hooks>>,
+    /// And its secrets to the subagent's commands.
+    pub secrets: c6_tools::Secrets,
 }
 
 pub struct Runner {
@@ -103,6 +105,7 @@ impl Subagents for Runner {
 
         let session_tools = Arc::new(SessionTools::new(std::path::PathBuf::from(&started.cwd)));
         session_tools.set_hooks(p.hooks.clone().map(|h| Arc::new(SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
+        session_tools.set_secrets(p.secrets.env());
         let mut conv = Conversation { history: vec![Message::user_text(text)], context_tokens: 0 };
         let reason = run_turn(1, &cfg, self.client.as_ref(), &tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
             .await

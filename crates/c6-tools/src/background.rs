@@ -145,6 +145,7 @@ pub struct Background {
     procs: Mutex<HashMap<String, Arc<BackgroundProc>>>,
     next: std::sync::atomic::AtomicU64,
     sink: Arc<Mutex<Option<TaskSink>>>,
+    secrets: crate::Secrets,
 }
 
 /// A running task, as the UI lists it.
@@ -156,9 +157,9 @@ pub struct TaskInfo {
     pub running: bool,
 }
 
-fn emit(sink: &Mutex<Option<TaskSink>>, id: &str, p: &BackgroundProc, state: TaskState) {
+fn emit(sink: &Mutex<Option<TaskSink>>, secrets: &crate::Secrets, id: &str, p: &BackgroundProc, state: TaskState) {
     let Some(tx) = sink.lock().unwrap().clone() else { return };
-    let output = if state == TaskState::Started { String::new() } else { p.tail() };
+    let output = if state == TaskState::Started { String::new() } else { secrets.redact(&p.tail()) };
     let _ = tx.send(TaskEvent {
         id: id.to_owned(),
         kind: p.kind,
@@ -173,6 +174,10 @@ fn emit(sink: &Mutex<Option<TaskSink>>, id: &str, p: &BackgroundProc, state: Tas
 }
 
 impl Background {
+    pub fn with_secrets(secrets: crate::Secrets) -> Self {
+        Self { secrets, ..Default::default() }
+    }
+
     /// Where task starts and ends are reported.
     pub fn set_sink(&self, sink: Option<TaskSink>) {
         *self.sink.lock().unwrap() = sink;
@@ -200,6 +205,7 @@ impl Background {
             .env("PAGER", "cat")
             .env("GIT_PAGER", "cat")
             .env("NO_COLOR", "1")
+            .envs(self.secrets.env())
             .stdin(Stdio::null())
             .stdout(Stdio::from(writer.try_clone()?))
             .stderr(Stdio::from(writer))
@@ -221,8 +227,8 @@ impl Background {
             p.eof.store(true, Ordering::Release);
         });
         self.procs.lock().unwrap().insert(id.clone(), proc.clone());
-        emit(&self.sink, &id, &proc, TaskState::Started);
-        let (sink, task_id) = (self.sink.clone(), id.clone());
+        emit(&self.sink, &self.secrets, &id, &proc, TaskState::Started);
+        let (sink, secrets, task_id) = (self.sink.clone(), self.secrets.clone(), id.clone());
         tokio::spawn(async move {
             let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
             // Let the last output arrive (unless a child keeps the pipe open).
@@ -234,7 +240,7 @@ impl Background {
             }
             *proc.status.lock().unwrap() = Some(code);
             let state = proc.stopped.lock().unwrap().unwrap_or(TaskState::Finished);
-            emit(&sink, &task_id, &proc, state);
+            emit(&sink, &secrets, &task_id, &proc, state);
         });
         Ok(id)
     }
@@ -246,7 +252,7 @@ impl Background {
         let cancel = CancellationToken::new();
         let proc = Arc::new(BackgroundProc::new(description, TaskKind::Agent, notify, None, Some(cancel.clone())));
         self.procs.lock().unwrap().insert(id.clone(), proc.clone());
-        emit(&self.sink, &id, &proc, TaskState::Started);
+        emit(&self.sink, &self.secrets, &id, &proc, TaskState::Started);
         (id, cancel)
     }
 
@@ -271,7 +277,7 @@ impl Background {
             notify: p.notify,
             exit_code: Some(code),
             elapsed: p.started.elapsed(),
-            output: crate::util::truncate_middle(&text, crate::MAX_OUTPUT_CHARS).0,
+            output: crate::util::truncate_middle(&self.secrets.redact(&text), crate::MAX_OUTPUT_CHARS).0,
             pgid: None,
         });
     }
@@ -287,7 +293,7 @@ impl Background {
         let mut out = p.out.lock().unwrap();
         let start = out.read.max(out.dropped);
         let skipped = start > out.read;
-        let text = String::from_utf8_lossy(&out.data[start - out.dropped..]).into_owned();
+        let text = self.secrets.redact(&String::from_utf8_lossy(&out.data[start - out.dropped..]));
         out.read = out.dropped + out.data.len();
         Some((text, status, skipped))
     }

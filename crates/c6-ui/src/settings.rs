@@ -80,6 +80,7 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 examples=skill_examples
             />
             <HooksSetting />
+            <SecretsSetting />
         </main>
     }
 }
@@ -879,5 +880,117 @@ fn ListItem(
                 </label>
             }).collect_view()}
         </div>
+    }
+}
+
+/// Settings: secrets, as environment variables for sessions' commands.
+/// Values are write-only.
+#[component]
+fn SecretsSetting() -> impl IntoView {
+    let list = LocalResource::new(api::secrets);
+    let name = RwSignal::new(String::new());
+    let value = RwSignal::new(String::new());
+    let description = RwSignal::new(String::new());
+    let applies = RwSignal::new(String::new());
+    // Editing an existing secret (its value can be left blank to keep it).
+    let editing = RwSignal::new(false);
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let reset = move || {
+        name.set(String::new());
+        value.set(String::new());
+        description.set(String::new());
+        applies.set(String::new());
+        editing.set(false);
+    };
+    let save = move |_| {
+        let n = name.get_untracked().trim().to_owned();
+        let req = c6_api::PutSecret {
+            value: Some(value.get_untracked()).filter(|v| !v.is_empty()),
+            description: description.get_untracked(),
+            applies_to: c6_api::labels::parse_labels(&applies.get_untracked()),
+        };
+        spawn_local(async move {
+            match api::put_secret(n, req).await {
+                Ok(()) => {
+                    status.set(Some(Ok("Saved. Sessions get it from their next turn.")));
+                    reset();
+                    list.refetch();
+                }
+                Err(e) => status.set(Some(Err(e))),
+            }
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Secrets"</h2>
+                <p class="text-sm text-zinc-500">
+                    "API keys, tokens and passwords for the agent's shell commands. Each is an environment variable (e.g. $GITHUB_TOKEN) in the sessions it applies to. The agent sees only its name and description: the value is never shown to it, is replaced by [secret:NAME] in command output, and stays encrypted on the head. Values can't be read back here, only replaced."
+                </p>
+            </div>
+            <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                {move || list.get().map(|r| match r {
+                    Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No secrets."</p> }.into_any(),
+                    Ok(v) => v.into_iter().map(|s| {
+                        let (edit, del) = (s.clone(), s.name.clone());
+                        view! {
+                            <div class="flex flex-wrap items-center gap-2 py-2 text-sm">
+                                <span class="font-mono">{format!("${}", s.name)}</span>
+                                <span class="min-w-0 flex-1 truncate text-zinc-500">{s.description.clone()}</span>
+                                {s.applies_to.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
+                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                    name.set(edit.name.clone());
+                                    description.set(edit.description.clone());
+                                    applies.set(edit.applies_to.join(", "));
+                                    value.set(String::new());
+                                    editing.set(true);
+                                }>"Edit"</button>
+                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                    let n = del.clone();
+                                    spawn_local(async move {
+                                        match api::delete_secret(n).await {
+                                            Ok(()) => list.refetch(),
+                                            Err(e) => status.set(Some(Err(e))),
+                                        }
+                                    });
+                                }>"Delete"</button>
+                            </div>
+                        }
+                    }).collect_view().into_any(),
+                })}
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="GITHUB_TOKEN" prop:disabled=move || editing.get()
+                        prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev).to_ascii_uppercase()) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Value"</span>
+                    <input type="password" autocomplete="off" class=format!("{INPUT} py-1 font-mono text-xs")
+                        placeholder=move || if editing.get() { "leave empty to keep the current value" } else { "the secret" }
+                        prop:value=move || value.get() on:input=move |ev| value.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Description (shown to the agent)"</span>
+                    <input class=format!("{INPUT} py-1 text-sm") placeholder="GitHub token with repo scope"
+                        prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Applies to"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="everywhere, or labels, e.g. repo:github.com/me/app"
+                        prop:value=move || applies.get() on:input=move |ev| applies.set(event_target_value(&ev)) />
+                </label>
+            </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                {move || editing.get().then(|| view! { <button class=BUTTON_QUIET on:click=move |_| reset()>"Cancel"</button> })}
+                <button class=BUTTON on:click=save>{move || if editing.get() { "Save changes" } else { "Add secret" }}</button>
+            </div>
+        </section>
     }
 }

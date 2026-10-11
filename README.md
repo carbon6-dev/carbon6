@@ -112,6 +112,14 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Secrets
+
+Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is an environment variable (`$GITHUB_TOKEN`) for the agent's shell commands, background commands included, in the sessions it applies to (an "Applies to" label list, like other settings).
+
+- **The agent never sees a value.** The system prompt lists only names and descriptions, and a value that appears in command output is replaced by `[secret:NAME]` before the model or the UI sees it.
+- **Storage.** Values are encrypted on the head and can only be replaced, never read back.
+- **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. A secret scoped to a `worker:` label is only handed to that worker.
+
 ### Background tasks
 
 The agent can start work in the background and carry on: long builds, test suites, servers (`bash` with `run_in_background`), and subagents (Task with `run_in_background`).

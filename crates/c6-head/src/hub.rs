@@ -214,7 +214,7 @@ async fn serve_worker(
             }
             worker_msg::Msg::RpcResponse(resp) => guard.rpc_response(resp),
             worker_msg::Msg::CredentialRequest(req) => {
-                let grant = sessions::credential(st, req).await;
+                let grant = sessions::credential(st, worker_id, req).await;
                 if tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await.is_err() {
                     return "response stream closed".into();
                 }
