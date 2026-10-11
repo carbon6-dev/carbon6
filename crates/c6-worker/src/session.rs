@@ -219,7 +219,17 @@ impl SessionManager {
     }
 
     async fn create(&self, session_id: &str, command_id: &str, spec: CreateSession) -> Result<(), String> {
-        let cwd = crate::expand_home(&spec.cwd);
+        // No folder: the session gets a scratch workspace of its own.
+        let cwd = if spec.cwd.trim().is_empty() {
+            if spec.worktree {
+                return Err("a git worktree needs a folder".into());
+            }
+            let dir = self.state_dir.join("scratch").join(session_id);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("creating a scratch workspace: {e}"))?;
+            dir
+        } else {
+            crate::expand_home(&spec.cwd)
+        };
         if !cwd.is_dir() {
             return Err(format!("working directory {} does not exist on this worker", cwd.display()));
         }

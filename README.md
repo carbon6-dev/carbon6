@@ -112,6 +112,10 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Sessions without a folder
+
+Not every task belongs in a repository. Leave the folder empty when starting a session (or use `c6 run --scratch`), and the worker gives it a scratch workspace of its own, `scratch/<session>` in the worker's state directory. It's where the agent downloads, drafts and builds things for research, documents and one-off jobs.
+
 ### Secrets
 
 Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is an environment variable (`$GITHUB_TOKEN`) for the agent's shell commands, background commands included, in the sessions it applies to (an "Applies to" label list, like other settings).

@@ -86,7 +86,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="truncate text-xs text-zinc-500">
-                    {worker} " · " <span class="font-mono">{s.cwd.clone()}</span> " · " {s.model.clone()}
+                    {worker} " · " <span class="font-mono">{if s.cwd.is_empty() { "scratch workspace".to_owned() } else { s.cwd.clone() }}</span> " · " {s.model.clone()}
                 </div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-1">
@@ -178,8 +178,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         if pending.get_untracked() {
             return;
         }
-        if cwd.get_untracked().is_empty() {
-            error.set(Some("Choose a working directory".into()));
+        if cwd.get_untracked().is_empty() && worktree.get_untracked() {
+            error.set(Some("A git worktree needs a folder".into()));
             return;
         }
         let Ok(worker_id) = worker.get_untracked().parse() else {
@@ -247,8 +247,12 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                             disabled=move || !worker_online()
                             title=move || if worker_online() { "Choose a folder on the worker" } else { "The worker is offline" }
                             on:click=move |_| picking.set(true)>
-                            {move || if cwd.get().is_empty() { "Choose a folder…".to_owned() } else { cwd.get() }}
+                            {move || if cwd.get().is_empty() { "No folder: a scratch workspace (choose one…)".to_owned() } else { cwd.get() }}
                         </button>
+                        {move || (!cwd.get().is_empty()).then(|| view! {
+                            <button class="shrink-0 rounded-md px-2 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                title="Work in a scratch workspace instead of a folder" on:click=move |_| cwd.set(String::new())>"✕"</button>
+                        })}
                     </div>
                 </div>
                 <label class="block text-xs text-zinc-500">

@@ -463,13 +463,17 @@ impl Store {
                 Some(Kind::Started(s)) => {
                     status = "idle".into();
                     done.push(s.command_id.clone());
-                    sqlx::query("UPDATE sessions SET repo = ?, folder = ?, home = ? WHERE id = ?")
-                        .bind(&s.repo)
-                        .bind(&s.cwd)
-                        .bind(&s.home)
-                        .bind(session_id)
-                        .execute(&mut *tx)
-                        .await?;
+                    // A scratch session learns its folder here.
+                    sqlx::query(
+                        "UPDATE sessions SET repo = ?, folder = ?, home = ?, cwd = CASE WHEN cwd = '' THEN ? ELSE cwd END WHERE id = ?",
+                    )
+                    .bind(&s.repo)
+                    .bind(&s.cwd)
+                    .bind(&s.home)
+                    .bind(&s.cwd)
+                    .bind(session_id)
+                    .execute(&mut *tx)
+                    .await?;
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),

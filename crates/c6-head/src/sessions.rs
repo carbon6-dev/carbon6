@@ -69,8 +69,12 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         return Err(bad_request("worker is revoked"));
     }
     let effort = check_effort(req.effort.clone())?;
-    if req.cwd.trim().is_empty() || req.model.trim().is_empty() {
-        return Err(bad_request("cwd and model are required"));
+    if req.model.trim().is_empty() {
+        return Err(bad_request("a model is required"));
+    }
+    // No folder: the worker gives the session a scratch workspace.
+    if req.cwd.trim().is_empty() && req.worktree {
+        return Err(bad_request("a git worktree needs a folder"));
     }
     let labels = check_labels(&req.labels)?;
     let now = now_ms();
