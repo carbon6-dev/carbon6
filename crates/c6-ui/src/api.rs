@@ -279,6 +279,31 @@ pub async fn check_host(name: String) -> Result<c6_api::HostCheck, String> {
     json(Request::post(&format!("/api/v1/hosts/{}/check", js_sys::encode_uri_component(&name))).send().await).await
 }
 
+pub async fn workflows() -> Result<Vec<c6_api::Workflow>, String> {
+    json(Request::get("/api/v1/settings/workflows").send().await).await
+}
+
+pub async fn workflow_runs() -> Result<Vec<c6_api::WorkflowRun>, String> {
+    json(Request::get("/api/v1/workflows/runs?limit=15").send().await).await
+}
+
+pub async fn run_workflow(name: String, input: String) -> Result<c6_api::WorkflowRun, String> {
+    let body = c6_api::RunWorkflow { input };
+    send_json(Request::post(&format!("/api/v1/workflows/{}/run", js_sys::encode_uri_component(&name))), &body).await
+}
+
+pub async fn decide_workflow_step(run: String, step: String, allow: bool) -> Result<(), String> {
+    let body = c6_api::ApprovalDecision { allow };
+    empty(
+        Request::post(&format!("/api/v1/workflows/runs/{run}/steps/{}/decide", js_sys::encode_uri_component(&step)))
+            .json(&body)
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
+
 pub async fn test_channel(name: String) -> Result<(), String> {
     let body = c6_api::TestChannel { name };
     empty(Request::post("/api/v1/settings/channels/test").json(&body).map_err(|e| e.to_string())?.send().await).await

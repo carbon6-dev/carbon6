@@ -81,8 +81,10 @@ async fn check(st: &HeadState, name: &str, template: &str, trigger: &str, cron: 
     if name.trim().is_empty() {
         return Err(bad_request("an automation needs a name"));
     }
-    if !crate::templates::templates(st).await?.iter().any(|t| t.name == template) {
-        return Err(bad_request(format!("no template named {template:?}")));
+    if !crate::templates::templates(st).await?.iter().any(|t| t.name == template)
+        && !crate::workflows::workflows(st).await?.iter().any(|w| w.name == template)
+    {
+        return Err(bad_request(format!("no template or workflow named {template:?}")));
     }
     match trigger {
         "schedule" => Schedule::parse(cron).map(drop).map_err(bad_request),
@@ -178,7 +180,19 @@ fn automation_labels(a: &api::Automation) -> Vec<String> {
 /// Runs an automation's template now, recording the run. `trigger`:
 /// "schedule", "webhook" or "manual".
 pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &str) -> anyhow::Result<api::TemplateRun> {
-    let result = crate::templates::run(st, &a.template, input, &[format!("automation:{}", label_safe(&a.name))]).await;
+    // A workflow, when no template has the name: the run is the workflow's,
+    // and its outcome arrives when it finishes (`workflow_finished`).
+    let is_template = crate::templates::templates(st).await?.iter().any(|t| t.name == a.template);
+    let workflow = !is_template && crate::workflows::workflows(st).await?.iter().any(|w| w.name == a.template);
+    let result = if workflow {
+        crate::workflows::start(st, &a.template, input, trigger).await.map(|r| api::TemplateRun {
+            run_id: r.id,
+            sessions: Vec::new(),
+            errors: Vec::new(),
+        })
+    } else {
+        crate::templates::run(st, &a.template, input, &[format!("automation:{}", label_safe(&a.name))]).await
+    };
     let (run_id, error) = match &result {
         Ok(r) => (Some(r.run_id.clone()), (!r.errors.is_empty()).then(|| r.errors.join("; "))),
         Err(e) => (None, Some(format!("{e:#}"))),
@@ -208,7 +222,7 @@ pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &st
     let started = now_ms();
     let mut tx = st.store.pool.begin().await?;
     let (run_id, running) = match &result {
-        Ok(r) => (r.run_id.clone(), !r.sessions.is_empty()),
+        Ok(r) => (r.run_id.clone(), workflow || !r.sessions.is_empty()),
         Err(_) => (uuid::Uuid::now_v7().simple().to_string()[24..].to_owned(), false),
     };
     sqlx::query(
@@ -300,6 +314,24 @@ async fn end_session(st: &HeadState, session_id: &str, outcome: &str) -> anyhow:
         after_failure(st, &automation_id).await;
     }
     Ok(())
+}
+
+/// A workflow an automation started has finished: `outcome` is "ok",
+/// "failed" or "stopped".
+pub async fn workflow_finished(st: &HeadState, run_id: &str, outcome: &str) {
+    let r = sqlx::query(
+        "UPDATE automation_runs SET outcome = ?, finished_at = ? WHERE run_id = ? AND outcome = 'running' RETURNING automation_id",
+    )
+    .bind(outcome)
+    .bind(now_ms())
+    .bind(run_id)
+    .fetch_optional(&st.store.pool)
+    .await;
+    match r {
+        Ok(Some(row)) if outcome == "failed" => after_failure(st, &row.get::<String, _>("automation_id")).await,
+        Ok(_) => {}
+        Err(e) => warn!("recording an automation's workflow run: {e:#}"),
+    }
 }
 
 /// After a failed run: switches the automation off once its last

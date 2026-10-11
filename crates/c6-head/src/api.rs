@@ -69,6 +69,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/channels", get(get_channels).put(put_channels))
         .route("/api/v1/settings/prices", get(get_prices).put(put_prices))
         .route("/api/v1/settings/hosts", get(get_hosts_setting).put(put_hosts))
+        .route("/api/v1/settings/workflows", get(get_workflows).put(put_workflows))
+        .route("/api/v1/workflows/runs", get(list_workflow_runs))
+        .route("/api/v1/workflows/runs/{id}", get(get_workflow_run))
+        .route("/api/v1/workflows/runs/{id}/steps/{step}/decide", post(decide_workflow_step))
+        .route("/api/v1/workflows/{name}/run", post(run_workflow))
         .route("/api/v1/hosts", get(list_hosts))
         .route("/api/v1/hosts/{name}/check", post(check_host))
         .route("/api/v1/settings/budgets", get(get_budgets).put(put_budgets))
@@ -988,6 +993,55 @@ async fn decide_approval(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
+    }
+}
+
+async fn get_workflows(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Workflow>>> {
+    Ok(Json(crate::workflows::workflows(&st).await?))
+}
+
+async fn put_workflows(State(st): State<Arc<HeadState>>, Json(w): Json<Vec<api::Workflow>>) -> ApiResult<StatusCode> {
+    crate::workflows::check(&st, &w).await?;
+    st.store.set_setting(crate::workflows::WORKFLOWS, &serde_json::to_string(&w).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_workflow(
+    State(st): State<Arc<HeadState>>,
+    Path(name): Path<String>,
+    Json(r): Json<api::RunWorkflow>,
+) -> ApiResult<Json<api::WorkflowRun>> {
+    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual").await?))
+}
+
+#[derive(serde::Deserialize)]
+struct WorkflowRunsQuery {
+    #[serde(default)]
+    workflow: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn list_workflow_runs(
+    State(st): State<Arc<HeadState>>,
+    Query(q): Query<WorkflowRunsQuery>,
+) -> ApiResult<Json<Vec<api::WorkflowRun>>> {
+    Ok(Json(crate::workflows::runs(&st, q.workflow.as_deref().filter(|w| !w.is_empty()), q.limit.unwrap_or(20)).await?))
+}
+
+async fn get_workflow_run(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::WorkflowRun>> {
+    Ok(Json(crate::workflows::get(&st, &id).await?))
+}
+
+async fn decide_workflow_step(
+    State(st): State<Arc<HeadState>>,
+    Path((id, step)): Path<(String, String)>,
+    Json(d): Json<api::ApprovalDecision>,
+) -> ApiResult<StatusCode> {
+    if crate::workflows::decide(&st, &id, &step, d.allow).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "that step is not waiting for an answer".into()))
     }
 }
 

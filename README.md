@@ -214,6 +214,21 @@ An automation (**Settings → Automations**) starts a template:
 - A failed run sends an `automation` notification.
 - **Switch off after** N failed runs in a row (the form suggests 3; never, if unset) turns the automation off and tells you.
 
+### Workflows
+
+A workflow (**Settings → Workflows**) is a list of steps, run in order:
+
+- **run:** start a template (fanning out to its hosts or workers as usual). The step's output is its sessions' last replies.
+- **approve:** wait for your go-ahead. Answer in the panel under the editor, or from the approval notification's link; "Stop" ends the run.
+- **notify:** send a notification.
+
+Inputs, titles and messages can use `{{input}}` (the workflow's input) and `{{steps.<id>.output}}`. A step with `when` runs only if an earlier step's output `contains` or does `not_contains` some text, or `changed` since the last run. `changed` compares the output's last `RESULT:` line, so a check that answers in different words each time only counts as changed when its result does.
+
+- **Failures:** a failed run step ends the run (unless `continue_on_failure`) and sends an `automation` notification.
+- **Starting one:** run it from the panel, or from an automation by choosing the workflow as its template. The automation's history then follows the workflow's outcome.
+- **Durability:** runs are stored on the head and pick up again after a restart.
+- **Presets:** tell me only when a check's result changes; check, ask me, then fix; research, then write it up.
+
 ### Connectors (MCP servers)
 
 **Settings → MCP servers** has an **Add a connector…** menu:

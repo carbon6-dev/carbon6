@@ -188,7 +188,8 @@ async fn links(st: &HeadState, note: &Note) -> anyhow::Result<Links> {
     if base.is_empty() {
         return Ok(Links::default());
     }
-    let session_url = note.session_id.as_ref().map(|id| format!("{base}/sessions/{id}"));
+    // Workflow approvals ("wf:<run>") have no session page.
+    let session_url = note.session_id.as_ref().filter(|id| !id.starts_with("wf:")).map(|id| format!("{base}/sessions/{id}"));
     let approve_url = match (&note.session_id, &note.call_id) {
         (Some(s), Some(c)) => Some(format!("{base}/approve/{}", sign(st, s, c, c6_core::now_ms() + LINK_TTL_MS).await?)),
         _ => None,
@@ -389,6 +390,22 @@ const INVALID: &str = "<p>This link is not valid or has expired. Open the sessio
 /// previews in chat apps cannot answer).
 pub async fn approve_page(State(st): State<Arc<HeadState>>, Path(token): Path<String>) -> Html<String> {
     let Some((session_id, call_id)) = verify(&st, &token).await else { return page("Approval", INVALID) };
+    if let Some(run) = session_id.strip_prefix("wf:") {
+        let Some((workflow, title, message)) = crate::workflows::waiting(&st, run, &call_id).await else {
+            return page("Approval", "<p>This step was already answered (or the run ended).</p>");
+        };
+        return page(
+            &format!("Go ahead with {workflow}?"),
+            &format!(
+                "<p class=muted>Workflow: {}<br>Step: {}</p><p>{}</p><pre>{}</pre>\
+                 <form method=post><button class=allow name=allow value=1>Go ahead</button><button class=deny name=allow value=0>Stop</button></form>",
+                esc(&workflow),
+                esc(&call_id),
+                esc(&title),
+                esc(&message)
+            ),
+        );
+    }
     let title = st.store.session(&session_id).await.ok().flatten().map(|s| s.title).unwrap_or_default();
     let Some((tool, input, policy, message)) = describe(&st, &session_id, &call_id).await else {
         return page("Approval", INVALID);
@@ -417,6 +434,14 @@ pub struct Answer {
 /// `POST /approve/{token}`.
 pub async fn approve_answer(State(st): State<Arc<HeadState>>, Path(token): Path<String>, Form(a): Form<Answer>) -> Html<String> {
     let Some((session_id, call_id)) = verify(&st, &token).await else { return page("Approval", INVALID) };
+    if let Some(run) = session_id.strip_prefix("wf:") {
+        let allow = a.allow == "1";
+        return match crate::workflows::decide(&st, run, &call_id, allow).await {
+            Ok(true) => page(if allow { "Going ahead" } else { "Stopped" }, "<p>Sent.</p>"),
+            Ok(false) => page("Approval", "<p>This step was already answered (or the run ended).</p>"),
+            Err(e) => page("Not sent", &format!("<p>{}</p>", esc(&format!("{e:#}")))),
+        };
+    }
     if !still_waiting(&st, &session_id, &call_id).await {
         return page("Approval", "<p>This call was already answered (or the wait ended).</p>");
     }

@@ -26,6 +26,7 @@ pub mod tls;
 pub mod ui_ca;
 pub mod usage;
 mod webauthn;
+pub mod workflows;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -88,6 +89,8 @@ pub struct HeadState {
     pub worker_url: String,
     /// Notifications to your channels.
     pub notifier: notify::Notifier,
+    /// Workflow runs to drive.
+    pub workflows: workflows::Runner,
     pub shutdown: CancellationToken,
 }
 
@@ -176,6 +179,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         ui_port: ui_addrs[0].port(),
         worker_url,
         notifier: Default::default(),
+        workflows: Default::default(),
         shutdown: shutdown.clone(),
     });
 
@@ -186,6 +190,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     notify::spawn(state.clone());
     usage::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());
+    workflows::spawn(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

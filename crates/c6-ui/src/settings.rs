@@ -138,6 +138,19 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 fields=ROUTE_FIELDS
                 examples=route_examples
             />
+            <JsonSetting
+                name="workflows"
+                title="Workflows"
+                help="Steps in order: run a template (its sessions' last replies are the step's output), approve (wait for your go-ahead: in the panel below, or from the notification's link), or notify. In inputs, titles and messages, {{input}} is the workflow's input and {{steps.<id>.output}} an earlier step's output. when: {\"step\": id, \"contains\" / \"not_contains\": text, or \"changed\": true} runs a step only if that holds (changed compares the output's last RESULT: line with the previous run's, so ask the template for one). A failed run step ends the run unless continue_on_failure. Run workflows by hand below, or from an automation (choose the workflow as its template)."
+                presets=workflow_presets
+                example=r#"[
+  {"name": "disk-watch", "steps": [
+    {"id": "check", "kind": "run", "template": "disk-check", "input": "{{input}}"},
+    {"id": "tell", "kind": "notify", "title": "Disks changed", "message": "{{steps.check.output}}", "when": {"step": "check", "changed": true}}
+  ]}
+]"#
+            />
+            <WorkflowRunsPanel />
             <AutomationsSetting />
             <HooksSetting />
             <SecretsSetting />
@@ -412,6 +425,164 @@ fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
 type Preset = (&'static str, &'static str, serde_json::Value);
 
 /// Ready-made MCP servers: (label, the secrets it needs, its config).
+fn workflow_presets() -> Vec<Preset> {
+    use serde_json::json;
+    vec![
+        (
+            "Tell me only when a check's result changes",
+            "a template (here check) whose reply ends with a RESULT: line",
+            json!({"name": "watch", "steps": [
+                {"id": "check", "kind": "run", "template": "check", "input": "{{input}}"},
+                {"id": "tell", "kind": "notify", "title": "Something changed", "message": "{{steps.check.output}}", "when": {"step": "check", "changed": true}}
+            ]}),
+        ),
+        (
+            "Check, ask me, then fix",
+            "templates check (ending with RESULT: OK or RESULT: PROBLEM) and fix",
+            json!({"name": "check-and-fix", "steps": [
+                {"id": "check", "kind": "run", "template": "check", "input": "{{input}}"},
+                {"id": "approve", "kind": "approve", "title": "Fix it?", "message": "{{steps.check.output}}", "when": {"step": "check", "contains": "RESULT: PROBLEM"}},
+                {"id": "fix", "kind": "run", "template": "fix", "input": "{{steps.check.output}}", "when": {"step": "check", "contains": "RESULT: PROBLEM"}},
+                {"id": "done", "kind": "notify", "title": "Fixed", "message": "{{steps.fix.output}}", "when": {"step": "check", "contains": "RESULT: PROBLEM"}}
+            ]}),
+        ),
+        (
+            "Research, then write it up",
+            "templates research and write-up",
+            json!({"name": "brief", "steps": [
+                {"id": "research", "kind": "run", "template": "research", "input": "{{input}}"},
+                {"id": "write", "kind": "run", "template": "write-up", "input": "Write a one-page brief from these notes:\n{{steps.research.output}}"},
+                {"id": "tell", "kind": "notify", "title": "Brief ready", "message": "{{steps.write.output}}"}
+            ]}),
+        ),
+    ]
+}
+
+fn step_tone(status: &str) -> &'static str {
+    match status {
+        "ok" => "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
+        "failed" | "denied" => "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300",
+        "running" => "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300",
+        "waiting" => "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200",
+        _ => "bg-zinc-100 text-zinc-500 dark:bg-zinc-800",
+    }
+}
+
+/// Run workflows and follow their runs; answer approve steps.
+#[component]
+fn WorkflowRunsPanel() -> impl IntoView {
+    let flows = LocalResource::new(api::workflows);
+    let runs = LocalResource::new(api::workflow_runs);
+    let (pick, input) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let status = RwSignal::new(None::<Result<String, String>>);
+    let ws = crate::workspace::use_workspace();
+    // Follow runs while any is unfinished.
+    let busy =
+        move || runs.get().and_then(Result::ok).is_some_and(|v| v.iter().any(|r| matches!(r.status.as_str(), "running" | "waiting")));
+    let tick = leptos::prelude::set_interval_with_handle(
+        move || {
+            if busy() {
+                runs.refetch();
+            }
+        },
+        std::time::Duration::from_secs(3),
+    )
+    .ok();
+    on_cleanup(move || {
+        if let Some(t) = tick {
+            t.clear();
+        }
+    });
+    let start = move |_| {
+        let name = pick.get_untracked();
+        if name.is_empty() {
+            status.set(Some(Err("Choose a workflow".into())));
+            return;
+        }
+        spawn_local(async move {
+            match api::run_workflow(name.clone(), input.get_untracked()).await {
+                Ok(_) => {
+                    status.set(Some(Ok(format!("Started {name}."))));
+                    runs.refetch();
+                }
+                Err(e) => status.set(Some(Err(e))),
+            }
+        });
+    };
+    let decide = move |run: String, step: String, allow: bool| {
+        spawn_local(async move {
+            if let Err(e) = api::decide_workflow_step(run, step, allow).await {
+                status.set(Some(Err(e)));
+            }
+            runs.refetch();
+        });
+    };
+    view! {
+        <section class="-mt-3 space-y-3 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
+            <div class="flex flex-wrap items-end gap-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Run a workflow"</span>
+                    <select class=format!("{INPUT} py-1") prop:value=move || pick.get() on:change=move |ev| pick.set(event_target_value(&ev))>
+                        <option value="">"Choose…"</option>
+                        {move || flows.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|w| w.enabled).map(|w| view! { <option value=w.name.clone()>{w.name.clone()}</option> }).collect_view()}
+                    </select>
+                </label>
+                <label class="min-w-0 flex-1 space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Input ({{input}})"</span>
+                    <input class=format!("{INPUT} py-1") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
+                </label>
+                <button class=BUTTON on:click=start>"Run"</button>
+            </div>
+            {move || status.get().map(|r| match r {
+                Ok(m) => view! { <p class="text-sm text-emerald-600">{m}</p> }.into_any(),
+                Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
+            })}
+            <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                {move || runs.get().map(|r| match r {
+                    Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-1 text-xs text-zinc-500">"No workflow runs yet."</p> }.into_any(),
+                    Ok(v) => v.into_iter().map(|run| {
+                        let rid = run.id.clone();
+                        view! {
+                            <div class="space-y-1 py-2">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="font-medium">{run.workflow.clone()}</span>
+                                    <span class=format!("rounded px-1.5 text-[11px] {}", step_tone(&run.status))>{run.status.clone()}</span>
+                                    <span class="text-xs text-zinc-500">{format!("{} · {}", when(run.started_at), run.trigger)}</span>
+                                    {run.error.clone().map(|e| view! { <span class="text-xs text-red-600">{e}</span> })}
+                                </div>
+                                <div class="flex flex-wrap items-center gap-1">
+                                    {run.steps.into_iter().map(|s| {
+                                        let (r1, r2, s1, s2) = (rid.clone(), rid.clone(), s.id.clone(), s.id.clone());
+                                        let sessions = s.sessions.clone();
+                                        let waiting = s.status == "waiting";
+                                        let tip: String = s.output.chars().take(600).collect();
+                                        view! {
+                                            <span class=format!("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] {}", step_tone(&s.status))
+                                                title=tip>
+                                                {format!("{} · {}", s.id, s.status)}
+                                                {sessions.into_iter().map(|sid| view! {
+                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>"↗"</button>
+                                                }).collect_view()}
+                                            </span>
+                                            {waiting.then(|| view! {
+                                                <span class="flex gap-1">
+                                                    <button class="rounded bg-emerald-600 px-2 text-xs text-white" on:click=move |_| decide(r1.clone(), s1.clone(), true)>"Go ahead"</button>
+                                                    <button class="rounded bg-red-600 px-2 text-xs text-white" on:click=move |_| decide(r2.clone(), s2.clone(), false)>"Stop"</button>
+                                                </span>
+                                            })}
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            </div>
+                        }
+                    }).collect_view().into_any(),
+                })}
+            </div>
+        </section>
+    }
+}
+
 fn connector_presets() -> Vec<Preset> {
     use serde_json::json;
     vec![
@@ -1608,6 +1779,7 @@ fn when(ms: i64) -> String {
 fn AutomationsSetting() -> impl IntoView {
     let list = LocalResource::new(api::automations);
     let templates = LocalResource::new(api::templates);
+    let workflow_list = LocalResource::new(api::workflows);
     let filter = crate::labels::use_filter().0;
     let ws = crate::workspace::use_workspace();
     let (name, template, trigger, cron, input) = (
@@ -1770,10 +1942,11 @@ fn AutomationsSetting() -> impl IntoView {
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. Morning health check" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Template"</span>
+                    <span class="text-xs text-zinc-500">"Template or workflow"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || template.get() on:change=move |ev| template.set(event_target_value(&ev))>
                         <option value="">"Choose…"</option>
                         {move || templates.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <option value=t.name.clone()>{t.name.clone()}</option> }).collect_view()}
+                        {move || workflow_list.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| view! { <option value=w.name.clone()>{format!("{} (workflow)", w.name)}</option> }).collect_view()}
                     </select>
                 </label>
                 <label class="space-y-0.5">

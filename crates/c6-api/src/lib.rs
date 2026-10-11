@@ -794,6 +794,108 @@ pub struct Automation {
     pub recent: Vec<String>,
 }
 
+/// A workflow (`/api/v1/settings/workflows`): steps that run templates,
+/// wait for your approval or notify you, in order, each one able to use
+/// earlier steps' results and to run only when they say so.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Workflow {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub steps: Vec<WorkflowStep>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    /// How later steps refer to it ({{steps.<id>.output}}); default: step1,
+    /// step2, ….
+    #[serde(default)]
+    pub id: String,
+    /// "run" (a template), "approve" (wait for your yes) or "notify".
+    pub kind: String,
+    /// run: the template.
+    #[serde(default)]
+    pub template: String,
+    /// run: the template's {{input}}. With {{input}} (the workflow's) and
+    /// {{steps.<id>.output}}.
+    #[serde(default)]
+    pub input: String,
+    /// approve, notify: what to tell you (same placeholders).
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub message: String,
+    /// Run this step only if this holds; otherwise skip it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<StepCondition>,
+    /// run: go on even if its sessions fail.
+    #[serde(default)]
+    pub continue_on_failure: bool,
+}
+
+/// A condition on an earlier step's output. For `changed`, the output's
+/// last line starting with `RESULT:` is compared (else all of it), so ask
+/// for one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StepCondition {
+    pub step: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_contains: Option<String>,
+    /// Different from that step's in the workflow's last finished run.
+    #[serde(default)]
+    pub changed: bool,
+}
+
+/// A run of a workflow (`GET /api/v1/workflows/runs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub workflow: String,
+    #[serde(default)]
+    pub input: String,
+    pub started_at: UnixMs,
+    #[serde(default)]
+    pub finished_at: Option<UnixMs>,
+    /// "manual", "schedule", "webhook".
+    pub trigger: String,
+    /// "running", "waiting" (for your approval), "ok", "failed", "denied".
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub steps: Vec<WorkflowStepRun>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStepRun {
+    pub id: String,
+    pub kind: String,
+    /// "pending", "running", "waiting", "ok", "failed", "skipped",
+    /// "denied".
+    pub status: String,
+    #[serde(default)]
+    pub output: String,
+    /// run: its sessions.
+    #[serde(default)]
+    pub sessions: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<UnixMs>,
+    #[serde(default)]
+    pub finished_at: Option<UnixMs>,
+}
+
+/// `POST /api/v1/workflows/{name}/run`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RunWorkflow {
+    #[serde(default)]
+    pub input: String,
+}
+
 /// One run of an automation (`GET /api/v1/automations/{id}/runs`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationRun {
