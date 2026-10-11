@@ -393,6 +393,12 @@ pub enum EventKind {
         scope: String,
         text: String,
     },
+    /// The agent sent you a notification.
+    Notice {
+        title: String,
+        message: String,
+        priority: String,
+    },
     /// From here on the session runs on this model.
     ModelSwitched {
         connection_id: String,
@@ -858,6 +864,66 @@ pub struct Route {
     pub subagent_model: String,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+}
+
+/// A notification channel (`/api/v1/settings/channels`): where the head
+/// tells you about events in sessions with its labels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Channel {
+    pub name: String,
+    /// "ntfy", "slack", "discord", "webhook" or "email".
+    pub kind: String,
+    /// ntfy: the topic URL (https://ntfy.sh/my-topic); Slack, Discord,
+    /// webhook: the webhook URL; email: the SMTP server, host[:port] (465:
+    /// TLS, else STARTTLS).
+    #[serde(default)]
+    pub url: String,
+    /// Email: the SMTP user, also the sender.
+    #[serde(default)]
+    pub user: String,
+    /// Email: the recipient.
+    #[serde(default)]
+    pub to: String,
+    /// The name of a secret (Settings → Secrets): the ntfy access token,
+    /// the SMTP password, or a bearer token for a webhook.
+    #[serde(default)]
+    pub secret: String,
+    /// Which events (see `NOTIFY_EVENTS`); empty: approvals, failures,
+    /// notices, automation failures and budgets.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// Labels a session must all have; empty: every session.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// Events a channel can carry: (name, description).
+pub const NOTIFY_EVENTS: [(&str, &str); 7] = [
+    ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
+    ("failed", "a turn ended with an error"),
+    ("finished", "a turn finished"),
+    ("notice", "the agent sent you a notification (notify)"),
+    ("output", "the agent published a file"),
+    ("automation", "an automation failed to start"),
+    ("budget", "a budget ran out"),
+];
+
+/// The events a channel without a list carries.
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 5] = ["approval", "failed", "notice", "automation", "budget"];
+
+/// `POST /api/v1/settings/channels/test`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TestChannel {
+    pub name: String,
+}
+
+/// `GET`/`PUT /api/v1/settings/public_url`: the address links in
+/// notifications point to.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PublicUrl {
+    pub url: String,
 }
 
 /// `POST /api/v1/sessions/{id}/approvals/{call_id}`.

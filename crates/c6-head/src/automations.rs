@@ -164,6 +164,16 @@ pub async fn fire(st: &HeadState, a: &api::Automation, input: &str) -> anyhow::R
         Ok(r) => info!(automation = %a.name, run = %r.run_id, sessions = r.sessions.len(), "automation ran"),
         Err(e) => warn!(automation = %a.name, "automation failed: {e:#}"),
     }
+    if let Some(error) = &error {
+        st.notifier.send(crate::notify::Note {
+            event: "automation",
+            title: format!("Automation {} failed", a.name),
+            message: error.clone(),
+            priority: "high",
+            labels: vec![format!("automation:{}", label_safe(&a.name)), format!("template:{}", a.template)],
+            ..Default::default()
+        });
+    }
     result
 }
 

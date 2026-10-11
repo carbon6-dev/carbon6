@@ -132,6 +132,17 @@ Policies (**Settings → Policies**) are rules for the agent's tool calls in ses
 - **Presets:** ask before any change on `env:prod`, never run destructive commands on prod, ask before package changes or `git push`, keep `research` sessions read-only.
 - **Scope:** policies apply to subagents' calls too. Claude Code sessions aren't covered.
 
+### Notifications
+
+Channels (**Settings → Notifications**) tell you about your sessions while you're away.
+
+- **Kinds:** ntfy (a phone app; the URL is your topic), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Tokens and SMTP passwords are secrets.
+- **Events:** `approval`, `failed`, `finished`, `notice`, `output`, `automation`, `budget`. A channel without a list gets approvals, failures, notices, automation failures and budgets.
+- **Scope:** `applies_to` labels limit a channel to matching sessions (`env:prod`, `automation:`).
+- **Approvals from your phone:** an approval notification links to a page showing the held call with **Allow** / **Deny**. The link is signed, works without signing in, and expires after an hour; answering takes a button press, so chat link previews can't answer for you. Links use the address under the channel list (taken from your browser the first time you save a channel).
+- **The agent's `notify` tool:** agents can send you a notice (a title, a few lines, a priority), for example from an automation that finds a problem.
+- **Testing:** **Send a test** sends a message on a channel and shows any error.
+
 ### Model routing
 
 Routing rules (**Settings → Model routing**) choose the connection and model for sessions started without one: from the new-session form on **Auto**, `c6 run` without `--model`, and templates or automations that leave the model empty.

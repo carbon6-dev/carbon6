@@ -10,6 +10,7 @@ mod export;
 pub mod guard;
 pub mod hub;
 pub mod memory;
+pub mod notify;
 pub mod oauth;
 pub mod pki;
 pub mod registry;
@@ -83,6 +84,8 @@ pub struct HeadState {
     pub ui_port: u16,
     /// URL workers dial, as put into enrollment tokens.
     pub worker_url: String,
+    /// Notifications to your channels.
+    pub notifier: notify::Notifier,
     pub shutdown: CancellationToken,
 }
 
@@ -170,6 +173,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         http,
         ui_port: ui_addrs[0].port(),
         worker_url,
+        notifier: Default::default(),
         shutdown: shutdown.clone(),
     });
 
@@ -177,6 +181,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
 
     // Scheduled automations.
     automations::spawn_scheduler(state.clone());
+    notify::spawn(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

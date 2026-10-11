@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -65,6 +65,10 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/approvals/{call_id}", post(decide_approval))
         .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
         .route("/api/v1/settings/routes", get(get_routes).put(put_routes))
+        .route("/api/v1/settings/channels", get(get_channels).put(put_channels))
+        .route("/api/v1/settings/channels/test", post(test_channel))
+        .route("/api/v1/settings/public_url", get(get_public_url).put(put_public_url))
+        .route("/approve/{token}", get(crate::notify::approve_page).post(crate::notify::approve_answer))
         .route("/api/v1/sessions/{id}/config", get(session_config))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
@@ -978,6 +982,40 @@ async fn decide_approval(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+async fn get_channels(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Channel>>> {
+    Ok(Json(crate::notify::channels(&st).await?))
+}
+
+/// Saving channels for the first time also takes the page's address as the
+/// one links point to, unless one is set.
+async fn put_channels(State(st): State<Arc<HeadState>>, headers: HeaderMap, Json(c): Json<Vec<api::Channel>>) -> ApiResult<StatusCode> {
+    crate::notify::check_channels(&c)?;
+    st.store.set_setting(crate::notify::CHANNELS, &serde_json::to_string(&c).map_err(anyhow::Error::from)?).await?;
+    let unset = st.store.setting(crate::notify::PUBLIC_URL).await?.is_none_or(|u| u.trim().is_empty());
+    if unset && let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        st.store.set_setting(crate::notify::PUBLIC_URL, origin).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn test_channel(State(st): State<Arc<HeadState>>, Json(t): Json<api::TestChannel>) -> ApiResult<StatusCode> {
+    crate::notify::test(&st, &t.name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_public_url(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::PublicUrl>> {
+    Ok(Json(api::PublicUrl { url: st.store.setting(crate::notify::PUBLIC_URL).await?.unwrap_or_default() }))
+}
+
+async fn put_public_url(State(st): State<Arc<HeadState>>, Json(p): Json<api::PublicUrl>) -> ApiResult<StatusCode> {
+    let url = p.url.trim().trim_end_matches('/');
+    if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(crate::bad_request("the address is http(s)://host[:port]").into());
+    }
+    st.store.set_setting(crate::notify::PUBLIC_URL, url).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_routes(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Route>>> {

@@ -727,12 +727,104 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     if !ing.events.is_empty() {
         st.registry.bump();
     }
+    notify_events(st, &batch.session_id, &ing.events).await;
     let ended: Vec<u64> =
         ing.events.iter().filter(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_)))).map(|e| e.seq).collect();
     if st.otlp.is_some() && !ended.is_empty() {
         export_turns(st, worker_id, &batch.session_id, ended).await;
     }
     Ok(Some(ing.last_seq))
+}
+
+/// Queues notifications for new events: approvals, notices, outputs, and
+/// turns that finished or failed (in your sessions, not subagents').
+async fn notify_events(st: &HeadState, session_id: &str, events: &[SessionEvent]) {
+    use c6_proto::session_event::Kind;
+    use c6_proto::{ContentBlock, TurnEndReason, content_block};
+    let interesting = events.iter().any(|e| {
+        matches!(&e.kind, Some(Kind::Approval(a)) if a.state == "requested")
+            || matches!(e.kind, Some(Kind::Notice(_) | Kind::Output(_) | Kind::TurnEnded(_)))
+    });
+    if !interesting {
+        return;
+    }
+    let Ok(Some(session)) = st.store.session(session_id).await else { return };
+    let labels = session.all_labels();
+    let base = crate::notify::Note { session_id: Some(session_id.to_owned()), labels, priority: "normal", ..Default::default() };
+    let title = |what: &str| format!("{what}: {}", session.title);
+    let text_of = |blocks: &[ContentBlock]| -> String {
+        blocks.iter().filter_map(|b| if let Some(content_block::Block::Text(t)) = &b.block { Some(t.as_str()) } else { None }).collect()
+    };
+    for ev in events {
+        let note = match &ev.kind {
+            Some(Kind::Approval(a)) if a.state == "requested" => crate::notify::Note {
+                event: "approval",
+                title: title("Approval needed"),
+                message: format!(
+                    "{}{}: {}",
+                    if a.message.is_empty() { String::new() } else { format!("{}\n", a.message) },
+                    a.tool,
+                    a.input.chars().take(600).collect::<String>()
+                ),
+                priority: "high",
+                call_id: Some(a.call_id.clone()),
+                ..base.clone()
+            },
+            Some(Kind::Notice(n)) => crate::notify::Note {
+                event: "notice",
+                title: n.title.clone(),
+                message: n.message.clone(),
+                priority: match n.priority.as_str() {
+                    "low" => "low",
+                    "high" => "high",
+                    _ => "normal",
+                },
+                ..base.clone()
+            },
+            Some(Kind::Output(o)) => crate::notify::Note {
+                event: "output",
+                title: title("Published"),
+                message: if o.title.is_empty() { o.name.clone() } else { format!("{} ({})", o.title, o.name) },
+                ..base.clone()
+            },
+            Some(Kind::TurnEnded(t)) if session.parent_call_id.is_none() => {
+                // What the turn ended with: its error, or the last reply.
+                let turn = st.store.turn_events(session_id, ev.seq).await.unwrap_or_default();
+                let before = turn.as_slice();
+                match TurnEndReason::try_from(t.reason) {
+                    Ok(TurnEndReason::Error) => crate::notify::Note {
+                        event: "failed",
+                        title: title("Failed"),
+                        message: before
+                            .iter()
+                            .rev()
+                            .find_map(|e| if let Some(Kind::Error(x)) = &e.kind { Some(x.message.clone()) } else { None })
+                            .unwrap_or_default(),
+                        priority: "high",
+                        ..base.clone()
+                    },
+                    Ok(TurnEndReason::Completed) => {
+                        let reply = before
+                            .iter()
+                            .rev()
+                            .find_map(|e| match &e.kind {
+                                Some(Kind::Assistant(m)) => Some(text_of(&m.blocks)).filter(|t| !t.trim().is_empty()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let mut message: String = reply.trim().chars().take(500).collect();
+                        if reply.trim().chars().count() > 500 {
+                            message.push('…');
+                        }
+                        crate::notify::Note { event: "finished", title: title("Done"), message, ..base.clone() }
+                    }
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        st.notifier.send(note);
+    }
 }
 
 async fn export_turns(st: &HeadState, worker_id: WorkerId, session_id: &str, ended: Vec<u64>) {

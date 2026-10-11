@@ -98,6 +98,15 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 examples=policy_examples
             />
             <ListSetting
+                name="channels"
+                title="Notifications"
+                noun="channel"
+                help="Where carbon6 tells you about your sessions while you are away: ntfy (a phone app; the URL is your topic, e.g. https://ntfy.sh/a-long-random-name), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Events: approval (with a link to Allow or Deny that works without signing in, for an hour), failed, finished, notice (the agent's notify tool), output, automation, budget; empty means approval, failed, notice, automation and budget. Applies to: only sessions with these labels. Tokens and SMTP passwords are secrets (Settings → Secrets)."
+                fields=CHANNEL_FIELDS
+                examples=channel_examples
+            />
+            <NotifyExtras />
+            <ListSetting
                 name="routes"
                 title="Model routing"
                 noun="rule"
@@ -771,6 +780,122 @@ fn policy_examples() -> Vec<(&'static str, serde_json::Value)> {
             p("Research is read-only", &["research"], "deny", "Write|Edit|Bash", "", "Research sessions only read and report."),
         ),
     ]
+}
+
+const CHANNEL_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. phone", kind: FieldKind::Line },
+    Field { key: "kind", label: "Kind", placeholder: "", kind: FieldKind::Choice(&["ntfy", "slack", "discord", "webhook", "email"]) },
+    Field {
+        key: "url",
+        label: "URL (email: SMTP server)",
+        placeholder: "https://ntfy.sh/your-topic, a webhook URL, or smtp.example.com:587",
+        kind: FieldKind::Mono,
+    },
+    Field {
+        key: "secret",
+        label: "Token or password (a secret's name)",
+        placeholder: "none; or e.g. NTFY_TOKEN, SMTP_PASSWORD",
+        kind: FieldKind::Mono,
+    },
+    Field { key: "user", label: "Email: user (and sender)", placeholder: "only for email: you@example.com", kind: FieldKind::Mono },
+    Field { key: "to", label: "Email: to", placeholder: "only for email: you@example.com", kind: FieldKind::Mono },
+    Field { key: "events", label: "Events", placeholder: "approval, failed, notice, automation, budget", kind: FieldKind::Labels },
+    Field {
+        key: "applies_to",
+        label: "Applies to",
+        placeholder: "every session, or labels, e.g. env:prod, automation:",
+        kind: FieldKind::Labels,
+    },
+];
+
+fn channel_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let c = |name: &str, kind: &str, url: &str, secret: &str, events: &[&str], labels: &[&str]| {
+        let mut v = item(&[("name", name), ("kind", kind), ("url", url), ("secret", secret), ("user", ""), ("to", "")]);
+        v["events"] = serde_json::json!(events);
+        v["applies_to"] = serde_json::json!(labels);
+        v
+    };
+    let mut email = c("email", "email", "smtp.gmail.com:587", "SMTP_PASSWORD", &["failed", "automation", "budget"], &[]);
+    email["user"] = "you@gmail.com".into();
+    email["to"] = "you@gmail.com".into();
+    vec![
+        ("Empty", c("", "ntfy", "", "", &[], &[])),
+        ("Phone (ntfy): approvals and problems", c("phone", "ntfy", "https://ntfy.sh/pick-a-long-random-topic", "", &[], &[])),
+        (
+            "Slack: automation results",
+            c("slack", "slack", "https://hooks.slack.com/services/…", "", &["finished", "failed", "notice"], &["automation:"]),
+        ),
+        (
+            "Discord: everything on prod",
+            c(
+                "discord",
+                "discord",
+                "https://discord.com/api/webhooks/…",
+                "",
+                &["approval", "failed", "finished", "notice", "output"],
+                &["env:prod"],
+            ),
+        ),
+        ("Email: failures and budgets", email),
+        ("Webhook (JSON) for your own tools", c("hook", "webhook", "https://example.com/carbon6", "HOOK_TOKEN", &[], &[])),
+    ]
+}
+
+#[component]
+fn NotifyExtras() -> impl IntoView {
+    let url = RwSignal::new(String::new());
+    let loaded = LocalResource::new(move || api::get_setting("public_url"));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            url.set(v["url"].as_str().unwrap_or_default().to_owned());
+        }
+    });
+    let channels = LocalResource::new(move || api::get_setting("channels"));
+    let test_name = RwSignal::new(String::new());
+    let status = RwSignal::new(None::<Result<String, String>>);
+    let save = move |_| {
+        let v = serde_json::json!({"url": url.get_untracked()});
+        spawn_local(async move {
+            status.set(Some(api::put_setting("public_url", v).await.map(|_| "Saved.".to_owned())));
+        });
+    };
+    let test = move |_| {
+        let name = test_name.get_untracked();
+        if name.is_empty() {
+            status.set(Some(Err("Save a channel, then pick it to test".into())));
+            return;
+        }
+        status.set(Some(Ok("Sending…".into())));
+        spawn_local(async move {
+            status.set(Some(api::test_channel(name.clone()).await.map(|_| format!("Sent a test to {name}."))));
+        });
+    };
+    view! {
+        <section class="-mt-3 space-y-2 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
+            <label class="block space-y-0.5">
+                <span class="text-xs text-zinc-500">"Links in notifications open"</span>
+                <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="https://head.example:7700 (set when you first save a channel)"
+                    prop:value=move || url.get() on:input=move |ev| url.set(event_target_value(&ev)) />
+            </label>
+            <p class="text-xs text-zinc-500">"The address your phone or other devices reach this head at. Approval links work there without signing in, for an hour."</p>
+            <div class="flex flex-wrap items-center justify-end gap-2">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON_QUIET on:click=save>"Save address"</button>
+                <select class=format!("{INPUT} w-auto py-1") prop:value=move || test_name.get() on:change=move |ev| test_name.set(event_target_value(&ev))
+                    on:focus=move |_| channels.refetch()>
+                    <option value="">"Channel to test…"</option>
+                    {move || channels.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).unwrap_or_default().into_iter().filter_map(|c| {
+                        let n = c["name"].as_str()?.to_owned();
+                        Some(view! { <option value=n.clone()>{n.clone()}</option> })
+                    }).collect_view()}
+                </select>
+                <button class=BUTTON on:click=test>"Send a test"</button>
+            </div>
+        </section>
+    }
 }
 
 const ROUTE_FIELDS: &[Field] = &[

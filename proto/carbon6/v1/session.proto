@@ -27,7 +27,17 @@ message SessionEvent {
     Output output = 23;
     MemoryUpdate memory = 24;
     Approval approval = 25;
+    Notice notice = 26;
   }
+}
+
+// The agent asked to tell you something (notify): the head sends it to
+// your notification channels.
+message Notice {
+  string title = 1;
+  string message = 2;
+  // "low", "normal" or "high".
+  string priority = 3;
 }
 
 // A tool call a policy holds for your approval, and what became of it.

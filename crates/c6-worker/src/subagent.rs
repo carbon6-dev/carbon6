@@ -34,6 +34,8 @@ pub struct Parent {
     pub publisher: Option<c6_tools::PublishSink>,
     /// And its memory changes are the parent's.
     pub memory: Option<c6_tools::MemorySink>,
+    /// And its notices.
+    pub notices: Option<c6_tools::NoticeSink>,
 }
 
 pub struct Runner {
@@ -116,6 +118,7 @@ impl Subagents for Runner {
         session_tools.set_secrets(p.secrets.env());
         session_tools.set_publisher(p.publisher.clone());
         session_tools.set_memory(p.memory.clone());
+        session_tools.set_notices(p.notices.clone());
         let mut conv = Conversation { history: vec![Message::user_text(text)], context_tokens: 0 };
         let reason = run_turn(1, &cfg, self.client.as_ref(), &tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
             .await

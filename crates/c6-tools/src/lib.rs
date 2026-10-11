@@ -6,6 +6,7 @@ mod bash;
 mod files;
 pub mod hooks;
 pub mod memory;
+pub mod notify;
 mod patch;
 mod plan;
 pub mod profiles;
@@ -31,6 +32,7 @@ pub use bash::Bash;
 pub use files::{Edit, Read, Write};
 pub use hooks::Hooks;
 pub use memory::{Forget, MemoryChange, MemorySink, Remember};
+pub use notify::{Notice, NoticeSink, Notify};
 pub use patch::ApplyPatch;
 pub use plan::Plan;
 pub use profiles::tools_for;
@@ -117,6 +119,8 @@ pub struct SessionTools {
     publisher: Mutex<Option<PublishSink>>,
     /// Where memory changes go (the session's log, then the head).
     memory: Mutex<Option<MemorySink>>,
+    /// Where notices go (the session's log, then your channels).
+    notices: Mutex<Option<NoticeSink>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -141,6 +145,7 @@ impl SessionTools {
             ssh,
             publisher: Mutex::default(),
             memory: Mutex::default(),
+            notices: Mutex::default(),
         }
     }
 
@@ -150,6 +155,14 @@ impl SessionTools {
 
     pub fn memory(&self) -> Option<MemorySink> {
         self.memory.lock().unwrap().clone()
+    }
+
+    pub fn set_notices(&self, n: Option<NoticeSink>) {
+        *self.notices.lock().unwrap() = n;
+    }
+
+    pub fn notices(&self) -> Option<NoticeSink> {
+        self.notices.lock().unwrap().clone()
     }
 
     pub fn set_publisher(&self, p: Option<PublishSink>) {

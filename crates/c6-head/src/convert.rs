@@ -98,6 +98,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             policy: a.policy.clone(),
             message: a.message.clone(),
         },
+        Kind::Notice(n) => api::EventKind::Notice { title: n.title.clone(), message: n.message.clone(), priority: n.priority.clone() },
         Kind::Memory(m) => api::EventKind::Memory { op: m.op.clone(), id: m.id.clone(), scope: m.scope.clone(), text: m.text.clone() },
         Kind::Output(o) => {
             api::EventKind::Output { name: o.name.clone(), title: o.title.clone(), mime: o.mime.clone(), size: o.data.len() as u64 }

@@ -131,6 +131,8 @@ enum ActorMsg {
     Published(c6_tools::Published),
     /// The agent changed a memory note.
     Memory(c6_tools::MemoryChange),
+    /// The agent sent you a notification.
+    Notice(c6_tools::Notice),
     /// A tool call held for approval, or what became of it.
     Approval(crate::policy::ApprovalEvent),
     /// Your answer for a held tool call.
@@ -594,6 +596,17 @@ impl SessionManager {
                     }
                 }
             });
+            // Notices too (the head sends them to your channels).
+            let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+            session_tools.set_notices(Some(note_tx));
+            let actor_tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(n) = note_rx.recv().await {
+                    if actor_tx.send(ActorMsg::Notice(n)).is_err() {
+                        break;
+                    }
+                }
+            });
             // Published files go to the actor, which logs them.
             let (pub_tx, mut pub_rx) = mpsc::unbounded_channel();
             session_tools.set_publisher(Some(pub_tx));
@@ -893,6 +906,13 @@ impl Actor {
                             return;
                         }
                     }
+                    Some(ActorMsg::Notice(n)) => {
+                        let notice = c6_proto::Notice { title: n.title, message: n.message, priority: n.priority };
+                        if let Err(e) = self.writer.append(session_event::Kind::Notice(notice)).await {
+                            error!(session = %self.writer.session_id, "recording a notice: {e:#}");
+                            return;
+                        }
+                    }
                     Some(ActorMsg::Published(p)) => {
                         let output = c6_proto::Output { name: p.name, title: p.title, mime: p.mime, data: p.data };
                         if let Err(e) = self.writer.append(session_event::Kind::Output(output)).await {
@@ -1045,6 +1065,7 @@ impl Actor {
             secrets: self.session_tools.secrets().clone(),
             publisher: self.session_tools.publisher(),
             memory: self.session_tools.memory(),
+            notices: self.session_tools.notices(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -1305,6 +1326,7 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::Publish::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Remember::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Forget::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::Notify::new(profile == ToolProfile::Claude)));
     // Named agents (from the head's settings) become Task's subagent types.
     #[derive(serde::Deserialize)]
     struct HeadAgent {

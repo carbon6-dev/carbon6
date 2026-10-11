@@ -266,6 +266,11 @@ pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String
     json(Request::get(&format!("/api/v1/settings/{name}")).send().await).await
 }
 
+pub async fn test_channel(name: String) -> Result<(), String> {
+    let body = c6_api::TestChannel { name };
+    empty(Request::post("/api/v1/settings/channels/test").json(&body).map_err(|e| e.to_string())?.send().await).await
+}
+
 pub async fn put_setting(name: &'static str, value: serde_json::Value) -> Result<(), String> {
     empty(Request::put(&format!("/api/v1/settings/{name}")).json(&value).map_err(|e| e.to_string())?.send().await).await
 }

@@ -1113,6 +1113,16 @@ fn render_event(
                 view! { <p class=format!("flex items-center gap-2 text-xs {tone}")><span>{icon}</span><span>{what}</span></p> }.into_any()
             }
         },
+        EventKind::Notice { title, message, priority } => {
+            let tone = if priority == "high" { "border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950" } else { "border-zinc-200 dark:border-zinc-800" };
+            view! {
+                <div class=format!("rounded-md border px-3 py-2 text-sm {tone}")>
+                    <p class="flex items-center gap-2 font-medium"><span>"🔔"</span><span>{title.clone()}</span></p>
+                    {(!message.is_empty()).then(|| view! { <p class="mt-1 whitespace-pre-wrap text-xs text-zinc-600 dark:text-zinc-400">{message.clone()}</p> })}
+                </div>
+            }
+            .into_any()
+        }
         EventKind::Memory { op, id, scope, text } => {
             let what = if op == "forget" {
                 format!("Forgot note {id}")

@@ -213,5 +213,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::Output { .. } => "output",
         EventKind::Memory { .. } => "memory",
         EventKind::Approval { .. } => "approval",
+        EventKind::Notice { .. } => "notice",
     }
 }
