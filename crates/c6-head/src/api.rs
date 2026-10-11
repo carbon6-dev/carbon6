@@ -40,6 +40,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
         .route("/api/v1/settings/hooks", get(get_hooks).put(put_hooks))
         .route("/api/v1/settings/secrets", get(list_secrets))
+        .route("/api/v1/settings/templates", get(get_templates).put(put_templates))
+        .route("/api/v1/templates/{name}/run", post(run_template))
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
@@ -699,6 +701,25 @@ async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api:
     }
     st.store.set_setting(crate::sessions::WEB_SEARCH, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_templates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Template>>> {
+    Ok(Json(crate::templates::templates(&st).await?))
+}
+
+async fn put_templates(State(st): State<Arc<HeadState>>, Json(templates): Json<Vec<api::Template>>) -> ApiResult<StatusCode> {
+    crate::templates::check(&templates)?;
+    st.store.set_setting(crate::templates::TEMPLATES, &serde_json::to_string(&templates).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_template(
+    State(st): State<Arc<HeadState>>,
+    Path(name): Path<String>,
+    body: Option<Json<api::RunTemplate>>,
+) -> ApiResult<Json<api::TemplateRun>> {
+    let input = body.map(|Json(b)| b.input).unwrap_or_default();
+    Ok(Json(crate::templates::run(&st, &name, &input, &[]).await?))
 }
 
 async fn list_secrets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::SecretInfo>>> {

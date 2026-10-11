@@ -99,6 +99,20 @@ async fn headless_cli() {
         fail.stdout.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["type"].as_str().unwrap().to_owned()).collect();
     assert!(kinds.contains(&"error".to_owned()) && kinds.last().map(String::as_str) == Some("turn_ended"), "{kinds:?}");
 
+    // A template, run by name with its {{input}}.
+    let r = reqwest::Client::new()
+        .put(format!("{url}/api/v1/settings/templates"))
+        .bearer_auth(&token)
+        .json(&json!([{"name": "greet", "model": "m", "cwd": cwd, "prompt": "Greet {{input}}."}]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    mock.push(Reply::Text("Hello, Ada!".into()));
+    let t = c6(h, &["run", "-t", "greet", "Ada"]).await;
+    assert_eq!((t.code, t.stdout.trim()), (0, "Hello, Ada!"), "{}", t.stderr);
+    assert!(mock.requests().last().unwrap()["messages"].to_string().contains("Greet Ada."));
+
     // sessions, show, search.
     let list = c6(h, &["sessions"]).await;
     assert!(list.stdout.contains("cli test") && list.stdout.contains("[team:core, cli]"), "{}", list.stdout);

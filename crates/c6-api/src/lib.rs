@@ -664,6 +664,62 @@ pub struct WebSearchSetting {
     pub always: bool,
 }
 
+/// A session template: where and how to start a session (or one per
+/// target, a fleet run), and what to ask (`/api/v1/settings/templates`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Template {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Worker names. Empty: the online worker (the first, if several);
+    /// `*`: every online worker (one session each).
+    #[serde(default)]
+    pub workers: Vec<String>,
+    /// SSH targets, reached through the worker(s): one session each.
+    #[serde(default)]
+    pub ssh: Vec<String>,
+    /// The folder (on the worker, or on the SSH target); empty: a scratch
+    /// workspace (or the home folder there).
+    #[serde(default)]
+    pub cwd: String,
+    /// Connection name or id; empty: the first connection.
+    #[serde(default)]
+    pub connection: String,
+    /// Empty: the connection's default model.
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+    /// Labels for its sessions (they also get template:<name> and
+    /// run:<id>).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// The first message. {{input}} is what the run was given (a webhook's
+    /// body), {{target}} the worker or host, {{date}} and {{time}} now.
+    pub prompt: String,
+    /// Off: it cannot be run (by hand, schedule or webhook).
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// `POST /api/v1/templates/{name}/run`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RunTemplate {
+    #[serde(default)]
+    pub input: String,
+}
+
+/// The sessions a template run started (one per target).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemplateRun {
+    /// Its sessions carry the label run:<run_id>.
+    pub run_id: String,
+    pub sessions: Vec<Session>,
+    /// Targets that could not start, and why.
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
 /// The commands built into carbon6: (name, description, argument hint).
 /// `compact`, `init` and `review` run on the worker; `clear` and `export`
 /// in the UI.

@@ -112,6 +112,20 @@ Sessions carry labels, which group them and decide which settings apply.
 - **Config tab.** A session's **Config** tab lists what applies to it, and why anything doesn't.
 - **When changes apply.** Commands follow label changes at once. Agents, skills and hooks are fixed when a session starts.
 
+### Templates and fleet runs
+
+A template (**Settings → Templates**) is a saved way to start a session:
+
+- **Where:** a worker; `*` for every online worker; or a list of SSH hosts, reached through a worker.
+- **How:** connection, model and labels.
+- **What to ask:** a prompt, where `{{input}}`, `{{target}}`, `{{date}}` and `{{time}}` are filled in.
+
+**Running one:** run a template from the Sessions page ("Run a template"), with `c6 run -t <name> [input]`, or on a schedule or from a webhook (see Automations).
+
+**Fleet runs:** a template with several targets starts one session per target, all sharing a `run:<id>` label. The UI opens mission control filtered to the run, and `c6 run -t` waits for them all and prints each one's last reply.
+
+Settings has examples: a health check across hosts, updating every worker, a research digest.
+
 ### Outputs: decks, reports and other deliverables
 
 When the agent finishes a deliverable (a slide deck, a report, a chart, a document), it publishes it with the `publish_file` tool, and it appears in the session's **Outputs** tab:

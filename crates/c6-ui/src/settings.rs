@@ -79,6 +79,14 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 fields=SKILL_FIELDS
                 examples=skill_examples
             />
+            <ListSetting
+                name="templates"
+                title="Templates"
+                noun="template"
+                help="Saved ways to start a session: where (a worker, every online worker with *, or SSH hosts through a worker), how (connection, model, labels) and what to ask. Several targets make a fleet run: one session each, sharing a run: label, so mission control shows them together. Run them from the Sessions page, with c6 run -t, on a schedule or from a webhook. In the prompt, {{input}} is what the run was given, {{target}} the worker or host, {{date}} and {{time}} now."
+                fields=TEMPLATE_FIELDS
+                examples=template_examples
+            />
             <HooksSetting />
             <SecretsSetting />
             <WebSearchSetting />
@@ -626,6 +634,72 @@ const AGENT_FIELDS: &[Field] = &[
     },
     Field { key: "prompt", label: "Instructions", placeholder: "You are a … Your job is …", kind: FieldKind::Text },
 ];
+
+const TEMPLATE_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. disk-check", kind: FieldKind::Mono },
+    Field { key: "description", label: "Description", placeholder: "what it is for", kind: FieldKind::Line },
+    Field { key: "workers", label: "Workers", placeholder: "the online one; or names; * for every online worker", kind: FieldKind::Labels },
+    Field { key: "ssh", label: "SSH hosts", placeholder: "none; or user@host, … (one session each)", kind: FieldKind::Labels },
+    Field { key: "cwd", label: "Folder", placeholder: "scratch workspace (or home on SSH hosts)", kind: FieldKind::Mono },
+    Field { key: "connection", label: "Connection", placeholder: "the first one", kind: FieldKind::Line },
+    Field { key: "model", label: "Model", placeholder: "the connection's default", kind: FieldKind::Mono },
+    Field { key: "labels", label: "Labels", placeholder: "e.g. ops, daily", kind: FieldKind::Labels },
+    Field { key: "prompt", label: "Prompt", placeholder: "Check {{target}} for … {{input}}", kind: FieldKind::Text },
+];
+
+fn template_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let t = |pairs: &[(&str, &str)], lists: &[(&str, &[&str])]| {
+        let mut v = item(pairs);
+        for (k, l) in lists {
+            v[*k] = serde_json::json!(l);
+        }
+        v
+    };
+    vec![
+        ("Empty", item(&[("name", ""), ("prompt", "")])),
+        (
+            "Health check across hosts",
+            t(
+                &[
+                    ("name", "health-check"),
+                    ("description", "Disk, memory, failed services and pending updates on each host"),
+                    (
+                        "prompt",
+                        "Check the health of {{target}}: disk usage (flag anything over 85%), memory, load, failed systemd services, and pending security updates. Do not change anything. Start your reply with OK if all is well, otherwise with ATTENTION and what needs doing.",
+                    ),
+                ],
+                &[("ssh", &["admin@host1", "admin@host2"]), ("labels", &["ops"])],
+            ),
+        ),
+        (
+            "Update packages on every worker",
+            t(
+                &[
+                    ("name", "update-workers"),
+                    (
+                        "prompt",
+                        "Update the system packages on this machine ({{target}}) with its package manager, non-interactively. Report what was upgraded and whether a reboot is needed; do not reboot.",
+                    ),
+                ],
+                &[("workers", &["*"]), ("labels", &["ops"])],
+            ),
+        ),
+        (
+            "Research digest",
+            t(
+                &[
+                    ("name", "digest"),
+                    ("description", "A short digest of news on a topic"),
+                    (
+                        "prompt",
+                        "Research what happened in the last week on: {{input}}. Search the web, read the best sources, and write digest.md: five bullet points with links, newest first, then a one-paragraph summary. Publish it.",
+                    ),
+                ],
+                &[("labels", &["research"])],
+            ),
+        ),
+    ]
+}
 
 const SKILL_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. release", kind: FieldKind::Mono },

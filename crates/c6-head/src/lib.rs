@@ -15,6 +15,7 @@ pub mod secrets;
 pub mod sessions;
 pub mod store;
 pub mod telemetry;
+pub mod templates;
 pub mod terminals;
 pub mod tls;
 pub mod ui_ca;

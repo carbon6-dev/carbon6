@@ -26,7 +26,7 @@ pub fn SessionsPage() -> impl IntoView {
                             "Add an LLM connection in " <Go to=View::Settings { note: None } class="underline">"Settings"</Go> " to start a session."
                         </div>
                     }.into_any(),
-                    Ok(conns) => view! { <NewSession connections=conns /> }.into_any(),
+                    Ok(conns) => view! { <NewSession connections=conns /> <RunTemplate /> }.into_any(),
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 })}
             </Suspense>
@@ -355,4 +355,76 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
 /// Live status for a session id, from the session list feed.
 pub fn live_status(id: &str) -> Option<SessionStatus> {
     api::live().sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.status))
+}
+
+/// Runs a template: one session, or a fleet run (then mission control,
+/// filtered to the run).
+#[component]
+fn RunTemplate() -> impl IntoView {
+    let (ws, col) = (use_workspace(), use_column());
+    let filter = crate::labels::use_filter().0;
+    let templates = LocalResource::new(api::templates);
+    let chosen = RwSignal::new(String::new());
+    let input = RwSignal::new(String::new());
+    let pending = RwSignal::new(false);
+    let result = RwSignal::new(None::<Result<String, String>>);
+    let run = move || {
+        let name = chosen.get_untracked();
+        if name.is_empty() || pending.get_untracked() {
+            return;
+        }
+        pending.set(true);
+        spawn_local(async move {
+            match api::run_template(name, input.get_untracked()).await {
+                Ok(r) => {
+                    let mut note = format!("Started {} session{}", r.sessions.len(), if r.sessions.len() == 1 { "" } else { "s" });
+                    if !r.errors.is_empty() {
+                        note.push_str(&format!(" ({} could not start: {})", r.errors.len(), r.errors.join("; ")));
+                    }
+                    result.set(Some(Ok(note)));
+                    input.set(String::new());
+                    if let [one] = r.sessions.as_slice() {
+                        match col {
+                            Some(c) => c.open(View::session(one.id.clone()), How::Beside),
+                            None => ws.open(None, View::session(one.id.clone()), How::Beside),
+                        }
+                    } else {
+                        filter.set(vec![format!("run:{}", r.run_id)]);
+                        ws.open(None, View::Mission, How::Beside);
+                    }
+                }
+                Err(e) => result.set(Some(Err(e))),
+            }
+            pending.set(false);
+        });
+    };
+    move || {
+        let list: Vec<c6_api::Template> =
+            templates.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|t| t.enabled).collect();
+        (!list.is_empty()).then(|| {
+            let descriptions: Vec<(String, String)> = list.iter().map(|t| (t.name.clone(), t.description.clone())).collect();
+            let takes_input: Vec<String> = list.iter().filter(|t| t.prompt.contains("{{input}}")).map(|t| t.name.clone()).collect();
+            let takes_input = StoredValue::new(takes_input);
+            let wants_input = move || takes_input.with_value(|v| v.contains(&chosen.get()));
+            view! {
+                <section class="space-y-2 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="text-sm font-medium">"Run a template"</span>
+                        <select class=format!("{INPUT} w-auto!") prop:value=move || chosen.get() on:change=move |ev| chosen.set(event_target_value(&ev))>
+                            <option value="">"Choose…"</option>
+                            {descriptions.iter().map(|(n, d)| view! { <option value=n.clone() title=d.clone()>{n.clone()}</option> }).collect_view()}
+                        </select>
+                        <input class=format!("{INPUT} min-w-48 flex-1") placeholder=move || if wants_input() { "input for {{input}}" } else { "(this template takes no input)" }
+                            prop:disabled=move || !wants_input() prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev))
+                            on:keydown=move |ev| if ev.key() == "Enter" { run() } />
+                        <button class=BUTTON prop:disabled=move || chosen.get().is_empty() || pending.get() on:click=move |_| run()>"Run"</button>
+                    </div>
+                    {move || result.get().map(|r| match r {
+                        Ok(m) => view! { <p class="text-sm text-emerald-600">{m}</p> }.into_any(),
+                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    })}
+                </section>
+            }
+        })
+    }
 }

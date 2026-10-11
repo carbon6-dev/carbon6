@@ -41,8 +41,12 @@ enum Command {
     /// Start a session and print the agent's reply as it works. Exits 1 if
     /// the turn fails.
     Run {
-        /// The prompt; `-` (or nothing, with input piped) reads stdin.
+        /// The prompt; `-` (or nothing, with input piped) reads stdin. With
+        /// --template, the template's {{input}}.
         prompt: Vec<String>,
+        /// Run this template (one session, or one per target: a fleet run).
+        #[arg(short, long)]
+        template: Option<String>,
         /// Worker name or id (default: the only one online).
         #[arg(short, long)]
         worker: Option<String>,
@@ -242,7 +246,28 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     let c = Client::new(cli.url.as_deref().unwrap_or(&cfg.url), &cfg.token, cfg.ca.as_ref())?;
     match cli.command {
         Command::Login { .. } => unreachable!(),
-        Command::Run { prompt, worker, cwd, scratch, ssh, connection, model, effort, title, worktree, label, json, detach } => {
+        Command::Run { prompt, template: Some(name), json, detach, .. } => {
+            let input = if prompt.is_empty() && std::io::stdin().is_terminal() { String::new() } else { prompt_text(&prompt)? };
+            let r: c6_api::TemplateRun = c.post(&format!("/templates/{name}/run"), &json!({"input": input})).await?;
+            for e in &r.errors {
+                eprintln!("could not start: {e}");
+            }
+            match r.sessions.as_slice() {
+                [] => Ok(1),
+                [one] if !detach => {
+                    eprintln!("session {} · {}", one.id, one.title);
+                    follow(&c, &one.id, 0, json).await
+                }
+                many if detach => {
+                    for s in many {
+                        println!("{}", s.id);
+                    }
+                    Ok(0)
+                }
+                many => fleet(&c, &r.run_id, many).await,
+            }
+        }
+        Command::Run { prompt, worker, cwd, scratch, ssh, connection, model, effort, title, worktree, label, json, detach, .. } => {
             let labels = c6_api::labels::parse_labels(&label.join(","));
             let text = prompt_text(&prompt)?;
             let workers: Vec<Worker> = c.get("/workers").await?;
@@ -476,4 +501,44 @@ async fn follow(c: &Client, id: &str, mut after: u64, json: bool) -> anyhow::Res
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+}
+
+/// Waits for a fleet run's sessions and prints each one's last reply.
+async fn fleet(c: &Client, run_id: &str, sessions: &[Session]) -> anyhow::Result<i32> {
+    eprintln!("fleet run {run_id}: {} sessions", sessions.len());
+    let mut code = 0;
+    for s in sessions {
+        // Wait until it has run and is idle (or failed).
+        let reply = loop {
+            let d: SessionDetail = c.get(&format!("/sessions/{}", s.id)).await?;
+            let evs: Vec<Event> = c.get(&format!("/sessions/{}/events", s.id)).await?;
+            let ended = evs.iter().rev().find_map(|e| match &e.kind {
+                EventKind::TurnEnded { reason, .. } => Some(*reason),
+                _ => None,
+            });
+            if d.session.status == SessionStatus::Failed {
+                break (Some(TurnEndReason::Error), d.session.error.unwrap_or_default());
+            }
+            if d.session.status == SessionStatus::Idle && ended.is_some() && d.queued.is_empty() {
+                let text = evs
+                    .iter()
+                    .rev()
+                    .find_map(|e| match &e.kind {
+                        EventKind::Assistant { blocks, .. } => blocks.iter().rev().find_map(|b| match b {
+                            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.clone()),
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                break (ended, text);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        if reply.0 != Some(TurnEndReason::Completed) {
+            code = 1;
+        }
+        println!("== {} ({})\n{}\n", s.title, &s.id[..13], reply.1.trim());
+    }
+    Ok(code)
 }

@@ -429,3 +429,11 @@ pub async fn put_secret(name: String, req: c6_api::PutSecret) -> Result<(), Stri
 pub async fn delete_secret(name: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/settings/secrets/{name}")).send().await).await
 }
+
+pub async fn templates() -> Result<Vec<c6_api::Template>, String> {
+    json(Request::get("/api/v1/settings/templates").send().await).await
+}
+
+pub async fn run_template(name: String, input: String) -> Result<c6_api::TemplateRun, String> {
+    send_json(Request::post(&format!("/api/v1/templates/{name}/run")), &c6_api::RunTemplate { input }).await
+}
