@@ -606,6 +606,7 @@ dependencies = [
  "prost",
  "rand 0.10.3",
  "rcgen",
+ "regex",
  "reqwest",
  "rustls",
  "serde",

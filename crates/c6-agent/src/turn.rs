@@ -20,6 +20,8 @@ use crate::{EventSink, PendingInput};
 
 /// Guards against runaway tool loops.
 const MAX_STEPS: usize = 500;
+/// How many times Stop hooks may keep one turn going.
+const MAX_STOP_HOOK_RUNS: usize = 10;
 /// Compact once the context reaches this share of the window.
 const COMPACT_AT: f64 = 0.85;
 const COMPACT_MAX_OUTPUT: u32 = 16_000;
@@ -184,6 +186,7 @@ impl Turn<'_> {
     ) -> anyhow::Result<TurnEndReason> {
         let by_name: HashMap<String, Arc<dyn Tool>> = self.specs.iter().map(|s| s.name.clone()).zip(tools.iter().cloned()).collect();
         let mut compacted_for_overflow = false;
+        let mut stop_hook_runs = 0;
 
         for _ in 0..MAX_STEPS {
             if self.cancel.is_cancelled() {
@@ -279,6 +282,18 @@ impl Turn<'_> {
             }
 
             for input in pending() {
+                self.sink.append(input.event()).await?;
+                user_blocks.extend(input.blocks());
+            }
+            // A Stop hook can send the model back to work, a few times.
+            if user_blocks.is_empty()
+                && stop_hook_runs < MAX_STOP_HOOK_RUNS
+                && let Some(h) = session_tools.hooks()
+                && let Some(reason) = h.stop(stop_hook_runs > 0).await
+            {
+                stop_hook_runs += 1;
+                let input =
+                    PendingInput { text: format!("Stop hook feedback: {reason}"), command: "stop-hook".into(), ..Default::default() };
                 self.sink.append(input.event()).await?;
                 user_blocks.extend(input.blocks());
             }
@@ -397,10 +412,25 @@ async fn run_one(
             (None, _) => ToolOutput::err(format!("Unknown tool `{name}`.")),
             (_, Err(e)) => ToolOutput::err(format!("Tool input is not valid JSON: {e}")),
             (Some(tool), Ok(value)) => {
-                let call_id = id.to_owned();
-                let stream_to = sink_output(sink, call_id);
-                let ctx = ToolCtx { session: session_tools.clone(), cancel: cancel.clone(), output: stream_to, call_id: id.to_owned() };
-                tool.call(&ctx, value).await
+                let hooks = session_tools.hooks();
+                let blocked = match &hooks {
+                    Some(h) => h.pre_tool_use(name, &value).await,
+                    None => None,
+                };
+                if let Some(reason) = blocked {
+                    ToolOutput::err(format!("Blocked by a PreToolUse hook: {reason}"))
+                } else {
+                    let call_id = id.to_owned();
+                    let stream_to = sink_output(sink, call_id);
+                    let ctx = ToolCtx { session: session_tools.clone(), cancel: cancel.clone(), output: stream_to, call_id: id.to_owned() };
+                    let mut output = tool.call(&ctx, value.clone()).await;
+                    if let Some(h) = &hooks
+                        && let Some(feedback) = h.post_tool_use(name, &value, &output.content, output.is_error).await
+                    {
+                        output.content.push_str(&format!("\n\n<post-tool-use-hook>\n{feedback}\n</post-tool-use-hook>"));
+                    }
+                    output
+                }
             }
         }
     };

@@ -32,6 +32,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 .collect(),
             command: u.command.clone(),
             prompt: u.prompt.clone(),
+            blocked: u.blocked.clone(),
         },
         Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn },
         Kind::Assistant(a) => api::EventKind::Assistant {

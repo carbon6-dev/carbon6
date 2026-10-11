@@ -271,6 +271,9 @@ pub enum EventKind {
         /// What the model got instead of the text, when a command expanded it.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         prompt: String,
+        /// Why a UserPromptSubmit hook blocked it (the model never saw it).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        blocked: String,
     },
     TurnStarted {
         turn: u64,

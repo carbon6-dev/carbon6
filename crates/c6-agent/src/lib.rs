@@ -37,6 +37,8 @@ pub struct PendingInput {
     pub command: String,
     /// What the model gets instead of the text, when a command expanded it.
     pub prompt: String,
+    /// Why a UserPromptSubmit hook blocked it, if one did.
+    pub blocked: String,
 }
 
 impl PendingInput {
@@ -48,6 +50,7 @@ impl PendingInput {
             attachments: self.attachments.clone(),
             command: self.command.clone(),
             prompt: self.prompt.clone(),
+            blocked: self.blocked.clone(),
         })
     }
 

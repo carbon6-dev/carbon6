@@ -12,7 +12,7 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
     for ev in &effective_events(events) {
         match &ev.kind {
             // `/compact` itself is not part of the conversation.
-            Some(session_event::Kind::User(u)) if u.command == "compact" => {}
+            Some(session_event::Kind::User(u)) if u.command == "compact" || !u.blocked.is_empty() => {}
             Some(session_event::Kind::User(u)) => {
                 for b in user_blocks(model_text(u), &u.attachments) {
                     push_user_block(&mut msgs, b);
@@ -136,6 +136,7 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
     let mut out = String::new();
     for ev in events {
         match &ev.kind {
+            Some(session_event::Kind::User(u)) if !u.blocked.is_empty() => {}
             Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", user_text(model_text(u), &u.attachments))),
             Some(session_event::Kind::Assistant(a)) => {
                 for b in &a.blocks {

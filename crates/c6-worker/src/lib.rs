@@ -6,6 +6,7 @@ pub mod claude_code;
 pub mod commands;
 pub mod conn;
 pub mod enroll;
+pub mod hooks;
 pub mod identity;
 pub mod journal;
 pub mod link;

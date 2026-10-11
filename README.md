@@ -101,6 +101,26 @@ Type `/` in the message box for the command list.
 
 Agents in Claude Code's format, `.claude/agents/<name>.md` (in the repository, or `~/.claude/agents/`), become subagent types the model can launch with the Task tool: frontmatter `name`, `description` (the model reads it to pick one), optional `tools` (comma-separated, Claude Code's names, e.g. `Read, Grep, Glob`; all tools when absent) and `model` (`inherit`, `opus`, `sonnet`, `haiku` or a model id; honored on Anthropic connections), and the body as the agent's instructions (its system prompt).
 
+### Hooks
+
+Hooks use Claude Code's `settings.json` format and files: `~/.claude/settings.json`, and the repository's `.claude/settings.json` and `.claude/settings.local.json`.
+
+```json
+{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/check-command.sh"}]}]}}
+```
+
+- Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop` and `SessionStart`.
+- **How a command runs.** Each one runs in the session's folder with the event as JSON on stdin (`tool_name`, `tool_input`, `prompt`, …) and `CLAUDE_PROJECT_DIR` set.
+- **Exit code 2 blocks**, with stderr as the reason:
+  - `PreToolUse`: the call is refused and the model is told why;
+  - `UserPromptSubmit`: the message is shown struck through and never sent;
+  - `Stop`: the model keeps working, with the reason as feedback;
+  - `PostToolUse`: stderr is added to the result.
+- **JSON output.** `{"decision": "block", "reason": …}` and `hookSpecificOutput.additionalContext` work as in Claude Code.
+- **Plain stdout** from `UserPromptSubmit` and `SessionStart` is added as context.
+- **Matchers** are regular expressions over tool names. Claude Code's names (`Bash`, `Edit`, `Read`, …) match in every tool set.
+- **Claude Code sessions** run their own hooks.
+
 ### Workspace
 
 The UI is a workspace of up to four tiles side by side, each a stack of columns:

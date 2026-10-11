@@ -84,8 +84,12 @@ message UserMessage {
   // if any.
   string command = 4;
   // What the model gets in place of the text, when a slash command
-  // expanded it (empty: the text itself).
+  // expanded it (or a UserPromptSubmit hook added context; empty: the
+  // text itself).
   string prompt = 5;
+  // Set when a UserPromptSubmit hook blocked the message: why. The model
+  // never sees a blocked message.
+  string blocked = 6;
 }
 
 message Attachment {

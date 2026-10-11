@@ -26,6 +26,8 @@ pub struct Parent {
     pub started: SessionStarted,
     pub journal: Arc<Journal>,
     pub link: Arc<HeadLink>,
+    /// Its hooks apply to the subagent's tool calls too.
+    pub hooks: Option<Arc<dyn c6_tools::Hooks>>,
 }
 
 pub struct Runner {
@@ -100,6 +102,7 @@ impl Subagents for Runner {
             .map_err(|e| format!("{e:#}"))?;
 
         let session_tools = Arc::new(SessionTools::new(std::path::PathBuf::from(&started.cwd)));
+        session_tools.set_hooks(p.hooks.clone().map(|h| Arc::new(SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
         let mut conv = Conversation { history: vec![Message::user_text(text)], context_tokens: 0 };
         let reason = run_turn(1, &cfg, self.client.as_ref(), &tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
             .await
@@ -131,5 +134,23 @@ fn agent_model(wanted: &str, connection_kind: &str) -> Option<String> {
         "haiku" => Some("claude-haiku-4-5".into()),
         id if id.starts_with("claude-") => Some(id.into()),
         _ => None,
+    }
+}
+
+/// The parent's tool hooks; Stop hooks are for the main session only.
+struct SubagentHooks(Arc<dyn c6_tools::Hooks>);
+
+#[async_trait]
+impl c6_tools::Hooks for SubagentHooks {
+    async fn pre_tool_use(&self, tool: &str, input: &serde_json::Value) -> Option<String> {
+        self.0.pre_tool_use(tool, input).await
+    }
+
+    async fn post_tool_use(&self, tool: &str, input: &serde_json::Value, output: &str, is_error: bool) -> Option<String> {
+        self.0.post_tool_use(tool, input, output, is_error).await
+    }
+
+    async fn stop(&self, _active: bool) -> Option<String> {
+        None
     }
 }

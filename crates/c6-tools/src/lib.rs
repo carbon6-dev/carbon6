@@ -4,6 +4,7 @@ pub mod agents;
 mod background;
 mod bash;
 mod files;
+pub mod hooks;
 mod patch;
 mod plan;
 pub mod profiles;
@@ -26,6 +27,7 @@ pub use agents::{AgentDef, Skill, SkillTool, Subagents, Task};
 pub use background::{Background, BashOutput, KillShell};
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};
+pub use hooks::Hooks;
 pub use patch::ApplyPatch;
 pub use plan::Plan;
 pub use profiles::tools_for;
@@ -71,6 +73,7 @@ pub struct SessionTools {
     cwd: Mutex<PathBuf>,
     pub background: Background,
     subagents: Mutex<Option<Arc<dyn Subagents>>>,
+    hooks: Mutex<Option<Arc<dyn Hooks>>>,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -79,7 +82,22 @@ pub struct SessionTools {
 
 impl SessionTools {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd: Mutex::new(cwd), seen: Mutex::default(), background: Background::default(), subagents: Mutex::default() }
+        Self {
+            cwd: Mutex::new(cwd),
+            seen: Mutex::default(),
+            background: Background::default(),
+            subagents: Mutex::default(),
+            hooks: Mutex::default(),
+        }
+    }
+
+    /// Sets the hooks run around this session's tool calls.
+    pub fn set_hooks(&self, h: Option<Arc<dyn Hooks>>) {
+        *self.hooks.lock().unwrap() = h;
+    }
+
+    pub fn hooks(&self) -> Option<Arc<dyn Hooks>> {
+        self.hooks.lock().unwrap().clone()
     }
 
     pub fn cwd(&self) -> PathBuf {

@@ -38,7 +38,7 @@ enum ActorMsg {
         restore_files: bool,
     },
     /// An input, possibly switching the session's model from it on.
-    Input(PendingInput, Option<ModelSpec>),
+    Input(Box<PendingInput>, Option<ModelSpec>),
     Interrupt,
 }
 
@@ -84,7 +84,7 @@ impl SessionManager {
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
                 let pending =
                     PendingInput { command_id: cmd.command_id, text: input.text, attachments: input.attachments, ..Default::default() };
-                let _ = actor.send(ActorMsg::Input(pending, input.model));
+                let _ = actor.send(ActorMsg::Input(Box::new(pending), input.model));
                 Ok(())
             }
             Some(session_command::Kind::Restore(r)) => {
@@ -147,6 +147,11 @@ impl SessionManager {
             let built = build_tools(&spec, &cwd, profile).await;
             setup_errors = built.errors;
             let mut prompt = system_prompt;
+            if let Some(h) = crate::hooks::HookRunner::load(session_id, &cwd)
+                && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": "startup"})).await.context
+            {
+                prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
+            }
             if !built.skills.is_empty() {
                 prompt.push_str("\n\n");
                 prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
@@ -271,9 +276,17 @@ impl SessionManager {
             None => build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile)).await.tools,
         };
         let started_cwd = started.cwd.clone();
+        // settings.json hooks (Claude Code sessions run their own).
+        let hooks = (started.tool_profile != crate::claude_code::PROFILE)
+            .then(|| crate::hooks::HookRunner::load(session_id, Path::new(&started.cwd)))
+            .flatten()
+            .map(Arc::new);
+        let session_tools = Arc::new(SessionTools::new(PathBuf::from(&started.cwd)));
+        session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
         let actor = Actor {
             spec,
-            session_tools: Arc::new(SessionTools::new(PathBuf::from(&started.cwd))),
+            session_tools,
+            hooks,
             tools,
             journal: self.journal.clone(),
             started,
@@ -384,6 +397,7 @@ struct Actor {
     spec: CreateSession,
     started: SessionStarted,
     session_tools: Arc<SessionTools>,
+    hooks: Option<Arc<crate::hooks::HookRunner>>,
     /// `None` while a turn task holds it.
     conv: Option<Conversation>,
     turns: u64,
@@ -427,7 +441,22 @@ impl Actor {
                         let cwd = Path::new(&self.started.cwd);
                         crate::commands::expand(cwd, &mut input).await;
                         crate::mentions::resolve(cwd, &mut input);
-                        self.inbox.lock().unwrap().push(input, model)
+                        if let Some(h) = &self.hooks {
+                            let v = h.run("UserPromptSubmit", None, serde_json::json!({"prompt": input.model_text()})).await;
+                            if let Some(reason) = v.blocked {
+                                // Recorded (so the command is done) but never sent.
+                                input.blocked = reason;
+                                if let Err(e) = self.writer.append(input.event()).await {
+                                    error!(session = %self.writer.session_id, "recording a blocked message: {e:#}");
+                                    return;
+                                }
+                                continue;
+                            }
+                            if let Some(context) = v.context {
+                                input.prompt = format!("{}\n\n<user-prompt-submit-hook>\n{context}\n</user-prompt-submit-hook>", input.model_text());
+                            }
+                        }
+                        self.inbox.lock().unwrap().push(*input, model)
                     }
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
@@ -529,6 +558,7 @@ impl Actor {
             started: self.started.clone(),
             journal: self.journal.clone(),
             link: self.link.clone(),
+            hooks: self.session_tools.hooks(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());

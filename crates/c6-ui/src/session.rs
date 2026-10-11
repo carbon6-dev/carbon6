@@ -1084,7 +1084,11 @@ fn render_event(
             </details>
         }
         .into_any(),
-        EventKind::User { text, attachments, command, prompt, .. } => {
+        EventKind::User { text, command, .. } if command == "stop-hook" => view! {
+            <p class="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400"><span>"↻"</span><span class="whitespace-pre-wrap">{text.clone()}</span></p>
+        }
+        .into_any(),
+        EventKind::User { text, attachments, command, prompt, blocked, .. } => {
             let url = |i: usize| format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq);
             let shown = attachments
                 .iter()
@@ -1112,11 +1116,14 @@ fn render_event(
                 <div class="flex flex-col items-end gap-1.5">
                     {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
                     {(!text.is_empty()).then(|| view! {
-                        <div class="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800">{text.clone()}</div>
+                        <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text.clone()}</div>
+                    })}
+                    {(!blocked.is_empty()).then(|| view! {
+                        <p class="max-w-[85%] text-right text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
                     })}
                     {(!prompt.is_empty()).then(|| view! {
                         <details class="max-w-[85%] text-xs text-zinc-500">
-                            <summary class="cursor-pointer select-none text-right">{format!("/{command} expanded to")}</summary>
+                            <summary class="cursor-pointer select-none text-right">{if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
                             <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
                         </details>
                     })}

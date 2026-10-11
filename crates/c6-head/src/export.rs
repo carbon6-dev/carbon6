@@ -13,6 +13,9 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
     let mut tools = std::collections::HashMap::new();
     for ev in &c6_agent::effective_events(events) {
         match &ev.kind {
+            Some(Kind::User(u)) if !u.blocked.is_empty() => {
+                out.push_str(&format!("\n## You\n\n~~{}~~\n\n> Blocked by a hook: {}\n", u.text, u.blocked))
+            }
             Some(Kind::User(u)) if u.prompt.is_empty() => out.push_str(&format!("\n## You\n\n{}\n", u.text)),
             Some(Kind::User(u)) => out.push_str(&format!(
                 "\n## You\n\n{}\n\n<details><summary>Expanded /{}</summary>\n\n{}\n\n</details>\n",
