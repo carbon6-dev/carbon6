@@ -288,6 +288,8 @@ message CreateSession {
   // to the branch point, its own ancestors' first). History only; the
   // session's own log starts at its SessionStarted.
   repeated SessionEvent seed = 7;
+  // Hooks from the head's settings (JSON array of c6_api::Hook).
+  string hooks_json = 8;
 }
 
 message ModelSpec {

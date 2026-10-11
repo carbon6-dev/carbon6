@@ -1,4 +1,4 @@
-//! settings.json hooks: SessionStart and UserPromptSubmit add context,
+//! Hooks from the head's settings: SessionStart and UserPromptSubmit add context,
 //! PreToolUse blocks a call, Stop sends the model back to work, and a
 //! blocked prompt never reaches the model.
 
@@ -57,17 +57,28 @@ async fn settings_hooks_shape_the_session() {
         .unwrap();
     let p = project.path();
 
+    // Hooks live in the head's settings; a Claude Code settings file in the
+    // project is not read.
     std::fs::create_dir_all(p.join(".claude")).unwrap();
     std::fs::write(
         p.join(".claude/settings.json"),
-        r#"{"hooks": {
-            "SessionStart": [{"hooks": [{"type": "command", "command": "echo START-CTX"}]}],
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "grep -q secret && { echo 'no secrets' >&2; exit 2; }; echo CTX-42"}]}],
-            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "grep -q 'rm -rf' && { echo 'no rm' >&2; exit 2; }; exit 0"}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": "grep -q '\"stop_hook_active\":true' && exit 0; echo 'check the tests' >&2; exit 2"}]}]
-        }}"#,
+        r#"{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "echo from-file >&2; exit 2"}]}]}}"#,
     )
     .unwrap();
+    let hooks = json!([
+        {"name": "start", "event": "SessionStart", "command": "echo START-CTX"},
+        {"event": "UserPromptSubmit", "command": "grep -q secret && { echo 'no secrets' >&2; exit 2; }; echo CTX-42"},
+        {"name": "no rm", "event": "PreToolUse", "matcher": "Bash", "command": "grep -q 'rm -rf' && { echo 'no rm' >&2; exit 2; }; exit 0"},
+        {"event": "Stop", "command": "grep -q '\"stop_hook_active\":true' && exit 0; echo 'check the tests' >&2; exit 2"},
+        {"event": "PreToolUse", "command": "echo elsewhere >&2; exit 2", "folder": "/not/this/project"}
+    ]);
+    let r = http.put(format!("{api}/settings/hooks")).json(&json!([{"event": "Nope", "command": "x"}])).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "unknown events are refused");
+    let r = http.put(format!("{api}/settings/hooks")).json(&hooks).send().await.unwrap();
+    assert!(r.status().is_success());
+    let saved: serde_json::Value = http.get(format!("{api}/settings/hooks")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(saved[2]["name"], "no rm");
+    assert_eq!(saved[0]["enabled"], true);
     let wid = worker.identity.meta.worker_id.0;
 
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"rm -rf build"}"#.into())]));
@@ -94,7 +105,9 @@ async fn settings_hooks_shape_the_session() {
     let reqs = mock.requests();
     let first = reqs[0]["messages"].to_string();
     assert!(first.contains("START-CTX") && first.contains("CTX-42") && first.contains("clean up"), "{first}");
-    assert!(reqs[1]["messages"].to_string().contains("Blocked by a PreToolUse hook: no rm"));
+    let second = reqs[1]["messages"].to_string();
+    assert!(second.contains("Blocked by a PreToolUse hook: no rm"), "{second}");
+    assert!(!second.contains("from-file") && !second.contains("elsewhere"), "{second}");
     assert!(reqs[2]["messages"].to_string().contains("Stop hook feedback: check the tests"));
     assert!(p.exists());
 

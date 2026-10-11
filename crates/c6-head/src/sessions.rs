@@ -21,6 +21,7 @@ use crate::{HeadState, bad_request, convert, not_found};
 /// Settings keys, included in every new session's configuration.
 pub const MCP_SERVERS: &str = "mcp_servers";
 pub const SKILLS: &str = "skills";
+pub const HOOKS: &str = "hooks";
 
 /// Per-session broadcast channels for stream subscribers.
 #[derive(Default)]
@@ -177,6 +178,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         worktree,
         mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
         skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
+        hooks_json: st.store.setting(HOOKS).await?.unwrap_or_else(|| "[]".into()),
         seed,
     })
 }

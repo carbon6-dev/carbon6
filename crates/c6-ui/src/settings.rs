@@ -1,6 +1,6 @@
-//! Settings: LLM connections.
+//! Settings: LLM connections, MCP servers, skills and hooks.
 
-use c6_api::{Connection, CreateConnection};
+use c6_api::{Connection, CreateConnection, Hook};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -63,6 +63,7 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
   {"name": "release", "description": "How to cut a release", "body": "1. Update CHANGELOG.md…"}
 ]"#
             />
+            <HooksSetting />
         </main>
     }
 }
@@ -370,5 +371,185 @@ fn JsonSetting(name: &'static str, title: &'static str, help: &'static str, exam
                 <button class=BUTTON on:click=save>"Save"</button>
             </div>
         </section>
+    }
+}
+
+/// Starting points for a new hook: (label, hook).
+fn hook_examples() -> Vec<(&'static str, Hook)> {
+    let h = |name: &str, event: &str, matcher: &str, command: &str| Hook {
+        name: name.into(),
+        event: event.into(),
+        matcher: matcher.into(),
+        folder: String::new(),
+        command: command.into(),
+        timeout_s: None,
+        enabled: true,
+    };
+    vec![
+        ("Empty", h("", "PreToolUse", "", "")),
+        (
+            "Refuse rm -rf",
+            h(
+                "Refuse rm -rf",
+                "PreToolUse",
+                "Bash",
+                "grep -q 'rm -rf' && { echo 'Do not use rm -rf; delete specific files instead.' >&2; exit 2; }; exit 0",
+            ),
+        ),
+        (
+            "Protect .env files",
+            h(
+                "Protect .env files",
+                "PreToolUse",
+                "Edit|Write",
+                "grep -qE '\"(file_)?path\": *\"[^\"]*\\.env' && { echo 'Do not edit .env files.' >&2; exit 2; }; exit 0",
+            ),
+        ),
+        ("Format Rust after edits", h("Format Rust after edits", "PostToolUse", "Edit|Write", "cargo fmt --quiet 2>&1 || exit 2")),
+        (
+            "Tell the agent the git branch",
+            h("Git branch", "UserPromptSubmit", "", "echo \"Current git branch: $(git branch --show-current 2>/dev/null)\""),
+        ),
+        (
+            "Keep going until tests pass",
+            h(
+                "Tests must pass",
+                "Stop",
+                "",
+                "grep -q '\"stop_hook_active\":true' && exit 0; cargo test --quiet >/dev/null 2>&1 || { echo 'The tests fail; fix them before finishing.' >&2; exit 2; }",
+            ),
+        ),
+        ("Project status at start", h("Project status", "SessionStart", "", "git status --short 2>/dev/null | head -50")),
+    ]
+}
+
+fn is_tool_event(event: &str) -> bool {
+    matches!(event, "PreToolUse" | "PostToolUse")
+}
+
+/// Settings: hooks, edited as a list.
+#[component]
+fn HooksSetting() -> impl IntoView {
+    let rows = RwSignal::new(Vec::<(u64, RwSignal<Hook>)>::new());
+    let next = StoredValue::new(0u64);
+    let add = move |h: Hook| {
+        let id = next.get_value();
+        next.set_value(id + 1);
+        rows.update(|r| r.push((id, RwSignal::new(h))));
+    };
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let loaded = LocalResource::new(move || api::get_setting("hooks"));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            rows.set(Vec::new());
+            for h in serde_json::from_value::<Vec<Hook>>(v).unwrap_or_default() {
+                add(h);
+            }
+        }
+    });
+    let save = move |_| {
+        let hooks: Vec<Hook> = rows.get_untracked().iter().map(|(_, h)| h.get_untracked()).collect();
+        spawn_local(async move {
+            let r = match serde_json::to_value(&hooks) {
+                Ok(v) => api::put_setting("hooks", v).await.map(|_| "Saved. New sessions will use them."),
+                Err(e) => Err(e.to_string()),
+            };
+            status.set(Some(r));
+        });
+    };
+    let example = RwSignal::new(String::new());
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Hooks"</h2>
+                <p class="text-sm text-zinc-500">
+                    "Shell commands run on the worker, in the session's folder, at points in every session: to refuse risky tool calls, check work after edits, add context to your messages, or keep the agent going until something passes. New sessions pick up changes."
+                </p>
+                <details class="mt-1 text-sm text-zinc-500">
+                    <summary class="cursor-pointer select-none">"How a hook works"</summary>
+                    <ul class="mt-1 list-disc space-y-1 pl-5">
+                        <li>"The event arrives as JSON on stdin: "<code>"tool_name"</code>", "<code>"tool_input"</code>" (tool events), "<code>"tool_response"</code>" (after a tool), "<code>"prompt"</code>" (your message), "<code>"stop_hook_active"</code>" (Stop), plus "<code>"session_id"</code>" and "<code>"cwd"</code>". "<code>"$C6_PROJECT_DIR"</code>" is the repository root."</li>
+                        <li><b>"Exit 0"</b>": carry on. For "<i>"UserPromptSubmit"</i>" and "<i>"SessionStart"</i>", what it prints is given to the agent as context."</li>
+                        <li><b>"Exit 2"</b>": block, with stderr as the reason. "<i>"PreToolUse"</i>": the call is refused and the agent told why. "<i>"UserPromptSubmit"</i>": your message is not sent. "<i>"Stop"</i>": the agent keeps working. "<i>"PostToolUse"</i>": stderr is added to the tool's result."</li>
+                        <li>"Other exit codes are errors and block nothing. Printing "<code>"{\"decision\": \"block\", \"reason\": \"…\"}"</code>" also blocks."</li>
+                        <li>"The matcher is a regular expression over tool names; Claude Code's names ("<code>"Bash"</code>", "<code>"Edit"</code>", "<code>"Write"</code>", "<code>"Read"</code>") work with every model."</li>
+                    </ul>
+                </details>
+            </div>
+            <div class="space-y-3">
+                <For each=move || rows.get() key=|(id, _)| *id let:row>
+                    <HookRow hook=row.1 on_remove=move || rows.update(|r| r.retain(|(id, _)| *id != row.0)) />
+                </For>
+                {move || rows.with(Vec::is_empty).then(|| view! { <p class="text-sm text-zinc-500">"No hooks."</p> })}
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <select class=format!("{INPUT} w-auto!") prop:value=move || example.get()
+                    on:change=move |ev| {
+                        let label = event_target_value(&ev);
+                        if let Some((_, h)) = hook_examples().into_iter().find(|(l, _)| *l == label) {
+                            add(h);
+                        }
+                        example.set(String::new());
+                    }>
+                    <option value="">"Add a hook…"</option>
+                    {hook_examples().into_iter().map(|(l, _)| view! { <option value=l>{l}</option> }).collect_view()}
+                </select>
+                <div class="flex items-center gap-3">
+                    {move || status.get().map(|r| match r {
+                        Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                        Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                    })}
+                    <button class=BUTTON on:click=save>"Save"</button>
+                </div>
+            </div>
+        </section>
+    }
+}
+
+#[component]
+fn HookRow(hook: RwSignal<Hook>, on_remove: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
+    let label = "text-xs text-zinc-500";
+    view! {
+        <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if hook.with(|h| h.enabled) { "" } else { "opacity-60" })>
+            <div class="flex flex-wrap items-center gap-2">
+                <input type="checkbox" title="Enabled" prop:checked=move || hook.with(|h| h.enabled)
+                    on:change=move |ev| hook.update(|h| h.enabled = event_target_checked(&ev)) />
+                <input class=format!("{INPUT} w-auto! min-w-0 flex-1 py-1") placeholder="Name (what it is for)" prop:value=move || hook.with(|h| h.name.clone())
+                    on:input=move |ev| hook.update(|h| h.name = event_target_value(&ev)) />
+                <select class=format!("{INPUT} w-auto! py-1") prop:value=move || hook.with(|h| h.event.clone())
+                    on:change=move |ev| hook.update(|h| h.event = event_target_value(&ev))>
+                    {c6_api::HOOK_EVENTS.into_iter().map(|e| view! { <option value=e>{e}</option> }).collect_view()}
+                </select>
+                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-[1fr_1fr_6rem]">
+                <label class="space-y-0.5">
+                    <span class=label>"Tools (regex)"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs")
+                        prop:disabled=move || !hook.with(|h| is_tool_event(&h.event))
+                        placeholder=move || if hook.with(|h| is_tool_event(&h.event)) { "all tools, or e.g. Bash|Edit" } else { "not used by this event" }
+                        prop:value=move || hook.with(|h| h.matcher.clone())
+                        on:input=move |ev| hook.update(|h| h.matcher = event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class=label>"Folder"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="all sessions, or e.g. ~/code/app"
+                        prop:value=move || hook.with(|h| h.folder.clone())
+                        on:input=move |ev| hook.update(|h| h.folder = event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class=label>"Timeout (s)"</span>
+                    <input class=format!("{INPUT} py-1 text-xs") type="number" min="1" max="3600" placeholder="60"
+                        prop:value=move || hook.with(|h| h.timeout_s.map(|t| t.to_string()).unwrap_or_default())
+                        on:input=move |ev| hook.update(|h| h.timeout_s = event_target_value(&ev).trim().parse().ok()) />
+                </label>
+            </div>
+            <label class="block space-y-0.5">
+                <span class=label>"Command (sh)"</span>
+                <textarea class=format!("{INPUT} min-h-16 font-mono text-xs") rows="2" placeholder="./scripts/check.sh"
+                    prop:value=move || hook.with(|h| h.command.clone())
+                    on:input=move |ev| hook.update(|h| h.command = event_target_value(&ev))></textarea>
+            </label>
+        </div>
     }
 }

@@ -47,6 +47,8 @@ pub async fn run_turn(
     effort: Option<&str>,
     inputs: Vec<PendingInput>,
     preamble: Option<&str>,
+    // Hooks from the head, as Claude Code settings JSON.
+    settings: Option<&str>,
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
@@ -64,10 +66,10 @@ pub async fn run_turn(
         }
         Some(bin) => {
             // The carbon6 session id doubles as Claude Code's session id.
-            let mut reason = run_process(&bin, turn, session_id, cwd, model, effort, &prompt, turn > 1, sink, cancel).await?;
+            let mut reason = run_process(&bin, turn, session_id, cwd, model, effort, settings, &prompt, turn > 1, sink, cancel).await?;
             if let Outcome::NoConversation = reason {
                 // The first turn never created the conversation (e.g. it failed early).
-                reason = run_process(&bin, turn, session_id, cwd, model, effort, &prompt, false, sink, cancel).await?;
+                reason = run_process(&bin, turn, session_id, cwd, model, effort, settings, &prompt, false, sink, cancel).await?;
             }
             match reason {
                 Outcome::Ended(r) => r,
@@ -93,6 +95,7 @@ async fn run_process(
     cwd: &Path,
     model: &str,
     effort: Option<&str>,
+    settings: Option<&str>,
     prompt: &str,
     resume: bool,
     sink: &Arc<dyn EventSink>,
@@ -106,6 +109,9 @@ async fn run_process(
     }
     if let Some(e) = effort {
         cmd.args(["--effort", e]);
+    }
+    if let Some(s) = settings {
+        cmd.args(["--settings", s]);
     }
     // The prompt goes on stdin so it can never be mistaken for a flag.
     cmd.current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).kill_on_drop(true);
@@ -302,6 +308,7 @@ case "$*" in *--dangerously-skip-permissions*) ;; *) echo "missing yolo flag" >&
 case "$*" in *"--resume"*) echo "No conversation found with session ID" >&2; exit 1;; esac
 prompt=$(cat)
 pwd > cwd.txt
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; shift; done
 printf '%s' "$prompt" > prompt.txt
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"s","tools":["Bash"],"model":"claude-opus-5-5"}
@@ -330,9 +337,22 @@ EOF
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let inputs = vec![PendingInput { command_id: "c1".into(), text: "list files".into(), ..Default::default() }];
         // Turn 2 tries --resume first; the fake has no conversation, so it falls back.
-        let reason =
-            run_turn(2, "0199-session", dir.path(), "opus", Some("high"), inputs, None, &sink, &CancellationToken::new()).await.unwrap();
+        let reason = run_turn(
+            2,
+            "0199-session",
+            dir.path(),
+            "opus",
+            Some("high"),
+            inputs,
+            None,
+            Some(r#"{"hooks":{}}"#),
+            &sink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(reason, TurnEndReason::Completed);
+        assert_eq!(std::fs::read_to_string(dir.path().join("settings.txt")).unwrap(), r#"{"hooks":{}}"#, "the head's hooks are passed on");
         assert_eq!(std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap(), "list files");
 
         let events = vec_sink.0.lock().unwrap().clone();

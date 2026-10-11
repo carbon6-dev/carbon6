@@ -479,6 +479,36 @@ pub struct CreateApiToken {
     pub name: String,
 }
 
+/// A hook: a shell command run on the worker at a point in each session
+/// (`GET`/`PUT /api/v1/settings/hooks`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Hook {
+    /// What it is for, for display.
+    #[serde(default)]
+    pub name: String,
+    /// One of `HOOK_EVENTS`.
+    pub event: String,
+    /// Tool events: a regular expression over the tool name (Claude Code
+    /// names like `Bash` or `Edit` work in every tool set); empty: all.
+    #[serde(default)]
+    pub matcher: String,
+    /// Only sessions in this folder (on the worker) or below; empty: all.
+    #[serde(default)]
+    pub folder: String,
+    pub command: String,
+    /// Seconds before it is stopped (default 60).
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+pub const HOOK_EVENTS: [&str; 5] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"];
+
 /// A signed-in browser.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthSession {

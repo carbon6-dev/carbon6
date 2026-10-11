@@ -1,25 +1,23 @@
-//! Hooks in Claude Code's `settings.json` format, from `~/.claude/settings.json`
-//! and the project's `.claude/settings.json` and `.claude/settings.local.json`:
+//! Hooks: shell commands the head's settings attach to points in every
+//! session (`CreateSession.hooks_json`, a snapshot taken when the session
+//! is created).
 //!
-//! ```json
-//! {"hooks": {"PreToolUse": [{"matcher": "Bash|Edit", "hooks": [{"type": "command", "command": "./check.sh", "timeout": 30}]}]}}
-//! ```
-//!
-//! Each command runs with `sh -c` in the session's folder, gets the event as
-//! JSON on stdin and `CLAUDE_PROJECT_DIR` in its environment. Exit code 2
-//! blocks (PreToolUse: the call; UserPromptSubmit: the message; Stop: the
-//! end of the turn) with stderr as the reason; for PostToolUse stderr goes
-//! to the model. Exit 0 with JSON on stdout can do the same with
-//! `{"decision": "block", "reason": …}` (or PreToolUse's
+//! Each command runs with `sh -c` in the session's folder, gets the event
+//! as JSON on stdin (the same fields as Claude Code's hooks) and
+//! `C6_PROJECT_DIR` (also `CLAUDE_PROJECT_DIR`) in its environment. Exit
+//! code 2 blocks (PreToolUse: the call; UserPromptSubmit: the message;
+//! Stop: the end of the turn) with stderr as the reason; for PostToolUse
+//! stderr goes to the model. Exit 0 with JSON on stdout can do the same
+//! with `{"decision": "block", "reason": …}` (or PreToolUse's
 //! `hookSpecificOutput.permissionDecision: "deny"`), and add context with
 //! `hookSpecificOutput.additionalContext`; plain stdout from
 //! UserPromptSubmit and SessionStart is added as context. Other exit codes
 //! are errors that block nothing.
 //!
-//! Supported events: PreToolUse, PostToolUse, UserPromptSubmit, Stop,
-//! SessionStart. Matchers (tool events) are regular expressions matched
-//! against the whole tool name, ours or its Claude Code name (`shell` is
-//! also `Bash`); empty or `*` matches every tool.
+//! Matchers (tool events) are regular expressions matched against the whole
+//! tool name, ours or its Claude Code name (`shell` is also `Bash`); empty
+//! or `*` matches every tool. A hook with a folder applies only to sessions
+//! in it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,34 +32,29 @@ use tracing::warn;
 
 const DEFAULT_TIMEOUT: u64 = 60;
 
+/// A hook as the head stores it (`c6_api::Hook`).
 #[derive(Clone, Debug, Default, Deserialize)]
-struct Group {
+struct Command {
+    event: String,
     #[serde(default)]
     matcher: String,
     #[serde(default)]
-    hooks: Vec<Command>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct Command {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
+    folder: String,
     command: String,
-    timeout: Option<u64>,
+    timeout_s: Option<u64>,
+    #[serde(default = "yes")]
+    enabled: bool,
 }
 
-#[derive(Default, Deserialize)]
-struct Settings {
-    #[serde(default)]
-    hooks: HashMap<String, Vec<Group>>,
+fn yes() -> bool {
+    true
 }
 
 pub struct HookRunner {
     session_id: String,
     cwd: PathBuf,
     project_dir: PathBuf,
-    events: HashMap<String, Vec<Group>>,
+    events: HashMap<String, Vec<Command>>,
 }
 
 /// What a set of hooks decided.
@@ -76,43 +69,51 @@ pub struct Verdict {
 }
 
 impl HookRunner {
-    /// The hooks configured for `cwd`; `None` when there are none.
-    pub fn load(session_id: &str, cwd: &Path) -> Option<Self> {
+    /// The enabled hooks in `hooks_json` that apply in `cwd`; `None` when
+    /// there are none.
+    pub fn new(session_id: &str, cwd: &Path, hooks_json: &str) -> Option<Self> {
         let project_dir = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd).to_owned();
-        let mut files = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            files.push(PathBuf::from(home).join(".claude/settings.json"));
-        }
-        files.push(project_dir.join(".claude/settings.json"));
-        files.push(project_dir.join(".claude/settings.local.json"));
-        let mut events: HashMap<String, Vec<Group>> = HashMap::new();
-        for f in files {
-            let Ok(text) = std::fs::read_to_string(&f) else { continue };
-            match serde_json::from_str::<Settings>(&text) {
-                Ok(s) => {
-                    for (event, groups) in s.hooks {
-                        events.entry(event).or_default().extend(groups);
-                    }
-                }
-                Err(e) => warn!(file = %f.display(), "ignoring unreadable settings: {e}"),
+        let hooks: Vec<Command> = serde_json::from_str(hooks_json).unwrap_or_else(|e| {
+            if !hooks_json.trim().is_empty() {
+                warn!("ignoring unreadable hooks: {e}");
+            }
+            Vec::new()
+        });
+        let mut events: HashMap<String, Vec<Command>> = HashMap::new();
+        for h in hooks {
+            let applies = h.folder.trim().is_empty() || cwd.starts_with(crate::expand_home(h.folder.trim()));
+            if h.enabled && applies && !h.command.trim().is_empty() {
+                events.entry(h.event.clone()).or_default().push(h);
             }
         }
-        events.retain(|_, g| g.iter().any(|g| g.hooks.iter().any(|h| !h.command.trim().is_empty())));
         (!events.is_empty()).then(|| Self { session_id: session_id.to_owned(), cwd: cwd.to_owned(), project_dir, events })
+    }
+
+    /// The hooks as Claude Code settings (`--settings`), for Claude Code
+    /// sessions, which run hooks themselves.
+    pub fn claude_settings(&self) -> String {
+        let mut hooks = serde_json::Map::new();
+        for (event, cmds) in &self.events {
+            let groups: Vec<Value> = cmds
+                .iter()
+                .map(|c| {
+                    let mut cmd = json!({"type": "command", "command": c.command});
+                    if let Some(t) = c.timeout_s {
+                        cmd["timeout"] = json!(t);
+                    }
+                    json!({"matcher": c.matcher, "hooks": [cmd]})
+                })
+                .collect();
+            hooks.insert(event.clone(), Value::Array(groups));
+        }
+        json!({"hooks": hooks}).to_string()
     }
 
     /// Runs the hooks for `event` (matching `tool`, for tool events) in
     /// parallel and combines what they decided.
     pub async fn run(&self, event: &str, tool: Option<&str>, mut payload: Value) -> Verdict {
-        let commands: Vec<&Command> = self
-            .events
-            .get(event)
-            .into_iter()
-            .flatten()
-            .filter(|g| tool.is_none_or(|t| matches(&g.matcher, t)))
-            .flat_map(|g| g.hooks.iter())
-            .filter(|c| (c.kind.is_empty() || c.kind == "command") && !c.command.trim().is_empty())
-            .collect();
+        let commands: Vec<&Command> =
+            self.events.get(event).into_iter().flatten().filter(|c| tool.is_none_or(|t| matches(&c.matcher, t))).collect();
         if commands.is_empty() {
             return Verdict::default();
         }
@@ -166,6 +167,7 @@ impl HookRunner {
             .arg("-c")
             .arg(&c.command)
             .current_dir(&self.cwd)
+            .env("C6_PROJECT_DIR", &self.project_dir)
             .env("CLAUDE_PROJECT_DIR", &self.project_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -179,7 +181,7 @@ impl HookRunner {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(input.as_bytes()).await;
         }
-        let timeout = Duration::from_secs(c.timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let timeout = Duration::from_secs(c.timeout_s.unwrap_or(DEFAULT_TIMEOUT));
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(o)) => {
                 (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
@@ -252,32 +254,33 @@ mod tests {
     use c6_tools::Hooks;
 
     #[tokio::test]
-    async fn runs_settings_hooks() {
+    async fn runs_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         std::fs::create_dir_all(d.join(".git")).unwrap();
-        std::fs::create_dir_all(d.join(".claude")).unwrap();
-        std::fs::write(
-            d.join(".claude/settings.json"),
-            r#"{"hooks": {
-                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "grep -q 'rm -rf' && { echo 'no rm -rf' >&2; exit 2; }; exit 0"}]}],
-                "PostToolUse": [{"matcher": "Write|Edit", "hooks": [{"type": "command", "command": "echo '{\"decision\":\"block\",\"reason\":\"run the formatter\"}'"}]}],
-                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo \"branch: main ($CLAUDE_PROJECT_DIR)\""}]}]
-            }}"#,
-        )
-        .unwrap();
-        std::fs::write(d.join(".claude/settings.local.json"), r#"{"hooks": {"Stop": [{"hooks": [{"command": "exit 3"}]}]}}"#).unwrap();
-        let h = HookRunner::load("s1", d).unwrap();
+        let hooks = json!([
+            {"event": "PreToolUse", "matcher": "Bash", "command": "grep -q 'rm -rf' && { echo 'no rm -rf' >&2; exit 2; }; exit 0"},
+            {"event": "PostToolUse", "matcher": "Write|Edit", "command": "echo '{\"decision\":\"block\",\"reason\":\"run the formatter\"}'"},
+            {"event": "UserPromptSubmit", "command": "echo \"branch: main ($C6_PROJECT_DIR)\""},
+            {"event": "Stop", "command": "exit 3"},
+            {"event": "Stop", "command": "echo off >&2; exit 2", "enabled": false},
+            {"event": "PreToolUse", "command": "exit 2", "folder": "/somewhere/else"}
+        ])
+        .to_string();
+        let h = HookRunner::new("s1", d, &hooks).unwrap();
 
         // `shell` (Codex) is Bash too.
         assert_eq!(h.pre_tool_use("shell", &json!({"command": "rm -rf /"})).await.as_deref(), Some("no rm -rf"));
-        assert_eq!(h.pre_tool_use("bash", &json!({"command": "ls"})).await, None);
+        assert_eq!(h.pre_tool_use("bash", &json!({"command": "ls"})).await, None, "a hook for another folder does not apply");
         assert_eq!(h.pre_tool_use("read", &json!({"path": "x"})).await, None, "the matcher does not apply");
         assert_eq!(h.post_tool_use("apply_patch", &json!({}), "ok", false).await.as_deref(), Some("run the formatter"));
         let v = h.run("UserPromptSubmit", None, json!({"prompt": "hi"})).await;
         assert_eq!(v.context, Some(format!("branch: main ({})", d.display())));
-        // A failing hook (not exit 2) blocks nothing.
+        // A failing hook (not exit 2) blocks nothing; a disabled one is not run.
         assert_eq!(h.stop(false).await, None);
-        assert!(HookRunner::load("s1", tempfile::tempdir().unwrap().path()).is_none_or(|h| !h.events.contains_key("PreToolUse")));
+        // Claude Code gets them as its own settings.
+        let cc: Value = serde_json::from_str(&h.claude_settings()).unwrap();
+        assert_eq!(cc["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert!(HookRunner::new("s1", d, "[]").is_none());
     }
 }

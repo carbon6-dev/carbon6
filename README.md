@@ -115,23 +115,17 @@ Agents in Claude Code's format, `.claude/agents/<name>.md` (in the repository, o
 
 ### Hooks
 
-Hooks use Claude Code's `settings.json` format and files: `~/.claude/settings.json`, and the repository's `.claude/settings.json` and `.claude/settings.local.json`.
+Hooks are shell commands that run on the worker at set points in every session. Set them up under **Settings → Hooks**; the head stores them and each new session takes a copy. Start from an example (refuse `rm -rf`, protect `.env` files, format after edits, tell the agent the git branch, keep going until tests pass) or write your own.
 
-```json
-{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/check-command.sh"}]}]}}
-```
-
-- Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop` and `SessionStart`.
-- **How a command runs.** Each one runs in the session's folder with the event as JSON on stdin (`tool_name`, `tool_input`, `prompt`, …) and `CLAUDE_PROJECT_DIR` set.
+- **Events:** `PreToolUse` and `PostToolUse` (narrowed by a tool-name regex; Claude Code's names like `Bash` and `Edit` work with every model), `UserPromptSubmit`, `Stop` and `SessionStart`. A hook can be limited to sessions in one folder, and switched off without deleting it.
+- **How a command runs.** It runs in the session's folder, gets the event as JSON on stdin (`tool_name`, `tool_input`, `prompt`, …), and has `C6_PROJECT_DIR` set to the repository root.
 - **Exit code 2 blocks**, with stderr as the reason:
-  - `PreToolUse`: the call is refused and the model is told why;
+  - `PreToolUse`: the call is refused and the agent is told why;
   - `UserPromptSubmit`: the message is shown struck through and never sent;
-  - `Stop`: the model keeps working, with the reason as feedback;
-  - `PostToolUse`: stderr is added to the result.
-- **JSON output.** `{"decision": "block", "reason": …}` and `hookSpecificOutput.additionalContext` work as in Claude Code.
-- **Plain stdout** from `UserPromptSubmit` and `SessionStart` is added as context.
-- **Matchers** are regular expressions over tool names. Claude Code's names (`Bash`, `Edit`, `Read`, …) match in every tool set.
-- **Claude Code sessions** run their own hooks.
+  - `Stop`: the agent keeps working, with the reason as feedback;
+  - `PostToolUse`: stderr is added to the tool's result.
+- **Exit 0.** Printing `{"decision": "block", "reason": …}` also blocks. Plain output from `UserPromptSubmit` and `SessionStart` is given to the agent as context.
+- **Claude Code sessions** get the same hooks, passed to the `claude` CLI as settings.
 
 ### Workspace
 

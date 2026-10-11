@@ -147,7 +147,7 @@ impl SessionManager {
             let built = build_tools(&spec, &cwd, profile).await;
             setup_errors = built.errors;
             let mut prompt = system_prompt;
-            if let Some(h) = crate::hooks::HookRunner::load(session_id, &cwd)
+            if let Some(h) = crate::hooks::HookRunner::new(session_id, &cwd, &spec.hooks_json)
                 && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": "startup"})).await.context
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
@@ -276,13 +276,13 @@ impl SessionManager {
             None => build_tools(&spec, std::path::Path::new(&started.cwd), ToolProfile::parse(&started.tool_profile)).await.tools,
         };
         let started_cwd = started.cwd.clone();
-        // settings.json hooks (Claude Code sessions run their own).
-        let hooks = (started.tool_profile != crate::claude_code::PROFILE)
-            .then(|| crate::hooks::HookRunner::load(session_id, Path::new(&started.cwd)))
-            .flatten()
-            .map(Arc::new);
+        // The head's hooks. Claude Code sessions get them as Claude Code
+        // settings and run them itself.
+        let hooks = crate::hooks::HookRunner::new(session_id, Path::new(&started.cwd), &spec.hooks_json).map(Arc::new);
         let session_tools = Arc::new(SessionTools::new(PathBuf::from(&started.cwd)));
-        session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
+        if started.tool_profile != crate::claude_code::PROFILE {
+            session_tools.set_hooks(hooks.clone().map(|h| h as Arc<dyn c6_tools::Hooks>));
+        }
         let actor = Actor {
             spec,
             session_tools,
@@ -441,7 +441,7 @@ impl Actor {
                         let cwd = Path::new(&self.started.cwd);
                         crate::commands::expand(cwd, &mut input).await;
                         crate::mentions::resolve(cwd, &mut input);
-                        if let Some(h) = &self.hooks {
+                        if let Some(h) = self.hooks.as_ref().filter(|_| self.started.tool_profile != crate::claude_code::PROFILE) {
                             let v = h.run("UserPromptSubmit", None, serde_json::json!({"prompt": input.model_text()})).await;
                             if let Some(reason) = v.blocked {
                                 // Recorded (so the command is done) but never sent.
@@ -567,6 +567,7 @@ impl Actor {
         let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
         let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
         let checkpoints = self.checkpoints.clone();
+        let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             // The files as they are before this turn's messages, for
@@ -601,6 +602,7 @@ impl Actor {
                     cfg.effort.as_deref(),
                     inputs,
                     preamble.as_deref(),
+                    claude_settings.as_deref(),
                     &sink,
                     &c,
                 )

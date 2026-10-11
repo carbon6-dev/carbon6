@@ -38,6 +38,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/side-chats", post(create_side_chat))
         .route("/api/v1/settings/mcp-servers", get(get_mcp_servers).put(put_mcp_servers))
         .route("/api/v1/settings/skills", get(get_skills).put(put_skills))
+        .route("/api/v1/settings/hooks", get(get_hooks).put(put_hooks))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
@@ -559,6 +560,27 @@ async fn put_skills(State(st): State<Arc<HeadState>>, Json(skills): Json<Vec<Ski
         return Err(ApiErr(StatusCode::BAD_REQUEST, "each skill needs a name and a body".into()));
     }
     st.store.set_setting(crate::sessions::SKILLS, &serde_json::to_string(&skills).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_hooks(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    get_setting(&st, crate::sessions::HOOKS).await
+}
+
+async fn put_hooks(State(st): State<Arc<HeadState>>, Json(hooks): Json<Vec<api::Hook>>) -> ApiResult<StatusCode> {
+    for (i, h) in hooks.iter().enumerate() {
+        let which = if h.name.trim().is_empty() { format!("hook {}", i + 1) } else { format!("hook {:?}", h.name) };
+        if !api::HOOK_EVENTS.contains(&h.event.as_str()) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{which}: unknown event {:?}", h.event)));
+        }
+        if h.command.trim().is_empty() {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{which} needs a command")));
+        }
+        if h.timeout_s.is_some_and(|t| t == 0 || t > 3600) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{which}: the timeout must be 1 to 3600 seconds")));
+        }
+    }
+    st.store.set_setting(crate::sessions::HOOKS, &serde_json::to_string(&hooks).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
