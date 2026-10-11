@@ -7,7 +7,7 @@ use std::time::Instant;
 use c6_llm::{Accumulator, Block, LlmError, Message, ModelClient, ModelEvent, ModelRequest, Role, ToolSpec, stop};
 use c6_proto::{
     AssistantMessage, Compaction, ErrorEvent, TextDelta, ToolOutputDelta, ToolResult, TurnEndReason, TurnEnded, TurnStarted, Usage,
-    UserMessage, ephemeral_event, session_event,
+    ephemeral_event, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
 use futures::StreamExt;
@@ -250,8 +250,8 @@ impl Turn<'_> {
             }
 
             for input in pending() {
-                self.sink.append(session_event::Kind::User(UserMessage { command_id: input.command_id, text: input.text.clone() })).await?;
-                user_blocks.push(Block::Text(input.text));
+                self.sink.append(input.event()).await?;
+                user_blocks.extend(input.blocks());
             }
             if user_blocks.is_empty() {
                 return Ok(TurnEndReason::Completed);

@@ -11,7 +11,11 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
     let mut msgs: Vec<Message> = Vec::new();
     for ev in &effective_events(events) {
         match &ev.kind {
-            Some(session_event::Kind::User(u)) => push_user_block(&mut msgs, Block::Text(u.text.clone())),
+            Some(session_event::Kind::User(u)) => {
+                for b in user_blocks(&u.text, &u.attachments) {
+                    push_user_block(&mut msgs, b);
+                }
+            }
             Some(session_event::Kind::Assistant(a)) => {
                 let blocks: Vec<Block> = a.blocks.iter().filter_map(block_from_proto).collect();
                 if !blocks.is_empty() {
@@ -27,6 +31,34 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
         }
     }
     repair_tool_results(msgs)
+}
+
+/// A user message as model blocks: its text, then each attachment (images
+/// as images; anything else as a file in text).
+pub fn user_blocks(text: &str, attachments: &[c6_proto::Attachment]) -> Vec<Block> {
+    let mut out = vec![Block::Text(text.to_owned())];
+    for a in attachments {
+        if a.mime.starts_with("image/") {
+            out.push(Block::Image { media_type: a.mime.clone(), data: a.data.clone() });
+        } else {
+            out.push(Block::Text(format!("\n\n<file name=\"{}\">\n{}\n</file>", a.name, String::from_utf8_lossy(&a.data))));
+        }
+    }
+    out
+}
+
+/// A user message as plain text, for backends without images (Claude
+/// Code): files inline, images named.
+pub fn user_text(text: &str, attachments: &[c6_proto::Attachment]) -> String {
+    let mut out = text.to_owned();
+    for a in attachments {
+        if a.mime.starts_with("image/") {
+            out.push_str(&format!("\n\n[image {} not shown: this backend takes text only]", a.name));
+        } else {
+            out.push_str(&format!("\n\n<file name=\"{}\">\n{}\n</file>", a.name, String::from_utf8_lossy(&a.data)));
+        }
+    }
+    out
 }
 
 /// The events that still count: a `Rewound` drops the events of its own
@@ -96,7 +128,7 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
     let mut out = String::new();
     for ev in events {
         match &ev.kind {
-            Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", u.text)),
+            Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", user_text(&u.text, &u.attachments))),
             Some(session_event::Kind::Assistant(a)) => {
                 for b in &a.blocks {
                     match &b.block {
@@ -161,7 +193,8 @@ pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
         Block::Opaque { provider, json, label } => {
             content_block::Block::Opaque(c6_proto::Opaque { provider: provider.clone(), json: json.clone(), label: label.clone() })
         }
-        Block::ToolResult { .. } => return None,
+        // Images come from users and are kept as attachments.
+        Block::ToolResult { .. } | Block::Image { .. } => return None,
     };
     Some(c6_proto::ContentBlock { block: Some(block) })
 }
@@ -226,7 +259,7 @@ mod tests {
     #[test]
     fn repairs_missing_results_and_keeps_order() {
         let events = vec![
-            ev(session_event::Kind::User(UserMessage { command_id: "c1".into(), text: "go".into() })),
+            ev(session_event::Kind::User(UserMessage { command_id: "c1".into(), text: "go".into(), ..Default::default() })),
             ev(session_event::Kind::Assistant(AssistantMessage {
                 turn: 1,
                 blocks: vec![tool_use("a"), tool_use("b")],
@@ -239,7 +272,7 @@ mod tests {
                 ..Default::default()
             })),
             // Crash before b's result; then the user spoke again.
-            ev(session_event::Kind::User(UserMessage { command_id: "c2".into(), text: "again".into() })),
+            ev(session_event::Kind::User(UserMessage { command_id: "c2".into(), text: "again".into(), ..Default::default() })),
         ];
         let msgs = history_from_events(&events);
         assert_eq!(msgs.len(), 3);
@@ -256,7 +289,7 @@ mod tests {
     #[test]
     fn rewinds_drop_their_own_session_events() {
         let at = |seq: u64, kind: session_event::Kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
-        let user = |t: &str| session_event::Kind::User(UserMessage { command_id: String::new(), text: t.into() });
+        let user = |t: &str| session_event::Kind::User(UserMessage { command_id: String::new(), text: t.into(), ..Default::default() });
         let started = || session_event::Kind::Started(Default::default());
         let rewound = |to: u64| session_event::Kind::Rewound(c6_proto::Rewound { to_seq: to, ..Default::default() });
         // A side chat: its parent's events (seed), then its own.

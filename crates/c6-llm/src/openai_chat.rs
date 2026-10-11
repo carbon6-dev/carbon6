@@ -38,16 +38,25 @@ impl OpenAiChat {
             match m.role {
                 Role::User => {
                     let mut text = String::new();
+                    let mut images = Vec::new();
                     for b in &m.blocks {
                         match b {
                             Block::ToolResult { id, content, .. } => {
                                 messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
                             }
                             Block::Text(t) => text.push_str(t),
+                            Block::Image { media_type, data } => {
+                                images.push(json!({"type": "image_url", "image_url": {"url": crate::data_url(media_type, data)}}))
+                            }
                             _ => {}
                         }
                     }
-                    if !text.is_empty() {
+                    if !images.is_empty() {
+                        // With images, content is a list of parts.
+                        let mut parts = vec![json!({"type": "text", "text": text})];
+                        parts.extend(images);
+                        messages.push(json!({"role": "user", "content": parts}));
+                    } else if !text.is_empty() {
                         messages.push(json!({"role": "user", "content": text}));
                     }
                 }

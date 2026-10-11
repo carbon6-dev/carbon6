@@ -41,10 +41,12 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/messages", post(send_message))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
+        .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
         .route("/api/v1/workers/{id}/fs/read", get(fs_read))
+        .route("/api/v1/workers/{id}/fs/find", get(fs_find))
         .route("/api/v1/workers/{id}/fs/mkdir", post(fs_mkdir))
         .route("/api/v1/workers/{id}/git/status", get(git_status))
         .route("/api/v1/workers/{id}/git/diff", get(git_diff))
@@ -566,6 +568,19 @@ async fn send_message(
     Ok(Json(crate::sessions::send_input(&st, &id, &req).await?))
 }
 
+/// An attachment of a user message, as sent.
+async fn attachment(State(st): State<Arc<HeadState>>, Path((id, seq, index)): Path<(String, u64, usize)>) -> ApiResult<Response> {
+    let ev = st.store.events_after(&id, seq.saturating_sub(1), 1).await?;
+    let a = match ev.first().filter(|e| e.seq == seq).and_then(|e| e.kind.as_ref()) {
+        Some(c6_proto::session_event::Kind::User(u)) => u.attachments.get(index).cloned(),
+        _ => None,
+    };
+    let Some(a) = a else { return Err(ApiErr(StatusCode::NOT_FOUND, "no such attachment".into())) };
+    // Text is served as plain text, never as something a browser would run.
+    let mime = if a.mime.starts_with("image/") { a.mime } else { "text/plain; charset=utf-8".into() };
+    Ok(([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into())], a.data).into_response())
+}
+
 async fn rewind_session(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
@@ -692,6 +707,10 @@ fn params_json(q: std::collections::HashMap<String, String>) -> serde_json::Valu
 
 async fn fs_list(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
     worker_call(&st, &id, "fs.list", params_json(q)).await
+}
+
+async fn fs_find(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
+    worker_call(&st, &id, "fs.find", params_json(q)).await
 }
 
 async fn fs_read(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {

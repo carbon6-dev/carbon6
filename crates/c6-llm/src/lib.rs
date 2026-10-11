@@ -56,6 +56,11 @@ pub enum Block {
         name: String,
         input_json: String,
     },
+    /// An image from the user (PNG, JPEG, GIF or WebP).
+    Image {
+        media_type: String,
+        data: Vec<u8>,
+    },
     ToolResult {
         id: String,
         content: String,
@@ -190,6 +195,12 @@ pub enum Provider {
     OpenAiChat,
     OpenAiResponses,
     Anthropic,
+}
+
+/// An image as a `data:` URL (OpenAI's APIs take images this way).
+pub(crate) fn data_url(media_type: &str, data: &[u8]) -> String {
+    use base64::Engine;
+    format!("data:{media_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
 }
 
 /// Whether a connection passes the reasoning effort on to the model. Chat

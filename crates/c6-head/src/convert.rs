@@ -22,7 +22,15 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 effort: m.effort,
             }
         }
-        Kind::User(u) => api::EventKind::User { command_id: u.command_id.clone(), text: u.text.clone() },
+        Kind::User(u) => api::EventKind::User {
+            command_id: u.command_id.clone(),
+            text: u.text.clone(),
+            attachments: u
+                .attachments
+                .iter()
+                .map(|a| api::AttachmentInfo { name: a.name.clone(), mime: a.mime.clone(), size: a.data.len() as u64 })
+                .collect(),
+        },
         Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn },
         Kind::Assistant(a) => api::EventKind::Assistant {
             turn: a.turn,

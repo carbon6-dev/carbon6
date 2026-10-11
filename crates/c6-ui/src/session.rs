@@ -405,7 +405,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         </div>
         </ScrollBox>
             <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some())>
-            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice />
+            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice
+                files=Signal::derive(move || Some((detail.get().and_then(|d| d.ok())?.session.worker_id.to_string(), started.get()?.0))) />
             </Show>
         </div>
     }
@@ -541,7 +542,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                                         </div>
                                     }.into_any()
                                 }
-                                None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&e, results, streaming, usage)).into_any(),
+                                None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&id.get_value(), &e, results, streaming, usage)).into_any(),
                             }}
                             {anchorable.then(|| view! {
                                 <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
@@ -608,7 +609,7 @@ fn RewindPanel(session: String, seq: u64, text: String, edit: bool, on_done: Cal
         busy.set(true);
         spawn_local(async move {
             let r = match api::rewind(session.get_value(), seq, restore.get_untracked()).await {
-                Ok(()) if edit => api::send_message(session.get_value(), text, None).await.map(drop),
+                Ok(()) if edit => api::send_message(session.get_value(), text, None, Vec::new()).await.map(drop),
                 other => other,
             };
             busy.set(false);
@@ -702,6 +703,7 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     let id = session.id.clone();
     let start = (session.connection_id.clone(), session.model.clone(), session.effort.clone().unwrap_or_default());
     let choice = ModelChoice::follow(feed.events, start);
+    let place = (session.worker_id.to_string(), session.cwd.clone());
     Effect::new(move || {
         let (_, m, e) = choice.current.get();
         model_label.set(self::model_label(&m, &e));
@@ -709,7 +711,7 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     view! {
         <div class="space-y-3 pb-2 pt-1">
             <Transcript session feed running />
-            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice />
+            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice files=Signal::derive(move || Some(place.clone())) />
         </div>
     }
 }
@@ -1068,6 +1070,7 @@ fn SessionStats(usage: Memo<UsageStats>) -> impl IntoView {
 }
 
 fn render_event(
+    session: &str,
     e: &Event,
     results: Memo<HashMap<String, ToolResultView>>,
     streaming: RwSignal<Streaming>,
@@ -1081,12 +1084,40 @@ fn render_event(
             </details>
         }
         .into_any(),
-        EventKind::User { text, .. } => view! {
-            <div class="flex justify-end">
-                <div class="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800">{text.clone()}</div>
-            </div>
+        EventKind::User { text, attachments, .. } => {
+            let url = |i: usize| format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq);
+            let shown = attachments
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if a.mime.starts_with("image/") {
+                        view! {
+                            <a href=url(i) target="_blank" title=a.name.clone()>
+                                <img src=url(i) alt=a.name.clone() class="max-h-40 max-w-60 rounded-lg border border-zinc-300 object-cover dark:border-zinc-700" />
+                            </a>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <a href=url(i) target="_blank" title=format!("{} bytes", a.size)
+                                class="flex items-center gap-1 rounded-md border border-zinc-300 bg-white px-2 py-1 font-mono text-xs text-zinc-600 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
+                                "📄 "{a.name.clone()}
+                            </a>
+                        }
+                        .into_any()
+                    }
+                })
+                .collect_view();
+            view! {
+                <div class="flex flex-col items-end gap-1.5">
+                    {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
+                    {(!text.is_empty()).then(|| view! {
+                        <div class="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800">{text.clone()}</div>
+                    })}
+                </div>
+            }
+            .into_any()
         }
-        .into_any(),
         EventKind::Assistant { blocks, stop_reason, .. } => {
             let interrupted = stop_reason == "interrupted";
             view! {
@@ -1342,6 +1373,24 @@ fn Queued(q: QueuedInput, session_id: String) -> impl IntoView {
     }
 }
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = c6Files, js_name = has)]
+    fn js_has_files(ev: &web_sys::Event) -> bool;
+
+    #[wasm_bindgen(catch, js_namespace = c6Files, js_name = read)]
+    async fn js_read_files(ev: &web_sys::Event) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+/// The `@` mention being typed at the caret: (where the @ is, the query).
+fn mention_at(text: &str, caret: usize) -> Option<(usize, String)> {
+    let before: String = text.chars().take(caret).collect();
+    let at = before.rfind('@')?;
+    let query = &before[at + 1..];
+    let starts_word = before[..at].chars().last().is_none_or(char::is_whitespace);
+    (starts_word && !query.contains(char::is_whitespace)).then(|| (before[..at].chars().count(), query.to_owned()))
+}
+
 #[component]
 fn Composer(
     id: String,
@@ -1354,20 +1403,82 @@ fn Composer(
     /// Offer a model picker; sending with another model switches to it.
     #[prop(optional)]
     model: Option<ModelChoice>,
+    /// (worker id, directory): for @-mention completion.
+    #[prop(optional, into)]
+    files: Option<Signal<Option<(String, String)>>>,
 ) -> impl IntoView {
     let text = RwSignal::new(String::new());
+    let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
     let id = StoredValue::new(id);
+    let area = NodeRef::<leptos::html::Textarea>::new();
+    // @-mention completion: (where the @ is, query), the matches, and the
+    // highlighted one.
+    let mention = RwSignal::new(None::<(usize, String)>);
+    let picked = RwSignal::new(0usize);
+    let matches = LocalResource::new(move || {
+        let q = mention.get().map(|(_, q)| q);
+        let place = files.and_then(|f| f.get());
+        async move {
+            match (q, place) {
+                (Some(q), Some((worker, root))) => api::fs_find(worker, root, q).await.unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+    });
+    let suggestions = move || if mention.with(Option::is_some) { matches.get().unwrap_or_default() } else { Vec::new() };
+    let update_mention = move || {
+        if let Some(el) = area.get_untracked() {
+            let caret = el.selection_start().ok().flatten().unwrap_or(0) as usize;
+            let m = mention_at(&text.get_untracked(), caret);
+            if m.as_ref().map(|x| &x.1) != mention.get_untracked().as_ref().map(|x| &x.1) {
+                picked.set(0);
+            }
+            mention.set(m);
+        }
+    };
+    let complete = move |path: String, dir: bool| {
+        let Some((at, query)) = mention.get_untracked() else { return };
+        let t = text.get_untracked();
+        let chars: Vec<char> = t.chars().collect();
+        let end = (at + 1 + query.chars().count()).min(chars.len());
+        let insert = format!("@{path}{} ", if dir { "/" } else { "" });
+        let new: String = chars[..at].iter().collect::<String>() + &insert + &chars[end..].iter().collect::<String>();
+        let caret = (at + insert.chars().count()) as u32;
+        text.set(new);
+        mention.set(None);
+        request_animation_frame(move || {
+            if let Some(el) = area.get_untracked() {
+                let _ = el.focus();
+                let _ = el.set_selection_range(caret, caret);
+            }
+        });
+    };
+    let add_files = move |ev: web_sys::Event| {
+        spawn_local(async move {
+            match js_read_files(&ev).await.ok().and_then(|v| v.as_string()) {
+                Some(json) => match serde_json::from_str::<Vec<c6_api::AttachmentUpload>>(&json) {
+                    Ok(files) => attachments.update(|a| a.extend(files)),
+                    Err(e) => error.set(Some(e.to_string())),
+                },
+                None => error.set(Some("could not read the file".into())),
+            }
+        });
+    };
     let send = move || {
         let t = text.get_untracked();
-        if t.trim().is_empty() || disabled.get_untracked() {
+        let files = attachments.get_untracked();
+        if (t.trim().is_empty() && files.is_empty()) || disabled.get_untracked() {
             return;
         }
         let switch = model.and_then(|m| m.switch());
         text.set(String::new());
+        attachments.set(Vec::new());
+        mention.set(None);
         spawn_local(async move {
-            if let Err(e) = api::send_message(id.get_value(), t.clone(), switch).await {
+            if let Err(e) = api::send_message(id.get_value(), t.clone(), switch, files.clone()).await {
                 error.set(Some(e));
                 text.set(t);
+                attachments.set(files);
             } else {
                 error.set(None);
             }
@@ -1380,21 +1491,95 @@ fn Composer(
             }
         });
     };
+    let picker = NodeRef::<leptos::html::Input>::new();
     view! {
-        <div class=if inline { "" } else { "shrink-0 border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" }>
+        <div
+            class=if inline { "" } else { "shrink-0 border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" }
+            on:dragover=|ev| ev.prevent_default()
+            on:drop=move |ev| {
+                let ev: web_sys::Event = ev.into();
+                if js_has_files(&ev) {
+                    ev.prevent_default();
+                    add_files(ev);
+                }
+            }
+        >
             <div class=if inline { "space-y-2" } else { "mx-auto max-w-4xl space-y-2 px-4 py-3" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-                <div class="flex items-end gap-2">
+                {move || (!attachments.with(Vec::is_empty)).then(|| view! {
+                    <div class="flex flex-wrap gap-2">
+                        {attachments.get().into_iter().enumerate().map(|(i, a)| {
+                            let image = a.mime.starts_with("image/");
+                            view! {
+                                <div class="group relative flex items-center gap-1.5 rounded-md border border-zinc-200 bg-white p-1 pr-2 text-xs dark:border-zinc-700 dark:bg-zinc-900">
+                                    {if image {
+                                        view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
+                                    } else {
+                                        view! { <span class="px-1">"📄"</span> }.into_any()
+                                    }}
+                                    <span class="max-w-40 truncate">{a.name.clone()}</span>
+                                    <button class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove" on:click=move |_| attachments.update(|v| { v.remove(i); })>"✕"</button>
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                })}
+                <div class="relative flex items-end gap-2">
+                    // @-mention suggestions, above the box.
+                    {move || {
+                        let list = suggestions();
+                        (!list.is_empty()).then(|| view! {
+                            <div class="absolute bottom-full left-0 z-30 mb-1 max-h-64 w-full max-w-lg overflow-y-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                                {list.into_iter().enumerate().map(|(i, (path, dir))| {
+                                    let (p2, d2) = (path.clone(), dir);
+                                    view! {
+                                        <button
+                                            class=move || format!("block w-full truncate px-3 py-1 text-left font-mono {}", if picked.get() == i { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
+                                            on:mousedown=move |ev| { ev.prevent_default(); complete(p2.clone(), d2); }
+                                        >{if dir { format!("{path}/") } else { path }}</button>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        })
+                    }}
+                    <button class="shrink-0 self-center rounded-md px-1.5 py-1 text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                        title="Attach images or files (or paste / drop them)" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>"📎"</button>
+                    <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                     <textarea
+                        node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat" } else { "Message the agent (Enter to send, Shift+Enter for a new line)" }
+                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat (@ to mention a file)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file)" }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
-                        on:input=move |ev| text.set(event_target_value(&ev))
+                        on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
+                        on:click=move |_| update_mention()
+                        on:paste=move |ev| {
+                            let ev: web_sys::Event = ev.into();
+                            if js_has_files(&ev) {
+                                ev.prevent_default();
+                                add_files(ev);
+                            }
+                        }
                         on:keydown=move |ev| {
+                            let list = suggestions();
+                            if !list.is_empty() {
+                                match ev.key().as_str() {
+                                    "ArrowDown" => { ev.prevent_default(); picked.update(|p| *p = (*p + 1) % list.len()); return; }
+                                    "ArrowUp" => { ev.prevent_default(); picked.update(|p| *p = (*p + list.len() - 1) % list.len()); return; }
+                                    "Enter" | "Tab" => {
+                                        ev.prevent_default();
+                                        let (path, dir) = list[picked.get_untracked().min(list.len() - 1)].clone();
+                                        complete(path, dir);
+                                        return;
+                                    }
+                                    "Escape" => { ev.prevent_default(); ev.stop_propagation(); mention.set(None); return; }
+                                    _ => {}
+                                }
+                            }
                             if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); send(); }
                         }
+                        on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { update_mention() }
                     ></textarea>
                     {move || if running.get() {
                         view! { <button class="rounded-md border border-zinc-300 px-3 py-2 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" on:click=stop>"Stop"</button> }.into_any()

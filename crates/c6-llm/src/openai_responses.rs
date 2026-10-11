@@ -74,17 +74,27 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
     for m in msgs {
         match m.role {
             Role::User => {
+                // Text and images go together in one message.
+                let mut parts: Vec<Value> = Vec::new();
+                let flush = |parts: &mut Vec<Value>, items: &mut Vec<Value>| {
+                    if !parts.is_empty() {
+                        items.push(json!({"type": "message", "role": "user", "content": std::mem::take(parts)}));
+                    }
+                };
                 for b in &m.blocks {
                     match b {
                         Block::ToolResult { id, content, .. } => {
+                            flush(&mut parts, &mut items);
                             items.push(json!({"type": "function_call_output", "call_id": id, "output": content}))
                         }
-                        Block::Text(t) if !t.is_empty() => {
-                            items.push(json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": t}]}))
+                        Block::Text(t) if !t.is_empty() => parts.push(json!({"type": "input_text", "text": t})),
+                        Block::Image { media_type, data } => {
+                            parts.push(json!({"type": "input_image", "image_url": crate::data_url(media_type, data)}))
                         }
                         _ => {}
                     }
                 }
+                flush(&mut parts, &mut items);
             }
             Role::Assistant => {
                 for b in &m.blocks {

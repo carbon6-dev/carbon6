@@ -92,6 +92,11 @@ fn messages(msgs: &[crate::Message]) -> Vec<Value> {
                 .iter()
                 .filter_map(|b| match b {
                     Block::Text(t) if !t.is_empty() => Some(json!({"type": "text", "text": t})),
+                    Block::Image { media_type, data } if m.role == Role::User => {
+                        use base64::Engine;
+                        let data = base64::engine::general_purpose::STANDARD.encode(data);
+                        Some(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}))
+                    }
                     Block::SignedThinking { text, signature } if m.role == Role::Assistant => {
                         Some(json!({"type": "thinking", "thinking": text, "signature": signature}))
                     }

@@ -235,7 +235,7 @@ fn MissionCard(id: String) -> impl IntoView {
         // Replying is attending to it.
         ws.dismiss(&send_id.get_value());
         spawn_local(async move {
-            if let Err(e) = api::send_message(send_id.get_value(), t.clone(), None).await {
+            if let Err(e) = api::send_message(send_id.get_value(), t.clone(), None, Vec::new()).await {
                 error.set(Some(e));
                 text.set(t);
             }

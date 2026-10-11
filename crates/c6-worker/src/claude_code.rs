@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use c6_agent::{EventSink, PendingInput};
 use c6_proto::{
-    AssistantMessage, ContentBlock, ErrorEvent, TextDelta, ToolResult, ToolUse, TurnEndReason, TurnEnded, TurnStarted, Usage, UserMessage,
+    AssistantMessage, ContentBlock, ErrorEvent, TextDelta, ToolResult, ToolUse, TurnEndReason, TurnEnded, TurnStarted, Usage,
     content_block, ephemeral_event, session_event,
 };
 use nix::sys::signal::{Signal, killpg};
@@ -50,10 +50,11 @@ pub async fn run_turn(
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
-    let prompt: Vec<&str> = preamble.into_iter().chain(inputs.iter().map(|i| i.text.as_str())).collect();
+    let texts: Vec<String> = inputs.iter().map(|i| c6_agent::user_text(&i.text, &i.attachments)).collect();
+    let prompt: Vec<&str> = preamble.into_iter().chain(texts.iter().map(String::as_str)).collect();
     let prompt = prompt.join("\n\n");
     for input in inputs {
-        sink.append(session_event::Kind::User(UserMessage { command_id: input.command_id, text: input.text })).await?;
+        sink.append(input.event()).await?;
     }
     sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
 
@@ -327,7 +328,7 @@ EOF
         unsafe { std::env::set_var("C6_CLAUDE_BIN", &bin) };
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
-        let inputs = vec![PendingInput { command_id: "c1".into(), text: "list files".into() }];
+        let inputs = vec![PendingInput { command_id: "c1".into(), text: "list files".into(), ..Default::default() }];
         // Turn 2 tries --resume first; the fake has no conversation, so it falls back.
         let reason =
             run_turn(2, "0199-session", dir.path(), "opus", Some("high"), inputs, None, &sink, &CancellationToken::new()).await.unwrap();

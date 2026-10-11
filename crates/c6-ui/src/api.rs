@@ -186,12 +186,18 @@ pub async fn session(id: String) -> Result<SessionDetail, String> {
 
 /// `switch`: (connection, model, effort) to switch the session to from this
 /// message; an empty effort is the model's default.
-pub async fn send_message(id: String, text: String, switch: Option<(String, String, String)>) -> Result<QueuedInput, String> {
+pub async fn send_message(
+    id: String,
+    text: String,
+    switch: Option<(String, String, String)>,
+    attachments: Vec<c6_api::AttachmentUpload>,
+) -> Result<QueuedInput, String> {
     let (connection_id, model, effort) = match switch {
         Some((c, m, e)) => (Some(c), Some(m), Some(e).filter(|e| !e.is_empty())),
         None => (None, None, None),
     };
-    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, connection_id, model, effort }).await
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, attachments, connection_id, model, effort })
+        .await
 }
 
 pub async fn interrupt(id: String) -> Result<(), String> {
@@ -363,4 +369,14 @@ pub async fn rewind(id: String, to_seq: u64, restore_files: bool) -> Result<(), 
             .await,
     )
     .await
+}
+
+/// Files and folders under `root` matching `q`, best first: (path, is folder).
+pub async fn fs_find(worker: String, root: String, q: String) -> Result<Vec<(String, bool)>, String> {
+    let v: serde_json::Value =
+        json(Request::get(&format!("/api/v1/workers/{worker}/fs/find")).query([("root", root), ("q", q)]).send().await).await?;
+    Ok(v["paths"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| Some((p["path"].as_str()?.to_owned(), p["dir"].as_bool().unwrap_or(false)))).collect())
+        .unwrap_or_default())
 }

@@ -71,6 +71,10 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     }
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let files = attachments(&req.attachments)?;
+    if prompt.is_none() && !files.is_empty() {
+        return Err(bad_request("attachments need a prompt"));
+    }
     let title = req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| default_title(prompt));
     let row = SessionRow {
         id: Uuid::now_v7().to_string(),
@@ -91,7 +95,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         archived: 0,
     };
     let spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
-    insert(st, row, spec, prompt).await
+    insert(st, row, spec, prompt.map(|p| (p, files))).await
 }
 
 /// A side chat on `parent_id`, branching after event `anchor_seq`.
@@ -135,7 +139,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
-    insert(st, row, spec, Some(prompt)).await
+    insert(st, row, spec, Some((prompt, Vec::new()))).await
 }
 
 fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
@@ -209,7 +213,12 @@ async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::R
 
 /// Stores a new session with its Create command (and first input) and
 /// tells the worker.
-async fn insert(st: &HeadState, row: SessionRow, spec: CreateSession, prompt: Option<&str>) -> anyhow::Result<api::Session> {
+async fn insert(
+    st: &HeadState,
+    row: SessionRow,
+    spec: CreateSession,
+    first: Option<(&str, Vec<c6_proto::Attachment>)>,
+) -> anyhow::Result<api::Session> {
     let worker_id: WorkerId = row.worker_id.parse()?;
     let session_id = row.id.clone();
     let create_id = Uuid::now_v7().to_string();
@@ -217,12 +226,12 @@ async fn insert(st: &HeadState, row: SessionRow, spec: CreateSession, prompt: Op
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
     let input_id = Uuid::now_v7().to_string();
-    if let Some(text) = prompt {
+    if let Some((text, attachments)) = first {
         commands.push(NewCommand {
             id: &input_id,
             session_id: &session_id,
             worker_id,
-            data: input_command(&input_id, &session_id, text),
+            data: input_command(&input_id, &session_id, UserInput { text: text.to_owned(), attachments, ..Default::default() }),
             text: Some(text),
         });
     }
@@ -239,23 +248,46 @@ fn default_title(prompt: Option<&str>) -> String {
     if line.chars().count() <= 60 { line.to_owned() } else { format!("{}…", line.chars().take(59).collect::<String>()) }
 }
 
-fn input_command(command_id: &str, session_id: &str, text: &str) -> Vec<u8> {
-    switch_command(command_id, session_id, text, None)
+/// An input (which may also switch the model or carry attachments).
+fn input_command(command_id: &str, session_id: &str, input: UserInput) -> Vec<u8> {
+    SessionCommand { command_id: command_id.to_owned(), session_id: session_id.to_owned(), kind: Some(session_command::Kind::Input(input)) }
+        .encode_to_vec()
 }
 
-/// An input that also switches the session to `model`.
-fn switch_command(command_id: &str, session_id: &str, text: &str, model: Option<ModelSpec>) -> Vec<u8> {
-    SessionCommand {
-        command_id: command_id.to_owned(),
-        session_id: session_id.to_owned(),
-        kind: Some(session_command::Kind::Input(UserInput { text: text.to_owned(), model })),
+const MAX_ATTACHMENT: usize = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS: usize = 20 * 1024 * 1024;
+
+/// Uploaded attachments, checked: images of the kinds models take, or
+/// UTF-8 text, within size limits.
+fn attachments(uploads: &[api::AttachmentUpload]) -> anyhow::Result<Vec<c6_proto::Attachment>> {
+    use base64::Engine;
+    let mut out = Vec::new();
+    let mut total = 0;
+    for u in uploads {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(u.data.trim())
+            .map_err(|_| bad_request(format!("{}: not valid base64", u.name)))?;
+        if data.len() > MAX_ATTACHMENT {
+            return Err(bad_request(format!("{} is larger than 10 MB", u.name)));
+        }
+        total += data.len();
+        let mime = u.mime.to_ascii_lowercase();
+        let image = matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp");
+        if !image && (mime.starts_with("image/") || std::str::from_utf8(&data).is_err()) {
+            return Err(bad_request(format!("{}: only PNG, JPEG, GIF and WebP images, or text files, can be attached", u.name)));
+        }
+        out.push(c6_proto::Attachment { name: u.name.clone(), mime: if image { mime } else { "text/plain".into() }, data });
     }
-    .encode_to_vec()
+    if total > MAX_ATTACHMENTS {
+        return Err(bad_request("attachments total more than 20 MB"));
+    }
+    Ok(out)
 }
 
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
     let text = req.text.trim();
-    if text.is_empty() {
+    let files = attachments(&req.attachments)?;
+    if text.is_empty() && files.is_empty() {
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
@@ -272,11 +304,13 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     };
     let worker_id: WorkerId = session.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
-    let data = switch_command(&id, session_id, text, model);
-    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(text) }).await?;
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
+    let data = input_command(&id, session_id, UserInput { text: text.to_owned(), model, attachments: files });
+    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
-    Ok(api::QueuedInput { command_id: id, text: text.to_owned(), created_at: now_ms(), rejected: None })
+    Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None })
 }
 
 /// Queues a rewind (applied after a running turn is interrupted). Commands
@@ -442,11 +476,11 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         return Ok(false);
     }
     let Some((text, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
-    // Keep a model switch the input asked for.
-    let model = SessionCommand::decode(data.as_slice()).ok().and_then(|c| match c.kind {
-        Some(session_command::Kind::Input(i)) => i.model,
-        _ => None,
-    });
+    // The same input (model switch, attachments and all), under a new id.
+    let input = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
+        Some(session_command::Kind::Input(i)) => i,
+        _ => UserInput { text: text.clone(), ..Default::default() },
+    };
     let events = st.store.events_after(session_id, 0, i64::MAX).await?;
     if events.is_empty() {
         return Ok(false);
@@ -470,13 +504,7 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         .replace_with_restore(
             command_id,
             &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
-            &NewCommand {
-                id: &input_id,
-                session_id,
-                worker_id,
-                data: switch_command(&input_id, session_id, &text, model),
-                text: Some(&text),
-            },
+            &NewCommand { id: &input_id, session_id, worker_id, data: input_command(&input_id, session_id, input), text: Some(&text) },
         )
         .await?;
     warn!(session = %session_id, "worker no longer had this session; restoring it from the head's log");

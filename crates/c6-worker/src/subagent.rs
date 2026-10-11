@@ -69,7 +69,7 @@ impl Subagents for Runner {
         });
         let text = format!("{prompt}{SUBAGENT_NOTE}");
         writer
-            .append(session_event::Kind::User(UserMessage { command_id: String::new(), text: text.clone() }))
+            .append(session_event::Kind::User(UserMessage { command_id: String::new(), text: text.clone(), ..Default::default() }))
             .await
             .map_err(|e| format!("{e:#}"))?;
 

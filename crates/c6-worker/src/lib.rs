@@ -8,6 +8,7 @@ pub mod enroll;
 pub mod identity;
 pub mod journal;
 pub mod link;
+pub mod mentions;
 pub mod pty;
 pub mod rpc;
 pub mod session;

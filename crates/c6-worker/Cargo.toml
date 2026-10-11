@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ignore = "0.4.33"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+base64 = "0.23.1"
 bytes = "1.12.1"
 c6-agent.workspace = true
 c6-core.workspace = true
@@ -37,6 +39,7 @@ uuid = { version = "1.28.0", features = ["v7"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
+base64 = "0.23.1"
 axum = "0.8"
 c6-api.workspace = true
 c6-core.workspace = true

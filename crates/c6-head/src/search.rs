@@ -30,7 +30,14 @@ fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
     use session_event::Kind;
     let mut out = Vec::new();
     match &ev.kind {
-        Some(Kind::User(u)) => out.push((0, "user", u.text.clone())),
+        Some(Kind::User(u)) => {
+            // Text attachments (pasted logs, mentioned files) are searchable too.
+            let mut text = u.text.clone();
+            for a in u.attachments.iter().filter(|a| !a.mime.starts_with("image/")) {
+                text.push_str(&format!("\n\n{}\n{}", a.name, String::from_utf8_lossy(&a.data)));
+            }
+            out.push((0, "user", text))
+        }
         Some(Kind::Assistant(a)) => {
             for (i, b) in a.blocks.iter().enumerate() {
                 let (kind, text) = match &b.block {

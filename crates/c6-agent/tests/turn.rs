@@ -53,7 +53,7 @@ async fn tool_call_then_answer_with_mid_turn_input() {
     let sink: Arc<dyn EventSink> = vec_sink.clone();
     let session = Arc::new(SessionTools::new(dir.path().to_owned()));
     let mut conv = Conversation { history: vec![Message::user_text("make hello.txt")], context_tokens: 0 };
-    let mut queued = vec![PendingInput { command_id: "c2".into(), text: "and say done".into() }];
+    let mut queued = vec![PendingInput { command_id: "c2".into(), text: "and say done".into(), ..Default::default() }];
     let mut pending = move || std::mem::take(&mut queued);
 
     let reason =

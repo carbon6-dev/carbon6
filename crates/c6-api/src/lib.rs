@@ -143,6 +143,9 @@ pub struct CreateSession {
     pub title: Option<String>,
     /// First message, sent right after creation.
     pub prompt: Option<String>,
+    /// Images and text files sent with the first message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
     /// Reasoning effort: low, medium, high, xhigh, max. Default: per model.
     #[serde(default)]
     pub effort: Option<String>,
@@ -171,6 +174,8 @@ pub struct CompleteChatGptSignIn {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SendMessage {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
     /// Switch the session to this connection and model from this message
     /// on. Both or neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +184,23 @@ pub struct SendMessage {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentInfo {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// An image or file sent with a message.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentUpload {
+    pub name: String,
+    /// image/png, image/jpeg, image/gif, image/webp, or a text type.
+    pub mime: String,
+    /// Base64.
+    pub data: String,
 }
 
 /// `POST /api/v1/sessions/{id}/rewind`
@@ -239,6 +261,10 @@ pub enum EventKind {
     User {
         command_id: String,
         text: String,
+        /// Images and files sent with it, and files it mentions (@path).
+        /// The bytes: `GET /api/v1/sessions/{id}/attachments/{seq}/{index}`.
+        #[serde(default)]
+        attachments: Vec<AttachmentInfo>,
     },
     TurnStarted {
         turn: u64,

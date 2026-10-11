@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
-use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
+use c6_llm::{Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
     Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Rewound, SessionActivity, SessionCommand,
-    SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, UserMessage, ephemeral_event, session_command, session_event,
+    SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, session_command, session_event,
 };
 use c6_tools::{SessionTools, Skill, SkillTool, Tool};
 use tokio::sync::mpsc;
@@ -82,7 +82,8 @@ impl SessionManager {
                     return Ok(());
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                let _ = actor.send(ActorMsg::Input(PendingInput { command_id: cmd.command_id, text: input.text }, input.model));
+                let pending = PendingInput { command_id: cmd.command_id, text: input.text, attachments: input.attachments };
+                let _ = actor.send(ActorMsg::Input(pending, input.model));
                 Ok(())
             }
             Some(session_command::Kind::Restore(r)) => {
@@ -415,7 +416,11 @@ impl Actor {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
-                    Some(ActorMsg::Input(input, model)) => self.inbox.lock().unwrap().push(input, model),
+                    Some(ActorMsg::Input(mut input, model)) => {
+                        // Attach the files it mentions, as they are now.
+                        crate::mentions::resolve(Path::new(&self.started.cwd), &mut input);
+                        self.inbox.lock().unwrap().push(input, model)
+                    }
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
                     }
@@ -596,8 +601,8 @@ async fn run_session_turn(
     let first = inbox.lock().unwrap().drain();
     let mut blocks = Vec::new();
     for input in first {
-        sink.append(session_event::Kind::User(UserMessage { command_id: input.command_id, text: input.text.clone() })).await?;
-        blocks.push(Block::Text(input.text));
+        sink.append(input.event()).await?;
+        blocks.extend(input.blocks());
     }
     match conv.history.last_mut() {
         Some(m) if m.role == Role::User => m.blocks.extend(blocks),

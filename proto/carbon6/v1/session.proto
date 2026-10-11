@@ -77,6 +77,18 @@ message SessionStarted {
 message UserMessage {
   string command_id = 1;
   string text = 2;
+  // Images and files sent with the message, and files it mentions with
+  // @path (read when it was received, so replays see what the model saw).
+  repeated Attachment attachments = 3;
+}
+
+message Attachment {
+  // File name or, for @mentions, the path as written.
+  string name = 1;
+  // MIME type: image/* is shown to the model as an image; anything else is
+  // UTF-8 text included in the message.
+  string mime = 2;
+  bytes data = 3;
 }
 
 message TurnStarted {
@@ -281,6 +293,7 @@ message ModelSpec {
 
 message UserInput {
   string text = 1;
+  repeated Attachment attachments = 3;
   // Set to switch the session to this model from this message on.
   ModelSpec model = 2;
 }

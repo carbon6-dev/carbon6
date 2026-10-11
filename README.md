@@ -85,6 +85,10 @@ c6w run
 
 Hover one of your messages: **↶ Rewind** takes the conversation back to before it, and **✎ Edit** changes it and sends it again. Either can also restore files: before each turn the worker snapshots the session's folder into a private repository in its state directory (your own git repository, if any, is never touched; folders without git work too; `node_modules/`, `target/` and the like are skipped, as are files your `.gitignore` ignores). Rewound messages stay in the transcript, folded under a marker.
 
+### Attachments and @-mentions
+
+Paste, drop or pick (📎) images and text files into the message box; they go with the message (images as images, for models that see them; text files inline). Type `@` to mention a file or folder in the session's folder: a fuzzy finder completes the path, and the worker attaches the file (or a folder's listing) when the message arrives, so the model has it without a tool call. Files over 256 KB are mentioned but not inlined. Limits: 10 MB per upload, 20 MB per message. The Claude Code backend gets text only.
+
 ### Workspace
 
 The UI is a workspace of up to four tiles side by side, each a stack of columns:

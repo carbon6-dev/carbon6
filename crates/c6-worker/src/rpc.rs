@@ -21,6 +21,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         "fs.list" => fs_list(serde_json::from_value(params)?).await,
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
         "fs.mkdir" => fs_mkdir(&path_param(&params)?).await,
+        "fs.find" => fs_find(serde_json::from_value(params)?).await,
         // Outside a repository, git methods answer `{"repo": false}` rather
         // than failing, so the UI can say so plainly.
         "git.status" | "git.diff" | "git.log" => {
@@ -57,6 +58,80 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
 fn path_param(params: &Value) -> anyhow::Result<PathBuf> {
     let p = params["path"].as_str().filter(|p| !p.is_empty()).context("path required")?;
     Ok(crate::expand_home(p))
+}
+
+#[derive(Deserialize)]
+struct FindParams {
+    root: String,
+    #[serde(default)]
+    q: String,
+}
+
+/// Entries walked per search, and results returned.
+const FIND_WALK: usize = 50_000;
+const FIND_RESULTS: usize = 30;
+
+/// Files and folders under `root` matching `q` (characters in order, case
+/// ignored), best first: for @-mentions. Respects .gitignore; skips hidden
+/// entries.
+async fn fs_find(p: FindParams) -> anyhow::Result<Value> {
+    let root = crate::expand_home(&p.root);
+    let q = p.q.to_lowercase();
+    tokio::task::spawn_blocking(move || {
+        let mut hits: Vec<(i64, String, bool)> = Vec::new();
+        for entry in ignore::WalkBuilder::new(&root).max_depth(Some(16)).build().filter_map(Result::ok).skip(1).take(FIND_WALK) {
+            let Ok(rel) = entry.path().strip_prefix(&root) else { continue };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let dir = entry.file_type().is_some_and(|t| t.is_dir());
+            if let Some(score) = fuzzy_score(&q, &rel) {
+                hits.push((score, rel, dir));
+            }
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(&b.1)));
+        let paths: Vec<Value> = hits.into_iter().take(FIND_RESULTS).map(|(_, path, dir)| json!({"path": path, "dir": dir})).collect();
+        json!({"paths": paths})
+    })
+    .await
+    .context("searching files")
+}
+
+/// How well `q` matches `path` (None: not at all): its characters must
+/// appear in order; matches in the file name, at word starts and in a row
+/// score higher, long paths lower.
+fn fuzzy_score(q: &str, path: &str) -> Option<i64> {
+    if q.is_empty() {
+        return Some(-(path.len() as i64));
+    }
+    let lower = path.to_lowercase();
+    let name_at = lower.rfind('/').map_or(0, |i| i + 1);
+    let name = &lower[name_at..];
+    if name.starts_with(q) {
+        return Some(10_000 - path.len() as i64);
+    }
+    if name.contains(q) {
+        return Some(8_000 - path.len() as i64);
+    }
+    if lower.contains(q) {
+        return Some(6_000 - path.len() as i64);
+    }
+    let (chars, mut score, mut last) = (lower.as_bytes(), 0i64, None::<usize>);
+    let mut from = 0;
+    for qc in q.bytes() {
+        let i = (from..chars.len()).find(|&i| chars[i] == qc)?;
+        score += match last {
+            Some(l) if l + 1 == i => 15,
+            _ => 0,
+        };
+        if i == 0 || matches!(chars[i - 1], b'/' | b'_' | b'-' | b'.') {
+            score += 10;
+        }
+        if i >= name_at {
+            score += 5;
+        }
+        last = Some(i);
+        from = i + 1;
+    }
+    Some(score * 10 - path.len() as i64)
 }
 
 #[derive(Deserialize)]
@@ -297,5 +372,19 @@ mod tests {
         let names: Vec<&str> = listing["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["a.txt", "new.txt", "untracked.txt"]);
         assert!(listing["git_root"].as_str().is_some());
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::fuzzy_score;
+
+    #[test]
+    fn file_names_first() {
+        let mut paths = ["src/main.rs", "docs/maintenance.md", "crates/x/src/domain.rs", "README.md"];
+        paths.sort_by_key(|p| std::cmp::Reverse(fuzzy_score("main", p).unwrap_or(i64::MIN)));
+        assert_eq!(&paths[..2], ["src/main.rs", "docs/maintenance.md"]);
+        assert!(fuzzy_score("srmn", "src/main.rs").is_some(), "characters in order");
+        assert!(fuzzy_score("zz", "src/main.rs").is_none());
     }
 }

@@ -483,6 +483,7 @@ name = "c6-llm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "futures",
  "reqwest",
@@ -583,6 +584,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "c6-agent",
  "c6-api",
@@ -596,6 +598,7 @@ dependencies = [
  "dirs",
  "futures",
  "gethostname",
+ "ignore",
  "nix 0.31.3",
  "opentelemetry-proto",
  "pem",

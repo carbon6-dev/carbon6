@@ -175,6 +175,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             model: model.get_untracked(),
             title: None,
             prompt: Some(prompt.get_untracked()).filter(|p| !p.trim().is_empty()),
+            attachments: Vec::new(),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked(),
         };
