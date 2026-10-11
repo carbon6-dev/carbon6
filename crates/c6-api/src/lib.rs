@@ -785,6 +785,41 @@ pub struct Automation {
     /// automation or a new token (it holds the token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// Switch it off after this many failed runs in a row; 0: never.
+    #[serde(default)]
+    pub disable_after: u32,
+    /// How its latest runs went, newest first (up to 10): "running", "ok",
+    /// "failed" or "stopped".
+    #[serde(default)]
+    pub recent: Vec<String>,
+}
+
+/// One run of an automation (`GET /api/v1/automations/{id}/runs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationRun {
+    pub run_id: String,
+    pub started_at: UnixMs,
+    #[serde(default)]
+    pub finished_at: Option<UnixMs>,
+    /// "schedule", "webhook" or "manual".
+    pub trigger: String,
+    /// "running", "ok", "failed" or "stopped" (a turn was interrupted).
+    pub outcome: String,
+    /// Why it did not start (or why some of its targets did not).
+    #[serde(default)]
+    pub error: Option<String>,
+    pub sessions: Vec<RunSession>,
+    /// USD, for models with a price (subagents included).
+    pub cost: f64,
+    pub calls: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunSession {
+    pub id: String,
+    pub title: String,
+    /// Empty while its first turn runs; "ok", "failed" or "stopped".
+    pub outcome: String,
 }
 
 /// `POST /api/v1/automations` (create) and `PATCH /api/v1/automations/{id}`.
@@ -802,6 +837,8 @@ pub struct AutomationEdit {
     pub input: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub disable_after: Option<u32>,
 }
 
 /// A memory note: kept across sessions, given to those whose labels match
@@ -910,7 +947,7 @@ pub const NOTIFY_EVENTS: [(&str, &str); 8] = [
     ("finished", "a turn finished"),
     ("notice", "the agent sent you a notification (notify)"),
     ("output", "the agent published a file"),
-    ("automation", "an automation failed to start"),
+    ("automation", "an automation run failed, or failures switched one off"),
     ("budget", "a budget ran out"),
     ("host", "a host's scheduled check failed, or it is reachable again"),
 ];

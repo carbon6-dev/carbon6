@@ -195,6 +195,13 @@ An automation (**Settings → Automations**) starts a template:
 
 **Runs:** each run is labelled `automation:<name>` and `run:<id>` and lands in your inbox when it finishes. Every automation shows its last run, any error, and **Run now**. Times missed while the head was down are skipped, not made up.
 
+**History and health:**
+
+- A run's outcome comes from how each of its sessions' first turn ended: **ok**, **failed** (an error, a session that could not start, or a target that did not start), or **stopped** (interrupted).
+- Each automation shows dots for its last ten runs. **History** lists runs with their trigger (schedule, webhook or manual), duration, model calls and cost, and their sessions.
+- A failed run sends an `automation` notification.
+- **Switch off after** N failed runs in a row (the form suggests 3; never, if unset) turns the automation off and tells you.
+
 ### Connectors (MCP servers)
 
 **Settings → MCP servers** has an **Add a connector…** menu:

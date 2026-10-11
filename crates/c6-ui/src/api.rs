@@ -476,6 +476,10 @@ pub async fn run_automation(id: String) -> Result<c6_api::TemplateRun, String> {
     json(Request::post(&format!("/api/v1/automations/{id}/run")).send().await).await
 }
 
+pub async fn automation_runs(id: String) -> Result<Vec<c6_api::AutomationRun>, String> {
+    json(Request::get(&format!("/api/v1/automations/{id}/runs?limit=20")).send().await).await
+}
+
 pub async fn rotate_automation(id: String) -> Result<c6_api::Automation, String> {
     json(Request::post(&format!("/api/v1/automations/{id}/rotate")).send().await).await
 }

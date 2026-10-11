@@ -47,6 +47,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/automations", get(list_automations).post(create_automation))
         .route("/api/v1/automations/{id}", axum::routing::patch(update_automation).delete(delete_automation))
         .route("/api/v1/automations/{id}/run", post(run_automation))
+        .route("/api/v1/automations/{id}/runs", get(automation_runs))
         .route("/api/v1/automations/{id}/rotate", post(rotate_automation))
         .route("/api/v1/webhooks/{id}/{token}", post(call_webhook))
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
@@ -988,6 +989,20 @@ async fn decide_approval(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+#[derive(serde::Deserialize)]
+struct RunsQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn automation_runs(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Query(q): Query<RunsQuery>,
+) -> ApiResult<Json<Vec<api::AutomationRun>>> {
+    Ok(Json(crate::automations::runs(&st, &id, q.limit.unwrap_or(20)).await?))
 }
 
 async fn get_hosts_setting(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Host>>> {

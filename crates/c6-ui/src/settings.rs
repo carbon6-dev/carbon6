@@ -1606,6 +1606,9 @@ fn AutomationsSetting() -> impl IntoView {
         RwSignal::new(String::new()),
         RwSignal::new(String::new()),
     );
+    let disable_after = RwSignal::new(3u32);
+    // The automation whose run history is open.
+    let history = RwSignal::new(None::<String>);
     let status = RwSignal::new(None::<Result<String, String>>);
     // A webhook's URL, shown once (after creating it or a new token).
     let url = RwSignal::new(None::<String>);
@@ -1623,6 +1626,7 @@ fn AutomationsSetting() -> impl IntoView {
             cron: Some(cron.get_untracked()),
             input: Some(input.get_untracked()),
             enabled: Some(true),
+            disable_after: Some(disable_after.get_untracked()),
         };
         spawn_local(async move {
             match api::create_automation(e).await {
@@ -1662,6 +1666,9 @@ fn AutomationsSetting() -> impl IntoView {
                     Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No automations."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|a| {
                         let (id1, id2, id3, id4) = (a.id.clone(), a.id.clone(), a.id.clone(), a.id.clone());
+                        let (id5, id6, id7) = (a.id.clone(), a.id.clone(), a.id.clone());
+                        let recent = a.recent.clone();
+                        let streak = a.disable_after;
                         let enabled = a.enabled;
                         let what = if a.trigger == "schedule" {
                             format!("{} · {}", a.cron, a.next_run_at.map(|t| format!("next {}", when(t))).unwrap_or_else(|| "off".into()))
@@ -1718,6 +1725,29 @@ fn AutomationsSetting() -> impl IntoView {
                                     })}
                                     {a.last_error.clone().map(|e| view! { <span class="text-red-600">{e}</span> })}
                                 </div>
+                                <div class="flex flex-wrap items-center gap-2 pl-6 text-xs text-zinc-500">
+                                    {(!recent.is_empty()).then(|| view! {
+                                        <span class="flex items-center gap-0.5" title="Latest runs, oldest to newest">
+                                            {recent.iter().rev().map(|o| view! { <span class=format!("h-2 w-2 rounded-full {}", outcome_dot(o)) title=o.clone()></span> }).collect_view()}
+                                        </span>
+                                        <button class="underline" on:click=move |_| history.update(|h| *h = if h.as_deref() == Some(id5.as_str()) { None } else { Some(id5.clone()) })>
+                                            {let id = id6.clone(); move || if history.get().as_deref() == Some(id.as_str()) { "hide history" } else { "history" }}
+                                        </button>
+                                    })}
+                                    <label class="flex items-center gap-1">
+                                        "switch off after"
+                                        <select class="rounded border border-zinc-300 bg-transparent px-1 dark:border-zinc-700" prop:value=streak.to_string() on:change=move |ev| {
+                                            let (id, n) = (id7.clone(), event_target_value(&ev).parse().unwrap_or(0));
+                                            spawn_local(async move {
+                                                let _ = api::update_automation(id, c6_api::AutomationEdit { disable_after: Some(n), ..Default::default() }).await;
+                                                list.refetch();
+                                            });
+                                        }>
+                                            {[0u32, 1, 2, 3, 5, 10].into_iter().map(|n| view! { <option value=n.to_string()>{if n == 0 { "never".to_owned() } else { format!("{n} failed runs") }}</option> }).collect_view()}
+                                        </select>
+                                    </label>
+                                </div>
+                                {let id = a.id.clone(); move || (history.get().as_deref() == Some(id.as_str())).then(|| view! { <RunHistory id=id.clone() /> })}
                             </div>
                         }
                     }).collect_view().into_any(),
@@ -1752,6 +1782,13 @@ fn AutomationsSetting() -> impl IntoView {
                         </select>
                     </div>
                 </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Switch it off after"</span>
+                    <select class=format!("{INPUT} py-1 text-sm") prop:value=move || disable_after.get().to_string()
+                        on:change=move |ev| disable_after.set(event_target_value(&ev).parse().unwrap_or(0))>
+                        {[0u32, 1, 2, 3, 5, 10].into_iter().map(|n| view! { <option value=n.to_string()>{if n == 0 { "never".to_owned() } else { format!("{n} failed runs in a row") }}</option> }).collect_view()}
+                    </select>
+                </label>
                 <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule">
                     <span class="text-xs text-zinc-500">"Input (the template's {{input}})"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
@@ -1765,6 +1802,55 @@ fn AutomationsSetting() -> impl IntoView {
                 <button class=BUTTON on:click=create>"Add automation"</button>
             </div>
         </section>
+    }
+}
+
+fn outcome_dot(outcome: &str) -> &'static str {
+    match outcome {
+        "ok" => "bg-emerald-500",
+        "failed" => "bg-red-500",
+        "stopped" => "bg-amber-500",
+        _ => "bg-sky-400 animate-pulse",
+    }
+}
+
+/// An automation's latest runs: when, how, what they cost, their sessions.
+#[component]
+fn RunHistory(id: String) -> impl IntoView {
+    let runs = LocalResource::new(move || api::automation_runs(id.clone()));
+    let ws = crate::workspace::use_workspace();
+    view! {
+        <div class="ml-6 mt-1 rounded-md border border-zinc-200 text-xs dark:border-zinc-800">
+            {move || runs.get().map(|r| match r {
+                Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="p-2 text-zinc-500">"No runs yet."</p> }.into_any(),
+                Ok(v) => v.into_iter().map(|run| {
+                    let took = run.finished_at.map(|f| format!(" · {}s", (f - run.started_at) / 1000)).unwrap_or_default();
+                    let cost = if run.calls == 0 { String::new() } else { format!(" · {} calls · ${:.2}", run.calls, run.cost) };
+                    view! {
+                        <div class="space-y-0.5 border-t border-zinc-100 px-2 py-1.5 first:border-t-0 dark:border-zinc-800/60">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class=format!("h-2 w-2 rounded-full {}", outcome_dot(&run.outcome))></span>
+                                <span>{when(run.started_at)}</span>
+                                <span class="text-zinc-500">{format!("{} · {}{took}{cost}", run.trigger, run.outcome)}</span>
+                            </div>
+                            {run.error.clone().map(|e| view! { <p class="pl-4 text-red-600">{e}</p> })}
+                            <div class="flex flex-wrap gap-x-3 pl-4">
+                                {run.sessions.into_iter().map(|s| {
+                                    let sid = s.id.clone();
+                                    view! {
+                                        <button class="flex items-center gap-1 hover:underline" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>
+                                            <span class=format!("h-1.5 w-1.5 rounded-full {}", outcome_dot(&s.outcome))></span>
+                                            {if s.title.is_empty() { s.id.clone() } else { s.title.clone() }}
+                                        </button>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        </div>
+                    }
+                }).collect_view().into_any(),
+            })}
+        </div>
     }
 }
 

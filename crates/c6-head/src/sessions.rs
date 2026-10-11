@@ -742,6 +742,17 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
         st.registry.bump();
     }
     notify_events(st, &batch.session_id, &ing.events).await;
+    // How a run's session went: its first turn's end.
+    for ev in &ing.events {
+        if let Some(c6_proto::session_event::Kind::TurnEnded(t)) = &ev.kind {
+            let outcome = match c6_proto::TurnEndReason::try_from(t.reason) {
+                Ok(c6_proto::TurnEndReason::Completed) => "ok",
+                Ok(c6_proto::TurnEndReason::Error) => "failed",
+                _ => "stopped",
+            };
+            crate::automations::session_ended(st, &batch.session_id, outcome).await;
+        }
+    }
     if ing.events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::Usage(_)))) {
         crate::usage::after_calls(st, &batch.session_id).await;
     }
@@ -903,6 +914,9 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
         warn!(session = %session_id, reason = %r.reason, "worker rejected command");
         publish_queue(st, &session_id).await;
         st.registry.bump();
+        if st.store.session(&session_id).await?.is_some_and(|s| s.status == "failed") {
+            crate::automations::session_ended(st, &session_id, "failed").await;
+        }
     }
     Ok(())
 }

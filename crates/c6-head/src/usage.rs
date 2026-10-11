@@ -329,6 +329,38 @@ async fn enforce(st: &HeadState, session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What sessions (and their subagents) cost: (USD, model calls).
+pub async fn cost_of(st: &HeadState, session_ids: &[String]) -> anyhow::Result<(f64, u64)> {
+    if session_ids.is_empty() {
+        return Ok((0.0, 0));
+    }
+    let prices = prices(st).await?;
+    let list = serde_json::to_string(session_ids)?;
+    let rows = sqlx::query(
+        "SELECT u.* FROM usage u JOIN sessions s ON s.id = u.session_id \
+         WHERE s.id IN (SELECT value FROM json_each(?)) OR s.parent_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(&list)
+    .bind(&list)
+    .fetch_all(&st.store.pool)
+    .await?;
+    let mut cost = 0.0;
+    for r in &rows {
+        let c = Call {
+            session_id: String::new(),
+            ts: 0,
+            connection_id: String::new(),
+            model: r.get("model"),
+            input: r.get::<i64, _>("input") as u64,
+            output: r.get::<i64, _>("output") as u64,
+            cache_read: r.get::<i64, _>("cache_read") as u64,
+            cache_write: r.get::<i64, _>("cache_write") as u64,
+        };
+        cost += c.cost(&prices).unwrap_or(0.0);
+    }
+    Ok((cost, rows.len() as u64))
+}
+
 /// Labels worth a row in the report: yours and host:, worker:, repo:.
 fn report_label(l: &str) -> bool {
     match l.split_once(':') {
