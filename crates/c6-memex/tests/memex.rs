@@ -202,6 +202,14 @@ async fn memex_round_trip() {
     let mail = ask(json!(["mail"])).await;
     assert!(mail.contains("Invoice 7781"), "{mail}");
 
+    // @memex:<label> in a message attaches what the memex knows about it.
+    let before = mock.requests().len();
+    mock.push(Reply::Text("ok".into()));
+    create(json!([]), "Summarize @memex:client:acme please").await;
+    eventually("the mention's turn", async || (mock.requests().len() > before).then_some(())).await;
+    let sent = mock.requests()[before]["messages"].to_string();
+    assert!(sent.contains("@memex:client:acme") && sent.contains("Priya") && sent.contains("staging gate"), "{sent}");
+
     // Forgetting a note removes it from the memex.
     let mems: Vec<c6_api::Memory> = http.get(format!("{api}/memories")).send().await.unwrap().json().await.unwrap();
     let acme_note = mems.iter().find(|m| m.text.contains("staging gate")).unwrap();

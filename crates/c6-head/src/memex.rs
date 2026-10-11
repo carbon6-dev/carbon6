@@ -453,3 +453,61 @@ fn tool_line(name: &str, input: &str) -> String {
         .unwrap_or_default();
     if gist.is_empty() { name.to_owned() } else { format!("{name} {gist}") }
 }
+
+/// The `@memex:<key>` mentions in a message.
+pub fn mentions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        if let Some(key) = word.strip_prefix("@memex:") {
+            let key = key.trim_end_matches(['.', ',', ';', '?', '!', ')']);
+            if !key.is_empty() && !out.iter().any(|k| k == key) {
+                out.push(key.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// What the memex knows about a thing (or an item), as Markdown for an
+/// attachment.
+pub async fn card(st: &HeadState, key: &str) -> anyhow::Result<String> {
+    let v = call(st, "memex.get", json!({"id": key})).await?;
+    if let Some(item) = v.get("item") {
+        return Ok(format!(
+            "# {} ({})\n\n{}",
+            item["title"].as_str().unwrap_or(""),
+            item["kind"].as_str().unwrap_or(""),
+            clip(item["text"].as_str().unwrap_or(""), 8000)
+        ));
+    }
+    let t = &v["thing"];
+    let mut out = format!(
+        "# {} ({}: {})\n",
+        t["thing"]["name"].as_str().unwrap_or(""),
+        t["thing"]["kind"].as_str().unwrap_or(""),
+        t["thing"]["label"].as_str().unwrap_or("")
+    );
+    for (title, key) in [("Notes", "notes"), ("Recent items", "items")] {
+        let rows: Vec<String> = t[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .take(12)
+                    .map(|h| {
+                        format!(
+                            "- ({}) {}: {} [{}]",
+                            h["kind"].as_str().unwrap_or(""),
+                            h["title"].as_str().unwrap_or(""),
+                            clip(h["snippet"].as_str().unwrap_or(""), 300),
+                            h["id"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            out.push_str(&format!("\n## {title}\n{}\n", rows.join("\n")));
+        }
+    }
+    Ok(out)
+}

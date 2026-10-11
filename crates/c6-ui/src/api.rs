@@ -342,6 +342,10 @@ pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::
     send_json(Request::post("/api/v1/memex/notes"), &c6_api::MemexNoteIn { text, about }).await
 }
 
+pub async fn memex_mentions(q: String) -> Result<Vec<c6_api::MemexThingRef>, String> {
+    json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).send().await).await
+}
+
 pub async fn memex_delete(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/memex/items/{id}")).send().await).await
 }

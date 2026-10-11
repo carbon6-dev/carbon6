@@ -147,6 +147,7 @@ The memex is your knowledge store: a separate service, `c6m`, on the same fabric
 - **memex → carbon6:**
   - **Briefs:** a new session starts with a brief from the memex about its labels and its first message (notes, recent sessions about the same things, what else matches), in place of the memory section.
   - **Tools:** agents get `memex_search` (keywords and meaning), `memex_get` (an item in full, or a thing with its notes, items and related things) and `memex_note`.
+- **@-mentions:** typing `@` in a message also offers things from the memex (people, clients, hosts, topics); `@memex:client:acme` attaches what the memex knows about it to the message.
 - **Search by meaning:** **Settings → Memex** picks an embedding model from one of your connections (Ollama's `nomic-embed-text`, OpenAI's `text-embedding-3-small`, …). Without one, search is by keywords.
 - **Scopes:** sessions see sessions, outputs, web pages, notes, documents and papers. **Settings → Memex scopes** lets sessions with given labels see more (email, photos, once those are in). You see everything on the **Memex** page, where you can also search, open items and things, delete items, and write notes.
 

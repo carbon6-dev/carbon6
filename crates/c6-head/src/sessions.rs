@@ -380,6 +380,20 @@ pub async fn custom_commands(st: &HeadState) -> anyhow::Result<Vec<api::CommandD
 /// session: commands apply as they are when the message is sent.
 async fn with_command(st: &HeadState, labels: Vec<String>, mut input: UserInput) -> anyhow::Result<UserInput> {
     input.labels = labels;
+    // @memex:<label or id>: what the memex knows about it, attached.
+    for key in crate::memex::mentions(&input.text) {
+        if input.attachments.iter().any(|a| a.name == format!("@memex:{key}")) {
+            continue;
+        }
+        match crate::memex::card(st, &key).await {
+            Ok(text) => input.attachments.push(c6_proto::Attachment {
+                name: format!("@memex:{key}"),
+                mime: "text/markdown".into(),
+                data: text.into_bytes(),
+            }),
+            Err(e) => debug!(%key, "memex mention: {e:#}"),
+        }
+    }
     let Some(rest) = input.text.strip_prefix('/') else { return Ok(input) };
     let name = rest.split(char::is_whitespace).next().unwrap_or("");
     if !api::valid_command_name(name) {

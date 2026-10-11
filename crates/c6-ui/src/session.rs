@@ -1477,6 +1477,8 @@ fn download(url: &str) {
 #[derive(Clone, PartialEq)]
 enum Suggestion {
     File(String, bool),
+    /// A thing in the memex: (what to insert after @memex:, kind, name).
+    Thing(String, String, String),
     Command(c6_api::CommandInfo),
 }
 
@@ -1525,6 +1527,16 @@ fn Composer(
             }
         }
     });
+    // Things in the memex (people, clients, hosts, topics) for @.
+    let things = LocalResource::new(move || {
+        let q = mention.get().map(|(_, q)| q).filter(|q| q.chars().count() >= 2);
+        async move {
+            match q {
+                Some(q) => api::memex_mentions(q).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+    });
     // Slash commands: the query, and the commands the head offers.
     let command = RwSignal::new(None::<String>);
     let commands = LocalResource::new(move || async move {
@@ -1543,7 +1555,12 @@ fn Composer(
             return starts.into_iter().map(Suggestion::Command).collect();
         }
         if mention.with(Option::is_some) {
-            matches.get().unwrap_or_default().into_iter().map(|(p, d)| Suggestion::File(p, d)).collect()
+            let mut list: Vec<Suggestion> = matches.get().unwrap_or_default().into_iter().map(|(p, d)| Suggestion::File(p, d)).collect();
+            list.extend(things.get().unwrap_or_default().into_iter().take(8).map(|t| {
+                let key = if t.label.is_empty() { t.id.clone() } else { t.label.clone() };
+                Suggestion::Thing(key, t.kind, t.name)
+            }));
+            list
         } else {
             Vec::new()
         }
@@ -1732,6 +1749,16 @@ fn Composer(
                                                 </button>
                                             }.into_any()
                                         }
+                                        Suggestion::Thing(key, kind, name) => {
+                                            let k2 = key.clone();
+                                            view! {
+                                                <button class=row on:mousedown=move |ev| { ev.prevent_default(); complete(format!("memex:{k2}"), false); }>
+                                                    <span class="rounded bg-violet-100 px-1 text-[10px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">{kind}</span>
+                                                    <span class="ml-1">{name}</span>
+                                                    <span class="ml-2 font-mono text-zinc-400">{key}</span>
+                                                </button>
+                                            }.into_any()
+                                        }
                                         Suggestion::Command(c) => {
                                             let n2 = c.name.clone();
                                             view! {
@@ -1755,7 +1782,7 @@ fn Composer(
                         node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat (@ to mention a file, / for commands)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file, / for commands)" }
+                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat (@ to mention a file, / for commands)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)" }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
@@ -1777,6 +1804,7 @@ fn Composer(
                                         let s = list[picked.get_untracked().min(list.len() - 1)].clone();
                                         match s {
                                             Suggestion::File(path, dir) => complete(path, dir),
+                                            Suggestion::Thing(key, _, _) => complete(format!("memex:{key}"), false),
                                             // Enter on a command already typed in full sends it.
                                             Suggestion::Command(c) if ev.key() == "Enter" && command.get_untracked().as_deref() == Some(c.name.as_str()) => {
                                                 ev.prevent_default();
