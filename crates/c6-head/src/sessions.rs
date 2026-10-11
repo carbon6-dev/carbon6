@@ -76,7 +76,15 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     if req.cwd.trim().is_empty() && req.worktree && req.ssh.is_none() {
         return Err(bad_request("a git worktree needs a folder"));
     }
-    let ssh = req.ssh.as_deref().map(str::trim).unwrap_or("").to_owned();
+    let mut ssh = req.ssh.as_deref().map(str::trim).unwrap_or("").to_owned();
+    // A host from the inventory (by name or target): its target and labels.
+    let mut req_labels = req.labels.clone();
+    if !ssh.is_empty()
+        && let Some(h) = crate::hosts::lookup(st, &ssh).await?
+    {
+        ssh = h.target.trim().to_owned();
+        req_labels.extend(h.labels.iter().cloned());
+    }
     if !ssh.is_empty() {
         if ssh.starts_with('-') || ssh.contains(char::is_whitespace) {
             return Err(bad_request("an SSH target is user@host or a host alias"));
@@ -85,7 +93,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
             return Err(bad_request("git worktrees are for folders on the worker, not SSH targets"));
         }
     }
-    let labels = check_labels(&req.labels)?;
+    let labels = check_labels(&req_labels)?;
     let cwd = req.cwd.trim().to_owned();
     let (connection_id, model, subagent_model) = {
         let mut route_labels = labels.clone();

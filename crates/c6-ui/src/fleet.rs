@@ -16,7 +16,74 @@ fn now_ms() -> i64 {
 #[component]
 pub fn FleetPage() -> impl IntoView {
     let workers = api::live().workers;
-    view! { <main class="mx-auto max-w-6xl px-4 py-6"><Fleet workers /></main> }
+    view! { <main class="mx-auto max-w-6xl space-y-6 px-4 py-6"><Fleet workers /><Hosts /></main> }
+}
+
+/// The host inventory and whether each host answers.
+#[component]
+fn Hosts() -> impl IntoView {
+    let hosts = LocalResource::new(api::hosts);
+    let checking = RwSignal::new(std::collections::HashSet::<String>::new());
+    let error = RwSignal::new(None::<String>);
+    let check = move |name: String| {
+        checking.update(|c| {
+            c.insert(name.clone());
+        });
+        spawn_local(async move {
+            if let Err(e) = api::check_host(name.clone()).await {
+                error.set(Some(e));
+            }
+            checking.update(|c| {
+                c.remove(&name);
+            });
+            hosts.refetch();
+        });
+    };
+    view! {
+        <section class="space-y-2">
+            <div>
+                <h2 class="text-base font-semibold">"Hosts"</h2>
+                <p class="text-sm text-zinc-500">"Machines your workers reach over SSH. Sessions on them get their labels; templates can run on every host with given labels. Add and edit them in Settings → Hosts."</p>
+            </div>
+            {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
+            <Suspense fallback=|| ()>
+                {move || hosts.get().map(|r| match r {
+                    Ok(hs) if hs.is_empty() => view! { <p class="text-sm text-zinc-500">"No hosts yet."</p> }.into_any(),
+                    Ok(hs) => view! {
+                        <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
+                            {hs.into_iter().map(|s| {
+                                let name = s.host.name.clone();
+                                let n2 = name.clone();
+                                let (dot, state) = match &s.check {
+                                    None => ("bg-zinc-400", "not checked".to_owned()),
+                                    Some(c) if c.ok => ("bg-emerald-500", format!("reachable · {} ms · {}", c.latency_ms, c.message)),
+                                    Some(c) => ("bg-red-500", format!("unreachable: {}", c.message)),
+                                };
+                                let when = s.check.as_ref().map(|c| format!("checked {} ago via {}", ago(now_ms() - c.at_ms), c.worker)).unwrap_or_default();
+                                view! {
+                                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2 text-sm">
+                                        <span class=format!("h-2 w-2 shrink-0 rounded-full {dot}")></span>
+                                        <span class="font-medium">{name.clone()}</span>
+                                        <span class="font-mono text-xs text-zinc-500">{s.host.target.clone()}</span>
+                                        {(!s.host.worker.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("via {}", s.host.worker)}</span> })}
+                                        <span class="flex flex-wrap gap-1">{s.host.labels.iter().map(|l| view! { <span class="rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800">{l.clone()}</span> }).collect_view()}</span>
+                                        {(!s.host.enabled).then(|| view! { <span class="text-xs text-zinc-500">"(off)"</span> })}
+                                        <span class="flex-1"></span>
+                                        <span class="max-w-md truncate text-xs text-zinc-500" title=when.clone()>{state}</span>
+                                        <button class="rounded-md px-2 py-0.5 text-xs text-zinc-600 hover:bg-zinc-200/60 disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                                            disabled=move || checking.with(|c| c.contains(&n2)) on:click=move |_| check(name.clone())>
+                                            {let n3 = s.host.name.clone(); move || if checking.with(|c| c.contains(&n3)) { "Checking…" } else { "Check" }}
+                                        </button>
+                                    </div>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_any(),
+                    Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
+                })}
+            </Suspense>
+        </section>
+    }
 }
 
 /// One worker: its files, git changes and terminals.

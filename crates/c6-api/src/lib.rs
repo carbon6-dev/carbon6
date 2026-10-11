@@ -709,6 +709,10 @@ pub struct Template {
     /// SSH targets, reached through the worker(s): one session each.
     #[serde(default)]
     pub ssh: Vec<String>,
+    /// Hosts from your inventory with all of these labels (or `*` for every
+    /// host): one session each, through the host's worker.
+    #[serde(default)]
+    pub hosts: Vec<String>,
     /// The folder (on the worker, or on the SSH target); empty: a scratch
     /// workspace (or the home folder there).
     #[serde(default)]
@@ -900,7 +904,7 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 7] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 8] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("failed", "a turn ended with an error"),
     ("finished", "a turn finished"),
@@ -908,10 +912,55 @@ pub const NOTIFY_EVENTS: [(&str, &str); 7] = [
     ("output", "the agent published a file"),
     ("automation", "an automation failed to start"),
     ("budget", "a budget ran out"),
+    ("host", "a host's scheduled check failed, or it is reachable again"),
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 5] = ["approval", "failed", "notice", "automation", "budget"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 6] = ["approval", "failed", "notice", "automation", "budget", "host"];
+
+/// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
+/// Sessions on it get its labels; templates can target hosts by label.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Host {
+    /// A short name (letters, digits, - _ .); you can start a session
+    /// with it as the SSH target.
+    pub name: String,
+    /// `user@host[:port]` or an alias from the worker's ~/.ssh/config.
+    pub target: String,
+    /// The worker that reaches it (by name); empty: any online worker.
+    #[serde(default)]
+    pub worker: String,
+    /// Labels for its sessions, like role:web, env:prod.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    /// Check that it is reachable every this many minutes; empty or 0:
+    /// only when you ask.
+    #[serde(default, deserialize_with = "maybe_number", skip_serializing_if = "Option::is_none")]
+    pub check_every: Option<f64>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// A host and its last reachability check (`GET /api/v1/hosts`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostStatus {
+    pub host: Host,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<HostCheck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostCheck {
+    pub at_ms: i64,
+    pub ok: bool,
+    /// The worker that checked.
+    pub worker: String,
+    /// The system (OS, kernel) when reachable; why not, when not.
+    pub message: String,
+    pub latency_ms: u64,
+}
 
 /// A model's price in USD per million tokens (`/api/v1/settings/prices`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

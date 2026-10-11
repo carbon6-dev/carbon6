@@ -35,6 +35,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
                 _ => git_log(&dir).await,
             }
         }
+        "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),
@@ -387,4 +388,18 @@ mod find_tests {
         assert!(fuzzy_score("srmn", "src/main.rs").is_some(), "characters in order");
         assert!(fuzzy_score("zz", "src/main.rs").is_none());
     }
+}
+
+/// Whether an SSH target answers: {ok, system} or {ok: false, error}.
+async fn ssh_check(target: &str) -> anyhow::Result<Value> {
+    let target = target.trim();
+    if target.is_empty() || target.starts_with('-') || target.contains(char::is_whitespace) {
+        bail!("an SSH target is user@host or a host alias");
+    }
+    let host = c6_tools::remote::SshHost::new(target, "");
+    Ok(match tokio::time::timeout(std::time::Duration::from_secs(20), host.probe("~")).await {
+        Ok(Ok((_, _, system))) => json!({"ok": true, "system": system}),
+        Ok(Err(e)) => json!({"ok": false, "error": e.trim()}),
+        Err(_) => json!({"ok": false, "error": format!("no answer from {target} in 20 seconds")}),
+    })
 }

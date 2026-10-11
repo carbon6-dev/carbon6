@@ -271,6 +271,14 @@ pub async fn usage(days: u32, labels: Vec<String>) -> Result<c6_api::UsageReport
     json(Request::get(&format!("/api/v1/usage?days={days}&labels={labels}")).send().await).await
 }
 
+pub async fn hosts() -> Result<Vec<c6_api::HostStatus>, String> {
+    json(Request::get("/api/v1/hosts").send().await).await
+}
+
+pub async fn check_host(name: String) -> Result<c6_api::HostCheck, String> {
+    json(Request::post(&format!("/api/v1/hosts/{}/check", js_sys::encode_uri_component(&name))).send().await).await
+}
+
 pub async fn test_channel(name: String) -> Result<(), String> {
     let body = c6_api::TestChannel { name };
     empty(Request::post("/api/v1/settings/channels/test").json(&body).map_err(|e| e.to_string())?.send().await).await

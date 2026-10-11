@@ -8,6 +8,7 @@ mod convert;
 mod cron;
 mod export;
 pub mod guard;
+pub mod hosts;
 pub mod hub;
 pub mod memory;
 pub mod notify;
@@ -184,6 +185,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     automations::spawn_scheduler(state.clone());
     notify::spawn(state.clone());
     usage::spawn_backfill(state.clone());
+    hosts::spawn_checks(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

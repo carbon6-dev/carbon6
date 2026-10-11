@@ -27,6 +27,7 @@ pub fn check(templates: &[api::Template]) -> anyhow::Result<()> {
             return Err(bad_request(format!("template {n:?} needs a prompt")));
         }
         crate::sessions::check_labels(&t.labels)?;
+        crate::sessions::check_selector(&t.hosts)?;
     }
     Ok(())
 }
@@ -65,7 +66,7 @@ pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String]) -> 
         }
         v
     };
-    if workers.is_empty() {
+    if workers.is_empty() && t.hosts.is_empty() {
         return Err(bad_request(format!("template {name:?}: no worker is online")));
     }
     // Without a connection or model, routing rules choose (by the labels
@@ -90,18 +91,34 @@ pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String]) -> 
     session_labels.push(format!("run:{run_id}"));
     let session_labels = crate::sessions::check_labels(&session_labels)?;
 
-    // One session per worker, or per SSH target on each worker.
+    // One session per worker, or per SSH target on each worker, or per
+    // host from the inventory (through its worker, else the template's).
     let mut targets: Vec<(&api::Worker, Option<String>)> = Vec::new();
-    for w in &workers {
-        if t.ssh.is_empty() {
-            targets.push((w, None));
-        } else {
-            targets.extend(t.ssh.iter().map(|h| (*w, Some(h.clone()))));
+    let mut errors = Vec::new();
+    if !t.hosts.is_empty() {
+        let inventory = crate::hosts::hosts(st).await?;
+        let chosen = crate::hosts::select(&inventory, &t.hosts);
+        if chosen.is_empty() {
+            return Err(bad_request(format!("template {name:?}: no host has the labels {}", t.hosts.join(", "))));
+        }
+        for h in chosen {
+            let worker = if h.worker.trim().is_empty() { workers.first().copied() } else { crate::hosts::worker_for(h, &all) };
+            match worker {
+                Some(w) => targets.push((w, Some(h.name.clone()))),
+                None => errors.push(format!("{}: its worker is not online", h.name)),
+            }
+        }
+    } else {
+        for w in &workers {
+            if t.ssh.is_empty() {
+                targets.push((w, None));
+            } else {
+                targets.extend(t.ssh.iter().map(|h| (*w, Some(h.clone()))));
+            }
         }
     }
-    let fleet = targets.len() > 1;
+    let fleet = targets.len() > 1 || !t.hosts.is_empty();
     let mut sessions = Vec::new();
-    let mut errors = Vec::new();
     for (w, ssh) in targets {
         let target = ssh.clone().unwrap_or_else(|| w.name.clone());
         let req = api::CreateSession {

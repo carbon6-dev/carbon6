@@ -143,6 +143,14 @@ Channels (**Settings → Notifications**) tell you about your sessions while you
 - **The agent's `notify` tool:** agents can send you a notice (a title, a few lines, a priority), for example from an automation that finds a problem.
 - **Testing:** **Send a test** sends a message on a channel and shows any error.
 
+### Hosts
+
+The host inventory (**Settings → Hosts**) lists machines your workers reach over SSH. Each host has a name, an SSH target (`user@host[:port]` or an `~/.ssh/config` alias on the worker), an optional worker, labels like `role:web` and `env:prod`, and optionally a check interval. carbon6 never handles SSH keys; the worker's own SSH setup is used.
+
+- **Sessions:** use a host's name as the SSH target (the new-session form suggests them). The session gets the host's labels, so policies, budgets, routing, memory and secrets for `env:prod` apply without tagging each run.
+- **Fleet runs:** a template's **Hosts by label** (`role:web, env:prod`, or `*`) starts one session per matching host, through that host's worker.
+- **Checks:** the **Workers** page lists hosts with their last check (reachable, latency and system, or why not) and a **Check** button. With a check interval, the head checks on its own and sends a `host` notification when a host stops answering or comes back.
+
 ### Usage and budgets
 
 **Usage and budgets** (in the ☰ menu) shows tokens and cost for the sessions matching the label filter, over today or the last 7, 30 or 90 days: totals, a daily chart, and breakdowns by model, connection, label, and the most expensive sessions (subagents count toward the session that started them).

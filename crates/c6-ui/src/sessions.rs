@@ -117,6 +117,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let remote = RwSignal::new(storage_get("c6.where").as_deref() == Some("ssh"));
     let ssh = RwSignal::new(String::new());
     let remote_dir = RwSignal::new(String::new());
+    // Hosts from the inventory, offered by name.
+    let inventory = LocalResource::new(api::hosts);
     let recent_ssh = move || -> Vec<String> {
         storage_get(&format!("c6.ssh.{}", worker.get())).map(|s| c6_api::labels::parse_labels(&s)).unwrap_or_default()
     };
@@ -298,7 +300,13 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                     <div class="mt-1 flex gap-2" class:hidden=move || !remote.get()>
                         <input class=format!("{INPUT} min-w-0 flex-1 font-mono") list="c6-ssh-recent" placeholder="user@host or an ssh_config alias"
                             prop:value=move || ssh.get() on:input=move |ev| ssh.set(event_target_value(&ev)) />
-                        <datalist id="c6-ssh-recent">{move || recent_ssh().into_iter().map(|t| view! { <option value=t></option> }).collect_view()}</datalist>
+                        <datalist id="c6-ssh-recent">
+                            {move || inventory.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|h| h.host.enabled).map(|h| {
+                                let label = format!("{} · {}", h.host.target, h.host.labels.join(", "));
+                                view! { <option value=h.host.name.clone() label=label></option> }
+                            }).collect_view()}
+                            {move || recent_ssh().into_iter().map(|t| view! { <option value=t></option> }).collect_view()}
+                        </datalist>
                         <input class=format!("{INPUT} w-40! font-mono") placeholder="folder there (~)"
                             prop:value=move || remote_dir.get() on:input=move |ev| remote_dir.set(event_target_value(&ev)) />
                     </div>

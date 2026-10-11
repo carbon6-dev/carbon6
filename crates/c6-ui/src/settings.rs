@@ -81,6 +81,14 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
                 examples=skill_examples
             />
             <ListSetting
+                name="hosts"
+                title="Hosts"
+                noun="host"
+                help="Machines your workers reach over SSH (keys and ~/.ssh/config on the worker; carbon6 never handles SSH keys). Start a session on one by its name; it gets the host's labels (so policies, budgets, routing and memory for env:prod apply). Templates can run on every host with given labels. Check every N minutes to be told when one stops answering (a host notification). See them on the Workers page."
+                fields=HOST_FIELDS
+                examples=host_examples
+            />
+            <ListSetting
                 name="templates"
                 title="Templates"
                 noun="template"
@@ -984,11 +992,43 @@ fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
     ]
 }
 
+const HOST_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. web1", kind: FieldKind::Mono },
+    Field { key: "target", label: "SSH target", placeholder: "user@host[:port] or an ssh_config alias", kind: FieldKind::Mono },
+    Field { key: "worker", label: "Through worker", placeholder: "any online worker", kind: FieldKind::Mono },
+    Field { key: "check_every", label: "Check every (minutes)", placeholder: "only when asked", kind: FieldKind::Mono },
+    Field { key: "labels", label: "Labels", placeholder: "e.g. role:web, env:prod", kind: FieldKind::Labels },
+    Field { key: "description", label: "Description", placeholder: "what it is", kind: FieldKind::Line },
+];
+
+fn host_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let h = |name: &str, target: &str, labels: &[&str], every: &str, description: &str| {
+        let mut v = item(&[("name", name), ("target", target), ("worker", ""), ("check_every", every), ("description", description)]);
+        v["labels"] = serde_json::json!(labels);
+        v
+    };
+    vec![
+        ("Empty", h("", "", &[], "", "")),
+        (
+            "A production web server, checked every 15 minutes",
+            h("web1", "deploy@web1.example.com", &["role:web", "env:prod"], "15", "nginx + app"),
+        ),
+        ("A database server", h("db1", "admin@db1.example.com", &["role:db", "env:prod"], "15", "Postgres primary")),
+        ("A home lab box (ssh_config alias)", h("nas", "nas", &["env:home"], "", "")),
+    ]
+}
+
 const TEMPLATE_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. disk-check", kind: FieldKind::Mono },
     Field { key: "description", label: "Description", placeholder: "what it is for", kind: FieldKind::Line },
     Field { key: "workers", label: "Workers", placeholder: "the online one; or names; * for every online worker", kind: FieldKind::Labels },
     Field { key: "ssh", label: "SSH hosts", placeholder: "none; or user@host, … (one session each)", kind: FieldKind::Labels },
+    Field {
+        key: "hosts",
+        label: "Hosts by label",
+        placeholder: "none; or e.g. role:web, env:prod (or * for all); one session each",
+        kind: FieldKind::Labels,
+    },
     Field { key: "cwd", label: "Folder", placeholder: "scratch workspace (or home on SSH hosts)", kind: FieldKind::Mono },
     Field { key: "connection", label: "Connection", placeholder: "by routing rules", kind: FieldKind::Line },
     Field { key: "model", label: "Model", placeholder: "by routing rules (Settings → Model routing)", kind: FieldKind::Mono },

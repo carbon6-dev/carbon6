@@ -67,6 +67,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/routes", get(get_routes).put(put_routes))
         .route("/api/v1/settings/channels", get(get_channels).put(put_channels))
         .route("/api/v1/settings/prices", get(get_prices).put(put_prices))
+        .route("/api/v1/settings/hosts", get(get_hosts_setting).put(put_hosts))
+        .route("/api/v1/hosts", get(list_hosts))
+        .route("/api/v1/hosts/{name}/check", post(check_host))
         .route("/api/v1/settings/budgets", get(get_budgets).put(put_budgets))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/settings/channels/test", post(test_channel))
@@ -985,6 +988,24 @@ async fn decide_approval(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+async fn get_hosts_setting(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Host>>> {
+    Ok(Json(crate::hosts::hosts(&st).await?))
+}
+
+async fn put_hosts(State(st): State<Arc<HeadState>>, Json(h): Json<Vec<api::Host>>) -> ApiResult<StatusCode> {
+    crate::hosts::check_hosts(&h)?;
+    st.store.set_setting(crate::hosts::HOSTS, &serde_json::to_string(&h).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_hosts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::HostStatus>>> {
+    Ok(Json(crate::hosts::list(&st).await?))
+}
+
+async fn check_host(State(st): State<Arc<HeadState>>, Path(name): Path<String>) -> ApiResult<Json<api::HostCheck>> {
+    Ok(Json(crate::hosts::check_now(&st, &name).await?))
 }
 
 async fn get_prices(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Price>>> {
