@@ -3,7 +3,7 @@
 //! `@daily`, `@weekly`, `@monthly`. As in cron, when both day fields are
 //! restricted a day matches either.
 
-use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Timelike};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Schedule {
@@ -91,16 +91,24 @@ impl Schedule {
 
     /// The next minute after `after` that matches (within a year).
     pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
-        let mut t = after.with_second(0)?.with_nanosecond(0)? + Duration::minutes(1);
+        // Absolute arithmetic: `with_minute` and friends fail on local times
+        // that occur twice when the clocks go back.
+        let mut t =
+            after - Duration::seconds(after.second() as i64) - Duration::nanoseconds(after.nanosecond() as i64) + Duration::minutes(1);
         let end = after + Duration::days(366);
-        while t < end {
+        // A year of whole days and hours is far fewer steps; the cap only
+        // guards against a time zone surprise looping forever.
+        for _ in 0..1_000_000 {
+            if t >= end {
+                break;
+            }
             if !self.months[t.month() as usize] {
                 // Skip to the next day (and on, quickly).
-                t = (t + Duration::days(1)).with_hour(0)?.with_minute(0)?;
+                t = next_day(t)?;
                 continue;
             }
             if !self.hours[t.hour() as usize] {
-                t = (t + Duration::hours(1)).with_minute(0)?;
+                t += Duration::minutes(60 - t.minute() as i64);
                 continue;
             }
             if self.matches(&t) {
@@ -110,6 +118,15 @@ impl Schedule {
         }
         None
     }
+}
+
+/// The first moment of the next calendar day. Not `t + 1 day`: a day can
+/// be 23 or 25 hours long where the clocks change.
+fn next_day(t: DateTime<Local>) -> Option<DateTime<Local>> {
+    let d = t.date_naive().succ_opt()?;
+    // Midnight may not exist (clocks jumping at midnight): the earliest
+    // time that does, within the first hours.
+    (0..4).find_map(|h| Local.from_local_datetime(&d.and_time(NaiveTime::from_hms_opt(h, 0, 0)?)).earliest())
 }
 
 #[cfg(test)]
@@ -136,6 +153,9 @@ mod tests {
         assert_eq!(Schedule::parse("@daily").unwrap().next_after(at(2026, 10, 12, 8, 7)), Some(at(2026, 10, 13, 0, 0)));
         assert!(Schedule::parse("0 9 1 * sun").unwrap().matches(&at(2026, 10, 11, 9, 0)), "either day field");
         assert!(Schedule::parse("30 6 * jan,jul 7").unwrap().matches(&at(2026, 7, 5, 6, 30)), "7 is Sunday");
+        // Across the end of daylight saving time (in zones that have it).
+        assert_eq!(Schedule::parse("0 0 1 1 *").unwrap().next_after(at(2026, 10, 20, 9, 0)), Some(at(2027, 1, 1, 0, 0)));
+        assert_eq!(Schedule::parse("30 2 * * *").unwrap().next_after(at(2026, 10, 31, 23, 0)).map(|t| t.day()), Some(1));
         for bad in ["* * * *", "61 * * * *", "*/0 * * * *", "0 25 * * *", "0 8 * * funday"] {
             assert!(Schedule::parse(bad).is_err(), "{bad}");
         }
