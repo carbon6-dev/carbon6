@@ -66,7 +66,7 @@ async fn backfill(st: &HeadState) -> anyhow::Result<()> {
         .await?;
         let Some(last) = rows.last() else { break };
         (after_session, after_seq) = (last.get("session_id"), last.get("seq"));
-        let mut tx = st.store.pool.begin().await?;
+        let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         for r in &rows {
             let ev = c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
             if let Some(c6_proto::session_event::Kind::Usage(u)) = &ev.kind {

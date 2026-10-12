@@ -743,6 +743,118 @@ pub struct KitDryRun {
     pub update_state: bool,
 }
 
+/// A fact about the systems around the code (environment knowledge).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Fact {
+    pub id: String,
+    pub claim: String,
+    /// The systems it is about (thing keys, e.g. ci:argo, repo:github.com/you/app).
+    pub about: Vec<String>,
+    /// reviewed, verified, observed, inferred, disputed or retired.
+    pub status: String,
+    /// stable (until contradicted) or slow (re-checked after 30 days).
+    pub volatility: String,
+    /// It applies only to sessions with these labels; empty: everywhere.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub conditions: String,
+    /// "X does not apply to Y".
+    #[serde(default)]
+    pub negative: bool,
+    /// A command that re-checks it (exit 0: still true), and where it runs.
+    #[serde(default)]
+    pub check: Option<Probe>,
+    #[serde(default)]
+    pub evidence: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub supports: Vec<String>,
+    #[serde(default)]
+    pub replaced_by: Option<String>,
+    pub valid_from: UnixMs,
+    #[serde(default)]
+    pub valid_to: Option<UnixMs>,
+    #[serde(default)]
+    pub last_verified: Option<UnixMs>,
+    /// Due for a re-check.
+    #[serde(default)]
+    pub due: bool,
+    pub made_by: String,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+/// An action item: something for you to settle when you want to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Todo {
+    pub id: i64,
+    /// confirm, dispute, kit, provide, question or follow_up.
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub detail: String,
+    /// What it is about: facts, things, sessions, kits, links (JSON).
+    #[serde(default)]
+    pub context: serde_json::Value,
+    /// Who raised it: a session, the memex, a kit.
+    pub source: String,
+    /// high, normal or low.
+    pub priority: String,
+    /// open, snoozed, done or dismissed.
+    pub state: String,
+    #[serde(default)]
+    pub snooze_until: Option<UnixMs>,
+    #[serde(default)]
+    pub resolution: String,
+    /// Sessions started to settle it.
+    #[serde(default)]
+    pub sessions: Vec<String>,
+    /// Raised again (grouped) this many times.
+    #[serde(default)]
+    pub count: u32,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+/// `POST /api/v1/todos`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TodoIn {
+    #[serde(default = "todo_kind")]
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub context: serde_json::Value,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub priority: String,
+    /// Items with the same group are one item (raised again: its count).
+    #[serde(default)]
+    pub group: String,
+}
+
+fn todo_kind() -> String {
+    "question".into()
+}
+
+/// `PATCH /api/v1/todos/{id}`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TodoEdit {
+    /// open, snoozed, done or dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snooze_until: Option<UnixMs>,
+}
+
 /// One input the assistant asks for.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1900,9 +2012,11 @@ pub struct SessionMatch {
 
 /// What kinds of items there are. Sessions see the default kinds, plus what
 /// their scope rules add.
-pub const MEMEX_KINDS: [&str; 11] = ["session", "output", "web", "note", "document", "paper", "email", "event", "photo", "video", "spam"];
-/// What every session may search unless a scope rule says more.
-pub const MEMEX_DEFAULT_SCOPE: [&str; 6] = ["session", "output", "web", "note", "document", "paper"];
+pub const MEMEX_KINDS: [&str; 12] =
+    ["session", "output", "web", "note", "document", "paper", "fact", "email", "event", "photo", "video", "spam"];
+/// What every session may search unless a scope rule says more (facts:
+/// environment knowledge, for every session).
+pub const MEMEX_DEFAULT_SCOPE: [&str; 7] = ["session", "output", "web", "note", "document", "paper", "fact"];
 
 /// An item to store (head → memex `memex.ingest`). The same source and
 /// external id again replaces it.

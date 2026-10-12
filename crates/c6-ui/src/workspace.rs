@@ -63,6 +63,7 @@ pub enum View {
     Calendar,
     Contacts,
     Photos,
+    Todos,
 }
 
 /// A place in a session: the transcript element to reveal, the side chats
@@ -122,6 +123,7 @@ impl View {
             View::Calendar => "/calendar".into(),
             View::Contacts => "/contacts".into(),
             View::Photos => "/photos".into(),
+            View::Todos => "/todos".into(),
         }
     }
 
@@ -185,6 +187,7 @@ impl View {
             ["calendar"] => View::Calendar,
             ["contacts"] => View::Contacts,
             ["photos"] => View::Photos,
+            ["todos"] => View::Todos,
             _ => View::Sessions,
         }
     }
@@ -214,6 +217,7 @@ impl View {
             View::Calendar => "Calendar".into(),
             View::Contacts => "Contacts".into(),
             View::Photos => "Photos".into(),
+            View::Todos => "To do".into(),
         }
     }
 
@@ -960,6 +964,7 @@ fn render_view(view: View) -> AnyView {
                     View::Calendar => view! { <crate::calendar::CalendarPage /> }.into_any(),
                     View::Contacts => view! { <crate::contacts::ContactsPage /> }.into_any(),
                     View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
+                    View::Todos => view! { <crate::todos::TodosPage /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>

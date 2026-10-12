@@ -498,7 +498,7 @@ pub async fn events(m: &Memex) -> anyhow::Result<usize> {
             _ => groups.push(vec![r]),
         }
     }
-    let mut tx = m.store.pool.begin().await?;
+    let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM evidence WHERE link_id IN (SELECT id FROM links WHERE made_by = ?)").bind(MADE_BY).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM links WHERE made_by = ?").bind(MADE_BY).execute(&mut *tx).await?;
     tx.commit().await?;

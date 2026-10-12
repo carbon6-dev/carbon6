@@ -8,8 +8,14 @@ use serde_json::{Value, json};
 use crate::{HeadState, bad_request};
 
 /// What a session's tools may ask the memex.
-const SESSION_METHODS: [&str; 15] = [
+const SESSION_METHODS: [&str; 20] = [
     "memex.search",
+    // Environment knowledge.
+    "memex.knowledge.record",
+    "memex.knowledge.verify",
+    "memex.knowledge.set",
+    "memex.knowledge.list",
+    "memex.knowledge.page",
     "memex.get",
     "memex.related",
     "memex.note",
@@ -36,6 +42,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 let kind = params["type"].as_str().unwrap_or_default().to_owned();
                 crate::automations::on_memex_event(st, &kind, &params["data"]).await;
                 Ok(json!({}))
+            }
+            // A disputed fact, for you to settle.
+            "todo.add" => {
+                let t: c6_api::TodoIn = serde_json::from_value(params).map_err(|e| bad_request(format!("{e}")))?;
+                Ok(json!({"id": crate::todos::add(st, &t).await?.id}))
             }
             "notify" => {
                 let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
@@ -70,6 +81,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 Ok(json!({"offered": id.is_some()}))
             }
             "followups" => Ok(json!(crate::followups::for_session(st, &target).await?)),
+            "todo" | "todo_resolve" => crate::todos::from_session(st, &target, what, &params).await,
             other => Err(bad_request(format!("a worker may not call session.{other}"))),
         };
     }

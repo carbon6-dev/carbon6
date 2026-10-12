@@ -47,7 +47,7 @@ impl Store {
         anyhow::ensure!(!it.kind.trim().is_empty() && !it.source.trim().is_empty(), "an item needs a kind and a source");
         let now = c6_core::now_ms();
         let external = if it.external_id.is_empty() { uuid::Uuid::now_v7().to_string() } else { it.external_id.clone() };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<(String, String)> = sqlx::query_as("SELECT id, body FROM items WHERE source = ? AND external_id = ?")
             .bind(&it.source)
             .bind(&external)
@@ -123,7 +123,7 @@ impl Store {
     /// Replaces an item's title and text (a caption, a transcript), with
     /// its passages.
     pub async fn set_text(&self, id: &str, title: &str, text: &str) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("UPDATE items SET title = ?, body = ?, updated_at = ? WHERE id = ?")
             .bind(title)
             .bind(text)
@@ -147,7 +147,7 @@ impl Store {
 
     /// Deletes an item and what derives from it. False: no such item.
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM faces WHERE item_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM media WHERE item_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM vectors WHERE part_id IN (SELECT id FROM parts WHERE item_id = ?)").bind(id).execute(&mut *tx).await?;

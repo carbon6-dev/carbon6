@@ -124,6 +124,10 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/live", get(live))
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
+        .route("/api/v1/todos", get(list_todos).post(add_todo))
+        .route("/api/v1/todos/count", get(count_todos))
+        .route("/api/v1/todos/{id}", get(get_todo).patch(edit_todo))
+        .route("/api/v1/todos/{id}/session", post(todo_session))
         .route("/api/v1/settings/kits", get(get_kits).put(put_kits))
         .route("/api/v1/kits/dry-run", post(kit_dry_run))
         .route("/api/v1/sessions/{id}/followups", get(session_followups))
@@ -1201,7 +1205,7 @@ struct RpcIn {
 /// commitments and graph call the memex through here (you, signed in:
 /// everything is in scope).
 async fn memex_rpc(State(st): State<Arc<HeadState>>, Json(r): Json<RpcIn>) -> ApiResult<Json<serde_json::Value>> {
-    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts."].iter().any(|p| r.method.starts_with(p))
+    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge."].iter().any(|p| r.method.starts_with(p))
         || r.method.starts_with("memex.media.")
         || matches!(
             r.method.as_str(),
@@ -1918,4 +1922,38 @@ async fn stop_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> 
 
 async fn investigate_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({"session_id": crate::followups::investigate_now(&st, id).await?})))
+}
+
+// --- Action items ---------------------------------------------------------------
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct TodoQuery {
+    /// open (default; includes snoozed items now due), snoozed, done or dismissed.
+    #[serde(default)]
+    state: String,
+}
+
+async fn list_todos(State(st): State<Arc<HeadState>>, Query(q): Query<TodoQuery>) -> ApiResult<Json<Vec<api::Todo>>> {
+    Ok(Json(crate::todos::list(&st, &q.state).await?))
+}
+
+async fn add_todo(State(st): State<Arc<HeadState>>, Json(t): Json<api::TodoIn>) -> ApiResult<Json<api::Todo>> {
+    Ok(Json(crate::todos::add(&st, &t).await?))
+}
+
+async fn count_todos(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({"open": crate::todos::open_count(&st).await?})))
+}
+
+async fn get_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Todo>> {
+    Ok(Json(crate::todos::get(&st, id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such action item".into()))?))
+}
+
+async fn edit_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>, Json(e): Json<api::TodoEdit>) -> ApiResult<Json<api::Todo>> {
+    Ok(Json(crate::todos::edit(&st, id, &e).await?))
+}
+
+/// Starts a session that helps you settle the item.
+async fn todo_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::todos::start_session(&st, id).await?))
 }

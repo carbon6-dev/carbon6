@@ -118,7 +118,7 @@ pub async fn backfill(store: &Store) -> anyhow::Result<()> {
     let ids: Vec<String> = sqlx::query("SELECT id FROM sessions").fetch_all(&store.pool).await?.iter().map(|r| r.get("id")).collect();
     let mut events = 0usize;
     for id in &ids {
-        let mut tx = store.pool.begin().await?;
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM search WHERE session_id = ?").bind(id).execute(&mut *tx).await?;
         let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? ORDER BY seq").bind(id).fetch_all(&mut *tx).await?;
         for r in &rows {

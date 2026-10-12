@@ -130,7 +130,7 @@ async fn person_named(store: &Store, name: &str) -> anyhow::Result<Option<String
 /// and `from` is gone.
 pub async fn merge(store: &Store, from: &str, into: &str) -> anyhow::Result<()> {
     anyhow::ensure!(from != into, "a thing cannot merge into itself");
-    let mut tx = store.pool.begin().await?;
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let (name, key): (String, Option<String>) = sqlx::query_as("SELECT name, key FROM things WHERE id = ?")
         .bind(from)
         .fetch_optional(&mut *tx)

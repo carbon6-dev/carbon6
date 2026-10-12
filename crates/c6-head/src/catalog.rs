@@ -11,8 +11,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::{
-    After, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TrailEdit, TrailStepIn, UpdateSession, UsageQuery,
-    WorkflowRunsQuery,
+    After, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TodoQuery, TrailEdit, TrailStepIn, UpdateSession,
+    UsageQuery, WorkflowRunsQuery,
 };
 
 /// What an operation does to carbon6.
@@ -161,6 +161,10 @@ const AREAS: &[(&str, &str)] = &[
     ("hosts", "The SSH host inventory."),
     ("settings", "Tools and context for sessions: MCP servers, skills, commands, agents, hooks, secrets, web search."),
     ("account", "Sign-in: passkeys, signed-in browsers, API tokens, one-time codes."),
+    (
+        "todos",
+        "Action items: things for the user to settle when they want to (facts to confirm, disputes, kits to review, open questions).",
+    ),
 ];
 
 pub fn areas() -> &'static [(&'static str, &'static str)] {
@@ -285,6 +289,14 @@ fn build() -> Vec<Op> {
         op!("trackers.stop", "followthrough", "POST" "/api/v1/trackers/{id}/stop", Write, Input::None, "Stops following a tracker."),
         op!("trackers.investigate", "followthrough", "POST" "/api/v1/trackers/{id}/investigate", Write, Input::None, "Starts an investigation of a tracker (a side chat that explains the failure and proposes a fix on a branch of its own)."),
 
+        // Action items.
+        op!("todos.list", "todos", "GET" "/api/v1/todos", Read, Input::Query(schema::<TodoQuery>), "Action items (open by default), most important first."),
+        op!("todos.count", "todos", "GET" "/api/v1/todos/count", Read, Input::None, "How many action items are open."),
+        op!("todos.get", "todos", "GET" "/api/v1/todos/{id}", Read, Input::None, "An action item with its context.", choices = &[("id", "todos.list")]),
+        op!("todos.add", "todos", "POST" "/api/v1/todos", Write, Input::Body(schema::<api::TodoIn>), "Adds an action item for the user (an open question, something to confirm or follow up)."),
+        op!("todos.edit", "todos", "PATCH" "/api/v1/todos/{id}", Write, Input::Body(schema::<api::TodoEdit>), "Settles (done, with a resolution), snoozes, dismisses or reopens an action item.", choices = &[("id", "todos.list")]),
+        op!("todos.session", "todos", "POST" "/api/v1/todos/{id}/session", Write, Input::None, "Starts a session that helps the user settle an action item, with its context.", choices = &[("id", "todos.list")]),
+
         // Hosts.
         op!("hosts.list", "hosts", "GET" "/api/v1/hosts", Read, Input::None, "Hosts in the inventory with their last check."),
         op!("hosts.check", "hosts", "POST" "/api/v1/hosts/{name}/check", Read, Input::None, "Checks a host now (reachable over SSH, system details).", choices = &[("name", "hosts.list")]),
@@ -345,6 +357,11 @@ fn build() -> Vec<Op> {
         op!(memex "memex.related", "knowledge", "memex.related", Read, r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#, "Things sharing items with a thing."),
         op!(memex "memex.summarize", "knowledge", "memex.summarize", Write, r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#, "Summarizes what the memex knows about a thing (saved as a note)."),
         op!(memex "memex.merge", "knowledge", "memex.merge", Destructive, r#"{"type":"object","required":["from","into"],"properties":{"from":{"type":"string"},"into":{"type":"string"}}}"#, "Merges one thing into another (the first is gone)."),
+        op!(memex "knowledge.list", "knowledge", "memex.knowledge.list", Read, r#"{"type":"object","properties":{"about":{"type":"array","items":{"type":"string"},"description":"thing keys, e.g. ci:argo or repo:github.com/you/app; empty: all"},"status":{"type":"string","enum":["reviewed","verified","observed","inferred","disputed","retired"]},"due":{"type":"boolean","description":"only facts due for a re-check"},"include_retired":{"type":"boolean"}}}"#, "Environment knowledge: facts about systems, with how each is known, where it applies, its check and evidence."),
+        op!(memex "knowledge.get", "knowledge", "memex.knowledge.get", Read, r#"{"type":"object","required":["ids"],"properties":{"ids":{"type":"array","items":{"type":"string"}}}}"#, "Facts by id."),
+        op!(memex "knowledge.page", "knowledge", "memex.knowledge.page", Read, r#"{"type":"object","required":["key"],"properties":{"key":{"type":"string","description":"a system's key, e.g. ci:argo"}}}"#, "A system's page: its summary, facts and procedures."),
+        op!(memex "knowledge.record", "knowledge", "memex.knowledge.record", Write, r#"{"type":"object","required":["claim","about"],"properties":{"claim":{"type":"string"},"about":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["observed","inferred"]},"volatility":{"type":"string","enum":["stable","slow"]},"labels":{"type":"array","items":{"type":"string"}},"conditions":{"type":"string"},"negative":{"type":"boolean"},"check":{"type":"object","properties":{"command":{"type":"string"},"on":{"type":"string"},"worker":{"type":"string"}}},"evidence":{"type":"object","properties":{"command":{"type":"string"},"excerpt":{"type":"string"},"source":{"type":"string"},"where":{"type":"string"}}},"supports":{"type":"array","items":{"type":"string"}},"replaces":{"type":"string"},"contradicts":{"type":"string"}}}"#, "Records a fact about the environment (the same claim again adds evidence)."),
+        op!(memex "knowledge.set", "knowledge", "memex.knowledge.set", Write, r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"status":{"type":"string","enum":["reviewed","observed","inferred","disputed","retired"]},"claim":{"type":"string","description":"a corrected claim (replaces the fact, reviewed)"},"labels":{"type":"array","items":{"type":"string"}},"conditions":{"type":"string"}}}"#, "Settles a fact: confirm (reviewed), correct, retire, or narrow where it applies."),
         op!(memex "google.status", "mail", "memex.google", Read, r#"{"type":"object"}"#, "Google sync state per account (mail, calendars, contacts)."),
         op!(memex "google.sync", "mail", "memex.google_sync", Write, r#"{"type":"object"}"#, "Syncs Google accounts now."),
         op!(memex "mail.threads", "mail", "memex.mail.threads", Read, r#"{"type":"object","properties":{"account":{"type":"string","description":"an account id or address; empty: all"},"view":{"type":"string","description":"inbox (default), needs_reply, waiting, starred, sent, drafts, all, spam, trash, or a Gmail label"},"before":{"type":"integer","description":"ms, for the next page"},"limit":{"type":"integer"}}}"#, "Mail threads in a view (to search mail, use memex.search with kinds email)."),

@@ -30,6 +30,7 @@ pub mod telemetry;
 pub mod templates;
 pub mod terminals;
 pub mod tls;
+pub mod todos;
 pub mod ui_ca;
 pub mod usage;
 mod webauthn;

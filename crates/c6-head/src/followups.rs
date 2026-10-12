@@ -1010,6 +1010,21 @@ pub async fn dry_run(st: &HeadState, req: &api::KitDryRun) -> anyhow::Result<Val
             k.state = if ok { "active" } else { "broken" }.into();
         }
         st.store.set_setting(KITS, &serde_json::to_string(&all)?).await?;
+        if !ok {
+            crate::todos::add(
+                st,
+                &api::TodoIn {
+                    kind: "kit".into(),
+                    title: format!("Kit {} does not work", kit.name),
+                    detail: "Its dry run failed; it is marked broken and does nothing until fixed.".into(),
+                    context: json!({"kits": [kit.name]}),
+                    source: "kits".into(),
+                    priority: "normal".into(),
+                    group: format!("kit:{}", kit.name),
+                },
+            )
+            .await?;
+        }
     }
     Ok(json!({"ok": ok, "reactions": reactions, "trackers": trackers}))
 }

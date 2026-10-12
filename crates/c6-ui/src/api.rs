@@ -695,3 +695,20 @@ pub async fn stop_tracker(id: i64) -> Result<(), String> {
 pub async fn investigate_tracker(id: i64) -> Result<serde_json::Value, String> {
     send_json(Request::post(&format!("/api/v1/trackers/{id}/investigate")), &serde_json::json!({})).await
 }
+
+pub async fn todos(state: String) -> Result<Vec<c6_api::Todo>, String> {
+    json(Request::get(&format!("/api/v1/todos?state={state}")).send().await).await
+}
+
+pub async fn todo_count() -> Result<i64, String> {
+    let v: serde_json::Value = json(Request::get("/api/v1/todos/count").send().await).await?;
+    Ok(v["open"].as_i64().unwrap_or(0))
+}
+
+pub async fn edit_todo(id: i64, body: serde_json::Value) -> Result<c6_api::Todo, String> {
+    send_json(Request::patch(&format!("/api/v1/todos/{id}")), &body).await
+}
+
+pub async fn todo_session(id: i64) -> Result<c6_api::Session, String> {
+    send_json(Request::post(&format!("/api/v1/todos/{id}/session")), &serde_json::json!({})).await
+}

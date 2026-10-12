@@ -1344,11 +1344,19 @@ pub(crate) async fn build_tools(
     // Next steps and trackers (through the head).
     tools.push(Arc::new(c6_tools::Suggest::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Followups::new(profile == ToolProfile::Claude)));
+    // Questions for the user, for later (never stop to ask).
+    tools.push(Arc::new(c6_tools::knowledge::TodoAdd::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::knowledge::TodoResolve::new(profile == ToolProfile::Claude)));
     if spec.memex_tools {
         tools.push(Arc::new(c6_tools::memex::MemexSearch::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexNote::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexTrail::new(profile == ToolProfile::Claude)));
+        // Environment knowledge.
+        tools.push(Arc::new(c6_tools::knowledge::KnowledgeRecord::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::knowledge::KnowledgeVerify::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::knowledge::KnowledgeList::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::knowledge::KnowledgeSet::new(profile == ToolProfile::Claude)));
     }
     let claude = profile == ToolProfile::Claude;
     if spec.memex_mail {

@@ -7,6 +7,7 @@ pub mod browser;
 mod files;
 mod followups;
 pub mod hooks;
+pub mod knowledge;
 pub mod memex;
 pub mod memory;
 pub mod notify;

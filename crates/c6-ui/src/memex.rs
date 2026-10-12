@@ -18,9 +18,10 @@ extern "C" {
     async fn js_read_files(ev: &web_sys::Event) -> Result<JsValue, JsValue>;
 }
 
-const KINDS: [(&str, &str); 10] = [
+const KINDS: [(&str, &str); 11] = [
     ("session", "Sessions"),
     ("note", "Notes"),
+    ("fact", "Facts"),
     ("web", "Web pages"),
     ("output", "Outputs"),
     ("document", "Documents"),
@@ -432,6 +433,7 @@ fn thing_view(t: Value, open: RwSignal<Option<String>>) -> impl IntoView {
             <h3 class="text-xs font-medium uppercase text-zinc-500">"Related"</h3>
             <div class="flex flex-wrap gap-1">{chips(related.iter().map(|p| p[0].clone()).collect::<Vec<_>>(), open)}</div>
         })}
+        <ThingKnowledge label=thing["label"].as_str().unwrap_or_default().to_owned() />
         <crate::understanding::ThingMore key open />
     }
 }
@@ -648,5 +650,36 @@ pub fn MemexSettings() -> impl IntoView {
                 <button class=BUTTON on:click=save>"Save"</button>
             </div>
         </section>
+    }
+}
+
+/// A system's environment knowledge: its page and facts.
+#[component]
+fn ThingKnowledge(label: String) -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let label = StoredValue::new(label);
+    let data = LocalResource::new(move || {
+        tick.track();
+        api::rpc("memex.knowledge.page", serde_json::json!({"key": label.get_value()}))
+    });
+    view! {
+        {move || data.get().and_then(Result::ok).filter(|v| v["facts"].as_array().is_some_and(|f| !f.is_empty())).map(|v| {
+            let page = v["page"].as_str().unwrap_or("").to_owned();
+            let facts: Vec<c6_api::Fact> = serde_json::from_value(v["facts"].clone()).unwrap_or_default();
+            let (current, old): (Vec<_>, Vec<_>) = facts.into_iter().partition(|f| f.valid_to.is_none());
+            view! {
+                <h3 class="text-xs font-medium uppercase text-zinc-500">"What sessions learned"</h3>
+                {(!page.is_empty()).then(|| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&page)></div> })}
+                <ul class="space-y-2">
+                    {current.into_iter().map(|f| view! { <crate::todos::FactRow f on_change=Callback::new(move |()| tick.update(|t| *t += 1)) /> }).collect_view()}
+                </ul>
+                {(!old.is_empty()).then(|| view! {
+                    <details class="text-xs text-zinc-500">
+                        <summary class="cursor-pointer">{format!("{} no longer true", old.len())}</summary>
+                        <ul class="mt-1 space-y-1">{old.into_iter().map(|f| view! { <li class="line-through">{f.claim}</li> }).collect_view()}</ul>
+                    </details>
+                })}
+            }
+        })}
     }
 }

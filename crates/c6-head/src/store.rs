@@ -83,7 +83,7 @@ impl Store {
     }
 
     pub async fn insert_worker(&self, w: &NewWorker<'_>, secret_hash: &str, now: i64) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO workers (id, name, hostname, os, arch, version, cert_serial, enrolled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -295,7 +295,7 @@ pub struct Ingested {
 impl Store {
     /// Creates a session and enqueues its commands atomically.
     pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
              labels, worker_name, ssh_target, subagent_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -456,7 +456,7 @@ impl Store {
         use c6_proto::session_event::Kind;
         use prost::Message;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ? AND worker_id = ?")
             .bind(session_id)
             .bind(worker_id.to_string())
@@ -679,7 +679,7 @@ impl Store {
     /// Marks a pending command rejected. A rejected `Create` fails the
     /// session and everything queued behind it. Returns the session id.
     pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(row) =
             sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, text")
                 .bind(reason)
@@ -720,7 +720,7 @@ impl Store {
 
     /// Retires a rejected input and queues a restore followed by a copy of it.
     pub async fn replace_with_restore(&self, old_id: &str, restore: &NewCommand<'_>, input: &NewCommand<'_>) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(old_id).execute(&mut *tx).await?;
         insert_command(&mut tx, restore).await?;
         insert_command(&mut tx, input).await?;

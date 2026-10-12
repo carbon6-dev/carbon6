@@ -250,10 +250,13 @@ pub fn spawn(m: std::sync::Arc<Memex>) {
                 suggested = Some(std::time::Instant::now());
             }
             let worked = m.link.is_connected()
-                && step(&m).await.unwrap_or_else(|e| {
+                && (step(&m).await.unwrap_or_else(|e| {
                     warn!("understanding: {e:#}");
                     false
-                });
+                }) || crate::knowledge::page_step(&m).await.unwrap_or_else(|e| {
+                    warn!("system pages: {e:#}");
+                    false
+                }));
             if worked {
                 done += 1;
                 if done.is_multiple_of(100) {

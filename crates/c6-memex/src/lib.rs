@@ -9,6 +9,7 @@ pub mod docs;
 pub mod embed;
 pub mod faces;
 pub mod google;
+pub mod knowledge;
 pub mod llm;
 pub mod mail;
 pub mod media;
@@ -729,6 +730,20 @@ impl Memex {
                 Ok(json!(review::graph(&self.store, params["id"].as_str().unwrap_or_default(), &allowed, limit).await?))
             }
             "memex.months" => Ok(review::histogram(&self.store, params["id"].as_str().unwrap_or_default(), &allowed).await?),
+            "memex.knowledge.record" => knowledge::record(self, &params).await,
+            "memex.knowledge.verify" => knowledge::verify(self, &params).await,
+            "memex.knowledge.set" => knowledge::set(self, &params).await,
+            "memex.knowledge.list" => knowledge::list(self, &params).await,
+            "memex.knowledge.get" => {
+                let mut out = Vec::new();
+                for id in params["ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                    if let Some(f) = knowledge::get(self, id).await? {
+                        out.push(f);
+                    }
+                }
+                Ok(json!(out))
+            }
+            "memex.knowledge.page" => knowledge::page(self, params["key"].as_str().or(params["id"].as_str()).unwrap_or_default()).await,
             "memex.reload" => {
                 self.reload.notify_one();
                 Ok(json!({}))
@@ -951,6 +966,22 @@ impl Memex {
             }
             if allowed.iter().any(|k| k == "session") {
                 recent.extend(self.store.about(Some(t), &["session".to_owned()], 5).await?);
+            }
+        }
+        // Environment knowledge: facts about these things and the systems
+        // they touch, with how each is known and where it applies.
+        if allowed.iter().any(|k| k == "fact") {
+            let facts = knowledge::for_brief(self, &names, &labels, 30).await.unwrap_or_default();
+            if !facts.is_empty() {
+                let now = c6_core::now_ms();
+                let lines: Vec<String> = facts.iter().map(|f| knowledge::brief_line(f, now)).collect();
+                sections.push(format!(
+                    "## Environment knowledge\nWhat earlier sessions learned about the systems around this work. Each fact says how it is known \
+(reviewed by the user, verified by a check, observed once, inferred) and where it applies; facts marked only for other labels do not \
+apply here. Rely on reviewed and verified facts; re-check observed or inferred ones before acting on them. Record what you learn with \
+knowledge_record and re-checks with knowledge_verify; never stop to ask the user about it (todo_add raises a question for later).\n{}",
+                    lines.join("\n")
+                ));
             }
         }
         let mut seen = std::collections::HashSet::new();

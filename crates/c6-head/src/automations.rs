@@ -238,7 +238,7 @@ pub async fn rotate(st: &HeadState, id: &str) -> anyhow::Result<api::Automation>
 }
 
 pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
-    let mut tx = st.store.pool.begin().await?;
+    let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let done = sqlx::query("DELETE FROM automations WHERE id = ?").bind(id).execute(&mut *tx).await?;
     if done.rows_affected() == 0 {
         return Err(not_found("no such automation"));
@@ -299,7 +299,7 @@ pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &st
     }
     // The run, and its sessions (whose first turns decide how it went).
     let started = now_ms();
-    let mut tx = st.store.pool.begin().await?;
+    let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let (run_id, running) = match &result {
         Ok(r) => (r.run_id.clone(), workflow || !r.sessions.is_empty()),
         Err(_) => (uuid::Uuid::now_v7().simple().to_string()[24..].to_owned(), false),
