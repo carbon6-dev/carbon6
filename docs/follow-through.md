@@ -49,9 +49,14 @@ Its definition is:
   - a final outcome: `succeeded`, `failed` or `cancelled`.
 - **Display:** one line ("CI: running · build ✓ · test 4/9") and a link.
 - **Interval** and **give-up time**.
-- **On the end:** notify; suggest a next step; for a failure, open an **investigation** in the tracker's thread. The investigating agent reads the logs (with the probe's means) and reports. It does not change code unless you ask.
+- **On the end:** notify; suggest a next step; for a failure, open an **investigation** in the tracker's thread. The investigating agent:
+  - reads the logs (with the probe's means) and explains the cause;
+  - **proposes a fix**: it makes the change on a new branch off the failing commit (`fix/<branch>-<sha>`), commits it there, and shows the diff;
+  - does not push. It offers next steps to push the fix branch (and open a PR), or to apply the change to your branch.
 
 The main agent can read every tracker's state ("CI for `abc123` failed in `test`"). Tracker updates are not added to the main conversation's context unless the agent asks for them or the tracker ends.
+
+**Every observation a tracker makes is kept, like sessions**: each change of phase or progress, with its time and the probe's output. A tracker's thread can be read back in full at any time, and its history is what "this step often fails" patterns are learned from (§6.4).
 
 ## 4. Project kits
 
@@ -147,7 +152,7 @@ The agent that records a fact assigns its volatility; curation can adjust it.
 
 - **`stable`:** structural facts that change only when someone redesigns something, such as which CI system a repo uses or how runs are labeled. They are trusted until contradicted, and re-checked opportunistically when they are used.
 - **`slow`:** addresses, versions, credential names, which worker reaches what. They become due for a re-check after 30 days.
-- **`volatile`:** current states, such as "CI is failing" or "the cluster is degraded". These are not facts: trackers and sessions keep them as observations, and only their patterns become facts ("the `e2e` step often fails on Mondays").
+- **`volatile`:** current states, such as "CI is failing" or "the cluster is degraded". These are not facts: trackers and sessions keep them as observations (forever, like sessions), and only their patterns become facts ("the `e2e` step often fails on Mondays").
 
 Any fact with a **check** (the command that proves it) is re-checked by the next session that relies on it once it is due, and that session records the result. A fact without a check stays at its status, and ages visibly in briefs.
 
@@ -210,7 +215,8 @@ Agents never wait on action items. They work with what they know, with its statu
    - self-repair.
 4. **Push:** webhook-fed trackers, when CI can reach carbon6.
 
-## 9. Open questions
+## 9. Settled since
 
-- Should investigations on CI failure ever propose a fix as a branch, or always only a report?
-- Retention for observations kept by trackers (volatile states): how long?
+- Investigations propose fixes, on a branch of their own, without pushing (§3).
+- Tracker observations are kept forever, like sessions (§3).
+- Kits that only read, suggest and notify switch on by themselves after a dry run (§4); setup runs once per repo automatically (§5).
