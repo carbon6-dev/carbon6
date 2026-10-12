@@ -210,7 +210,7 @@ where
 /// Plain HTTP when HTTPS is on: redirect, except the OAuth callback and
 /// the CA download.
 async fn to_https(State(base): State<Arc<String>>, req: Request, next: Next) -> Response {
-    if matches!(req.uri().path(), "/auth/callback" | "/ca.pem" | "/ca.crt" | "/ca.mobileconfig") {
+    if matches!(req.uri().path(), "/callback" | "/ca.pem" | "/ca.crt" | "/ca.mobileconfig") {
         return next.run(req).await;
     }
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
@@ -267,7 +267,7 @@ mod tests {
         let r = plain.get(format!("http://127.0.0.1:{port}/sessions/x?y=1")).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(r.headers()["location"], format!("https://localhost:{port}/sessions/x?y=1").as_str());
-        let r = plain.get(format!("http://127.0.0.1:{port}/auth/callback?code=x&state=y")).send().await.unwrap();
+        let r = plain.get(format!("http://127.0.0.1:{port}/callback?code=x&state=y")).send().await.unwrap();
         assert_ne!(r.status(), StatusCode::PERMANENT_REDIRECT);
         head.shutdown().await.unwrap();
     }

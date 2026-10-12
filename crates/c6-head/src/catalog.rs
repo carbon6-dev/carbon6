@@ -377,7 +377,7 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str)] = &[
     ("GET", "/api/v1/mail/attachment", "a file download"),
     ("POST", "/api/v1/memex/rpc", "the memex's methods are operations of their own"),
     ("POST", "/api/v1/webhooks/{id}/{token}", "called by other systems, with its own token"),
-    ("GET", "/auth/callback", "the ChatGPT sign-in redirect"),
+    ("GET", "/callback", "the ChatGPT sign-in redirect"),
     ("GET", "/auth/google/callback", "the Google sign-in redirect"),
     ("GET", "/ca.pem", "a certificate download"),
     ("GET", "/ca.crt", "a certificate download"),

@@ -521,7 +521,7 @@ fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                             "fails to load: copy its full address and paste it below."
                         </p>
                         <div class="flex gap-2">
-                            <input class=format!("{INPUT} font-mono text-xs") placeholder="http://127.0.0.1:…/auth/callback?code=…"
+                            <input class=format!("{INPUT} font-mono text-xs") placeholder="http://127.0.0.1:…/callback?code=…"
                                 prop:value=move || callback.get() on:input=move |ev| callback.set(event_target_value(&ev)) />
                             <button class=BUTTON disabled=move || pending.get() on:click=complete>"Finish"</button>
                         </div>

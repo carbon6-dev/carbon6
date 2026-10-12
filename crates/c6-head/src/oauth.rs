@@ -26,6 +26,10 @@ const SCOPES: &str = "openid profile email offline_access resource.invoke chatgp
 const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
 /// First-time registration entrypoint; the callback returns the real id.
 const DYNAMIC_CLIENT: &str = "dynamic_agent_client";
+/// The name OpenAI shows for carbon6 on first registration.
+const AGENT_NAME: &str = "carbon6";
+/// The loopback redirect's path (fixed by OpenAI; only the port varies).
+pub const CALLBACK_PATH: &str = "/callback";
 const PENDING_TTL_MS: i64 = 15 * 60 * 1000;
 /// Refresh this long before expiry.
 const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
@@ -74,17 +78,26 @@ fn random_b64(n: usize) -> String {
 
 impl OAuth {
     /// Starts a sign-in and returns the URL to open. `client_id` is an id
-    /// issued by an earlier sign-in, if any.
-    pub fn start(&self, name: &str, ui_port: u16, client_id: Option<String>) -> String {
+    /// issued by an earlier sign-in, if any; `host_id` is this head's
+    /// stable `ext_agent_host_id`.
+    pub fn start(&self, name: &str, ui_port: u16, client_id: Option<String>, host_id: &str) -> String {
         let verifier = random_b64(64);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_b64(24);
         let nonce = random_b64(24);
-        let redirect_uri = format!("http://127.0.0.1:{ui_port}/auth/callback");
+        let redirect_uri = format!("http://127.0.0.1:{ui_port}{CALLBACK_PATH}");
         let client_id = client_id.unwrap_or_else(|| DYNAMIC_CLIENT.to_owned());
         let mut url = url::Url::parse(AUTHORIZE_URL).expect("valid URL");
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("client_id", &client_id);
+            // The app's name, on first registration only.
+            if client_id == DYNAMIC_CLIENT {
+                q.append_pair("agent_name_hint", AGENT_NAME);
+            }
+            q.append_pair("ext_agent_host_id", host_id);
+        }
         url.query_pairs_mut()
-            .append_pair("client_id", &client_id)
             .append_pair("response_type", "code")
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("scope", SCOPES)
@@ -196,10 +209,13 @@ mod tests {
     #[test]
     fn start_builds_pkce_url() {
         let o = OAuth::default();
-        let url = url::Url::parse(&o.start("me", 7700, None)).unwrap();
+        let url = url::Url::parse(&o.start("me", 7700, None, "urn:uuid:5f0c")).unwrap();
         let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(q["client_id"], "dynamic_agent_client");
-        assert_eq!(q["redirect_uri"], "http://127.0.0.1:7700/auth/callback");
+        assert_eq!(q["agent_name_hint"], "carbon6");
+        assert_eq!(q["ext_agent_host_id"], "urn:uuid:5f0c");
+        assert_eq!(q["redirect_uri"], "http://127.0.0.1:7700/callback");
+        assert_eq!(q["resource"], "https://api.openai.com/v1");
         assert_eq!(q["code_challenge_method"], "S256");
         assert!(q["scope"].contains("chatgpt.tokens.use.direct"));
         let p = o.pending.lock().unwrap();
@@ -207,12 +223,22 @@ mod tests {
         assert_eq!(URL_SAFE_NO_PAD.encode(Sha256::digest(pending.verifier.as_bytes())), q["code_challenge"]);
     }
 
+    #[test]
+    fn reauth_has_no_name_hint() {
+        let o = OAuth::default();
+        let url = url::Url::parse(&o.start("me", 7700, Some("oaiapp_x".into()), "urn:uuid:5f0c")).unwrap();
+        let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "oaiapp_x");
+        assert!(!q.contains_key("agent_name_hint"));
+        assert_eq!(q["ext_agent_host_id"], "urn:uuid:5f0c");
+    }
+
     #[tokio::test]
     async fn complete_rejects_unknown_state_and_errors() {
         let o = OAuth::default();
         c6_llm::install_crypto_provider();
         let http = reqwest::Client::new();
-        let e = o.complete(&http, "http://127.0.0.1:7700/auth/callback?code=x&state=nope").await.err().unwrap();
+        let e = o.complete(&http, "http://127.0.0.1:7700/callback?code=x&state=nope").await.err().unwrap();
         assert!(e.to_string().contains("unknown or expired"));
         let e = o.complete(&http, "?error=access_denied&error_description=no").await.err().unwrap();
         assert!(e.to_string().contains("access_denied"));

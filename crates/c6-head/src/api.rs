@@ -27,7 +27,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/{id}/models", get(connection_models))
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
-        .route("/auth/callback", get(chatgpt_callback))
+        .route("/callback", get(chatgpt_callback))
         .route("/auth/google/callback", get(crate::google::callback))
         .route("/api/v1/google/client", get(get_google_client).put(put_google_client))
         .route("/api/v1/google/connect", post(google_connect))
@@ -331,7 +331,20 @@ async fn chatgpt_start(State(st): State<Arc<HeadState>>, Json(req): Json<api::St
             break;
         }
     }
-    Ok(Json(api::ChatGptSignIn { authorize_url: st.oauth.start(&name, st.ui_port, client_id) }))
+    let host_id = chatgpt_host_id(&st).await?;
+    Ok(Json(api::ChatGptSignIn { authorize_url: st.oauth.start(&name, st.ui_port, client_id, &host_id) }))
+}
+
+/// This head's `ext_agent_host_id` for ChatGPT sign-in: made once, then kept
+/// (OpenAI requires it to stay the same across sign-ins and restarts).
+async fn chatgpt_host_id(st: &HeadState) -> anyhow::Result<String> {
+    const KEY: &str = "chatgpt_host_id";
+    if let Some(id) = st.store.setting(KEY).await?.filter(|s| !s.is_empty()) {
+        return Ok(id);
+    }
+    let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    st.store.set_setting(KEY, &id).await?;
+    Ok(id)
 }
 
 async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::Connection> {

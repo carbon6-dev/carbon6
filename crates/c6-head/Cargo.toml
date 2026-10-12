@@ -49,7 +49,7 @@ tonic = { version = "0.14.6", features = ["tls-ring"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 url = "2.5.8"
-uuid = { version = "1.28.0", features = ["v7", "serde"] }
+uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 x509-parser = "0.18.1"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
 schemars = "1.2.2"
