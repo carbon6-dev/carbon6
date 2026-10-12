@@ -639,3 +639,25 @@ pub async fn decide(id: String, call_id: String, allow: bool) -> Result<(), Stri
         .await;
     empty(resp).await
 }
+
+/// Asks the assistant (a new conversation).
+pub async fn ask_assistant(prompt: String, context: String) -> Result<c6_api::Session, String> {
+    send_json(Request::post("/api/v1/assistant"), &c6_api::AskAssistant { prompt, context }).await
+}
+
+/// Your answers to the assistant's question.
+pub async fn answer(
+    id: String,
+    call_id: String,
+    values: serde_json::Map<String, serde_json::Value>,
+    cancelled: bool,
+) -> Result<(), String> {
+    empty(
+        Request::post(&format!("/api/v1/sessions/{id}/answers/{call_id}"))
+            .json(&c6_api::AnswerIn { values, cancelled })
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}

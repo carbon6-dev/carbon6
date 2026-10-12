@@ -234,6 +234,8 @@ impl SessionManager {
                 }
                 Ok(())
             }
+            // Questions are the head's assistant's; worker sessions ask none.
+            Some(session_command::Kind::Answer(_)) => Ok(()),
             Some(session_command::Kind::Approve(a)) => {
                 if let Some(actor) = self.actors.lock().unwrap().get(&cmd.session_id) {
                     let _ = actor.send(ActorMsg::Decide { call_id: a.call_id, allow: a.allow });

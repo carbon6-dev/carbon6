@@ -154,6 +154,7 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             <WorkflowRunsPanel />
             <AutomationsSetting />
             <crate::mail::GoogleSettings />
+            <crate::assistant::AssistantSettings />
             <crate::memex::MemexSettings />
             <ListSetting
                 name="memex_folders"

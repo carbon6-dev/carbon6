@@ -55,7 +55,7 @@ impl LiveHub {
         self.channels.lock().unwrap().entry(session_id.to_owned()).or_insert_with(|| broadcast::channel(1024).0).subscribe()
     }
 
-    fn publish(&self, session_id: &str, msg: api::StreamMsg) {
+    pub(crate) fn publish(&self, session_id: &str, msg: api::StreamMsg) {
         let mut channels = self.channels.lock().unwrap();
         if let Some(tx) = channels.get(session_id)
             && tx.send(msg).is_err()
@@ -70,6 +70,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     let worker = st.store.worker(worker_id).await?.ok_or_else(|| bad_request("no such worker"))?;
     if worker.revoked_at.is_some() {
         return Err(bad_request("worker is revoked"));
+    }
+    if worker.role == "head" {
+        return Err(bad_request("that is the head itself; ask the assistant instead (POST /api/v1/assistant)"));
     }
     if worker.role == "memex" {
         return Err(bad_request(format!("{} is the memex, which runs no sessions; pick a worker", worker.name)));
@@ -156,6 +159,68 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     ));
     spec.memex_brief = crate::memex::brief(st, &brief_labels, prompt.unwrap_or("")).await;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
+}
+
+/// A conversation with the assistant (it runs in the head).
+pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow::Result<api::Session> {
+    let prompt = req.prompt.trim();
+    if prompt.is_empty() {
+        return Err(bad_request("ask something"));
+    }
+    let head_id = st.assistant.head_id().ok_or_else(|| bad_request("the assistant is starting; try again"))?;
+    let (connection_id, model) = crate::assistant::model(st).await?;
+    let connection = st.store.connection(&connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    if connection.kind == "claude_code" {
+        return Err(bad_request(
+            "the assistant calls models directly: choose an API connection for it (Settings → Assistant), not Claude Code",
+        ));
+    }
+    let labels = vec![crate::assistant::LABEL.to_owned()];
+    if let Some(why) = crate::usage::blocked(st, &labels).await? {
+        return Err(bad_request(format!("not started: {why}")));
+    }
+    let now = now_ms();
+    let row = SessionRow {
+        id: Uuid::now_v7().to_string(),
+        worker_id: head_id.to_string(),
+        title: default_title(Some(prompt)),
+        cwd: String::new(),
+        connection_id: connection_id.clone(),
+        model: model.clone(),
+        status: "starting".into(),
+        error: None,
+        effort: None,
+        parent_id: None,
+        parent_call_id: None,
+        fork_seq: None,
+        created_at: now,
+        updated_at: now,
+        last_seq: 0,
+        archived: 0,
+        labels: serde_json::to_string(&labels)?,
+        worker_name: "head".into(),
+        repo: String::new(),
+        folder: String::new(),
+        home: String::new(),
+        ssh_target: String::new(),
+        awaiting: 0,
+        subagent_model: String::new(),
+    };
+    let spec = CreateSession {
+        model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
+        base_prompt: crate::assistant::prompt(&req.context),
+        labels,
+        ..Default::default()
+    };
+    let session = insert(st, row, spec, Some((prompt, Vec::new()))).await?;
+    crate::assistant::started(&session.id);
+    Ok(session)
+}
+
+/// The connection and model a new session with these labels gets.
+pub async fn route_for(st: &HeadState, connection: &str, model: &str, labels: &[String]) -> anyhow::Result<(String, String)> {
+    let r = route(st, connection, model, labels).await?;
+    Ok((r.connection, r.model))
 }
 
 /// A side chat on `parent_id`, branching after event `anchor_seq`.

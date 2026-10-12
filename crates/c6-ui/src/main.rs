@@ -2,6 +2,7 @@
 
 mod activity;
 mod api;
+mod assistant;
 mod auth;
 mod calendar;
 mod contacts;
@@ -99,6 +100,7 @@ fn Main() -> impl IntoView {
                     <NavLink to=View::Settings { note: None } label="Settings" />
                 </nav>
                 <span class="flex-1"></span>
+                <assistant::AskButton />
                 <span class="hidden md:contents"><search::SearchBox /></span>
                 {move || (tiles() < workspace::MAX_TILES).then(|| view! {
                     <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 md:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"

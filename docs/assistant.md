@@ -93,7 +93,45 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
    - suggested next steps ("this worker is offline: re-enroll?");
    - `c6 <op>` generated from the catalog.
 
-## 8. Open questions
+## 8. As built
+
+- **Code:**
+  - `c6-head/src/catalog.rs` holds the operations: every HTTP route the UI uses, plus the memex methods it calls.
+  - `c6-head/src/assistant.rs` holds the head's worker connection, the conversation actors and the tools.
+- **The head's own worker:** a `workers` row with the role `head`.
+  - It is attached to the registry in-process and hidden from the worker list.
+  - It cannot be revoked, deleted or used for ordinary sessions.
+  - Its conversations' commands go through the normal command queue, and their events go through `sessions::ingest`.
+  - A conversation's actor rebuilds its state from the log after a restart.
+  - Requests for files, git or terminals on it get an error right away.
+- **`c6_call` runs operations as you**:
+  - HTTP operations go through the head's own router, with an in-process `InternalCall` marker that the sign-in check accepts. Outside requests cannot set it.
+  - Memex operations go through `memex::call` with `made_by: assistant`.
+- **Asking first:**
+  - before destructive operations;
+  - before a list replacement that drops entries (compared by name or id with the current list);
+  - when one of your policies matches `c6_call` and its input (`ask`). A `deny` refuses the call.
+  - Approvals are ordinary `Approval` events, decided through the existing endpoint.
+- **Questions:**
+  - The question is a `Question` event (asked, answered, cancelled); your answer is an `Answer` command (`POST /api/v1/sessions/{id}/answers/{call_id}`).
+  - Secret fields come back to the model as placeholders. `c6_call` replaces them with the value.
+  - The log records `[secret]`.
+- **Secret outputs:**
+  - The secret is an ephemeral `SecretCard` on the session's live stream. It is shown while the conversation is open and is never stored.
+  - The tool result says `[shown to the user]`.
+- **API:**
+  - `POST /api/v1/assistant` (prompt and page context);
+  - `GET`/`PUT /api/v1/settings/assistant`;
+  - `GET /api/v1/catalog` and `POST /api/v1/catalog/call` (for the CLI: destructive operations need `confirmed`).
+- **CLI:** `c6 ops [words]` and `c6 op <name> key=value…`.
+- **UI:**
+  - ✦ Ask in the header (⌘J), with the focused column as context;
+  - question forms;
+  - secret cards;
+  - Settings → Assistant.
+- **Not built:** the assistant does not wait for the sessions it starts (it reports that it started them).
+
+## 9. Open questions
 
 - Should the assistant be able to start ordinary sessions on workers and follow them (for example "run the tests in proj X and tell me")? It can through the ops; the question is whether it should wait for results in the same conversation.
 - Voice input on the phone.

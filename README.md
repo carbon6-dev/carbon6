@@ -73,7 +73,27 @@ c6 login https://head.example:7700 --token c6_… --ca carbon6-ca.pem   # --ca o
 
 - **`c6 run "fix the failing test"`** starts a session in the current folder on the only online worker (or `--worker`, `-C <dir>`, `-c <connection>`, `-m <model>`; the model defaults to your latest session's). It prints the reply as the agent works, with tool calls on stderr, and exits 0 when the turn completes, 1 when it fails, or 130 when interrupted (Ctrl-C interrupts it). The prompt can come from stdin, and `--json` prints events as JSON lines.
 - **`c6 send <id> "…"`** continues a session (a unique id prefix is enough). Also: `c6 wait`, `c6 show` (Markdown), `c6 stop`, `c6 sessions`, `c6 search` and `c6 workers`.
+- **`c6 ops [words]`** finds operations, meaning everything you can do in carbon6 (with no words, it lists the areas; with an operation's name, it shows its input).
+- **`c6 op <name> key=value…`** runs one and prints the result as JSON, for example `c6 op workers.enrollments.create body='{"name":"build-1"}'` or `c6 op connections.models id=<id>`. Destructive operations ask first, or skip the question with `--yes`.
 - **API tokens** reach the whole API except sign-in management. Revoke them in Settings. `C6_URL`, `C6_TOKEN` and `C6_CA` override the saved login.
+
+### The assistant
+
+**✦ Ask** in the header (⌘J) asks carbon6 to do anything you can do in the UI, or to explain your setup. For example:
+
+- "What can I do in carbon6?"
+- "Which models are set up for vision?"
+- "Create an enrollment token for a new worker"
+
+How it works:
+
+- **It runs in the head**, so it works before any worker is attached.
+- **It finds operations** in a catalog of everything the UI does. A test keeps that catalog complete.
+- **It asks for missing details with a form** in the conversation, with choices from your actual workers, connections and sessions.
+- **Secrets never pass through the model.** Tokens and codes it creates are shown only to you, in a card. Secrets you give it (API keys) stay out of the model too.
+- **It waits for your approval before anything destructive**, such as deleting, revoking, sending mail, or replacing a list with fewer entries.
+- **Its model is set under Settings → Assistant.** Its conversations have the label `assistant`, so routes, policies and budgets for that label apply.
+- **The design is in [docs/assistant.md](docs/assistant.md).**
 
 ### Configuration
 

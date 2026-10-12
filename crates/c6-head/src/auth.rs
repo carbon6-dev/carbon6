@@ -330,6 +330,10 @@ const PUBLIC: [&str; 6] = [
 ];
 
 pub async fn require(State(st): State<Arc<HeadState>>, req: Request, next: Next) -> Response {
+    // The head calling itself (the assistant, as you).
+    if req.extensions().get::<crate::assistant::InternalCall>().is_some() {
+        return next.run(req).await;
+    }
     let path = req.uri().path();
     // Webhooks carry their own credential (the token in the URL).
     if !st.auth.required || !path.starts_with("/api/") || PUBLIC.contains(&path) || path.starts_with("/api/v1/webhooks/") {

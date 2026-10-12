@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub type UnixMs = i64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     Online,
@@ -17,6 +18,7 @@ pub enum WorkerStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Worker {
     pub id: Uuid,
     pub name: String,
@@ -39,12 +41,14 @@ pub struct Worker {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateEnrollment {
     /// Display name for the worker; defaults to its hostname.
     pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Enrollment {
     pub token: String,
     pub expires_at: UnixMs,
@@ -52,6 +56,7 @@ pub struct Enrollment {
 
 /// Messages on `WS /api/v1/live`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveEvent {
     /// Full fleet snapshot; sent on connect and whenever anything changes.
@@ -63,6 +68,7 @@ pub enum LiveEvent {
 // --- LLM connections --------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Connection {
     pub id: String,
     pub name: String,
@@ -78,6 +84,7 @@ pub struct Connection {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateConnection {
     /// `openai_compat` (default), `openai`, `anthropic`, or `claude_code`
     /// (runs the worker's own signed-in Claude Code). ChatGPT
@@ -93,6 +100,7 @@ pub struct CreateConnection {
 // --- Sessions ---------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// Created on the head; the worker has not started it yet.
@@ -104,6 +112,7 @@ pub enum SessionStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Session {
     pub id: String,
     pub worker_id: Uuid,
@@ -144,6 +153,7 @@ pub struct Session {
 /// A side chat: a new session that branches from `anchor_seq` of a session
 /// (with everything up to there as context) on the same worker.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateSideChat {
     pub anchor_seq: u64,
     pub connection_id: String,
@@ -154,6 +164,7 @@ pub struct CreateSideChat {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateSession {
     pub worker_id: Uuid,
     pub cwd: String,
@@ -187,23 +198,27 @@ pub struct CreateSession {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StartChatGptSignIn {
     pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChatGptSignIn {
     /// Open this in a browser and approve.
     pub authorize_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CompleteChatGptSignIn {
     /// The address the browser landed on after approving.
     pub callback_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SendMessage {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -219,6 +234,7 @@ pub struct SendMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentInfo {
     pub name: String,
     pub mime: String,
@@ -227,6 +243,7 @@ pub struct AttachmentInfo {
 
 /// An image or file sent with a message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentUpload {
     pub name: String,
     /// image/png, image/jpeg, image/gif, image/webp, or a text type.
@@ -237,6 +254,7 @@ pub struct AttachmentUpload {
 
 /// `POST /api/v1/sessions/{id}/rewind`
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RewindRequest {
     /// The user message to rewind to before (its event seq).
     pub to_seq: u64,
@@ -247,6 +265,7 @@ pub struct RewindRequest {
 
 /// Input accepted by the head but not yet recorded by the worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QueuedInput {
     pub command_id: String,
     pub text: String,
@@ -256,6 +275,7 @@ pub struct QueuedInput {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionDetail {
     pub session: Session,
     pub worker_name: String,
@@ -264,6 +284,7 @@ pub struct SessionDetail {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Event {
     pub seq: u64,
     pub ts: UnixMs,
@@ -272,6 +293,7 @@ pub struct Event {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     Started {
@@ -397,6 +419,17 @@ pub enum EventKind {
         scope: String,
         text: String,
     },
+    /// The assistant asked you for inputs (a form), and what became of it.
+    Question {
+        call_id: String,
+        title: String,
+        fields: Vec<QuestionField>,
+        /// "asked", "answered" or "cancelled".
+        state: String,
+        /// Your answers (secret ones as "[secret]").
+        #[serde(default)]
+        answer: serde_json::Value,
+    },
     /// The agent sent you a notification.
     Notice {
         title: String,
@@ -414,6 +447,7 @@ pub enum EventKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     /// A tool the provider ran itself (e.g. web search), for display.
@@ -434,6 +468,7 @@ pub enum ContentBlock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TurnEndReason {
     Completed,
@@ -443,8 +478,83 @@ pub enum TurnEndReason {
     Unknown,
 }
 
+/// One input the assistant asks for.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QuestionField {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    /// "text", "longtext", "number", "boolean", "secret" or "choice".
+    #[serde(default = "text_field")]
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<Choice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+fn text_field() -> String {
+    "text".into()
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Choice {
+    pub value: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// `POST /api/v1/sessions/{id}/answers/{call_id}`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AnswerIn {
+    #[serde(default)]
+    pub values: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+/// `POST /api/v1/assistant`: a question for the assistant.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AskAssistant {
+    pub prompt: String,
+    /// Where you are in the UI ("Settings → Memex", "worker build-1").
+    #[serde(default)]
+    pub context: String,
+}
+
+/// `GET`/`PUT /api/v1/settings/assistant`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AssistantSettings {
+    /// The assistant's model; none: the routes for the label `assistant`,
+    /// else the first connection's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<MemexModel>,
+}
+
+/// `POST /api/v1/catalog/call` (the CLI).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CatalogCall {
+    pub op: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+    /// Destructive operations need this (the CLI asks you first).
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
 /// Messages on `WS /api/v1/sessions/{id}/stream`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamMsg {
     /// A durable event, in seq order with no gaps.
@@ -467,6 +577,14 @@ pub enum StreamMsg {
     Activity {
         running: bool,
     },
+    /// A secret an operation returned (a token, a code), for you only:
+    /// shown live, never logged or given to the model.
+    Secret {
+        call_id: String,
+        title: String,
+        value: String,
+        note: String,
+    },
     /// Current queued inputs, sent whenever they change.
     Queue {
         queued: Vec<QueuedInput>,
@@ -474,6 +592,7 @@ pub enum StreamMsg {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiError {
     pub error: String,
 }
@@ -482,6 +601,7 @@ pub struct ApiError {
 
 /// `GET /api/v1/auth/status`
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuthStatus {
     pub authenticated: bool,
     /// The head requires sign-in (`auth = true`, the default).
@@ -499,12 +619,14 @@ pub struct AuthStatus {
 
 /// `POST /api/v1/auth/link`: redeem a one-time login link.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RedeemLink {
     pub token: String,
 }
 
 /// `POST /api/v1/auth/codes`: a one-time code for signing in another device.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LoginCode {
     /// e.g. "K7QM-2XRD"
     pub code: String,
@@ -513,12 +635,14 @@ pub struct LoginCode {
 
 /// `POST /api/v1/auth/code`: sign in with a one-time code.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RedeemCode {
     pub code: String,
 }
 
 /// `POST /api/v1/auth/passkeys/register/finish`
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RegisterPasskey {
     pub name: String,
     /// What `navigator.credentials.create` returned, as the UI encodes it.
@@ -527,11 +651,13 @@ pub struct RegisterPasskey {
 
 /// `PATCH /api/v1/auth/passkeys/{id}`
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RenamePasskey {
     pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Passkey {
     pub id: String,
     pub name: String,
@@ -544,6 +670,7 @@ pub struct Passkey {
 /// An API token (for scripts and the `c6` CLI). The secret is only in the
 /// response that creates it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiToken {
     pub id: String,
     pub name: String,
@@ -554,6 +681,7 @@ pub struct ApiToken {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateApiToken {
     pub name: String,
 }
@@ -561,6 +689,7 @@ pub struct CreateApiToken {
 /// A hook: a shell command run on the worker at a point in each session
 /// (`GET`/`PUT /api/v1/settings/hooks`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Hook {
     /// What it is for, for display.
     #[serde(default)]
@@ -591,6 +720,7 @@ fn enabled_default() -> bool {
 
 /// A custom slash command (`GET`/`PUT /api/v1/settings/commands`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CommandDef {
     /// Typed as `/name`; letters, digits, `-`, `_`, `:` and `.`.
     pub name: String,
@@ -612,6 +742,7 @@ pub struct CommandDef {
 
 /// A named agent the Task tool can launch (`/api/v1/settings/agents`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentDef {
     pub name: String,
     /// When to use it; the model reads this to pick an agent.
@@ -636,6 +767,7 @@ pub struct AgentDef {
 
 /// A skill: instructions the agent loads by name (`/api/v1/settings/skills`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SkillDef {
     pub name: String,
     #[serde(default)]
@@ -651,6 +783,7 @@ pub struct SkillDef {
 /// A secret: an environment variable for sessions' commands. Its value is
 /// write-only (`PUT /api/v1/settings/secrets/{name}`); lists never show it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecretInfo {
     pub name: String,
     #[serde(default)]
@@ -664,6 +797,7 @@ pub struct SecretInfo {
 /// `PUT /api/v1/settings/secrets/{name}`: create or update a secret. A
 /// missing `value` keeps the current one.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PutSecret {
     #[serde(default)]
     pub value: Option<String>,
@@ -684,6 +818,7 @@ pub fn valid_secret_name(name: &str) -> bool {
 /// The web search provider for models whose own provider has none
 /// (`GET`/`PUT /api/v1/settings/web-search`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WebSearchSetting {
     /// "brave", "tavily", "searxng"; empty: off.
     #[serde(default)]
@@ -702,6 +837,7 @@ pub struct WebSearchSetting {
 /// A session template: where and how to start a session (or one per
 /// target, a fleet run), and what to ask (`/api/v1/settings/templates`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Template {
     pub name: String,
     #[serde(default)]
@@ -743,6 +879,7 @@ pub struct Template {
 
 /// `POST /api/v1/templates/{name}/run`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RunTemplate {
     #[serde(default)]
     pub input: String,
@@ -750,6 +887,7 @@ pub struct RunTemplate {
 
 /// The sessions a template run started (one per target).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateRun {
     /// Its sessions carry the label run:<run_id>.
     pub run_id: String,
@@ -761,6 +899,7 @@ pub struct TemplateRun {
 
 /// An automation: starts a template on a schedule or from a webhook.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Automation {
     pub id: String,
     pub name: String,
@@ -802,6 +941,7 @@ pub struct Automation {
 /// wait for your approval or notify you, in order, each one able to use
 /// earlier steps' results and to run only when they say so.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Workflow {
     pub name: String,
     #[serde(default)]
@@ -812,6 +952,7 @@ pub struct Workflow {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowStep {
     /// How later steps refer to it ({{steps.<id>.output}}); default: step1,
     /// step2, ….
@@ -843,6 +984,7 @@ pub struct WorkflowStep {
 /// last line starting with `RESULT:` is compared (else all of it), so ask
 /// for one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StepCondition {
     pub step: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -856,6 +998,7 @@ pub struct StepCondition {
 
 /// A run of a workflow (`GET /api/v1/workflows/runs`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowRun {
     pub id: String,
     pub workflow: String,
@@ -874,6 +1017,7 @@ pub struct WorkflowRun {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowStepRun {
     pub id: String,
     pub kind: String,
@@ -895,6 +1039,7 @@ pub struct WorkflowStepRun {
 
 /// `POST /api/v1/workflows/{name}/run`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RunWorkflow {
     #[serde(default)]
     pub input: String,
@@ -902,6 +1047,7 @@ pub struct RunWorkflow {
 
 /// One run of an automation (`GET /api/v1/automations/{id}/runs`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AutomationRun {
     pub run_id: String,
     pub started_at: UnixMs,
@@ -921,6 +1067,7 @@ pub struct AutomationRun {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RunSession {
     pub id: String,
     pub title: String,
@@ -930,6 +1077,7 @@ pub struct RunSession {
 
 /// `POST /api/v1/automations` (create) and `PATCH /api/v1/automations/{id}`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AutomationEdit {
     #[serde(default)]
     pub name: Option<String>,
@@ -950,6 +1098,7 @@ pub struct AutomationEdit {
 /// A memory note: kept across sessions, given to those whose labels match
 /// its scope (`/api/v1/memories`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Memory {
     #[serde(default)]
     pub id: String,
@@ -968,6 +1117,7 @@ pub struct Memory {
 /// A policy: what happens to matching tool calls in sessions with its
 /// labels (`/api/v1/settings/policies`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Policy {
     pub name: String,
     /// Labels a session must all have; empty: every session.
@@ -993,6 +1143,7 @@ pub struct Policy {
 /// new sessions with its labels that are started without a model. The
 /// first enabled rule that matches wins.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Route {
     pub name: String,
     /// Labels a session must all have; empty: every session.
@@ -1016,6 +1167,7 @@ pub struct Route {
 /// A notification channel (`/api/v1/settings/channels`): where the head
 /// tells you about events in sessions with its labels.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Channel {
     pub name: String,
     /// "push" (your browsers and phones, see Settings), "ntfy", "slack",
@@ -1065,6 +1217,7 @@ pub const DEFAULT_NOTIFY_EVENTS: [&str; 6] = ["approval", "failed", "notice", "a
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Host {
     /// A short name (letters, digits, - _ .); you can start a session
     /// with it as the SSH target.
@@ -1089,6 +1242,7 @@ pub struct Host {
 
 /// A host and its last reachability check (`GET /api/v1/hosts`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostStatus {
     pub host: Host,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1096,6 +1250,7 @@ pub struct HostStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostCheck {
     pub at_ms: i64,
     pub ok: bool,
@@ -1108,6 +1263,7 @@ pub struct HostCheck {
 
 /// A model's price in USD per million tokens (`/api/v1/settings/prices`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Price {
     /// A model id, or a prefix ending in `*` (`claude-sonnet-*`).
     pub model: String,
@@ -1126,6 +1282,7 @@ pub struct Price {
 /// A number, or a string holding one (as the settings editor saves it).
 fn maybe_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
     #[derive(Deserialize)]
+    #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
     #[serde(untagged)]
     enum N {
         Num(f64),
@@ -1149,6 +1306,7 @@ fn number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 /// A spending limit for sessions with given labels
 /// (`/api/v1/settings/budgets`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Budget {
     pub name: String,
     /// Labels a session must all have; empty: every session.
@@ -1168,6 +1326,7 @@ pub struct Budget {
 
 /// Tokens and cost for one group of model calls.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageRow {
     /// The group: a day (YYYY-MM-DD), model, connection id, label or
     /// session id.
@@ -1188,6 +1347,7 @@ pub struct UsageRow {
 
 /// A budget and where it stands this period.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct BudgetStatus {
     pub name: String,
     pub period: String,
@@ -1200,6 +1360,7 @@ pub struct BudgetStatus {
 
 /// `GET /api/v1/usage?days=N&labels=a,b`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageReport {
     pub since_ms: i64,
     pub total: UsageRow,
@@ -1218,6 +1379,7 @@ pub struct UsageReport {
 /// A browser's push subscription (`POST /api/v1/push/subscriptions`), as
 /// `PushSubscription.toJSON()` gives it, plus a name for the device.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PushSubscription {
     pub endpoint: String,
     pub keys: PushKeys,
@@ -1226,6 +1388,7 @@ pub struct PushSubscription {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PushKeys {
     pub p256dh: String,
     pub auth: String,
@@ -1233,6 +1396,7 @@ pub struct PushKeys {
 
 /// A subscribed device (`GET /api/v1/push/subscriptions`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PushDevice {
     pub id: String,
     pub name: String,
@@ -1250,12 +1414,14 @@ pub struct PushDevice {
 
 /// `GET /api/v1/push/key`: the head's public key for subscribing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PushKey {
     pub key: String,
 }
 
 /// `POST /api/v1/settings/channels/test`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TestChannel {
     pub name: String,
 }
@@ -1263,12 +1429,14 @@ pub struct TestChannel {
 /// `GET`/`PUT /api/v1/settings/public_url`: the address links in
 /// notifications point to.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PublicUrl {
     pub url: String,
 }
 
 /// `POST /api/v1/sessions/{id}/approvals/{call_id}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApprovalDecision {
     pub allow: bool,
 }
@@ -1286,6 +1454,7 @@ pub const BUILTIN_COMMANDS: [(&str, &str, &str); 5] = [
 
 /// A command as the composer lists it (`GET /api/v1/commands`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CommandInfo {
     pub name: String,
     pub description: String,
@@ -1304,6 +1473,7 @@ pub const HOOK_EVENTS: [&str; 5] = ["PreToolUse", "PostToolUse", "UserPromptSubm
 
 /// `PUT /api/v1/sessions/{id}/labels`: the labels you attach to a session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetLabels {
     pub labels: Vec<String>,
 }
@@ -1311,6 +1481,7 @@ pub struct SetLabels {
 /// `GET /api/v1/sessions/{id}/config`: what applies to a session, from the
 /// head's current settings and the session's labels.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EffectiveConfig {
     pub labels: Vec<String>,
     pub commands: Vec<Applied>,
@@ -1320,6 +1491,7 @@ pub struct EffectiveConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Applied {
     pub name: String,
     pub applies_to: Vec<String>,
@@ -1331,6 +1503,7 @@ pub struct Applied {
 
 /// A signed-in browser.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuthSession {
     pub id: String,
     /// "passkey", "link" or "code".
@@ -1346,6 +1519,7 @@ pub struct AuthSession {
 
 /// `GET /api/v1/search`
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SearchQuery {
     /// Words and "quoted phrases" (all must match, as substrings of 3+
     /// characters); `-word` excludes.
@@ -1366,6 +1540,7 @@ pub struct SearchQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SearchResponse {
     /// Sessions, best match first.
     pub results: Vec<SearchResult>,
@@ -1379,6 +1554,7 @@ pub struct SearchResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SearchResult {
     pub session: Session,
     pub worker_name: String,
@@ -1393,6 +1569,7 @@ pub struct SearchResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct OpenIn {
     pub session_id: String,
     pub title: String,
@@ -1401,6 +1578,7 @@ pub struct OpenIn {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SearchHit {
     /// The transcript element showing the match: `{session}-e{seq}`, or
     /// `call-{id}` for tool output (shown in its call's card).
@@ -1415,6 +1593,7 @@ pub struct SearchHit {
 
 /// A piece of a snippet; `hit` pieces match the query.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SnippetPart {
     pub text: String,
     pub hit: bool,
@@ -1422,6 +1601,7 @@ pub struct SnippetPart {
 
 /// `GET /api/v1/sessions/{id}/matches?q=`: find in a session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionMatches {
     /// In transcript order, side chats included.
     pub matches: Vec<SessionMatch>,
@@ -1432,6 +1612,7 @@ pub struct SessionMatches {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionMatch {
     /// The transcript element showing it (see `SearchHit::anchor`).
     pub anchor: String,
@@ -1453,6 +1634,7 @@ pub const MEMEX_DEFAULT_SCOPE: [&str; 6] = ["session", "output", "web", "note", 
 /// An item to store (head → memex `memex.ingest`). The same source and
 /// external id again replaces it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexItemIn {
     pub kind: String,
     /// Where it comes from: "carbon6", "memory", "you", a session, ….
@@ -1475,6 +1657,7 @@ pub struct MemexItemIn {
 
 /// `memex.search` (and `GET /api/v1/memex/search`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexQuery {
     pub query: String,
     /// Only these kinds; empty: all the caller may see.
@@ -1488,6 +1671,7 @@ pub struct MemexQuery {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexHit {
     pub id: String,
     pub kind: String,
@@ -1505,6 +1689,7 @@ pub struct MemexHit {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexThingRef {
     pub id: String,
     pub kind: String,
@@ -1516,6 +1701,7 @@ pub struct MemexThingRef {
 
 /// An item, in full (`memex.get` of an item id).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexItem {
     pub id: String,
     pub kind: String,
@@ -1535,6 +1721,7 @@ pub struct MemexItem {
 /// A thing in the graph with what is known about it (`memex.get` of a
 /// thing id or label).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexThing {
     pub thing: MemexThingRef,
     /// Notes about it, newest first.
@@ -1547,6 +1734,7 @@ pub struct MemexThing {
 
 /// `memex.brief`: context for a session about these labels.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexBrief {
     pub text: String,
     /// The items it draws on.
@@ -1555,6 +1743,7 @@ pub struct MemexBrief {
 
 /// The memex's state (`GET /api/v1/memex/status`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexStatus {
     pub connected: bool,
     #[serde(default)]
@@ -1597,6 +1786,7 @@ pub struct MemexStatus {
 /// Who owes what, by when (`/api/v1/memex/commitments`), read from mail and
 /// sessions.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Commitment {
     pub id: i64,
     pub item_id: String,
@@ -1614,6 +1804,7 @@ pub struct Commitment {
 /// A suggestion for you to decide (`/api/v1/memex/review`): two things that
 /// may be the same (`merge`), or a face to name (`face`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexReview {
     pub id: i64,
     pub kind: String,
@@ -1630,6 +1821,7 @@ pub struct MemexReview {
 /// A thing's neighbourhood (`memex.graph`): things linked to it directly or
 /// through items, with how strongly.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexGraph {
     pub center: MemexThingRef,
     pub nodes: Vec<MemexGraphNode>,
@@ -1639,6 +1831,7 @@ pub struct MemexGraph {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexGraphNode {
     pub thing: MemexThingRef,
     /// Direct relations to the centre (e.g. member_of), if any.
@@ -1653,6 +1846,7 @@ pub struct MemexGraphNode {
 
 /// A model for one of the memex's tasks.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexModel {
     /// A connection name or id.
     pub connection: String,
@@ -1661,6 +1855,7 @@ pub struct MemexModel {
 
 /// `GET`/`PUT /api/v1/settings/memex`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexSettings {
     /// Turns text into vectors for search by meaning; none: keyword search
     /// only.
@@ -1706,6 +1901,7 @@ pub struct MemexSettings {
 /// A scope rule (`/api/v1/settings/memex_scopes`): sessions with these
 /// labels may also see these kinds of items.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexScope {
     pub name: String,
     #[serde(default)]
@@ -1717,6 +1913,7 @@ pub struct MemexScope {
 
 /// A note you write (`POST /api/v1/memex/notes`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexNoteIn {
     pub text: String,
     /// Labels or thing ids it is about.
@@ -1727,6 +1924,7 @@ pub struct MemexNoteIn {
 /// An associative trail: a named path through items and things, with
 /// comments (`/api/v1/memex/trails`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexTrail {
     pub id: String,
     pub name: String,
@@ -1741,6 +1939,7 @@ pub struct MemexTrail {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexTrailStep {
     pub id: i64,
     /// An item id, or a thing (id or label).
@@ -1758,6 +1957,7 @@ pub struct MemexTrailStep {
 
 /// A file to add (`POST /api/v1/memex/upload`): base64 data.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexUpload {
     pub name: String,
     #[serde(default)]
@@ -1770,6 +1970,7 @@ pub struct MemexUpload {
 /// A folder the memex watches (`/api/v1/settings/memex_folders`), on the
 /// machine the memex runs on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexFolder {
     pub path: String,
     /// Labels for what is found there (e.g. research, client:acme).
@@ -1781,6 +1982,7 @@ pub struct MemexFolder {
 
 /// Your Google OAuth client (`/api/v1/google/client`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GoogleClient {
     pub client_id: String,
     pub has_secret: bool,
@@ -1790,6 +1992,7 @@ pub struct GoogleClient {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GoogleClientIn {
     pub client_id: String,
     /// Kept as is when absent.
@@ -1799,6 +2002,7 @@ pub struct GoogleClientIn {
 
 /// A connected Google account (`/api/v1/google/accounts`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GoogleAccount {
     pub id: String,
     pub email: String,
@@ -1811,6 +2015,7 @@ pub struct GoogleAccount {
 
 /// A conversation in a mail view (`GET /api/v1/mail/threads`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MailThread {
     pub account: String,
     pub thread_id: String,
@@ -1830,6 +2035,7 @@ pub struct MailThread {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MailMessage {
     pub item_id: String,
     pub gmail_id: String,
@@ -1850,6 +2056,7 @@ pub struct MailMessage {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MailAttachment {
     pub index: u32,
     pub name: String,
@@ -1860,6 +2067,7 @@ pub struct MailAttachment {
 /// A message to send or keep as a draft (`POST /api/v1/mail/send`,
 /// `/api/v1/mail/drafts`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MailDraft {
     /// The account's id or address.
     pub account: String,
@@ -1889,6 +2097,7 @@ pub struct MailDraft {
 
 /// A message on its way out (undo while pending).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Outgoing {
     pub id: String,
     pub send_at: UnixMs,
@@ -1901,6 +2110,7 @@ pub struct Outgoing {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Calendar {
     pub account: String,
     pub id: String,
@@ -1913,6 +2123,7 @@ pub struct Calendar {
 
 /// An event, or one instance of a recurring one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CalendarEvent {
     pub account: String,
     pub calendar_id: String,
@@ -1939,6 +2150,7 @@ pub struct CalendarEvent {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Attendee {
     pub email: String,
     pub name: String,
@@ -1948,6 +2160,7 @@ pub struct Attendee {
 
 /// Creating or changing an event (`/api/v1/calendar/events`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EventEdit {
     pub account: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1979,6 +2192,7 @@ pub struct EventEdit {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Contact {
     pub account: String,
     pub resource: String,
@@ -1994,6 +2208,7 @@ pub struct Contact {
 
 /// Someone you write to who is not a contact yet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContactCandidate {
     pub email: String,
     pub name: String,

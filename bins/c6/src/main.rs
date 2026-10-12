@@ -122,6 +122,24 @@ enum Command {
     },
     /// List workers.
     Workers,
+    /// Find operations: everything you can do in carbon6 (with no words:
+    /// the areas; with an operation's exact name: its input).
+    Ops {
+        words: Vec<String>,
+        /// Only this area.
+        #[arg(short, long)]
+        area: Option<String>,
+    },
+    /// Run an operation (see `c6 ops`). Inputs are key=value (JSON values,
+    /// or text), or one JSON object; a body is body=<json> or body=@file.
+    /// Prints the result as JSON.
+    Op {
+        name: String,
+        input: Vec<String>,
+        /// Run a destructive operation without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -362,6 +380,76 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        Command::Ops { words, area } => {
+            let catalog: serde_json::Value = c.get("/catalog").await?;
+            let ops = catalog["operations"].as_array().cloned().unwrap_or_default();
+            if let [name] = words.as_slice()
+                && let Some(op) = ops.iter().find(|o| o["op"] == name.as_str())
+            {
+                println!("{}", serde_json::to_string_pretty(op)?);
+                return Ok(0);
+            }
+            let wanted: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+            if wanted.is_empty() && area.is_none() {
+                for a in catalog["areas"].as_array().into_iter().flatten() {
+                    let n = ops.iter().filter(|o| o["area"] == a["area"]).count();
+                    println!("{:<14} {:>3}  {}", a["area"].as_str().unwrap_or(""), n, a["what"].as_str().unwrap_or(""));
+                }
+                println!("\n`c6 ops <words>` or `c6 ops --area <area>` to see operations; `c6 ops <name>` for one's input.");
+                return Ok(0);
+            }
+            for o in &ops {
+                let text = format!("{} {}", o["op"].as_str().unwrap_or(""), o["summary"].as_str().unwrap_or("")).to_lowercase();
+                if area.as_deref().is_some_and(|a| o["area"] != a) || !wanted.iter().all(|w| text.contains(w.as_str())) {
+                    continue;
+                }
+                let effect = match o["effect"].as_str().unwrap_or("") {
+                    "read" => "",
+                    "write" => " ✎",
+                    "destructive" => " ⚠",
+                    _ => " 🔑",
+                };
+                println!("{:<32} {}{effect}", o["op"].as_str().unwrap_or(""), o["summary"].as_str().unwrap_or(""));
+            }
+            Ok(0)
+        }
+        Command::Op { name, input, yes } => {
+            let input = op_input(&input)?;
+            let call = |confirmed: bool| json!({"op": name, "input": input, "confirmed": confirmed});
+            let r = c
+                .http
+                .post(format!("{}/catalog/call", c.api))
+                .bearer_auth(&c.token)
+                .json(&call(yes))
+                .send()
+                .await
+                .context("cannot reach the head")?;
+            let r = if r.status() == reqwest::StatusCode::CONFLICT {
+                let why: serde_json::Value = r.json().await.unwrap_or_default();
+                eprintln!("{}", why["error"].as_str().unwrap_or("this operation is destructive"));
+                if !std::io::stdin().is_terminal() {
+                    bail!("run it with --yes to confirm");
+                }
+                eprint!("Run it? [y/N] ");
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    eprintln!("Not run.");
+                    return Ok(1);
+                }
+                c.send(c.http.post(format!("{}/catalog/call", c.api)).json(&call(true))).await?
+            } else if r.status().is_success() {
+                r
+            } else {
+                let status = r.status();
+                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                bail!("{status}: {}", body["error"].as_str().unwrap_or(""));
+            };
+            let v: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(0)
+        }
         Command::Workers => {
             let workers: Vec<Worker> = c.get("/workers").await?;
             for w in workers {
@@ -527,4 +615,25 @@ async fn fleet(c: &Client, run_id: &str, sessions: &[Session]) -> anyhow::Result
         println!("== {} ({})\n{}\n", s.title, &s.id[..13], reply.1.trim());
     }
     Ok(code)
+}
+
+/// An operation's input from `key=value` arguments (values as JSON when
+/// they parse, else text; `body=@file` reads a file), or one JSON object.
+fn op_input(args: &[String]) -> anyhow::Result<serde_json::Value> {
+    if let [one] = args
+        && one.trim_start().starts_with('{')
+    {
+        return serde_json::from_str(one).context("the input is not a JSON object");
+    }
+    let mut m = serde_json::Map::new();
+    for a in args {
+        let (k, v) = a.split_once('=').with_context(|| format!("{a}: inputs are key=value"))?;
+        let text = match v.strip_prefix('@') {
+            Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?,
+            None => v.to_owned(),
+        };
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        m.insert(k.to_owned(), value);
+    }
+    Ok(serde_json::Value::Object(m))
 }

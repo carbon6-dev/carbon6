@@ -28,7 +28,21 @@ message SessionEvent {
     MemoryUpdate memory = 24;
     Approval approval = 25;
     Notice notice = 26;
+    Question question = 27;
   }
+}
+
+// The assistant asked you for inputs (a form), and what became of it.
+message Question {
+  string call_id = 1;
+  string title = 2;
+  // The fields (JSON array: name, label, type, choices, default, required,
+  // description).
+  string fields_json = 3;
+  // "asked", "answered" or "cancelled".
+  string state = 4;
+  // Your answers (JSON object; secret fields shown as "[secret]").
+  string answer_json = 5;
 }
 
 // The agent asked to tell you something (notify): the head sends it to
@@ -276,7 +290,17 @@ message EphemeralEvent {
     TextDelta thinking = 3;
     ToolOutputDelta tool_output = 4;
     SessionActivity activity = 5;
+    SecretCard secret = 6;
   }
+}
+
+// A secret an operation returned (a token, a code), for you only: shown
+// live, never logged or given to the model.
+message SecretCard {
+  string call_id = 1;
+  string title = 2;
+  string value = 3;
+  string note = 4;
 }
 
 message TextDelta {
@@ -329,7 +353,16 @@ message SessionCommand {
     Rewind rewind = 14;
     StopTask stop_task = 15;
     Approve approve = 16;
+    Answer answer = 17;
   }
+}
+
+// Your answers to a question (a form) the assistant asked.
+message Answer {
+  string call_id = 1;
+  // JSON object, field name to value.
+  string values_json = 2;
+  bool cancelled = 3;
 }
 
 // Your answer to an approval request.

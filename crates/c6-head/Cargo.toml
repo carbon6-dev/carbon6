@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23.1"
 c6-agent.workspace = true
-c6-api.workspace = true
+c6-api = { workspace = true, features = ["schema"] }
 c6-core.workspace = true
 c6-llm.workspace = true
 c6-mcp.workspace = true
@@ -52,7 +52,10 @@ url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v7", "serde"] }
 x509-parser = "0.18.1"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
+schemars = "1.2.2"
+c6-tools.workspace = true
+async-trait = "0.1.92"
+tower = { version = "0.5.3", features = ["util"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tower = { version = "0.5.3", features = ["util"] }

@@ -124,6 +124,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/live", get(live))
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
+        .route("/api/v1/assistant", post(ask_assistant))
+        .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
+        .route("/api/v1/catalog", get(get_catalog))
+        .route("/api/v1/catalog/call", post(call_catalog))
+        .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
@@ -415,8 +420,8 @@ async fn list_models(kind: &str, base_url: &str, key: &str) -> ApiResult<Vec<Str
     })
 }
 
-#[derive(serde::Deserialize)]
-struct TestConnection {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct TestConnection {
     kind: Option<String>,
     #[serde(default)]
     base_url: String,
@@ -513,8 +518,8 @@ async fn ui_ca_profile(State(st): State<Arc<HeadState>>) -> Response {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct FindQuery {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct FindQuery {
     q: String,
 }
 
@@ -546,8 +551,8 @@ async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
     }))
 }
 
-#[derive(serde::Deserialize)]
-struct UpdateSession {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct UpdateSession {
     title: Option<String>,
     archived: Option<bool>,
 }
@@ -567,8 +572,8 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(serde::Deserialize)]
-struct After {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct After {
     #[serde(default)]
     after: u64,
 }
@@ -671,8 +676,8 @@ async fn put_agents(State(st): State<Arc<HeadState>>, Json(agents): Json<Vec<api
 
 /// The slash commands the composer offers: built-ins and the enabled custom
 /// ones (a custom command replaces a built-in of the same name).
-#[derive(serde::Deserialize)]
-struct ForSession {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ForSession {
     #[serde(default)]
     session: Option<String>,
 }
@@ -1049,8 +1054,8 @@ async fn memex_status(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::M
     Ok(Json(crate::memex::status(&st).await?))
 }
 
-#[derive(serde::Deserialize)]
-struct MemexSearchQuery {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct MemexSearchQuery {
     #[serde(default)]
     q: String,
     #[serde(default)]
@@ -1072,8 +1077,8 @@ async fn memex_search(State(st): State<Arc<HeadState>>, Query(q): Query<MemexSea
     Ok(Json(serde_json::from_value(v).map_err(anyhow::Error::from)?))
 }
 
-#[derive(serde::Deserialize)]
-struct IdQuery {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct IdQuery {
     #[serde(default)]
     id: String,
     #[serde(default)]
@@ -1274,8 +1279,8 @@ async fn memex_trail(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
     Ok(Json(crate::memex::call(&st, "memex.trail", serde_json::json!({"id": id})).await?))
 }
 
-#[derive(serde::Deserialize)]
-struct TrailStepIn {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct TrailStepIn {
     trail: String,
     target: String,
     #[serde(default)]
@@ -1287,8 +1292,8 @@ async fn memex_trail_append(State(st): State<Arc<HeadState>>, Json(s): Json<Trai
     Ok(Json(crate::memex::call(&st, "memex.trail_append", params).await?))
 }
 
-#[derive(serde::Deserialize)]
-struct TrailEdit {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct TrailEdit {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -1344,8 +1349,8 @@ async fn run_workflow(
     Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual").await?))
 }
 
-#[derive(serde::Deserialize)]
-struct WorkflowRunsQuery {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct WorkflowRunsQuery {
     #[serde(default)]
     workflow: Option<String>,
     #[serde(default)]
@@ -1375,8 +1380,8 @@ async fn decide_workflow_step(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct RunsQuery {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct RunsQuery {
     #[serde(default)]
     limit: Option<u32>,
 }
@@ -1427,8 +1432,8 @@ async fn put_budgets(State(st): State<Arc<HeadState>>, Json(b): Json<Vec<api::Bu
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(serde::Deserialize)]
-struct UsageQuery {
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct UsageQuery {
     #[serde(default)]
     days: Option<u32>,
     #[serde(default)]
@@ -1758,4 +1763,61 @@ async fn static_asset(uri: Uri) -> Response {
     // change. Everything else (index.html, vendored scripts) is revalidated.
     let cache = if is_fingerprinted(path) { "public, max-age=31536000, immutable" } else { "no-cache" };
     ([(header::CONTENT_TYPE, mime.as_ref().to_owned()), (header::CACHE_CONTROL, cache.to_owned())], file.data).into_response()
+}
+
+// --- The assistant and the operation catalog ----------------------------------
+
+async fn ask_assistant(State(st): State<Arc<HeadState>>, Json(req): Json<api::AskAssistant>) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::sessions::create_assistant(&st, req).await?))
+}
+
+async fn get_assistant_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::AssistantSettings>> {
+    Ok(Json(serde_json::from_str(&st.store.setting(crate::assistant::SETTING).await?.unwrap_or_default()).unwrap_or_default()))
+}
+
+async fn put_assistant_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::AssistantSettings>) -> ApiResult<StatusCode> {
+    crate::assistant::check_settings(&st, &s).await?;
+    st.store.set_setting(crate::assistant::SETTING, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every operation (for the CLI).
+async fn get_catalog() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "areas": crate::catalog::areas().iter().map(|(a, d)| serde_json::json!({"area": a, "what": d})).collect::<Vec<_>>(),
+        "operations": crate::catalog::ops().iter().map(crate::catalog::describe).collect::<Vec<_>>(),
+    }))
+}
+
+/// Runs an operation (the CLI): destructive ones need `confirmed`.
+async fn call_catalog(State(st): State<Arc<HeadState>>, Json(c): Json<api::CatalogCall>) -> ApiResult<Json<serde_json::Value>> {
+    let op = crate::catalog::find(&c.op).ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("no operation {:?}", c.op)))?;
+    if op.effect == crate::catalog::Effect::Destructive && !c.confirmed {
+        return Err(ApiErr(StatusCode::CONFLICT, format!("{} is destructive ({}); confirm to run it", op.name, op.summary)));
+    }
+    Ok(Json(crate::assistant::execute(&st, op, c.input, "you").await?))
+}
+
+/// Your answers to the assistant's question (a form).
+async fn answer_question(
+    State(st): State<Arc<HeadState>>,
+    Path((id, call_id)): Path<(String, String)>,
+    Json(a): Json<api::AnswerIn>,
+) -> ApiResult<StatusCode> {
+    let session = st.store.session(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let cmd = c6_proto::SessionCommand {
+        command_id: uuid::Uuid::now_v7().to_string(),
+        session_id: id,
+        kind: Some(c6_proto::session_command::Kind::Answer(c6_proto::Answer {
+            call_id,
+            values_json: serde_json::Value::Object(a.values).to_string(),
+            cancelled: a.cancelled,
+        })),
+    };
+    let worker: WorkerId = session.worker_id.parse().map_err(anyhow::Error::from)?;
+    if st.registry.send_command(worker, cmd) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "the conversation is not running".into()))
+    }
 }

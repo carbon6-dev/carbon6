@@ -98,6 +98,13 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             policy: a.policy.clone(),
             message: a.message.clone(),
         },
+        Kind::Question(q) => api::EventKind::Question {
+            call_id: q.call_id.clone(),
+            title: q.title.clone(),
+            fields: serde_json::from_str(&q.fields_json).unwrap_or_default(),
+            state: q.state.clone(),
+            answer: serde_json::from_str(&q.answer_json).unwrap_or_default(),
+        },
         Kind::Notice(n) => api::EventKind::Notice { title: n.title.clone(), message: n.message.clone(), priority: n.priority.clone() },
         Kind::Memory(m) => api::EventKind::Memory { op: m.op.clone(), id: m.id.clone(), scope: m.scope.clone(), text: m.text.clone() },
         Kind::Output(o) => {
@@ -134,6 +141,9 @@ pub fn ephemeral(kind: &ephemeral_event::Kind) -> api::StreamMsg {
         ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone() },
         ephemeral_event::Kind::ToolOutput(d) => api::StreamMsg::ToolOutput { call_id: d.call_id.clone(), text: d.text.clone() },
         ephemeral_event::Kind::Activity(a) => api::StreamMsg::Activity { running: a.running },
+        ephemeral_event::Kind::Secret(c) => {
+            api::StreamMsg::Secret { call_id: c.call_id.clone(), title: c.title.clone(), value: c.value.clone(), note: c.note.clone() }
+        }
     }
 }
 

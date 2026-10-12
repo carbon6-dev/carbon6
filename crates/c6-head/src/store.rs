@@ -111,7 +111,8 @@ impl Store {
     }
 
     pub async fn workers(&self) -> anyhow::Result<Vec<WorkerRow>> {
-        Ok(sqlx::query_as("SELECT * FROM workers ORDER BY name, id").fetch_all(&self.pool).await?)
+        // Not the head's own (it runs the assistant's conversations).
+        Ok(sqlx::query_as("SELECT * FROM workers WHERE role != 'head' ORDER BY name, id").fetch_all(&self.pool).await?)
     }
 
     /// Records facts from a worker's `Hello`.
@@ -140,7 +141,7 @@ impl Store {
 
     /// Returns false if the worker does not exist.
     pub async fn revoke_worker(&self, id: WorkerId, now: i64) -> anyhow::Result<bool> {
-        let r = sqlx::query("UPDATE workers SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?")
+        let r = sqlx::query("UPDATE workers SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND role != 'head'")
             .bind(now)
             .bind(id.to_string())
             .execute(&self.pool)
@@ -149,7 +150,7 @@ impl Store {
     }
 
     pub async fn delete_worker(&self, id: WorkerId) -> anyhow::Result<bool> {
-        let r = sqlx::query("DELETE FROM workers WHERE id = ?").bind(id.to_string()).execute(&self.pool).await?;
+        let r = sqlx::query("DELETE FROM workers WHERE id = ? AND role != 'head'").bind(id.to_string()).execute(&self.pool).await?;
         Ok(r.rows_affected() > 0)
     }
 }

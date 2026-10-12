@@ -214,5 +214,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::Memory { .. } => "memory",
         EventKind::Approval { .. } => "approval",
         EventKind::Notice { .. } => "notice",
+        EventKind::Question { .. } => "question",
     }
 }

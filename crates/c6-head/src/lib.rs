@@ -1,8 +1,10 @@
 //! The carbon6 head (`c6h`): system of record, worker hub and web UI server.
 
 pub mod api;
+pub mod assistant;
 pub mod auth;
 pub mod automations;
+pub mod catalog;
 pub mod config;
 mod convert;
 mod cron;
@@ -97,6 +99,8 @@ pub struct HeadState {
     pub workflows: workflows::Runner,
     /// Wakes what sends the memex its updates.
     pub memex_feed: memex::Feed,
+    /// The assistant: its conversations run in the head.
+    pub assistant: assistant::Assistant,
     pub shutdown: CancellationToken,
 }
 
@@ -187,6 +191,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         notifier: Default::default(),
         workflows: Default::default(),
         memex_feed: Default::default(),
+        assistant: Default::default(),
         shutdown: shutdown.clone(),
     });
 
@@ -199,6 +204,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     hosts::spawn_checks(state.clone());
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
+    assistant::start(state.clone(), api::router(state.clone())).await?;
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();
@@ -352,4 +358,14 @@ async fn bind_all(ips: &[IpAddr], port: u16) -> anyhow::Result<Vec<TcpListener>>
         out.push(TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?);
     }
     Ok(out)
+}
+
+/// `s` cut to at most `n` characters (with an ellipsis).
+pub(crate) fn util_clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }

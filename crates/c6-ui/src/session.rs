@@ -148,6 +148,17 @@ pub(crate) struct Feed {
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
     activity: RwSignal<Option<bool>>,
+    /// Secrets the assistant's operations returned, for you (shown while
+    /// this page is open; never logged).
+    secrets: RwSignal<Vec<SecretCard>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SecretCard {
+    call_id: String,
+    title: String,
+    value: String,
+    note: String,
 }
 
 impl Feed {
@@ -158,8 +169,9 @@ impl Feed {
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
             activity: RwSignal::new(None),
+            secrets: RwSignal::new(Vec::new()),
         };
-        let Feed { events, streaming, queued, activity } = feed;
+        let Feed { events, streaming, queued, activity, secrets } = feed;
         let handle = api::stream_session(
             id,
             move |msg| match msg {
@@ -192,6 +204,7 @@ impl Feed {
                 StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
                 StreamMsg::Activity { running } => activity.set(Some(running)),
                 StreamMsg::Queue { queued: q } => queued.set(q),
+                StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
             },
             move || events.with_untracked(|e| e.last().map(|e| e.seq).unwrap_or(0)),
         );
@@ -227,7 +240,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         move || api::session(id.clone())
     });
     let feed = Feed::open(id.clone());
-    let Feed { events, streaming, queued, activity } = feed;
+    let Feed { events, streaming, queued, activity, .. } = feed;
     let error = RwSignal::new(None::<String>);
 
     let status = {
@@ -433,7 +446,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 /// shown under them (recursively).
 #[component]
 fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoView {
-    let Feed { events, streaming, queued, .. } = feed;
+    let Feed { events, streaming, queued, secrets, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     let results = Memo::new(move |_| {
         events.with(|evs| {
@@ -587,6 +600,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                     }
                 }
             </For>
+            {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
             {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
                 <div class="space-y-2">
                     {(!s.thinking.is_empty()).then(|| view! { <Thinking text=s.thinking.clone() open=true /> })}
@@ -1112,6 +1126,31 @@ fn render_event(
                 };
                 view! { <p class=format!("flex items-center gap-2 text-xs {tone}")><span>{icon}</span><span>{what}</span></p> }.into_any()
             }
+        },
+        EventKind::Question { call_id, title, fields, state, answer } => match state.as_str() {
+            "asked" => {
+                let call = call_id.clone();
+                let open = Signal::derive(move || results.with(|r| !r.contains_key(&call)));
+                view! { <QuestionCard session=session.to_owned() call_id=call_id.clone() title=title.clone() fields=fields.clone() open /> }.into_any()
+            }
+            "answered" => {
+                let shown: Vec<String> = fields
+                    .iter()
+                    .filter_map(|f| {
+                        let v = &answer[&f.name];
+                        if v.is_null() {
+                            return None;
+                        }
+                        let text = match v {
+                            serde_json::Value::String(s) => f.choices.iter().find(|c| &c.value == s).map(|c| c.label.clone()).unwrap_or_else(|| s.clone()),
+                            other => other.to_string(),
+                        };
+                        Some(format!("{}: {text}", if f.label.is_empty() { &f.name } else { &f.label }))
+                    })
+                    .collect();
+                view! { <p class="flex items-start gap-2 text-xs text-zinc-500"><span>"✎"</span><span>{format!("Answered “{title}” · {}", shown.join(" · "))}</span></p> }.into_any()
+            }
+            _ => view! { <p class="flex items-center gap-2 text-xs text-zinc-500"><span>"✗"</span><span>{format!("Not answered: {title}")}</span></p> }.into_any(),
         },
         EventKind::Notice { title, message, priority } => {
             let tone = if priority == "high" { "border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950" } else { "border-zinc-200 dark:border-zinc-800" };
@@ -1892,6 +1931,132 @@ fn ApprovalCard(session: String, call_id: String, tool: String, input: String, p
                 }.into_any(),
                 None => ().into_any(),
             }}
+        </div>
+    }
+}
+
+/// The assistant's question: a form while it waits, with choices from your
+/// setup.
+#[component]
+fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_api::QuestionField>, open: Signal<bool>) -> impl IntoView {
+    let sid = StoredValue::new(session);
+    let call = StoredValue::new(call_id);
+    let values: Vec<(c6_api::QuestionField, RwSignal<String>)> = fields
+        .into_iter()
+        .map(|f| {
+            let initial = match &f.default {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Null) | None => match f.r#type.as_str() {
+                    "boolean" => "false".into(),
+                    "choice" => f.choices.first().map(|c| c.value.clone()).filter(|_| f.required).unwrap_or_default(),
+                    _ => String::new(),
+                },
+                Some(v) => v.to_string(),
+            };
+            (f, RwSignal::new(initial))
+        })
+        .collect();
+    let values = StoredValue::new(values);
+    let error = RwSignal::new(None::<String>);
+    let sent = RwSignal::new(false);
+    let submit = move |cancelled: bool| {
+        let mut out = serde_json::Map::new();
+        for (f, v) in values.get_value() {
+            let raw = v.get_untracked();
+            if f.required && raw.trim().is_empty() && !cancelled {
+                error.set(Some(format!("{} is needed", if f.label.is_empty() { &f.name } else { &f.label })));
+                return;
+            }
+            let value = match f.r#type.as_str() {
+                _ if raw.trim().is_empty() => serde_json::Value::Null,
+                "number" => match raw.trim().parse::<f64>() {
+                    Ok(n) => serde_json::json!(n),
+                    Err(_) => {
+                        error.set(Some(format!("{} is a number", f.label)));
+                        return;
+                    }
+                },
+                "boolean" => serde_json::Value::Bool(raw == "true"),
+                _ => serde_json::Value::String(raw),
+            };
+            out.insert(f.name.clone(), value);
+        }
+        sent.set(true);
+        spawn_local(async move {
+            if let Err(e) = api::answer(sid.get_value(), call.get_value(), out, cancelled).await {
+                error.set(Some(e));
+                sent.set(false);
+            }
+        });
+    };
+    view! {
+        <div class="space-y-3 rounded-lg border border-sky-300 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/40">
+            <p class="flex items-center gap-2 font-medium"><span>"✎"</span><span>{title}</span></p>
+            {move || open.get().then(|| view! {
+                <div class="space-y-2">
+                    {values.get_value().into_iter().map(|(f, v)| {
+                        let label = if f.label.is_empty() { f.name.clone() } else { f.label.clone() };
+                        let input = match f.r#type.as_str() {
+                            "choice" => view! {
+                                <select class=format!("{INPUT} py-1 text-sm") prop:value=move || v.get() on:change=move |ev| v.set(event_target_value(&ev))>
+                                    {(!f.required).then(|| view! { <option value="">"—"</option> })}
+                                    {f.choices.iter().map(|c| view! { <option value=c.value.clone()>{if c.label.is_empty() { c.value.clone() } else { c.label.clone() }}</option> }).collect_view()}
+                                </select>
+                            }.into_any(),
+                            "boolean" => view! {
+                                <input type="checkbox" prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) />
+                            }.into_any(),
+                            "longtext" => view! {
+                                <textarea class=format!("{INPUT} min-h-20 text-sm") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev))></textarea>
+                            }.into_any(),
+                            kind => {
+                                let t = match kind { "secret" => "password", "number" => "number", _ => "text" };
+                                view! { <input type=t autocomplete="off" class=format!("{INPUT} py-1 text-sm") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev)) /> }.into_any()
+                            }
+                        };
+                        view! {
+                            <label class="block space-y-0.5">
+                                <span class="text-xs text-zinc-600 dark:text-zinc-400">{label}{f.required.then_some(" *")}</span>
+                                {input}
+                                {(!f.description.is_empty()).then(|| view! { <span class="block text-[11px] text-zinc-500">{f.description.clone()}</span> })}
+                                {(f.r#type == "secret").then(|| view! { <span class="block text-[11px] text-zinc-500">"Kept from the model: it only passes it on."</span> })}
+                            </label>
+                        }
+                    }).collect_view()}
+                    {move || error.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
+                    <div class="flex gap-2">
+                        <button class=BUTTON disabled=move || sent.get() on:click=move |_| submit(false)>"Send"</button>
+                        <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" disabled=move || sent.get() on:click=move |_| submit(true)>"Cancel"</button>
+                    </div>
+                </div>
+            })}
+        </div>
+    }
+}
+
+/// A secret an operation returned, for you: copy it now.
+#[component]
+fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoView {
+    let copied = RwSignal::new(false);
+    let value = StoredValue::new(card.value.clone());
+    let id = card.call_id.clone();
+    view! {
+        <div class="space-y-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/40">
+            <div class="flex items-center gap-2">
+                <span>"🔑"</span>
+                <span class="font-medium">{card.title.clone()}</span>
+                <span class="text-xs text-zinc-500">"only you see this; it is not kept"</span>
+                <span class="flex-1"></span>
+                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| on_dismiss.run(id.clone())>"Dismiss"</button>
+            </div>
+            <pre class="select-all overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{card.value.clone()}</pre>
+            <div class="flex items-center gap-2">
+                <button class=BUTTON on:click=move |_| {
+                    let _ = window().navigator().clipboard().write_text(&value.get_value());
+                    copied.set(true);
+                }>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
+                <span class="text-xs text-zinc-600 dark:text-zinc-400">{card.note.clone()}</span>
+            </div>
         </div>
     }
 }
