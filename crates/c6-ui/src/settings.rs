@@ -298,6 +298,9 @@ fn ConnectionRow(c: Connection, on_change: impl Fn() + Copy + Send + Sync + 'sta
         });
     };
     let check = RwSignal::new(None::<Result<Vec<String>, String>>);
+    let reauth = RwSignal::new(false);
+    let chatgpt = c.kind == "chatgpt";
+    let again_id = c.id.clone();
     let test_id = c.id.clone();
     let test = move |_| {
         let id = test_id.clone();
@@ -318,9 +321,11 @@ fn ConnectionRow(c: Connection, on_change: impl Fn() + Copy + Send + Sync + 'sta
                     {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
             </div>
+            {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}
             <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=test>"Test"</button>
             <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=remove>"Delete"</button>
         </div>
+        {move || reauth.get().then(|| view! { <ChatGptSignIn on_added=move || { reauth.set(false); on_change(); } again=again_id.clone() /> })}
     }
 }
 
@@ -460,8 +465,15 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
 /// the head directly when this browser runs on the head machine, otherwise
 /// the user pastes the address it ended on.
 #[component]
-fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
-    let name = RwSignal::new("ChatGPT".to_owned());
+fn ChatGptSignIn(
+    on_added: impl Fn() + Copy + Send + Sync + 'static,
+    /// Sign this connection's account in again (instead of adding one).
+    #[prop(optional)]
+    again: Option<String>,
+) -> impl IntoView {
+    let again = StoredValue::new(again);
+    let name = RwSignal::new(String::new());
+    let email = RwSignal::new(String::new());
     let url = RwSignal::new(None::<String>);
     let callback = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
@@ -470,7 +482,8 @@ fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
     let start = move |_| {
         pending.set(true);
         spawn_local(async move {
-            match api::start_chatgpt(name.get_untracked()).await {
+            let hint = Some(email.get_untracked()).filter(|e| !e.trim().is_empty());
+            match api::start_chatgpt(name.get_untracked(), again.get_value(), hint).await {
                 Ok(r) => {
                     let _ = window().open_with_url_and_target(&r.authorize_url, "_blank");
                     url.set(Some(r.authorize_url));
@@ -497,20 +510,33 @@ fn ChatGptSignIn(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
         });
     };
 
+    let adding = again.with_value(Option::is_none);
     view! {
-        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-            <div>
-                <h2 class="font-medium">"Sign in with ChatGPT"</h2>
-                <p class="text-sm text-zinc-500">"Use your ChatGPT plan for OpenAI models. The head keeps and refreshes the sign-in; workers only ever get short-lived tokens."</p>
-            </div>
+        <section class=if adding { "space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800" } else { "space-y-2 px-4 pb-3" }>
+            {adding.then(|| view! {
+                <div>
+                    <h2 class="font-medium">"Add a ChatGPT account"</h2>
+                    <p class="text-sm text-zinc-500">"Use a ChatGPT plan for OpenAI models; add as many accounts and workspaces as you like, each its own connection. The head keeps and refreshes each sign-in; workers only ever get short-lived tokens. To add a different account than the one signed in at chatgpt.com in this browser, give its email, or sign out there first."</p>
+                </div>
+            })}
             {move || match url.get() {
-                None => view! {
-                    <div class="flex items-end gap-2">
-                        <label class="block flex-1 text-xs text-zinc-500">
+                None if adding => view! {
+                    <div class="flex flex-wrap items-end gap-2">
+                        <label class="block min-w-40 flex-1 text-xs text-zinc-500">
                             "Connection name"
-                            <input class=format!("mt-1 {INPUT}") prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                            <input class=format!("mt-1 {INPUT}") placeholder="ChatGPT (your email)" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                        </label>
+                        <label class="block min-w-40 flex-1 text-xs text-zinc-500">
+                            "Account email (optional)"
+                            <input class=format!("mt-1 {INPUT}") type="email" placeholder="to pick the account" prop:value=move || email.get() on:input=move |ev| email.set(event_target_value(&ev)) />
                         </label>
                         <button class=BUTTON disabled=move || pending.get() on:click=start>"Sign in"</button>
+                    </div>
+                }.into_any(),
+                None => view! {
+                    <div class="flex items-center gap-2 text-sm">
+                        <span class="flex-1 text-zinc-500">"Sign this account in again (if its sign-in expired or was revoked)."</span>
+                        <button class=BUTTON disabled=move || pending.get() on:click=start>"Sign in again"</button>
                     </div>
                 }.into_any(),
                 Some(u) => view! {

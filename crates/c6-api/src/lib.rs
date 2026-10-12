@@ -200,7 +200,15 @@ pub struct CreateSession {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StartChatGptSignIn {
+    #[serde(default)]
     pub name: String,
+    /// Sign this connection's account in again (its sign-in expired or was
+    /// revoked); none: add an account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    /// An email to suggest to OpenAI's sign-in page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

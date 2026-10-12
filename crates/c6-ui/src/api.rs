@@ -156,8 +156,14 @@ pub async fn create_connection(req: CreateConnection) -> Result<Connection, Stri
     send_json(Request::post("/api/v1/connections"), &req).await
 }
 
-pub async fn start_chatgpt(name: String) -> Result<c6_api::ChatGptSignIn, String> {
-    send_json(Request::post("/api/v1/connections/chatgpt/start"), &c6_api::StartChatGptSignIn { name }).await
+/// Starts signing in with ChatGPT: a new account, or `connection_id`'s
+/// account again.
+pub async fn start_chatgpt(
+    name: String,
+    connection_id: Option<String>,
+    login_hint: Option<String>,
+) -> Result<c6_api::ChatGptSignIn, String> {
+    send_json(Request::post("/api/v1/connections/chatgpt/start"), &c6_api::StartChatGptSignIn { name, connection_id, login_hint }).await
 }
 
 pub async fn complete_chatgpt(callback_url: String) -> Result<Connection, String> {

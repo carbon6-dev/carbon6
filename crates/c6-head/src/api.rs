@@ -317,22 +317,30 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
 }
 
 async fn chatgpt_start(State(st): State<Arc<HeadState>>, Json(req): Json<api::StartChatGptSignIn>) -> ApiResult<Json<api::ChatGptSignIn>> {
-    let name = Some(req.name.trim()).filter(|n| !n.is_empty()).unwrap_or("ChatGPT").to_owned();
-    // Reuse the client id issued to us by an earlier sign-in.
-    let mut client_id = None;
-    for c in st.store.connections().await?.into_iter().filter(|c| c.kind == "chatgpt") {
-        if let Some(t) = c
-            .api_key
-            .as_deref()
-            .and_then(|k| st.secrets.decrypt(k).ok())
-            .and_then(|j| serde_json::from_str::<crate::oauth::ChatGptTokens>(&j).ok())
-        {
-            client_id = Some(t.client_id);
-            break;
+    let name = req.name.trim().to_owned();
+    // Signing an account in again uses its own client id (each account has
+    // one); a new account registers afresh.
+    let reauth = match req.connection_id.as_deref().filter(|c| !c.is_empty()) {
+        Some(id) => {
+            let tokens = chatgpt_saved(&st, id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such ChatGPT connection".into()))?;
+            Some(crate::oauth::Reauth {
+                connection_id: id.to_owned(),
+                client_id: tokens.client_id,
+                id_token: tokens.id_token,
+                sub: tokens.sub,
+            })
         }
-    }
+        None => None,
+    };
     let host_id = chatgpt_host_id(&st).await?;
-    Ok(Json(api::ChatGptSignIn { authorize_url: st.oauth.start(&name, st.ui_port, client_id, &host_id) }))
+    Ok(Json(api::ChatGptSignIn { authorize_url: st.oauth.start(&name, st.ui_port, reauth, &host_id, req.login_hint.as_deref()) }))
+}
+
+/// A ChatGPT connection's saved sign-in.
+async fn chatgpt_saved(st: &HeadState, id: &str) -> anyhow::Result<Option<crate::oauth::ChatGptTokens>> {
+    let Some(c) = st.store.connection(id).await?.filter(|c| c.kind == "chatgpt") else { return Ok(None) };
+    let Some(blob) = c.api_key.as_deref() else { return Ok(None) };
+    Ok(serde_json::from_str(&st.secrets.decrypt(blob)?).ok())
 }
 
 /// This head's `ext_agent_host_id` for ChatGPT sign-in: made once, then kept
@@ -347,14 +355,37 @@ async fn chatgpt_host_id(st: &HeadState) -> anyhow::Result<String> {
     Ok(id)
 }
 
+/// Saves a sign-in: to the connection signed in again, to the connection
+/// already holding this account (and workspace), or as a new connection.
 async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::Connection> {
     let done = st.oauth.complete(&st.http, callback).await?;
+    let secret = st.secrets.encrypt(&serde_json::to_string(&done.tokens)?)?;
+    let mut existing = done.reauth.as_ref().map(|r| r.connection_id.clone());
+    if existing.is_none() {
+        for c in st.store.connections().await?.into_iter().filter(|c| c.kind == "chatgpt") {
+            if let Some(t) = chatgpt_saved(st, &c.id).await?
+                && !t.sub.is_empty()
+                && t.sub == done.tokens.sub
+                && t.workspace == done.tokens.workspace
+            {
+                existing = Some(c.id);
+                break;
+            }
+        }
+    }
+    if let Some(id) = existing {
+        st.store.set_connection_secret(&id, &secret).await?;
+        let row = st.store.connection(&id).await?.ok_or_else(|| anyhow::anyhow!("the connection went away"))?;
+        return Ok(connection_view(row));
+    }
+    let who = if done.tokens.email.is_empty() { done.tokens.sub.clone() } else { done.tokens.email.clone() };
+    let name = if done.name.is_empty() || done.name == "ChatGPT" { format!("ChatGPT ({who})") } else { done.name };
     let row = crate::store::ConnectionRow {
         id: uuid::Uuid::now_v7().to_string(),
-        name: done.name,
+        name,
         kind: "chatgpt".into(),
         base_url: crate::oauth::RESOURCE.into(),
-        api_key: Some(st.secrets.encrypt(&serde_json::to_string(&done.tokens)?)?),
+        api_key: Some(secret),
         default_model: None,
         created_at: now_ms(),
     };
