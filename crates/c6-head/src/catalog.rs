@@ -152,6 +152,7 @@ const AREAS: &[(&str, &str)] = &[
     ("connections", "Model providers: API keys, ChatGPT sign-in, local servers; their models."),
     ("routing", "Which model a session uses (routes by label), and policies (ask/deny for tools)."),
     ("automation", "Automations (cron, webhooks, memex events), templates, workflows and their runs."),
+    ("followthrough", "Project kits: reactions to what sessions do (a push), next steps, and trackers that follow CI runs and the like."),
     ("knowledge", "Memory notes, and the memex: search, notes, trails, documents, settings, folders, review, commitments, graph."),
     ("mail", "Mail, calendar and contacts through the memex's Google accounts."),
     ("photos", "Photos and videos in the memex."),
@@ -239,6 +240,7 @@ fn build() -> Vec<Op> {
     v.extend(list_setting!("settings.budgets.get", "settings.budgets.put", "usage", "/api/v1/settings/budgets", api::Budget, "Budgets: spending limits per period and label, warn or stop."));
     v.extend(list_setting!("settings.hosts.get", "settings.hosts.put", "hosts", "/api/v1/settings/hosts", api::Host, "The SSH host inventory: name, target, worker to reach it through, labels."));
     v.extend(list_setting!("settings.workflows.get", "settings.workflows.put", "automation", "/api/v1/settings/workflows", api::Workflow, "Workflows: steps of sessions, approvals and conditions."));
+    v.extend(list_setting!("settings.kits.get", "settings.kits.put", "followthrough", "/api/v1/settings/kits", api::Kit, "Project kits: per labels (e.g. repo:…), reactions to what sessions do (when a tool call matches: check something, then suggest, track, notify or tell) and trackers (probe something until it ends; investigate failures)."));
     v.extend(list_setting!("settings.memex_scopes.get", "settings.memex_scopes.put", "knowledge", "/api/v1/settings/memex_scopes", api::MemexScope, "Memex scope rules: which kinds of items (email, photo…) sessions with given labels may see."));
     v.extend(list_setting!("settings.memex_folders.get", "settings.memex_folders.put", "knowledge", "/api/v1/settings/memex_folders", api::MemexFolder, "Folders on the memex's machine it reads (documents, papers, photos, videos)."));
     v.extend([
@@ -273,6 +275,15 @@ fn build() -> Vec<Op> {
         op!("workflows.runs", "automation", "GET" "/api/v1/workflows/runs", Read, Input::Query(schema::<WorkflowRunsQuery>), "Workflow runs, newest first."),
         op!("workflows.runs.get", "automation", "GET" "/api/v1/workflows/runs/{id}", Read, Input::None, "A workflow run with its steps.", choices = &[("id", "workflows.runs")]),
         op!("workflows.steps.decide", "automation", "POST" "/api/v1/workflows/runs/{id}/steps/{step}/decide", Write, Input::Body(schema::<api::ApprovalDecision>), "Approves or rejects a workflow step waiting for you.", choices = &[("id", "workflows.runs")]),
+
+        // Follow-through.
+        op!("kits.dry_run", "followthrough", "POST" "/api/v1/kits/dry-run", Read, Input::Body(schema::<api::KitDryRun>), "Runs a kit's checks and tracker probes once (a saved kit by name, or one given), to see that they work; update_state marks it active or broken.", choices = &[("body.session_id", "sessions.list")]),
+        op!("sessions.followups", "followthrough", "GET" "/api/v1/sessions/{id}/followups", Read, Input::None, "A session's next steps and trackers.", choices = &[("id", "sessions.list")]),
+        op!("sessions.suggestions.take", "followthrough", "POST" "/api/v1/sessions/{id}/suggestions/{sid}/take", Write, Input::None, "Takes a next step (sends it as your message).", choices = &[("id", "sessions.list")]),
+        op!("sessions.suggestions.dismiss", "followthrough", "POST" "/api/v1/sessions/{id}/suggestions/{sid}/dismiss", Write, Input::None, "Dismisses a next step.", choices = &[("id", "sessions.list")]),
+        op!("trackers.get", "followthrough", "GET" "/api/v1/trackers/{id}", Read, Input::None, "A tracker with every change it saw."),
+        op!("trackers.stop", "followthrough", "POST" "/api/v1/trackers/{id}/stop", Write, Input::None, "Stops following a tracker."),
+        op!("trackers.investigate", "followthrough", "POST" "/api/v1/trackers/{id}/investigate", Write, Input::None, "Starts an investigation of a tracker (a side chat that explains the failure and proposes a fix on a branch of its own)."),
 
         // Hosts.
         op!("hosts.list", "hosts", "GET" "/api/v1/hosts", Read, Input::None, "Hosts in the inventory with their last check."),

@@ -151,6 +151,8 @@ pub(crate) struct Feed {
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
     secrets: RwSignal<Vec<SecretCard>>,
+    /// Next steps and trackers (follow-through), kept current live.
+    followups: RwSignal<c6_api::Followups>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -170,8 +172,17 @@ impl Feed {
             queued: RwSignal::new(Vec::new()),
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
+            followups: RwSignal::new(c6_api::Followups::default()),
         };
-        let Feed { events, streaming, queued, activity, secrets } = feed;
+        let Feed { events, streaming, queued, activity, secrets, followups } = feed;
+        {
+            let id = id.clone();
+            spawn_local(async move {
+                if let Ok(f) = api::followups(id).await {
+                    followups.set(f);
+                }
+            });
+        }
         let handle = api::stream_session(
             id,
             move |msg| match msg {
@@ -205,6 +216,16 @@ impl Feed {
                 StreamMsg::Activity { running } => activity.set(Some(running)),
                 StreamMsg::Queue { queued: q } => queued.set(q),
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
+                StreamMsg::Suggestion { suggestion } => {
+                    followups.update(|f| match f.suggestions.iter_mut().find(|x| x.id == suggestion.id) {
+                        Some(x) => *x = suggestion,
+                        None => f.suggestions.push(suggestion),
+                    })
+                }
+                StreamMsg::Tracker { tracker } => followups.update(|f| match f.trackers.iter_mut().find(|x| x.id == tracker.id) {
+                    Some(x) => *x = tracker,
+                    None => f.trackers.push(tracker),
+                }),
             },
             move || events.with_untracked(|e| e.last().map(|e| e.seq).unwrap_or(0)),
         );
@@ -446,7 +467,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 /// shown under them (recursively).
 #[component]
 fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoView {
-    let Feed { events, streaming, queued, secrets, .. } = feed;
+    let Feed { events, streaming, queued, secrets, followups, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     let results = Memo::new(move |_| {
         events.with(|evs| {
@@ -477,6 +498,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
     let children = LocalResource::new(move || {
         results.track();
         refresh.track();
+        // Investigations are side chats the head starts.
+        followups.with(|f| f.trackers.iter().filter(|t| t.investigation.is_some()).count());
         api::children(id.get_value())
     });
     let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
@@ -587,6 +610,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                         {move || rewinding.get().filter(|(s, _)| *s == seq).map(|(_, edit)| view! {
                             <RewindPanel session=id.get_value() seq text=user_text.clone().unwrap_or_default() edit on_done=Callback::new(move |()| rewinding.set(None)) />
                         })}
+                        <Followups session=id.get_value() seq followups />
                         <For
                             each=move || child_list.with(|cs| cs.iter().filter(|c| c.fork_seq == Some(seq)).cloned().collect::<Vec<_>>())
                             key=|c| c.id.clone()
@@ -2057,6 +2081,111 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
                 }>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
                 <span class="text-xs text-zinc-600 dark:text-zinc-400">{card.note.clone()}</span>
             </div>
+        </div>
+    }
+}
+
+/// Next steps and trackers anchored at event `seq`.
+#[component]
+fn Followups(session: String, seq: u64, followups: RwSignal<c6_api::Followups>) -> impl IntoView {
+    let sid = StoredValue::new(session);
+    let next = Memo::new(move |_| {
+        followups.with(|f| {
+            f.suggestions.iter().filter(|s| s.anchor_seq == seq && s.kind == "next" && s.state == "open").cloned().collect::<Vec<_>>()
+        })
+    });
+    let trackers = Memo::new(move |_| followups.with(|f| f.trackers.iter().filter(|t| t.anchor_seq == seq).cloned().collect::<Vec<_>>()));
+    let error = RwSignal::new(None::<String>);
+    view! {
+        {move || trackers.get().into_iter().map(|t| view! { <TrackerCard t /> }).collect_view()}
+        {move || (!next.get().is_empty()).then(|| view! {
+            <div class="flex flex-wrap items-center gap-1.5 pl-1">
+                <span class="text-xs text-zinc-500">"Next:"</span>
+                {next.get().into_iter().map(|s| {
+                    let (take_id, drop_id) = (s.id, s.id);
+                    view! {
+                        <span class="inline-flex items-center overflow-hidden rounded-full border border-sky-300 text-xs dark:border-sky-800">
+                            <button class="px-2.5 py-1 text-sky-800 hover:bg-sky-50 dark:text-sky-300 dark:hover:bg-sky-950" title=s.prompt.clone()
+                                on:click=move |_| spawn_local(async move {
+                                    if let Err(e) = api::take_suggestion(sid.get_value(), take_id).await { error.set(Some(e)); }
+                                })>{s.text.clone()}</button>
+                            <button class="border-l border-sky-200 px-1.5 py-1 text-zinc-400 hover:text-zinc-700 dark:border-sky-900" title="Dismiss"
+                                on:click=move |_| spawn_local(async move {
+                                    if let Err(e) = api::dismiss_suggestion(sid.get_value(), drop_id).await { error.set(Some(e)); }
+                                })>"×"</button>
+                        </span>
+                    }
+                }).collect_view()}
+            </div>
+        })}
+        {move || error.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
+    }
+}
+
+/// A tracker, live: its phase and line, a link, its history, and what you
+/// can do with it.
+#[component]
+fn TrackerCard(t: c6_api::Tracker) -> impl IntoView {
+    let id = t.id;
+    let open = RwSignal::new(false);
+    let history = LocalResource::new(move || {
+        open.track();
+        async move { if open.get_untracked() { api::tracker(id).await.ok() } else { None } }
+    });
+    let ended = t.ended_at.is_some();
+    let (dot, tone) = match t.phase.as_str() {
+        "succeeded" => ("✓", "border-emerald-300 dark:border-emerald-900"),
+        "failed" => ("✗", "border-red-300 dark:border-red-900"),
+        "running" => ("●", "border-sky-300 dark:border-sky-900"),
+        "waiting" => ("◌", "border-zinc-300 dark:border-zinc-700"),
+        _ => ("■", "border-zinc-300 dark:border-zinc-700"),
+    };
+    let pulse = matches!(t.phase.as_str(), "running" | "waiting");
+    let error = RwSignal::new(None::<String>);
+    let investigation = t.investigation.clone();
+    let failed = t.phase == "failed";
+    view! {
+        <div class=format!("space-y-1 rounded-md border px-3 py-2 text-sm {tone}")>
+            <div class="flex flex-wrap items-center gap-2">
+                <span class:animate-pulse=pulse>{dot}</span>
+                <span class="font-medium">{t.title.clone()}</span>
+                <span class="text-xs text-zinc-500">{t.phase.clone()}</span>
+                <span class="min-w-0 flex-1 truncate text-xs text-zinc-600 dark:text-zinc-400">{t.line.clone()}</span>
+                {(!t.url.is_empty()).then(|| view! { <a href=t.url.clone() target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open ↗"</a> })}
+                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| open.update(|o| *o = !*o)>{move || if open.get() { "hide history" } else { "history" }}</button>
+                {(!ended).then(|| view! {
+                    <button class="text-xs text-zinc-500 hover:text-red-600" on:click=move |_| spawn_local(async move {
+                        if let Err(e) = api::stop_tracker(id).await { error.set(Some(e)); }
+                    })>"stop"</button>
+                })}
+                {(failed && investigation.is_none()).then(|| view! {
+                    <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| spawn_local(async move {
+                        if let Err(e) = api::investigate_tracker(id).await { error.set(Some(e)); }
+                    })>"investigate"</button>
+                })}
+            </div>
+            {investigation.map(|s| view! {
+                <p class="text-xs text-zinc-500">"Investigating in a side chat below · "
+                    <crate::workspace::Go to=crate::workspace::View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"open it"</crate::workspace::Go>
+                </p>
+            })}
+            {(!t.error.is_empty()).then(|| view! { <p class="text-xs text-amber-700">{format!("Probe: {}", t.error)}</p> })}
+            {move || error.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
+            {move || open.get().then(|| history.get().flatten().map(|h| view! {
+                <ol class="space-y-0.5 border-l border-zinc-200 pl-3 text-xs dark:border-zinc-800">
+                    {h["observations"].as_array().cloned().unwrap_or_default().into_iter().map(|o| {
+                        let ts = o["ts"].as_i64().unwrap_or(0);
+                        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ts as f64));
+                        view! {
+                            <li>
+                                <span class="text-zinc-400">{String::from(d.to_locale_time_string("default"))}</span>" "
+                                <span class="font-medium">{o["phase"].as_str().unwrap_or("").to_owned()}</span>" "
+                                <span class="text-zinc-600 dark:text-zinc-400">{o["line"].as_str().unwrap_or("").to_owned()}</span>
+                            </li>
+                        }
+                    }).collect_view()}
+                </ol>
+            }))}
         </div>
     }
 }

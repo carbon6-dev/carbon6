@@ -124,6 +124,14 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/live", get(live))
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
+        .route("/api/v1/settings/kits", get(get_kits).put(put_kits))
+        .route("/api/v1/kits/dry-run", post(kit_dry_run))
+        .route("/api/v1/sessions/{id}/followups", get(session_followups))
+        .route("/api/v1/sessions/{id}/suggestions/{sid}/take", post(take_suggestion))
+        .route("/api/v1/sessions/{id}/suggestions/{sid}/dismiss", post(dismiss_suggestion))
+        .route("/api/v1/trackers/{id}", get(get_tracker))
+        .route("/api/v1/trackers/{id}/stop", post(stop_tracker))
+        .route("/api/v1/trackers/{id}/investigate", post(investigate_tracker))
         .route("/api/v1/assistant", post(ask_assistant))
         .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
         .route("/api/v1/catalog", get(get_catalog))
@@ -1864,4 +1872,50 @@ async fn answer_question(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "the conversation is not running".into()))
     }
+}
+
+// --- Follow-through: kits, next steps, trackers ---------------------------------
+
+async fn get_kits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Kit>>> {
+    Ok(Json(crate::followups::kits(&st).await?))
+}
+
+async fn put_kits(State(st): State<Arc<HeadState>>, Json(k): Json<Vec<api::Kit>>) -> ApiResult<StatusCode> {
+    crate::followups::check_kits(&k)?;
+    st.store.set_setting(crate::followups::KITS, &serde_json::to_string(&k).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn kit_dry_run(State(st): State<Arc<HeadState>>, Json(r): Json<api::KitDryRun>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::followups::dry_run(&st, &r).await?))
+}
+
+async fn session_followups(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::Followups>> {
+    Ok(Json(crate::followups::for_session(&st, &id).await?))
+}
+
+/// Takes a next step: sends its prompt as your message.
+async fn take_suggestion(State(st): State<Arc<HeadState>>, Path((id, sid)): Path<(String, i64)>) -> ApiResult<Json<api::QueuedInput>> {
+    let prompt = crate::followups::decide_suggestion(&st, &id, sid, true).await?;
+    Ok(Json(crate::sessions::send_input(&st, &id, &api::SendMessage { text: prompt, ..Default::default() }).await?))
+}
+
+async fn dismiss_suggestion(State(st): State<Arc<HeadState>>, Path((id, sid)): Path<(String, i64)>) -> ApiResult<StatusCode> {
+    crate::followups::decide_suggestion(&st, &id, sid, false).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A tracker with everything it saw.
+async fn get_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let t = crate::followups::tracker(&st, id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such tracker".into()))?;
+    Ok(Json(serde_json::json!({"tracker": t, "observations": crate::followups::observations(&st, id).await?})))
+}
+
+async fn stop_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+    crate::followups::stop(&st, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn investigate_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({"session_id": crate::followups::investigate_now(&st, id).await?})))
 }

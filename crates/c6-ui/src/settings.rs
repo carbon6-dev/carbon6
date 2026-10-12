@@ -8,9 +8,10 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// The sections of Settings: (id, title, what is in it).
-const SECTIONS: [(&str, &str, &str); 10] = [
+const SECTIONS: [(&str, &str, &str); 11] = [
     ("models", "Models", "Connections, model routing, the assistant"),
     ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
+    ("projects", "Projects", "Kits: what sessions follow through on (next steps, CI and the like)"),
     ("rules", "Policies", "Ask or deny the agent's tool calls"),
     ("automation", "Automation", "Templates, workflows, automations"),
     ("notifications", "Notifications", "Channels, push on this device, links"),
@@ -115,6 +116,16 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         <HooksSetting />
                         <WebSearchSetting />
                         <SecretsSetting />
+                    }.into_any(),
+                    "projects" => view! {
+                        <JsonSetting
+                            name="kits"
+                            title="Project kits"
+                            help="How sessions with given labels (e.g. repo:github.com/you/app) follow through. Reactions: when a tool call matches (tool, input and output regular expressions; output's named groups become {{vars.…}}), run a check (on the session's worker, a named worker such as one inside a private network, or the head), then suggest a next step, track something, notify you, or tell the agent. Trackers: probe until done (print JSON with phase, line, url, or map the output with phase rules), shown live at the event that started them; every change is kept; a failure starts an investigation that proposes a fix on its own branch. Nothing about any CI or forge is built in. Agents read and write kits too (see docs/follow-through.md)."
+                            presets=kit_presets
+                            example=r#"[{"name": "app", "applies_to": ["repo:github.com/you/app"], "reactions": [], "trackers": []}]"#
+                        />
+                        <KitDryRun />
                     }.into_any(),
                     "rules" => view! {
                     <ListSetting
@@ -563,6 +574,38 @@ fn ChatGptSignIn(
 type Preset = (&'static str, &'static str, serde_json::Value);
 
 /// Ready-made MCP servers: (label, the secrets it needs, its config).
+fn kit_presets() -> Vec<Preset> {
+    use serde_json::json;
+    vec![
+        (
+            "GitHub: offer a PR after a push",
+            "gh signed in on the worker; set applies_to to your repo",
+            json!({"name": "github-pr", "applies_to": ["repo:github.com/you/app"], "reactions": [{
+                "name": "after push",
+                "when": {"tool": "(?i)bash", "input": "git push", "output": "(?P<branch>[\\w./-]+) -> (?P<remote>[\\w./-]+)"},
+                "check": {"command": "gh pr view --json number,state,url 2>/dev/null || echo '{}'"},
+                "then": [{"kind": "suggest", "text": "Open a PR for {{vars.branch}}", "if": [{"var": "check.json.number", "exists": false}]}]
+            }]}),
+        ),
+        (
+            "CI run in Argo, probed from a worker inside a private network",
+            "a worker that reaches Argo (here build-1), argo CLI there, workflows labelled with the commit",
+            json!({"name": "argo-ci", "applies_to": ["repo:github.com/you/app"], "reactions": [{
+                "name": "after push",
+                "when": {"tool": "(?i)bash", "input": "git push"},
+                "check": {"command": "git rev-parse HEAD; git branch --show-current"},
+                "then": [{"kind": "track", "tracker": "ci"}]
+            }], "trackers": [{
+                "name": "ci",
+                "title": "CI for {{vars.sha}}",
+                "probe": {"on": "worker", "worker": "build-1", "command": "argo list -n ci -l git-sha={{vars.sha}} -o json | jq -c '.[0] // {} | {phase: ({\"Pending\":\"running\",\"Running\":\"running\",\"Succeeded\":\"succeeded\",\"Failed\":\"failed\",\"Error\":\"failed\"}[.status.phase] // \"waiting\"), line: (.status.progress // \"\"), url: (\"https://argo.internal/workflows/ci/\" + (.metadata.name // \"\"))}'"},
+                "interval_s": 30,
+                "logs": {"on": "worker", "worker": "build-1", "command": "argo logs -n ci @latest --tail 200 2>&1 | tail -c 20000"}
+            }]}),
+        ),
+    ]
+}
+
 fn workflow_presets() -> Vec<Preset> {
     use serde_json::json;
     vec![
@@ -2302,6 +2345,51 @@ fn MemorySetting() -> impl IntoView {
                 {move || editing.get().is_some().then(|| view! { <button class=BUTTON_QUIET on:click=move |_| { editing.set(None); text.set(String::new()); }>"Cancel"</button> })}
                 <button class=BUTTON on:click=save>{move || if editing.get().is_some() { "Save note" } else { "Add note" }}</button>
             </div>
+        </section>
+    }
+}
+
+/// Runs a kit's checks and probes once.
+#[component]
+fn KitDryRun() -> impl IntoView {
+    let (name, worker, vars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let result = RwSignal::new(None::<Result<serde_json::Value, String>>);
+    let busy = RwSignal::new(false);
+    let run = move |_| {
+        let mut v = serde_json::Map::new();
+        for pair in vars.get_untracked().split(',') {
+            if let Some((k, val)) = pair.split_once('=') {
+                v.insert(k.trim().to_owned(), serde_json::json!(val.trim()));
+            }
+        }
+        let body = serde_json::json!({"name": name.get_untracked().trim(), "worker": worker.get_untracked().trim(), "vars": v});
+        busy.set(true);
+        spawn_local(async move {
+            result.set(Some(api::kit_dry_run(body).await));
+            busy.set(false);
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Try a kit"</h2>
+                <p class="text-sm text-zinc-500">"Runs a saved kit's checks and tracker probes once, with values you give, and shows what they found and what would happen."</p>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-3">
+                <input class=format!("{INPUT} py-1 text-sm") placeholder="kit name" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} py-1 text-sm") placeholder="worker for session probes" prop:value=move || worker.get() on:input=move |ev| worker.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="sha=abc123, branch=main" prop:value=move || vars.get() on:input=move |ev| vars.set(event_target_value(&ev)) />
+            </div>
+            <div class="flex justify-end"><button class=BUTTON disabled=move || busy.get() on:click=run>{move || if busy.get() { "Running…" } else { "Dry run" }}</button></div>
+            {move || result.get().map(|r| match r {
+                Ok(v) => view! {
+                    <p class=if v["ok"] == true { "text-sm text-emerald-700 dark:text-emerald-400" } else { "text-sm text-amber-700" }>
+                        {if v["ok"] == true { "Everything ran." } else { "Something did not run; see below." }}
+                    </p>
+                    <pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-900">{serde_json::to_string_pretty(&v).unwrap_or_default()}</pre>
+                }.into_any(),
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+            })}
         </section>
     }
 }

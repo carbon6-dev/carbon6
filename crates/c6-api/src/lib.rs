@@ -225,7 +225,7 @@ pub struct CompleteChatGptSignIn {
     pub callback_url: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SendMessage {
     pub text: String,
@@ -486,6 +486,263 @@ pub enum TurnEndReason {
     Unknown,
 }
 
+/// A project kit (`/api/v1/settings/kits`): how sessions with these labels
+/// follow through (docs/follow-through.md): reactions to what they do, and
+/// trackers for what that starts outside carbon6.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Kit {
+    pub name: String,
+    /// Labels a session must all have, e.g. repo:github.com/you/app.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    /// proposed, active, broken or disabled; only active kits act.
+    #[serde(default = "kit_active")]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub trackers: Vec<TrackerDef>,
+}
+
+fn kit_active() -> String {
+    "active".into()
+}
+
+/// When a session does something: check something, then act.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Reaction {
+    pub name: String,
+    pub when: Trigger,
+    /// Run this first; its output is `check` in conditions and templates
+    /// (`check.exit`, `check.stdout`, `check.lines.0`, `check.json.…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Probe>,
+    #[serde(default)]
+    pub then: Vec<Action>,
+}
+
+/// A tool call that fires a reaction.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Trigger {
+    /// A regular expression over the tool's name (bash, Bash, …); empty: any.
+    #[serde(default)]
+    pub tool: String,
+    /// A regular expression over the call's input (JSON); empty: any.
+    #[serde(default)]
+    pub input: String,
+    /// A regular expression over the tool's output; its named groups
+    /// become `vars.<name>`. Empty: any.
+    #[serde(default)]
+    pub output: String,
+    /// success (default), failure or any.
+    #[serde(default)]
+    pub result: String,
+}
+
+/// A command to run, and where.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Probe {
+    /// A shell command; {{vars.…}}, {{session.…}} and {{check.…}} are
+    /// filled in.
+    pub command: String,
+    /// session (its worker, in its folder; default), worker (by name, e.g.
+    /// one inside a private network) or head.
+    #[serde(default)]
+    pub on: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker: String,
+    /// Seconds before it is stopped (default 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+    /// carbon6 secrets to set as environment variables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+}
+
+/// What a reaction (or a tracker's end) does.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Action {
+    /// suggest (a next step), track (start a tracker), notify (you), or
+    /// tell (the agent, with your next message).
+    pub kind: String,
+    /// Only if all of these hold.
+    #[serde(default, rename = "if", skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+    /// The suggestion, notification title or note (a template).
+    #[serde(default)]
+    pub text: String,
+    /// For suggest: what is sent when you take it (default: the text).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    /// For track: the kit's tracker to start.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tracker: String,
+}
+
+/// A test on a value (`var` is a path like check.exit or vars.branch).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Condition {
+    pub var: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_equals: Option<serde_json::Value>,
+    /// A regular expression the value (as text) matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<String>,
+    /// The value is there (true) or missing, null or empty (false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
+}
+
+/// Something outside carbon6 to follow for a while (a CI run).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TrackerDef {
+    pub name: String,
+    /// Its title (a template), e.g. CI for {{vars.sha}}.
+    #[serde(default)]
+    pub title: String,
+    /// Run every interval. If its output is JSON with "phase" (and "line",
+    /// "url"), that is the state; otherwise `phases` and `line` decide.
+    pub probe: Probe,
+    /// The first rule whose conditions hold gives the phase: waiting,
+    /// running, succeeded, failed or cancelled. Conditions see
+    /// `probe.exit`, `probe.stdout`, `probe.json.…`.
+    #[serde(default)]
+    pub phases: Vec<PhaseRule>,
+    /// The one-line state (a template); default: the phase.
+    #[serde(default)]
+    pub line: String,
+    /// A link (a template).
+    #[serde(default)]
+    pub url: String,
+    /// Seconds between probes (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_s: Option<u64>,
+    /// How long it may stay waiting (default 900).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_s: Option<u64>,
+    /// When to give up altogether (default 21600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub give_up_s: Option<u64>,
+    /// Fetches what failed (logs) for the investigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Probe>,
+    /// On failure, start an investigation (a side chat that explains the
+    /// failure and proposes a fix on a branch of its own). Default on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigate: Option<bool>,
+    /// When it ends: actions (conditions see `phase`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_end: Vec<Action>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PhaseRule {
+    pub phase: String,
+    #[serde(default, rename = "if", skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+}
+
+/// A next step offered in a session.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Suggestion {
+    pub id: i64,
+    pub session_id: String,
+    /// Shown after this event.
+    pub anchor_seq: u64,
+    /// next (a button) or note (for the agent, with your next message).
+    pub kind: String,
+    pub text: String,
+    pub prompt: String,
+    /// Which kit and reaction, or "agent".
+    pub source: String,
+    /// open, taken, dismissed or delivered.
+    pub state: String,
+    pub created_at: UnixMs,
+}
+
+/// A tracker in a session.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Tracker {
+    pub id: i64,
+    pub session_id: String,
+    pub anchor_seq: u64,
+    pub kit: String,
+    pub name: String,
+    pub title: String,
+    /// waiting, running, succeeded, failed, cancelled or stopped.
+    pub phase: String,
+    pub line: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub error: String,
+    pub started_at: UnixMs,
+    pub updated_at: UnixMs,
+    #[serde(default)]
+    pub ended_at: Option<UnixMs>,
+    /// The investigation's side chat, if one was started.
+    #[serde(default)]
+    pub investigation: Option<String>,
+}
+
+/// One change a tracker saw (kept forever).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TrackerObservation {
+    pub ts: UnixMs,
+    pub phase: String,
+    pub line: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub output: String,
+}
+
+/// `GET /api/v1/sessions/{id}/followups`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Followups {
+    pub suggestions: Vec<Suggestion>,
+    pub trackers: Vec<Tracker>,
+}
+
+/// `POST /api/v1/kits/dry-run`: run a kit's checks and probes once.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct KitDryRun {
+    /// A kit by name, or a kit to try (not saved).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit: Option<Kit>,
+    /// A session whose worker, folder and labels to use (for `on: session`).
+    #[serde(default)]
+    pub session_id: String,
+    /// Without a session: the worker that `on: session` probes run on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker: String,
+    /// Values for {{vars.…}} (e.g. sha, branch).
+    #[serde(default)]
+    pub vars: serde_json::Map<String, serde_json::Value>,
+    /// Mark the kit active if everything ran, broken if not.
+    #[serde(default)]
+    pub update_state: bool,
+}
+
 /// One input the assistant asks for.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -592,6 +849,14 @@ pub enum StreamMsg {
         title: String,
         value: String,
         note: String,
+    },
+    /// A next step was offered, taken or dismissed.
+    Suggestion {
+        suggestion: Suggestion,
+    },
+    /// A tracker changed.
+    Tracker {
+        tracker: Tracker,
     },
     /// Current queued inputs, sent whenever they change.
     Queue {

@@ -5,6 +5,7 @@ mod background;
 mod bash;
 pub mod browser;
 mod files;
+mod followups;
 pub mod hooks;
 pub mod memex;
 pub mod memory;
@@ -18,6 +19,7 @@ mod search;
 mod util;
 mod web;
 
+pub use followups::{Followups, Suggest};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

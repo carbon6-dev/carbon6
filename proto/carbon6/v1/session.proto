@@ -470,6 +470,9 @@ message UserInput {
   // The session's labels from the head as of this message (yours, and
   // worker:<name>).
   repeated string labels = 6;
+  // Context from the head for the model only (open next steps, notes from
+  // reactions, trackers that ended), added after the text.
+  string context = 7;
 }
 
 message Interrupt {}
