@@ -327,24 +327,41 @@ pub async fn list_models(base_url: &str, bearer: &str) -> Result<Vec<String>, Ll
     if !(200..300).contains(&status) {
         return Err(LlmError::Http { status, body: truncate(&text, 2000), retry_after: None });
     }
-    #[derive(Deserialize)]
-    struct Models {
-        data: Vec<ModelId>,
+    parse_models(&text)
+}
+
+/// A model list: OpenAI's `data` of `{id}` (sorted), or a ChatGPT plan's
+/// `models` of `{slug, visibility}` (those listed, in its order).
+fn parse_models(text: &str) -> Result<Vec<String>, LlmError> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| LlmError::Protocol(e.to_string()))?;
+    if let Some(data) = v["data"].as_array() {
+        let mut ids: Vec<String> = data.iter().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect();
+        ids.sort();
+        return Ok(ids);
     }
-    #[derive(Deserialize)]
-    struct ModelId {
-        id: String,
+    if let Some(models) = v["models"].as_array() {
+        return Ok(models
+            .iter()
+            .filter(|m| m["visibility"].as_str().is_none_or(|vis| vis == "list"))
+            .filter_map(|m| m["slug"].as_str().or_else(|| m["id"].as_str()).map(str::to_owned))
+            .collect());
     }
-    let models: Models = serde_json::from_str(&text).map_err(|e| LlmError::Protocol(e.to_string()))?;
-    let mut ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
-    ids.sort();
-    Ok(ids)
+    Err(LlmError::Protocol("the model list has neither data nor models".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn model_lists() {
+        let openai = r#"{"object":"list","data":[{"id":"gpt-5","object":"model"},{"id":"gpt-4.1","object":"model"}]}"#;
+        assert_eq!(parse_models(openai).unwrap(), vec!["gpt-4.1", "gpt-5"]);
+        let plan = r#"{"models":[{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list"},{"slug":"internal","visibility":"hide"},{"slug":"gpt-5.5-mini","display_name":"GPT-5.5 mini","visibility":"list"}]}"#;
+        assert_eq!(parse_models(plan).unwrap(), vec!["gpt-5.5", "gpt-5.5-mini"]);
+        assert!(parse_models(r#"{"x":1}"#).is_err());
+    }
 
     fn parse(chunks: &[&str]) -> Vec<Result<ModelEvent, String>> {
         let mut st = StreamState::new(futures::stream::empty().boxed());
