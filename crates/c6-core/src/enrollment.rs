@@ -21,7 +21,7 @@ pub struct EnrollmentToken {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("malformed enrollment token (expected the whole c6e1.… token from the head; create a new one if it was cut short)")]
+#[error("malformed enrollment token")]
 pub struct TokenError;
 
 impl EnrollmentToken {
@@ -31,15 +31,8 @@ impl EnrollmentToken {
     }
 
     pub fn decode(s: &str) -> Result<Self, TokenError> {
-        // The token wherever it is in what was pasted (with a command
-        // around it, or broken across lines).
-        let joined: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-        let start = joined.find(PREFIX).ok_or(TokenError)?;
-        let body: String = joined[start + PREFIX.len()..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        let json = URL_SAFE_NO_PAD.decode(&body).map_err(|_| TokenError)?;
+        let body = s.trim().strip_prefix(PREFIX).ok_or(TokenError)?;
+        let json = URL_SAFE_NO_PAD.decode(body).map_err(|_| TokenError)?;
         serde_json::from_slice(&json).map_err(|_| TokenError)
     }
 }
@@ -53,8 +46,5 @@ mod tests {
         let t = EnrollmentToken { url: "https://100.64.0.1:7701".into(), ca_sha256: "ab".repeat(32), secret: "s3cret".into() };
         assert_eq!(EnrollmentToken::decode(&t.encode()).unwrap(), t);
         assert!(EnrollmentToken::decode("nope").is_err());
-        assert!(EnrollmentToken::decode("c6e1.…").is_err());
-        // Pasted with the command around it.
-        assert_eq!(EnrollmentToken::decode(&format!("c6m enroll {}\nc6m run", t.encode())).unwrap(), t);
     }
 }
