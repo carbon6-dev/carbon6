@@ -233,7 +233,7 @@ fn build() -> Vec<Op> {
     v.extend(list_setting!("settings.hooks.get", "settings.hooks.put", "settings", "/api/v1/settings/hooks", api::Hook, "Hooks: commands run around tool use and prompts (by label)."));
     v.extend(list_setting!("settings.templates.get", "settings.templates.put", "automation", "/api/v1/settings/templates", api::Template, "Session templates (a prompt, folder, model and labels to start from; fleet runs)."));
     v.extend(list_setting!("settings.policies.get", "settings.policies.put", "routing", "/api/v1/settings/policies", api::Policy, "Policies: ask or deny tool calls matching a tool and input pattern, for sessions with given labels."));
-    v.extend(list_setting!("settings.routes.get", "settings.routes.put", "routing", "/api/v1/settings/routes", api::Route, "Model routes: which connection and model sessions with given labels use (and their subagents)."));
+    v.extend(list_setting!("settings.routes.get", "settings.routes.put", "routing", "/api/v1/settings/routes", api::Route, "Model routes: which connection and model sessions use, by label (and their subagents' model)."));
     v.extend(list_setting!("settings.channels.get", "settings.channels.put", "notifications", "/api/v1/settings/channels", api::Channel, "Notification channels (push, ntfy, Slack, Discord, webhook, email) and what goes to each."));
     v.extend(list_setting!("settings.prices.get", "settings.prices.put", "usage", "/api/v1/settings/prices", api::Price, "Model prices, for cost estimates."));
     v.extend(list_setting!("settings.budgets.get", "settings.budgets.put", "usage", "/api/v1/settings/budgets", api::Budget, "Budgets: spending limits per period and label, warn or stop."));
@@ -249,9 +249,9 @@ fn build() -> Vec<Op> {
         op!("settings.web_search.put", "settings", "PUT" "/api/v1/settings/web-search", Write, Input::Body(schema::<api::WebSearchSetting>), "Sets the web search provider."),
         op!("settings.public_url.get", "notifications", "GET" "/api/v1/settings/public_url", Read, Input::None, "The address links in notifications point to."),
         op!("settings.public_url.put", "notifications", "PUT" "/api/v1/settings/public_url", Write, Input::Body(schema::<api::PublicUrl>), "Sets the address links in notifications point to."),
-        op!("settings.assistant.get", "assistant", "GET" "/api/v1/settings/assistant", Read, Input::None, "The assistant's model (none: routes for the label assistant, else the default)."),
+        op!("settings.assistant.get", "assistant", "GET" "/api/v1/settings/assistant", Read, Input::None, "Which model the assistant uses (none: routes for the label assistant, else the default)."),
         op!("settings.assistant.put", "assistant", "PUT" "/api/v1/settings/assistant", Write, Input::Body(schema::<api::AssistantSettings>), "Sets the assistant's model.", choices = &[("model.connection", "connections.list")]),
-        op!("settings.memex.get", "knowledge", "GET" "/api/v1/settings/memex", Read, Input::None, "Memex settings: the models for embeddings, understanding, vision and transcription; calls a day; brief size; places file; face models; contacts and sending options."),
+        op!("settings.memex.get", "knowledge", "GET" "/api/v1/settings/memex", Read, Input::None, "Which models the memex uses for each task: embeddings (search by meaning), understanding (summaries, topics, commitments), vision (photo captions) and transcription (videos); also calls a day, brief size, places file, face models, contacts and sending options."),
         op!("settings.memex.put", "knowledge", "PUT" "/api/v1/settings/memex", Write, Input::Body(schema::<api::MemexSettings>), "Replaces the memex settings (read them first and keep what should stay).", choices = &[("understanding.connection", "connections.list"), ("vision.connection", "connections.list"), ("embedding.connection", "connections.list")]),
 
         // Knowledge: memory.
@@ -503,20 +503,55 @@ pub fn discover(query: &str, area: Option<&str>) -> Value {
         let t = words(text);
         q.iter().filter(|w| t.contains(w)).count()
     };
+    // With a query, an area ranks its operations first rather than hiding
+    // the rest.
     let mut found: Vec<(usize, &Op)> = ops()
         .iter()
-        .filter(in_area)
         .map(|o| (score(&format!("{} {} {} {}", o.name.replace(['.', '_'], " "), o.area, o.summary, o.name)), o))
         .filter(|(s, _)| *s > 0)
+        .map(|(s, o)| (s * 2 + usize::from(area == Some(o.area)), o))
         .collect();
     found.sort_by_key(|f| std::cmp::Reverse(f.0));
     let mut docs: Vec<(usize, &(String, String))> =
         docs().iter().map(|d| (score(&format!("{} {}", d.0, d.1)) * 2 / 3 + score(&d.0), d)).filter(|(s, _)| *s > 0).collect();
     docs.sort_by_key(|d| std::cmp::Reverse(d.0));
     json!({
-        "operations": found.iter().take(15).map(|(_, o)| brief(o)).collect::<Vec<_>>(),
-        "docs": docs.iter().take(3).map(|(_, (t, b))| json!({"section": t, "text": crate::util_clip(b, 1500)})).collect::<Vec<_>>(),
+        "operations": found.iter().take(12).map(|(_, o)| brief(o)).collect::<Vec<_>>(),
+        "docs": docs.iter().take(2).map(|(_, (t, b))| json!({"section": t, "text": crate::util_clip(b.trim(), 700)})).collect::<Vec<_>>(),
     })
+}
+
+/// `discover` as the assistant reads it: operations first, then docs.
+pub fn discover_text(query: &str, area: Option<&str>) -> String {
+    let v = discover(query, area);
+    let mut out = String::new();
+    if let Some(areas) = v["areas"].as_array() {
+        out.push_str("Areas (operations):\n");
+        for a in areas {
+            out.push_str(&format!("- {} ({}): {}\n", a["area"].as_str().unwrap_or(""), a["operations"], a["what"].as_str().unwrap_or("")));
+        }
+    }
+    let ops = v["operations"].as_array().cloned().unwrap_or_default();
+    if !ops.is_empty() {
+        out.push_str("Operations (best first):\n");
+        for o in &ops {
+            out.push_str(&format!(
+                "- {} [{}] {}\n",
+                o["op"].as_str().unwrap_or(""),
+                o["effect"].as_str().unwrap_or(""),
+                o["summary"].as_str().unwrap_or("")
+            ));
+        }
+    } else if v["areas"].is_null() {
+        out.push_str("No operations match; try other words, or no query to see the areas.\n");
+    }
+    for d in v["docs"].as_array().into_iter().flatten() {
+        out.push_str(&format!("\nDocs — {}:\n{}\n", d["section"].as_str().unwrap_or(""), d["text"].as_str().unwrap_or("")));
+    }
+    if let Some(h) = v["hint"].as_str() {
+        out.push_str(&format!("\n{h}\n"));
+    }
+    out
 }
 
 #[cfg(test)]

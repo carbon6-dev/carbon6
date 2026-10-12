@@ -524,7 +524,7 @@ impl Tool for Discover {
                 .into(),
             parameters: json!({"type": "object", "properties": {
                 "query": {"type": "string", "description": "what you want to do or know, in a few words"},
-                "area": {"type": "string", "description": "limit to one area", "enum": catalog::areas().iter().map(|(a, _)| *a).collect::<Vec<_>>()}
+                "area": {"type": "string", "description": "rank this area first", "enum": catalog::areas().iter().map(|(a, _)| *a).collect::<Vec<_>>()}
             }, "additionalProperties": false}),
         }
     }
@@ -534,8 +534,10 @@ impl Tool for Discover {
     }
 
     async fn call(&self, _ctx: &ToolCtx, input: Value) -> ToolOutput {
-        let v = catalog::discover(input["query"].as_str().unwrap_or(""), input["area"].as_str().filter(|a| !a.is_empty()));
-        ToolOutput::limited(serde_json::to_string_pretty(&v).unwrap_or_default(), false)
+        ToolOutput::limited(
+            catalog::discover_text(input["query"].as_str().unwrap_or(""), input["area"].as_str().filter(|a| !a.is_empty())),
+            false,
+        )
     }
 }
 
@@ -965,6 +967,8 @@ real options: workers, connections, sessions…). Never guess names, ids or sett
 - Destructive operations wait for the user's approval in the UI; say what you are about to do and why before calling one.
 - Secrets (tokens, codes) returned by operations are shown to the user directly; you never see them. For a secret the user must \
 give (an API key, a password), ask with a secret field.
+- Which model does what is in settings: sessions by settings.routes (by label), the memex's tasks (embeddings, understanding, \
+vision, transcription) in settings.memex, yourself in settings.assistant. A connection's available models: connections.models.
 - Be brief. After acting, say what you did and anything the user should do next (e.g. run a command on another machine).
 - You cannot run commands or read files yourself. For work on a machine, start a session on a worker (sessions.create) and \
 tell the user; for something recurring, create an automation or workflow.
