@@ -170,7 +170,7 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
             .iter()
             .find(|c| c.id == m.connection || c.name == m.connection)
             .ok_or_else(|| bad_request(format!("no connection {:?}", m.connection)))?;
-        if c.kind == "anthropic" || c.kind == "claude_code" {
+        if matches!(c.kind.as_str(), "anthropic" | "claude_code" | "chatgpt") {
             return Err(bad_request(format!(
                 "{} has no embedding models; choose an OpenAI or OpenAI-compatible (e.g. Ollama) connection",
                 c.name
@@ -190,7 +190,7 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
         if c.kind == "claude_code" {
             return Err(bad_request(format!("{what}: the memex calls models directly; choose an API connection, not {}", c.name)));
         }
-        if what == "transcription" && c.kind == "anthropic" {
+        if what == "transcription" && matches!(c.kind.as_str(), "anthropic" | "chatgpt") {
             return Err(bad_request("transcription: choose an OpenAI or OpenAI-compatible connection (one with /audio/transcriptions)"));
         }
         if m.model.trim().is_empty() {

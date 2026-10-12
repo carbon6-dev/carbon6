@@ -574,7 +574,7 @@ pub fn MemexSettings() -> impl IntoView {
                     <span class="text-xs text-zinc-500">"Embedding connection"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || conn.get() on:change=move |ev| conn.set(event_target_value(&ev))>
                         <option value="">"None (keyword search only)"</option>
-                        {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.kind != "anthropic" && c.kind != "claude_code").map(|c| view! { <option value=c.name.clone()>{c.name.clone()}</option> }).collect_view()}
+                        {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| !matches!(c.kind.as_str(), "anthropic" | "claude_code" | "chatgpt")).map(|c| view! { <option value=c.name.clone()>{c.name.clone()}</option> }).collect_view()}
                     </select>
                 </label>
                 <label class="space-y-0.5">
@@ -601,7 +601,7 @@ pub fn MemexSettings() -> impl IntoView {
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=move || c.get() on:change=move |ev| c.set(event_target_value(&ev))>
                                 <option value="">"None (off)"</option>
                                 {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
-                                    .filter(|x| x.kind != "claude_code" && (k != "transcription" || x.kind != "anthropic"))
+                                    .filter(|x| x.kind != "claude_code" && (k != "transcription" || !matches!(x.kind.as_str(), "anthropic" | "chatgpt")))
                                     .map(|x| view! { <option value=x.name.clone()>{x.name.clone()}</option> }).collect_view()}
                             </select>
                         </label>
