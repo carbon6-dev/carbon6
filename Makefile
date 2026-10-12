@@ -16,7 +16,7 @@ UI_PORT      ?= 7700
 WORKER_PORT  ?= 7701
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
-        ui build test dev-head dev-token dev-login-link dev-worker clean
+        ui build test dev-head dev-token dev-login-link dev-worker dev-memex clean
 
 help: ## Show this help
 	@echo "Usage: make <target> [VAR=value]"
@@ -83,6 +83,10 @@ dev-login-link: ## Print a one-time web UI login link for the dev head
 dev-worker: ## Run the dev worker (pass TOKEN=... to enroll it first)
 	@if [ -n "$(TOKEN)" ]; then cargo run -p c6w -- enroll --force "$(TOKEN)"; fi
 	cargo run -p c6w -- run
+
+dev-memex: ## Run the dev memex (pass TOKEN=... from Settings → Memex to enroll it first)
+	@if [ -n "$(TOKEN)" ]; then cargo run -p c6m -- enroll --force "$(TOKEN)"; fi
+	cargo run -p c6m -- run
 
 clean: ## Remove build outputs (target/, dist/, crates/c6-ui/dist)
 	cargo clean

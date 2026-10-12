@@ -423,6 +423,7 @@ The search box in the header (⌘K) searches every message, tool call, tool outp
 make dev-head                     # head on all interfaces using dev/c6h.toml; state in the standard data directory
 make dev-token                    # prints a token
 make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it (later: just make dev-worker)
+make dev-memex TOKEN=c6e1.…       # enrolls and runs the memex (token from Settings → Memex; later: just make dev-memex)
 make dev-login-link               # a one-time link to sign in to the dev UI
 ```
 
