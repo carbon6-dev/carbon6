@@ -89,7 +89,7 @@ pub fn PhotosPage() -> impl IntoView {
                     return view! {
                         <p class="text-sm text-zinc-500">
                             "No photos or videos yet. Add a folder of them under "
-                            <Go to=View::Settings { note: None } class="underline">"Settings → Memex folders"</Go>
+                            <Go to=View::Settings { note: None, section: "memex".into() } class="underline">"Settings → Memex folders"</Go>
                             "; they are read in place (nothing is copied but thumbnails)."
                         </p>
                     }.into_any();

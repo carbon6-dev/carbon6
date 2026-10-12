@@ -7,23 +7,245 @@ use leptos::task::spawn_local;
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
+/// The sections of Settings: (id, title, what is in it).
+const SECTIONS: [(&str, &str, &str); 10] = [
+    ("models", "Models", "Connections, model routing, the assistant"),
+    ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
+    ("rules", "Policies", "Ask or deny the agent's tool calls"),
+    ("automation", "Automation", "Templates, workflows, automations"),
+    ("notifications", "Notifications", "Channels, push on this device, links"),
+    ("spending", "Prices and budgets", "What models cost, and spending limits"),
+    ("hosts", "Hosts", "Machines reached over SSH"),
+    ("memex", "Memory and memex", "Memory notes, the memex, its folders and scopes"),
+    ("mail", "Mail and calendar", "Google accounts"),
+    ("account", "Sign-in", "Passkeys, signed-in browsers, API tokens"),
+];
+
+/// A section's title, for column headers.
+pub fn section_title(id: &str) -> Option<&'static str> {
+    SECTIONS.iter().find(|(s, _, _)| *s == id).map(|(_, t, _)| *t)
+}
+
 #[component]
 /// `note`: a notice after a redirect ("chatgpt": signed in with ChatGPT;
-/// "link": signed in with a login link).
-pub fn SettingsPage(note: Option<String>) -> impl IntoView {
+/// "link": signed in with a login link). `section`: which one is shown
+/// ("" for the first).
+pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
+    let col = crate::workspace::use_column();
+    let auth_required = LocalResource::new(api::auth_status);
+    let current = RwSignal::new(if section_title(&section).is_some() { section } else { SECTIONS[0].0.to_owned() });
+    let note = StoredValue::new(note);
+    // Switching sections keeps this column and updates its address.
+    let go = move |id: &'static str| {
+        current.set(id.to_owned());
+        if let Some(c) = col {
+            c.replace(crate::workspace::View::Settings { note: None, section: id.to_owned() });
+        }
+    };
+    let visible = move |id: &str| id != "account" || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required);
+    // On a phone the menu scrolls sideways: show the chosen section.
+    let nav = NodeRef::<leptos::html::Nav>::new();
+    Effect::new(move || {
+        let id = current.get();
+        if let Some(n) = nav.get()
+            && let Ok(Some(b)) = n.query_selector(&format!("[data-section='{id}']"))
+            && let Ok(b) = wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(b)
+        {
+            n.set_scroll_left(b.offset_left() - 16);
+        }
+    });
+    let heading = move || SECTIONS.iter().find(|(s, _, _)| current.with(|c| c == s)).map(|(_, t, w)| (*t, *w)).unwrap_or(("", ""));
+    view! {
+        <main class="mx-auto max-w-5xl px-4 py-6 md:flex md:gap-8">
+            <nav node_ref=nav class="relative -mx-4 mb-4 flex gap-1 overflow-x-auto px-4 pb-1 text-sm md:sticky md:top-4 md:mx-0 md:mb-0 md:w-48 md:shrink-0 md:flex-col md:self-start md:overflow-visible md:px-0">
+                {SECTIONS.iter().map(|(id, t, w)| {
+                    let id = *id;
+                    view! {
+                        <button class=move || format!("shrink-0 whitespace-nowrap rounded-md px-3 py-1.5 text-left {}", if current.with(|c| c == id) {
+                                "bg-zinc-200 font-medium text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
+                            } else {
+                                "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-900"
+                            })
+                            class:hidden=move || !visible(id)
+                            data-section=id title=*w on:click=move |_| go(id)>{*t}</button>
+                    }
+                }).collect_view()}
+            </nav>
+            <div class="min-w-0 flex-1 space-y-6">
+                <div>
+                    <h1 class="text-lg font-semibold">{move || heading().0}</h1>
+                    <p class="text-sm text-zinc-500">{move || heading().1}</p>
+                </div>
+                {move || match current.get().as_str() {
+                    "tools" => view! {
+                    <JsonSetting
+                        name="mcp-servers"
+                        title="MCP servers (connectors)"
+                        help="Started for each new session: stdio servers run on the worker in the session's directory; HTTP servers are reached from the worker. Their tools appear as mcp__<server>__<tool>. ${NAME} in a command, argument, env value, URL or bearer token is replaced by that secret (Settings → Secrets); \"applies_to\": [labels] limits a server to matching sessions. Start from a connector preset below."
+                        presets=connector_presets
+                        example=r#"[
+          {"name": "github", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "…"}},
+          {"name": "docs", "transport": "http", "url": "http://10.0.0.5:8080/mcp"}
+        ]"#
+                    />
+                    <ListSetting
+                        name="commands"
+                        title="Slash commands"
+                        noun="command"
+                        help="Your own /commands, offered when you type / in a message. Changes apply to the next message. In the prompt, $ARGUMENTS (or $1…$9) takes what follows the command, !`cmd` the output of a shell command run in the session's folder, and @path attaches a file. A command named like a built-in one replaces it."
+                        fields=COMMAND_FIELDS
+                        examples=command_examples
+                    />
+                    <ListSetting
+                        name="agents"
+                        title="Agents"
+                        noun="agent"
+                        help="Specialized subagents the model can launch (with the Task tool), each with its own instructions and, optionally, a limited set of tools. The model picks one by its description. New sessions pick up changes."
+                        fields=AGENT_FIELDS
+                        examples=agent_examples
+                    />
+                    <ListSetting
+                        name="skills"
+                        title="Skills"
+                        noun="skill"
+                        help="Instructions the agent loads by name when they apply; only the name and description sit in its prompt until then. New sessions pick up changes."
+                        fields=SKILL_FIELDS
+                        examples=skill_examples
+                    />
+                        <HooksSetting />
+                        <WebSearchSetting />
+                        <SecretsSetting />
+                    }.into_any(),
+                    "rules" => view! {
+                    <ListSetting
+                        name="policies"
+                        title="Policies"
+                        noun="policy"
+                        help="Rules for the agent's tool calls in sessions with given labels: deny them, or have them wait for your approval (in the transcript, the inbox and a notification; an hour without an answer means no). Tools is a regular expression over tool names (Bash, Edit, Write, … work with every model); Pattern one over the call's input. The first matching policy applies. Claude Code sessions are not covered."
+                        fields=POLICY_FIELDS
+                        examples=policy_examples
+                    />
+                    }.into_any(),
+                    "automation" => view! {
+                    <ListSetting
+                        name="templates"
+                        title="Templates"
+                        noun="template"
+                        help="Saved ways to start a session: where (a worker, every online worker with *, or SSH hosts through a worker), how (connection, model, labels) and what to ask. Several targets make a fleet run: one session each, sharing a run: label, so mission control shows them together. Run them from the Sessions page, with c6 run -t, on a schedule or from a webhook. In the prompt, {{input}} is what the run was given, {{target}} the worker or host, {{date}} and {{time}} now."
+                        fields=TEMPLATE_FIELDS
+                        examples=template_examples
+                    />
+                    <JsonSetting
+                        name="workflows"
+                        title="Workflows"
+                        help="Steps in order: run a template (its sessions' last replies are the step's output), approve (wait for your go-ahead: in the panel below, or from the notification's link), or notify. In inputs, titles and messages, {{input}} is the workflow's input and {{steps.<id>.output}} an earlier step's output. when: {\"step\": id, \"contains\" / \"not_contains\": text, or \"changed\": true} runs a step only if that holds (changed compares the output's last RESULT: line with the previous run's, so ask the template for one). A failed run step ends the run unless continue_on_failure. Run workflows by hand below, or from an automation (choose the workflow as its template)."
+                        presets=workflow_presets
+                        example=r#"[
+          {"name": "disk-watch", "steps": [
+            {"id": "check", "kind": "run", "template": "disk-check", "input": "{{input}}"},
+            {"id": "tell", "kind": "notify", "title": "Disks changed", "message": "{{steps.check.output}}", "when": {"step": "check", "changed": true}}
+          ]}
+        ]"#
+                    />
+                        <WorkflowRunsPanel />
+                        <AutomationsSetting />
+                    }.into_any(),
+                    "notifications" => view! {
+                    <ListSetting
+                        name="channels"
+                        title="Notifications"
+                        noun="channel"
+                        help="Where carbon6 tells you about your sessions while you are away: push (your browsers and phones, turned on below on each device), ntfy (a phone app; the URL is your topic, e.g. https://ntfy.sh/a-long-random-name), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Events: approval (with a link to Allow or Deny that works without signing in, for an hour), failed, finished, notice (the agent's notify tool), output, automation, budget; empty means approval, failed, notice, automation and budget. Applies to: only sessions with these labels. Tokens and SMTP passwords are secrets (Settings → Secrets)."
+                        fields=CHANNEL_FIELDS
+                        examples=channel_examples
+                    />
+                        <NotifyExtras />
+                        <crate::push::PushSetting />
+                    }.into_any(),
+                    "spending" => view! {
+                    <ListSetting
+                        name="prices"
+                        title="Prices"
+                        noun="price"
+                        help="What model calls cost, in USD per million tokens, for Usage and budgets. A model is an exact id or a prefix ending in * (claude-sonnet-*); the most specific entry wins. Cache read and write default to the input price. Copy the numbers from your provider's price list; models without a price count as $0 (Usage lists them)."
+                        fields=PRICE_FIELDS
+                        examples=price_examples
+                    />
+                    <ListSetting
+                        name="budgets"
+                        title="Budgets"
+                        noun="budget"
+                        help="Spending limits per day, week (from Monday) or month, for sessions with given labels (e.g. automation:, template:triage, client:acme; empty: everything). Notify tells you once per period when one is used up (as a budget notification); block also stops running turns and refuses new sessions and messages until the period ends. See where each stands under Usage."
+                        fields=BUDGET_FIELDS
+                        examples=budget_examples
+                    />
+                    }.into_any(),
+                    "hosts" => view! {
+                    <ListSetting
+                        name="hosts"
+                        title="Hosts"
+                        noun="host"
+                        help="Machines your workers reach over SSH (keys and ~/.ssh/config on the worker; carbon6 never handles SSH keys). Start a session on one by its name; it gets the host's labels (so policies, budgets, routing and memory for env:prod apply). Templates can run on every host with given labels. Check every N minutes to be told when one stops answering (a host notification). See them on the Workers page."
+                        fields=HOST_FIELDS
+                        examples=host_examples
+                    />
+                    }.into_any(),
+                    "memex" => view! {
+                        <MemorySetting />
+                        <crate::memex::MemexSettings />
+                    <ListSetting
+                        name="memex_folders"
+                        title="Memex folders"
+                        noun="folder"
+                        help="Folders on the memex's machine that it keeps in sync: documents and papers (PDF, Word, Markdown, HTML, text) in them and their subfolders are read, changes are picked up every few minutes, and removed files leave the memex. Hidden files are skipped."
+                        fields=FOLDER_FIELDS
+                        examples=folder_examples
+                    />
+                    <ListSetting
+                        name="memex_scopes"
+                        title="Memex scopes"
+                        noun="rule"
+                        help="What sessions may see in the memex. Every session sees sessions, outputs, web pages, notes, documents and papers; a rule lets sessions with its labels also see more kinds (email, photo). You, in the UI, see everything."
+                        fields=SCOPE_FIELDS
+                        examples=scope_examples
+                    />
+                    }.into_any(),
+                    "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
+                    "account" => view! {
+                        {move || match auth_required.get().and_then(Result::ok) {
+                            Some(s) if s.required => view! { <crate::auth::SignInSettings after_link=note.get_value().as_deref() == Some("link") /> }.into_any(),
+                            Some(_) => view! { <p class="text-sm text-zinc-500">"Sign-in is off on this head (it is started without authentication)."</p> }.into_any(),
+                            None => ().into_any(),
+                        }}
+                    }.into_any(),
+                    _ => view! {
+                        <Connections signed_in=note.get_value().as_deref() == Some("chatgpt") />
+                    <ListSetting
+                        name="routes"
+                        title="Model routing"
+                        noun="rule"
+                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent model, if set, runs the Task tool's subagents (a named agent's own model still wins)."
+                        fields=ROUTE_FIELDS
+                        examples=route_examples
+                    />
+                        <crate::assistant::AssistantSettings />
+                    }.into_any(),
+                }}
+            </div>
+        </main>
+    }
+}
+
+/// LLM connections: the list, adding one, signing in with ChatGPT.
+#[component]
+fn Connections(signed_in: bool) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let error = RwSignal::new(None::<String>);
-    let after_link = note.as_deref() == Some("link");
-    let signed_in = note.as_deref() == Some("chatgpt");
     let signed_in = move || signed_in;
-
-    let auth_required = LocalResource::new(api::auth_status);
     view! {
-        <main class="mx-auto max-w-3xl space-y-6 px-4 py-6">
-            {move || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required).then(|| view! { <crate::auth::SignInSettings after_link /> })}
             <section class="space-y-3">
                 <div>
-                    <h1 class="text-lg font-semibold">"LLM connections"</h1>
+                    <h2 class="font-medium">"LLM connections"</h2>
                     <p class="text-sm text-zinc-500">
                         "Model providers for sessions. Keys and sign-ins are encrypted on the head; workers fetch short-lived credentials when they call the model and keep them only in memory."
                     </p>
@@ -46,136 +268,6 @@ pub fn SettingsPage(note: Option<String>) -> impl IntoView {
             })}
             <AddConnection on_added=move || connections.refetch() />
             <ChatGptSignIn on_added=move || connections.refetch() />
-            <JsonSetting
-                name="mcp-servers"
-                title="MCP servers (connectors)"
-                help="Started for each new session: stdio servers run on the worker in the session's directory; HTTP servers are reached from the worker. Their tools appear as mcp__<server>__<tool>. ${NAME} in a command, argument, env value, URL or bearer token is replaced by that secret (Settings → Secrets); \"applies_to\": [labels] limits a server to matching sessions. Start from a connector preset below."
-                presets=connector_presets
-                example=r#"[
-  {"name": "github", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "…"}},
-  {"name": "docs", "transport": "http", "url": "http://10.0.0.5:8080/mcp"}
-]"#
-            />
-            <ListSetting
-                name="commands"
-                title="Slash commands"
-                noun="command"
-                help="Your own /commands, offered when you type / in a message. Changes apply to the next message. In the prompt, $ARGUMENTS (or $1…$9) takes what follows the command, !`cmd` the output of a shell command run in the session's folder, and @path attaches a file. A command named like a built-in one replaces it."
-                fields=COMMAND_FIELDS
-                examples=command_examples
-            />
-            <ListSetting
-                name="agents"
-                title="Agents"
-                noun="agent"
-                help="Specialized subagents the model can launch (with the Task tool), each with its own instructions and, optionally, a limited set of tools. The model picks one by its description. New sessions pick up changes."
-                fields=AGENT_FIELDS
-                examples=agent_examples
-            />
-            <ListSetting
-                name="skills"
-                title="Skills"
-                noun="skill"
-                help="Instructions the agent loads by name when they apply; only the name and description sit in its prompt until then. New sessions pick up changes."
-                fields=SKILL_FIELDS
-                examples=skill_examples
-            />
-            <ListSetting
-                name="hosts"
-                title="Hosts"
-                noun="host"
-                help="Machines your workers reach over SSH (keys and ~/.ssh/config on the worker; carbon6 never handles SSH keys). Start a session on one by its name; it gets the host's labels (so policies, budgets, routing and memory for env:prod apply). Templates can run on every host with given labels. Check every N minutes to be told when one stops answering (a host notification). See them on the Workers page."
-                fields=HOST_FIELDS
-                examples=host_examples
-            />
-            <ListSetting
-                name="templates"
-                title="Templates"
-                noun="template"
-                help="Saved ways to start a session: where (a worker, every online worker with *, or SSH hosts through a worker), how (connection, model, labels) and what to ask. Several targets make a fleet run: one session each, sharing a run: label, so mission control shows them together. Run them from the Sessions page, with c6 run -t, on a schedule or from a webhook. In the prompt, {{input}} is what the run was given, {{target}} the worker or host, {{date}} and {{time}} now."
-                fields=TEMPLATE_FIELDS
-                examples=template_examples
-            />
-            <MemorySetting />
-            <ListSetting
-                name="policies"
-                title="Policies"
-                noun="policy"
-                help="Rules for the agent's tool calls in sessions with given labels: deny them, or have them wait for your approval (in the transcript, the inbox and a notification; an hour without an answer means no). Tools is a regular expression over tool names (Bash, Edit, Write, … work with every model); Pattern one over the call's input. The first matching policy applies. Claude Code sessions are not covered."
-                fields=POLICY_FIELDS
-                examples=policy_examples
-            />
-            <ListSetting
-                name="channels"
-                title="Notifications"
-                noun="channel"
-                help="Where carbon6 tells you about your sessions while you are away: push (your browsers and phones, turned on below on each device), ntfy (a phone app; the URL is your topic, e.g. https://ntfy.sh/a-long-random-name), a Slack or Discord webhook, any webhook (JSON), or email over SMTP. Events: approval (with a link to Allow or Deny that works without signing in, for an hour), failed, finished, notice (the agent's notify tool), output, automation, budget; empty means approval, failed, notice, automation and budget. Applies to: only sessions with these labels. Tokens and SMTP passwords are secrets (Settings → Secrets)."
-                fields=CHANNEL_FIELDS
-                examples=channel_examples
-            />
-            <NotifyExtras />
-            <crate::push::PushSetting />
-            <ListSetting
-                name="prices"
-                title="Prices"
-                noun="price"
-                help="What model calls cost, in USD per million tokens, for Usage and budgets. A model is an exact id or a prefix ending in * (claude-sonnet-*); the most specific entry wins. Cache read and write default to the input price. Copy the numbers from your provider's price list; models without a price count as $0 (Usage lists them)."
-                fields=PRICE_FIELDS
-                examples=price_examples
-            />
-            <ListSetting
-                name="budgets"
-                title="Budgets"
-                noun="budget"
-                help="Spending limits per day, week (from Monday) or month, for sessions with given labels (e.g. automation:, template:triage, client:acme; empty: everything). Notify tells you once per period when one is used up (as a budget notification); block also stops running turns and refuses new sessions and messages until the period ends. See where each stands under Usage."
-                fields=BUDGET_FIELDS
-                examples=budget_examples
-            />
-            <ListSetting
-                name="routes"
-                title="Model routing"
-                noun="rule"
-                help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent model, if set, runs the Task tool's subagents (a named agent's own model still wins)."
-                fields=ROUTE_FIELDS
-                examples=route_examples
-            />
-            <JsonSetting
-                name="workflows"
-                title="Workflows"
-                help="Steps in order: run a template (its sessions' last replies are the step's output), approve (wait for your go-ahead: in the panel below, or from the notification's link), or notify. In inputs, titles and messages, {{input}} is the workflow's input and {{steps.<id>.output}} an earlier step's output. when: {\"step\": id, \"contains\" / \"not_contains\": text, or \"changed\": true} runs a step only if that holds (changed compares the output's last RESULT: line with the previous run's, so ask the template for one). A failed run step ends the run unless continue_on_failure. Run workflows by hand below, or from an automation (choose the workflow as its template)."
-                presets=workflow_presets
-                example=r#"[
-  {"name": "disk-watch", "steps": [
-    {"id": "check", "kind": "run", "template": "disk-check", "input": "{{input}}"},
-    {"id": "tell", "kind": "notify", "title": "Disks changed", "message": "{{steps.check.output}}", "when": {"step": "check", "changed": true}}
-  ]}
-]"#
-            />
-            <WorkflowRunsPanel />
-            <AutomationsSetting />
-            <crate::mail::GoogleSettings />
-            <crate::assistant::AssistantSettings />
-            <crate::memex::MemexSettings />
-            <ListSetting
-                name="memex_folders"
-                title="Memex folders"
-                noun="folder"
-                help="Folders on the memex's machine that it keeps in sync: documents and papers (PDF, Word, Markdown, HTML, text) in them and their subfolders are read, changes are picked up every few minutes, and removed files leave the memex. Hidden files are skipped."
-                fields=FOLDER_FIELDS
-                examples=folder_examples
-            />
-            <ListSetting
-                name="memex_scopes"
-                title="Memex scopes"
-                noun="rule"
-                help="What sessions may see in the memex. Every session sees sessions, outputs, web pages, notes, documents and papers; a rule lets sessions with its labels also see more kinds (email, photo). You, in the UI, see everything."
-                fields=SCOPE_FIELDS
-                examples=scope_examples
-            />
-            <HooksSetting />
-            <SecretsSetting />
-            <WebSearchSetting />
-        </main>
     }
 }
 

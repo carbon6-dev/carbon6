@@ -97,7 +97,7 @@ fn Main() -> impl IntoView {
                         </span>
                     </Go>
                     <span class="hidden sm:contents"><NavLink to=View::Mission label="Mission" /></span>
-                    <NavLink to=View::Settings { note: None } label="Settings" />
+                    <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                 </nav>
                 <span class="flex-1"></span>
                 <assistant::AskButton />
@@ -149,7 +149,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Photos class=MENU>"Photos"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
-                    <Go to=View::Settings { note: None } class=MENU>"Settings"</Go>
+                    <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                 </div>
             </div>
         </details>

@@ -295,7 +295,7 @@ fn StatusLine(s: MemexStatus) -> impl IntoView {
         return view! {
             <div class="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
                 "No memex is connected. Set one up in "
-                <Go to=View::Settings { note: None } class="underline">"Settings → Memex"</Go>
+                <Go to=View::Settings { note: None, section: "memex".into() } class="underline">"Settings → Memex"</Go>
                 {(s.outbox > 0).then(|| format!(" ({} updates are waiting for it).", s.outbox))}
             </div>
         }

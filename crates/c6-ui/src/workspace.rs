@@ -51,6 +51,9 @@ pub enum View {
         /// A notice after a redirect: "chatgpt" or "link".
         #[serde(default)]
         note: Option<String>,
+        /// Which section ("" for the first).
+        #[serde(default)]
+        section: String,
     },
     Inbox,
     Mission,
@@ -109,7 +112,8 @@ impl View {
             }
             View::Workers => "/workers".into(),
             View::Worker { id } => format!("/workers/{id}"),
-            View::Settings { .. } => "/settings".into(),
+            View::Settings { section, .. } if section.is_empty() => "/settings".into(),
+            View::Settings { section, .. } => format!("/settings/{section}"),
             View::Inbox => "/inbox".into(),
             View::Mission => "/mission".into(),
             View::Usage => "/usage".into(),
@@ -155,15 +159,24 @@ impl View {
             ["search"] => View::Search { q: get("q"), kind: get("kind"), worker: get("worker") },
             ["workers"] => View::Workers,
             ["workers", id] => View::Worker { id: (*id).to_owned() },
-            ["settings"] => View::Settings {
-                note: if query.contains_key("signed_in") {
+            ["settings", rest @ ..] => {
+                let note = if query.contains_key("signed_in") {
                     Some("chatgpt".into())
                 } else if query.contains_key("signed_in_with_link") {
                     Some("link".into())
                 } else {
                     None
-                },
-            },
+                };
+                // Where a redirect back lands.
+                let section = match (rest.first(), note.as_deref()) {
+                    (Some(s), _) => (*s).to_owned(),
+                    (None, Some("chatgpt")) => "models".into(),
+                    (None, Some("link")) => "account".into(),
+                    (None, None) if query.contains_key("google") => "mail".into(),
+                    _ => String::new(),
+                };
+                View::Settings { note, section }
+            }
             ["inbox"] => View::Inbox,
             ["mission"] => View::Mission,
             ["usage"] => View::Usage,
@@ -189,7 +202,10 @@ impl View {
                 .workers
                 .with(|ws| ws.iter().find(|w| &w.id.to_string() == id).map(|w| w.name.clone()))
                 .unwrap_or_else(|| "Worker".into()),
-            View::Settings { .. } => "Settings".into(),
+            View::Settings { section, .. } => match crate::settings::section_title(section) {
+                Some(t) => format!("Settings · {t}"),
+                None => "Settings".into(),
+            },
             View::Inbox => "Inbox".into(),
             View::Mission => "Mission control".into(),
             View::Usage => "Usage".into(),
@@ -935,7 +951,7 @@ fn render_view(view: View) -> AnyView {
                     View::Search { q, kind, worker } => view! { <crate::search::SearchPage q kind worker /> }.into_any(),
                     View::Workers => view! { <crate::fleet::FleetPage /> }.into_any(),
                     View::Worker { id } => view! { <crate::fleet::WorkerPage id /> }.into_any(),
-                    View::Settings { note } => view! { <crate::settings::SettingsPage note /> }.into_any(),
+                    View::Settings { note, section } => view! { <crate::settings::SettingsPage note section /> }.into_any(),
                     View::Inbox => view! { <crate::activity::InboxPage /> }.into_any(),
                     View::Mission => view! { <crate::activity::MissionPage /> }.into_any(),
                     View::Usage => view! { <crate::usage::UsagePage /> }.into_any(),

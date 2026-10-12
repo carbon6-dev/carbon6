@@ -23,7 +23,7 @@ pub fn SessionsPage() -> impl IntoView {
                 {move || connections.get().map(|r| match r {
                     Ok(conns) if conns.is_empty() => view! {
                         <div class="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
-                            "Add an LLM connection in " <Go to=View::Settings { note: None } class="underline">"Settings"</Go> " to start a session."
+                            "Add an LLM connection in " <Go to=View::Settings { note: None, section: "models".into() } class="underline">"Settings"</Go> " to start a session."
                         </div>
                     }.into_any(),
                     Ok(conns) => view! { <NewSession connections=conns /> <RunTemplate /> }.into_any(),
