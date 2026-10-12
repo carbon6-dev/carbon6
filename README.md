@@ -136,7 +136,7 @@ Policies (**Settings → Policies**) are rules for the agent's tool calls in ses
 
 The memex is your knowledge store: a separate service, `c6m`, on the same fabric as the workers. It can run on any machine (this one is fine). Its design, and what comes next (documents and papers, Gmail, calendar and contacts, photos and videos), is in [docs/memex.md](docs/memex.md).
 
-- **Connecting one:** **Settings → Memex → Create a token**, then on the machine that should hold it, `c6m enroll <token>` and `c6m run`. It keeps its store under its state folder.
+- **Connecting one:** **Settings → Memex → Create an enrollment token**, then on the machine that should hold it, `c6m enroll <token>` and `c6m run`. It keeps its store under its state folder.
 - **carbon6 → memex:**
   - every session's digest (what was asked, what tools did, what it concluded);
   - published outputs;

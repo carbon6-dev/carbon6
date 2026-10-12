@@ -21,8 +21,14 @@ pub struct EnrollmentToken {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("malformed enrollment token")]
-pub struct TokenError;
+pub enum TokenError {
+    #[error("malformed enrollment token")]
+    Malformed,
+    #[error(
+        "this is an API token (for the c6 CLI), not an enrollment token; enrolling needs an enrollment token (c6e1.…) from Settings → Memex (for a memex) or Workers → Add worker"
+    )]
+    ApiToken,
+}
 
 impl EnrollmentToken {
     pub fn encode(&self) -> String {
@@ -31,9 +37,13 @@ impl EnrollmentToken {
     }
 
     pub fn decode(s: &str) -> Result<Self, TokenError> {
-        let body = s.trim().strip_prefix(PREFIX).ok_or(TokenError)?;
-        let json = URL_SAFE_NO_PAD.decode(body).map_err(|_| TokenError)?;
-        serde_json::from_slice(&json).map_err(|_| TokenError)
+        let s = s.trim();
+        if s.starts_with("c6_") {
+            return Err(TokenError::ApiToken);
+        }
+        let body = s.strip_prefix(PREFIX).ok_or(TokenError::Malformed)?;
+        let json = URL_SAFE_NO_PAD.decode(body).map_err(|_| TokenError::Malformed)?;
+        serde_json::from_slice(&json).map_err(|_| TokenError::Malformed)
     }
 }
 
@@ -46,5 +56,6 @@ mod tests {
         let t = EnrollmentToken { url: "https://100.64.0.1:7701".into(), ca_sha256: "ab".repeat(32), secret: "s3cret".into() };
         assert_eq!(EnrollmentToken::decode(&t.encode()).unwrap(), t);
         assert!(EnrollmentToken::decode("nope").is_err());
+        assert!(matches!(EnrollmentToken::decode("c6_1b37"), Err(TokenError::ApiToken)));
     }
 }

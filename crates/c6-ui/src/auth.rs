@@ -385,7 +385,7 @@ fn ApiTokens() -> impl IntoView {
             <form class="mt-2 flex gap-2" on:submit=move |ev| { ev.prevent_default(); create(); }>
                 <input class=format!("{INPUT} flex-1") placeholder="What it is for, e.g. laptop CLI" prop:value=move || name.get()
                     on:input=move |ev| name.set(event_target_value(&ev)) />
-                <button class=format!("{BUTTON} shrink-0") type="submit">"Create a token"</button>
+                <button class=format!("{BUTTON} shrink-0") type="submit">"Create an API token"</button>
             </form>
             {move || error.get().map(|e| view! { <div class="mt-2"><ErrorBox message=e /></div> })}
             {move || created.get().and_then(|t| t.token).map(|t| {

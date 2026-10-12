@@ -562,7 +562,7 @@ pub fn MemexSettings() -> impl IntoView {
                 view! {
                     <div class="space-y-2 text-sm">
                         <p>"Not connected. On the machine that should hold it (this one is fine), with c6m installed:"</p>
-                        <button class=BUTTON_QUIET on:click=make_token>"Create a token"</button>
+                        <button class=BUTTON_QUIET on:click=make_token>"Create an enrollment token"</button>
                         {move || token.get().map(|t| view! {
                             <pre class="select-all overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{format!("c6m enroll {t}\nc6m run")}</pre>
                         })}
