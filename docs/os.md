@@ -143,9 +143,10 @@ grant(id, from_realm, to_realm,
 
 ### 3.10 Moving in
 
-- **Everything moves into home:** sessions, memex items, facts, settings, secrets, automations, action items.
+- **Your data moves into home,** and so does your configuration that grants abilities: secrets, MCP servers, skills, agents, commands, hooks, templates and memory notes. A new realm doesn't inherit them unless you move them to root or share them.
+- **Restrictions move into root,** so every realm inherits them: policies and budget caps. A new realm is never less protected than home.
 - **Memex scopes by label** become label scopes inside home.
-- **Until you create a second realm, nothing behaves differently.**
+- **Until you create a second realm, nothing behaves differently.** The full upgrade plan is in 13.
 
 ## 4. Primitives
 
@@ -430,6 +431,8 @@ A realm that keeps you in touch with people who matter, using your mail without 
 
 ## 8. What changes in today's features
 
+In short; the details are in 12, and how existing data is upgraded is in 13.
+
 | Today | Becomes |
 |---|---|
 | Labels as the only scope | Labels inside realms |
@@ -444,21 +447,27 @@ A realm that keeps you in touch with people who matter, using your mail without 
 
 ## 9. Build order
 
-Each step is usable on its own:
+Each step is usable on its own. Each step also moves the features that duplicate its primitive onto it (12), and upgrades existing data (13), in the same step, so there is never a second way of doing the same thing for long.
 
 1. **Realms:**
-   - realm on every object; home and root, with everything moved into home;
+   - realm on every object; root and home, with everything moved in (3.10);
    - a session's realm; workers and connections available per realm; secrets, policies, budgets and programs per realm, inherited from root;
-   - realm-scoped API tokens; the realm switcher in the UI;
-   - the system prompts as root skills.
+   - realm-scoped API tokens; the realm switcher in the UI.
+   - **Ports:** carbon6's own prompts (the base prompt, briefing guidance, the decision-session prompt, compaction) and the memex's understanding prompts become root skills.
 2. **Grants and commons:** the four modes, provenance, the log, the commons review queue.
-3. **Collections:** schemas, records, history, queries, the agent tools, the memex mirror, a generic table and record view.
-4. **Decisions:** the primitive, then moving tool-call approvals, action items, workflow approve steps and the assistant's questions onto it; batching and digests.
-5. **Triggers:** record, decision, series and session events; mappings; loop protection. Automations move onto it.
-6. **Series:** points, queries, thresholds; usage and budgets move onto it.
+3. **Collections:** schemas, records, history, queries, the agent tools, the memex mirror, generated forms, a table and record view.
+   - **Ports:** every list in Settings becomes a system collection with generated forms; hosts, memory notes, facts, commitments and trails become collections.
+4. **Decisions:** the primitive, batching and digests, answering by link.
+   - **Ports:** tool-call approvals, action items, workflow approve steps, the assistant's questions, confirmations of destructive operations, the memex review queue and fact disputes.
+5. **Triggers:** record, decision, series and session events; mappings; loop protection.
+   - **Ports:** automations, cron schedules, webhooks and memex events become triggers; notifications become a subscriber to events.
+6. **Series:** points, queries, thresholds.
+   - **Ports:** usage, model prices, budgets, host checks and the memex's model-call budget.
 7. **Views:** board, chart, feed, page and actions; each realm's menu.
-8. **Apps:** the package format, install, upgrade, export, remove; a skill for agents writing packages.
-9. **The examples:** the service factory and the personal CRM as example packages. Building them is the final check that no app needs code.
+   - **Ports:** the usage page and the To do list become views.
+8. **The assistant as a program:** a template with the catalog tools and a root skill, running in a realm like any session.
+9. **Apps:** the package format, install, upgrade, export, remove; a skill for agents writing packages.
+10. **The examples:** the service factory and the personal CRM as example packages. Building them is the final check that no app needs code.
 
 ## 10. Decisions
 
@@ -472,6 +481,10 @@ Each step is usable on its own:
 | Apps | Configuration only; a missing primitive is added, never the app |
 | Users | One |
 | Sandboxing | Unchanged: not by default; dedicated workers when files must be isolated |
+| Architecture | A microkernel: a small kernel of orthogonal primitives; system services built on its public operations (12) |
+| Duplicated features | Rebuilt on their primitive in the step that builds it (12, 9) |
+| Existing data | Upgraded automatically in each step, after a backup, all or nothing, nothing dropped (13) |
+| Where existing configuration goes | What grants abilities (secrets, tools, programs) to home; restrictions (policies, budget caps) to root |
 
 ## 11. Open questions
 
@@ -480,3 +493,109 @@ Each step is usable on its own:
 - **Claude Code sessions:** they reach carbon6 through MCP. The realm checks are in the head, so they hold, but their tool set needs the same realm-aware tools.
 - **Charts and pages:** whether the view kinds in 4.5 cover what apps need, or a page kind with richer layout is needed.
 - **Records at scale:** the head's SQLite fits personal-scale apps. If an app needs millions of records, collections may need their own store.
+
+## 12. Revisiting what's built
+
+carbon6 follows a microkernel and Unix approach. A small kernel provides orthogonal primitives, and system services are built by combining them through the same public operations apps use. The test for anything built: **could it have been written on the public API, or does it reach into private internals?**
+
+### 12.1 The kernel: stays, becomes realm-aware
+
+- **Processes and IPC:** the fabric and registry (workers and memex nodes), the session runtime with journaling and sync, live streams.
+- **Identity and security:** sign-in, API tokens, the PKI and TLS, secrets, and policies. Policies are the kernel's permission check on tool calls; an "ask" opens a decision.
+- **The system-call table:** the catalog. A test already checks that every route is an operation. The UI, the CLI, the assistant, the API reference and the OpenAPI document all go through it.
+- **Exec:** templates, which say how to start a process. Fleet runs are a template with several targets.
+- **Files:** outputs.
+- **The new primitives:** realms and grants, collections, decisions, triggers, series and views.
+- **A small search index** for sessions, because the memex is optional (12.4).
+
+### 12.2 Duplicates of a primitive: rebuild on it
+
+| Built today | Duplicates | Becomes |
+|---|---|---|
+| Every list in Settings: MCP servers, skills, commands, agents, hooks, templates, workflows, notification channels, policies, model routes, prices, budgets, memex folders and scopes. Each has its own JSON blob, routes and hand-written form. | Collections | System collections, inherited from root and overridden per realm by one mechanism. Forms are generated from each schema. Presets and inline help become schema annotations (descriptions, examples) and preset records. |
+| Single settings: the public URL, web search, the assistant's model, memex settings | Collections | Records in a `config` system collection |
+| Tool-call approvals; action items (`todos`); workflow approve steps; the assistant's questions; the memex review queue (merge suggestions, low-confidence links, naming faces); fact disputes | Decisions | Kinds of decision: one list, one set of notifications, one way to answer |
+| Automations, cron schedules, webhooks, memex events | Triggers | Triggers; schedules and webhooks are event sources |
+| Usage, model prices, budgets, host checks, the memex's model-call budget | Series | Series and thresholds |
+| Facts (a hand-built table with a strict schema, history and a memex mirror) | Collections | A `facts` collection; facts were the prototype of collections |
+| Commitments, trails, the hosts inventory | Collections | Collections with links into the memex |
+| Memory notes (`remember`, `forget`), memex notes (`memex_note`), facts (`knowledge_record`), action items (`todo_add`) | Overlapping tools | One knowledge model: memory notes become a collection whose records are always in briefs. Agents get `records_*`, `decision_request` and the memex tools, each doing one thing. |
+
+### 12.3 Services and apps: move outside the kernel
+
+| Built today | Is really | Becomes |
+|---|---|---|
+| The assistant: runs inside the head on a hidden worker row, with its own tools | A program | A template with the catalog tools and a root skill, running in a realm (3.6). The kernel provides a way to run sessions inside the head, as a kind of worker. |
+| Notifications and web push | A service | A subscriber to events; channels are a collection |
+| Workflows | The shell | Kept as the way to combine programs. Approve steps are decisions, notify steps are trigger actions, and run state can be records. |
+| The memex's understanding steps (summaries, topics, commitments, captions, system pages) | Services, with prompts in code | Prompts become root skills; jobs start from ingest events through triggers |
+| Gmail, Calendar and Contacts sync | Drivers | Unchanged; they already store through the ingest handlers |
+| The mail client, calendar and photos pages | Built-in apps | Their rich UIs stay, using only public operations. Mail rules, "needs reply" and triage become triggers and views. |
+
+### 12.4 Search
+
+The head has its own full-text index of sessions, and the memex has another. The memex is optional, so the head keeps a small kernel index. When a memex is connected, it is the search service, and session search goes through it.
+
+### 12.5 Keeping the boundary
+
+In a single Rust head, "services use only public operations" is a rule, checked in code review and by tests: services call the catalog's operations, not each other's internals. If it proves necessary, services can later run as separate processes that can only reach the catalog.
+
+## 13. Upgrading existing data
+
+carbon6 already holds real data. Every step of the build order upgrades it to the new representation automatically, when the new version starts.
+
+### 13.1 Principles
+
+1. **A backup first.** Before a step changes data, the head copies its database (SQLite `VACUUM INTO`) next to it, with the version and time in the name. The memex does the same for its store. Backups stay until you delete them. `master.key` is never touched.
+2. **All or nothing.** Each step's migration runs in one transaction per database. If it fails, it rolls back and the head refuses to start, saying why. The database is unchanged, so the previous version still runs on it.
+3. **Nothing is lost.** Every field moves somewhere. Anything without a place in the new shape is kept in a `legacy` field on the new record, never dropped.
+4. **Identity is kept.** Session, item, thing and fact ids stay the same, so links, `@`-mentions and history keep working. Where an id has to change (action items' numbers become decision ids), a map is kept, so old references such as "action item #12" still resolve.
+5. **Checked.** After migrating, counts and totals are compared per kind of object: settings entries, action items, automations, sessions, spend. An upgrade report is kept under **Settings → System → Upgrades**.
+6. **Large data in the background.** Big memex tables (items, parts, vectors) get their realm in batches, with a progress marker, while the memex keeps serving. A step finishes only when every batch is done.
+7. **Old tables stay for one release,** renamed `legacy_*` and read-only. A later release drops them only after you confirm, as a decision.
+8. **Try it first:** `c6h upgrade --check` runs the migration on a copy of the database and prints the report without touching the real one. The same goes for `c6m`.
+9. **Going back** means restoring the backup. There is no automatic downgrade, because new data written after the upgrade has no old shape.
+10. **Tested against real shapes.** Every migration is tested on databases created by each earlier version (synthetic data, never yours), from that version's schema through the latest.
+
+### 13.2 Head: what moves where
+
+| Data today | After |
+|---|---|
+| `sessions`, `events`, `run_sessions` | Unchanged, in home |
+| Settings lists: `agents`, `commands`, `skills`, `hooks`, `mcp_servers`, `templates`, `workflows`, `memex_folders`, `memex_scopes` | Records in system collections, in home (step 3) |
+| Settings lists: `policies`, `budgets` | Records in system collections, in root, so every realm inherits them (step 3) |
+| Settings lists: `routes`, `prices`, `channels`, `hosts` | Records in system collections, in root (routes, prices) or home (channels, hosts) (step 3) |
+| Single settings: `public_url`, `web_search`, `assistant`, `memex` | Records in the `config` collection, in root (step 3) |
+| `memories` | Records in the `memory` collection, in home (step 3) |
+| `todos` | Decisions, with kinds and states mapped and an id map (step 4) |
+| Pending tool-call approvals, and workflow runs waiting at an approve step (`workflow_runs`) | Open decisions, still answerable (step 4) |
+| `automations`, `automation_runs` | Triggers and their runs. Webhook URLs keep working: their stored hashes move unchanged (step 5) |
+| `usage` | Points in the spend and token series, by session, model and labels. Totals per day are checked against the old table (step 6) |
+| `host_checks` | Points in a `host_check` series by host (step 6) |
+| `secrets` | Home (step 1) |
+| `api_tokens` | Root tokens, which reach every realm, as today. New tokens can be scoped (step 1) |
+| `workers`, `connections` | Available to every realm, as today (step 1) |
+| `passkeys`, `auth_sessions`, `login_links`, `enrollments`, `push_subscriptions`, `google_accounts` | Root, unchanged |
+| `memex_outbox` | Unchanged; queued entries are for home |
+| Search tables | Rebuilt with realms: they are derived |
+
+### 13.3 Memex: what moves where
+
+| Data today | After |
+|---|---|
+| Items, parts, vectors, things, links, evidence, trails, mail, calendars, contacts, media, faces, files, sync state | In home (step 1, in batches). Things are keyed per realm. |
+| `facts` | A `facts` collection in home, in the head, keeping ids. The memex keeps its search mirror. This runs as a background job when the memex connects after the upgrade (step 3). |
+| `commitments`, `trails` | Collections in home, the same way (step 3) |
+| `review` | Open decisions (step 4) |
+| `model_calls` | Points in the memex model-call series (step 6) |
+
+### 13.4 Workers
+
+Workers' journals hold sessions' events, and need no migration. The head decides a session's realm, so workers don't need to know it. New protocol fields are additive, so workers on the previous version keep working until they're updated.
+
+### 13.5 The order across machines
+
+- **Head first.** Until the memex is upgraded, the head treats it as home-only and leaves the realm features that need it (grants on memex data, commons) unavailable.
+- **The memex next,** whenever it next starts on the new version. It migrates in the background (13.1, rule 6).
+- **Workers whenever you like** (13.4).
+
