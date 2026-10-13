@@ -1115,7 +1115,7 @@ fn render_event(
             </details>
         }
         .into_any(),
-        EventKind::Output { name, title, size, .. } => crate::outputs::published_line(session, e.seq, name, title, *size),
+        EventKind::Output { name, title, mime, size } => crate::outputs::published_line(session, e.seq, name, title, mime, *size),
         EventKind::Approval { call_id, state, tool, input, policy, message } => match state.as_str() {
             "requested" => view! { <ApprovalCard session=session.to_owned() call_id=call_id.clone() tool=tool.clone() input=input.clone() policy=policy.clone() message=message.clone() /> }.into_any(),
             s => {

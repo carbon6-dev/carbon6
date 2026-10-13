@@ -137,18 +137,26 @@ fn Preview(url: String, mime: String) -> impl IntoView {
     }
 }
 
-/// A publish, as a line in the transcript.
-pub fn published_line(session: &str, seq: u64, name: &str, title: &str, size_bytes: u64) -> AnyView {
+/// A publish, as a line in the transcript; an image is shown too.
+pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &str, size_bytes: u64) -> AnyView {
     let u = url(session, seq);
+    let image = mime.starts_with("image/");
     view! {
-        <p class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-            <span>"📦"</span>
-            <span>"Published"</span>
-            <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
-            <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
-            <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
-            <span>"· see Outputs"</span>
-        </p>
+        <div class="space-y-1">
+            <p class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                <span>"📦"</span>
+                <span>"Published"</span>
+                <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
+                <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
+                <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
+                <span>"· see Outputs"</span>
+            </p>
+            {image.then(|| view! {
+                <a href=u.clone() target="_blank" rel="noopener" title="Open full size">
+                    <img class="max-h-96 max-w-full rounded-md border border-zinc-200 dark:border-zinc-800" src=u.clone() alt=title.to_owned() loading="lazy" />
+                </a>
+            })}
+        </div>
     }
     .into_any()
 }
