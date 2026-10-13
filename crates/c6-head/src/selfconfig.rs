@@ -140,32 +140,152 @@ fn same(a: &api::Kit, b: &api::Kit) -> bool {
     strip(a) == strip(b)
 }
 
-/// The setup playbook (a generic procedure; it knows no CI or forge).
-pub fn playbook(repo: &str) -> String {
-    format!(
-        "Set up follow-through for {repo} (docs/follow-through.md). Work on your own; never stop to ask the user: what you cannot settle \
+// --- Playbooks ----------------------------------------------------------------
+
+pub const PLAYBOOKS: &str = "playbooks";
+/// Which playbooks already ran for which key (first_session: once per).
+pub const RUNS: &str = "playbook_runs";
+const TRIGGERS: [&str; 4] = ["first_session", "tracker_failed", "probe_failing", "todo_session"];
+
+/// What carbon6 starts with: editable (Settings → Projects), not built in.
+pub fn default_playbooks() -> Vec<api::Playbook> {
+    let p = |name: &str, trigger: &str, once_per: &str, description: &str, prompt: &str| api::Playbook {
+        name: name.into(),
+        trigger: trigger.into(),
+        applies_to: Vec::new(),
+        once_per: once_per.into(),
+        prompt: prompt.into(),
+        description: description.into(),
+        enabled: true,
+    };
+    vec![
+        p(
+            "Set up follow-through",
+            "first_session",
+            "repo",
+            "The first session in a repository: work out how it is built and tested, and write a kit.",
+            "Set up follow-through for {{key}} (docs/follow-through.md). Work on your own; never stop to ask the user: what you cannot settle \
 becomes an action item (todo_add), and you carry on with your best assumption.
 
 1. What is known: knowledge_list and memex_search for this repo and the systems it touches (CI, forge, clusters, networks). If kits \
 already cover another repo with the same CI, start from them (c6_call settings.kits.get).
 2. The repo: CI, deploy and infrastructure files (workflow templates, Kubernetes/Helm/Kustomize, Makefiles, docs) for what builds and \
 tests it, where, and how a run is tied to a commit (labels, parameters, statuses).
-3. The forge: on a recent pushed commit, the statuses and checks (they name the CI and link to it), required checks, webhooks (e.g. gh \
-api repos/<owner>/<name>/commits/<sha>/status, gh api …/check-runs).
+3. The forge: on a recent pushed commit, the statuses and checks (they name the CI and link to it), required checks, webhooks.
 4. The network: which carbon6 workers can reach the CI's address (c6_call workers.list; try the address from each where you can), and \
-which CLIs and credentials each has (argo, kubectl, gh…).
+which CLIs and credentials each has.
 5. Write it down as you go: knowledge_record for every fact (observed with evidence, or inferred with what it rests on), with a check \
 command when one proves it and where it applies.
-6. Write a kit (c6_describe settings.kits.put; c6_call settings.kits.put with every existing kit plus yours) for {repo}: a reaction to \
+6. Write a kit (c6_describe settings.kits.put; c6_call settings.kits.put with every existing kit plus yours) for {{key}}: a reaction to \
 pushes that offers opening a PR when there is none, and a tracker for the CI run (probing from a worker that reaches it; print \
-{{\"phase\",\"line\",\"url\"}} JSON or map the output with phase rules; a logs command for investigations). It is dry-run when saved: if it is \
+{\"phase\",\"line\",\"url\"} JSON or map the output with phase rules; a logs command for investigations). It is dry-run when saved: if it is \
 broken, fix it and save again.
-7. Finish with a short summary of what you set up and what is left for the user (the action items you raised)."
-    )
+7. Finish with a short summary of what you set up and what is left for the user (the action items you raised).",
+        ),
+        p(
+            "Investigate a failure",
+            "tracker_failed",
+            "",
+            "A tracker ended failed: explain why, and propose a fix on a branch of its own.",
+            "The tracker \"{{tracker.title}}\" (kit {{tracker.kit}}) ended {{tracker.phase}}: {{tracker.line}}\n{{tracker.url}}\n\n{{logs}}\n\n\
+Investigate why it failed and explain the cause briefly. Then propose a fix: create a new branch off the failing commit {{sha}} named \
+fix/<branch>-<short sha>, make the change there, commit it, and show the diff. Do not push. Finish by offering next steps with the \
+suggest tool: pushing the fix branch (and opening a PR), or applying the change to the working branch.",
+        ),
+        p(
+            "Repair a kit",
+            "probe_failing",
+            "",
+            "A tracker's probe keeps failing (or nothing ever showed up): work out what changed and fix the kit.",
+            "The kit \"{{tracker.kit}}\" may be broken: its tracker \"{{tracker.name}}\" ({{tracker.title}}) {{why}}.\n\nIts definition:\n\
+```json\n{{definition}}\n```\n\nWork out what changed: check the environment knowledge about these systems (knowledge_list), re-run the \
+probe by hand where it runs, and compare. Record what you find (knowledge_record; contradicts for facts that no longer hold). Then fix the \
+kit with c6_call settings.kits.put (send every kit back; it is dry-run when saved). If it needs the user (a credential, access), raise it \
+with todo_add and say what you assumed.",
+        ),
+        p(
+            "Work on an action item",
+            "todo_session",
+            "",
+            "You started a session from an action item: help settle it with its context.",
+            "Help me settle this action item.\n\nAction item #{{todo.id}} ({{todo.kind}}): {{todo.title}}\n{{todo.detail}}\n\nContext: \
+{{todo.context}}\n\nIf it names facts, read them with knowledge_list (by id) and their evidence; re-check what you can by running their \
+checks here. Then ask me what you need, settle it with me, and record the outcome: knowledge_set for facts I confirm, correct or retire, \
+knowledge_record for anything new, and todo_resolve with a one-line resolution when we are done.",
+        ),
+    ]
 }
 
-/// A session started: if its repo has no kit and was never set up, set it
-/// up in a side chat (once per repo).
+/// The playbooks: yours, or what carbon6 starts with (until you save them).
+/// The earlier on/off switch for setting up repos carries over.
+pub async fn playbooks(st: &HeadState) -> anyhow::Result<Vec<api::Playbook>> {
+    if let Some(saved) = st.store.setting(PLAYBOOKS).await? {
+        return Ok(serde_json::from_str(&saved).unwrap_or_default());
+    }
+    let mut d = default_playbooks();
+    if settings(st).await?.auto_setup == Some(false) {
+        for p in d.iter_mut().filter(|p| p.trigger == "first_session") {
+            p.enabled = false;
+        }
+    }
+    Ok(d)
+}
+
+pub fn check_playbooks(list: &[api::Playbook]) -> anyhow::Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for p in list {
+        if p.name.trim().is_empty() || !names.insert(p.name.trim().to_owned()) {
+            return Err(bad_request(format!("playbook names must be unique and not empty ({:?})", p.name)));
+        }
+        if !TRIGGERS.contains(&p.trigger.as_str()) {
+            return Err(bad_request(format!("playbook {}: the trigger is one of {}", p.name, TRIGGERS.join(", "))));
+        }
+        if p.prompt.trim().is_empty() {
+            return Err(bad_request(format!("playbook {} needs a prompt", p.name)));
+        }
+        crate::sessions::check_selector(&p.applies_to)?;
+    }
+    Ok(())
+}
+
+/// The most specific enabled playbook for this trigger and these labels.
+pub async fn pick(st: &HeadState, trigger: &str, labels: &[String]) -> anyhow::Result<Option<api::Playbook>> {
+    let mut found: Vec<api::Playbook> = playbooks(st)
+        .await?
+        .into_iter()
+        .filter(|p| p.enabled && p.trigger == trigger && api::labels::applies(&p.applies_to, labels))
+        .collect();
+    found.sort_by_key(|p| std::cmp::Reverse((p.applies_to.len(), p.applies_to.iter().map(String::len).sum::<usize>())));
+    Ok(found.into_iter().next())
+}
+
+/// Which keys a playbook already ran for.
+pub async fn runs(st: &HeadState) -> anyhow::Result<std::collections::BTreeMap<String, Vec<String>>> {
+    if let Some(saved) = st.store.setting(RUNS).await? {
+        return Ok(serde_json::from_str(&saved).unwrap_or_default());
+    }
+    // From before playbooks: the repos already set up.
+    let mut m = std::collections::BTreeMap::new();
+    let old = settings(st).await?.set_up;
+    if !old.is_empty() {
+        m.insert(default_playbooks()[0].name.clone(), old);
+    }
+    Ok(m)
+}
+
+async fn mark_run(st: &HeadState, name: &str, key: &str) -> anyhow::Result<bool> {
+    let mut r = runs(st).await?;
+    let keys = r.entry(name.to_owned()).or_default();
+    if keys.iter().any(|k| k == key) {
+        return Ok(false);
+    }
+    keys.push(key.to_owned());
+    st.store.set_setting(RUNS, &serde_json::to_string(&r)?).await?;
+    Ok(true)
+}
+
+/// A session started: the first_session playbook for its labels, once per
+/// value of its once_per label.
 pub async fn on_started(st: &HeadState, session_id: &str, seq: u64) -> anyhow::Result<()> {
     let Some(session) = st.store.session(session_id).await? else { return Ok(()) };
     if session.parent_id.is_some() || session.parent_call_id.is_some() {
@@ -175,76 +295,113 @@ pub async fn on_started(st: &HeadState, session_id: &str, seq: u64) -> anyhow::R
     if labels.iter().any(|l| l == crate::assistant::LABEL || l == "todo") {
         return Ok(());
     }
-    let Some(repo) = labels.iter().find(|l| l.starts_with("repo:")).cloned() else { return Ok(()) };
-    let mut s = settings(st).await?;
-    if !s.auto_setup.unwrap_or(true) || s.set_up.contains(&repo) {
-        return Ok(());
-    }
+    let Some(book) = pick(st, "first_session", &labels).await? else { return Ok(()) };
+    let Some(key) = once_key(&book, &labels) else { return Ok(()) };
+    // A repo with a kit already is set up.
     let kits = crate::followups::kits(st).await?;
     if kits.iter().any(|k| k.state != "disabled" && !k.applies_to.is_empty() && api::labels::applies(&k.applies_to, &labels)) {
         return Ok(());
     }
-    s.set_up.push(repo.clone());
-    st.store.set_setting(SETTING, &serde_json::to_string(&s)?).await?;
-    start_setup(st, &session, seq, &repo).await?;
+    if !mark_run(st, &book.name, &key).await? {
+        return Ok(());
+    }
+    run_first_session(st, &session, &book, seq, &key).await?;
     Ok(())
 }
 
-pub async fn start_setup(st: &HeadState, session: &SessionRow, seq: u64, repo: &str) -> anyhow::Result<api::Session> {
+fn once_key(book: &api::Playbook, labels: &[String]) -> Option<String> {
+    let prefix = if book.once_per.is_empty() { "repo" } else { book.once_per.trim_end_matches(':') };
+    labels.iter().find(|l| l.split_once(':').is_some_and(|(k, _)| k == prefix)).cloned()
+}
+
+async fn run_first_session(
+    st: &HeadState,
+    session: &SessionRow,
+    book: &api::Playbook,
+    seq: u64,
+    key: &str,
+) -> anyhow::Result<api::Session> {
+    let ctx = json!({
+        "key": key,
+        "repo": key.split_once(':').map(|(_, v)| v).unwrap_or(key),
+        "once_per": book.once_per,
+        "session": {"id": session.id, "title": session.title, "cwd": session.cwd, "worker": session.worker_name},
+        "labels": session.all_labels(),
+    });
+    side_chat(st, session, seq, &crate::followups::render(&book.prompt, &ctx)).await
+}
+
+async fn side_chat(st: &HeadState, session: &SessionRow, anchor: u64, prompt: &str) -> anyhow::Result<api::Session> {
     crate::sessions::create_side_chat(
         st,
         &session.id,
         api::CreateSideChat {
-            anchor_seq: seq,
+            anchor_seq: anchor,
             connection_id: session.connection_id.clone(),
             model: session.model.clone(),
             effort: None,
-            prompt: playbook(repo),
+            prompt: prompt.to_owned(),
         },
     )
     .await
 }
 
-/// `POST /api/v1/kits/setup`: set a session's repo up now.
+/// `POST /api/v1/kits/setup`: run a session's first_session playbook now
+/// (even if it ran for its repo before).
 pub async fn setup_now(st: &HeadState, session_id: &str) -> anyhow::Result<api::Session> {
     let session = st.store.session(session_id).await?.ok_or_else(|| crate::not_found("no such session"))?;
-    let repo = session
-        .all_labels()
-        .into_iter()
-        .find(|l| l.starts_with("repo:"))
-        .ok_or_else(|| bad_request("that session is not in a repository"))?;
-    let mut s = settings(st).await?;
-    if !s.set_up.contains(&repo) {
-        s.set_up.push(repo.clone());
-        st.store.set_setting(SETTING, &serde_json::to_string(&s)?).await?;
-    }
-    start_setup(st, &session, session.last_seq as u64, &repo).await
+    let labels = session.all_labels();
+    let book = pick(st, "first_session", &labels)
+        .await?
+        .ok_or_else(|| bad_request("no enabled first-session playbook applies to that session (Settings → Projects)"))?;
+    let key = once_key(&book, &labels).ok_or_else(|| {
+        bad_request(format!("that session has no {} label", if book.once_per.is_empty() { "repo" } else { &book.once_per }))
+    })?;
+    mark_run(st, &book.name, &key).await?;
+    run_first_session(st, &session, &book, session.last_seq as u64, &key).await
 }
 
-/// A tracker's probe keeps failing (or nothing ever showed up): a side chat
-/// works out what changed and fixes the kit.
-pub async fn repair(st: &HeadState, session: &SessionRow, t: &api::Tracker, def: &api::TrackerDef, why: &str) -> anyhow::Result<String> {
-    let prompt = format!(
-        "The kit \"{}\" may be broken: its tracker \"{}\" ({}) {why}.\n\nIts definition:\n```json\n{}\n```\n\nWork out what changed: check the \
-environment knowledge about these systems (knowledge_list), re-run the probe by hand where it runs, and compare. Record what you find \
-(knowledge_record; contradicts for facts that no longer hold). Then fix the kit with c6_call settings.kits.put (send every kit back; it \
-is dry-run when saved). If it needs the user (a credential, access), raise it with todo_add and say what you assumed.",
-        t.kit,
-        t.name,
-        t.title,
-        serde_json::to_string_pretty(def).unwrap_or_default()
-    );
-    let side = crate::sessions::create_side_chat(
-        st,
-        &session.id,
-        api::CreateSideChat {
-            anchor_seq: t.anchor_seq,
-            connection_id: session.connection_id.clone(),
-            model: session.model.clone(),
-            effort: None,
-            prompt,
-        },
-    )
-    .await?;
-    Ok(side.id)
+/// The prompt for a failed tracker's investigation, if a playbook applies.
+pub async fn investigation_prompt(
+    st: &HeadState,
+    session: &SessionRow,
+    t: &api::Tracker,
+    logs: &str,
+    ctx: &Value,
+) -> anyhow::Result<Option<String>> {
+    let Some(book) = pick(st, "tracker_failed", &session.all_labels()).await? else { return Ok(None) };
+    let c = json!({
+        "tracker": t, "logs": logs, "vars": ctx["vars"],
+        "sha": crate::followups::lookup(ctx, "vars.sha").cloned().unwrap_or(Value::Null),
+        "session": {"id": session.id, "title": session.title, "cwd": session.cwd, "worker": session.worker_name},
+    });
+    Ok(Some(crate::followups::render(&book.prompt, &c)))
+}
+
+/// A tracker's probe keeps failing (or nothing ever showed up): the
+/// probe_failing playbook in a side chat, if one applies.
+pub async fn repair(
+    st: &HeadState,
+    session: &SessionRow,
+    t: &api::Tracker,
+    def: &api::TrackerDef,
+    why: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(book) = pick(st, "probe_failing", &session.all_labels()).await? else { return Ok(None) };
+    let c = json!({
+        "tracker": t, "why": why, "definition": serde_json::to_string_pretty(def).unwrap_or_default(),
+        "session": {"id": session.id, "title": session.title, "cwd": session.cwd, "worker": session.worker_name},
+    });
+    let side = side_chat(st, session, t.anchor_seq, &crate::followups::render(&book.prompt, &c)).await?;
+    Ok(Some(side.id))
+}
+
+/// The prompt for a session started from an action item.
+pub async fn todo_prompt(st: &HeadState, t: &api::Todo, labels: &[String]) -> anyhow::Result<String> {
+    let c = json!({"todo": {"id": t.id, "kind": t.kind, "title": t.title, "detail": t.detail, "source": t.source,
+        "context": serde_json::to_string_pretty(&t.context).unwrap_or_default()}});
+    Ok(match pick(st, "todo_session", labels).await? {
+        Some(book) => crate::followups::render(&book.prompt, &c),
+        None => format!("Help me settle this action item: {}\n{}\n\nContext: {}", t.title, t.detail, t.context),
+    })
 }

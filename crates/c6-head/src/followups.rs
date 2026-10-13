@@ -137,7 +137,7 @@ pub fn check_kits(kits: &[api::Kit]) -> anyhow::Result<()> {
         if !matches!(k.state.as_str(), "proposed" | "active" | "broken" | "disabled") {
             return Err(bad_request(format!("kit {k_name}: state is proposed, active, broken or disabled")));
         }
-        crate::sessions::check_labels(&k.applies_to)?;
+        crate::sessions::check_selector(&k.applies_to)?;
         let regex = |what: &str, r: &str| -> anyhow::Result<()> {
             if !r.is_empty() {
                 regex::Regex::new(r).map_err(|e| bad_request(format!("kit {k_name}: {what}: {e}")))?;
@@ -816,9 +816,13 @@ async fn poll(st: &Arc<HeadState>, id: i64) -> anyhow::Result<()> {
     {
         let why = if errors >= 3 { format!("failed {errors} times in a row: {error}") } else { line.clone() };
         match crate::selfconfig::repair(st, s, &t, &def, &why).await {
-            Ok(side) => {
+            Ok(Some(side)) => {
                 sqlx::query("UPDATE trackers SET repair = ? WHERE id = ?").bind(&side).bind(id).execute(&st.store.pool).await?;
                 publish_tracker(st, id).await;
+            }
+            // No playbook repairs here: do not ask again.
+            Ok(None) => {
+                sqlx::query("UPDATE trackers SET repair = '' WHERE id = ?").bind(id).execute(&st.store.pool).await?;
             }
             Err(e) => warn!(tracker = id, "starting a repair: {e:#}"),
         }
@@ -869,7 +873,11 @@ async fn finish(
         }
     }
     if phase == "failed" && def.investigate.unwrap_or(true) {
-        investigate(st, session, id, def, ctx).await?;
+        match investigate(st, session, id, def, ctx).await {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("no enabled playbook") => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -894,18 +902,9 @@ pub async fn investigate(st: &HeadState, session: &SessionRow, id: i64, def: &ap
         },
         None => "No logs command is configured for this tracker; find the logs from the link if you can reach it.".into(),
     };
-    let sha = lookup(ctx, "vars.sha").map(as_text).unwrap_or_default();
-    let prompt = format!(
-        "The tracker \"{}\" (kit {}) ended {}: {}{}\n\n{logs}\n\nInvestigate why it failed and explain the cause briefly. Then propose a fix: \
-create a new branch off the failing commit{} named fix/<branch>-<short sha>, make the change there, commit it, and show the diff. Do not push. \
-Finish by offering next steps with the suggest tool: pushing the fix branch (and opening a PR), or applying the change to the working branch.",
-        t.title,
-        t.kit,
-        t.phase,
-        t.line,
-        if t.url.is_empty() { String::new() } else { format!("\n{}", t.url) },
-        if sha.is_empty() { String::new() } else { format!(" ({sha})") },
-    );
+    let prompt = crate::selfconfig::investigation_prompt(st, session, &t, &logs, ctx)
+        .await?
+        .ok_or_else(|| bad_request("no enabled playbook investigates failures here (Settings → Projects → Playbooks)"))?;
     let side = crate::sessions::create_side_chat(
         st,
         &session.id,
@@ -1091,6 +1090,8 @@ mod tests {
             "trackers": [{"name": "ci", "probe": {"command": "true", "on": "worker", "worker": "build-1"}}]}),
         );
         assert!(check_kits(&good).is_ok());
+        let for_repo = kit(json!({"name": "falcon", "applies_to": ["repo:github.com/mach5-io/falcon"]}));
+        assert!(check_kits(&for_repo).is_ok(), "kits apply to labels carbon6 sets, like repo:");
         assert!(check_kits(&kit(json!({"name": "x", "reactions": [{"name": "r", "when": {"tool": "("}}]}))).is_err());
         assert!(
             check_kits(&kit(

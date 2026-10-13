@@ -702,6 +702,38 @@ pub struct Tracker {
     pub repair: Option<String>,
 }
 
+/// A playbook (`/api/v1/settings/playbooks`): what an agent is asked to do
+/// when something happens: a repo's first session (set it up), a tracker
+/// failing (investigate), a probe failing repeatedly (repair), a session
+/// started from an action item. carbon6 starts with editable ones; the most
+/// specific enabled playbook for the labels wins.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Playbook {
+    pub name: String,
+    /// first_session, tracker_failed, probe_failing or todo_session.
+    pub trigger: String,
+    /// Labels the session must all have (a prefix like repo:github.com/acme
+    /// covers an org); empty: every session.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    /// For first_session: run once per value of this label (default repo:
+    /// once per repository); a session without it is skipped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub once_per: String,
+    /// The prompt (a template: {{key}}, {{repo}}, {{session.…}},
+    /// {{tracker.…}}, {{logs}}, {{why}}, {{todo.…}}…).
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default = "playbook_enabled")]
+    pub enabled: bool,
+}
+
+fn playbook_enabled() -> bool {
+    true
+}
+
 /// `GET`/`PUT /api/v1/settings/followthrough`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

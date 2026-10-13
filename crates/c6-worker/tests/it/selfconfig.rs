@@ -85,6 +85,23 @@ async fn sessions_configure_follow_through() {
     };
     let cwd = repo.path().canonicalize().unwrap().display().to_string();
 
+    // The playbooks start as carbon6's own; yours replace them. A more
+    // specific one (for this org) wins over the general one.
+    let mut books: Vec<Value> = http.get(format!("{api}/settings/playbooks")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(books.len(), 4, "{books:?}");
+    assert!(books[0]["prompt"].as_str().unwrap().contains("Set up follow-through for {{key}}"));
+    books.push(json!({"name": "Our repos", "trigger": "first_session", "applies_to": ["repo:github.com/you"],
+        "prompt": "Set up {{repo}} our way: CI is Argo, reached from build-1."}));
+    let bad = http
+        .put(format!("{api}/settings/playbooks"))
+        .json(&json!([{"name": "x", "trigger": "whenever", "prompt": "p"}]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+    let r = http.put(format!("{api}/settings/playbooks")).json(&books).send().await.unwrap();
+    assert!(r.status().is_success());
+
     // The first session in the repo: set up in a side chat, by itself.
     mock.push(Reply::Text("ok".into()));
     mock.push(Reply::Text("Set up: nothing found yet.".into()));
@@ -97,11 +114,11 @@ async fn sessions_configure_follow_through() {
         .requests()
         .iter()
         .map(|r| r.to_string())
-        .find(|r| r.contains("Set up follow-through for repo:github.com/you/app"))
-        .expect("the playbook");
-    assert!(asked.contains("knowledge_record") && asked.contains("settings.kits.put"), "{asked}");
-    let ft: Value = http.get(format!("{api}/settings/followthrough")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(ft["set_up"], json!(["repo:github.com/you/app"]));
+        .find(|r| r.contains("Set up github.com/you/app our way: CI is Argo, reached from build-1."))
+        .expect("your playbook, filled in");
+    assert!(!asked.contains("Set up follow-through for"), "the more specific playbook won: {asked}");
+    let runs: Value = http.get(format!("{api}/settings/playbook_runs")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(runs["Our repos"], json!(["repo:github.com/you/app"]));
     // Once per repo.
     mock.push(Reply::Text("ok".into()));
     let s2 = start("again", cwd.clone()).await;

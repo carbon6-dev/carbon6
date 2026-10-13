@@ -131,7 +131,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/kits", get(get_kits).put(put_kits))
         .route("/api/v1/kits/dry-run", post(kit_dry_run))
         .route("/api/v1/kits/setup", post(kit_setup))
-        .route("/api/v1/settings/followthrough", get(get_followthrough).put(put_followthrough))
+        .route("/api/v1/settings/playbooks", get(get_playbooks).put(put_playbooks))
+        .route("/api/v1/settings/playbook_runs", get(get_playbook_runs).put(put_playbook_runs))
         .route("/api/v1/sessions/{id}/followups", get(session_followups))
         .route("/api/v1/sessions/{id}/suggestions/{sid}/take", post(take_suggestion))
         .route("/api/v1/sessions/{id}/suggestions/{sid}/dismiss", post(dismiss_suggestion))
@@ -1971,11 +1972,24 @@ async fn kit_setup(State(st): State<Arc<HeadState>>, Json(r): Json<SetupIn>) -> 
     Ok(Json(crate::selfconfig::setup_now(&st, &r.session_id).await?))
 }
 
-async fn get_followthrough(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::FollowThroughSettings>> {
-    Ok(Json(crate::selfconfig::settings(&st).await?))
+async fn get_playbooks(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Playbook>>> {
+    Ok(Json(crate::selfconfig::playbooks(&st).await?))
 }
 
-async fn put_followthrough(State(st): State<Arc<HeadState>>, Json(s): Json<api::FollowThroughSettings>) -> ApiResult<StatusCode> {
-    st.store.set_setting(crate::selfconfig::SETTING, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+async fn put_playbooks(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::Playbook>>) -> ApiResult<StatusCode> {
+    crate::selfconfig::check_playbooks(&p)?;
+    st.store.set_setting(crate::selfconfig::PLAYBOOKS, &serde_json::to_string(&p).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_playbook_runs(State(st): State<Arc<HeadState>>) -> ApiResult<Json<std::collections::BTreeMap<String, Vec<String>>>> {
+    Ok(Json(crate::selfconfig::runs(&st).await?))
+}
+
+async fn put_playbook_runs(
+    State(st): State<Arc<HeadState>>,
+    Json(r): Json<std::collections::BTreeMap<String, Vec<String>>>,
+) -> ApiResult<StatusCode> {
+    st.store.set_setting(crate::selfconfig::RUNS, &serde_json::to_string(&r).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }

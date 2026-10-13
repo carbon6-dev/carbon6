@@ -147,22 +147,7 @@ pub async fn start_session(st: &HeadState, id: i64) -> anyhow::Result<api::Sessi
         .find(|w| !wanted.is_empty() && (w.name == wanted || w.id == wanted))
         .or_else(|| online.first())
         .ok_or_else(|| bad_request("no worker is online to work on it"))?;
-    let facts = t.context["facts"].as_array().cloned().unwrap_or_default();
-    let mut prompt = format!(
-        "Help me settle this action item.\n\nAction item #{} ({}): {}\n{}\n\nContext: {}\n",
-        t.id,
-        t.kind,
-        t.title,
-        t.detail,
-        serde_json::to_string_pretty(&t.context).unwrap_or_default()
-    );
-    if !facts.is_empty() {
-        prompt.push_str("\nRead the facts named above with knowledge_list (by id) and their evidence; re-check what you can by running their checks here. ");
-    }
-    prompt.push_str(
-        "\nThen ask me what you need, settle it with me, and record the outcome: knowledge_set for facts I confirm, correct or retire, \
-knowledge_record for anything new, and todo_resolve with a one-line resolution when we are done.",
-    );
+    let prompt = crate::selfconfig::todo_prompt(st, &t, &["todo".to_owned()]).await?;
     let req: api::CreateSession = serde_json::from_value(json!({
         "worker_id": worker.id, "cwd": "", "connection_id": "", "model": "",
         "prompt": prompt, "title": format!("To do: {}", crate::util_clip(&t.title, 60)), "labels": ["todo"],

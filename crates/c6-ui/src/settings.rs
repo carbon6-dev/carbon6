@@ -125,7 +125,15 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                             presets=kit_presets
                             example=r#"[{"name": "app", "applies_to": ["repo:github.com/you/app"], "reactions": [], "trackers": []}]"#
                         />
-                        <AutoSetup />
+                        <ListSetting
+                            name="playbooks"
+                            title="Playbooks"
+                            noun="playbook"
+                            help="What agents are asked to do when something happens. First session: a repository's first session (once per value of the once-per label, default repo), e.g. setting up follow-through. Tracker failed: an investigation. Probe failing: a repair. Todo session: a session you start from an action item. Each runs in a side chat (or the started session). Applies to: labels (a prefix such as repo:github.com/acme covers an org); the most specific enabled playbook wins. The prompt is a template: {{key}} and {{repo}} (first session), {{tracker.title}}, {{tracker.line}}, {{tracker.url}}, {{logs}}, {{sha}} (tracker failed), {{why}} and {{definition}} (probe failing), {{todo.title}}, {{todo.detail}}, {{todo.context}} (todo session), {{session.…}}. These start as carbon6's own; change them to fit how you work."
+                            fields=PLAYBOOK_FIELDS
+                            examples=playbook_examples
+                        />
+                        <PlaybookRuns />
                         <KitDryRun />
                     }.into_any(),
                     "rules" => view! {
@@ -575,6 +583,58 @@ fn ChatGptSignIn(
 type Preset = (&'static str, &'static str, serde_json::Value);
 
 /// Ready-made MCP servers: (label, the secrets it needs, its config).
+const PLAYBOOK_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. Set up follow-through", kind: FieldKind::Line },
+    Field {
+        key: "trigger",
+        label: "When",
+        placeholder: "",
+        kind: FieldKind::Choice(&["first_session", "tracker_failed", "probe_failing", "todo_session"]),
+    },
+    Field {
+        key: "applies_to",
+        label: "Applies to",
+        placeholder: "every session, or labels, e.g. repo:github.com/acme",
+        kind: FieldKind::Labels,
+    },
+    Field { key: "once_per", label: "Once per (first session)", placeholder: "repo", kind: FieldKind::Mono },
+    Field { key: "description", label: "What it is for", placeholder: "shown here", kind: FieldKind::Line },
+    Field {
+        key: "prompt",
+        label: "Prompt",
+        placeholder: "what the agent is asked to do ({{key}}, {{tracker.title}}, …)",
+        kind: FieldKind::Text,
+    },
+];
+
+fn playbook_examples() -> Vec<(&'static str, serde_json::Value)> {
+    let p = |name: &str, trigger: &str, labels: &[&str], prompt: &str| {
+        let mut v = item(&[("name", name), ("trigger", trigger), ("prompt", prompt)]);
+        v["applies_to"] = serde_json::json!(labels);
+        v
+    };
+    vec![
+        (
+            "Set up one org's repos your way",
+            p(
+                "Set up our repos",
+                "first_session",
+                &["repo:github.com/your-org"],
+                "Set up follow-through for {{key}}. Our CI: … (where it runs, how to reach it, how runs are tied to commits). Write a kit for {{key}} with c6_call settings.kits.put, record what you learn with knowledge_record, and raise anything you cannot settle with todo_add.",
+            ),
+        ),
+        (
+            "Investigate failures without proposing fixes",
+            p(
+                "Explain failures",
+                "tracker_failed",
+                &[],
+                "\"{{tracker.title}}\" failed: {{tracker.line}} {{tracker.url}}\n\n{{logs}}\n\nExplain the cause briefly. Do not change any code.",
+            ),
+        ),
+    ]
+}
+
 fn kit_presets() -> Vec<Preset> {
     use serde_json::json;
     vec![
@@ -2395,61 +2455,53 @@ fn KitDryRun() -> impl IntoView {
     }
 }
 
-/// Whether repos are set up by themselves, and which have been.
+/// Where once-only playbooks ran (× lets one run there again).
 #[component]
-fn AutoSetup() -> impl IntoView {
+fn PlaybookRuns() -> impl IntoView {
     let tick = RwSignal::new(0u32);
     let loaded = LocalResource::new(move || {
         tick.track();
-        api::get_setting("followthrough")
+        api::get_setting("playbook_runs")
     });
-    let note = RwSignal::new(None::<Result<String, String>>);
+    let error = RwSignal::new(None::<String>);
     let save = move |v: serde_json::Value| {
         spawn_local(async move {
-            note.set(Some(api::put_setting("followthrough", v).await.map(|_| "Saved.".to_owned())));
+            if let Err(e) = api::put_setting("playbook_runs", v).await {
+                error.set(Some(e));
+            }
             tick.update(|t| *t += 1);
         });
     };
     view! {
-        <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-            <h2 class="font-medium">"Set up by itself"</h2>
-            <p class="text-sm text-zinc-500">"The first session in a repository with no kit gets a side chat that works out its CI and the rest, writes a kit and what it learned, dry-runs it, and raises action items for what it could not settle. Once per repository."</p>
-            {move || loaded.get().and_then(Result::ok).map(|v| {
-                let on = v["auto_setup"].as_bool().unwrap_or(true);
-                let repos: Vec<String> = v["set_up"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
-                let v2 = v.clone();
-                view! {
-                    <label class="flex items-center gap-2 text-sm">
-                        <input type="checkbox" prop:checked=on on:change=move |ev| {
-                            let mut v = v2.clone();
-                            v["auto_setup"] = event_target_checked(&ev).into();
-                            save(v);
-                        } />
-                        "Set up new repositories automatically"
-                    </label>
-                    {(!repos.is_empty()).then(|| view! {
+        {move || loaded.get().and_then(Result::ok).filter(|v| v.as_object().is_some_and(|o| o.values().any(|k| k.as_array().is_some_and(|a| !a.is_empty())))).map(|v| view! {
+            <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+                <h2 class="font-medium">"Where first-session playbooks ran"</h2>
+                <p class="text-sm text-zinc-500">"They run once per repository (or whatever their once-per label is). Remove one to let it run there again."</p>
+                {v.as_object().cloned().unwrap_or_default().into_iter().map(|(book, keys)| {
+                    let keys: Vec<String> = keys.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                    let all = v.clone();
+                    view! {
                         <div class="flex flex-wrap items-center gap-1 text-xs">
-                            <span class="text-zinc-500">"Set up (× to allow again):"</span>
-                            {repos.iter().map(|r| {
-                                let (r2, all, v3) = (r.clone(), repos.clone(), v.clone());
+                            <span class="text-zinc-500">{format!("{book}:")}</span>
+                            {keys.iter().map(|k| {
+                                let (k2, b2, all2) = (k.clone(), book.clone(), all.clone());
                                 view! {
-                                    <span class="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 font-mono dark:bg-zinc-800">{r.clone()}
-                                        <button class="text-zinc-400 hover:text-red-600" on:click=move |_| {
-                                            let mut v = v3.clone();
-                                            v["set_up"] = serde_json::json!(all.iter().filter(|x| **x != r2).collect::<Vec<_>>());
+                                    <span class="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 font-mono dark:bg-zinc-800">{k.clone()}
+                                        <button class="text-zinc-400 hover:text-red-600" title="Let it run here again" on:click=move |_| {
+                                            let mut v = all2.clone();
+                                            if let Some(a) = v[&b2].as_array_mut() {
+                                                a.retain(|x| x.as_str() != Some(k2.as_str()));
+                                            }
                                             save(v);
                                         }>"×"</button>
                                     </span>
                                 }
                             }).collect_view()}
                         </div>
-                    })}
-                }
-            })}
-            {move || note.get().map(|r| match r {
-                Ok(m) => view! { <p class="text-xs text-emerald-600">{m}</p> }.into_any(),
-                Err(e) => view! { <p class="text-xs text-red-600">{e}</p> }.into_any(),
-            })}
-        </section>
+                    }
+                }).collect_view()}
+            </section>
+        })}
+        {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
     }
 }

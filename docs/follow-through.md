@@ -247,9 +247,14 @@ Agents never wait on action items. They work with what they know, with its statu
   - `settings.kits.put` may add or change kits, not remove them. What changed is proposed, dry-run on the session's worker, then active (with a low-priority review item) or broken.
   - A short list of other writes is allowed: action items, knowledge, notes, memories, a session's title and labels.
   - Destructive operations, operations that return secrets, and everything that changes tools, permissions or credentials are refused, with a pointer to `todo_add`.
-- **Setup and repair:**
-  - The first session with a `repo:` label and no kit for it runs the setup playbook in a side chat, once per repo. The repos done are listed in the `followthrough` setting, which also turns this off. `POST /api/v1/kits/setup` runs it now.
-  - A tracker whose probe fails 3 times in a row, or that stalls while waiting, starts a repair side chat once.
+- **Playbooks:** what agents are asked to do when something happens is configuration, not code. It lives in the head setting `playbooks`, under Settings → Projects. Each playbook has:
+  - a trigger: `first_session`, `tracker_failed`, `probe_failing` or `todo_session`;
+  - labels it applies to; the most specific enabled playbook wins;
+  - for `first_session`, a once-per label (default `repo`);
+  - a prompt template.
+  - carbon6 starts with four editable playbooks: set up follow-through, investigate a failure, repair a kit, and work on an action item. Until you save your own list, those are what apply.
+  - Where once-only playbooks ran is the `playbook_runs` setting; removing an entry lets one run there again. `POST /api/v1/kits/setup` runs a session's first-session playbook now.
+  - A tracker whose probe fails 3 times in a row, or that stalls while waiting, runs the `probe_failing` playbook in a side chat, once. A failed tracker runs `tracker_failed`. Without an applicable playbook, nothing runs.
 - **Not built:** webhook-fed trackers (build order step 4).
 
 ## 10. Settled since
