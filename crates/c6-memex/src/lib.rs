@@ -9,6 +9,7 @@ pub mod docs;
 pub mod embed;
 pub mod faces;
 pub mod google;
+pub mod ingest;
 pub mod knowledge;
 pub mod llm;
 pub mod mail;
@@ -84,7 +85,7 @@ fn task_of(v: &Value) -> Option<llm::Task> {
 }
 
 /// Files larger than this are not read.
-const MAX_FILE: u64 = 50 * 1024 * 1024;
+pub(crate) const MAX_FILE: u64 = 50 * 1024 * 1024;
 
 impl Memex {
     pub async fn open(dir: &Path, link: Arc<HeadLink>) -> anyhow::Result<Arc<Self>> {
@@ -312,6 +313,12 @@ impl Memex {
 
     pub fn account_id(&self, id_or_email: &str) -> anyhow::Result<String> {
         Ok(self.account(id_or_email)?.id)
+    }
+
+    /// A mail account to read or label: a Google account, or an import
+    /// source (`import:…`).
+    pub fn mail_account(&self, id_or_email: &str) -> anyhow::Result<String> {
+        if id_or_email.starts_with("import:") { Ok(id_or_email.to_owned()) } else { self.account_id(id_or_email) }
     }
 
     pub fn contacts_auto(&self) -> bool {
@@ -543,11 +550,8 @@ impl Memex {
     pub async fn handle_method(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let allowed = Self::allowed(&params);
         match method {
-            "memex.ingest" => {
-                let item: api::MemexItemIn = serde_json::from_value(params)?;
-                let id = self.store.put(&item, &item.source).await?;
-                Ok(json!({"id": id}))
-            }
+            "memex.ingest" => ingest::ingest(self, params).await,
+            "memex.types" => Ok(json!(ingest::types())),
             "memex.delete" => {
                 let id = match params["id"].as_str() {
                     Some(id) => Some(id.to_owned()),
@@ -619,8 +623,16 @@ impl Memex {
                 let data = base64::engine::general_purpose::STANDARD.decode(u.data.as_bytes())?;
                 anyhow::ensure!(data.len() as u64 <= MAX_FILE, "files up to 50 MB");
                 let hash = c6_core::sha256_hex(&data);
-                let (id, kind, title) = self.add_document(&u.name, &data, "upload", &hash, &u.labels, None).await?;
-                Ok(json!({"id": id, "kind": kind, "title": title}))
+                // Through the document handler: a file already here is that item.
+                let ext = u.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                let r = ingest::document(self, "upload", &hash, &u.name, &ext, &data, &u.labels, None).await?;
+                let id = r.id.unwrap_or_default();
+                let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
+                    .bind(&id)
+                    .fetch_optional(&self.store.pool)
+                    .await?
+                    .unwrap_or_default();
+                Ok(json!({"id": id, "kind": r.kind, "title": title, "status": r.status}))
             }
             "memex.content" => {
                 use base64::Engine;
@@ -802,7 +814,7 @@ impl Memex {
                 json!({})
             }
             "memex.mail.threads" => {
-                let account = params["account"].as_str().filter(|a| !a.is_empty()).map(|a| self.account_id(a)).transpose()?;
+                let account = params["account"].as_str().filter(|a| !a.is_empty()).map(|a| self.mail_account(a)).transpose()?;
                 let view = params["view"].as_str().unwrap_or("inbox");
                 json!(
                     mail::threads(
@@ -815,12 +827,12 @@ impl Memex {
                     .await?
                 )
             }
-            "memex.mail.thread" => json!(mail::thread(self, &self.account_id(&s("account"))?, &s("thread_id")).await?),
+            "memex.mail.thread" => json!(mail::thread(self, &self.mail_account(&s("account"))?, &s("thread_id")).await?),
             "memex.mail.modify" => {
                 let list = |k: &str| -> Vec<String> {
                     params[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default()
                 };
-                mail::modify(self, &self.account_id(&s("account"))?, &s("thread_id"), &list("add"), &list("remove")).await?;
+                mail::modify(self, &self.mail_account(&s("account"))?, &s("thread_id"), &list("add"), &list("remove")).await?;
                 json!({})
             }
             "memex.mail.attachment" => {

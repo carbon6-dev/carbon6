@@ -240,7 +240,7 @@ trail(id, name, description) ; trail_step(trail_id, ordinal, target, comment)
 | `attributes` | Facts that aren't inside the bytes: a folder, flags, a received date, a page URL. Checked against the handler's schema. |
 | `labels` | Which sessions may see it (2.3), checked as uploads are checked today. |
 
-The reply has one result per item: `created` with its id, `duplicate` with the existing id, or `rejected` with the handler's reason (for example "not an RFC 822 message: no headers"). A batch never fails as a whole because of one item.
+The reply has one result per item: `created` with its id, `updated` (the same source and id with new content; documents only, since a message never changes), `duplicate` with the existing id, or `rejected` with the handler's reason (for example "not an RFC 822 message: no headers"). A batch never fails as a whole because of one item.
 
 #### The type registry
 
@@ -283,11 +283,23 @@ Importers read the registry, so a new source needs no new API, only a client.
 
 #### What it replaces
 
-- **`memex.upload`** becomes ingest with the document and media handlers. The head's `/api/v1/memex/upload` stays as a thin wrapper for the UI.
-- **Folder scan** reads files and calls the same handlers with origin `imported` and source `folder:<path>`.
-- **Notes** become ingest of `text/markdown` with `source: note`. `memex.note` stays as a wrapper.
-- **The head's internal ingest** (session digests, outputs, memory) uses `memex.ingest` with its own source kinds.
-- **The generic-item form** (`MemexItemIn`) stays as a handler for `application/vnd.c6.item+json`, for sources that are already text with a title (session digests). It is internal to the head and not offered to tokens.
+- **`memex.upload`** goes through the document handler, so a file already in the memex is that item. The head's `/api/v1/memex/upload` stays as the UI's wrapper.
+- **Folder scan** keeps its own walk and change tracking, and stores each file with the same code the document handler uses.
+- **Ingested sources** are always `import:<kind>[:<id>]`, so a client can never write into a connector's source (`gmail:…`) or the head's.
+
+#### As built (2026-10-13)
+
+- **Handlers:** mail (`message/rfc822`) and documents (PDF, Word, Markdown, plain text, HTML, reStructuredText). Photos and videos still come in only from watched folders, because the memex keeps media where it lives instead of copying it.
+- **Imported mail:**
+  - It belongs to a mail account named after its source (`import:mbox:archive`) and shows in the mail views and label views. Its folder is a label.
+  - Flags: `read` defaults to true. A folder named Spam or Junk marks the message spam, so it stays out of agents' context.
+  - Labels and read state change only in the memex: there is no Gmail to tell. A reply from an imported thread fails with "no Google account", because there is no account to send it from.
+  - It never fires new-mail automations, since it's archive mail.
+  - When Gmail sync later brings in the same Message-ID, the item becomes the synced one and keeps its id.
+- **Kept as they were:**
+  - **Notes** stay `memex.note`, because notes carry who made them and appear in trails.
+  - **The head's own items** (session digests, outputs, memory) still send the older single-item form of `memex.ingest`, which its outbox may hold across upgrades. The head's gateway accepts only typed batches from outside, so a token cannot use that form.
+- **Through the head:** `memex.ingest` and `memex.types` are callable on `POST /api/v1/memex/rpc` with an API token, are listed in the operation catalog, and are therefore in the API reference agents get (`carbon6_api`) and in `/api/v1/openapi.json`. A request is up to 40 MB, and a message up to 25 MB.
 
 ## 5. Pipelines
 
@@ -539,7 +551,7 @@ Each step is usable on its own:
    - triage, drafting, scheduling and meeting-prep workflows, memex event triggers, and inbox integration.
 4. **Understanding tiers:** summaries, topics, commitments, the graph explorer and timelines. (Built: see 5.1.)
 5. **Photos and videos:** EXIF and places, captions, objects, faces and naming, transcripts. (Built: see 7.1.)
-6. **One ingest API (4.5):**
+6. **One ingest API (4.5).** (Built: see 4.5, "As built".)
    - `memex.ingest` and `memex.types`, the handler registry, and per-item results;
    - mail as the first handler: imported mail, threading by headers, upgrade to mirrored;
    - upload, folder scan, notes and the head's internal ingest moved onto it.

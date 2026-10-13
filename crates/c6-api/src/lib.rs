@@ -2109,6 +2109,84 @@ pub struct MemexUpload {
     pub labels: Vec<String>,
 }
 
+/// `memex.ingest`: items to add, each typed by its MIME type and handled by
+/// that type's handler (`memex.types`). docs/memex.md §4.5.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MemexIngest {
+    /// Up to 500 items.
+    pub items: Vec<IngestItem>,
+}
+
+/// One item to add.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct IngestItem {
+    /// Its MIME type, e.g. message/rfc822 or application/pdf: picks the
+    /// handler.
+    #[serde(rename = "type")]
+    pub mime: String,
+    /// Its bytes in that format, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// For text types, the text instead of `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Where it comes from.
+    pub source: IngestSource,
+    /// The source's own id for it: sending it again is harmless.
+    pub external_id: String,
+    /// Facts that aren't in the bytes (a folder, flags), as the handler's
+    /// schema allows.
+    #[serde(default)]
+    pub attributes: serde_json::Value,
+    /// carbon6 labels: which sessions may see it.
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// Where ingested items come from, e.g. {kind: "mbox", id: "archive-2009"}.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct IngestSource {
+    pub kind: String,
+    #[serde(default)]
+    pub id: String,
+}
+
+/// What became of one ingested item.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct IngestResult {
+    /// created, updated (the same source and id, new content), duplicate
+    /// (already here: `id` is the existing item) or rejected (see `error`).
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The item's kind: email, document, paper, ….
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A handler in `memex.types`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct IngestType {
+    pub name: String,
+    /// The MIME types it takes.
+    pub types: Vec<String>,
+    /// What `attributes` may hold (JSON Schema; other keys are rejected).
+    pub attributes: serde_json::Value,
+    /// How it recognizes an item it already has.
+    pub identity: String,
+    /// The largest item, in bytes.
+    pub limit: u64,
+    /// The item kinds it creates.
+    pub produces: Vec<String>,
+}
+
 /// A folder the memex watches (`/api/v1/settings/memex_folders`), on the
 /// machine the memex runs on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

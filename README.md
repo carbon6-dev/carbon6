@@ -178,6 +178,7 @@ The memex is your knowledge store: a separate service, `c6m`, on the same fabric
   - **Tools:** agents get `memex_search` (keywords and meaning), `memex_get` (an item in full, or a thing with its notes, items and related things) and `memex_note`.
 - **@-mentions:** typing `@` in a message also offers things from the memex (people, clients, hosts, topics); `@memex:client:acme` attaches what the memex knows about it to the message.
 - **Documents and papers:** add files on the Memex page (**Add files**) or keep folders in sync (**Settings → Memex folders**, on the memex's machine).
+- **Bringing in data from other tools:** `memex.ingest` (on `POST /api/v1/memex/rpc`, with an API token) takes batches of items typed by MIME type: mail as `message/rfc822` (an old archive, for example), and documents as PDF, Word, Markdown, text or HTML. Each item comes back created, updated, duplicate or rejected with the reason. `memex.types` lists what each type accepts. Imported mail is threaded and searchable like synced mail, is never written back to Gmail, and becomes the synced copy if Gmail later has the same message. Design: [docs/memex.md](docs/memex.md) §4.5.
   - **Formats:** PDF, Word (.docx), Markdown, HTML and text are read.
   - **Papers** are recognized, with their title, authors, DOI or arXiv id, and the papers they cite. Cited papers become things too, so the memex holds a citation graph. For example, a paper's page lists the papers in your memex that cite it.
   - **Originals** open from the item.

@@ -176,6 +176,70 @@ pub async fn store_message(
     raw: &[u8],
 ) -> anyhow::Result<String> {
     let msg = mail_parser::MessageParser::default().parse(raw).ok_or_else(|| anyhow::anyhow!("not a mail message"))?;
+    let source = format!("gmail:{}", acct.id);
+    let rfc_id = msg.message_id().unwrap_or("").to_owned();
+    // Imported earlier and now synced: the item becomes the synced one and
+    // keeps its id, so links and notes made meanwhile stay.
+    if !rfc_id.is_empty() {
+        let twin: Option<String> = sqlx::query_scalar("SELECT item_id FROM mail WHERE rfc_id = ? AND account LIKE 'import:%' LIMIT 1")
+            .bind(&rfc_id)
+            .fetch_optional(&m.store.pool)
+            .await?;
+        if let Some(id) = twin {
+            let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            sqlx::query("UPDATE items SET source = ?, external_id = ? WHERE id = ?")
+                .bind(&source)
+                .bind(gmail_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE mail SET account = ?, gmail_id = ?, thread_id = ? WHERE item_id = ?")
+                .bind(&acct.id)
+                .bind(gmail_id)
+                .bind(thread_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+    }
+    let to = Stored {
+        account: &acct.id,
+        external_id: gmail_id,
+        thread_id,
+        source: &source,
+        rfc_id: &rfc_id,
+        origin: "mirrored",
+        owner: &acct.email,
+    };
+    store(m, &msg, raw, &to, labels, date).await
+}
+
+/// Where a message is kept: its mail account (a Gmail account's id, or
+/// `import:…` for imported mail) and thread.
+pub struct Stored<'a> {
+    pub account: &'a str,
+    pub external_id: &'a str,
+    pub thread_id: &'a str,
+    /// The item's source.
+    pub source: &'a str,
+    pub rfc_id: &'a str,
+    /// mirrored (synced both ways) or imported (here only).
+    pub origin: &'a str,
+    /// The account's address, or the source for imported mail.
+    pub owner: &'a str,
+}
+
+/// Stores a parsed message: the item (searchable text, the people as
+/// links) and its row in the mail store.
+pub async fn store(
+    m: &Memex,
+    msg: &mail_parser::Message<'_>,
+    raw: &[u8],
+    at: &Stored<'_>,
+    labels: &[String],
+    date: i64,
+) -> anyhow::Result<String> {
     let addrs = |a: Option<&mail_parser::Address>| -> Vec<(String, String)> {
         a.map(|a| a.iter().filter_map(|x| Some((x.address()?.to_lowercase(), x.name().unwrap_or("").to_owned()))).collect())
             .unwrap_or_default()
@@ -206,8 +270,8 @@ pub async fn store_message(
     };
     let item = api::MemexItemIn {
         kind: if spam { "spam" } else { "email" }.into(),
-        source: format!("gmail:{}", acct.id),
-        external_id: gmail_id.into(),
+        source: at.source.into(),
+        external_id: at.external_id.into(),
         title: if subject.is_empty() { "(no subject)".into() } else { subject.clone() },
         text: format!(
             "From: {}\nTo: {}\n{}\n{}",
@@ -217,7 +281,7 @@ pub async fn store_message(
             clip(&body, 100_000)
         ),
         created_at: Some(date),
-        meta: json!({"account": acct.email, "thread_id": thread_id, "from": from.0, "attachments": attachments.len()}),
+        meta: json!({"account": at.owner, "thread_id": at.thread_id, "from": from.0, "attachments": attachments.len(), "origin": at.origin}),
         ..Default::default()
     };
     let item_id = m.store.put(&item, &item.source).await?;
@@ -229,10 +293,10 @@ pub async fn store_message(
          spam = excluded.spam, trash = excluded.trash, sent = excluded.sent, draft = excluded.draft",
     )
     .bind(&item_id)
-    .bind(&acct.id)
-    .bind(gmail_id)
-    .bind(thread_id)
-    .bind(msg.message_id().unwrap_or(""))
+    .bind(at.account)
+    .bind(at.external_id)
+    .bind(at.thread_id)
+    .bind(at.rfc_id)
     .bind(date)
     .bind(&from.0)
     .bind(&from.1)
@@ -467,11 +531,15 @@ pub async fn attachment(m: &Memex, item_id: &str, index: usize) -> anyhow::Resul
     ))
 }
 
-/// Adds and removes labels on a thread (in Gmail, then here): read and
+/// Adds and removes labels on a thread (in Gmail, then here; imported
+/// mail only here): read and
 /// unread (UNREAD), archive (−INBOX), star (STARRED), trash (TRASH).
 pub async fn modify(m: &Memex, account: &str, thread_id: &str, add: &[String], remove: &[String]) -> anyhow::Result<()> {
-    let body = json!({"addLabelIds": add, "removeLabelIds": remove});
-    m.google.call(account, reqwest::Method::POST, &format!("/gmail/v1/users/me/threads/{thread_id}/modify"), &[], Some(&body)).await?;
+    // Imported mail has no Gmail to tell: its changes stay here.
+    if !account.starts_with("import:") {
+        let body = json!({"addLabelIds": add, "removeLabelIds": remove});
+        m.google.call(account, reqwest::Method::POST, &format!("/gmail/v1/users/me/threads/{thread_id}/modify"), &[], Some(&body)).await?;
+    }
     let rows = sqlx::query("SELECT item_id, labels FROM mail WHERE account = ? AND thread_id = ?")
         .bind(account)
         .bind(thread_id)

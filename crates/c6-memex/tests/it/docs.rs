@@ -166,6 +166,39 @@ async fn documents_papers_and_trails() {
         .unwrap();
     assert_eq!((up["kind"].as_str(), up["title"].as_str()), (Some("paper"), Some("Attention Is All You Need")), "{up}");
     let paper_id = up["id"].as_str().unwrap().to_owned();
+    // The same file through memex.ingest is that item; a new document is
+    // created, then updated from the same source and id.
+    let ingest = |items: Value| {
+        let (http, url) = (http.clone(), format!("{api}/memex/rpc"));
+        async move {
+            let r: Value = http
+                .post(url)
+                .json(&json!({"method": "memex.ingest", "params": {"items": items}}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            r["results"].as_array().unwrap().clone()
+        }
+    };
+    let src = json!({"kind": "notes-app", "id": "laptop"});
+    let r = ingest(json!([{"type": "application/pdf", "data": base64::engine::general_purpose::STANDARD.encode(&bytes), "source": src, "external_id": "a.pdf"}])).await;
+    assert_eq!((r[0]["status"].as_str(), r[0]["id"].as_str()), (Some("duplicate"), Some(paper_id.as_str())), "{r:?}");
+    let note =
+        |text: &str| json!([{"type": "text/markdown", "text": text, "source": src, "external_id": "n1", "attributes": {"name": "Ideas"}}]);
+    let r = ingest(note("# Ideas\n\nA cache for embeddings.")).await;
+    assert_eq!((r[0]["status"].as_str(), r[0]["kind"].as_str()), (Some("created"), Some("document")), "{r:?}");
+    let doc_id = r[0]["id"].as_str().unwrap().to_owned();
+    let r = ingest(note("# Ideas\n\nA cache for embeddings, keyed by model.")).await;
+    assert_eq!((r[0]["status"].as_str(), r[0]["id"].as_str()), (Some("updated"), Some(doc_id.as_str())), "{r:?}");
+    let r =
+        ingest(json!([{"type": "text/markdown", "text": "x", "source": src, "external_id": "n2", "attributes": {"created": "yesterday"}}]))
+            .await;
+    assert_eq!(r[0]["error"], "created is an integer", "{r:?}");
+    assert!(http.delete(format!("{api}/memex/items/{doc_id}")).send().await.unwrap().status().is_success());
+
     let original = http.get(format!("{api}/memex/items/{paper_id}/content")).send().await.unwrap();
     assert_eq!(original.headers()["content-type"], "application/pdf");
     assert_eq!(original.bytes().await.unwrap().as_ref(), bytes.as_slice(), "the original, byte for byte");

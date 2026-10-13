@@ -431,6 +431,71 @@ async fn google_mail_calendar_contacts() {
         .json()
         .await
         .unwrap();
+    // Imported mail (memex.ingest, docs/memex.md §4.5): typed by MIME type,
+    // attributes checked strictly, recognized by Message-ID across synced
+    // mail, threaded by its headers, and upgraded in place when Gmail later
+    // has the same message.
+    let types = rpc("memex.types", json!({})).await;
+    assert!(types.as_array().unwrap().iter().any(|t| t["name"] == "mail" && t["types"][0] == "message/rfc822"), "{types}");
+    let eml = |from: &str, subject: &str, id: &str, extra: &str, body: &str| {
+        let m = format!(
+            "From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\nMessage-ID: <{id}>\r\nDate: Tue, 3 Mar 2009 10:00:00 +0000\r\n{extra}Content-Type: text/plain\r\n\r\n{body}\r\n"
+        );
+        base64::engine::general_purpose::STANDARD.encode(m)
+    };
+    let item = |data: String, ext: &str, attrs: Value| json!({"type": "message/rfc822", "data": data, "source": {"kind": "mbox", "id": "archive"}, "external_id": ext, "attributes": attrs});
+    let first = item(
+        eml("Alice Smith <alice@acme.com>", "Contract draft", "Contract-draft@mail", "", "Old copy."),
+        "Work#1",
+        json!({"folder": "Work/2009"}),
+    );
+    let batch = json!({"items": [
+        first.clone(),
+        item(eml("Alice Smith <alice@acme.com>", "Re: Contract draft", "reply-1@acme.com",
+            "In-Reply-To: <Contract-draft@mail>\r\nReferences: <Contract-draft@mail>\r\n", "Signed."), "Work#2", json!({"folder": "Work/2009", "read": false})),
+        // Gmail already has it (m1).
+        item(eml("Alice Smith <alice@acme.com>", "Lunch on Friday?", "Lunch-on-Friday?@mail", "", "copy"), "Inbox#9", json!({})),
+        item(base64::engine::general_purpose::STANDARD.encode("just some bytes"), "Junk#1", json!({})),
+        item(eml("x@y.z", "Hi", "hi@y.z", "", "hi"), "Work#3", json!({"fodler": "Work"})),
+        {"type": "application/x-unknown", "data": "", "source": {"kind": "mbox", "id": "archive"}, "external_id": "x"},
+        {"type": "message/rfc822", "data": eml("x@y.z", "Hi", "hi2@y.z", "", "hi"), "source": {"kind": "gmail:abc"}, "external_id": "m1"},
+    ]});
+    let r = rpc("memex.ingest", batch.clone()).await;
+    let res = r["results"].as_array().unwrap();
+    let status: Vec<&str> = res.iter().map(|x| x["status"].as_str().unwrap()).collect();
+    assert_eq!(status, ["created", "created", "duplicate", "rejected", "rejected", "rejected", "rejected"], "{r}");
+    let inbox = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
+    let t1 = inbox.as_array().unwrap().iter().find(|t| t["thread_id"] == "t1").unwrap().clone();
+    let m1 = rpc("memex.mail.thread", json!({"account": t1["account"], "thread_id": "t1"})).await;
+    let m1_item = m1[0]["item_id"].as_str().unwrap().to_owned();
+    assert_eq!(res[2]["id"].as_str().unwrap(), m1_item, "the synced copy wins: {r}");
+    assert!(res[3]["error"].as_str().unwrap().contains("no headers"), "{r}");
+    assert!(res[4]["error"].as_str().unwrap().contains("unknown attribute \"fodler\""), "{r}");
+    assert!(res[5]["error"].as_str().unwrap().contains("no handler for"), "{r}");
+    assert!(res[6]["error"].as_str().unwrap().contains("source.kind"), "a client can't name a connector's source: {r}");
+    let imported = res[0]["id"].as_str().unwrap().to_owned();
+    // Sending the batch again changes nothing.
+    let again = rpc("memex.ingest", batch).await;
+    assert_eq!(again["results"][0], json!({"status": "duplicate", "id": imported}), "{again}");
+    // One thread, in the folder's label view, with changes kept here.
+    let threads = rpc("memex.mail.threads", json!({"view": "label:Work/2009"})).await;
+    let t = &threads[0];
+    assert_eq!((threads.as_array().unwrap().len(), t["count"].as_u64(), t["unread"].as_bool()), (1, Some(2), Some(true)), "{threads}");
+    assert_eq!(t["account"], "import:mbox:archive");
+    let msgs = rpc("memex.mail.thread", json!({"account": t["account"], "thread_id": t["thread_id"]})).await;
+    assert_eq!(msgs.as_array().unwrap().len(), 2, "{msgs}");
+    let modified_before = g.lock().unwrap().modified.len();
+    rpc("memex.mail.modify", json!({"account": t["account"], "thread_id": t["thread_id"], "remove": ["UNREAD"]})).await;
+    assert_eq!(g.lock().unwrap().modified.len(), modified_before, "imported mail is never written back to Gmail");
+    // Through the head's gateway only typed batches go in.
+    let legacy = http
+        .post(format!("{api}/memex/rpc"))
+        .json(&json!({"method": "memex.ingest", "params": {"kind": "note", "source": "x", "external_id": "1", "title": "t"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let before = mock.requests().len();
     mock.push(Reply::Text("Triaged.".into()));
     {
@@ -457,6 +522,12 @@ async fn google_mail_calendar_contacts() {
     eventually("the triage session", async || (mock.requests().len() > before).then_some(())).await;
     let asked = mock.requests()[before]["messages"].to_string();
     assert!(asked.contains("Triage: New email from Alice Smith <alice@acme.com>") && asked.contains("Contract draft"), "{asked}");
+    // Gmail now has the message imported earlier: the same item, now synced.
+    let upgraded: Value = http.get(format!("{api}/memex/get?id={imported}")).send().await.unwrap().json().await.unwrap();
+    assert!(upgraded["item"]["source"].as_str().unwrap_or("").starts_with("gmail:"), "{upgraded}");
+    let t6 = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
+    assert!(t6.as_array().unwrap().iter().any(|t| t["thread_id"] == "t6" && t["account"] != "import:mbox:archive"), "{t6}");
+
     assert!(g.lock().unwrap().tokens.contains(&"authorization_code".to_owned()));
 
     stop.cancel();

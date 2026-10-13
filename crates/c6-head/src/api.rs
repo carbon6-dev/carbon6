@@ -1214,9 +1214,20 @@ async fn memex_rpc(State(st): State<Arc<HeadState>>, Json(r): Json<RpcIn>) -> Ap
                 | "memex.months"
                 | "memex.timeline"
                 | "memex.related"
+                | "memex.ingest"
+                | "memex.types"
         );
     if !ok {
         return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
+    }
+    // Ingest from outside is a batch of typed items, with labels checked as
+    // uploads are; the head's own generic items are not sent through here.
+    if r.method == "memex.ingest" {
+        let batch: api::MemexIngest = serde_json::from_value(r.params.clone())
+            .map_err(|e| crate::bad_request(format!("memex.ingest takes {{\"items\": [...]}}: {e}")))?;
+        for item in &batch.items {
+            crate::sessions::check_labels(&item.labels)?;
+        }
     }
     let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
     params["made_by"] = serde_json::json!("you");
