@@ -630,13 +630,9 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     let id = Uuid::now_v7().to_string();
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
-    let context = crate::followups::context_for_input(st, session_id).await;
-    let input = with_command(
-        st,
-        session.head_labels(),
-        UserInput { text: text.to_owned(), model, attachments: files, context, ..Default::default() },
-    )
-    .await?;
+    let input =
+        with_command(st, session.head_labels(), UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() })
+            .await?;
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
@@ -864,7 +860,6 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
         st.registry.bump();
     }
     notify_events(st, &batch.session_id, &ing.events).await;
-    crate::followups::on_events(st, &batch.session_id, &ing.events);
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.
     for ev in &ing.events {

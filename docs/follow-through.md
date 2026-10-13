@@ -1,5 +1,7 @@
 # Follow-through and environment knowledge — Design
 
+> **Status (2026-10-13):** follow-through (§2–4: reactions, next steps, trackers, kits), self-configuration (§5) and playbooks were built and then **removed**: they did not land well. **Environment knowledge (§6) and action items (§7) are built** and stay. The rest of this document is the design as it was, kept for a later attempt.
+
 A coding session doesn't end at `git push`. The push creates things outside carbon6: a branch, a pull request, a CI run, and later perhaps a deployment. Each has its own lifecycle. A session should **follow through**:
 - offer the obvious next step (open a PR);
 - keep track of what happens next (the CI run);
@@ -217,21 +219,8 @@ Agents never wait on action items. They work with what they know, with its statu
 
 ## 9. As built
 
-- **Kits** are the head setting `kits`, edited under Settings → Projects or through operations.
-  - Reactions are matched by the head as events arrive, on a finished tool call's name, input, output and success. Output named groups become `{{vars.…}}`.
-  - Checks and probes run on the session's worker (in its folder), on a named worker, or on the head. On workers they use the `cmd.run` RPC: the user's login shell, with secrets as environment variables.
-  - A probe can print `{"phase","line","url"}` itself, or the kit maps its output with phase rules. Templates fill `{{…}}` from dotted paths. Conditions test equals, not_equals, matches and exists.
-  - `POST /api/v1/kits/dry-run` runs a kit's checks and probes once. With `update_state`, it marks the kit active or broken; a broken kit raises an action item.
-- **Next steps and notes:**
-  - Next steps are the `suggestions` table. They show as buttons under the turn that caused them, and taking one sends it as your message.
-  - Notes ("tell") and open next steps reach the model with your next message: `UserInput.context`, logged in the message's `prompt` so replays match.
-  - The agent has `suggest` and `followups` tools.
-- **Trackers:**
-  - Stored in the `trackers` table, with every change in `tracker_observations`, kept forever.
-  - Probed every `interval_s` by the head's scheduler; they are `stalled` after `wait_s` waiting or `give_up_s` overall.
-  - They appear live under the event that started them.
-  - When one ends, it adds a note for the agent and sends a notification.
-  - A failure starts an investigation side chat, given the `logs` probe's output. It proposes a fix on its own branch and doesn't push.
+Only environment knowledge and action items remain.
+
 - **Knowledge:**
   - Facts are the memex's `facts` table. Each is mirrored as a searchable `fact` item linked to its systems; `fact` is in every session's scope.
   - Sessions use `knowledge_record`, `knowledge_verify`, `knowledge_list` and `knowledge_set`. Observed facts need evidence. The same claim (normalized) about the same systems adds evidence instead of a duplicate. `contradicts` disputes a fact and raises an action item; `replaces` retires one.
@@ -239,23 +228,13 @@ Agents never wait on action items. They work with what they know, with its statu
   - System pages are written from facts by the understanding model, within its budget.
 - **Action items:**
   - Stored in the head's `todos` table: `GET`/`POST /api/v1/todos`, `PATCH /api/v1/todos/{id}`, and `POST /api/v1/todos/{id}/session`, which starts a session with the item's context on the worker it names.
-  - Sources: sessions (`todo_add` and `todo_resolve`), the memex (disputes), and kits (broken; review).
+  - Sources: sessions (`todo_add` and `todo_resolve`) and the memex (disputes).
   - The UI has the To do page (with a count in the header), and facts with Confirm, Correct and "No longer true" on items and on system pages.
-- **Self-configuration:**
-  - Worker sessions have `c6_discover`, `c6_describe` and `c6_call`.
-  - Reads are free.
-  - `settings.kits.put` may add or change kits, not remove them. What changed is proposed, dry-run on the session's worker, then active (with a low-priority review item) or broken.
-  - A short list of other writes is allowed: action items, knowledge, notes, memories, a session's title and labels.
-  - Destructive operations, operations that return secrets, and everything that changes tools, permissions or credentials are refused, with a pointer to `todo_add`.
-- **Playbooks:** what agents are asked to do when something happens is configuration, not code. It lives in the head setting `playbooks`, under Settings → Projects. Each playbook has:
-  - a trigger: `first_session`, `tracker_failed`, `probe_failing` or `todo_session`;
-  - labels it applies to; the most specific enabled playbook wins;
-  - for `first_session`, a once-per label (default `repo`);
-  - a prompt template.
-  - carbon6 starts with four editable playbooks: set up follow-through, investigate a failure, repair a kit, and work on an action item. Until you save your own list, those are what apply.
-  - Where once-only playbooks ran is the `playbook_runs` setting; removing an entry lets one run there again. `POST /api/v1/kits/setup` runs a session's first-session playbook now.
-  - A tracker whose probe fails 3 times in a row, or that stalls while waiting, runs the `probe_failing` playbook in a side chat, once. A failed tracker runs `tracker_failed`. Without an applicable playbook, nothing runs.
-- **Not built:** webhook-fed trackers (build order step 4).
+- **Removed:**
+  - kits, reactions, next steps, trackers, investigations, dry runs;
+  - the worker's `cmd.run`, and `UserInput.context`;
+  - sessions' `c6_discover`/`c6_describe`/`c6_call`, the setup and repair side chats, and playbooks.
+  - Their head tables and settings are dropped by migration `0027`.
 
 ## 10. Settled since
 

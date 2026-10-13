@@ -36,7 +36,6 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
             }
         }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
-        "cmd.run" => cmd_run(&params).await,
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),
@@ -409,40 +408,4 @@ async fn ssh_check(target: &str) -> anyhow::Result<Value> {
         Ok(Err(e)) => json!({"ok": false, "error": e.trim()}),
         Err(_) => json!({"ok": false, "error": format!("no answer from {target} in 20 seconds")}),
     })
-}
-
-/// Runs a shell command for the head (a kit's check or probe): in `cwd`
-/// (default: home), with `env`, for up to `timeout_s` seconds. The user's
-/// login shell, so their PATH (gh, argo, kubectl) applies.
-async fn cmd_run(params: &Value) -> anyhow::Result<Value> {
-    const MAX: usize = 256 * 1024;
-    let command = params["command"].as_str().filter(|c| !c.trim().is_empty()).context("command required")?;
-    let cwd = params["cwd"].as_str().filter(|c| !c.is_empty()).map(crate::expand_home).unwrap_or_else(|| crate::expand_home("~"));
-    let timeout = std::time::Duration::from_secs(params["timeout_s"].as_u64().unwrap_or(60).clamp(1, 600));
-    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
-    let mut cmd = tokio::process::Command::new(&shell);
-    cmd.arg("-lc").arg(command).current_dir(&cwd).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    if let Some(env) = params["env"].as_object() {
-        for (k, v) in env {
-            cmd.env(k, v.as_str().unwrap_or_default());
-        }
-    }
-    let out = match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(r) => r.with_context(|| format!("running {shell}"))?,
-        Err(_) => {
-            return Ok(json!({"exit": -1, "stdout": "", "stderr": format!("stopped after {}s", timeout.as_secs()), "timed_out": true}));
-        }
-    };
-    let cut = |b: &[u8]| -> String {
-        let s = String::from_utf8_lossy(b);
-        if s.len() <= MAX {
-            return s.into_owned();
-        }
-        let mut start = s.len() - MAX;
-        while !s.is_char_boundary(start) {
-            start += 1;
-        }
-        s[start..].to_owned()
-    };
-    Ok(json!({"exit": out.status.code().unwrap_or(-1), "stdout": cut(&out.stdout), "stderr": cut(&out.stderr), "timed_out": false}))
 }

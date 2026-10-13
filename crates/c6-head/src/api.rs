@@ -128,17 +128,6 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/todos/count", get(count_todos))
         .route("/api/v1/todos/{id}", get(get_todo).patch(edit_todo))
         .route("/api/v1/todos/{id}/session", post(todo_session))
-        .route("/api/v1/settings/kits", get(get_kits).put(put_kits))
-        .route("/api/v1/kits/dry-run", post(kit_dry_run))
-        .route("/api/v1/kits/setup", post(kit_setup))
-        .route("/api/v1/settings/playbooks", get(get_playbooks).put(put_playbooks))
-        .route("/api/v1/settings/playbook_runs", get(get_playbook_runs).put(put_playbook_runs))
-        .route("/api/v1/sessions/{id}/followups", get(session_followups))
-        .route("/api/v1/sessions/{id}/suggestions/{sid}/take", post(take_suggestion))
-        .route("/api/v1/sessions/{id}/suggestions/{sid}/dismiss", post(dismiss_suggestion))
-        .route("/api/v1/trackers/{id}", get(get_tracker))
-        .route("/api/v1/trackers/{id}/stop", post(stop_tracker))
-        .route("/api/v1/trackers/{id}/investigate", post(investigate_tracker))
         .route("/api/v1/assistant", post(ask_assistant))
         .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
         .route("/api/v1/catalog", get(get_catalog))
@@ -1881,52 +1870,6 @@ async fn answer_question(
     }
 }
 
-// --- Follow-through: kits, next steps, trackers ---------------------------------
-
-async fn get_kits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Kit>>> {
-    Ok(Json(crate::followups::kits(&st).await?))
-}
-
-async fn put_kits(State(st): State<Arc<HeadState>>, Json(k): Json<Vec<api::Kit>>) -> ApiResult<StatusCode> {
-    crate::followups::check_kits(&k)?;
-    st.store.set_setting(crate::followups::KITS, &serde_json::to_string(&k).map_err(anyhow::Error::from)?).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn kit_dry_run(State(st): State<Arc<HeadState>>, Json(r): Json<api::KitDryRun>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::followups::dry_run(&st, &r).await?))
-}
-
-async fn session_followups(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::Followups>> {
-    Ok(Json(crate::followups::for_session(&st, &id).await?))
-}
-
-/// Takes a next step: sends its prompt as your message.
-async fn take_suggestion(State(st): State<Arc<HeadState>>, Path((id, sid)): Path<(String, i64)>) -> ApiResult<Json<api::QueuedInput>> {
-    let prompt = crate::followups::decide_suggestion(&st, &id, sid, true).await?;
-    Ok(Json(crate::sessions::send_input(&st, &id, &api::SendMessage { text: prompt, ..Default::default() }).await?))
-}
-
-async fn dismiss_suggestion(State(st): State<Arc<HeadState>>, Path((id, sid)): Path<(String, i64)>) -> ApiResult<StatusCode> {
-    crate::followups::decide_suggestion(&st, &id, sid, false).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// A tracker with everything it saw.
-async fn get_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
-    let t = crate::followups::tracker(&st, id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such tracker".into()))?;
-    Ok(Json(serde_json::json!({"tracker": t, "observations": crate::followups::observations(&st, id).await?})))
-}
-
-async fn stop_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    crate::followups::stop(&st, id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn investigate_tracker(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(serde_json::json!({"session_id": crate::followups::investigate_now(&st, id).await?})))
-}
-
 // --- Action items ---------------------------------------------------------------
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -1959,37 +1902,4 @@ async fn edit_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>, Json(e
 /// Starts a session that helps you settle the item.
 async fn todo_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::todos::start_session(&st, id).await?))
-}
-
-#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
-pub(crate) struct SetupIn {
-    /// A session in the repository to set up (the setup runs as its side chat).
-    session_id: String,
-}
-
-/// Sets a session's repository up now (the setup playbook, in a side chat).
-async fn kit_setup(State(st): State<Arc<HeadState>>, Json(r): Json<SetupIn>) -> ApiResult<Json<api::Session>> {
-    Ok(Json(crate::selfconfig::setup_now(&st, &r.session_id).await?))
-}
-
-async fn get_playbooks(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Playbook>>> {
-    Ok(Json(crate::selfconfig::playbooks(&st).await?))
-}
-
-async fn put_playbooks(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::Playbook>>) -> ApiResult<StatusCode> {
-    crate::selfconfig::check_playbooks(&p)?;
-    st.store.set_setting(crate::selfconfig::PLAYBOOKS, &serde_json::to_string(&p).map_err(anyhow::Error::from)?).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn get_playbook_runs(State(st): State<Arc<HeadState>>) -> ApiResult<Json<std::collections::BTreeMap<String, Vec<String>>>> {
-    Ok(Json(crate::selfconfig::runs(&st).await?))
-}
-
-async fn put_playbook_runs(
-    State(st): State<Arc<HeadState>>,
-    Json(r): Json<std::collections::BTreeMap<String, Vec<String>>>,
-) -> ApiResult<StatusCode> {
-    st.store.set_setting(crate::selfconfig::RUNS, &serde_json::to_string(&r).map_err(anyhow::Error::from)?).await?;
-    Ok(StatusCode::NO_CONTENT)
 }

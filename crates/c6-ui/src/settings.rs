@@ -8,10 +8,9 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// The sections of Settings: (id, title, what is in it).
-const SECTIONS: [(&str, &str, &str); 11] = [
+const SECTIONS: [(&str, &str, &str); 10] = [
     ("models", "Models", "Connections, model routing, the assistant"),
     ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
-    ("projects", "Projects", "Kits: what sessions follow through on (next steps, CI and the like)"),
     ("rules", "Policies", "Ask or deny the agent's tool calls"),
     ("automation", "Automation", "Templates, workflows, automations"),
     ("notifications", "Notifications", "Channels, push on this device, links"),
@@ -116,25 +115,6 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         <HooksSetting />
                         <WebSearchSetting />
                         <SecretsSetting />
-                    }.into_any(),
-                    "projects" => view! {
-                        <JsonSetting
-                            name="kits"
-                            title="Project kits"
-                            help="How sessions with given labels (e.g. repo:github.com/you/app) follow through. Reactions: when a tool call matches (tool, input and output regular expressions; output's named groups become {{vars.…}}), run a check (on the session's worker, a named worker such as one inside a private network, or the head), then suggest a next step, track something, notify you, or tell the agent. Trackers: probe until done (print JSON with phase, line, url, or map the output with phase rules), shown live at the event that started them; every change is kept; a failure starts an investigation that proposes a fix on its own branch. Nothing about any CI or forge is built in. Agents read and write kits too (see docs/follow-through.md)."
-                            presets=kit_presets
-                            example=r#"[{"name": "app", "applies_to": ["repo:github.com/you/app"], "reactions": [], "trackers": []}]"#
-                        />
-                        <ListSetting
-                            name="playbooks"
-                            title="Playbooks"
-                            noun="playbook"
-                            help="What agents are asked to do when something happens. First session: a repository's first session (once per value of the once-per label, default repo), e.g. setting up follow-through. Tracker failed: an investigation. Probe failing: a repair. Todo session: a session you start from an action item. Each runs in a side chat (or the started session). Applies to: labels (a prefix such as repo:github.com/acme covers an org); the most specific enabled playbook wins. The prompt is a template: {{key}} and {{repo}} (first session), {{tracker.title}}, {{tracker.line}}, {{tracker.url}}, {{logs}}, {{sha}} (tracker failed), {{why}} and {{definition}} (probe failing), {{todo.title}}, {{todo.detail}}, {{todo.context}} (todo session), {{session.…}}. These start as carbon6's own; change them to fit how you work."
-                            fields=PLAYBOOK_FIELDS
-                            examples=playbook_examples
-                        />
-                        <PlaybookRuns />
-                        <KitDryRun />
                     }.into_any(),
                     "rules" => view! {
                     <ListSetting
@@ -583,90 +563,6 @@ fn ChatGptSignIn(
 type Preset = (&'static str, &'static str, serde_json::Value);
 
 /// Ready-made MCP servers: (label, the secrets it needs, its config).
-const PLAYBOOK_FIELDS: &[Field] = &[
-    Field { key: "name", label: "Name", placeholder: "e.g. Set up follow-through", kind: FieldKind::Line },
-    Field {
-        key: "trigger",
-        label: "When",
-        placeholder: "",
-        kind: FieldKind::Choice(&["first_session", "tracker_failed", "probe_failing", "todo_session"]),
-    },
-    Field {
-        key: "applies_to",
-        label: "Applies to",
-        placeholder: "every session, or labels, e.g. repo:github.com/acme",
-        kind: FieldKind::Labels,
-    },
-    Field { key: "once_per", label: "Once per (first session)", placeholder: "repo", kind: FieldKind::Mono },
-    Field { key: "description", label: "What it is for", placeholder: "shown here", kind: FieldKind::Line },
-    Field {
-        key: "prompt",
-        label: "Prompt",
-        placeholder: "what the agent is asked to do ({{key}}, {{tracker.title}}, …)",
-        kind: FieldKind::Text,
-    },
-];
-
-fn playbook_examples() -> Vec<(&'static str, serde_json::Value)> {
-    let p = |name: &str, trigger: &str, labels: &[&str], prompt: &str| {
-        let mut v = item(&[("name", name), ("trigger", trigger), ("prompt", prompt)]);
-        v["applies_to"] = serde_json::json!(labels);
-        v
-    };
-    vec![
-        (
-            "Set up one org's repos your way",
-            p(
-                "Set up our repos",
-                "first_session",
-                &["repo:github.com/your-org"],
-                "Set up follow-through for {{key}}. Our CI: … (where it runs, how to reach it, how runs are tied to commits). Write a kit for {{key}} with c6_call settings.kits.put, record what you learn with knowledge_record, and raise anything you cannot settle with todo_add.",
-            ),
-        ),
-        (
-            "Investigate failures without proposing fixes",
-            p(
-                "Explain failures",
-                "tracker_failed",
-                &[],
-                "\"{{tracker.title}}\" failed: {{tracker.line}} {{tracker.url}}\n\n{{logs}}\n\nExplain the cause briefly. Do not change any code.",
-            ),
-        ),
-    ]
-}
-
-fn kit_presets() -> Vec<Preset> {
-    use serde_json::json;
-    vec![
-        (
-            "GitHub: offer a PR after a push",
-            "gh signed in on the worker; set applies_to to your repo",
-            json!({"name": "github-pr", "applies_to": ["repo:github.com/you/app"], "reactions": [{
-                "name": "after push",
-                "when": {"tool": "(?i)bash", "input": "git push", "output": "(?P<branch>[\\w./-]+) -> (?P<remote>[\\w./-]+)"},
-                "check": {"command": "gh pr view --json number,state,url 2>/dev/null || echo '{}'"},
-                "then": [{"kind": "suggest", "text": "Open a PR for {{vars.branch}}", "if": [{"var": "check.json.number", "exists": false}]}]
-            }]}),
-        ),
-        (
-            "CI run in Argo, probed from a worker inside a private network",
-            "a worker that reaches Argo (here build-1), argo CLI there, workflows labelled with the commit",
-            json!({"name": "argo-ci", "applies_to": ["repo:github.com/you/app"], "reactions": [{
-                "name": "after push",
-                "when": {"tool": "(?i)bash", "input": "git push"},
-                "check": {"command": "git rev-parse HEAD; git branch --show-current"},
-                "then": [{"kind": "track", "tracker": "ci"}]
-            }], "trackers": [{
-                "name": "ci",
-                "title": "CI for {{vars.sha}}",
-                "probe": {"on": "worker", "worker": "build-1", "command": "argo list -n ci -l git-sha={{vars.sha}} -o json | jq -c '.[0] // {} | {phase: ({\"Pending\":\"running\",\"Running\":\"running\",\"Succeeded\":\"succeeded\",\"Failed\":\"failed\",\"Error\":\"failed\"}[.status.phase] // \"waiting\"), line: (.status.progress // \"\"), url: (\"https://argo.internal/workflows/ci/\" + (.metadata.name // \"\"))}'"},
-                "interval_s": 30,
-                "logs": {"on": "worker", "worker": "build-1", "command": "argo logs -n ci @latest --tail 200 2>&1 | tail -c 20000"}
-            }]}),
-        ),
-    ]
-}
-
 fn workflow_presets() -> Vec<Preset> {
     use serde_json::json;
     vec![
@@ -2407,101 +2303,5 @@ fn MemorySetting() -> impl IntoView {
                 <button class=BUTTON on:click=save>{move || if editing.get().is_some() { "Save note" } else { "Add note" }}</button>
             </div>
         </section>
-    }
-}
-
-/// Runs a kit's checks and probes once.
-#[component]
-fn KitDryRun() -> impl IntoView {
-    let (name, worker, vars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
-    let result = RwSignal::new(None::<Result<serde_json::Value, String>>);
-    let busy = RwSignal::new(false);
-    let run = move |_| {
-        let mut v = serde_json::Map::new();
-        for pair in vars.get_untracked().split(',') {
-            if let Some((k, val)) = pair.split_once('=') {
-                v.insert(k.trim().to_owned(), serde_json::json!(val.trim()));
-            }
-        }
-        let body = serde_json::json!({"name": name.get_untracked().trim(), "worker": worker.get_untracked().trim(), "vars": v});
-        busy.set(true);
-        spawn_local(async move {
-            result.set(Some(api::kit_dry_run(body).await));
-            busy.set(false);
-        });
-    };
-    view! {
-        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-            <div>
-                <h2 class="font-medium">"Try a kit"</h2>
-                <p class="text-sm text-zinc-500">"Runs a saved kit's checks and tracker probes once, with values you give, and shows what they found and what would happen."</p>
-            </div>
-            <div class="grid gap-2 sm:grid-cols-3">
-                <input class=format!("{INPUT} py-1 text-sm") placeholder="kit name" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 text-sm") placeholder="worker for session probes" prop:value=move || worker.get() on:input=move |ev| worker.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="sha=abc123, branch=main" prop:value=move || vars.get() on:input=move |ev| vars.set(event_target_value(&ev)) />
-            </div>
-            <div class="flex justify-end"><button class=BUTTON disabled=move || busy.get() on:click=run>{move || if busy.get() { "Running…" } else { "Dry run" }}</button></div>
-            {move || result.get().map(|r| match r {
-                Ok(v) => view! {
-                    <p class=if v["ok"] == true { "text-sm text-emerald-700 dark:text-emerald-400" } else { "text-sm text-amber-700" }>
-                        {if v["ok"] == true { "Everything ran." } else { "Something did not run; see below." }}
-                    </p>
-                    <pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-900">{serde_json::to_string_pretty(&v).unwrap_or_default()}</pre>
-                }.into_any(),
-                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-            })}
-        </section>
-    }
-}
-
-/// Where once-only playbooks ran (× lets one run there again).
-#[component]
-fn PlaybookRuns() -> impl IntoView {
-    let tick = RwSignal::new(0u32);
-    let loaded = LocalResource::new(move || {
-        tick.track();
-        api::get_setting("playbook_runs")
-    });
-    let error = RwSignal::new(None::<String>);
-    let save = move |v: serde_json::Value| {
-        spawn_local(async move {
-            if let Err(e) = api::put_setting("playbook_runs", v).await {
-                error.set(Some(e));
-            }
-            tick.update(|t| *t += 1);
-        });
-    };
-    view! {
-        {move || loaded.get().and_then(Result::ok).filter(|v| v.as_object().is_some_and(|o| o.values().any(|k| k.as_array().is_some_and(|a| !a.is_empty())))).map(|v| view! {
-            <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-                <h2 class="font-medium">"Where first-session playbooks ran"</h2>
-                <p class="text-sm text-zinc-500">"They run once per repository (or whatever their once-per label is). Remove one to let it run there again."</p>
-                {v.as_object().cloned().unwrap_or_default().into_iter().map(|(book, keys)| {
-                    let keys: Vec<String> = keys.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
-                    let all = v.clone();
-                    view! {
-                        <div class="flex flex-wrap items-center gap-1 text-xs">
-                            <span class="text-zinc-500">{format!("{book}:")}</span>
-                            {keys.iter().map(|k| {
-                                let (k2, b2, all2) = (k.clone(), book.clone(), all.clone());
-                                view! {
-                                    <span class="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 font-mono dark:bg-zinc-800">{k.clone()}
-                                        <button class="text-zinc-400 hover:text-red-600" title="Let it run here again" on:click=move |_| {
-                                            let mut v = all2.clone();
-                                            if let Some(a) = v[&b2].as_array_mut() {
-                                                a.retain(|x| x.as_str() != Some(k2.as_str()));
-                                            }
-                                            save(v);
-                                        }>"×"</button>
-                                    </span>
-                                }
-                            }).collect_view()}
-                        </div>
-                    }
-                }).collect_view()}
-            </section>
-        })}
-        {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
     }
 }

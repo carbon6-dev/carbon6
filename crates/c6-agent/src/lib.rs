@@ -41,9 +41,6 @@ pub struct PendingInput {
     pub prompt: String,
     /// Why a UserPromptSubmit hook blocked it, if one did.
     pub blocked: String,
-    /// Context from the head for the model (open next steps, notes),
-    /// added after the text; logged in `prompt` so replays see it.
-    pub context: String,
 }
 
 impl PendingInput {
@@ -54,19 +51,18 @@ impl PendingInput {
             text: self.text.clone(),
             attachments: self.attachments.clone(),
             command: self.command.clone(),
-            prompt: if self.context.is_empty() { self.prompt.clone() } else { self.model_text().into_owned() },
+            prompt: self.prompt.clone(),
             blocked: self.blocked.clone(),
         })
     }
 
     /// What the model gets: the text (or its expansion), then each attachment.
     pub fn blocks(&self) -> Vec<c6_llm::Block> {
-        history::user_blocks(&self.model_text(), &self.attachments)
+        history::user_blocks(self.model_text(), &self.attachments)
     }
 
-    pub fn model_text(&self) -> std::borrow::Cow<'_, str> {
-        let base = if self.prompt.is_empty() { &self.text } else { &self.prompt };
-        if self.context.is_empty() { base.into() } else { format!("{base}\n\n{}", self.context).into() }
+    pub fn model_text(&self) -> &str {
+        if self.prompt.is_empty() { &self.text } else { &self.prompt }
     }
 
     /// `/compact`: summarize the conversation instead of running a turn.

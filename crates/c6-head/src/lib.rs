@@ -10,7 +10,6 @@ mod convert;
 mod cron;
 mod export;
 pub mod fabric;
-pub mod followups;
 pub mod google;
 pub mod guard;
 pub mod hosts;
@@ -24,7 +23,6 @@ pub mod push;
 pub mod registry;
 pub mod search;
 pub mod secrets;
-pub mod selfconfig;
 pub mod sessions;
 pub mod store;
 pub mod telemetry;
@@ -104,8 +102,6 @@ pub struct HeadState {
     pub memex_feed: memex::Feed,
     /// The assistant: its conversations run in the head.
     pub assistant: assistant::Assistant,
-    /// Reactions, next steps and trackers.
-    pub followups: followups::Followups,
     pub shutdown: CancellationToken,
 }
 
@@ -197,7 +193,6 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         workflows: Default::default(),
         memex_feed: Default::default(),
         assistant: Default::default(),
-        followups: Default::default(),
         shutdown: shutdown.clone(),
     });
 
@@ -211,7 +206,6 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
     assistant::start(state.clone(), api::router(state.clone())).await?;
-    followups::spawn(state.clone());
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

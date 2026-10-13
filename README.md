@@ -95,15 +95,11 @@ How it works:
 - **Its model is set under Settings → Assistant.** Its conversations have the label `assistant`, so routes, policies and budgets for that label apply.
 - **The design is in [docs/assistant.md](docs/assistant.md).**
 
-### Follow-through and environment knowledge
+### Environment knowledge and To do
 
-Sessions follow what they start outside carbon6. After a push they offer the obvious next step (open a PR), track the CI run in a live card where the push happened, tell you when it ends, and on failure start an investigation that proposes a fix on a branch of its own. None of this knows any particular CI or forge.
-
-- **Project kits** (Settings → Projects) hold each project's reactions and trackers. Usually an agent writes them: the first session in a new repository sets it up in a side chat, finding the CI, which worker can reach it and how runs are tied to commits.
-- **Playbooks** (Settings → Projects) say what agents are asked to do: set up a new repository, investigate a failure, repair a kit, settle an action item. Each has a trigger, the labels it applies to and a prompt. carbon6 starts with editable ones; write your own for an org or a repo, and the most specific one wins.
-- **Environment knowledge:** agents record what they learn about the systems around the code as facts in the memex. Each fact says how it's known (reviewed, verified, observed, inferred), where it applies, and how to re-check it. Every session starts with the relevant facts.
-- **To do:** what agents can't settle becomes an action item instead of a question that stops them. It's listed under To do with its context, and you can settle it inline or start a session for it.
-- **The design** is in [docs/follow-through.md](docs/follow-through.md).
+- **Environment knowledge:** agents record what they learn about the systems around the code (CI, clusters, networks, hosts) as facts in the memex. Each fact says how it is known (reviewed, verified, observed, inferred), where it applies, and how to re-check it. Every session starts with the relevant facts, and contradictions become action items.
+- **To do:** what agents cannot settle becomes an action item instead of a question that stops them. It is listed under To do with its context, and you can settle it inline or start a session for it.
+- **The design:** see [docs/follow-through.md](docs/follow-through.md) §6–7.
 
 ### Configuration
 

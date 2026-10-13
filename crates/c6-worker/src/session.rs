@@ -199,7 +199,6 @@ impl SessionManager {
                     text: input.text,
                     attachments: input.attachments,
                     command: input.command,
-                    context: input.context,
                     ..Default::default()
                 };
                 let choice = CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels };
@@ -1341,16 +1340,9 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::Remember::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Forget::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Notify::new(profile == ToolProfile::Claude)));
-    // Next steps and trackers (through the head).
-    tools.push(Arc::new(c6_tools::Suggest::new(profile == ToolProfile::Claude)));
-    tools.push(Arc::new(c6_tools::Followups::new(profile == ToolProfile::Claude)));
     // Questions for the user, for later (never stop to ask).
     tools.push(Arc::new(c6_tools::knowledge::TodoAdd::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::knowledge::TodoResolve::new(profile == ToolProfile::Claude)));
-    // carbon6 itself: kits for this project, and the rest (within limits).
-    tools.push(Arc::new(c6_tools::operations::C6Discover));
-    tools.push(Arc::new(c6_tools::operations::C6Describe));
-    tools.push(Arc::new(c6_tools::operations::C6Call));
     if spec.memex_tools {
         tools.push(Arc::new(c6_tools::memex::MemexSearch::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));

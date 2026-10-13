@@ -63,17 +63,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             other => Err(bad_request(format!("the memex may not call {other}"))),
         };
     }
-    // The operation catalog, for one of this worker's sessions (within the
-    // rules for sessions).
-    if let Some(what) = method.strip_prefix("c6.") {
-        let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();
-        let session = st.store.session(&session_id).await?.ok_or_else(|| bad_request("no such session"))?;
-        if session.worker_id != from.to_string() {
-            return Err(bad_request("that session is not on this worker"));
-        }
-        return crate::selfconfig::session_call(st, &session, what, &params).await;
-    }
-    // Next steps and trackers, for one of this worker's sessions.
+    // Action items, for one of this worker's sessions.
     if let Some(what) = method.strip_prefix("session.") {
         let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();
         let session = st.store.session(&session_id).await?.ok_or_else(|| bad_request("no such session"))?;
@@ -83,14 +73,6 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         // A side chat or subagent works for its parent's conversation.
         let target = session.parent_id.clone().unwrap_or(session_id);
         return match what {
-            "suggest" => {
-                let text = params["text"].as_str().unwrap_or_default();
-                let prompt = params["prompt"].as_str().filter(|p| !p.trim().is_empty()).unwrap_or(text);
-                let anchor = st.store.session(&target).await?.map(|s| s.last_seq as u64).unwrap_or(0);
-                let id = crate::followups::suggest(st, &target, anchor, "next", text, prompt, "agent").await?;
-                Ok(json!({"offered": id.is_some()}))
-            }
-            "followups" => Ok(json!(crate::followups::for_session(st, &target).await?)),
             "todo" | "todo_resolve" => crate::todos::from_session(st, &target, what, &params).await,
             other => Err(bad_request(format!("a worker may not call session.{other}"))),
         };

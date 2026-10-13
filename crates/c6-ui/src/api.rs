@@ -668,34 +668,6 @@ pub async fn answer(
     .await
 }
 
-pub async fn kit_dry_run(body: serde_json::Value) -> Result<serde_json::Value, String> {
-    send_json(Request::post("/api/v1/kits/dry-run"), &body).await
-}
-
-pub async fn followups(id: String) -> Result<c6_api::Followups, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/followups")).send().await).await
-}
-
-pub async fn take_suggestion(id: String, sid: i64) -> Result<serde_json::Value, String> {
-    send_json(Request::post(&format!("/api/v1/sessions/{id}/suggestions/{sid}/take")), &serde_json::json!({})).await
-}
-
-pub async fn dismiss_suggestion(id: String, sid: i64) -> Result<(), String> {
-    empty(Request::post(&format!("/api/v1/sessions/{id}/suggestions/{sid}/dismiss")).send().await).await
-}
-
-pub async fn tracker(id: i64) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/trackers/{id}")).send().await).await
-}
-
-pub async fn stop_tracker(id: i64) -> Result<(), String> {
-    empty(Request::post(&format!("/api/v1/trackers/{id}/stop")).send().await).await
-}
-
-pub async fn investigate_tracker(id: i64) -> Result<serde_json::Value, String> {
-    send_json(Request::post(&format!("/api/v1/trackers/{id}/investigate")), &serde_json::json!({})).await
-}
-
 pub async fn todos(state: String) -> Result<Vec<c6_api::Todo>, String> {
     json(Request::get(&format!("/api/v1/todos?state={state}")).send().await).await
 }
