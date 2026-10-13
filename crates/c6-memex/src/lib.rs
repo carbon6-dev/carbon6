@@ -552,6 +552,7 @@ impl Memex {
         match method {
             "memex.ingest" => ingest::ingest(self, params).await,
             "memex.types" => Ok(json!(ingest::types())),
+            "memex.upgrades" => Ok(json!(self.store.upgrades().await?)),
             "memex.delete" => {
                 let id = match params["id"].as_str() {
                     Some(id) => Some(id.to_owned()),

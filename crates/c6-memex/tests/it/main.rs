@@ -2,6 +2,7 @@
 //! environment variables (google, media) stay binaries of their own.
 
 mod docs;
+mod fixtures;
 mod knowledge;
 mod memex;
 mod understanding;

@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::Context;
 use c6_core::WorkerId;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::{FromRow, Row};
@@ -45,17 +44,48 @@ pub struct NewWorker<'a> {
     pub cert_serial: &'a str,
 }
 
+/// The head database's migrations.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// What upgrades of the head database check, and which migrations may
+/// remove rows (docs/os.md §13).
+pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
+    checks: &[],
+    allow: &[
+        // Follow-through was removed (its tables and settings).
+        c6_core::upgrade::Allow { version: 27, table: "tracker_observations" },
+        c6_core::upgrade::Allow { version: 27, table: "trackers" },
+        c6_core::upgrade::Allow { version: 27, table: "suggestions" },
+        c6_core::upgrade::Allow { version: 27, table: "settings" },
+    ],
+};
+
+/// Runs the head database's upgrade on a copy (`c6h upgrade --check`).
+pub async fn check_upgrade(path: &Path) -> anyhow::Result<c6_core::upgrade::Report> {
+    let opts = SqliteConnectOptions::from_str("sqlite:")?.journal_mode(SqliteJournalMode::Wal).foreign_keys(true);
+    c6_core::upgrade::check(path, opts, &MIGRATOR, &UPGRADES).await
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self::open_reporting(path).await?.0)
+    }
+
+    /// Opens the database, upgrading it first if needed, with the upgrade's
+    /// report (`None` when nothing needed doing).
+    pub async fn open_reporting(path: &Path) -> anyhow::Result<(Self, Option<c6_core::upgrade::Report>)> {
         let opts = SqliteConnectOptions::from_str("sqlite:")?
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
-        let pool =
-            SqlitePoolOptions::new().max_connections(8).connect_with(opts).await.with_context(|| format!("opening {}", path.display()))?;
-        sqlx::migrate!("./migrations").run(&pool).await.context("running migrations")?;
-        Ok(Self { pool })
+        let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
+        Ok((Self { pool }, report))
+    }
+
+    /// Earlier upgrades of this database, newest first.
+    pub async fn upgrades(&self) -> anyhow::Result<Vec<c6_core::upgrade::Report>> {
+        c6_core::upgrade::reports(&self.pool).await
     }
 
     pub async fn create_enrollment(&self, secret_hash: &str, name: Option<&str>, now: i64, expires_at: i64) -> anyhow::Result<()> {

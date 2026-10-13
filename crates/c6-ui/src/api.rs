@@ -277,6 +277,10 @@ pub async fn usage(days: u32, labels: Vec<String>) -> Result<c6_api::UsageReport
     json(Request::get(&format!("/api/v1/usage?days={days}&labels={labels}")).send().await).await
 }
 
+pub async fn upgrades() -> Result<Vec<c6_api::Upgrade>, String> {
+    json(Request::get("/api/v1/system/upgrades").send().await).await
+}
+
 pub async fn hosts() -> Result<Vec<c6_api::HostStatus>, String> {
     json(Request::get("/api/v1/hosts").send().await).await
 }

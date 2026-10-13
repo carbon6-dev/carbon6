@@ -123,6 +123,17 @@ How it works:
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
+### Upgrades
+
+A new version of carbon6 upgrades its databases when it starts: the head's (`c6h.db`) and the memex's (`memex.db`). Workers' journals need no upgrading.
+
+- **A backup first:** the database is copied to `backups/` next to it, named with the versions and the time, before anything changes. Backups are kept until you delete them.
+- **All or nothing:** if a step fails, or a check finds data missing afterwards, the backup is put back and carbon6 refuses to start, saying why. The database is as it was, so the previous version still runs on it.
+- **Nothing lost silently:** every table must keep its rows, unless the upgrade says it moves or removes them.
+- **Try it first:** `c6h upgrade --check` (and `c6m upgrade --check`) upgrades a copy and prints what would change, leaving your database untouched. `c6h upgrade` upgrades without starting the head.
+- **History:** **Settings → System** lists each upgrade with what changed and where its backup is.
+- **Going back:** stop carbon6 and put the backup in place of the database.
+
 ### Labels
 
 Sessions carry labels, which group them and decide which settings apply.

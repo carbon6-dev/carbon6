@@ -9,7 +9,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23.1"
 c6-agent.workspace = true
 c6-api = { workspace = true, features = ["schema"] }
-c6-core.workspace = true
+c6-core = { workspace = true, features = ["upgrade"] }
 c6-llm.workspace = true
 c6-mcp.workspace = true
 c6-proto.workspace = true

@@ -8,7 +8,7 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// The sections of Settings: (id, title, what is in it).
-const SECTIONS: [(&str, &str, &str); 10] = [
+const SECTIONS: [(&str, &str, &str); 11] = [
     ("models", "Models", "Connections, model routing, the assistant"),
     ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
     ("rules", "Policies", "Ask or deny the agent's tool calls"),
@@ -19,6 +19,7 @@ const SECTIONS: [(&str, &str, &str); 10] = [
     ("memex", "Memory and memex", "Memory notes, the memex, its folders and scopes"),
     ("mail", "Mail and calendar", "Google accounts"),
     ("account", "Sign-in", "Passkeys, signed-in browsers, API tokens"),
+    ("system", "System", "Upgrades of carbon6's databases, and their backups"),
 ];
 
 /// A section's title, for column headers.
@@ -211,6 +212,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
+                    "system" => view! { <Upgrades /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
                             Some(s) if s.required => view! { <crate::auth::SignInSettings after_link=note.get_value().as_deref() == Some("link") /> }.into_any(),
@@ -233,6 +235,38 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 }}
             </div>
         </main>
+    }
+}
+
+/// Upgrades of the head's and the memex's databases, newest first.
+#[component]
+fn Upgrades() -> impl IntoView {
+    let list = LocalResource::new(crate::api::upgrades);
+    view! {
+        <section class="space-y-2">
+            <h2 class="font-medium">"Upgrades"</h2>
+            <p class="text-sm text-zinc-500">"Each new version of carbon6 upgrades its databases when it starts (or with c6h upgrade and c6m upgrade). The database is copied to backups/ next to it first; a failed upgrade puts the copy back, so nothing changes. To go back to an earlier version, stop carbon6 and put the backup in place of the database. To see what an upgrade would do first: c6h upgrade --check (or c6m upgrade --check)."</p>
+            {move || list.get().map(|r| match r {
+                Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"No upgrades yet."</p> }.into_any(),
+                Ok(v) => v.into_iter().map(|u| {
+                    let what = match u.from_version {
+                        None => format!("created at version {}", u.to_version),
+                        Some(f) => format!("version {f} → {}", u.to_version),
+                    };
+                    view! {
+                        <details class="rounded-md border border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                            <summary class="cursor-pointer select-none text-sm">
+                                <span class="font-medium">{format!("{} · {}", u.service, u.database)}</span>
+                                <span class="ml-2 text-zinc-500">{what}</span>
+                                <span class="ml-2 text-xs text-zinc-500">{crate::util::ago(crate::util::now_ms() - u.at)}</span>
+                            </summary>
+                            <pre class="mt-2 overflow-auto whitespace-pre-wrap font-mono text-[11px]">{u.report}</pre>
+                        </details>
+                    }
+                }).collect_view().into_any(),
+            })}
+        </section>
     }
 }
 

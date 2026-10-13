@@ -132,6 +132,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
+        .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/catalog/call", post(call_catalog))
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
@@ -1850,6 +1851,26 @@ async fn get_catalog() -> Json<serde_json::Value> {
 }
 
 /// Runs an operation (the CLI): destructive ones need `confirmed`.
+/// Upgrades of the head's database and, if one is connected, the memex's.
+async fn get_upgrades(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Upgrade>>> {
+    let as_api = |service: &str, r: c6_core::upgrade::Report| api::Upgrade {
+        service: service.to_owned(),
+        database: r.database.clone(),
+        at: r.at,
+        from_version: r.from_version,
+        to_version: r.to_version,
+        backup: r.backup.clone(),
+        report: r.text(),
+    };
+    let mut out: Vec<api::Upgrade> = st.store.upgrades().await?.into_iter().map(|r| as_api("head", r)).collect();
+    if let Ok(v) = crate::memex::call(&st, "memex.upgrades", serde_json::json!({})).await {
+        let memex: Vec<c6_core::upgrade::Report> = serde_json::from_value(v).unwrap_or_default();
+        out.extend(memex.into_iter().map(|r| as_api("memex", r)));
+    }
+    out.sort_by_key(|u| std::cmp::Reverse(u.at));
+    Ok(Json(out))
+}
+
 /// The API as OpenAPI 3.1, for code generation.
 async fn get_openapi(State(st): State<Arc<HeadState>>) -> Json<serde_json::Value> {
     Json(crate::catalog::openapi(&crate::notify::api_urls(&st).await))

@@ -555,6 +555,21 @@ carbon6 already holds real data. Every step of the build order upgrades it to th
 9. **Going back** means restoring the backup. There is no automatic downgrade, because new data written after the upgrade has no old shape.
 10. **Tested against real shapes.** Every migration is tested on databases created by each earlier version (synthetic data, never yours), from that version's schema through the latest.
 
+### 13.1a As built (step 0)
+
+- **The machinery** is `c6_core::upgrade` (feature `upgrade`), used by the head's and the memex's stores:
+  - **Backup:** pending migrations are found by comparing the migrator with `_sqlx_migrations`. Before any runs, the database is copied with `VACUUM INTO` to `backups/<name>-v<from>-to-v<to>-<UTC time>.db`.
+  - **Checks:** after migrating, every table's row count is compared with before. A table may shrink or vanish only if a pending migration names it in the store's `Plan` (`Allow`). `Check`s compare a query on the backup (attached as `before`) with one on the upgraded database.
+  - **Restore:** a failed migration, lost rows or a failed check close the pool, put the backup back (removing the WAL files), and return an error naming the backup.
+  - **Reports:** each upgrade's report is stored in the database's own `upgrades` table.
+- **Commands:** `c6h upgrade [--check]` and `c6m upgrade [--check]`. `--check` copies the database to a temporary directory and upgrades the copy.
+- **Seeing them:** `GET /api/v1/system/upgrades` (operation `system.upgrades`) and **Settings → System** list the head's and the memex's reports.
+- **Test databases:**
+  - `crates/c6-head/fixtures/c6h-v0027.db` and `crates/c6-memex/fixtures/memex-v0006.db` hold synthetic data in today's shape. A real head, worker and memex filled them through the API, then one synthetic row went into each table the API didn't reach. The head's includes a session waiting for approval and a workflow waiting at its approve step; the memex's includes a mail thread, documents, notes, a trail, and facts with a dispute.
+  - **Regenerating them:** the `make_head_fixture` and `make_memex_fixture` tests (`--ignored`) regenerate them. Run them before a step changes a schema, so the old shape is kept as a new file.
+  - **Testing against them:** `head_fixtures_upgrade_and_serve` and `memex_fixtures_upgrade_and_serve` upgrade every saved database (with `--check` first, then for real). They then serve it, by starting a head on it and opening the memex's store, and check that its data comes back.
+- **Not built yet:** the `legacy_*` convention (13.1, rule 7) has nothing to keep so far. It arrives with the first step that moves data.
+
 ### 13.2 Head: what moves where
 
 | Data today | After |

@@ -1566,6 +1566,24 @@ pub struct TestChannel {
     pub name: String,
 }
 
+/// `GET /api/v1/system/upgrades`: an upgrade of one of carbon6's
+/// databases, newest first (docs/os.md §13).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Upgrade {
+    /// head or memex.
+    pub service: String,
+    pub database: String,
+    pub at: i64,
+    /// The schema version before (none: the database was created).
+    pub from_version: Option<i64>,
+    pub to_version: i64,
+    /// Where the database was copied before upgrading.
+    pub backup: Option<String>,
+    /// What changed, as text.
+    pub report: String,
+}
+
 /// `GET`/`PUT /api/v1/settings/public_url`: the address links in
 /// notifications point to.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

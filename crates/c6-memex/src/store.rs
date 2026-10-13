@@ -4,7 +4,6 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::Context;
 use c6_api as api;
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -24,8 +23,28 @@ pub struct Found {
     pub item_id: String,
 }
 
+/// The memex database's migrations.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// What upgrades of the memex database check, and which migrations may
+/// remove rows (docs/os.md §13).
+pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan { checks: &[], allow: &[] };
+
+/// Runs the memex database's upgrade on a copy (`c6m upgrade --check`).
+pub async fn check_upgrade(path: &Path) -> anyhow::Result<c6_core::upgrade::Report> {
+    let opts =
+        SqliteConnectOptions::from_str("sqlite:")?.journal_mode(SqliteJournalMode::Wal).busy_timeout(std::time::Duration::from_secs(10));
+    c6_core::upgrade::check(path, opts, &MIGRATOR, &UPGRADES).await
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self::open_reporting(path).await?.0)
+    }
+
+    /// Opens the database, upgrading it first if needed, with the upgrade's
+    /// report (`None` when nothing needed doing).
+    pub async fn open_reporting(path: &Path) -> anyhow::Result<(Self, Option<c6_core::upgrade::Report>)> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -34,10 +53,13 @@ impl Store {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(10));
-        let pool =
-            SqlitePoolOptions::new().max_connections(8).connect_with(opts).await.with_context(|| format!("opening {}", path.display()))?;
-        sqlx::migrate!("./migrations").run(&pool).await.context("memex migrations")?;
-        Ok(Self { pool })
+        let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
+        Ok((Self { pool }, report))
+    }
+
+    /// Earlier upgrades of this database, newest first.
+    pub async fn upgrades(&self) -> anyhow::Result<Vec<c6_core::upgrade::Report>> {
+        c6_core::upgrade::reports(&self.pool).await
     }
 
     /// Stores an item (replacing the one with its source and external id),

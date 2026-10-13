@@ -11,6 +11,7 @@ mod automations;
 mod background;
 mod chaos;
 mod commands;
+mod fixtures;
 mod hooks;
 mod ide;
 mod journal;

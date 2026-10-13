@@ -31,6 +31,15 @@ enum Command {
     Run,
     /// Show this memex's identity.
     Status,
+    /// Upgrade the memex's database to this version without serving
+    /// (`run` upgrades too). A backup is made first, and a failed upgrade
+    /// restores it.
+    Upgrade {
+        /// Only try it: upgrade a copy and print what would change, leaving
+        /// the database untouched.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn default_state_dir() -> PathBuf {
@@ -70,6 +79,24 @@ async fn main() -> anyhow::Result<()> {
                 token.cancel();
             });
             conn::run(node, state_tx, stop).await
+        }
+        Command::Upgrade { check } => {
+            let path = state_dir.join("memex").join("memex.db");
+            if check {
+                let report = c6_memex::store::check_upgrade(&path).await?;
+                print!("{}", report.text());
+                if !report.applied.is_empty() {
+                    eprintln!("(a check: {} is unchanged)", path.display());
+                }
+                return Ok(());
+            }
+            anyhow::ensure!(path.exists(), "no memex database at {}", path.display());
+            let (_, report) = c6_memex::store::Store::open_reporting(&path).await?;
+            match report {
+                Some(r) => print!("{}", r.text()),
+                None => println!("{}: up to date", path.display()),
+            }
+            Ok(())
         }
         Command::Status => {
             let id = Identity::load(&state_dir)?;

@@ -37,6 +37,15 @@ enum Command {
         #[arg(default_value = "c6 CLI")]
         name: String,
     },
+    /// Upgrade the head's database to this version without starting the
+    /// head (starting it upgrades too). A backup is made first, and a failed
+    /// upgrade restores it.
+    Upgrade {
+        /// Only try it: upgrade a copy and print what would change, leaving
+        /// the database untouched.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -72,6 +81,23 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ApiToken { name } => {
             println!("{}", c6_head::offline_api_token(cfg, &name).await.context("creating API token")?);
+            Ok(())
+        }
+        Command::Upgrade { check } => {
+            let path = cfg.data_dir.join("c6h.db");
+            if check {
+                let report = c6_head::store::check_upgrade(&path).await?;
+                print!("{}", report.text());
+                if !report.applied.is_empty() {
+                    eprintln!("(a check: {} is unchanged)", path.display());
+                }
+                return Ok(());
+            }
+            let (_, report) = c6_head::store::Store::open_reporting(&path).await?;
+            match report {
+                Some(r) => print!("{}", r.text()),
+                None => println!("{}: up to date", path.display()),
+            }
             Ok(())
         }
         Command::EnrollToken { name } => {
