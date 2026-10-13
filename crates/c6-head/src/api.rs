@@ -130,6 +130,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/todos/{id}/session", post(todo_session))
         .route("/api/v1/settings/kits", get(get_kits).put(put_kits))
         .route("/api/v1/kits/dry-run", post(kit_dry_run))
+        .route("/api/v1/kits/setup", post(kit_setup))
+        .route("/api/v1/settings/followthrough", get(get_followthrough).put(put_followthrough))
         .route("/api/v1/sessions/{id}/followups", get(session_followups))
         .route("/api/v1/sessions/{id}/suggestions/{sid}/take", post(take_suggestion))
         .route("/api/v1/sessions/{id}/suggestions/{sid}/dismiss", post(dismiss_suggestion))
@@ -1956,4 +1958,24 @@ async fn edit_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>, Json(e
 /// Starts a session that helps you settle the item.
 async fn todo_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::todos::start_session(&st, id).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize, serde::Serialize)]
+pub(crate) struct SetupIn {
+    /// A session in the repository to set up (the setup runs as its side chat).
+    session_id: String,
+}
+
+/// Sets a session's repository up now (the setup playbook, in a side chat).
+async fn kit_setup(State(st): State<Arc<HeadState>>, Json(r): Json<SetupIn>) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::selfconfig::setup_now(&st, &r.session_id).await?))
+}
+
+async fn get_followthrough(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::FollowThroughSettings>> {
+    Ok(Json(crate::selfconfig::settings(&st).await?))
+}
+
+async fn put_followthrough(State(st): State<Arc<HeadState>>, Json(s): Json<api::FollowThroughSettings>) -> ApiResult<StatusCode> {
+    st.store.set_setting(crate::selfconfig::SETTING, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -697,6 +697,23 @@ pub struct Tracker {
     /// The investigation's side chat, if one was started.
     #[serde(default)]
     pub investigation: Option<String>,
+    /// The repair's side chat, if its probe kept failing.
+    #[serde(default)]
+    pub repair: Option<String>,
+}
+
+/// `GET`/`PUT /api/v1/settings/followthrough`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FollowThroughSettings {
+    /// Set up follow-through automatically (a side chat in the first session
+    /// in a repo without a kit). Default on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_setup: Option<bool>,
+    /// Repos already set up (or tried), which are not set up again by
+    /// themselves.
+    #[serde(default)]
+    pub set_up: Vec<String>,
 }
 
 /// One change a tracker saw (kept forever).

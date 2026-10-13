@@ -11,6 +11,7 @@ pub mod knowledge;
 pub mod memex;
 pub mod memory;
 pub mod notify;
+pub mod operations;
 mod patch;
 mod plan;
 pub mod profiles;

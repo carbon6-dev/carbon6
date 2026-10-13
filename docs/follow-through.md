@@ -215,7 +215,44 @@ Agents never wait on action items. They work with what they know, with its statu
    - self-repair.
 4. **Push:** webhook-fed trackers, when CI can reach carbon6.
 
-## 9. Settled since
+## 9. As built
+
+- **Kits** are the head setting `kits`, edited under Settings → Projects or through operations.
+  - Reactions are matched by the head as events arrive, on a finished tool call's name, input, output and success. Output named groups become `{{vars.…}}`.
+  - Checks and probes run on the session's worker (in its folder), on a named worker, or on the head. On workers they use the `cmd.run` RPC: the user's login shell, with secrets as environment variables.
+  - A probe can print `{"phase","line","url"}` itself, or the kit maps its output with phase rules. Templates fill `{{…}}` from dotted paths. Conditions test equals, not_equals, matches and exists.
+  - `POST /api/v1/kits/dry-run` runs a kit's checks and probes once. With `update_state`, it marks the kit active or broken; a broken kit raises an action item.
+- **Next steps and notes:**
+  - Next steps are the `suggestions` table. They show as buttons under the turn that caused them, and taking one sends it as your message.
+  - Notes ("tell") and open next steps reach the model with your next message: `UserInput.context`, logged in the message's `prompt` so replays match.
+  - The agent has `suggest` and `followups` tools.
+- **Trackers:**
+  - Stored in the `trackers` table, with every change in `tracker_observations`, kept forever.
+  - Probed every `interval_s` by the head's scheduler; they are `stalled` after `wait_s` waiting or `give_up_s` overall.
+  - They appear live under the event that started them.
+  - When one ends, it adds a note for the agent and sends a notification.
+  - A failure starts an investigation side chat, given the `logs` probe's output. It proposes a fix on its own branch and doesn't push.
+- **Knowledge:**
+  - Facts are the memex's `facts` table. Each is mirrored as a searchable `fact` item linked to its systems; `fact` is in every session's scope.
+  - Sessions use `knowledge_record`, `knowledge_verify`, `knowledge_list` and `knowledge_set`. Observed facts need evidence. The same claim (normalized) about the same systems adds evidence instead of a duplicate. `contradicts` disputes a fact and raises an action item; `replaces` retires one.
+  - Briefs include an "Environment knowledge" section: facts about the session's things and the systems they mention, ranked by status. Facts for other labels come last and are marked.
+  - System pages are written from facts by the understanding model, within its budget.
+- **Action items:**
+  - Stored in the head's `todos` table: `GET`/`POST /api/v1/todos`, `PATCH /api/v1/todos/{id}`, and `POST /api/v1/todos/{id}/session`, which starts a session with the item's context on the worker it names.
+  - Sources: sessions (`todo_add` and `todo_resolve`), the memex (disputes), and kits (broken; review).
+  - The UI has the To do page (with a count in the header), and facts with Confirm, Correct and "No longer true" on items and on system pages.
+- **Self-configuration:**
+  - Worker sessions have `c6_discover`, `c6_describe` and `c6_call`.
+  - Reads are free.
+  - `settings.kits.put` may add or change kits, not remove them. What changed is proposed, dry-run on the session's worker, then active (with a low-priority review item) or broken.
+  - A short list of other writes is allowed: action items, knowledge, notes, memories, a session's title and labels.
+  - Destructive operations, operations that return secrets, and everything that changes tools, permissions or credentials are refused, with a pointer to `todo_add`.
+- **Setup and repair:**
+  - The first session with a `repo:` label and no kit for it runs the setup playbook in a side chat, once per repo. The repos done are listed in the `followthrough` setting, which also turns this off. `POST /api/v1/kits/setup` runs it now.
+  - A tracker whose probe fails 3 times in a row, or that stalls while waiting, starts a repair side chat once.
+- **Not built:** webhook-fed trackers (build order step 4).
+
+## 10. Settled since
 
 - Investigations propose fixes, on a branch of their own, without pushing (§3).
 - Tracker observations are kept forever, like sessions (§3).

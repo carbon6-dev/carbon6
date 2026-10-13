@@ -36,6 +36,8 @@ struct Job {
     input: Option<String>,
     output: String,
     is_error: bool,
+    /// A session started (for the setup playbook) instead of a tool call.
+    started: bool,
 }
 
 #[derive(Default)]
@@ -56,8 +58,9 @@ pub fn spawn(st: Arc<HeadState>) {
         while let Some(job) = rx.recv().await {
             let s = s.clone();
             tokio::spawn(async move {
-                if let Err(e) = react(&s, job).await {
-                    warn!("reaction: {e:#}");
+                let r = if job.started { crate::selfconfig::on_started(&s, &job.session_id, job.seq).await } else { react(&s, job).await };
+                if let Err(e) = r {
+                    warn!("follow-through: {e:#}");
                 }
             });
         }
@@ -92,6 +95,17 @@ pub fn on_events(st: &HeadState, session_id: &str, events: &[SessionEvent]) {
                     calls.clear();
                 }
             }
+            Some(session_event::Kind::Started(_)) => {
+                let _ = tx.send(Job {
+                    session_id: session_id.to_owned(),
+                    seq: ev.seq,
+                    tool: String::new(),
+                    input: None,
+                    output: String::new(),
+                    is_error: false,
+                    started: true,
+                });
+            }
             Some(session_event::Kind::ToolResult(r)) => {
                 let input = st.followups.calls.lock().unwrap().remove(&r.call_id);
                 let _ = tx.send(Job {
@@ -101,6 +115,7 @@ pub fn on_events(st: &HeadState, session_id: &str, events: &[SessionEvent]) {
                     input,
                     output: r.output.clone(),
                     is_error: r.is_error,
+                    started: false,
                 });
             }
             _ => {}
@@ -610,6 +625,7 @@ fn tracker_of(r: &sqlx::sqlite::SqliteRow) -> api::Tracker {
         updated_at: r.get("updated_at"),
         ended_at: r.get("ended_at"),
         investigation: r.get("investigation"),
+        repair: r.get("repair"),
     }
 }
 
@@ -790,6 +806,23 @@ async fn poll(st: &Arc<HeadState>, id: i64) -> anyhow::Result<()> {
     .bind(id)
     .execute(&st.store.pool)
     .await?;
+    // A probe that keeps failing, or nothing ever showing up: a repair.
+    let errors = if error.is_empty() { 0 } else { r.get::<i64, _>("errors") + 1 };
+    sqlx::query("UPDATE trackers SET errors = ? WHERE id = ?").bind(errors).bind(id).execute(&st.store.pool).await?;
+    let stalled_waiting = phase == "stalled" && t.phase == "waiting";
+    if (errors >= 3 || stalled_waiting)
+        && r.get::<Option<String>, _>("repair").is_none()
+        && let Some(s) = &session
+    {
+        let why = if errors >= 3 { format!("failed {errors} times in a row: {error}") } else { line.clone() };
+        match crate::selfconfig::repair(st, s, &t, &def, &why).await {
+            Ok(side) => {
+                sqlx::query("UPDATE trackers SET repair = ? WHERE id = ?").bind(&side).bind(id).execute(&st.store.pool).await?;
+                publish_tracker(st, id).await;
+            }
+            Err(e) => warn!(tracker = id, "starting a repair: {e:#}"),
+        }
+    }
     if changed || error != t.error {
         publish_tracker(st, id).await;
     }

@@ -57,6 +57,9 @@ async fn labels_scope_settings() {
         .unwrap();
     let p = project.path();
 
+    // Not about follow-through: no setup side chat taking the model's replies.
+    let r = http.put(format!("{api}/settings/followthrough")).json(&json!({"auto_setup": false})).send().await.unwrap();
+    assert!(r.status().is_success());
     let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(p).args(args).output().unwrap();
     git(&["init", "-q"]);
     git(&["remote", "add", "origin", "git@github.com:acme/app.git"]);

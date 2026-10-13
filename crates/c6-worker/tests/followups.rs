@@ -163,7 +163,7 @@ async fn push_tracks_ci_and_investigates_failures() {
     // the agent checks on CI.
     eventually("the first turn's end", async || {
         let d: SessionDetail = http.get(format!("{api}/sessions/{}", s.id)).send().await.ok()?.json().await.ok()?;
-        (d.session.status == SessionStatus::Idle).then_some(())
+        (d.session.status == SessionStatus::Idle && turn_ended(&http, &api, &d.session.id).await).then_some(())
     })
     .await;
     mock.push(Reply::ToolCalls(vec![("followups".into(), "{}".into())]));
@@ -188,7 +188,7 @@ async fn push_tracks_ci_and_investigates_failures() {
     // CI fails: the tracker ends, and an investigation starts with the logs.
     eventually("the second turn's end", async || {
         let d: SessionDetail = http.get(format!("{api}/sessions/{}", s.id)).send().await.ok()?.json().await.ok()?;
-        (d.session.status == SessionStatus::Idle).then_some(())
+        (d.session.status == SessionStatus::Idle && turn_ended(&http, &api, &d.session.id).await).then_some(())
     })
     .await;
     mock.push(Reply::Text("test_parse expects 3 but the parser now returns 4; fix on branch fix/feature-x-abc123.".into()));
@@ -233,11 +233,21 @@ async fn push_tracks_ci_and_investigates_failures() {
         .unwrap();
     eventually("the other session to finish", async || {
         let d: SessionDetail = http.get(format!("{api}/sessions/{}", other.id)).send().await.ok()?.json().await.ok()?;
-        (d.session.status == SessionStatus::Idle).then_some(())
+        (d.session.status == SessionStatus::Idle && turn_ended(&http, &api, &d.session.id).await).then_some(())
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let f = followups(other.id.clone()).await;
     assert!(f.suggestions.is_empty() && f.trackers.is_empty(), "{f:?}");
     stop.cancel();
+}
+
+/// The session's last event ends a turn (a new session is idle for a moment
+/// before its first turn starts).
+async fn turn_ended(http: &reqwest::Client, api: &str, id: &str) -> bool {
+    let ev: Vec<serde_json::Value> = match http.get(format!("{api}/sessions/{id}/events?after=0")).send().await {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => return false,
+    };
+    ev.last().is_some_and(|e| e["type"] == "turn_ended")
 }

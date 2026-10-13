@@ -125,6 +125,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                             presets=kit_presets
                             example=r#"[{"name": "app", "applies_to": ["repo:github.com/you/app"], "reactions": [], "trackers": []}]"#
                         />
+                        <AutoSetup />
                         <KitDryRun />
                     }.into_any(),
                     "rules" => view! {
@@ -2389,6 +2390,65 @@ fn KitDryRun() -> impl IntoView {
                     <pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-900">{serde_json::to_string_pretty(&v).unwrap_or_default()}</pre>
                 }.into_any(),
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+            })}
+        </section>
+    }
+}
+
+/// Whether repos are set up by themselves, and which have been.
+#[component]
+fn AutoSetup() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let loaded = LocalResource::new(move || {
+        tick.track();
+        api::get_setting("followthrough")
+    });
+    let note = RwSignal::new(None::<Result<String, String>>);
+    let save = move |v: serde_json::Value| {
+        spawn_local(async move {
+            note.set(Some(api::put_setting("followthrough", v).await.map(|_| "Saved.".to_owned())));
+            tick.update(|t| *t += 1);
+        });
+    };
+    view! {
+        <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">"Set up by itself"</h2>
+            <p class="text-sm text-zinc-500">"The first session in a repository with no kit gets a side chat that works out its CI and the rest, writes a kit and what it learned, dry-runs it, and raises action items for what it could not settle. Once per repository."</p>
+            {move || loaded.get().and_then(Result::ok).map(|v| {
+                let on = v["auto_setup"].as_bool().unwrap_or(true);
+                let repos: Vec<String> = v["set_up"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                let v2 = v.clone();
+                view! {
+                    <label class="flex items-center gap-2 text-sm">
+                        <input type="checkbox" prop:checked=on on:change=move |ev| {
+                            let mut v = v2.clone();
+                            v["auto_setup"] = event_target_checked(&ev).into();
+                            save(v);
+                        } />
+                        "Set up new repositories automatically"
+                    </label>
+                    {(!repos.is_empty()).then(|| view! {
+                        <div class="flex flex-wrap items-center gap-1 text-xs">
+                            <span class="text-zinc-500">"Set up (× to allow again):"</span>
+                            {repos.iter().map(|r| {
+                                let (r2, all, v3) = (r.clone(), repos.clone(), v.clone());
+                                view! {
+                                    <span class="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 font-mono dark:bg-zinc-800">{r.clone()}
+                                        <button class="text-zinc-400 hover:text-red-600" on:click=move |_| {
+                                            let mut v = v3.clone();
+                                            v["set_up"] = serde_json::json!(all.iter().filter(|x| **x != r2).collect::<Vec<_>>());
+                                            save(v);
+                                        }>"×"</button>
+                                    </span>
+                                }
+                            }).collect_view()}
+                        </div>
+                    })}
+                }
+            })}
+            {move || note.get().map(|r| match r {
+                Ok(m) => view! { <p class="text-xs text-emerald-600">{m}</p> }.into_any(),
+                Err(e) => view! { <p class="text-xs text-red-600">{e}</p> }.into_any(),
             })}
         </section>
     }

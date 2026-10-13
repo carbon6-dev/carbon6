@@ -63,6 +63,16 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             other => Err(bad_request(format!("the memex may not call {other}"))),
         };
     }
+    // The operation catalog, for one of this worker's sessions (within the
+    // rules for sessions).
+    if let Some(what) = method.strip_prefix("c6.") {
+        let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();
+        let session = st.store.session(&session_id).await?.ok_or_else(|| bad_request("no such session"))?;
+        if session.worker_id != from.to_string() {
+            return Err(bad_request("that session is not on this worker"));
+        }
+        return crate::selfconfig::session_call(st, &session, what, &params).await;
+    }
     // Next steps and trackers, for one of this worker's sessions.
     if let Some(what) = method.strip_prefix("session.") {
         let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();

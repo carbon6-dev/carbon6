@@ -92,7 +92,7 @@ async fn knowledge_and_action_items() {
         async move {
             eventually("the turn's end", async || {
                 let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
-                (d.session.status == SessionStatus::Idle).then_some(())
+                (d.session.status == SessionStatus::Idle && turn_ended(&http, &api, &d.session.id).await).then_some(())
             })
             .await
         }
@@ -233,4 +233,14 @@ async fn knowledge_and_action_items() {
     let count: Value = http.get(format!("{api}/todos/count")).send().await.unwrap().json().await.unwrap();
     assert_eq!(count["open"], 0);
     stop.cancel();
+}
+
+/// The session's last event ends a turn (a new session is idle for a moment
+/// before its first turn starts).
+async fn turn_ended(http: &reqwest::Client, api: &str, id: &str) -> bool {
+    let ev: Vec<serde_json::Value> = match http.get(format!("{api}/sessions/{id}/events?after=0")).send().await {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => return false,
+    };
+    ev.last().is_some_and(|e| e["type"] == "turn_ended")
 }

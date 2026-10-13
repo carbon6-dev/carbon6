@@ -11,8 +11,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::{
-    After, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TodoQuery, TrailEdit, TrailStepIn, UpdateSession,
-    UsageQuery, WorkflowRunsQuery,
+    After, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, SetupIn, TestConnection, TodoQuery, TrailEdit, TrailStepIn,
+    UpdateSession, UsageQuery, WorkflowRunsQuery,
 };
 
 /// What an operation does to carbon6.
@@ -282,6 +282,9 @@ fn build() -> Vec<Op> {
 
         // Follow-through.
         op!("kits.dry_run", "followthrough", "POST" "/api/v1/kits/dry-run", Read, Input::Body(schema::<api::KitDryRun>), "Runs a kit's checks and tracker probes once (a saved kit by name, or one given), to see that they work; update_state marks it active or broken.", choices = &[("body.session_id", "sessions.list")]),
+        op!("kits.setup", "followthrough", "POST" "/api/v1/kits/setup", Write, Input::Body(schema::<SetupIn>), "Sets up follow-through for a session's repository now: the setup playbook runs in a side chat of that session (discovers the CI and the rest, writes a kit and facts, dry-runs it).", choices = &[("body.session_id", "sessions.list")]),
+        op!("settings.followthrough.get", "followthrough", "GET" "/api/v1/settings/followthrough", Read, Input::None, "Whether repos are set up automatically, and which have been."),
+        op!("settings.followthrough.put", "followthrough", "PUT" "/api/v1/settings/followthrough", Write, Input::Body(schema::<api::FollowThroughSettings>), "Turns automatic setup on or off, or lets a repo be set up again (remove it from set_up)."),
         op!("sessions.followups", "followthrough", "GET" "/api/v1/sessions/{id}/followups", Read, Input::None, "A session's next steps and trackers.", choices = &[("id", "sessions.list")]),
         op!("sessions.suggestions.take", "followthrough", "POST" "/api/v1/sessions/{id}/suggestions/{sid}/take", Write, Input::None, "Takes a next step (sends it as your message).", choices = &[("id", "sessions.list")]),
         op!("sessions.suggestions.dismiss", "followthrough", "POST" "/api/v1/sessions/{id}/suggestions/{sid}/dismiss", Write, Input::None, "Dismisses a next step.", choices = &[("id", "sessions.list")]),
@@ -485,6 +488,7 @@ pub fn docs() -> &'static [(String, String)] {
         let files = [
             ("README", include_str!("../../../README.md")),
             ("assistant", include_str!("../../../docs/assistant.md")),
+            ("follow-through", include_str!("../../../docs/follow-through.md")),
             ("memex", include_str!("../../../docs/memex.md")),
             ("architecture", include_str!("../../../docs/architecture.md")),
         ];

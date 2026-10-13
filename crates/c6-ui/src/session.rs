@@ -499,7 +499,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         results.track();
         refresh.track();
         // Investigations are side chats the head starts.
-        followups.with(|f| f.trackers.iter().filter(|t| t.investigation.is_some()).count());
+        followups.with(|f| f.trackers.iter().filter(|t| t.investigation.is_some() || t.repair.is_some()).count());
         api::children(id.get_value())
     });
     let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
@@ -2143,6 +2143,7 @@ fn TrackerCard(t: c6_api::Tracker) -> impl IntoView {
     let pulse = matches!(t.phase.as_str(), "running" | "waiting");
     let error = RwSignal::new(None::<String>);
     let investigation = t.investigation.clone();
+    let repair = t.repair.clone();
     let failed = t.phase == "failed";
     view! {
         <div class=format!("space-y-1 rounded-md border px-3 py-2 text-sm {tone}")>
@@ -2170,6 +2171,11 @@ fn TrackerCard(t: c6_api::Tracker) -> impl IntoView {
                 </p>
             })}
             {(!t.error.is_empty()).then(|| view! { <p class="text-xs text-amber-700">{format!("Probe: {}", t.error)}</p> })}
+            {repair.map(|s| view! {
+                <p class="text-xs text-zinc-500">"The kit may be broken; a side chat is repairing it · "
+                    <crate::workspace::Go to=crate::workspace::View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"open it"</crate::workspace::Go>
+                </p>
+            })}
             {move || error.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
             {move || open.get().then(|| history.get().flatten().map(|h| view! {
                 <ol class="space-y-0.5 border-l border-zinc-200 pl-3 text-xs dark:border-zinc-800">

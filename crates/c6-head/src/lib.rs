@@ -24,6 +24,7 @@ pub mod push;
 pub mod registry;
 pub mod search;
 pub mod secrets;
+pub mod selfconfig;
 pub mod sessions;
 pub mod store;
 pub mod telemetry;

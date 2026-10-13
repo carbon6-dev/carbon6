@@ -1347,6 +1347,10 @@ pub(crate) async fn build_tools(
     // Questions for the user, for later (never stop to ask).
     tools.push(Arc::new(c6_tools::knowledge::TodoAdd::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::knowledge::TodoResolve::new(profile == ToolProfile::Claude)));
+    // carbon6 itself: kits for this project, and the rest (within limits).
+    tools.push(Arc::new(c6_tools::operations::C6Discover));
+    tools.push(Arc::new(c6_tools::operations::C6Describe));
+    tools.push(Arc::new(c6_tools::operations::C6Call));
     if spec.memex_tools {
         tools.push(Arc::new(c6_tools::memex::MemexSearch::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));
