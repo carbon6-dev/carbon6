@@ -63,7 +63,7 @@ The API is JSON over the fabric. Each method is also exposed by the head under `
 
 | Area | Methods |
 |---|---|
-| Items | `items.put` (upload or reference), `items.get`, `items.content` (raw bytes, such as the original email or the full image), `items.delete` (with what derives from it) |
+| Items | `ingest` (any type, by MIME type and its handler: 4.5), `types` (the handlers and their attribute schemas), `items.get`, `items.content` (raw bytes, such as the original email or the full image), `items.delete` (with what derives from it) |
 | Search | `search` (hybrid: keyword, meaning, graph filters, time; results grouped by kind), `similar` (more like this item) |
 | Graph | `entity.get` (a card: facts, aliases, timeline), `entity.neighbors`, `entity.merge`, `entity.split`, `link.add`, `link.retract`, `timeline` |
 | Writing | `notes.put` (an insight or a note), `trails.*` (create, append a step, comment, list) |
@@ -206,6 +206,89 @@ trail(id, name, description) ; trail_step(trail_id, ordinal, target, comment)
 - **Encryption at rest** is the storage layer's job (per your decision).
 - **Backup:** the SQLite file and the blob directory. All derived content can be rebuilt.
 
+### 4.5 Getting data in: one ingest API, typed by handlers
+
+**The problem.** Ingest has grown one path per kind of data: document upload, folder scan, notes, an internal generic ingest the head uses for sessions and memory, and Gmail sync. Each new source (Thunderbird, Takeout, a scanner, a feed) would add another API. Making the API general must not cost any guarantee that a dedicated API gives.
+
+**The rule.** Getting data in is general, and what the data means stays specialized:
+- **One way in:** a single ingest call, one envelope, one set of retry and result semantics.
+- **The type is the item's MIME type:** `message/rfc822`, `application/pdf`, `text/html`, `image/jpeg`, `text/calendar`, `text/vcard`, and so on. Standard formats are already self-describing, so the memex invents no type system. An email is "a specialized document" at the format level already.
+- **Meaning stays in handlers:** each registered handler keeps its own parsing, identity, storage tables and derived structure (threads, people, faces, papers).
+- **No common data model:** forcing email into `{title, body, author, date}` would lose recipients, threads, Message-ID, labels and flags, which is exactly the watering-down to avoid. What every handler shares is the base item (4.1: title, searchable text, when it happened, links to things), which feeds search and briefs. Each handler then adds its own records beside it, so the base item plus extension is how "email is a document" shows up in storage.
+
+#### The ingest call
+
+`memex.ingest`, public through `/api/v1/memex/rpc` (signed in, or with an API token):
+
+```json
+{"items": [{
+  "type": "message/rfc822",
+  "data": "<base64 of the bytes>",
+  "source": {"kind": "thunderbird", "id": "work-laptop"},
+  "external_id": "Local Folders/Work/2009#88123",
+  "attributes": {"folder": "Work/2009", "read": true, "starred": false},
+  "labels": ["personal"]
+}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `type` | The MIME type; it picks the handler. |
+| `data` | The item's bytes in its standard format, base64. Text types may pass `text` instead. |
+| `source` | Where it comes from. Items are unique by source and `external_id` (the `items` table already enforces this). |
+| `external_id` | The source's own id for the item, so re-sending is harmless. |
+| `attributes` | Facts that aren't inside the bytes: a folder, flags, a received date, a page URL. Checked against the handler's schema. |
+| `labels` | Which sessions may see it (2.3), checked as uploads are checked today. |
+
+The reply has one result per item: `created` with its id, `duplicate` with the existing id, or `rejected` with the handler's reason (for example "not an RFC 822 message: no headers"). A batch never fails as a whole because of one item.
+
+#### The type registry
+
+`memex.types` lists the handlers. Each one declares:
+
+- **Types:** the MIME types it accepts.
+- **Attribute schema:** a JSON Schema with strict keys. Unknown keys and wrong types are rejected, so attributes are typed per handler, not a free-form bag.
+- **Identity rule:** how it recognizes an item it already has. Mail uses Message-ID (or, without one, a hash of key headers and the body); documents the content hash; papers DOI or arXiv id, then content hash; photos the content hash.
+- **Limit:** the largest item it takes.
+- **Produces:** the item kinds it creates (an email produces `email` plus `attachment` items).
+
+Importers read the registry, so a new source needs no new API, only a client.
+
+#### Guarantees, and how each is kept
+
+| Guarantee | A dedicated API gives it by | The ingest API keeps it by |
+|---|---|---|
+| Valid input | its request schema | the handler parsing the standard format (a stricter contract than a bespoke JSON shape), plus the strict attribute schema |
+| Right identity and dedup | its own code | the handler's identity rule, plus source and `external_id` for retries |
+| Specialized structure | its own tables | handlers keep their own tables (`mail`, `mail_labels`, media, papers) |
+| Limits per type | its own limit | declared per handler and enforced before parsing |
+| Two-way sync is never faked | only sync code writes mail | **origin is set by the server.** Every ingested item is `imported` and read-only. Only built-in connectors create `mirrored` items, the ones whose changes are written back. The ingest API cannot create a mirrored item. |
+| Privacy | its own rules | the handler classifies (spam, mailing lists; spam never reaches agents), and labels are checked as today |
+| Clear errors | its own messages | the per-item `rejected` reason |
+
+#### Mail, the first handler
+
+- `message/rfc822` → the parsing that `mail::store_message` does today, without requiring a Gmail account.
+- **Accounts and threads:** an imported message belongs to its source (for example `thunderbird:work-laptop`) instead of a Gmail account. It is threaded by `References` and `In-Reply-To`, since it has no Gmail thread id.
+- **Labels and flags:** attributes `folder` (a label), `read`, `starred`, and `received` (a fallback date).
+- **Imported and mirrored copies of the same message:**
+  - Imported mail that Gmail sync already has is a duplicate; the mirrored copy wins.
+  - If Gmail sync brings in a message that was imported earlier, the item is upgraded to mirrored and keeps its id, so links and notes made meanwhile survive.
+
+#### What stays separate
+
+- **Connectors** (Gmail, Calendar, Contacts sync) pull on a schedule, keep cursors and write back, so they are not uploads. Internally they call the same handlers with origin `mirrored`, so synced and imported mail share one code path.
+- **Actions** (send, RSVP, edit a contact, label a thread) are not data coming in. Each means something different, so they keep their own methods.
+- **Containers** (mbox, Maildir, zip, Takeout) are split by the importer, on its side, into single items. Multi-gigabyte files don't belong in one request, and the importer can keep its own position to resume. A server-side splitter for small `application/mbox` uploads may come later as a convenience.
+
+#### What it replaces
+
+- **`memex.upload`** becomes ingest with the document and media handlers. The head's `/api/v1/memex/upload` stays as a thin wrapper for the UI.
+- **Folder scan** reads files and calls the same handlers with origin `imported` and source `folder:<path>`.
+- **Notes** become ingest of `text/markdown` with `source: note`. `memex.note` stays as a wrapper.
+- **The head's internal ingest** (session digests, outputs, memory) uses `memex.ingest` with its own source kinds.
+- **The generic-item form** (`MemexItemIn`) stays as a handler for `application/vnd.c6.item+json`, for sources that are already text with a title (session digests). It is internal to the head and not offered to tokens.
+
 ## 5. Pipelines
 
 Jobs live in a durable queue in the memex database, each with a priority, a budget and a version. They run in tiers:
@@ -294,11 +377,12 @@ carbon6 replaces the mail client, the calendar and the address book, starting wi
 - **No exclusions:** everything is brought in, including Spam and Trash. Spam is marked as such and never reaches agents' context.
 - **Multiple accounts** appear in one unified inbox or one at a time. Replies default to the account and address the thread came to.
 - **Archives no longer on Gmail** can be imported from mbox, Maildir or Google Takeout files. They're marked as imported, not synced, and deduplicated against synced mail by Message-ID.
-  - **Thunderbird:** point the importer at a Thunderbird profile, which `c6m` reads in place, on its own machine or on a worker:
-    - mbox files under `Mail/` and `ImapMail/`, each with a sibling `.msf` index that is ignored;
-    - or Maildir folders, for profiles set up that way;
-    - folder names become labels;
-    - a message Thunderbird marked deleted but hasn't compacted away (`X-Mozilla-Status` flags) is skipped.
+  - **Thunderbird:** a separate importer (a `c6` command, or any tool) reads a Thunderbird profile where it lives and sends each message through `memex.ingest` (4.5). The memex needs no access to the profile.
+    - It reads mbox files under `Mail/` and `ImapMail/` (each has a sibling `.msf` index, which it ignores), or Maildir folders for profiles set up that way.
+    - Folder names become the `folder` attribute, then labels.
+    - It skips messages Thunderbird marked deleted but hasn't compacted away (`X-Mozilla-Status` flags).
+    - It keeps its own position (a byte offset per mbox file) to resume. Re-sending is harmless.
+    - It's safest to run with Thunderbird closed, or on a copy, because compacting rewrites mbox files.
 
     This comes after Gmail sync.
 
@@ -462,6 +546,11 @@ Each step is usable on its own:
    - triage, drafting, scheduling and meeting-prep workflows, memex event triggers, and inbox integration.
 4. **Understanding tiers:** summaries, topics, commitments, the graph explorer and timelines. (Built: see 5.1.)
 5. **Photos and videos:** EXIF and places, captions, objects, faces and naming, transcripts. (Built: see 7.1.)
+6. **One ingest API (4.5):**
+   - `memex.ingest` and `memex.types`, the handler registry, and per-item results;
+   - mail as the first handler: imported mail, threading by headers, upgrade to mirrored;
+   - upload, folder scan, notes and the head's internal ingest moved onto it;
+   - the Thunderbird importer as its first outside client.
 
 ## 11. Decisions
 
@@ -476,7 +565,8 @@ Each step is usable on its own:
 | Where `c6m` runs | This Mac first, with nothing assuming it |
 | Exclusions | None: everything is brought in (Spam is kept out of agents' context) |
 | Google Cloud project | You have one; adding an account asks for its OAuth client |
-| Old mail | Backfill from Thunderbird (mbox or Maildir) after Gmail sync, deduplicated by Message-ID |
+| Old mail | Backfill from Thunderbird (mbox or Maildir) after Gmail sync, deduplicated by Message-ID, through a separate importer |
+| Getting data in | One ingest API typed by MIME type, with registered handlers that keep their own identity, schema and storage; connectors and actions stay separate (4.5) |
 | Encryption at rest | Left to the disks |
 
 ## 12. Open questions
