@@ -164,6 +164,18 @@ pub async fn test(st: &HeadState, name: &str) -> anyhow::Result<()> {
     deliver(st, ch, &note, &Links::default()).await.map_err(|e| bad_request(format!("{e:#}")))
 }
 
+/// Where the API is reached: the public address if set, then where the
+/// head listens.
+pub async fn api_urls(st: &HeadState) -> Vec<String> {
+    let mut urls: Vec<String> = vec![public_url(st).await].into_iter().filter(|u| !u.is_empty()).collect();
+    for u in st.ui_urls.get().into_iter().flatten() {
+        if !urls.contains(u) {
+            urls.push(u.clone());
+        }
+    }
+    urls
+}
+
 /// The address links point to: the setting, without a trailing slash.
 async fn public_url(st: &HeadState) -> String {
     st.store.setting(PUBLIC_URL).await.ok().flatten().unwrap_or_default().trim().trim_end_matches('/').to_owned()

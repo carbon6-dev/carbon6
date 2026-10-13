@@ -94,6 +94,8 @@ pub struct HeadState {
     pub ui_port: u16,
     /// URL workers dial, as put into enrollment tokens.
     pub worker_url: String,
+    /// Where the web UI and API are reached (set once listening).
+    pub ui_urls: std::sync::OnceLock<Vec<String>>,
     /// Notifications to your channels.
     pub notifier: notify::Notifier,
     /// Workflow runs to drive.
@@ -189,6 +191,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         http,
         ui_port: ui_addrs[0].port(),
         worker_url,
+        ui_urls: Default::default(),
         notifier: Default::default(),
         workflows: Default::default(),
         memex_feed: Default::default(),
@@ -266,6 +269,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         }
     };
 
+    let _ = state.ui_urls.set(ui_urls.clone());
     info!(ui = ?ui_urls, worker = ?worker_addrs, worker_url = %state.worker_url, auth = cfg.auth, "head started");
     Ok(Head { state, ui_addrs, worker_addrs, ui_urls, shutdown, tasks })
 }

@@ -63,7 +63,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             other => Err(bad_request(format!("the memex may not call {other}"))),
         };
     }
-    // Action items, for one of this worker's sessions.
+    // Action items and the API reference, for one of this worker's sessions.
     if let Some(what) = method.strip_prefix("session.") {
         let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();
         let session = st.store.session(&session_id).await?.ok_or_else(|| bad_request("no such session"))?;
@@ -74,6 +74,14 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         let target = session.parent_id.clone().unwrap_or(session_id);
         return match what {
             "todo" | "todo_resolve" => crate::todos::from_session(st, &target, what, &params).await,
+            // The API reference, for agents writing integrations.
+            "api" => {
+                let urls = crate::notify::api_urls(st).await;
+                let text = crate::catalog::reference(params["query"].as_str().unwrap_or(""), params["op"].as_str().unwrap_or(""), &urls)
+                    .map_err(bad_request)?;
+                Ok(json!({"text": text}))
+            }
+            "openapi" => Ok(crate::catalog::openapi(&crate::notify::api_urls(st).await)),
             other => Err(bad_request(format!("a worker may not call session.{other}"))),
         };
     }

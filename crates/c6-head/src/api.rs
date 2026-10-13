@@ -131,6 +131,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/assistant", post(ask_assistant))
         .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
         .route("/api/v1/catalog", get(get_catalog))
+        .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/catalog/call", post(call_catalog))
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
@@ -1838,6 +1839,11 @@ async fn get_catalog() -> Json<serde_json::Value> {
 }
 
 /// Runs an operation (the CLI): destructive ones need `confirmed`.
+/// The API as OpenAPI 3.1, for code generation.
+async fn get_openapi(State(st): State<Arc<HeadState>>) -> Json<serde_json::Value> {
+    Json(crate::catalog::openapi(&crate::notify::api_urls(&st).await))
+}
+
 async fn call_catalog(State(st): State<Arc<HeadState>>, Json(c): Json<api::CatalogCall>) -> ApiResult<Json<serde_json::Value>> {
     let op = crate::catalog::find(&c.op).ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("no operation {:?}", c.op)))?;
     if op.effect == crate::catalog::Effect::Destructive && !c.confirmed {

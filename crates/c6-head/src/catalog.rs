@@ -407,6 +407,7 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/api/v1/auth/passkeys/register/finish", "a passkey ceremony in the browser"),
     ("POST", "/api/v1/assistant", "starts an assistant conversation (this one)"),
     ("GET", "/api/v1/catalog", "this catalog"),
+    ("GET", "/api/v1/openapi.json", "this catalog, as OpenAPI"),
     ("POST", "/api/v1/catalog/call", "this catalog"),
     ("POST", "/api/v1/sessions/{id}/answers/{call_id}", "answers the assistant's questions (the UI's forms)"),
 ];
@@ -569,6 +570,236 @@ pub fn discover_text(query: &str, area: Option<&str>) -> String {
     out
 }
 
+// --- The API reference, for agents writing code against carbon6 ------------
+
+/// How scripts reach the API: the base URL, auth, errors and the memex
+/// envelope.
+fn api_basics(urls: &[String]) -> String {
+    let base = if urls.is_empty() { "the head's web address".to_owned() } else { urls.join(" or ") };
+    format!(
+        "carbon6 HTTP API\n\
+- Base URL: {base}. Code should take it from configuration (for example C6_URL), not hard-code it.\n\
+- Auth: every /api/ request sends `Authorization: Bearer c6_…`, an API token the user creates in Settings → Sign-in → API tokens. \
+Read it from the environment (for example C6_TOKEN); never hard-code, print or log it. The user can give sessions a token as a secret \
+(Settings → Agents and tools → Secrets). Tokens reach everything except sign-in management (/api/v1/auth/…).\n\
+- TLS: an https head may use carbon6's own certificate authority; trust it from <base URL>/ca.pem rather than turning verification off.\n\
+- Requests and responses are JSON. An error is a non-2xx status with {{\"error\": \"message\"}}.\n\
+- Memex operations are one endpoint: POST /api/v1/memex/rpc with {{\"method\": \"memex.…\", \"params\": {{…}}}}; the reply is the method's result.\n\
+- Effects: read; write; destructive (deletes, revokes, sends: code should do these only when the user asked for exactly that); \
+secret (the reply holds a secret: never log it).\n\
+- The reference gives each operation's input. For a reply's shape, call a read operation once and look.\n"
+    )
+}
+
+fn http_of(op: &Op) -> (&'static str, String) {
+    match &op.via {
+        Via::Http { method, path } => (method, path.to_string()),
+        Via::Memex { .. } => ("POST", "/api/v1/memex/rpc".to_owned()),
+    }
+}
+
+/// One operation, as a developer reads it.
+fn op_reference(op: &Op) -> String {
+    let (method, path) = http_of(op);
+    let mut out = format!(
+        "{} [{}]: {}\n{method} {path}\n",
+        op.name,
+        serde_json::to_value(op.effect).unwrap_or_default().as_str().unwrap_or(""),
+        op.summary
+    );
+    let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+    let example_body: Option<String> = match (&op.via, op.input) {
+        (Via::Memex { method }, input) => {
+            let params = match input {
+                Input::Params(s) => serde_json::from_str(s).unwrap_or_else(|_| any_object()),
+                Input::Typed(f) => f(),
+                _ => any_object(),
+            };
+            out.push_str(&format!(
+                "Body: {{\"method\": \"{method}\", \"params\": <params>}}\nparams (JSON Schema):\n{}\n",
+                pretty(&params)
+            ));
+            Some(format!("{{\"method\": \"{method}\", \"params\": {{…}}}}"))
+        }
+        (Via::Http { path: p, .. }, input) => {
+            let params = path_params(p);
+            if !params.is_empty() {
+                out.push_str("Path parameters:");
+                for name in &params {
+                    let from = op.choices.iter().find(|(f, _)| f == name).map(|(_, o)| format!(" (from {o})")).unwrap_or_default();
+                    out.push_str(&format!(" {name}{from};"));
+                }
+                out.push('\n');
+            }
+            match input {
+                Input::Body(f) => {
+                    out.push_str(&format!("Body (JSON Schema):\n{}\n", pretty(&f())));
+                    Some("{…}".to_owned())
+                }
+                Input::Query(f) => {
+                    out.push_str(&format!("Query parameters (JSON Schema):\n{}\n", pretty(&f())));
+                    None
+                }
+                _ => None,
+            }
+        }
+    };
+    let url_path = path.replace('{', "<").replace('}', ">");
+    out.push_str(&format!("Example:\n  curl -sS -X {method} \"$C6_URL{url_path}\" -H \"Authorization: Bearer $C6_TOKEN\""));
+    if let Some(b) = example_body {
+        out.push_str(&format!(" -H 'Content-Type: application/json' -d '{b}'"));
+    }
+    out.push('\n');
+    if !op.secret.is_empty() {
+        out.push_str(&format!("The reply's {} hold a secret.\n", op.secret.join(", ")));
+    }
+    out
+}
+
+/// The reference for agents: the basics and the areas (no arguments),
+/// operations matching `query`, or one operation in full.
+pub fn reference(query: &str, op: &str, urls: &[String]) -> Result<String, String> {
+    if !op.trim().is_empty() {
+        let o = find(op.trim()).ok_or_else(|| format!("no operation {op:?}; search with query"))?;
+        return Ok(op_reference(o));
+    }
+    let mut out = api_basics(urls);
+    if query.trim().is_empty() {
+        out.push_str("\nAreas (operations):\n");
+        for (a, d) in AREAS {
+            out.push_str(&format!("- {a} ({}): {d}\n", ops().iter().filter(|o| o.area == *a).count()));
+        }
+        out.push_str("\nSearch with query, read one operation with op, or save the OpenAPI document for code generation.\n");
+        return Ok(out);
+    }
+    let found = discover(query, None);
+    let names: Vec<&str> = found["operations"].as_array().into_iter().flatten().filter_map(|o| o["op"].as_str()).collect();
+    if names.is_empty() {
+        return Ok(format!("{out}\nNo operations match {query:?}; try other words, or no query to see the areas.\n"));
+    }
+    out.push_str("\nMatching operations (best first; the first in full):\n\n");
+    for (i, n) in names.iter().enumerate() {
+        let Some(o) = find(n) else { continue };
+        if i == 0 {
+            out.push_str(&op_reference(o));
+            out.push('\n');
+        } else {
+            let (m, p) = http_of(o);
+            let via = if let Via::Memex { method } = &o.via { format!("{m} {p} ({method})") } else { format!("{m} {p}") };
+            out.push_str(&format!("- {n}: {} — {via}\n", o.summary));
+        }
+    }
+    Ok(out)
+}
+
+/// Moves a JSON Schema's `$defs` into `defs` and points its references
+/// there (OpenAPI keeps shared schemas under components).
+fn hoist(mut schema: Value, defs: &mut serde_json::Map<String, Value>) -> Value {
+    if let Some(obj) = schema.as_object_mut() {
+        obj.remove("$schema");
+        for key in ["$defs", "definitions"] {
+            if let Some(Value::Object(d)) = obj.remove(key) {
+                for (k, v) in d {
+                    let v = hoist(v, defs);
+                    defs.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
+    fn refs(v: &mut Value) {
+        match v {
+            Value::Object(o) => {
+                if let Some(Value::String(r)) = o.get_mut("$ref") {
+                    for from in ["#/$defs/", "#/definitions/"] {
+                        if let Some(name) = r.strip_prefix(from) {
+                            *r = format!("#/components/schemas/{name}");
+                        }
+                    }
+                }
+                o.values_mut().for_each(refs);
+            }
+            Value::Array(a) => a.iter_mut().for_each(refs),
+            _ => {}
+        }
+    }
+    refs(&mut schema);
+    schema
+}
+
+/// The API as an OpenAPI 3.1 document, from the catalog. Memex operations
+/// are the variants of one request body on /api/v1/memex/rpc.
+pub fn openapi(urls: &[String]) -> Value {
+    let mut defs = serde_json::Map::new();
+    let mut paths = serde_json::Map::new();
+    let json_body = |schema: Value| json!({"required": true, "content": {"application/json": {"schema": schema}}});
+    let responses = json!({
+        "2XX": {"description": "The result", "content": {"application/json": {"schema": {}}}},
+        "default": {"description": "An error", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+    });
+    let mut rpc = Vec::new();
+    for op in ops() {
+        let effect = serde_json::to_value(op.effect).unwrap_or_default();
+        match (&op.via, op.input) {
+            (Via::Memex { method }, input) => {
+                let params = match input {
+                    Input::Params(s) => serde_json::from_str(s).unwrap_or_else(|_| any_object()),
+                    Input::Typed(f) => f(),
+                    _ => any_object(),
+                };
+                rpc.push(json!({
+                    "title": op.name, "description": op.summary, "type": "object", "x-c6-effect": effect,
+                    "required": ["method"],
+                    "properties": {"method": {"const": method}, "params": hoist(params, &mut defs)},
+                }));
+            }
+            (Via::Http { method, path }, input) => {
+                let mut parameters: Vec<Value> = path_params(path)
+                    .into_iter()
+                    .map(|p| json!({"name": p, "in": "path", "required": true, "schema": {"type": "string"}}))
+                    .collect();
+                let mut entry = json!({
+                    "operationId": op.name, "summary": op.summary, "tags": [op.area], "x-c6-effect": effect, "responses": responses,
+                });
+                match input {
+                    Input::Body(f) => entry["requestBody"] = json_body(hoist(f(), &mut defs)),
+                    Input::Query(f) => {
+                        let q = hoist(f(), &mut defs);
+                        let required: Vec<&str> = q["required"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
+                        for (name, schema) in q["properties"].as_object().into_iter().flatten() {
+                            parameters.push(
+                                json!({"name": name, "in": "query", "required": required.contains(&name.as_str()), "schema": schema}),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                if !parameters.is_empty() {
+                    entry["parameters"] = Value::Array(parameters);
+                }
+                let item = paths.entry(path.to_string()).or_insert_with(|| json!({}));
+                item[method.to_lowercase()] = entry;
+            }
+        }
+    }
+    paths.insert(
+        "/api/v1/memex/rpc".into(),
+        json!({"post": {
+            "operationId": "memex.rpc", "summary": "Calls a memex method: one variant per memex operation (its title).",
+            "tags": ["memex"], "requestBody": json_body(json!({"oneOf": rpc})), "responses": responses,
+        }}),
+    );
+    defs.insert("ApiError".into(), json!({"type": "object", "required": ["error"], "properties": {"error": {"type": "string"}}}));
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "carbon6", "version": env!("CARGO_PKG_VERSION"), "description": api_basics(urls)},
+        "servers": urls.iter().map(|u| json!({"url": u})).collect::<Vec<_>>(),
+        "security": [{"token": []}],
+        "tags": AREAS.iter().map(|(a, d)| json!({"name": a, "description": d})).collect::<Vec<_>>(),
+        "paths": paths,
+        "components": {"securitySchemes": {"token": {"type": "http", "scheme": "bearer", "description": "An API token (c6_…)"}}, "schemas": defs},
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +868,51 @@ mod tests {
         assert!(d["operations"].as_array().unwrap().iter().any(|o| o["op"] == "settings.memex.get"), "{d}");
         let all = discover("", None);
         assert_eq!(all["areas"].as_array().unwrap().len(), AREAS.len());
+    }
+
+    #[test]
+    fn api_reference() {
+        let urls = vec!["https://head.example:7443".to_owned()];
+        let basics = reference("", "", &urls).unwrap();
+        assert!(basics.contains("https://head.example:7443") && basics.contains("Authorization: Bearer c6_"), "{basics}");
+        assert!(AREAS.iter().all(|(a, _)| basics.contains(&format!("- {a} ("))), "{basics}");
+
+        let one = reference("", "sessions.create", &urls).unwrap();
+        assert!(one.contains("POST /api/v1/sessions\n") && one.contains("Body (JSON Schema)") && one.contains("curl -sS -X POST"), "{one}");
+        let path = reference("", "sessions.send", &urls).unwrap();
+        assert!(
+            path.contains("Path parameters: id (from sessions.list);") && path.contains("$C6_URL/api/v1/sessions/<id>/messages"),
+            "{path}"
+        );
+        let memex = ops().iter().find(|o| matches!(o.via, Via::Memex { .. })).unwrap();
+        let m = reference("", memex.name, &urls).unwrap();
+        assert!(m.contains("POST /api/v1/memex/rpc") && m.contains("\"method\": \"memex."), "{m}");
+        assert!(reference("", "no.such.op", &urls).is_err());
+
+        let found = reference("enrollment token worker", "", &urls).unwrap();
+        assert!(found.contains("Matching operations") && found.contains("workers.enrollments.create [secret]"), "{found}");
+    }
+
+    #[test]
+    fn openapi_document() {
+        let doc = openapi(&["http://localhost:7070".to_owned()]);
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert_eq!(doc["servers"][0]["url"], "http://localhost:7070");
+        // Every HTTP operation is there once, under its method and path.
+        let paths = doc["paths"].as_object().unwrap();
+        let http = ops().iter().filter(|o| matches!(o.via, Via::Http { .. })).count();
+        let listed: usize = paths.iter().filter(|(p, _)| *p != "/api/v1/memex/rpc").map(|(_, i)| i.as_object().unwrap().len()).sum();
+        assert_eq!(listed, http, "an operation shares a method and path with another");
+        let memex = ops().iter().filter(|o| matches!(o.via, Via::Memex { .. })).count();
+        let variants = &paths["/api/v1/memex/rpc"]["post"]["requestBody"]["content"]["application/json"]["schema"]["oneOf"];
+        assert_eq!(variants.as_array().unwrap().len(), memex);
+        // Every reference resolves, and no nested $defs are left.
+        let text = doc.to_string();
+        assert!(!text.contains("\"$defs\"") && !text.contains("#/$defs/") && !text.contains("#/definitions/"));
+        let schemas = doc["components"]["schemas"].as_object().unwrap();
+        let re = regex::Regex::new(r##""\$ref":"#/components/schemas/([^"]+)""##).unwrap();
+        for c in re.captures_iter(&text) {
+            assert!(schemas.contains_key(&c[1]), "unresolved reference {}", &c[1]);
+        }
     }
 }
