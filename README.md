@@ -20,6 +20,7 @@ See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs
 - **Offline-tolerant.** Workers journal every event before sending it. Sessions keep running when the head is unreachable and sync back exactly when it returns. A worker that loses its journal has its sessions restored from the head.
 - **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser.
 - **Observability:** the head exports OpenTelemetry GenAI traces over OTLP.
+- **Next: carbon6 as an operating system for agents.** Realms isolate apps from each other, and apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only. This is a design, not built yet: see [docs/os.md](docs/os.md).
 
 ## Build
 
