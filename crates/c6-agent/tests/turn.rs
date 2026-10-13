@@ -135,6 +135,82 @@ async fn compacts_when_the_context_fills_up() {
     assert_eq!(history_from_events(&events), conv.history);
 }
 
+/// A turn on a 100-token window (the mock reports 110 per call, so the
+/// second step compacts), with the given replies.
+async fn compacting_turn(replies: Vec<Reply>) -> (TurnEndReason, Vec<serde_json::Value>, Vec<SessionEvent>, Conversation) {
+    let mock = MockLlm::start().await;
+    for r in replies {
+        mock.push(r);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap();
+    let vec_sink = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = vec_sink.clone();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let cfg = TurnConfig { context_window: 100, ..cfg() };
+    let mut conv = Conversation { history: vec![Message::user_text("say hi")], context_tokens: 0 };
+    let reason =
+        run_turn(1, &cfg, &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &CancellationToken::new()).await.unwrap();
+    let events = vec_sink.events.lock().unwrap().clone();
+    (reason, mock.requests(), events, conv)
+}
+
+fn bash_call() -> Reply {
+    Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hi"}"#.into())])
+}
+
+fn compaction(events: &[SessionEvent]) -> String {
+    events.iter().find_map(|e| if let Some(session_event::Kind::Compaction(c)) = &e.kind { Some(c.summary.clone()) } else { None }).unwrap()
+}
+
+#[tokio::test]
+async fn compaction_asks_again_without_tools_when_the_model_calls_one() {
+    let (reason, reqs, events, conv) =
+        compacting_turn(vec![bash_call(), bash_call(), Reply::Text("SUMMARY: ran echo".into()), Reply::Text("All done.".into())]).await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(reqs.len(), 4);
+    // The second try: the conversation as text, no tools.
+    assert!(reqs[2].get("tools").is_none(), "{}", reqs[2]);
+    let retry = reqs[2]["messages"].as_array().unwrap();
+    assert_eq!(retry.len(), 2, "system + one user message");
+    let text = retry[1]["content"].as_str().unwrap();
+    assert!(text.contains("say hi") && text.contains("[tool call bash:") && text.contains("summary"), "{text}");
+    assert_eq!(compaction(&events), "SUMMARY: ran echo");
+    assert_eq!(history_from_events(&events), conv.history);
+}
+
+#[tokio::test]
+async fn automatic_compaction_falls_back_to_a_digest() {
+    let (reason, reqs, events, conv) = compacting_turn(vec![bash_call(), bash_call(), bash_call(), Reply::Text("All done.".into())]).await;
+    assert_eq!(reason, TurnEndReason::Completed, "the session is not stuck");
+    assert_eq!(reqs.len(), 4);
+    let digest = compaction(&events);
+    assert!(digest.contains("the model called `bash` instead of writing a summary"), "{digest}");
+    assert!(digest.contains("mechanical digest") && digest.contains("say hi") && digest.contains("echo hi"), "{digest}");
+    assert!(reqs[3]["messages"][1]["content"].as_str().unwrap().contains("mechanical digest"));
+    assert_eq!(history_from_events(&events), conv.history);
+}
+
+#[tokio::test]
+async fn asked_compaction_reports_what_the_model_did() {
+    let mock = MockLlm::start().await;
+    mock.push(bash_call());
+    mock.push(bash_call());
+    let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap();
+    let vec_sink = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = vec_sink.clone();
+    let mut conv = Conversation { history: vec![Message::user_text("say hi")], context_tokens: 0 };
+    let before = conv.history.clone();
+    let reason =
+        c6_agent::compact_turn(1, &cfg(), &client, &default_tools(), &sink, &mut conv, "", &CancellationToken::new()).await.unwrap();
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(conv.history, before, "nothing dropped");
+    let events = vec_sink.events.lock().unwrap().clone();
+    let err =
+        events.iter().find_map(|e| if let Some(session_event::Kind::Error(x)) = &e.kind { Some(x.message.clone()) } else { None }).unwrap();
+    assert!(err.contains("compaction failed: the model called `bash` instead of writing a summary"), "{err}");
+}
+
 fn kind_name(e: &SessionEvent) -> &'static str {
     match e.kind.as_ref().unwrap() {
         session_event::Kind::Started(_) => "started",

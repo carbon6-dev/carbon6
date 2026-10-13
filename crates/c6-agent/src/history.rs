@@ -157,6 +157,64 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
     out
 }
 
+/// A plain-text digest of an in-memory conversation within about `budget`
+/// characters: the most recent steps in full (long tool input and output
+/// shortened), and before them only what the user asked.
+pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
+    fn clip(s: &str, max: usize) -> String {
+        if s.chars().count() <= max { s.to_owned() } else { format!("{}… (shortened)", s.chars().take(max).collect::<String>()) }
+    }
+    // One chunk per message, and whether it is something the user wrote.
+    let chunks: Vec<(String, bool)> = msgs
+        .iter()
+        .map(|m| {
+            let mut out = String::new();
+            let mut typed = false;
+            for b in &m.blocks {
+                match (m.role, b) {
+                    (Role::User, Block::Text(t)) => {
+                        typed = true;
+                        out.push_str(&format!("\n## User\n{}\n", clip(t, 4000)));
+                    }
+                    (Role::User, Block::Image { .. }) => out.push_str("[image]\n"),
+                    (_, Block::ToolResult { content, is_error, .. }) => {
+                        out.push_str(&format!("[tool {}]\n{}\n", if *is_error { "error" } else { "result" }, clip(content, 1500)))
+                    }
+                    (Role::Assistant, Block::Text(t)) => out.push_str(&format!("\n## Assistant\n{t}\n")),
+                    (_, Block::ToolUse { name, input_json, .. }) => {
+                        out.push_str(&format!("\n[tool call {name}: {}]\n", clip(input_json, 1500)))
+                    }
+                    _ => {}
+                }
+            }
+            (out, typed)
+        })
+        .collect();
+    // Recent steps, newest first, while they fit.
+    let mut used = 0;
+    let mut start = chunks.len();
+    while start > 0 && used + chunks[start - 1].0.len() <= budget {
+        start -= 1;
+        used += chunks[start].0.len();
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push_str(&format!("# Earlier ({start} messages, shortened to what the user wrote)\n"));
+        for (c, _) in chunks[..start].iter().filter(|(_, typed)| *typed) {
+            if used + c.len() > budget + budget / 4 {
+                break;
+            }
+            used += c.len();
+            out.push_str(c);
+        }
+        out.push_str("\n# Most recent\n");
+    }
+    for (c, _) in &chunks[start..] {
+        out.push_str(c);
+    }
+    out
+}
+
 /// The user message that stands in for a compacted conversation.
 pub fn compacted_context(summary: &str) -> String {
     format!(
@@ -256,6 +314,32 @@ mod tests {
     use c6_proto::{AssistantMessage, ContentBlock, ToolResult, ToolUse, UserMessage};
 
     use super::*;
+
+    #[test]
+    fn digest_keeps_recent_steps_and_earlier_requests() {
+        let step = |i: usize| {
+            vec![
+                Message {
+                    role: Role::Assistant,
+                    blocks: vec![Block::ToolUse { id: format!("t{i}"), name: "bash".into(), input_json: "{}".into() }],
+                },
+                Message {
+                    role: Role::User,
+                    blocks: vec![Block::ToolResult { id: format!("t{i}"), content: format!("output {i} ").repeat(500), is_error: false }],
+                },
+            ]
+        };
+        let mut msgs = vec![Message::user_text("build the card")];
+        msgs.extend((0..20).flat_map(step));
+        msgs.push(Message::user_text("now flip the blade"));
+        let d = messages_digest(&msgs, 5000);
+        assert!(d.contains("# Earlier") && d.contains("build the card") && d.contains("now flip the blade"), "{d}");
+        assert!(d.contains("output 19") && !d.contains("output 0 "), "{d}");
+        assert!(d.contains("(shortened)"));
+        assert!(d.len() < 8000, "{}", d.len());
+        // Everything fits: no omission note.
+        assert!(!messages_digest(&msgs[..3], 100_000).contains("# Earlier"));
+    }
 
     fn ev(kind: session_event::Kind) -> SessionEvent {
         SessionEvent { seq: 0, ts_ms: 0, kind: Some(kind) }

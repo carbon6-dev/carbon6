@@ -15,7 +15,7 @@ use futures::future::join_all;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::history::{block_to_proto, compacted_context};
+use crate::history::{block_to_proto, compacted_context, messages_digest};
 use crate::{EventSink, PendingInput};
 
 /// Guards against runaway tool loops.
@@ -90,7 +90,7 @@ pub async fn compact_turn(
     let reason = if conv.history.is_empty() {
         t.fail("there is nothing to compact yet".into()).await?
     } else {
-        match t.compact(conv, COMPACT_WHY_ASKED, focus).await? {
+        match t.compact(conv, COMPACT_WHY_ASKED, focus, false).await? {
             Ok(()) => TurnEndReason::Completed,
             Err(_) if cancel.is_cancelled() => TurnEndReason::Interrupted,
             Err(e) => t.fail(format!("compaction failed: {e}")).await?,
@@ -194,7 +194,7 @@ impl Turn<'_> {
             }
             if self.cfg.context_window > 0
                 && conv.context_tokens as f64 > self.cfg.context_window as f64 * COMPACT_AT
-                && let Err(e) = self.compact(conv, COMPACT_WHY, "").await?
+                && let Err(e) = self.compact(conv, COMPACT_WHY, "", true).await?
             {
                 return self.fail(format!("compaction failed: {e}")).await;
             }
@@ -204,7 +204,7 @@ impl Turn<'_> {
                 Ok(r) => r,
                 Err(LlmError::ContextOverflow(_)) if !compacted_for_overflow => {
                     compacted_for_overflow = true;
-                    if let Err(e) = self.compact(conv, COMPACT_WHY, "").await? {
+                    if let Err(e) = self.compact(conv, COMPACT_WHY, "", true).await? {
                         return self.fail(format!("context window exceeded and compaction failed: {e}")).await;
                     }
                     continue;
@@ -325,36 +325,86 @@ impl Turn<'_> {
     /// Simple compaction: the model summarizes the conversation (same model,
     /// system and tools, so the cached prefix is reused) and the summary
     /// replaces the whole history. Nothing older is replayed, so no earlier
-    /// reasoning blocks are sent again. The outer `Result` is a journal
-    /// failure; the inner one a compaction failure.
-    async fn compact(&self, conv: &mut Conversation, why: &str, focus: &str) -> anyhow::Result<Result<(), String>> {
+    /// reasoning blocks are sent again. If the model answers with no text
+    /// (often a tool call: it carries on with the work), it is asked once
+    /// more with the conversation as text and no tools. With `fallback`
+    /// (automatic compaction), a mechanical digest stands in when that fails
+    /// too, so the session is not stuck over its window. The outer `Result`
+    /// is a journal failure; the inner one a compaction failure.
+    async fn compact(&self, conv: &mut Conversation, why: &str, focus: &str, fallback: bool) -> anyhow::Result<Result<(), String>> {
         let mut prompt = format!("{why} {COMPACT_PROMPT}");
         if !focus.trim().is_empty() {
             prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {}", focus.trim()));
         }
         let mut msgs = conv.history.clone();
         match msgs.last_mut() {
-            Some(m) if m.role == Role::User => m.blocks.push(Block::Text(prompt)),
-            _ => msgs.push(Message::user_text(prompt)),
+            Some(m) if m.role == Role::User => m.blocks.push(Block::Text(prompt.clone())),
+            _ => msgs.push(Message::user_text(prompt.clone())),
         }
-        let req = self.request(msgs, Some(COMPACT_MAX_OUTPUT));
+        let first = match self.summarize(self.request(msgs, Some(COMPACT_MAX_OUTPUT))).await? {
+            Ok(summary) => return self.compacted(conv, summary).await,
+            // A request that failed may fail again; an interrupt is final.
+            Err(NoSummary::Failed(e)) => return Ok(Err(e)),
+            Err(NoSummary::Answered(e) | NoSummary::Overflow(e)) => e,
+        };
+        warn!(error = %first, "compaction: no summary; retrying with the conversation as text and no tools");
+
+        // The window holds the whole conversation, so its text (shorter:
+        // tool output is clipped) fits too.
+        let budget = self.digest_budget(2);
+        let text = format!(
+            "Below is a conversation between a user and you, an agent working on their task, as text.\n\n{}\n\n---\n\n{prompt}",
+            messages_digest(&conv.history, budget)
+        );
+        let mut req = self.request(vec![Message::user_text(text)], Some(COMPACT_MAX_OUTPUT));
+        req.tools.clear();
+        req.web_search = false;
+        let (second, answered) = match self.summarize(req).await? {
+            Ok(summary) => return self.compacted(conv, summary).await,
+            Err(NoSummary::Answered(e)) => (e, true),
+            Err(NoSummary::Failed(e) | NoSummary::Overflow(e)) => (e, false),
+        };
+        let why = if second == first { first } else { format!("{first}; asked again without tools, {second}") };
+        // Only when the model answered: a failed request is no reason to
+        // drop the history.
+        if !fallback || !answered || self.cancel.is_cancelled() {
+            return Ok(Err(why));
+        }
+
+        warn!(error = %why, "compaction: falling back to a mechanical digest");
+        let digest = format!(
+            "(The model could not write a summary: {why}. This is a mechanical digest instead: the most recent steps, \
+             with long tool input and output shortened, and before them only what the user wrote. Re-read files rather \
+             than trusting shortened output.)\n\n{}",
+            messages_digest(&conv.history, self.digest_budget(1))
+        );
+        self.compacted(conv, digest).await
+    }
+
+    /// One summarizing call: the summary, or what came back instead.
+    async fn summarize(&self, req: ModelRequest) -> anyhow::Result<Result<String, NoSummary>> {
         let resp = match self.call(&req, false).await {
             Ok(r) => r,
-            Err(e) => return Ok(Err(e.to_string())),
+            Err(e @ LlmError::ContextOverflow(_)) => return Ok(Err(NoSummary::Overflow(e.to_string()))),
+            Err(e) => return Ok(Err(NoSummary::Failed(e.to_string()))),
         };
         self.record_usage(&resp.usage).await?;
+        if resp.interrupted {
+            return Ok(Err(NoSummary::Failed("interrupted".into())));
+        }
         if let Some(e) = resp.error {
-            return Ok(Err(e.to_string()));
+            return Ok(Err(NoSummary::Failed(e.to_string())));
         }
-        let summary: String = resp
-            .message
-            .map(|m| {
-                m.blocks.into_iter().filter_map(|b| if let Block::Text(t) = b { Some(t) } else { None }).collect::<Vec<_>>().join("\n")
-            })
-            .unwrap_or_default();
-        if summary.trim().is_empty() {
-            return Ok(Err("the model returned no summary".into()));
+        let blocks = resp.message.map(|m| m.blocks).unwrap_or_default();
+        let summary =
+            blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n");
+        if !summary.trim().is_empty() {
+            return Ok(Ok(summary));
         }
+        Ok(Err(NoSummary::Answered(no_summary(&blocks, &resp.stop_reason))))
+    }
+
+    async fn compacted(&self, conv: &mut Conversation, summary: String) -> anyhow::Result<Result<(), String>> {
         self.sink
             .append(session_event::Kind::Compaction(Compaction { summary: summary.clone(), tokens_before: conv.context_tokens }))
             .await?;
@@ -363,9 +413,43 @@ impl Turn<'_> {
         Ok(Ok(()))
     }
 
+    /// A digest of about `quarters` quarters of the context window (at about
+    /// 3.5 characters a token).
+    fn digest_budget(&self, quarters: u64) -> usize {
+        let window = if self.cfg.context_window > 0 { self.cfg.context_window } else { 128_000 };
+        (window * quarters / 4 * 7 / 2) as usize
+    }
+
     async fn fail(&self, message: String) -> anyhow::Result<TurnEndReason> {
         fail(self.sink.as_ref(), message).await
     }
+}
+
+/// Why a summarizing call gave no summary.
+enum NoSummary {
+    /// The model answered, but with no text.
+    Answered(String),
+    /// The conversation did not fit.
+    Overflow(String),
+    /// The request failed or was interrupted.
+    Failed(String),
+}
+
+/// What the model sent back instead of a summary.
+fn no_summary(blocks: &[Block], stop_reason: &str) -> String {
+    let calls: Vec<&str> =
+        blocks.iter().filter_map(|b| if let Block::ToolUse { name, .. } = b { Some(name.as_str()) } else { None }).collect();
+    let reasoned = blocks
+        .iter()
+        .any(|b| matches!(b, Block::Thinking(_) | Block::SignedThinking { .. } | Block::RedactedThinking(_) | Block::Reasoning { .. }));
+    let what = if !calls.is_empty() {
+        format!("the model called {} instead of writing a summary", calls.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
+    } else if reasoned {
+        "the model only reasoned and wrote no summary".to_owned()
+    } else {
+        "the model returned no summary".to_owned()
+    };
+    if stop_reason.is_empty() { what } else { format!("{what} (stop reason: {stop_reason})") }
 }
 
 async fn fail(sink: &dyn EventSink, message: String) -> anyhow::Result<TurnEndReason> {
