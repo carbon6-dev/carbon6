@@ -208,7 +208,7 @@ trail(id, name, description) ; trail_step(trail_id, ordinal, target, comment)
 
 ### 4.5 Getting data in: one ingest API, typed by handlers
 
-**The problem.** Ingest has grown one path per kind of data: document upload, folder scan, notes, an internal generic ingest the head uses for sessions and memory, and Gmail sync. Each new source (Thunderbird, Takeout, a scanner, a feed) would add another API. Making the API general must not cost any guarantee that a dedicated API gives.
+**The problem.** Ingest has grown one path per kind of data: document upload, folder scan, notes, an internal generic ingest the head uses for sessions and memory, and Gmail sync. Each new source (an mbox archive, Takeout, a scanner, a feed) would add another API. Making the API general must not cost any guarantee that a dedicated API gives.
 
 **The rule.** Getting data in is general, and what the data means stays specialized:
 - **One way in:** a single ingest call, one envelope, one set of retry and result semantics.
@@ -224,8 +224,8 @@ trail(id, name, description) ; trail_step(trail_id, ordinal, target, comment)
 {"items": [{
   "type": "message/rfc822",
   "data": "<base64 of the bytes>",
-  "source": {"kind": "thunderbird", "id": "work-laptop"},
-  "external_id": "Local Folders/Work/2009#88123",
+  "source": {"kind": "mbox", "id": "archive-2009"},
+  "external_id": "Work.mbox#88123",
   "attributes": {"folder": "Work/2009", "read": true, "starred": false},
   "labels": ["personal"]
 }]}
@@ -269,7 +269,7 @@ Importers read the registry, so a new source needs no new API, only a client.
 #### Mail, the first handler
 
 - `message/rfc822` → the parsing that `mail::store_message` does today, without requiring a Gmail account.
-- **Accounts and threads:** an imported message belongs to its source (for example `thunderbird:work-laptop`) instead of a Gmail account. It is threaded by `References` and `In-Reply-To`, since it has no Gmail thread id.
+- **Accounts and threads:** an imported message belongs to its source (for example `mbox:archive-2009`) instead of a Gmail account. It is threaded by `References` and `In-Reply-To`, since it has no Gmail thread id.
 - **Labels and flags:** attributes `folder` (a label), `read`, `starred`, and `received` (a fallback date).
 - **Imported and mirrored copies of the same message:**
   - Imported mail that Gmail sync already has is a duplicate; the mirrored copy wins.
@@ -377,14 +377,7 @@ carbon6 replaces the mail client, the calendar and the address book, starting wi
 - **No exclusions:** everything is brought in, including Spam and Trash. Spam is marked as such and never reaches agents' context.
 - **Multiple accounts** appear in one unified inbox or one at a time. Replies default to the account and address the thread came to.
 - **Archives no longer on Gmail** can be imported from mbox, Maildir or Google Takeout files. They're marked as imported, not synced, and deduplicated against synced mail by Message-ID.
-  - **Thunderbird:** a separate importer (a `c6` command, or any tool) reads a Thunderbird profile where it lives and sends each message through `memex.ingest` (4.5). The memex needs no access to the profile.
-    - It reads mbox files under `Mail/` and `ImapMail/` (each has a sibling `.msf` index, which it ignores), or Maildir folders for profiles set up that way.
-    - Folder names become the `folder` attribute, then labels.
-    - It skips messages Thunderbird marked deleted but hasn't compacted away (`X-Mozilla-Status` flags).
-    - It keeps its own position (a byte offset per mbox file) to resume. Re-sending is harmless.
-    - It's safest to run with Thunderbird closed, or on a copy, because compacting rewrites mbox files.
-
-    This comes after Gmail sync.
+  - carbon6 ships no importer for these. Any tool can send messages through `memex.ingest` (4.5), splitting the archive on its side.
 
 ### 6.3 The mail client, in carbon6's UI
 
@@ -549,8 +542,7 @@ Each step is usable on its own:
 6. **One ingest API (4.5):**
    - `memex.ingest` and `memex.types`, the handler registry, and per-item results;
    - mail as the first handler: imported mail, threading by headers, upgrade to mirrored;
-   - upload, folder scan, notes and the head's internal ingest moved onto it;
-   - the Thunderbird importer as its first outside client.
+   - upload, folder scan, notes and the head's internal ingest moved onto it.
 
 ## 11. Decisions
 
@@ -565,7 +557,7 @@ Each step is usable on its own:
 | Where `c6m` runs | This Mac first, with nothing assuming it |
 | Exclusions | None: everything is brought in (Spam is kept out of agents' context) |
 | Google Cloud project | You have one; adding an account asks for its OAuth client |
-| Old mail | Backfill from Thunderbird (mbox or Maildir) after Gmail sync, deduplicated by Message-ID, through a separate importer |
+| Old mail | No Thunderbird importer. Archives can come in through `memex.ingest` from any tool, deduplicated by Message-ID |
 | Getting data in | One ingest API typed by MIME type, with registered handlers that keep their own identity, schema and storage; connectors and actions stay separate (4.5) |
 | Encryption at rest | Left to the disks |
 
@@ -573,5 +565,4 @@ Each step is usable on its own:
 
 None blocking. To revisit when we reach them:
 
-- Which Thunderbird profile and folders to backfill from.
 - Where your photo and video libraries live.
