@@ -21,3 +21,9 @@ c6-agent = { path = "crates/c6-agent" }
 c6-tools = { path = "crates/c6-tools" }
 c6-mcp = { path = "crates/c6-mcp" }
 c6-testkit = { path = "crates/c6-testkit" }
+
+# Dependencies without debug info: much smaller test binaries, which link
+# faster and (on macOS) are scanned faster before their first launch. Our
+# own crates keep full debug info.
+[profile.dev.package."*"]
+debug = false
