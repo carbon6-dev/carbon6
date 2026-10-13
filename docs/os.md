@@ -449,22 +449,19 @@ In short; the details are in 12, and how existing data is upgraded is in 13.
 
 Each step is usable on its own. Each step also moves the features that duplicate its primitive onto it (12), and upgrades existing data (13), in the same step, so there is never a second way of doing the same thing for long.
 
-1. **Realms:**
-   - realm on every object; root and home, with everything moved in (3.10);
-   - a session's realm; workers and connections available per realm; secrets, policies, budgets and programs per realm, inherited from root;
-   - realm-scoped API tokens; the realm switcher in the UI.
-   - **Ports:** carbon6's own prompts (the base prompt, briefing guidance, the decision-session prompt, compaction) and the memex's understanding prompts become root skills.
-2. **Grants and commons:** the four modes, provenance, the log, the commons review queue.
-3. **Collections:** schemas, records, history, queries, the agent tools, the memex mirror, generated forms, a table and record view.
-   - **Ports:** every list in Settings becomes a system collection with generated forms; hosts, memory notes, facts, commitments and trails become collections.
-4. **Decisions:** the primitive, batching and digests, answering by link.
+0. **The upgrade machinery (13):** backups before migrating, restoring on failure, checks that compare before and after, the upgrade report, `c6h upgrade` and `c6m upgrade` (with `--check` to try a copy), and test databases in today's shape that every later step is tested against. Nothing visible changes.
+1. **Realm plumbing:** root and home, a realm on every object, a session's realm, the head and the memex checking realms, realm-scoped API tokens. There is no way to create a second realm yet, so nothing visible changes.
+2. **Collections:** schemas, records, history, the JSON filter queries, the agent tools, the memex mirror, generated forms, a table and record view. **Root → realm inheritance is built here, once,** on collections.
+   - **Ports:** every list in Settings becomes a system collection with generated forms; hosts, memory notes, facts, commitments and trails become collections. carbon6's own prompts and the memex's understanding prompts become root skills.
+3. **Decisions:** the primitive, batching and digests, answering by link.
    - **Ports:** tool-call approvals, action items, workflow approve steps, the assistant's questions, confirmations of destructive operations, the memex review queue and fact disputes.
+4. **Realms you can create, grants and commons:** the realm switcher; workers and connections available per realm; the four grant modes, provenance, the log; the commons review queue. Grant requests are decisions (3), and realms differ by configuration (2).
 5. **Triggers:** record, decision, series and session events; mappings; loop protection.
    - **Ports:** automations, cron schedules, webhooks and memex events become triggers; notifications become a subscriber to events.
 6. **Series:** points, queries, thresholds.
    - **Ports:** usage, model prices, budgets, host checks and the memex's model-call budget.
 7. **Views:** board, chart, feed, page and actions; each realm's menu.
-   - **Ports:** the usage page and the To do list become views.
+   - **Ports:** the usage page and the decision list become views.
 8. **The assistant as a program:** a template with the catalog tools and a root skill, running in a realm like any session.
 9. **Apps:** the package format, install, upgrade, export, remove; a skill for agents writing packages.
 10. **The examples:** the service factory and the personal CRM as example packages. Building them is the final check that no app needs code.
@@ -485,10 +482,11 @@ Each step is usable on its own. Each step also moves the features that duplicate
 | Duplicated features | Rebuilt on their primitive in the step that builds it (12, 9) |
 | Existing data | Upgraded automatically in each step, after a backup, all or nothing, nothing dropped (13) |
 | Where existing configuration goes | What grants abilities (secrets, tools, programs) to home; restrictions (policies, budget caps) to root |
+| Query language for collections | The small JSON filter (4.1) for now; a richer language only if apps need it |
+| Settings forms | Generated from schema annotations (descriptions, examples, field order, presets as records). A hand-written form is deleted only when the generated one covers everything it did. |
 
 ## 11. Open questions
 
-- **Query language:** whether the JSON filter (4.1) is enough for views and agents, or a small typed query language is worth it later.
 - **One person in two realms:** whether commons should hold shared identities (people, organizations) by default, or only by explicit linking.
 - **Claude Code sessions:** they reach carbon6 through MCP. The realm checks are in the head, so they hold, but their tool set needs the same realm-aware tools.
 - **Charts and pages:** whether the view kinds in 4.5 cover what apps need, or a page kind with richer layout is needed.
@@ -553,7 +551,7 @@ carbon6 already holds real data. Every step of the build order upgrades it to th
 5. **Checked.** After migrating, counts and totals are compared per kind of object: settings entries, action items, automations, sessions, spend. An upgrade report is kept under **Settings → System → Upgrades**.
 6. **Large data in the background.** Big memex tables (items, parts, vectors) get their realm in batches, with a progress marker, while the memex keeps serving. A step finishes only when every batch is done.
 7. **Old tables stay for one release,** renamed `legacy_*` and read-only. A later release drops them only after you confirm, as a decision.
-8. **Try it first:** `c6h upgrade --check` runs the migration on a copy of the database and prints the report without touching the real one. The same goes for `c6m`.
+8. **Try it first:** `c6h upgrade --check` runs the migration on a copy of the database and prints the report without touching the real one; `c6h upgrade` upgrades without starting the head. The same goes for `c6m`.
 9. **Going back** means restoring the backup. There is no automatic downgrade, because new data written after the upgrade has no old shape.
 10. **Tested against real shapes.** Every migration is tested on databases created by each earlier version (synthetic data, never yours), from that version's schema through the latest.
 
