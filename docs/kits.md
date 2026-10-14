@@ -49,6 +49,23 @@ Apps need software that workers don't have: python-pptx, LibreOffice, ffmpeg, a 
 - **`tools`:** each one is a command template, with its arguments typed. A `path` argument must be inside the session's folder and is mapped into the sandbox.
 - **`shell`:** whether agents may run arbitrary commands in the kit (a permission of its own).
 
+## 3a. Kits built from kits
+
+Building a kit often needs other software: a compiler for a tool, a Python base with packages. Those are kits too, so kits depend on kits.
+
+- **Naming them:** a Dockerfile names other kits as `kit:<name>`, as a base (`FROM kit:python-base`) or as a build stage (`FROM kit:rust-builder AS build`).
+- **Pinning:** the manifest locks each one to a version: `"uses": {"python-base": "sha256:…"}`. When building, carbon6 replaces `kit:<name>` with the local tag of that exact version.
+- **A graph, built bottom-up:** the worker builds a kit's dependencies first, each version once, shared by every kit that uses it.
+  - **Digests:** a kit's digest covers its dependencies' digests, so a new base rebuilds only what uses it.
+  - **Cycles:** refused when a kit is saved.
+- **Roots:** a kit whose Dockerfile starts from a pinned upstream image (`debian:bookworm-slim@sha256:…`), or from `scratch` with a root filesystem archive kept in the registry.
+  - **Offline builds:** once a root's base is mirrored in the local registry, builds need nothing outside.
+  - **The floor:** someone has to provide a first filesystem; bootstrapping below that isn't attempted.
+- **Builds run on the worker's container runtime,** not inside a kit, so the recursion ends there. A builder kit (BuildKit or Buildah) could later make builds possible on workers without a runtime.
+- **Permissions don't carry over:** a kit used to build another lends its files, not its permissions. At run time, only the running kit's approved permissions apply.
+- **Approval shows build dependencies:** build steps run with network, so approving a kit lists what it is built from ("built from rust-builder 1.2 and python-base 3.1"). Unapproved dependencies are asked for in the same decision.
+- **Updates:** a new version of a base kit leaves kits that use it on their locked version until you update them. The update is a new version of each kit, approved again only if its permissions grew.
+
 ## 4. Permissions and the sandbox
 
 | Permission | Values | Sandbox |
@@ -93,8 +110,8 @@ Every run also gets `--cap-drop ALL`, `--security-opt no-new-privileges`, a non-
 
 ## 8. Build order (local only)
 
-1. **The registry in the head:** kits, versions, files, approvals and builds; the API; Settings → Kits.
-2. **Worker runtime detection, local builds, and sandboxed runs**, with the permissions mapped to flags.
+1. **The registry in the head:** kits, versions, files, dependencies (locked, with cycles refused), approvals and builds; the API; Settings → Kits.
+2. **Worker runtime detection, local builds in dependency order, and sandboxed runs**, with the permissions mapped to flags.
 3. **The agent tools** `kit_run` and `kit_shell`, and kits available per realm.
 4. **Apps declare kits** in `needs.kits`; installing an app installs and approves them.
 5. **The first kit, `decks-render`:** HTML slides to PPTX with python-pptx, and SVG to PNG.
