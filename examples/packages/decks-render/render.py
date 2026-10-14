@@ -28,7 +28,7 @@ def pages(pdf_path, out_dir, first=None, last=None, width=1280):
     """One PNG per page, slide-01.png …; returns their paths."""
     os.makedirs(out_dir, exist_ok=True)
     tmp = tempfile.mkdtemp(dir="/tmp")
-    cmd = ["pdftoppm", "-png", "-scale-to", str(width)]
+    cmd = ["pdftoppm", "-q", "-png", "-scale-to", str(width)]
     if first:
         cmd += ["-f", str(first), "-l", str(last or first)]
     subprocess.run(cmd + [pdf_path, os.path.join(tmp, "p")], check=True)

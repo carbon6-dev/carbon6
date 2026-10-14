@@ -395,3 +395,71 @@ async fn template_start_through_an_export() {
     assert!(seen.contains("Make: a chair"), "{seen}");
     w.stop().await;
 }
+
+/// The decks-render kit from examples/packages, installed with the decks
+/// app and run by an agent: slides, PDF and PowerPoint. Its first build
+/// downloads Debian packages, Chromium and fonts, so it runs only with
+/// C6_TEST_DECKS_RENDER=1.
+#[tokio::test]
+async fn decks_render_kit_renders_a_deck() {
+    use c6_testkit::Reply;
+    if std::env::var("C6_TEST_DECKS_RENDER").is_err() || c6_tools::kits::runtime().await.is_none() {
+        eprintln!("set C6_TEST_DECKS_RENDER=1 (and have Docker or Podman) to run");
+        return;
+    }
+    let w = with_worker().await;
+    let http = reqwest::Client::new();
+    let api = w.api.clone();
+    let ok = async |r: reqwest::Response| -> Value {
+        let s = r.status();
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let kit: Value = serde_json::from_str(include_str!("../../../../examples/packages/decks-render.json")).unwrap();
+    let decks: Value = serde_json::from_str(include_str!("../../../../examples/apps/decks.json")).unwrap();
+    ok(http.post(format!("{api}/packages")).json(&kit).send().await.unwrap()).await;
+    let i: c6_api::AppInstall = serde_json::from_value(ok(http.post(format!("{api}/apps")).json(&decks).send().await.unwrap()).await).unwrap();
+    ok(http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap()).await;
+
+    // A deck made the way deck-html says: its base CSS and a theme.
+    let skill = decks["contents"]["skills"].as_array().unwrap().iter().find(|s| s["name"] == "deck-html").unwrap()["body"].as_str().unwrap();
+    let base = skill.split("```css\n").nth(1).unwrap().split("```").next().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(
+        work.path().join("deck.html"),
+        format!(
+            "<!doctype html><meta charset=utf-8><style>{base}:root{{--bg:#fff;--fg:#111;--accent:#c00;--muted:#666;--font-body:Inter,sans-serif;--font-display:P052,serif;--display-weight:700}}</style>\
+             <section class='slide title'><h1>One</h1></section><section class='slide'><h2>Two</h2><ul class=points><li>é ✓</li></ul></section>"
+        ),
+    )
+    .unwrap();
+    for (tool, out) in [("slides", "slides"), ("pdf", "deck.pdf"), ("pptx", "deck.pptx")] {
+        w.mock.push(Reply::ToolCalls(vec![(
+            "kit_run".into(),
+            json!({"kit": "decks-render", "tool": tool, "args": {"html": "deck.html", "out": out}}).to_string(),
+        )]));
+    }
+    w.mock.push(Reply::Text("Rendered.".into()));
+    ok(http
+        .post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": w.wid, "cwd": work.path(), "connection_id": w.conn.id, "model": "m", "prompt": "render", "realm": "decks"}))
+        .send()
+        .await
+        .unwrap())
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1800);
+    while w.mock.requests().len() < 4 {
+        assert!(tokio::time::Instant::now() < deadline, "timed out");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let seen = w.mock.requests().last().unwrap()["messages"].to_string();
+    for want in ["2 slides: /work/slides/slide-01.png", "printed /work/deck.pdf", "2 slides in /work/deck.pptx"] {
+        assert!(seen.contains(want), "{want} in {seen}");
+    }
+    let png = std::fs::read(work.path().join("slides/slide-02.png")).unwrap();
+    assert_eq!(&png[1..4], b"PNG");
+    assert!(std::fs::read(work.path().join("deck.pdf")).unwrap().starts_with(b"%PDF"));
+    assert!(std::fs::read(work.path().join("deck.pptx")).unwrap().starts_with(b"PK"));
+    w.stop().await;
+}
