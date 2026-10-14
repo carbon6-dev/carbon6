@@ -105,7 +105,7 @@ async fn apps_install_export_upgrade_remove() {
     assert_eq!(exp.contents.lists["views"][0]["name"], "people");
     assert_eq!(exp.contents.triggers[0].name.as_deref(), Some("new contact"));
     assert!(exp.contents.records.is_empty());
-    assert!(exp.needs.grants.iter().any(|g| g.from_realm == "home"));
+    assert!(exp.permissions.grants.iter().any(|g| g.from_realm == "home"));
     let with_data: AppPackage = send(M::GET, "apps/export?realm=crm&data=true", json!({})).await.json().await.unwrap();
     assert_eq!(with_data.contents.records["contacts"].len(), 2);
 

@@ -26,6 +26,7 @@ mod m4;
 mod memory;
 mod notify;
 mod outputs;
+mod packages;
 mod policies;
 mod prompts;
 mod push;

@@ -382,50 +382,58 @@ fn Realms() -> impl IntoView {
     }
 }
 
-/// Apps (docs/os.md §5): packages of configuration, each in a realm of its
-/// own; install, upgrade and remove wait for your decision.
+/// Packages (docs/packages.md): the local registry, and what is
+/// installed; installing, upgrading and removing wait for your decision.
 #[component]
 fn Apps() -> impl IntoView {
     let tick = RwSignal::new(0u32);
-    let apps = LocalResource::new(move || {
+    let registry = LocalResource::new(move || {
         tick.track();
-        crate::api::apps()
+        crate::api::packages()
+    });
+    let installed = LocalResource::new(move || {
+        tick.track();
+        crate::api::installs()
     });
     let text = RwSignal::new(String::new());
-    // The realm a pasted package upgrades (empty: a new install).
-    let target = RwSignal::new(String::new());
+    let realm = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let note = RwSignal::new(None::<String>);
-    let parsed =
-        move || serde_json::from_str::<serde_json::Value>(&text.get_untracked()).map_err(|e| format!("The package is not JSON: {e}"));
-    let plan = move |_| match parsed() {
+    let done = move |r: Result<String, String>| match r {
+        Ok(n) => {
+            error.set(None);
+            note.set(Some(n));
+            tick.update(|t| *t += 1);
+        }
         Err(e) => error.set(Some(e)),
-        Ok(p) => spawn_local(async move {
-            match crate::api::plan_app(p).await {
-                Ok(plan) => {
-                    error.set((!plan.problems.is_empty()).then(|| plan.problems.join("; ")));
-                    note.set(Some(plan.plan));
-                }
-                Err(e) => error.set(Some(e)),
-            }
-        }),
     };
-    let go = move |_| match parsed() {
-        Err(e) => error.set(Some(e)),
-        Ok(p) => spawn_local(async move {
-            let t = target.get_untracked();
-            let r = if t.is_empty() { crate::api::install_app(p).await } else { crate::api::upgrade_app(t, p).await };
-            match r {
-                Ok(i) => {
-                    error.set(None);
-                    note.set(Some(format!("Waiting for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
-                    text.set(String::new());
-                    target.set(String::new());
-                    tick.update(|t| *t += 1);
+    // A manifest, or {manifest, files}.
+    let parsed = move || -> Result<c6_api::PackageIn, String> {
+        let v: serde_json::Value = serde_json::from_str(&text.get_untracked()).map_err(|e| format!("The package is not JSON: {e}"))?;
+        if v.get("manifest").is_some() {
+            serde_json::from_value(v).map_err(|e| e.to_string())
+        } else {
+            Ok(c6_api::PackageIn { manifest: v, files: Default::default() })
+        }
+    };
+    let add = move |then_install: bool| {
+        let p = match parsed() {
+            Ok(p) => p,
+            Err(e) => return error.set(Some(e)),
+        };
+        spawn_local(async move {
+            let r = async {
+                let info = crate::api::add_package(p).await?;
+                text.set(String::new());
+                if !then_install {
+                    return Ok(format!("Added {} {} to the registry.", info.name, info.version));
                 }
-                Err(e) => error.set(Some(e)),
+                let i = crate::api::install_package(c6_api::InstallIn { package: info.name, version: info.version, realm: realm.get_untracked() }).await?;
+                Ok(format!("Installing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default()))
             }
-        }),
+            .await;
+            done(r);
+        });
     };
     let load = move |ev: leptos::ev::Event| {
         use wasm_bindgen::JsCast;
@@ -440,40 +448,70 @@ fn Apps() -> impl IntoView {
     };
     view! {
         <section class="space-y-3 pt-4">
-            <h2 class="font-medium">"Apps"</h2>
-            <p class="text-sm text-zinc-500">"An app is a package of configuration (collections, series, triggers, views, skills, templates and more), with no code, installed into a realm of its own. Installing, upgrading and removing each wait for your decision; an upgrade keeps your edits. Export turns any realm into a package you can install again or share."</p>
+            <h2 class="font-medium">"Packages"</h2>
+            <p class="text-sm text-zinc-500">"Everything you install is a package: an app (a realm of its own), a kit (software that workers build and run in a sandbox, with tools for agents), or a library (configuration added to a realm). Packages can require others; installing one asks you once for everything it and what it requires need. The registry below is local to this head."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || note.get().map(|n| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&n)></div> })}
-            {move || apps.get().and_then(Result::ok).map(|list| list.into_iter().map(|a| {
-                let (r1, r2, r3) = (a.realm.clone(), a.realm.clone(), a.realm.clone());
+            <h3 class="text-sm font-medium">"Installed"</h3>
+            {move || installed.get().and_then(Result::ok).map(|list| {
+                if list.is_empty() {
+                    return view! { <p class="text-sm text-zinc-500">"Nothing yet."</p> }.into_any();
+                }
+                let names: std::collections::HashMap<i64, String> = list.iter().map(|i| (i.id, i.package.clone())).collect();
+                list.into_iter().map(|i| {
+                    let (id1, id2) = (i.id, i.id);
+                    let is_app = i.roles.iter().any(|r| r == "app");
+                    let realm = i.realm.clone();
+                    let by: Vec<String> = i.required_by.iter().filter_map(|b| names.get(b).cloned()).collect();
+                    view! {
+                        <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
+                            <span class="font-medium">{i.package.clone()}</span>
+                            <span class="text-xs text-zinc-500">{format!("{} · {}{} · {}", i.version, i.roles.join(" and "), if i.realm.is_empty() { " for workers".to_owned() } else { format!(" in {}", i.realm) }, i.state)}</span>
+                            <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{(!by.is_empty()).then(|| format!("required by {}", by.join(", ")))}</span>
+                            {is_app.then(|| view! {
+                                <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&realm, false) download=format!("{realm}.json")>"Export"</a>
+                                <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&realm, true) download=format!("{realm}-with-data.json")>"Export with data"</a>
+                            })}
+                            <button class=format!("{BUTTON_QUIET} text-xs") title="To the newest version in the registry" on:click=move |_| spawn_local(async move {
+                                done(crate::api::upgrade_install(id1).await.map(|i| format!("Upgrading waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
+                            })>"Upgrade…"</button>
+                            <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| spawn_local(async move {
+                                done(crate::api::remove_install(id2).await.map(|i| format!("Removing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
+                            })>"Remove…"</button>
+                        </div>
+                    }
+                }).collect_view().into_any()
+            })}
+            <h3 class="text-sm font-medium">"Registry"</h3>
+            {move || registry.get().and_then(Result::ok).map(|list| list.into_iter().map(|p| {
+                let (name, version) = (p.name.clone(), p.version.clone());
+                let installed = !p.installed_in.is_empty();
                 view! {
-                    <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
-                        <span class="font-medium">{a.app.clone()}</span>
-                        <span class="text-xs text-zinc-500">{format!("{} · realm {} · {}", a.version, a.realm, a.state)}</span>
-                        <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{a.description.clone()}</span>
-                        <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&r1, false) download=format!("{r1}.json")>"Export"</a>
-                        <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&r1, true) download=format!("{r1}-with-data.json")>"Export with data"</a>
-                        <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| { target.set(r2.clone()); note.set(Some(format!("Paste or load the new version of the app in {r2}, then Upgrade."))); }>"Upgrade…"</button>
-                        <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
-                            let r = r3.clone();
-                            spawn_local(async move {
-                                match crate::api::remove_app(r).await {
-                                    Ok(i) => { note.set(Some(format!("Removing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default()))); tick.update(|t| *t += 1); }
-                                    Err(e) => error.set(Some(e)),
-                                }
-                            });
-                        }>"Remove…"</button>
+                    <div class="flex flex-wrap items-center gap-2 px-1 text-sm">
+                        <span class="font-mono">{format!("{} {}", p.name, p.version)}</span>
+                        <span class="rounded bg-zinc-100 px-1.5 text-xs dark:bg-zinc-800">{p.roles.join(", ")}</span>
+                        <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{p.description.clone()}</span>
+                        {(!p.requires.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("requires {}", p.requires.iter().map(|(n, r)| format!("{n} {r}")).collect::<Vec<_>>().join(", "))}</span> })}
+                        {(!installed).then(|| view! {
+                            <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                let (name, version) = (name.clone(), version.clone());
+                                spawn_local(async move {
+                                    done(crate::api::install_package(c6_api::InstallIn { package: name, version, realm: realm.get_untracked() }).await
+                                        .map(|i| format!("Installing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
+                                });
+                            }>"Install…"</button>
+                        })}
                     </div>
                 }
             }).collect_view())}
-            <textarea class=format!("{INPUT} min-h-32 font-mono text-xs") placeholder=r#"{"app": "crm", "version": "1.0.0", "contents": {"collections": [...], "views": [...]}}"#
+            <textarea class=format!("{INPUT} min-h-32 font-mono text-xs") placeholder=r#"{"package": "crm", "version": "1.0.0", "realm": "crm", "requires": {...}, "contents": {...}} — or {"manifest": {...}, "files": {"Dockerfile": "<base64>"}} for a kit"#
                 prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
             <div class="flex flex-wrap items-center gap-2">
                 <input type="file" accept=".json,application/json" class="text-xs" on:change=load />
                 <span class="flex-1"></span>
-                {move || (!target.get().is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("upgrading the app in {}", target.get())}</span> })}
-                <button class=BUTTON_QUIET on:click=plan>"Plan"</button>
-                <button class=BUTTON on:click=go>{move || if target.get().is_empty() { "Install…" } else { "Upgrade…" }}</button>
+                <input class=format!("{INPUT} w-40 py-1 text-sm") placeholder="realm (libraries)" prop:value=move || realm.get() on:input=move |ev| realm.set(event_target_value(&ev)) />
+                <button class=BUTTON_QUIET on:click=move |_| add(false)>"Add to registry"</button>
+                <button class=BUTTON on:click=move |_| add(true)>"Add and install…"</button>
             </div>
         </section>
     }

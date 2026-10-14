@@ -24,6 +24,7 @@ pub mod memex;
 pub mod memory;
 pub mod notify;
 pub mod oauth;
+pub mod packages;
 pub mod pki;
 pub mod prompts;
 pub mod push;

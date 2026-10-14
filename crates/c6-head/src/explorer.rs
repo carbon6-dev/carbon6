@@ -224,7 +224,7 @@ pub async fn summary(st: &HeadState, realm: &str) -> anyhow::Result<api::RealmSu
     } else {
         0.0
     } + 0.0;
-    let app = crate::apps::list(st).await?.into_iter().find(|a| a.realm == realm);
+    let app = crate::packages::apps(st).await?.into_iter().find(|a| a.realm == realm);
     let last_activity = entries.iter().filter_map(|e| e.changed_at).max();
     Ok(api::RealmSummary { realm: info, app, entries, health, spend_month, last_activity, knowledge: inventory.is_some() })
 }

@@ -1,15 +1,10 @@
-//! Apps (docs/os.md §5): packages of configuration (collections, series,
-//! triggers, views, skills, templates and the other settings lists, memory
-//! notes, and optionally records to start with), with no code.
-//!
-//! - **Install** shows you the plan as a decision, then creates the realm
-//!   and its contents, asks for the grants it needs, and tells you which
-//!   secrets to set.
-//! - **Upgrade** compares the installed version, your edits since, and the
-//!   new version: your edits are kept, and conflicts are yours to settle.
-//! - **Export** turns a realm's configuration (and, if asked, its records)
-//!   into a package. **Remove** deletes the realm and everything in it,
-//!   after your decision.
+//! The realm half of packages (docs/os.md §5, docs/packages.md): writing a
+//! package's configuration (collections, series, triggers, views, skills,
+//! templates and the other settings lists, memory notes, records to start
+//! with) into a realm, exporting a realm's configuration as a package,
+//! merging an upgrade three ways (the version installed, your edits since,
+//! the new version), and deleting a realm with everything in it. Installs,
+//! approvals and the registry are `packages`.
 //!
 //! Contents are written through the head's own API, so they are checked
 //! exactly as when you write them in Settings.
@@ -23,7 +18,7 @@ use sqlx::Row;
 use tracing::warn;
 
 use crate::realms::{COMMONS, HOME, ROOT};
-use crate::{HeadState, bad_request, not_found};
+use crate::{HeadState, bad_request};
 
 /// The settings lists an app may bring, and their API paths.
 pub const LISTS: [(&str, &str); 12] = [
@@ -41,30 +36,8 @@ pub const LISTS: [(&str, &str); 12] = [
     ("budgets", "budgets"),
 ];
 
-fn install_of(r: &sqlx::sqlite::SqliteRow) -> api::AppInstall {
-    api::AppInstall {
-        realm: r.get("realm"),
-        app: r.get("app"),
-        version: r.get("version"),
-        description: r.get("description"),
-        state: r.get("state"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
-        decision: r.get("decision"),
-    }
-}
-
-pub async fn list(st: &HeadState) -> anyhow::Result<Vec<api::AppInstall>> {
-    let rows = sqlx::query("SELECT * FROM apps ORDER BY app").fetch_all(&st.store.pool).await?;
-    Ok(rows.iter().map(install_of).collect())
-}
-
-async fn row(st: &HeadState, realm: &str) -> anyhow::Result<Option<sqlx::sqlite::SqliteRow>> {
-    Ok(sqlx::query("SELECT * FROM apps WHERE realm = ?").bind(realm).fetch_optional(&st.store.pool).await?)
-}
-
 /// A request the head makes to its own API, as you.
-async fn internal(st: &HeadState, method: &str, uri: &str, body: Option<&Value>) -> anyhow::Result<Value> {
+pub(crate) async fn internal(st: &HeadState, method: &str, uri: &str, body: Option<&Value>) -> anyhow::Result<Value> {
     use tower::ServiceExt;
     let router = st.assistant.router().ok_or_else(|| anyhow::anyhow!("the head is starting"))?;
     let mut req =
@@ -85,29 +58,32 @@ async fn internal(st: &HeadState, method: &str, uri: &str, body: Option<&Value>)
     Ok(v)
 }
 
-fn realm_of(p: &api::AppPackage) -> String {
-    if p.realm.trim().is_empty() { p.app.trim().to_owned() } else { p.realm.trim().to_owned() }
+/// An app's realm (packages are normalized so an app always names it).
+pub(crate) fn realm_of(p: &api::AppPackage) -> String {
+    p.realm.trim().to_owned()
 }
 
-fn check_package(p: &api::AppPackage) -> Vec<String> {
+pub(crate) fn check_package(p: &api::AppPackage) -> Vec<String> {
     let mut problems = Vec::new();
     let valid = |s: &str| !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if !valid(p.app.trim()) {
-        problems.push("an app's name is lowercase letters, digits and - (up to 32)".into());
+        problems.push("a package's name is lowercase letters, digits and - (up to 32)".into());
     }
     let realm = realm_of(p);
-    if [ROOT, HOME, COMMONS].contains(&realm.as_str()) {
+    if !realm.is_empty() && [ROOT, HOME, COMMONS].contains(&realm.as_str()) {
         problems.push(format!("an app gets a realm of its own, not {realm}"));
     }
     for key in p.contents.lists.keys() {
         if !LISTS.iter().any(|(k, _)| k == key) {
-            problems
-                .push(format!("{key:?} is not something an app can bring ({})", LISTS.iter().map(|l| l.0).collect::<Vec<_>>().join(", ")));
+            problems.push(format!(
+                "{key:?} is not something a package can bring ({})",
+                LISTS.iter().map(|l| l.0).collect::<Vec<_>>().join(", ")
+            ));
         }
     }
     for c in p.contents.records.keys() {
         if !p.contents.collections.iter().any(|x| &x.name == c) {
-            problems.push(format!("records for {c}, which the app does not define"));
+            problems.push(format!("records for {c}, which the package does not define"));
         }
     }
     problems
@@ -117,18 +93,10 @@ fn count(what: &str, n: usize) -> Option<String> {
     (n > 0).then(|| format!("{n} {what}"))
 }
 
-/// What installing a package would do.
-pub async fn plan_install(st: &HeadState, p: &api::AppPackage) -> anyhow::Result<api::AppPlan> {
-    let realm = realm_of(p);
-    let mut problems = check_package(p);
-    if crate::realms::exists(st, &realm).await? {
-        problems.push(format!("realm {realm} already exists (upgrade the app installed there, or give the package another realm)"));
-    }
+/// What installing a package's realm half creates, in lines of Markdown.
+pub(crate) fn contents_lines(p: &api::AppPackage) -> Vec<String> {
     let c = &p.contents;
-    let mut lines = vec![format!("Install **{}** {} into a new realm **{realm}**.", p.app, p.version), String::new()];
-    if !p.description.is_empty() {
-        lines.splice(1..1, [String::new(), p.description.clone()]);
-    }
+    let mut lines = Vec::new();
     let mut what: Vec<String> = [
         count("collections", c.collections.len()),
         count("series", c.series.len()),
@@ -140,7 +108,10 @@ pub async fn plan_install(st: &HeadState, p: &api::AppPackage) -> anyhow::Result
     .flatten()
     .collect();
     what.extend(c.lists.iter().filter_map(|(k, v)| count(k, v.len())));
-    lines.push(format!("It creates: {}.", if what.is_empty() { "nothing".to_owned() } else { what.join(", ") }));
+    if what.is_empty() {
+        return lines;
+    }
+    lines.push(format!("It creates: {}.", what.join(", ")));
     for (title, items) in [
         ("Collections", c.collections.iter().map(|x| x.name.clone()).collect::<Vec<_>>()),
         ("Triggers", c.triggers.iter().map(|t| t.name.clone().unwrap_or_default()).collect()),
@@ -153,140 +124,48 @@ pub async fn plan_install(st: &HeadState, p: &api::AppPackage) -> anyhow::Result
         let names: Vec<String> = v.iter().map(|e| e["name"].as_str().unwrap_or("?").to_owned()).collect();
         lines.push(format!("- {k}: {}", names.join(", ")));
     }
-    if !p.needs.secrets.is_empty() {
-        lines.push(format!(
-            "\nIt needs these secrets, which you set afterwards (Settings → Secrets, in realm {realm}): {}.",
-            p.needs.secrets.join(", ")
-        ));
-    }
-    if p.needs.workers == "dedicated" {
-        lines.push(format!("\nIt wants a worker of its own: dedicate one to realm {realm} under Settings → System → Realms."));
-    }
-    for g in &p.needs.grants {
-        lines.push(format!(
-            "\nIt asks for a grant: {} {} of realm {} ({}), which comes to you as a decision of its own.",
-            g.mode, g.kind, g.from_realm, g.scope
-        ));
-    }
-    Ok(api::AppPlan { realm, plan: lines.join("\n"), problems, conflicts: Vec::new() })
+    lines
 }
 
-/// Asks to install a package: the plan waits as a decision.
-pub async fn install(st: &HeadState, p: &api::AppPackage) -> anyhow::Result<api::AppInstall> {
-    let plan = plan_install(st, p).await?;
-    if !plan.problems.is_empty() {
-        return Err(bad_request(plan.problems.join("; ")));
-    }
-    if row(st, &plan.realm).await?.is_some() {
-        return Err(bad_request(format!("an app is already being installed into {}", plan.realm)));
-    }
-    let now = now_ms();
-    sqlx::query("INSERT INTO apps (realm, app, version, description, state, pending, created_at, updated_at) VALUES (?, ?, ?, ?, 'installing', ?, ?, ?)")
-        .bind(&plan.realm)
-        .bind(p.app.trim())
-        .bind(&p.version)
-        .bind(&p.description)
-        .bind(serde_json::to_string(p)?)
-        .bind(now)
-        .bind(now)
-        .execute(&st.store.pool)
-        .await?;
-    ask(st, &plan.realm, "install", &format!("Install the app {}?", p.app), &plan.plan, &["Install", "Cancel"]).await
-}
-
-async fn ask(st: &HeadState, realm: &str, what: &str, title: &str, document: &str, options: &[&str]) -> anyhow::Result<api::AppInstall> {
-    let d = api::DecisionIn {
-        kind: "approve".into(),
-        title: title.to_owned(),
-        document: document.to_owned(),
-        options: options.iter().map(|o| api::DecisionOption { label: (*o).to_owned(), does: String::new() }).collect(),
-        priority: "normal".into(),
-        source: "apps".into(),
-        context: json!({"app_realm": realm, "what": what}),
-        ..Default::default()
-    };
-    let d = crate::decisions::open(st, &d, ROOT, &format!("app:{what}:{realm}")).await?;
-    sqlx::query("UPDATE apps SET decision = ?, updated_at = ? WHERE realm = ?")
-        .bind(d.id)
-        .bind(now_ms())
-        .bind(realm)
-        .execute(&st.store.pool)
-        .await?;
-    Ok(install_of(&row(st, realm).await?.ok_or_else(|| anyhow::anyhow!("app gone"))?))
-}
-
-/// Your answer to an install, upgrade or removal.
-pub async fn answer(st: &HeadState, what: &str, realm: &str, option: Option<&str>) -> anyhow::Result<()> {
-    let r = row(st, realm).await?.ok_or_else(|| not_found(format!("no app in {realm}")))?;
-    let pending: Option<api::AppPackage> = r.get::<Option<String>, _>("pending").and_then(|p| serde_json::from_str(&p).ok());
-    let go = matches!(option, Some("Install" | "Upgrade, keeping my edits" | "Upgrade, taking the new version" | "Remove"));
-    if !go {
-        // Cancelled: an install that never happened leaves nothing.
-        if what == "install" {
-            sqlx::query("DELETE FROM apps WHERE realm = ?").bind(realm).execute(&st.store.pool).await?;
-        } else {
-            sqlx::query("UPDATE apps SET state = 'installed', pending = NULL, decision = NULL, updated_at = ? WHERE realm = ?")
-                .bind(now_ms())
-                .bind(realm)
-                .execute(&st.store.pool)
-                .await?;
-        }
-        return Ok(());
-    }
-    match what {
-        "install" => {
-            let p = pending.ok_or_else(|| anyhow::anyhow!("the package is gone"))?;
-            apply_install(st, realm, &p).await?;
-            finished(st, realm, &p).await?;
-            next_steps(st, realm, &p).await;
-        }
-        "upgrade" => {
-            let p = pending.ok_or_else(|| anyhow::anyhow!("the package is gone"))?;
-            let base: api::AppPackage = serde_json::from_str(&r.get::<String, _>("installed")).unwrap_or_default();
-            apply_upgrade(st, realm, &base, &p, option == Some("Upgrade, taking the new version")).await?;
-            finished(st, realm, &p).await?;
-        }
-        "remove" => remove_now(st, realm).await?,
-        _ => {}
-    }
-    Ok(())
-}
-
-async fn finished(st: &HeadState, realm: &str, p: &api::AppPackage) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE apps SET state = 'installed', installed = ?, pending = NULL, decision = NULL, version = ?, description = ?, updated_at = ? WHERE realm = ?",
-    )
-    .bind(serde_json::to_string(p)?)
-    .bind(&p.version)
-    .bind(&p.description)
-    .bind(now_ms())
-    .bind(realm)
-    .execute(&st.store.pool)
-    .await?;
-    sqlx::query("UPDATE realms SET app = ? WHERE id = ?").bind(p.app.trim()).bind(realm).execute(&st.store.pool).await?;
-    st.registry.bump();
-    Ok(())
-}
-
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     s.bytes()
         .map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect()
 }
 
-async fn apply_install(st: &HeadState, realm: &str, p: &api::AppPackage) -> anyhow::Result<()> {
-    let r = api::RealmIn { id: realm.to_owned(), name: p.app.clone(), description: p.description.clone(), reads_commons: None };
-    crate::realms::create(st, &r, &format!("app:{}", p.app)).await?;
+/// Writes a package's configuration into a realm: an app's new realm
+/// (made here), or the realm a library is added to (where its list entries
+/// join what is there).
+pub(crate) async fn apply_contents(st: &HeadState, realm: &str, p: &api::AppPackage, new_realm: bool) -> anyhow::Result<()> {
+    if new_realm && !crate::realms::exists(st, realm).await? {
+        let r = api::RealmIn { id: realm.to_owned(), name: p.app.clone(), description: p.description.clone(), reads_commons: None };
+        crate::realms::create(st, &r, &format!("app:{}", p.app)).await?;
+    }
     let c = &p.contents;
     let q = format!("?realm={}", enc(realm));
     for col in &c.collections {
-        internal(st, "POST", &format!("/api/v1/collections{q}"), Some(&json!(col))).await?;
+        if new_realm || crate::collections::get(st, realm, &col.name).await.is_err() {
+            internal(st, "POST", &format!("/api/v1/collections{q}"), Some(&json!(col))).await?;
+        }
     }
     for s in &c.series {
-        internal(st, "POST", &format!("/api/v1/series{q}"), Some(&json!(s))).await?;
+        if new_realm || crate::series::get(st, realm, &s.name).await.is_err() {
+            internal(st, "POST", &format!("/api/v1/series{q}"), Some(&json!(s))).await?;
+        }
     }
     for (key, entries) in &c.lists {
-        write_list(st, realm, key, entries.clone()).await?;
+        // The realm's own entries, with the package's added (or replacing
+        // ones of the same identity).
+        let mut all = if new_realm { Vec::new() } else { crate::lists::read(&st.store.pool, key, realm).await? };
+        let l = crate::lists::list(key);
+        for e in entries {
+            let id = l.map(|l| crate::lists::identity(l, e));
+            match all.iter().position(|x| l.map(|l| crate::lists::identity(l, x)) == id) {
+                Some(i) => all[i] = e.clone(),
+                None => all.push(e.clone()),
+            }
+        }
+        write_list(st, realm, key, all).await?;
     }
     for t in &c.triggers {
         crate::triggers::create(st, t.clone(), realm).await?;
@@ -308,7 +187,7 @@ async fn apply_install(st: &HeadState, realm: &str, p: &api::AppPackage) -> anyh
 }
 
 /// Replaces a realm's own entries of a list, through Settings.
-async fn write_list(st: &HeadState, realm: &str, key: &str, entries: Vec<Value>) -> anyhow::Result<()> {
+pub(crate) async fn write_list(st: &HeadState, realm: &str, key: &str, entries: Vec<Value>) -> anyhow::Result<()> {
     let path =
         LISTS.iter().find(|(k, _)| *k == key).map(|l| l.1).ok_or_else(|| bad_request(format!("{key} is not a list an app brings")))?;
     internal(st, "PUT", &format!("/api/v1/settings/{path}?realm={}", enc(realm)), Some(&Value::Array(entries))).await?;
@@ -317,8 +196,8 @@ async fn write_list(st: &HeadState, realm: &str, key: &str, entries: Vec<Value>)
 
 /// After installing: the grants it needs (asked as decisions), and what is
 /// left for you (secrets, a worker of its own), as a follow-up.
-async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage) {
-    for g in &p.needs.grants {
+pub(crate) async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage) {
+    for g in &p.permissions.grants {
         let gi = api::GrantIn {
             from_realm: g.from_realm.clone(),
             to_realm: realm.to_owned(),
@@ -334,7 +213,7 @@ async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage) {
     }
     let have: Vec<String> =
         sqlx::query_scalar("SELECT name FROM secrets WHERE realm = ?").bind(realm).fetch_all(&st.store.pool).await.unwrap_or_default();
-    let missing: Vec<&String> = p.needs.secrets.iter().filter(|s| !have.contains(s)).collect();
+    let missing: Vec<&String> = p.permissions.secrets.iter().filter(|s| !have.contains(s)).collect();
     let mut todo = Vec::new();
     if !missing.is_empty() {
         todo.push(format!(
@@ -342,7 +221,7 @@ async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage) {
             missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         ));
     }
-    if p.needs.workers == "dedicated" {
+    if p.permissions.workers == "dedicated" {
         todo.push(format!("- Dedicate a worker to realm **{realm}** (Settings → System → Realms)."));
     }
     if p.contents.triggers.iter().any(|t| t.trigger.as_deref() == Some("webhook")) {
@@ -368,12 +247,14 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
     if !crate::realms::exists(st, realm).await? || realm == ROOT {
         return Err(bad_request(format!("no realm {realm:?} to export")));
     }
-    let installed = row(st, realm).await?;
+    let installed = crate::packages::app_in(st, realm).await?;
     let mut p = api::AppPackage {
-        app: installed.as_ref().map(|r| r.get::<String, _>("app")).unwrap_or_else(|| realm.to_owned()),
-        version: installed.as_ref().map(|r| r.get::<String, _>("version")).unwrap_or_default(),
-        description: installed.as_ref().map(|r| r.get::<String, _>("description")).unwrap_or_default(),
+        app: installed.as_ref().map(|(i, _)| i.package.clone()).unwrap_or_else(|| realm.to_owned()),
+        version: installed.as_ref().map(|(i, _)| i.version.clone()).unwrap_or_default(),
+        description: installed.as_ref().map(|(_, m)| m.description.clone()).unwrap_or_default(),
         realm: realm.to_owned(),
+        requires: installed.as_ref().map(|(_, m)| m.requires.clone()).unwrap_or_default(),
+        exports: installed.as_ref().map(|(_, m)| m.exports.clone()).unwrap_or_default(),
         ..Default::default()
     };
     for c in crate::collections::list(st, realm).await?.into_iter().filter(|c| !c.system) {
@@ -430,16 +311,16 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
     for m in crate::memory::list(st, &crate::realms::Caller::in_realm(realm)).await? {
         p.contents.memory.push(json!({"scope": m.scope, "text": m.text}));
     }
-    p.needs.secrets =
+    p.permissions.secrets =
         sqlx::query_scalar("SELECT name FROM secrets WHERE realm = ? ORDER BY name").bind(realm).fetch_all(&st.store.pool).await?;
-    p.needs.grants = crate::grants::list(st, Some(realm))
+    p.permissions.grants = crate::grants::list(st, Some(realm))
         .await?
         .into_iter()
         .filter(|g| g.to_realm == realm && matches!(g.state.as_str(), "active" | "requested"))
         .map(|g| api::AppGrant { from_realm: g.from_realm, kind: g.kind, mode: g.mode, scope: g.scope, note: g.note })
         .collect();
     let workers = crate::api::workers_snapshot(st).await.unwrap_or_default();
-    p.needs.workers = if workers.iter().any(|w| w.realms == [realm.to_owned()]) { "dedicated".into() } else { "any".into() };
+    p.permissions.workers = if workers.iter().any(|w| w.realms == [realm.to_owned()]) { "dedicated".into() } else { "any".into() };
     Ok(p)
 }
 
@@ -559,19 +440,19 @@ fn diff(base: &api::AppPackage, mine: &api::AppPackage, theirs: &api::AppPackage
     d
 }
 
-pub async fn plan_upgrade(st: &HeadState, realm: &str, p: &api::AppPackage) -> anyhow::Result<api::AppPlan> {
-    let r = row(st, realm).await?.ok_or_else(|| not_found(format!("no app installed in {realm}")))?;
-    let mut problems = check_package(&api::AppPackage { realm: realm.to_owned(), ..p.clone() });
-    if r.get::<String, _>("app") != p.app.trim() {
-        problems.push(format!("realm {realm} has the app {}, not {}", r.get::<String, _>("app"), p.app));
-    }
-    let base: api::AppPackage = serde_json::from_str(&r.get::<String, _>("installed")).unwrap_or_default();
+/// What an upgrade changes in a realm, and what both you and the new
+/// version changed: lines of Markdown, and the conflicts' names.
+pub(crate) async fn upgrade_lines(
+    st: &HeadState,
+    realm: &str,
+    base: &api::AppPackage,
+    p: &api::AppPackage,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mine = export(st, realm, false).await?;
-    let d = diff(&base, &mine, p);
+    let d = diff(base, &mine, p);
     let describe =
         |(k, v): &((String, String), Option<Value>)| format!("- {} {}", if v.is_some() { "update" } else { "remove" }, name_of(&k.0, &k.1));
-    let mut lines =
-        vec![format!("Upgrade **{}** in realm **{realm}** from {} to {}.", p.app, r.get::<String, _>("version"), p.version), String::new()];
+    let mut lines = Vec::new();
     if d.apply.is_empty() {
         lines.push("Nothing of yours changes.".into());
     } else {
@@ -582,35 +463,16 @@ pub async fn plan_upgrade(st: &HeadState, realm: &str, p: &api::AppPackage) -> a
         lines.push("\nYou and the new version both changed these; by default yours are kept:".into());
         lines.extend(d.conflicts.iter().map(describe));
     }
-    Ok(api::AppPlan {
-        realm: realm.to_owned(),
-        plan: lines.join("\n"),
-        problems,
-        conflicts: d.conflicts.iter().map(|(k, _)| name_of(&k.0, &k.1)).collect(),
-    })
+    Ok((lines, d.conflicts.iter().map(|(k, _)| name_of(&k.0, &k.1)).collect()))
 }
 
-/// Asks to upgrade the app in `realm` to a new version.
-pub async fn upgrade(st: &HeadState, realm: &str, p: &api::AppPackage) -> anyhow::Result<api::AppInstall> {
-    let plan = plan_upgrade(st, realm, p).await?;
-    if !plan.problems.is_empty() {
-        return Err(bad_request(plan.problems.join("; ")));
-    }
-    sqlx::query("UPDATE apps SET state = 'upgrading', pending = ?, updated_at = ? WHERE realm = ? AND state = 'installed'")
-        .bind(serde_json::to_string(p)?)
-        .bind(now_ms())
-        .bind(realm)
-        .execute(&st.store.pool)
-        .await?;
-    let options: &[&str] = if plan.conflicts.is_empty() {
-        &["Upgrade, keeping my edits", "Cancel"]
-    } else {
-        &["Upgrade, keeping my edits", "Upgrade, taking the new version", "Cancel"]
-    };
-    ask(st, realm, "upgrade", &format!("Upgrade {} to {}?", p.app, p.version), &plan.plan, options).await
-}
-
-async fn apply_upgrade(st: &HeadState, realm: &str, base: &api::AppPackage, p: &api::AppPackage, take_theirs: bool) -> anyhow::Result<()> {
+pub(crate) async fn apply_upgrade(
+    st: &HeadState,
+    realm: &str,
+    base: &api::AppPackage,
+    p: &api::AppPackage,
+    take_theirs: bool,
+) -> anyhow::Result<()> {
     let mine = export(st, realm, false).await?;
     let d = diff(base, &mine, p);
     let changes: Vec<_> = d.apply.into_iter().chain(if take_theirs { d.conflicts } else { Vec::new() }).collect();
@@ -683,24 +545,9 @@ async fn apply_upgrade(st: &HeadState, realm: &str, base: &api::AppPackage, p: &
     Ok(())
 }
 
-/// Asks to remove the app in `realm`, with everything in the realm.
-pub async fn remove(st: &HeadState, realm: &str) -> anyhow::Result<api::AppInstall> {
-    let r = row(st, realm).await?.ok_or_else(|| not_found(format!("no app installed in {realm}")))?;
-    let doc = format!(
-        "Removing **{}** deletes realm **{realm}** and everything in it: its sessions and their history, collections and records, series, \
-         triggers, views and other settings, decisions, secrets, memory notes and knowledge. Its grants end. Model usage stays in the usage \
-         ledger. This cannot be undone.\n\nExport it first (Settings → System → Apps → Export, with data) to keep a copy you can install again.",
-        r.get::<String, _>("app")
-    );
-    sqlx::query("UPDATE apps SET state = 'removing', updated_at = ? WHERE realm = ?")
-        .bind(now_ms())
-        .bind(realm)
-        .execute(&st.store.pool)
-        .await?;
-    ask(st, realm, "remove", &format!("Remove the app {} and its realm?", r.get::<String, _>("app")), &doc, &["Remove", "Cancel"]).await
-}
-
-async fn remove_now(st: &HeadState, realm: &str) -> anyhow::Result<()> {
+/// Deletes a realm and everything in it (an app's removal, once you
+/// decided).
+pub(crate) async fn remove_now(st: &HeadState, realm: &str) -> anyhow::Result<()> {
     let running: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE realm = ? AND status IN ('starting', 'running')")
         .bind(realm)
         .fetch_one(&st.store.pool)
@@ -729,7 +576,6 @@ async fn remove_now(st: &HeadState, realm: &str) -> anyhow::Result<()> {
         "DELETE FROM series WHERE realm = ?".into(),
         "DELETE FROM secrets WHERE realm = ?".into(),
         "DELETE FROM api_tokens WHERE realm = ?".into(),
-        "DELETE FROM apps WHERE realm = ?".into(),
         "DELETE FROM realms WHERE id = ?".into(),
     ] {
         sqlx::query(sqlx::AssertSqlSafe(sql)).bind(realm).execute(&mut *tx).await?;

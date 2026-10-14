@@ -324,8 +324,8 @@ async fn act(
                 }
             }
         }
-        (Some("app"), Some(what), Some(realm)) => {
-            crate::apps::answer(st, what, realm, option).await?;
+        (Some("app" | "package"), Some(_), Some(_)) => {
+            crate::packages::answer(st, reference, option).await?;
         }
         (Some("publish"), _, _) => {
             crate::commons::answer(st, d, option == Some("Publish")).await?;

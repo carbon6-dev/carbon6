@@ -180,24 +180,28 @@ pub async fn realm_object(realm: String, kind: String, id: String) -> Result<c6_
     json(Request::get(&format!("/api/v1/realms/{}/object?kind={}&id={}", enc(&realm), enc(&kind), enc(&id))).send().await).await
 }
 
-pub async fn apps() -> Result<Vec<c6_api::AppInstall>, String> {
-    json(Request::get("/api/v1/apps").send().await).await
+pub async fn packages() -> Result<Vec<c6_api::PackageInfo>, String> {
+    json(Request::get("/api/v1/packages").send().await).await
 }
 
-pub async fn plan_app(p: serde_json::Value) -> Result<c6_api::AppPlan, String> {
-    send_json(Request::post("/api/v1/apps/plan"), &p).await
+pub async fn add_package(p: c6_api::PackageIn) -> Result<c6_api::PackageInfo, String> {
+    send_json(Request::post("/api/v1/packages"), &p).await
 }
 
-pub async fn install_app(p: serde_json::Value) -> Result<c6_api::AppInstall, String> {
-    send_json(Request::post("/api/v1/apps"), &p).await
+pub async fn installs() -> Result<Vec<c6_api::Install>, String> {
+    json(Request::get("/api/v1/installs").send().await).await
 }
 
-pub async fn upgrade_app(realm: String, p: serde_json::Value) -> Result<c6_api::AppInstall, String> {
-    send_json(Request::post(&format!("/api/v1/apps/{}/upgrade", enc(&realm))), &p).await
+pub async fn install_package(i: c6_api::InstallIn) -> Result<c6_api::Install, String> {
+    send_json(Request::post("/api/v1/installs"), &i).await
 }
 
-pub async fn remove_app(realm: String) -> Result<c6_api::AppInstall, String> {
-    json(Request::delete(&format!("/api/v1/apps/{}", enc(&realm))).send().await).await
+pub async fn upgrade_install(id: i64) -> Result<c6_api::Install, String> {
+    send_json(Request::post(&format!("/api/v1/installs/{id}/upgrade")), &serde_json::json!({})).await
+}
+
+pub async fn remove_install(id: i64) -> Result<c6_api::Install, String> {
+    json(Request::delete(&format!("/api/v1/installs/{id}")).send().await).await
 }
 
 /// Where a realm's package downloads from.

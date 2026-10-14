@@ -127,6 +127,13 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
             after: "SELECT count(*) FROM decisions WHERE state = 'answered'",
         },
         c6_core::upgrade::Check {
+            version: 39,
+            name: "every installed app is a package and an install of it, in its realm",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(app || '@' || version || ' in ' || realm || ' ' || state, '|'), '') FROM (SELECT * FROM before.apps ORDER BY realm)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(i.package || '@' || i.version || ' in ' || i.realm || ' ' || i.state, '|'), '') \
+                    FROM (SELECT * FROM installs ORDER BY realm) i JOIN packages p ON p.digest = i.digest",
+        },
+        c6_core::upgrade::Check {
             version: 36,
             name: "each host's latest check is a point of host_up and host_check_ms",
             before: "SELECT count(*) || ':' || coalesce(group_concat(name || '=' || ok || '/' || latency_ms || '@' || at, '|'), '') FROM (SELECT * FROM before.host_checks ORDER BY name)",
@@ -168,6 +175,8 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
         c6_core::upgrade::Allow { version: 30, table: "settings" },
         // Memory notes moved into records (kept as legacy_memories).
         c6_core::upgrade::Allow { version: 30, table: "memories" },
+        // Apps became packages and installs.
+        c6_core::upgrade::Allow { version: 39, table: "apps" },
         // Automations became triggers (the same tables, renamed).
         c6_core::upgrade::Allow { version: 35, table: "automations" },
         c6_core::upgrade::Allow { version: 35, table: "automation_runs" },
@@ -203,6 +212,7 @@ impl Store {
         let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
         crate::lists::ensure(&pool).await?;
         crate::prompts::seed(&pool).await?;
+        crate::packages::fix_legacy(&pool).await?;
         Ok((Self { pool }, report))
     }
 

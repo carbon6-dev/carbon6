@@ -150,6 +150,13 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/realms/{id}/object", get(realm_object))
         .route("/api/v1/realms/{id}/search", get(realm_search))
         .route("/api/v1/realms/{id}/neighborhood", get(realm_neighborhood))
+        .route("/api/v1/packages", get(list_packages).post(add_package))
+        .route("/api/v1/packages/{name}/{version}", get(get_package).delete(delete_package))
+        .route("/api/v1/packages/{name}/{version}/files/{*path}", get(package_file))
+        .route("/api/v1/installs", get(list_installs).post(add_install))
+        .route("/api/v1/installs/plan", post(plan_install))
+        .route("/api/v1/installs/{id}/upgrade", post(upgrade_install))
+        .route("/api/v1/installs/{id}", axum::routing::delete(remove_install))
         .route("/api/v1/apps", get(list_apps).post(install_app))
         .route("/api/v1/apps/plan", post(plan_app))
         .route("/api/v1/apps/export", get(export_app))
@@ -2335,27 +2342,86 @@ async fn realm_neighborhood(
 // --- Apps (docs/os.md §5) ----------------------------------------------------
 
 async fn list_apps(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::AppInstall>>> {
-    Ok(Json(crate::apps::list(&st).await?))
+    Ok(Json(crate::packages::apps(&st).await?))
 }
 
-async fn plan_app(State(st): State<Arc<HeadState>>, Json(p): Json<api::AppPackage>) -> ApiResult<Json<api::AppPlan>> {
-    Ok(Json(crate::apps::plan_install(&st, &p).await?))
+async fn plan_app(State(st): State<Arc<HeadState>>, Json(p): Json<serde_json::Value>) -> ApiResult<Json<api::AppPlan>> {
+    Ok(Json(crate::packages::plan_manifest(&st, p).await?))
 }
 
-async fn install_app(State(st): State<Arc<HeadState>>, Json(p): Json<api::AppPackage>) -> ApiResult<Json<api::AppInstall>> {
-    Ok(Json(crate::apps::install(&st, &p).await?))
+async fn install_app(State(st): State<Arc<HeadState>>, Json(p): Json<serde_json::Value>) -> ApiResult<Json<api::AppInstall>> {
+    Ok(Json(crate::packages::install_manifest(&st, p).await?))
 }
 
 async fn upgrade_app(
     State(st): State<Arc<HeadState>>,
     Path(realm): Path<String>,
-    Json(p): Json<api::AppPackage>,
+    Json(p): Json<serde_json::Value>,
 ) -> ApiResult<Json<api::AppInstall>> {
-    Ok(Json(crate::apps::upgrade(&st, &realm, &p).await?))
+    Ok(Json(crate::packages::upgrade_manifest(&st, &realm, p).await?))
 }
 
 async fn remove_app(State(st): State<Arc<HeadState>>, Path(realm): Path<String>) -> ApiResult<Json<api::AppInstall>> {
-    Ok(Json(crate::apps::remove(&st, &realm).await?))
+    Ok(Json(crate::packages::remove_app(&st, &realm).await?))
+}
+
+// --- Packages (docs/packages.md) ---------------------------------------------
+
+async fn list_packages(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::PackageInfo>>> {
+    Ok(Json(crate::packages::list(&st).await?))
+}
+
+async fn add_package(State(st): State<Arc<HeadState>>, Json(p): Json<api::PackageIn>) -> ApiResult<Json<api::PackageInfo>> {
+    Ok(Json(crate::packages::add_in(&st, p).await?))
+}
+
+async fn get_package(
+    State(st): State<Arc<HeadState>>,
+    Path((name, version)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (manifest, info) = crate::packages::get(&st, &name, &version).await?;
+    Ok(Json(serde_json::json!({"manifest": manifest, "info": info})))
+}
+
+async fn package_file(
+    State(st): State<Arc<HeadState>>,
+    Path((name, version, path)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    let (_, info) = crate::packages::get(&st, &name, &version).await?;
+    let data = crate::packages::file(&st, &info.digest, &path).await?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response())
+}
+
+async fn delete_package(State(st): State<Arc<HeadState>>, Path((name, version)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    crate::packages::delete(&st, &name, &version).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_installs(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Install>>> {
+    Ok(Json(crate::packages::installs(&st).await?))
+}
+
+async fn plan_install(State(st): State<Arc<HeadState>>, Json(i): Json<api::InstallIn>) -> ApiResult<Json<api::AppPlan>> {
+    Ok(Json(crate::packages::plan(&st, &i).await?))
+}
+
+async fn add_install(State(st): State<Arc<HeadState>>, Json(i): Json<api::InstallIn>) -> ApiResult<Json<api::Install>> {
+    Ok(Json(crate::packages::install(&st, &i).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct UpgradeIn {
+    /// A version range; default: the newest.
+    #[serde(default)]
+    version: String,
+}
+
+async fn upgrade_install(State(st): State<Arc<HeadState>>, Path(id): Path<i64>, Json(u): Json<UpgradeIn>) -> ApiResult<Json<api::Install>> {
+    Ok(Json(crate::packages::upgrade(&st, id, &u.version).await?))
+}
+
+async fn remove_install(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Install>> {
+    Ok(Json(crate::packages::remove(&st, id).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]

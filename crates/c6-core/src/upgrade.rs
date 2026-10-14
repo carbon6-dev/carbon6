@@ -343,6 +343,19 @@ async fn run_checks(pool: &SqlitePool, backup: &Path, plan: &Plan, pending: &[i6
     let mut out = Vec::new();
     let mut failure = None;
     for c in due {
+        // A table the old database didn't have held nothing to move: the
+        // check has nothing to compare.
+        if let Err(e) = scalar(&mut conn, c.before).await
+            && e.to_string().contains("no such table: before.")
+        {
+            out.push(CheckResult {
+                name: c.name.to_owned(),
+                ok: true,
+                before: "(not in the old database)".into(),
+                after: "(nothing to check)".into(),
+            });
+            continue;
+        }
         let result = async {
             let b = scalar(&mut conn, c.before).await.with_context(|| format!("check {} (before)", c.name))?;
             let a = scalar(&mut conn, c.after).await.with_context(|| format!("check {} (after)", c.name))?;
@@ -583,6 +596,23 @@ mod tests {
             vec![CheckResult { name: "every note moved".into(), before: "a,b,c".into(), after: "a,b,c".into(), ok: true }]
         );
         assert!(r.tables.contains(&TableCount { table: "notes".into(), before: 3, after: None }));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_check_on_a_table_the_old_database_lacked_does_not_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = at_v1(dir.path()).await;
+        let m = migrator(dir.path(), &[V1, (2, "new", "CREATE TABLE extra (x TEXT);")]).await;
+        static CHECK: [Check; 1] = [Check {
+            version: 2,
+            name: "extras kept",
+            before: "SELECT count(*) FROM before.extras_v0",
+            after: "SELECT count(*) FROM extra",
+        }];
+        let (pool, report) = open_db(&path, &m, &Plan { checks: &CHECK, allow: &[] }).await.unwrap();
+        let r = report.unwrap();
+        assert!(r.checks[0].ok && r.checks[0].before.contains("not in the old database"), "{:?}", r.checks);
         pool.close().await;
     }
 

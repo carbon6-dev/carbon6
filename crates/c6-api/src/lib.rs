@@ -379,28 +379,264 @@ pub struct ExObject {
     pub data: serde_json::Value,
 }
 
-/// An app (docs/os.md §5): a package of configuration, with no code,
-/// installed into a realm of its own.
+/// A package (docs/packages.md): an app (with a realm and its
+/// configuration), a kit (software to build and the tools it offers), a
+/// library (configuration added to the realms that require it), or more
+/// than one. Written as `package` (or `app`, as packages were first written).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppPackage {
     /// Its name (lowercase letters, digits and -).
+    #[serde(rename = "package", alias = "app")]
     pub app: String,
+    /// A semantic version (1.2.3).
     #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub description: String,
-    /// The realm it installs into; default: its name.
-    #[serde(default)]
+    /// An app's realm (an app written with `app` gets its name); none: not
+    /// an app.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub realm: String,
+    /// Other packages it needs: name → version range (^1.2, ~1.2, >=1.0,
+    /// 1.2.3, *).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub requires: std::collections::BTreeMap<String, String>,
+    /// Everything it asks for, approved when it is installed.
     #[serde(default)]
+    pub permissions: Permissions,
+    /// The old name of the realm half of `permissions` (read, not written).
+    #[serde(default, skip_serializing_if = "AppNeeds::is_empty")]
     pub needs: AppNeeds,
-    #[serde(default)]
+    /// An app's or a library's configuration.
+    #[serde(default, skip_serializing_if = "AppContents::is_empty")]
     pub contents: AppContents,
+    /// What an app offers to apps that require it.
+    #[serde(default, skip_serializing_if = "Exports::is_empty")]
+    pub exports: Exports,
+    /// A kit's environment and tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit: Option<KitPart>,
 }
 
-/// What an app needs from you: secrets to set, a worker of its own, and
-/// grants from other realms (each asked as a decision).
+/// What a package asks for. For a realm: secrets to set, a worker of its
+/// own, grants from other realms. For a kit's runs: files, network, CPU,
+/// memory, time, and a shell.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Permissions {
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// "any" (default) or "dedicated".
+    #[serde(default)]
+    pub workers: String,
+    #[serde(default)]
+    pub grants: Vec<AppGrant>,
+    /// Kit runs: "session" (the session's folder, read-write; default) or
+    /// "session-ro".
+    #[serde(default = "files_default")]
+    pub files: String,
+    /// Kit runs: "none" (default) or "any".
+    #[serde(default = "network_default")]
+    pub network: String,
+    #[serde(default = "cpus_default")]
+    pub cpus: f64,
+    #[serde(default = "memory_default")]
+    pub memory_mb: u64,
+    #[serde(default = "timeout_default")]
+    pub timeout_s: u64,
+    /// Whether agents may run any command in the kit.
+    #[serde(default)]
+    pub shell: bool,
+}
+
+fn files_default() -> String {
+    "session".into()
+}
+fn network_default() -> String {
+    "none".into()
+}
+fn cpus_default() -> f64 {
+    1.0
+}
+fn memory_default() -> u64 {
+    1024
+}
+fn timeout_default() -> u64 {
+    120
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Self {
+            secrets: Vec::new(),
+            workers: String::new(),
+            grants: Vec::new(),
+            files: files_default(),
+            network: network_default(),
+            cpus: cpus_default(),
+            memory_mb: memory_default(),
+            timeout_s: timeout_default(),
+            shell: false,
+        }
+    }
+}
+
+/// What an app offers to the apps that require it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Exports {
+    /// Templates they may start (in this app's realm).
+    #[serde(default)]
+    pub templates: Vec<String>,
+}
+
+impl Exports {
+    pub fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
+}
+
+/// A kit: how to build its environment, and the tools it offers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct KitPart {
+    #[serde(default)]
+    pub build: KitBuild,
+    /// A prebuilt image instead (registry/name@sha256:…), for remote
+    /// registries later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<KitTool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct KitBuild {
+    /// Its Dockerfile, among the package's files. `kit:<name>` in it names
+    /// a kit it requires.
+    #[serde(default = "dockerfile_default")]
+    pub dockerfile: String,
+    /// The other files the build uses (paths among the package's files).
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+fn dockerfile_default() -> String {
+    "Dockerfile".into()
+}
+
+impl Default for KitBuild {
+    fn default() -> Self {
+        Self { dockerfile: dockerfile_default(), files: Vec::new() }
+    }
+}
+
+/// A command a kit offers to agents.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct KitTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The command, with {arg} placeholders.
+    pub command: Vec<String>,
+    /// Its arguments: name → "path" (inside the session's folder) or
+    /// "text".
+    #[serde(default)]
+    pub args: std::collections::BTreeMap<String, String>,
+}
+
+/// A package version in the registry.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PackageInfo {
+    pub name: String,
+    pub version: String,
+    pub digest: String,
+    /// app, kit, library.
+    pub roles: Vec<String>,
+    pub description: String,
+    /// local, or where it came from.
+    pub source: String,
+    pub added_at: UnixMs,
+    /// Where it is installed (realms; "" for a kit).
+    #[serde(default)]
+    pub installed_in: Vec<String>,
+    #[serde(default)]
+    pub requires: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// `POST /api/v1/packages`: a package version for the registry.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PackageIn {
+    pub manifest: serde_json::Value,
+    /// Its files: path → base64.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+/// A package installed: in a realm (apps, libraries), or for every worker
+/// (kits).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Install {
+    pub id: i64,
+    pub package: String,
+    pub version: String,
+    pub digest: String,
+    pub roles: Vec<String>,
+    /// Its realm (app), the realm it was added to (library), or "" (kit).
+    pub realm: String,
+    /// installing, installed, upgrading or removing.
+    pub state: String,
+    /// What it requires, locked: name → digest.
+    #[serde(default)]
+    pub locks: std::collections::BTreeMap<String, String>,
+    /// Installs that require it.
+    #[serde(default)]
+    pub required_by: Vec<i64>,
+    #[serde(default)]
+    pub decision: Option<i64>,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+/// `POST /api/v1/installs`: install a package (and what it requires).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InstallIn {
+    pub package: String,
+    /// A version range; default: the newest.
+    #[serde(default)]
+    pub version: String,
+    /// A library's realm (apps have their own; kits none).
+    #[serde(default)]
+    pub realm: String,
+}
+
+impl AppNeeds {
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty() && self.workers.is_empty() && self.grants.is_empty()
+    }
+}
+
+impl AppContents {
+    pub fn is_empty(&self) -> bool {
+        self.collections.is_empty()
+            && self.series.is_empty()
+            && self.triggers.is_empty()
+            && self.memory.is_empty()
+            && self.records.is_empty()
+            && self.lists.is_empty()
+    }
+}
+
+/// The old name of the realm half of a package's permissions.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppNeeds {

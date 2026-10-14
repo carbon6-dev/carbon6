@@ -266,6 +266,15 @@ fn build() -> Vec<Op> {
         op!("explorer.neighborhood", "explorer", "GET" "/api/v1/realms/{id}/neighborhood", Read, Input::Query(schema::<crate::api::ExObjectQuery>), "An object's connections two hops deep, as nodes (with depth and the node each hangs from) and labelled edges, for drawing.", choices = &[("id", "realms.list")]),
     ]);
     v.extend([
+        op!("packages.list", "apps", "GET" "/api/v1/packages", Read, Input::None, "The local registry: every package version (apps, kits, libraries), what it requires, and where it is installed."),
+        op!("packages.add", "apps", "POST" "/api/v1/packages", Write, Input::Body(schema::<api::PackageIn>), "Adds a package version to the registry: its manifest (package, version, description, realm for an app, requires {name: range}, permissions, contents, exports, kit {build {dockerfile, files}, tools}) and its files (path → base64). The same version with other content is refused."),
+        op!("packages.get", "apps", "GET" "/api/v1/packages/{name}/{version}", Read, Input::None, "A package version: its manifest and registry entry (digest, roles, files)."),
+        op!("packages.delete", "apps", "DELETE" "/api/v1/packages/{name}/{version}", Destructive, Input::None, "Removes a package version nothing has installed."),
+        op!("installs.list", "apps", "GET" "/api/v1/installs", Read, Input::None, "What is installed: each package version, where (its realm, the realm it joined, or for workers), what it requires (locked) and what requires it."),
+        op!("installs.plan", "apps", "POST" "/api/v1/installs/plan", Read, Input::Body(schema::<api::InstallIn>), "What installing a package would install (with what it requires) and ask permission for."),
+        op!("installs.add", "apps", "POST" "/api/v1/installs", Write, Input::Body(schema::<api::InstallIn>), "Asks to install a package from the registry (and what it requires): one decision for the user listing everything it asks for."),
+        op!("installs.upgrade", "apps", "POST" "/api/v1/installs/{id}/upgrade", Write, Input::Body(schema::<crate::api::UpgradeIn>), "Asks to upgrade an install to the newest version a range allows: your edits are kept, and it asks again only for what grew.", choices = &[("id", "installs.list")]),
+        op!("installs.remove", "apps", "DELETE" "/api/v1/installs/{id}", Destructive, Input::None, "Asks to remove an install (an app: its realm and everything in it). Refused while other installs require it.", choices = &[("id", "installs.list")]),
         op!("apps.list", "apps", "GET" "/api/v1/apps", Read, Input::None, "Installed apps: each a package of configuration in a realm of its own, with its version and state."),
         op!("apps.plan", "apps", "POST" "/api/v1/apps/plan", Read, Input::Body(schema::<api::AppPackage>), "What installing a package would create, what it needs, and why it could not go ahead."),
         op!("apps.install", "apps", "POST" "/api/v1/apps", Write, Input::Body(schema::<api::AppPackage>), "Asks to install a package (JSON: app, version, description, realm, needs {secrets, workers, grants}, contents {collections, series, triggers, memory, records, and settings lists by key: views, skills, agents, commands, hooks, mcp_servers, templates, workflows, policies, routes, prices, budgets}). The user decides; then its realm and contents are created."),
@@ -499,6 +508,7 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str)] = &[
     ("GET", "/api/v1/sessions/{id}/attachments/{seq}/{index}", "a file download"),
     ("GET", "/api/v1/sessions/{id}/outputs/{seq}", "a file download"),
     ("GET", "/api/v1/sessions/{id}/export", "a file download"),
+    ("GET", "/api/v1/packages/{name}/{version}/files/{*path}", "a file download"),
     ("GET", "/api/v1/memex/items/{id}/content", "a file download"),
     ("GET", "/api/v1/memex/media/{id}/thumb", "an image"),
     ("GET", "/api/v1/memex/face/{id}", "an image"),
