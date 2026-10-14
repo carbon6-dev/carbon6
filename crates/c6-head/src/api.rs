@@ -148,6 +148,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/realms/{id}/activity", get(realm_activity))
         .route("/api/v1/realms/{id}/list", get(realm_list))
         .route("/api/v1/realms/{id}/object", get(realm_object))
+        .route("/api/v1/realms/{id}/search", get(realm_search))
+        .route("/api/v1/realms/{id}/neighborhood", get(realm_neighborhood))
         .route("/api/v1/apps", get(list_apps).post(install_app))
         .route("/api/v1/apps/plan", post(plan_app))
         .route("/api/v1/apps/export", get(export_app))
@@ -2302,6 +2304,31 @@ async fn realm_object(
 ) -> ApiResult<Json<api::ExObject>> {
     explored(&st, &caller, &id).await?;
     Ok(Json(crate::explorer::object(&st, &id, &q.kind, &q.id).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ExSearchQuery {
+    q: String,
+}
+
+async fn realm_search(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<ExSearchQuery>,
+) -> ApiResult<Json<Vec<api::ExGroup>>> {
+    explored(&st, &caller, &id).await?;
+    Ok(Json(crate::explorer::search(&st, &id, &q.q).await?))
+}
+
+async fn realm_neighborhood(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<ExObjectQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    explored(&st, &caller, &id).await?;
+    Ok(Json(crate::explorer::neighborhood(&st, &id, &q.kind, &q.id).await?))
 }
 
 // --- Apps (docs/os.md §5) ----------------------------------------------------

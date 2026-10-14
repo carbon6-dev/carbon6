@@ -127,6 +127,31 @@ async fn explorer_shows_a_realm_and_its_connections() {
         send(M::GET, &format!("realms/crm/object?kind=trigger&id={}", wins["id"].as_str().unwrap()), json!({})).await.json().await.unwrap();
     assert_eq!(g(&t, "Involves"), Some(vec!["deals".to_owned(), "invoices".to_owned()]));
 
+    // Search: across records, decisions, triggers and settings.
+    let found: Vec<c6_api::ExGroup> = send(M::GET, "realms/crm/search?q=acme", json!({})).await.json().await.unwrap();
+    let labels: Vec<&str> = found.iter().map(|g| g.label.as_str()).collect();
+    assert!(labels.contains(&"Records") && labels.contains(&"Decisions"), "{found:?}");
+    assert_eq!(found.iter().find(|g| g.label == "Records").unwrap().items.len(), 2, "the deal and its invoice");
+    let found: Vec<c6_api::ExGroup> = send(M::GET, "realms/crm/search?q=invoice", json!({})).await.json().await.unwrap();
+    assert!(found.iter().any(|g| g.label == "Triggers" && g.items[0].title == "invoice wins"), "{found:?}");
+    let found: Vec<c6_api::ExGroup> = send(M::GET, "realms/crm/search?q=pipeline", json!({})).await.json().await.unwrap();
+    assert!(found.iter().any(|g| g.label == "Configuration" && g.items[0].title == "pipeline"), "{found:?}");
+
+    // Two hops: the deal → the invoice (linking back) → … and the trigger →
+    // the invoices collection.
+    let n = ok(send(M::GET, &format!("realms/crm/neighborhood?kind=record&id=deals/{did}"), json!({})).await).await;
+    let nodes = n["nodes"].as_array().unwrap();
+    assert_eq!(nodes[0]["ref"]["title"], "Acme");
+    assert!(nodes.iter().any(|x| x["depth"] == 1 && x["ref"]["kind"] == "trigger"), "{n}");
+    assert!(nodes.iter().any(|x| x["depth"] == 2 && x["ref"]["kind"] == "collection" && x["ref"]["id"] == "invoices"), "{n}");
+    let ids: Vec<(String, String)> =
+        nodes.iter().map(|x| (x["ref"]["kind"].as_str().unwrap().to_owned(), x["ref"]["id"].as_str().unwrap().to_owned())).collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "each object once: {ids:?}");
+    assert!(n["edges"].as_array().unwrap().iter().all(|e| e["label"].is_string()));
+
     // The map; and a realm's token sees only its own realm.
     let map = ok(send(M::GET, "explorer/map", json!({})).await).await;
     assert!(

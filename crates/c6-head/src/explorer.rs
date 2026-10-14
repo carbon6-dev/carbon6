@@ -1197,3 +1197,238 @@ pub async fn map(st: &HeadState) -> anyhow::Result<Value> {
         crate::grants::list(st, None).await?.into_iter().filter(|g| matches!(g.state.as_str(), "active" | "requested")).collect();
     Ok(json!({"realms": cards, "grants": grants}))
 }
+
+/// Everything in a realm that matches `q`: records, knowledge, sessions
+/// (their titles and what was said), decisions, triggers, series, views
+/// and settings entries; grouped by kind.
+pub async fn search(st: &HeadState, realm: &str, q: &str) -> anyhow::Result<Vec<api::ExGroup>> {
+    let q = q.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = &st.store.pool;
+    let like = format!("%{}%", q.replace(['%', '_'], ""));
+    let mut groups: Vec<Option<api::ExGroup>> = Vec::new();
+    if realm != ROOT {
+        let mut records = Vec::new();
+        for c in crate::collections::list(st, realm).await?.into_iter().filter(|c| !c.system) {
+            let page = crate::collections::query(
+                st,
+                realm,
+                &c.name,
+                &api::RecordQuery { text: q.to_owned(), limit: Some(20), ..Default::default() },
+            )
+            .await?;
+            records.extend(
+                page.records
+                    .iter()
+                    .map(|x| r("record", format!("{}/{}", c.name, x.id), record_title(&x.fields, &x.id), &c.name, Some(x.updated_at))),
+            );
+        }
+        groups.push(group("Records", records));
+        if let Some(v) = knowledge(st, realm, "memex.explore.list", json!({"what": "things", "q": q, "limit": 20})).await {
+            groups.push(group(
+                "Things",
+                v.as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|x| {
+                        r(
+                            "thing",
+                            x["id"].as_str().unwrap_or(""),
+                            x["title"].as_str().unwrap_or(""),
+                            x["kind"].as_str().unwrap_or(""),
+                            None,
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        if let Some(v) = knowledge(st, realm, "memex.search", json!({"query": q, "limit": 20})).await {
+            groups.push(group(
+                "Knowledge",
+                v.as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|h| {
+                        r(
+                            "item",
+                            h["id"].as_str().unwrap_or(""),
+                            h["title"].as_str().unwrap_or(""),
+                            format!("{} · {}", h["kind"].as_str().unwrap_or(""), clip(h["snippet"].as_str().unwrap_or(""), 120)),
+                            h["created_at"].as_i64(),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        if let Some(v) = knowledge(st, realm, "memex.explore.list", json!({"what": "facts", "q": q, "limit": 20})).await {
+            groups.push(group(
+                "Facts",
+                v.as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|x| {
+                        r(
+                            "fact",
+                            x["id"].as_str().unwrap_or(""),
+                            x["title"].as_str().unwrap_or(""),
+                            x["kind"].as_str().unwrap_or(""),
+                            x["at"].as_i64(),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        // Sessions: by title, or by what was said in them (the search index).
+        let mut sessions: Vec<api::ExRef> = sqlx::query(
+            "SELECT id, title, status, updated_at FROM sessions WHERE realm = ? AND title LIKE ? ORDER BY updated_at DESC LIMIT 20",
+        )
+        .bind(realm)
+        .bind(&like)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|s| {
+            r(
+                "session",
+                s.get::<String, _>("id"),
+                s.get::<String, _>("title"),
+                format!("{} · title", s.get::<String, _>("status")),
+                Some(s.get("updated_at")),
+            )
+        })
+        .collect();
+        if q.chars().count() >= 3 {
+            let said = sqlx::query(
+                "SELECT s.id, s.title, s.updated_at, snippet(search, 0, '«', '»', '…', 12) AS snip FROM search JOIN sessions s ON s.id = search.session_id \
+                 WHERE search MATCH ? AND s.realm = ? GROUP BY s.id ORDER BY s.updated_at DESC LIMIT 20",
+            )
+            .bind(format!("\"{}\"", q.replace('"', "\"\"")))
+            .bind(realm)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for s in said {
+                let id: String = s.get("id");
+                if !sessions.iter().any(|x| x.id == id) {
+                    sessions.push(r("session", id, s.get::<String, _>("title"), s.get::<String, _>("snip"), Some(s.get("updated_at"))));
+                }
+            }
+        }
+        groups.push(group("Sessions", sessions));
+        groups.push(group(
+            "Decisions",
+            sqlx::query("SELECT id, title, state, updated_at FROM decisions WHERE realm = ? AND (title LIKE ?2 OR document LIKE ?2) ORDER BY updated_at DESC LIMIT 20")
+                .bind(realm)
+                .bind(&like)
+                .fetch_all(pool)
+                .await?
+                .iter()
+                .map(|d| r("decision", d.get::<i64, _>("id").to_string(), d.get::<String, _>("title"), d.get::<String, _>("state"), Some(d.get("updated_at"))))
+                .collect(),
+        ));
+        let ql = q.to_lowercase();
+        groups.push(group(
+            "Triggers",
+            crate::triggers::list(st, &crate::realms::Caller::in_realm(realm))
+                .await?
+                .iter()
+                .filter(|t| t.name.to_lowercase().contains(&ql) || t.template.to_lowercase().contains(&ql))
+                .map(trigger_ref)
+                .collect(),
+        ));
+        groups.push(group(
+            "Series",
+            crate::series::list(st, realm)
+                .await?
+                .into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&ql) || s.description.to_lowercase().contains(&ql))
+                .map(|s| r("series", &s.name, &s.name, &s.unit, None))
+                .collect(),
+        ));
+    }
+    // Settings entries (views, templates, skills…), the realm's and root's.
+    let mut entries = Vec::new();
+    for (key, _) in LISTS {
+        let found = list(st, realm, &format!("list:{key}"), "").await.unwrap_or_default();
+        let ql = q.to_lowercase();
+        entries.extend(found.into_iter().filter(|x| x.title.to_lowercase().contains(&ql) || x.sub.to_lowercase().contains(&ql)).map(
+            |mut x| {
+                x.sub = format!("{key} · {}", x.sub);
+                x
+            },
+        ));
+    }
+    groups.push(group("Configuration", entries));
+    Ok(groups.into_iter().flatten().collect())
+}
+
+/// An object, what is connected to it, and what is connected to those: a
+/// graph two hops deep (bounded), for drawing. Nodes carry their depth and
+/// the node they hang from.
+pub async fn neighborhood(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow::Result<Value> {
+    const FIRST: usize = 14;
+    const PER_GROUP: usize = 5;
+    const SECOND_PER_NODE: usize = 4;
+    const MAX_NODES: usize = 60;
+    let center = object(st, realm, kind, id).await?;
+    let mut nodes: Vec<Value> =
+        vec![json!({"ref": r(&center.kind, &center.id, &center.title, &center.sub, None), "depth": 0, "parent": Value::Null})];
+    let mut keys: Vec<(String, String)> = vec![(center.kind.clone(), center.id.clone())];
+    let mut edges: Vec<Value> = Vec::new();
+    let mut first: Vec<usize> = Vec::new();
+    for g in &center.connected {
+        for item in g.items.iter().take(PER_GROUP) {
+            if first.len() >= FIRST {
+                break;
+            }
+            let key = (item.kind.clone(), item.id.clone());
+            let at = match keys.iter().position(|k| *k == key) {
+                Some(i) => i,
+                None => {
+                    keys.push(key);
+                    nodes.push(json!({"ref": item, "depth": 1, "parent": 0}));
+                    first.push(nodes.len() - 1);
+                    nodes.len() - 1
+                }
+            };
+            edges.push(json!({"from": 0, "to": at, "label": g.label}));
+        }
+    }
+    for &i in &first {
+        let (k, oid) = keys[i].clone();
+        let Ok(o) = Box::pin(object(st, realm, &k, &oid)).await else { continue };
+        // A record found as ?/<id> now has its collection: one node for it.
+        if o.id != oid {
+            keys[i].1 = o.id.clone();
+            nodes[i]["ref"]["id"] = json!(o.id);
+        }
+        let mut added = 0;
+        for g in &o.connected {
+            for item in &g.items {
+                if added >= SECOND_PER_NODE {
+                    break;
+                }
+                let key = (item.kind.clone(), item.id.clone());
+                match keys.iter().position(|x| *x == key) {
+                    Some(0) => {}
+                    Some(j) => {
+                        let exists = edges.iter().any(|e| (e["from"] == i && e["to"] == j) || (e["from"] == j && e["to"] == i));
+                        if !exists {
+                            edges.push(json!({"from": i, "to": j, "label": g.label}));
+                        }
+                    }
+                    None if nodes.len() < MAX_NODES => {
+                        keys.push(key);
+                        nodes.push(json!({"ref": item, "depth": 2, "parent": i}));
+                        edges.push(json!({"from": i, "to": nodes.len() - 1, "label": g.label}));
+                        added += 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    Ok(json!({"nodes": nodes, "edges": edges}))
+}

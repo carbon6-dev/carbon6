@@ -91,6 +91,17 @@ async fn realms_have_their_own_knowledge() {
     let item: c6_api::ExObject =
         http.get(format!("{api}/realms/lab/object?kind=item&id={}", notes[0].id)).send().await.unwrap().json().await.unwrap();
     assert!(item.body.contains("eu-west"), "{item:?}");
+    // Search reaches the knowledge: items and the facts.
+    let found: Vec<c6_api::ExGroup> = http.get(format!("{api}/realms/lab/search?q=staging")).send().await.unwrap().json().await.unwrap();
+    let k = found.iter().find(|g| g.label == "Knowledge").expect("knowledge hits");
+    assert!(k.items.iter().any(|i| i.sub.contains("eu-west")), "{k:?}");
+    let found: Vec<c6_api::ExGroup> = http.get(format!("{api}/realms/lab/search?q=Buildkite")).send().await.unwrap().json().await.unwrap();
+    assert!(found.iter().any(|g| g.label == "Facts"), "{found:?}");
+    // And a thing's two-hop neighborhood: its fact, and what that fact is about.
+    let n: serde_json::Value =
+        http.get(format!("{api}/realms/lab/neighborhood?kind=thing&id=ci:buildkite")).send().await.unwrap().json().await.unwrap();
+    assert!(n["nodes"].as_array().unwrap().iter().any(|x| x["ref"]["kind"] == "fact"), "{n}");
+
     // Home's mail and photos link out to their own pages.
     let home: c6_api::RealmSummary = http.get(format!("{api}/realms/home/summary")).send().await.unwrap().json().await.unwrap();
     assert!(home.knowledge);

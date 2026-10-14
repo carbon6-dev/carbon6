@@ -80,6 +80,26 @@ fn Ex(to: View, #[prop(optional, into)] class: String, #[prop(optional, into)] t
     }
 }
 
+/// A click on a link drawn in a graph: as `Ex` does.
+fn follow(ev: web_sys::MouseEvent, to: View, nav: &Nav) {
+    if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
+        return;
+    }
+    ev.prevent_default();
+    match &nav.0 {
+        Some(c) if !(ev.meta_key() || ev.ctrl_key()) => c.replace(to),
+        _ => nav.1.open(None, to, crate::workspace::How::from_mouse(&ev)),
+    }
+}
+
+/// Where graph clicks go: this column (or the workspace).
+#[derive(Clone)]
+struct Nav(Option<crate::workspace::ColumnCtx>, crate::workspace::Workspace);
+
+fn nav() -> Nav {
+    Nav(crate::workspace::use_column(), crate::workspace::use_workspace())
+}
+
 // --- The map ---------------------------------------------------------------------
 
 /// Every realm, what it holds, and the grants between them.
@@ -240,6 +260,7 @@ fn Inventory(summary: RealmSummary, realm: String, section: String) -> impl Into
             <p class="font-mono text-xs text-zinc-500">{rid}</p>
         </Ex>
         <Ex to=View::Realms class="text-xs text-zinc-500 underline">"All realms"</Ex>
+        <SearchBox realm=realm.clone() current=section.strip_prefix("search:").unwrap_or("").to_owned() />
         {GROUPS.iter().map(|(g, title)| {
             let entries: Vec<c6_api::ExEntry> = summary.entries.iter().filter(|e| e.group == *g).cloned().collect();
             (!entries.is_empty()).then(|| view! {
@@ -343,6 +364,7 @@ fn Overview(summary: RealmSummary, realm: String) -> impl IntoView {
 /// what views show, as three columns.
 #[component]
 fn Wiring(realm: String) -> impl IntoView {
+    let nav = nav();
     let data = LocalResource::new(move || async move {
         let triggers = api::automations().await?;
         let views = api::views().await.unwrap_or_default();
@@ -419,7 +441,7 @@ fn Wiring(realm: String) -> impl IntoView {
                 let node = |x: f64, y: f64, text: String, to: Option<View>| {
                     let t = view! { <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class="fill-zinc-800 text-[11px] dark:fill-zinc-200">{text}</text> };
                     match to {
-                        Some(to) => view! { <a href=to.path()>{t}</a> }.into_any(),
+                        Some(to) => { let nav = nav.clone(); view! { <a href=to.path() on:click=move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav)>{t}</a> }.into_any() }
                         None => t.into_any(),
                     }
                 };
@@ -454,8 +476,67 @@ fn Wiring(realm: String) -> impl IntoView {
     }
 }
 
+/// Searches the realm: results in the middle pane.
+#[component]
+fn SearchBox(realm: String, current: String) -> impl IntoView {
+    let q = RwSignal::new(current);
+    let col = crate::workspace::use_column();
+    let ws = crate::workspace::use_workspace();
+    let go = move || {
+        let text = q.get_untracked().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let v = explore(&realm, &format!("search:{text}"), "", "");
+        match &col {
+            Some(c) => c.replace(v),
+            None => ws.open(None, v, crate::workspace::How::Beside),
+        }
+    };
+    view! {
+        <form class="px-2" on:submit=move |ev| { ev.prevent_default(); go(); }>
+            <input class=format!("{INPUT} py-1 text-sm") type="search" placeholder="Search this realm" prop:value=move || q.get() on:input=move |ev| q.set(event_target_value(&ev)) />
+        </form>
+    }
+}
+
+/// What a search found, by kind.
+#[component]
+fn SearchResults(realm: String, q: String, selected: String) -> impl IntoView {
+    let (r1, q1) = (realm.clone(), q.clone());
+    let found = LocalResource::new(move || api::realm_search(r1.clone(), q1.clone()));
+    let section = format!("search:{q}");
+    view! {
+        <div class="space-y-3">
+            <div class="flex items-center gap-2">
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-zinc-500 hover:underline lg:hidden">"← Overview"</Ex>
+                <h2 class="font-medium">{format!("“{q}”")}</h2>
+            </div>
+            {move || found.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(gs) if gs.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing in this realm matches."</p> }.into_any(),
+                Ok(gs) => gs.into_iter().map(|g| {
+                    let (rr, ss, sel) = (realm.clone(), section.clone(), selected.clone());
+                    view! {
+                        <div>
+                            <h3 class="px-2 text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("{} ({}{})", g.label, g.items.len(), if g.more > 0 { format!("+{}", g.more) } else { String::new() })}</h3>
+                            {g.items.into_iter().map(|x| {
+                                let on = x.id == sel;
+                                view! { <div class=if on { "rounded bg-sky-50 dark:bg-sky-950" } else { "" }><RefLine realm=rr.clone() section=ss.clone() r=x /></div> }
+                            }).collect_view()}
+                        </div>
+                    }
+                }).collect_view().into_any(),
+            })}
+        </div>
+    }
+}
+
 #[component]
 fn SectionList(realm: String, section: String, selected: String) -> impl IntoView {
+    if let Some(q) = section.strip_prefix("search:") {
+        return view! { <SearchResults realm=realm.clone() q=q.to_owned() selected=selected.clone() /> }.into_any();
+    }
     let q = RwSignal::new(String::new());
     let (r1, s1) = (realm.clone(), section.clone());
     let list = LocalResource::new(move || api::realm_list(r1.clone(), s1.clone(), q.get()));
@@ -482,6 +563,7 @@ fn SectionList(realm: String, section: String, selected: String) -> impl IntoVie
             })}
         </div>
     }
+    .into_any()
 }
 
 #[component]
@@ -544,36 +626,79 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
     }
 }
 
-/// An object and what is connected to it, in a ring; clicking a node opens
-/// it (and centers on it).
+/// An object, what is connected to it, and what is connected to those:
+/// two rings. Clicking a node opens it.
 #[component]
 fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoView {
-    let nodes: Vec<(String, ExRef)> =
-        object.connected.iter().flat_map(|g| g.items.iter().take(8).map(move |i| (g.label.clone(), i.clone()))).take(40).collect();
-    let n = nodes.len().max(1) as f64;
-    let (w, h) = (460.0, 360.0);
-    let (cx, cy) = (w / 2.0, h / 2.0);
+    let nav = nav();
+    let (r1, k1, i1) = (realm.clone(), object.kind.clone(), object.id.clone());
+    let data = LocalResource::new(move || api::realm_neighborhood(r1.clone(), k1.clone(), i1.clone()));
     let short = |s: &str| {
-        let t: String = s.chars().take(18).collect();
-        if s.chars().count() > 18 { format!("{t}…") } else { t }
+        let t: String = s.chars().take(16).collect();
+        if s.chars().count() > 16 { format!("{t}…") } else { t }
     };
     view! {
-        <svg viewBox=format!("0 0 {w} {h}") class="w-full rounded-md border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
-            {nodes.iter().enumerate().map(|(i, (label, r))| {
-                let a = std::f64::consts::TAU * i as f64 / n;
-                let (x, y) = (cx + 165.0 * a.cos(), cy + 140.0 * a.sin());
-                let (mark, color) = badge(&r.kind);
-                let to = explore(&realm, &section, &r.kind, &r.id);
-                view! {
-                    <g>
-                        <line x1=format!("{cx:.0}") y1=format!("{cy:.0}") x2=format!("{x:.0}") y2=format!("{y:.0}") class="stroke-zinc-300 dark:stroke-zinc-700" stroke-width="1"><title>{label.clone()}</title></line>
-                        <a href=to.path()>
-                            <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class=format!("text-[10px] fill-current {color}")>{format!("{mark} {}", short(&r.title))}<title>{format!("{}: {}", label, r.title)}</title></text>
-                        </a>
-                    </g>
+        {move || data.get().map(|r| match r {
+            Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+            Ok(g) => {
+                let nodes = g["nodes"].as_array().cloned().unwrap_or_default();
+                let edges = g["edges"].as_array().cloned().unwrap_or_default();
+                let (w, h) = (520.0, 440.0);
+                let (cx, cy) = (w / 2.0, h / 2.0);
+                // Ring 1 evenly; ring 2 fanned out around its parent.
+                let ring1: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i]["depth"] == 1).collect();
+                let mut angle = vec![0.0f64; nodes.len()];
+                let mut pos = vec![(cx, cy); nodes.len()];
+                let n1 = ring1.len().max(1) as f64;
+                for (k, &i) in ring1.iter().enumerate() {
+                    let a = std::f64::consts::TAU * k as f64 / n1 - std::f64::consts::FRAC_PI_2;
+                    angle[i] = a;
+                    pos[i] = (cx + 120.0 * a.cos(), cy + 100.0 * a.sin());
                 }
-            }).collect_view()}
-            <text x=format!("{cx:.0}") y=format!("{:.0}", cy + 4.0) text-anchor="middle" class="fill-zinc-900 text-[12px] font-semibold dark:fill-zinc-100">{format!("{} {}", badge(&object.kind).0, short(&object.title))}</text>
-        </svg>
+                let spread = std::f64::consts::TAU / n1 * 0.8;
+                for &p in &ring1 {
+                    let kids: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i]["depth"] == 2 && nodes[i]["parent"].as_u64() == Some(p as u64)).collect();
+                    let m = kids.len();
+                    for (k, &i) in kids.iter().enumerate() {
+                        let off = if m > 1 { spread * (k as f64 / (m - 1) as f64 - 0.5) } else { 0.0 };
+                        let a = angle[p] + off;
+                        pos[i] = (cx + 225.0 * a.cos(), cy + 195.0 * a.sin());
+                    }
+                }
+                let refs: Vec<ExRef> = nodes.iter().map(|n| serde_json::from_value(n["ref"].clone()).unwrap_or_default()).collect();
+                view! {
+                    <svg viewBox=format!("0 0 {w} {h}") class="w-full rounded-md border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+                        {edges.iter().filter_map(|e| {
+                            let (a, b) = (e["from"].as_u64()? as usize, e["to"].as_u64()? as usize);
+                            let (p, q) = (*pos.get(a)?, *pos.get(b)?);
+                            let far = nodes.get(a)?["depth"] == 2 || nodes.get(b)?["depth"] == 2;
+                            Some(view! {
+                                <line x1=format!("{:.0}", p.0) y1=format!("{:.0}", p.1) x2=format!("{:.0}", q.0) y2=format!("{:.0}", q.1)
+                                    class=if far { "stroke-zinc-200 dark:stroke-zinc-800" } else { "stroke-zinc-300 dark:stroke-zinc-700" } stroke-width="1">
+                                    <title>{e["label"].as_str().unwrap_or("").to_owned()}</title>
+                                </line>
+                            })
+                        }).collect_view()}
+                        {refs.iter().enumerate().map(|(i, r)| {
+                            let (x, y) = pos[i];
+                            let (mark, color) = badge(&r.kind);
+                            let depth = nodes[i]["depth"].as_u64().unwrap_or(0);
+                            let to = explore(&realm, &section, &r.kind, &r.id);
+                            let size = match depth { 0 => "text-[12px] font-semibold", 1 => "text-[10px]", _ => "text-[9px] opacity-80" };
+                            let href = to.path();
+                            view! {
+                                <a href=href on:click={ let nav = nav.clone(); move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav) }>
+                                    <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class=format!("fill-current {color} {size}")>
+                                        {format!("{mark} {}", short(&r.title))}
+                                        <title>{format!("{} {}: {}", r.kind, r.title, r.sub)}</title>
+                                    </text>
+                                </a>
+                            }
+                        }).collect_view()}
+                    </svg>
+                    <p class="text-xs text-zinc-500">"Two hops: what is connected to it, and what is connected to those. Click a node to open it."</p>
+                }.into_any()
+            }
+        })}
     }
 }

@@ -168,6 +168,14 @@ pub async fn realm_list(realm: String, section: String, q: String) -> Result<Vec
     json(Request::get(&format!("/api/v1/realms/{}/list?section={}&q={}", enc(&realm), enc(&section), enc(&q))).send().await).await
 }
 
+pub async fn realm_search(realm: String, q: String) -> Result<Vec<c6_api::ExGroup>, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/search?q={}", enc(&realm), enc(&q))).send().await).await
+}
+
+pub async fn realm_neighborhood(realm: String, kind: String, id: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/neighborhood?kind={}&id={}", enc(&realm), enc(&kind), enc(&id))).send().await).await
+}
+
 pub async fn realm_object(realm: String, kind: String, id: String) -> Result<c6_api::ExObject, String> {
     json(Request::get(&format!("/api/v1/realms/{}/object?kind={}&id={}", enc(&realm), enc(&kind), enc(&id))).send().await).await
 }

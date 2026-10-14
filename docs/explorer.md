@@ -138,10 +138,12 @@ All three answer realm-scoped tokens for their own realm (admitted like collecti
 - **Fixed on the way:**
   - The realm signal now lives as long as the page. It used to be owned by whichever component asked for it first, and the explorer could dispose it.
   - Triggers and decisions can be created with `?realm=`; before, a root caller could only create them in home. The Triggers form now lists and creates in the realm picked in the header.
-- **Not built:**
-  - realm-wide search in the explorer (the header's search covers sessions);
-  - "upgrade available" for apps;
-  - two-hop graphs.
+- **Search** (`/api/v1/realms/{id}/search?q=`, and the box above the inventory):
+  - **What it searches:** the realm's records (their text), things, knowledge (the memex's search), facts, sessions (by title and by what was said in them, through the session index), decisions (title and document), triggers, series, and settings entries.
+  - **Results** are grouped by kind in the middle pane, at `/realms/<id>/in/search:<q>`, and each opens as any object does.
+- **Two-hop graphs** (`/api/v1/realms/{id}/neighborhood?kind=&id=`): the object, up to 14 objects connected to it, and up to 4 more from each of those (60 at most). Each object appears once, and links among them are kept.
+  - **Drawing:** two rings, with the second fanned out around its parent. Clicking a node opens it in the same column.
+- **Not built:** "upgrade available" for apps (a package isn't kept anywhere to compare against until it's loaded).
 
 ## 12. Open questions
 
