@@ -15,12 +15,14 @@ use crate::{Concurrency, Tool, ToolCtx, ToolOutput};
 pub trait Subagents: Send + Sync {
     /// Returns the subagent's final answer. `agent`: a named agent's
     /// instructions, tools and model; `None` for a general-purpose one.
+    /// `background`: the background task it runs as, if it does.
     async fn run(
         &self,
         parent_call_id: &str,
         description: &str,
         prompt: &str,
         agent: Option<&AgentDef>,
+        background: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<String, String>;
 }
@@ -135,14 +137,14 @@ impl Tool for Task {
             let (session, call_id, description, prompt, agent, task) =
                 (ctx.session.clone(), ctx.call_id.clone(), description.to_owned(), prompt.to_owned(), agent.cloned(), id.clone());
             tokio::spawn(async move {
-                let result = agents.run(&call_id, &description, &prompt, agent.as_ref(), cancel).await;
+                let result = agents.run(&call_id, &description, &prompt, agent.as_ref(), Some(&task), cancel).await;
                 session.background.finish_agent(&task, result);
             });
             return ToolOutput::ok(format!(
                 "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
             ));
         }
-        match agents.run(&ctx.call_id, description, prompt, agent, ctx.cancel.clone()).await {
+        match agents.run(&ctx.call_id, description, prompt, agent, None, ctx.cancel.clone()).await {
             Ok(answer) => ToolOutput::limited(answer, false),
             Err(e) => ToolOutput::err(format!("subagent failed: {e}")),
         }

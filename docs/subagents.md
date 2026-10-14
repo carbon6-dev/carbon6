@@ -45,7 +45,7 @@ Not a goal: rewinding a subagent.
 3. **Wait or don't.** Foreground: wait for the oneshot. Background: register the task as today and let the oneshot finish it.
 4. **Cascade interrupts.** If the parent's cancel token fires, the runner sends `Interrupt` to the child actor; it does not just drop a future. A subagent interrupted this way interrupts its own foreground subagents the same way, so a stop runs down the tree.
 
-The child then gets everything an actor already has for free: inbox delivery at model boundaries, `Checkpoint`s in its own repository (the same work tree), reload from the journal, history repair for tool calls that never got a result, `Restore`, and its own subagent runner. Nesting therefore needs no separate code path.
+The child then gets everything an actor already has for free: inbox delivery at model boundaries, reload from the journal, history repair for tool calls that never got a result, `Restore`, and its own subagent runner. Nesting therefore needs no separate code path. It takes no `Checkpoint`s: subagents are not rewound, and the parent's checkpoints cover the same folder.
 
 ### Events
 
@@ -233,6 +233,8 @@ The breadcrumb shows the chain, for example "*main session* › *Find all caller
 - **`SendMessage` to a subagent the caller is waiting on.** This can't happen, because a waiting caller isn't running. Two calls in one message that target the same idle subagent are refused for the second one ("already running").
 
 ## 12. Steps
+
+As built: step 1 on 2026-10-14. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
 
 1. **Actor-backed subagents.** `Delegation` in `CreateSession`, `SubagentSpawned`, the child built and reloaded as an actor, interrupts cascaded through the actor. Depth limit 1, so visible behavior stays as today. Tested by killing the worker mid-subagent and reloading.
 2. **Partial results.** The digest; foreground and background results for every outcome; recovery writing results for dangling delegations; the corrected `lost` text; the head columns.

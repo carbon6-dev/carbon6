@@ -40,6 +40,7 @@ mod secrets;
 mod series;
 mod session;
 mod side_chat;
+mod subagents;
 mod triggers;
 mod usage;
 mod views;

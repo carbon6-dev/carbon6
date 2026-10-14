@@ -29,7 +29,20 @@ message SessionEvent {
     Approval approval = 25;
     Notice notice = 26;
     Question question = 27;
+    SubagentSpawned subagent_spawned = 28;
   }
+}
+
+// A tool call (Task) started a subagent: written to the parent's log before
+// the subagent's own, so the parent links to its children by itself.
+message SubagentSpawned {
+  string call_id = 1;
+  string child_session_id = 2;
+  // The named agent; empty for a general-purpose one.
+  string agent = 3;
+  string description = 4;
+  // Set when it runs in the background (the BackgroundTask's id).
+  string background_task_id = 5;
 }
 
 // The assistant asked you for inputs (a form), and what became of it.
@@ -158,6 +171,10 @@ message SessionStarted {
   // On another machine over SSH: the target, and a line about its system.
   string ssh_target = 15;
   string system = 16;
+  // Subagents: the named agent (empty: general-purpose) and how deep in
+  // the tree (the top-level session is 0).
+  string agent = 17;
+  uint32 depth = 18;
 }
 
 message UserMessage {
@@ -176,6 +193,8 @@ message UserMessage {
   // Set when a UserPromptSubmit hook blocked the message: why. The model
   // never sees a blocked message.
   string blocked = 6;
+  // In a subagent: the parent's tool call that sent it; empty when you did.
+  string delegated_by = 7;
 }
 
 message Attachment {
@@ -450,6 +469,21 @@ message CreateSession {
   // compaction prompts and the subagent note, as edited (docs/os.md §4.6).
   // Missing ones are the defaults.
   string prompts_json = 21;
+  // Set for a subagent, which the worker creates itself (never the head).
+  Delegation delegation = 22;
+}
+
+// What makes a session a subagent: who started it, and as which agent.
+message Delegation {
+  string parent_session_id = 1;
+  string parent_call_id = 2;
+  // The top-level session of the tree (secrets and head calls go by it:
+  // its row always exists on the head).
+  string root_session_id = 3;
+  // The named agent (JSON c6_api::AgentDef-like: name, description, tools,
+  // model, prompt); empty for a general-purpose one.
+  string agent_json = 4;
+  uint32 depth = 5;
 }
 
 message ModelSpec {

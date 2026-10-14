@@ -215,5 +215,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::Approval { .. } => "approval",
         EventKind::Notice { .. } => "notice",
         EventKind::Question { .. } => "question",
+        EventKind::SubagentSpawned { .. } => "subagent_spawned",
     }
 }

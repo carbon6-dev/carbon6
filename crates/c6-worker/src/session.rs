@@ -21,16 +21,37 @@ use crate::checkpoint::Checkpoints;
 use crate::journal::Journal;
 use crate::link::HeadLink;
 
+/// Cheap to clone: a session's actor holds one to start its subagents.
+#[derive(Clone)]
 pub struct SessionManager {
     journal: Arc<Journal>,
     link: Arc<HeadLink>,
     worktrees: PathBuf,
     /// The worker's state directory (checkpoint repositories live here).
     state_dir: PathBuf,
-    actors: Mutex<HashMap<String, mpsc::UnboundedSender<ActorMsg>>>,
+    actors: Arc<Mutex<HashMap<String, Handle>>>,
 }
 
-struct CommandChoice {
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// A live actor: where its messages go, and its tools' shared state (a
+/// subagent works with its parent's hooks, publisher and the like).
+#[derive(Clone)]
+struct Handle {
+    tx: mpsc::UnboundedSender<ActorMsg>,
+    tools: Arc<SessionTools>,
+}
+
+/// How a delegation's turn ended.
+pub(crate) struct Outcome {
+    pub reason: TurnEndReason,
+    /// The final assistant text of the turn (empty if none).
+    pub report: String,
+    /// The turn's last error, if any.
+    pub error: String,
+}
+
+pub(crate) struct CommandChoice {
     /// The command's variants from the head: [{applies_to, body}].
     candidates_json: String,
     /// The session's labels from the head as of the message.
@@ -102,7 +123,7 @@ pub(crate) fn normalize_remote(url: &str) -> String {
     format!("{}/{}", host.to_ascii_lowercase(), path.trim_start_matches('/'))
 }
 
-enum ActorMsg {
+pub(crate) enum ActorMsg {
     /// Rewind the conversation (after interrupting a running turn).
     Rewind {
         command_id: String,
@@ -140,6 +161,9 @@ enum ActorMsg {
         call_id: String,
         allow: bool,
     },
+    /// A subagent's task from its parent: run it as given (no command
+    /// expansion, mentions or prompt hooks) and say how its turn ended.
+    Delegate(Box<PendingInput>, tokio::sync::oneshot::Sender<Outcome>),
 }
 
 /// Background-task notices may start this many turns per hour in an idle
@@ -150,12 +174,16 @@ impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
         prune_browser_profiles(&state_dir.join("browser"), std::time::Duration::from_secs(30 * 24 * 3600));
-        Self { journal, link, worktrees, state_dir, actors: Mutex::default() }
+        Self { journal, link, worktrees, state_dir, actors: Arc::default() }
     }
 
     /// Session ids with a live actor.
     pub fn active(&self) -> Vec<String> {
-        self.actors.lock().unwrap().iter().filter(|(_, a)| !a.is_closed()).map(|(id, _)| id.clone()).collect()
+        self.actors.lock().unwrap().iter().filter(|(_, a)| !a.tx.is_closed()).map(|(id, _)| id.clone()).collect()
+    }
+
+    fn live(&self, session_id: &str) -> Option<mpsc::UnboundedSender<ActorMsg>> {
+        self.actors.lock().unwrap().get(session_id).map(|a| a.tx.clone())
     }
 
     /// Closes turns left open by a crash or kill.
@@ -229,7 +257,7 @@ impl SessionManager {
                 Ok(())
             }
             Some(session_command::Kind::Interrupt(_)) => {
-                if let Some(a) = self.actors.lock().unwrap().get(&cmd.session_id) {
+                if let Some(a) = self.live(&cmd.session_id) {
                     let _ = a.send(ActorMsg::Interrupt);
                 }
                 Ok(())
@@ -237,14 +265,14 @@ impl SessionManager {
             // Questions are the head's assistant's; worker sessions ask none.
             Some(session_command::Kind::Answer(_)) => Ok(()),
             Some(session_command::Kind::Approve(a)) => {
-                if let Some(actor) = self.actors.lock().unwrap().get(&cmd.session_id) {
+                if let Some(actor) = self.live(&cmd.session_id) {
                     let _ = actor.send(ActorMsg::Decide { call_id: a.call_id, allow: a.allow });
                 }
                 Ok(())
             }
             Some(session_command::Kind::StopTask(t)) => {
                 // Without a live actor no task of the session is running.
-                if let Some(a) = self.actors.lock().unwrap().get(&cmd.session_id) {
+                if let Some(a) = self.live(&cmd.session_id) {
                     let _ = a.send(ActorMsg::StopTask(t.task_id));
                 }
                 Ok(())
@@ -438,7 +466,7 @@ impl SessionManager {
         }
         info!(session = %session_id, cwd = %cwd.display(), %profile, "session created");
         let conv = Conversation { history: history_from_events(&seed_events(&spec)), context_tokens: 0 };
-        self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools)).await;
+        self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools)).await.map_err(|e| format!("worker error: {e:#}"))?;
         Ok(())
     }
 
@@ -476,7 +504,13 @@ impl SessionManager {
 
     /// The session's actor, starting it from the journal if needed.
     async fn actor(&self, session_id: &str) -> anyhow::Result<Option<mpsc::UnboundedSender<ActorMsg>>> {
-        if let Some(a) = self.actors.lock().unwrap().get(session_id).filter(|a| !a.is_closed()) {
+        Ok(self.load(session_id).await?.map(|h| h.tx))
+    }
+
+    /// The session's live actor and tools, starting it from the journal if
+    /// needed.
+    async fn load(&self, session_id: &str) -> anyhow::Result<Option<Handle>> {
+        if let Some(a) = self.actors.lock().unwrap().get(session_id).filter(|a| !a.tx.is_closed()) {
             return Ok(Some(a.clone()));
         }
         let Some((spec, events)) = self.journal.load_session(session_id).await? else { return Ok(None) };
@@ -502,7 +536,8 @@ impl SessionManager {
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
         let mut spec = spec;
         let conv = conversation_from_log(&mut spec, &events);
-        let tx = self.spawn(session_id, spec, started, conv, next_seq, turns, None).await;
+        let handle = self.spawn(session_id, spec, started, conv, next_seq, turns, None).await?;
+        let tx = handle.tx.clone();
         // Background tasks still running when the worker stopped are gone.
         let mut open: Vec<c6_proto::BackgroundTask> = Vec::new();
         let mut highest = 0u64;
@@ -520,7 +555,29 @@ impl SessionManager {
             let _ =
                 tx.send(ActorMsg::Lost { task_id: t.task_id, kind: t.kind, description: t.description, notify: t.notify, pgid: t.pgid });
         }
-        Ok(Some(tx))
+        Ok(Some(handle))
+    }
+
+    /// Starts a subagent: journals its session (`spec.delegation` set) and
+    /// starts its actor with `tools`, the parent's as the subagent may use
+    /// them. Returns where to send it work.
+    pub(crate) async fn start_subagent(
+        &self,
+        session_id: &str,
+        spec: CreateSession,
+        started: SessionStarted,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> anyhow::Result<mpsc::UnboundedSender<ActorMsg>> {
+        let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
+        self.journal.create_session(session_id, &spec, &ev).await?;
+        let conv = Conversation { history: Vec::new(), context_tokens: 0 };
+        Ok(self.spawn(session_id, spec, started, conv, 2, 0, Some(tools)).await?.tx)
+    }
+
+    /// The shared tool state of a subagent's parent, starting the parent's
+    /// actor if needed (after a restart, a subagent may be loaded first).
+    fn parent_tools<'a>(&'a self, parent_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<Arc<SessionTools>>>> {
+        Box::pin(async move { Ok(self.load(parent_id).await?.map(|h| h.tools)) })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -533,8 +590,12 @@ impl SessionManager {
         next_seq: u64,
         turns: u64,
         tools: Option<Vec<Arc<dyn Tool>>>,
-    ) -> mpsc::UnboundedSender<ActorMsg> {
+    ) -> anyhow::Result<Handle> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let delegation = spec.delegation.clone();
+        // A subagent's secrets and head calls go by its tree's top-level
+        // session (its row always exists on the head).
+        let on_behalf_of = delegation.as_ref().map_or(session_id, |d| d.root_session_id.as_str()).to_owned();
         let writer = Arc::new(Writer {
             session_id: session_id.to_owned(),
             journal: self.journal.clone(),
@@ -558,21 +619,40 @@ impl SessionManager {
                 let labels =
                     session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
                 let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
-                let (secret_values, _) = fetch_secrets(&self.link, session_id, &names).await;
-                build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels, &secret_values).await.tools
+                let (secret_values, _) = fetch_secrets(&self.link, &on_behalf_of, &names).await;
+                let built = build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels, &secret_values).await.tools;
+                match &delegation {
+                    Some(d) => crate::subagent::delegated_tools(d, built),
+                    None => built,
+                }
             }
         };
         let started_cwd = started.cwd.clone();
         // The head's hooks. Claude Code sessions get them as Claude Code
         // settings and run them itself.
         let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
-        let hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
         session_tools.browser.set_profile(self.state_dir.join("browser").join(session_id));
-        session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: session_id.to_owned() })));
+        let mut hooks = None;
         let mut policies = None;
-        if started.tool_profile != crate::claude_code::PROFILE {
+        if let Some(d) = &delegation {
+            // A subagent works with its parent's tool hooks and policies
+            // (held calls wait in the parent), publisher, memory, notices
+            // and way to the head.
+            let parent = self.parent_tools(&d.parent_session_id).await?.ok_or_else(|| {
+                anyhow::anyhow!("the parent session {} of subagent {session_id} is not on this worker", d.parent_session_id)
+            })?;
+            session_tools.set_hooks(parent.hooks().map(|h| Arc::new(crate::subagent::SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
+            session_tools.set_publisher(parent.publisher());
+            session_tools.set_memory(parent.memory());
+            session_tools.set_notices(parent.notices());
+            session_tools.set_head(parent.head());
+        } else {
+            hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
+            session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: session_id.to_owned() })));
+        }
+        if started.tool_profile != crate::claude_code::PROFILE && delegation.is_none() {
             // Policies first (a denial wins), then your hooks.
             let (ap_tx, mut ap_rx) = mpsc::unbounded_channel();
             policies = crate::policy::Policies::new(&spec.policies_json, &labels, ap_tx);
@@ -630,6 +710,8 @@ impl SessionManager {
                     }
                 }
             });
+        }
+        if started.tool_profile != crate::claude_code::PROFILE {
             // Background tasks report to the actor.
             let (task_tx, mut task_rx) = mpsc::unbounded_channel();
             session_tools.background.set_sink(Some(task_tx));
@@ -659,10 +741,14 @@ impl SessionManager {
             checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, if remote { &local } else { Path::new(&started_cwd) })),
             auto_turns: VecDeque::new(),
             deferred: Vec::new(),
+            on_behalf_of,
+            waiting: Vec::new(),
+            manager: self.clone(),
         };
+        let handle = Handle { tx, tools: actor.session_tools.clone() };
         tokio::spawn(actor.run(rx));
-        self.actors.lock().unwrap().insert(session_id.to_owned(), tx.clone());
-        tx
+        self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
+        Ok(handle)
     }
 }
 
@@ -707,6 +793,34 @@ fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> C
         })
         .unwrap_or(0);
     Conversation { history, context_tokens }
+}
+
+/// How the log's last turn ended: its reason, final assistant text and
+/// last error.
+fn last_turn_outcome(events: &[SessionEvent]) -> Outcome {
+    let start = events.iter().rposition(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).unwrap_or(0);
+    let mut out = Outcome { reason: TurnEndReason::Unspecified, report: String::new(), error: String::new() };
+    for e in &events[start..] {
+        match &e.kind {
+            Some(session_event::Kind::Assistant(a)) => {
+                let text: Vec<&str> = a
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match &b.block {
+                        Some(c6_proto::content_block::Block::Text(t)) if !t.trim().is_empty() => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.is_empty() {
+                    out.report = text.join("\n");
+                }
+            }
+            Some(session_event::Kind::Error(err)) => out.error = err.message.clone(),
+            Some(session_event::Kind::TurnEnded(t)) => out.reason = TurnEndReason::try_from(t.reason).unwrap_or(TurnEndReason::Unspecified),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A side chat's branched-from conversation, made portable when the side
@@ -775,6 +889,13 @@ struct Actor {
     auto_turns: VecDeque<std::time::Instant>,
     /// Notices held back by that limit, delivered with your next message.
     deferred: Vec<PendingInput>,
+    /// The session secrets and head calls are asked for on behalf of: its
+    /// own, or a subagent's top-level session.
+    on_behalf_of: String,
+    /// Delegations waiting for their turn to end: the input's command id.
+    waiting: Vec<(String, tokio::sync::oneshot::Sender<Outcome>)>,
+    /// To start subagents.
+    manager: SessionManager,
 }
 
 impl Actor {
@@ -854,6 +975,10 @@ impl Actor {
                     }
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
+                    }
+                    Some(ActorMsg::Delegate(input, done)) => {
+                        self.waiting.push((input.command_id.clone(), done));
+                        self.inbox.lock().unwrap().push(*input, None);
                     }
                     Some(ActorMsg::Task(ev)) => {
                         let state = match ev.state {
@@ -941,7 +1066,12 @@ impl Actor {
                     running = None;
                     self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
                     match done {
-                        Ok(Some(conv)) => self.conv = Some(conv),
+                        Ok(Some(conv)) => {
+                            self.conv = Some(conv);
+                            if let Err(e) = self.settle_delegations().await {
+                                error!(session = %self.writer.session_id, "reading a delegation's outcome: {e:#}");
+                            }
+                        }
                         // The log and the in-memory state may disagree, and
                         // queued inputs may be lost: stop, and let the next
                         // command (or the head's redelivery) rebuild the
@@ -955,6 +1085,29 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Tells delegations whose input a turn took (no longer queued) how
+    /// that turn ended: the last turn in the log.
+    async fn settle_delegations(&mut self) -> anyhow::Result<()> {
+        if self.waiting.is_empty() {
+            return Ok(());
+        }
+        let settled: Vec<_> = {
+            let inbox = self.inbox.lock().unwrap();
+            let (done, still): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.waiting).into_iter().partition(|(id, _)| !inbox.queue.iter().any(|(i, _)| &i.command_id == id));
+            self.waiting = still;
+            done
+        };
+        if settled.is_empty() {
+            return Ok(());
+        }
+        let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+        for (_, tx) in settled {
+            let _ = tx.send(last_turn_outcome(&events));
+        }
+        Ok(())
     }
 
     /// Logs a background task's start or end and, for an end the agent
@@ -1072,14 +1225,8 @@ impl Actor {
             session_id: self.writer.session_id.clone(),
             spec: self.spec.clone(),
             started: self.started.clone(),
-            journal: self.journal.clone(),
-            link: self.link.clone(),
-            hooks: self.session_tools.hooks(),
-            secrets: self.session_tools.secrets().clone(),
-            publisher: self.session_tools.publisher(),
-            memory: self.session_tools.memory(),
-            notices: self.session_tools.notices(),
-            head: self.session_tools.head(),
+            log: self.writer.clone(),
+            manager: self.manager.clone(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -1089,6 +1236,10 @@ impl Actor {
         let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
         let checkpoints = self.checkpoints.clone();
         let remote_session = !self.started.ssh_target.is_empty();
+        // Subagents cannot be rewound: their parent's checkpoints cover the
+        // same folder.
+        let subagent = self.spec.delegation.is_some();
+        let on_behalf_of = self.on_behalf_of.clone();
         let secret_names: Vec<String> = {
             let labels = session_labels(
                 &self.spec.labels,
@@ -1105,7 +1256,7 @@ impl Actor {
             let sink: Arc<dyn EventSink> = writer.clone();
             // Secrets for this turn's commands (values only in memory).
             if !secret_names.is_empty() {
-                let (values, errors) = fetch_secrets(&link, &writer.session_id, &secret_names).await;
+                let (values, errors) = fetch_secrets(&link, &on_behalf_of, &secret_names).await;
                 for e in errors {
                     warn!(session = %writer.session_id, "secret unavailable: {e}");
                 }
@@ -1114,20 +1265,22 @@ impl Actor {
             // The files as they are before this turn's messages, for
             // rewinding to before them. A failed snapshot does not stop the
             // turn; the rewind then cannot restore files.
-            let checkpoint = match if remote_session {
-                Err(anyhow::anyhow!("files on an SSH target are not checkpointed"))
-            } else {
-                checkpoints.snapshot().await
-            } {
-                Ok(commit) => Checkpoint { commit, error: String::new() },
-                Err(e) => {
-                    warn!(session = %writer.session_id, "no checkpoint: {e:#}");
-                    Checkpoint { commit: String::new(), error: format!("{e:#}") }
+            if !subagent {
+                let checkpoint = match if remote_session {
+                    Err(anyhow::anyhow!("files on an SSH target are not checkpointed"))
+                } else {
+                    checkpoints.snapshot().await
+                } {
+                    Ok(commit) => Checkpoint { commit, error: String::new() },
+                    Err(e) => {
+                        warn!(session = %writer.session_id, "no checkpoint: {e:#}");
+                        Checkpoint { commit: String::new(), error: format!("{e:#}") }
+                    }
+                };
+                if let Err(e) = sink.append(session_event::Kind::Checkpoint(checkpoint)).await {
+                    error!(session = %writer.session_id, "turn failed: {e:#}");
+                    return None;
                 }
-            };
-            if let Err(e) = sink.append(session_event::Kind::Checkpoint(checkpoint)).await {
-                error!(session = %writer.session_id, "turn failed: {e:#}");
-                return None;
             }
             let result = if claude_code {
                 let inputs = inbox.lock().unwrap().drain();

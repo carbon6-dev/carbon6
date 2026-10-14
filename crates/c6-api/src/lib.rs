@@ -1195,6 +1195,10 @@ pub enum EventKind {
         /// Why a UserPromptSubmit hook blocked it (the model never saw it).
         #[serde(default, skip_serializing_if = "String::is_empty")]
         blocked: String,
+        /// In a subagent: the parent's tool call that sent it; empty when
+        /// you did.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        delegated_by: String,
     },
     TurnStarted {
         turn: u64,
@@ -1264,6 +1268,18 @@ pub enum EventKind {
         elapsed_ms: u64,
         #[serde(default)]
         notify: bool,
+    },
+    /// A tool call started a subagent (the child session).
+    SubagentSpawned {
+        call_id: String,
+        child_session_id: String,
+        /// The named agent; empty for a general-purpose one.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        agent: String,
+        description: String,
+        /// Set when it runs in the background.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        background_task_id: String,
     },
     /// A deliverable the agent published. Its content:
     /// `GET /api/v1/sessions/{id}/outputs/{seq}` (`?download=1` to save).

@@ -365,6 +365,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         memex_calendar: memex && scope.iter().any(|k| k == "event"),
         prompts_json: crate::prompts::for_worker(st, &row.realm).await,
         seed,
+        delegation: None,
     })
 }
 

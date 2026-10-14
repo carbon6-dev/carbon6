@@ -33,6 +33,14 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             command: u.command.clone(),
             prompt: u.prompt.clone(),
             blocked: u.blocked.clone(),
+            delegated_by: u.delegated_by.clone(),
+        },
+        Kind::SubagentSpawned(s) => api::EventKind::SubagentSpawned {
+            call_id: s.call_id.clone(),
+            child_session_id: s.child_session_id.clone(),
+            agent: s.agent.clone(),
+            description: s.description.clone(),
+            background_task_id: s.background_task_id.clone(),
         },
         Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn },
         Kind::Assistant(a) => api::EventKind::Assistant {

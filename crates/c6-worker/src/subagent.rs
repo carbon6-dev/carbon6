@@ -1,55 +1,77 @@
-//! Subagents: `Task` runs a child session on this worker with a fresh
-//! conversation and the parent's tools minus `Task` itself. The child's log
-//! syncs to the head like any session, linked to the parent call.
+//! Subagents: `Task` starts a child session on this worker with a fresh
+//! conversation and the parent's tools (filtered by the named agent). The
+//! child is a session like any other, with its own actor and log, linked
+//! to the parent call (docs/subagents.md). Its log syncs to the head like
+//! any session's.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use c6_agent::{Conversation, EventSink, TurnConfig, run_turn};
-use c6_llm::{Block, Message, ModelClient, Role};
-use c6_proto::{CreateSession, ModelSpec, SessionEvent, SessionStarted, UserMessage, session_event};
-use c6_tools::{AgentDef, SessionTools, Subagents, Task, Tool};
+use c6_agent::{EventSink, PendingInput, TurnConfig};
+use c6_llm::ModelClient;
+use c6_proto::{CreateSession, Delegation, ModelSpec, SessionStarted, SubagentSpawned, TurnEndReason, session_event};
+use c6_tools::{AgentDef, Subagents, Task, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::journal::Journal;
-use crate::link::HeadLink;
-use crate::session::Writer;
+use crate::session::{SessionManager, Writer};
 
-/// What a subagent inherits from its parent session.
+/// How deep subagents may nest: the top-level session is depth 0, so its
+/// subagents (depth 1) cannot start their own.
+const MAX_DEPTH: u32 = 1;
+
+/// The session a subagent is started from.
 pub struct Parent {
     pub session_id: String,
     pub spec: CreateSession,
     pub started: SessionStarted,
-    pub journal: Arc<Journal>,
-    pub link: Arc<HeadLink>,
-    /// Its hooks apply to the subagent's tool calls too.
-    pub hooks: Option<Arc<dyn c6_tools::Hooks>>,
-    /// And its secrets to the subagent's commands.
-    pub secrets: c6_tools::Secrets,
-    /// What a subagent publishes appears in the parent's Outputs.
-    pub publisher: Option<c6_tools::PublishSink>,
-    /// And its memory changes are the parent's.
-    pub memory: Option<c6_tools::MemorySink>,
-    /// And its notices.
-    pub notices: Option<c6_tools::NoticeSink>,
-    /// And its way to the head (the memex tools, in its scope).
-    pub head: Option<Arc<dyn c6_tools::HeadCaller>>,
+    /// The parent's log (for `SubagentSpawned`).
+    pub log: Arc<Writer>,
+    pub manager: SessionManager,
 }
 
 pub struct Runner {
     parent: Parent,
     cfg: TurnConfig,
-    client: Arc<dyn ModelClient>,
     tools: Vec<Arc<dyn Tool>>,
 }
 
 impl Runner {
-    pub fn new(parent: Parent, cfg: &TurnConfig, client: Arc<dyn ModelClient>, tools: &[Arc<dyn Tool>]) -> Self {
-        let cfg = cfg.clone();
-        let tools = tools.iter().filter(|t| !Task::is_task(&t.spec().name)).cloned().collect();
-        Self { parent, cfg, client, tools }
+    pub fn new(parent: Parent, cfg: &TurnConfig, _client: Arc<dyn ModelClient>, tools: &[Arc<dyn Tool>]) -> Self {
+        Self { parent, cfg: cfg.clone(), tools: tools.to_vec() }
     }
+}
+
+/// What a subagent's journaled spec says about its agent, to rebuild its
+/// tools when it is loaded again.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AgentJson {
+    name: String,
+    #[serde(default)]
+    tools: Vec<String>,
+}
+
+/// The tools a subagent has, of those its session would otherwise get:
+/// those its named agent allows, and no Task below the depth limit.
+pub(crate) fn delegated_tools(d: &Delegation, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    let agent = serde_json::from_str::<AgentJson>(&d.agent_json).ok().map(|a| AgentDef {
+        name: a.name,
+        description: String::new(),
+        tools: a.tools,
+        model: String::new(),
+        prompt: String::new(),
+    });
+    filter_tools(tools, agent.as_ref(), d.depth)
+}
+
+fn filter_tools(tools: Vec<Arc<dyn Tool>>, agent: Option<&AgentDef>, depth: u32) -> Vec<Arc<dyn Tool>> {
+    tools
+        .into_iter()
+        .filter(|t| {
+            let name = t.spec().name;
+            !(Task::is_task(&name) && depth >= MAX_DEPTH) && agent.is_none_or(|a| a.allows(&name))
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -60,28 +82,33 @@ impl Subagents for Runner {
         description: &str,
         prompt: &str,
         agent: Option<&AgentDef>,
+        background: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
         let child_id = uuid::Uuid::now_v7().to_string();
         let p = &self.parent;
-        let tools: Vec<Arc<dyn Tool>> = self.tools.iter().filter(|t| agent.is_none_or(|a| a.allows(&t.spec().name))).cloned().collect();
-        let mut cfg = TurnConfig { cache_key: child_id.clone(), ..self.cfg.clone() };
+        let depth = p.spec.delegation.as_ref().map_or(0, |d| d.depth) + 1;
+        let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
+        let tools = filter_tools(self.tools.clone(), agent, depth);
+        let mut model = self.cfg.model.clone();
         if !p.spec.subagent_model.trim().is_empty() {
-            cfg.model = p.spec.subagent_model.trim().to_owned();
+            model = p.spec.subagent_model.trim().to_owned();
         }
+        let mut system_prompt = p.started.system_prompt.clone();
         if let Some(a) = agent {
             // The agent's instructions are its system prompt.
-            cfg.system_prompt = format!(
+            system_prompt = format!(
                 "{}\n\n# Environment\n\nWorking directory: {}\nToday's date: {}",
                 a.prompt,
                 p.started.cwd,
                 time::OffsetDateTime::now_utc().date()
             );
             let kind = p.spec.model.as_ref().map(|m| m.connection_kind.as_str()).unwrap_or_default();
-            if let Some(model) = agent_model(&a.model, kind) {
-                cfg.model = model;
+            if let Some(m) = agent_model(&a.model, kind) {
+                model = m;
             }
         }
+        let model_spec = p.spec.model.clone().map(|m| ModelSpec { model: model.clone(), ..m });
         let started = SessionStarted {
             title: match agent {
                 Some(a) => format!("{description} ({})", a.name),
@@ -90,51 +117,84 @@ impl Subagents for Runner {
             parent_session_id: p.session_id.clone(),
             parent_call_id: parent_call_id.to_owned(),
             tools: tools.iter().map(|t| t.spec().name).collect(),
-            system_prompt: if agent.is_some() { cfg.system_prompt.clone() } else { p.started.system_prompt.clone() },
-            model: p.started.model.clone().map(|m| ModelSpec { model: cfg.model.clone(), ..m }),
+            system_prompt,
+            model: model_spec.clone(),
+            agent: agent.map(|a| a.name.clone()).unwrap_or_default(),
+            depth,
             ..p.started.clone()
         };
-        let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
+        let delegation = Delegation {
+            parent_session_id: p.session_id.clone(),
+            parent_call_id: parent_call_id.to_owned(),
+            root_session_id: root,
+            agent_json: agent
+                .map(|a| serde_json::to_string(&AgentJson { name: a.name.clone(), tools: a.tools.clone() }).unwrap_or_default())
+                .unwrap_or_default(),
+            depth,
+        };
         // Subagents start fresh: a side chat's seed is not theirs.
-        let spec = CreateSession { seed: Vec::new(), ..p.spec.clone() };
-        p.journal.create_session(&child_id, &spec, &ev).await.map_err(|e| format!("{e:#}"))?;
+        let spec = CreateSession { seed: Vec::new(), model: model_spec, delegation: Some(delegation), ..p.spec.clone() };
+
+        // The parent's log links to the child before the child's exists.
+        p.log
+            .append(session_event::Kind::SubagentSpawned(SubagentSpawned {
+                call_id: parent_call_id.to_owned(),
+                child_session_id: child_id.clone(),
+                agent: agent.map(|a| a.name.clone()).unwrap_or_default(),
+                description: description.to_owned(),
+                background_task_id: background.unwrap_or_default().to_owned(),
+            }))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let child = p.manager.start_subagent(&child_id, spec, started, tools).await.map_err(|e| format!("{e:#}"))?;
         info!(parent = %p.session_id, child = %child_id, %description, "subagent started");
 
-        let writer: Arc<dyn EventSink> = Arc::new(Writer {
-            session_id: child_id.clone(),
-            journal: p.journal.clone(),
-            link: p.link.clone(),
-            next_seq: tokio::sync::Mutex::new(2),
-        });
         let note = crate::session::spec_prompt(&p.spec, "session.subagent", c6_agent::SUBAGENT_NOTE);
-        let text = format!("{prompt}\n\n---\n{note}");
-        writer
-            .append(session_event::Kind::User(UserMessage { command_id: String::new(), text: text.clone(), ..Default::default() }))
-            .await
-            .map_err(|e| format!("{e:#}"))?;
+        let input = PendingInput {
+            command_id: format!("delegation:{}", uuid::Uuid::now_v7()),
+            text: prompt.to_owned(),
+            prompt: format!("{prompt}\n\n---\n{note}"),
+            delegated_by: parent_call_id.to_owned(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        child.send(crate::session::ActorMsg::Delegate(Box::new(input), tx)).map_err(|_| "the subagent stopped before it started".to_owned())?;
+        // Stopping the parent's turn (or this background task) stops the
+        // subagent's turn; its log keeps what it did. The delegation's
+        // outcome follows once that turn closes.
+        let mut guard = InterruptOnDrop(Some(child.clone()));
+        let outcome = tokio::select! {
+            o = &mut rx => o,
+            _ = cancel.cancelled() => {
+                let _ = child.send(crate::session::ActorMsg::Interrupt);
+                (&mut rx).await
+            }
+        };
+        guard.0 = None;
+        finish(&child_id, outcome.ok())
+    }
+}
 
-        let session_tools = Arc::new(SessionTools::new(std::path::PathBuf::from(&started.cwd)));
-        session_tools.set_hooks(p.hooks.clone().map(|h| Arc::new(SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
-        session_tools.set_secrets(p.secrets.env());
-        session_tools.set_publisher(p.publisher.clone());
-        session_tools.set_memory(p.memory.clone());
-        session_tools.set_notices(p.notices.clone());
-        session_tools.set_head(p.head.clone());
-        let mut conv = Conversation { history: vec![Message::user_text(text)], context_tokens: 0 };
-        let reason = run_turn(1, &cfg, self.client.as_ref(), &tools, &session_tools, &writer, &mut conv, &mut Vec::new, &cancel)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        let answer: Vec<String> = conv
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant && m.blocks.iter().any(|b| matches!(b, Block::Text(t) if !t.trim().is_empty())))
-            .map(|m| m.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.clone()) } else { None }).collect())
-            .unwrap_or_default();
-        if answer.is_empty() {
-            return Err(format!("the subagent ended ({reason:?}) without a report"));
+/// Interrupts the subagent if the call is dropped before it returns.
+struct InterruptOnDrop(Option<tokio::sync::mpsc::UnboundedSender<crate::session::ActorMsg>>);
+
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        if let Some(c) = &self.0 {
+            let _ = c.send(crate::session::ActorMsg::Interrupt);
         }
-        Ok(format!("{}\n\n[subagent session {child_id}]", answer.join("\n")))
+    }
+}
+
+/// The tool result for a delegation's outcome.
+fn finish(child_id: &str, outcome: Option<crate::session::Outcome>) -> Result<String, String> {
+    let Some(o) = outcome else { return Err(format!("the subagent stopped unexpectedly [subagent session {child_id}]")) };
+    match o.reason {
+        TurnEndReason::Completed if !o.report.trim().is_empty() => Ok(format!("{}\n\n[subagent session {child_id}]", o.report)),
+        reason => {
+            let why = if o.error.is_empty() { String::new() } else { format!(": {}", o.error) };
+            Err(format!("the subagent ended ({reason:?}) without a report{why}"))
+        }
     }
 }
 
@@ -155,7 +215,7 @@ fn agent_model(wanted: &str, connection_kind: &str) -> Option<String> {
 }
 
 /// The parent's tool hooks; Stop hooks are for the main session only.
-struct SubagentHooks(Arc<dyn c6_tools::Hooks>);
+pub(crate) struct SubagentHooks(pub(crate) Arc<dyn c6_tools::Hooks>);
 
 #[async_trait]
 impl c6_tools::Hooks for SubagentHooks {

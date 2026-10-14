@@ -45,6 +45,8 @@ pub struct PendingInput {
     pub prompt: String,
     /// Why a UserPromptSubmit hook blocked it, if one did.
     pub blocked: String,
+    /// In a subagent: the parent's tool call that sent it.
+    pub delegated_by: String,
 }
 
 impl PendingInput {
@@ -57,6 +59,7 @@ impl PendingInput {
             command: self.command.clone(),
             prompt: self.prompt.clone(),
             blocked: self.blocked.clone(),
+            delegated_by: self.delegated_by.clone(),
         })
     }
 
