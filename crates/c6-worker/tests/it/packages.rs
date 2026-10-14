@@ -384,7 +384,13 @@ async fn template_start_through_an_export() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
     assert_eq!(started.realm, "maker");
-    let seen = w.mock.requests().iter().map(|r| r["messages"].to_string()).collect::<Vec<_>>().join("\n");
+    let seen = loop {
+        let seen = w.mock.requests().iter().map(|r| r["messages"].to_string()).collect::<Vec<_>>().join("\n");
+        if seen.contains("Make: a chair") || tokio::time::Instant::now() >= deadline {
+            break seen;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert!(seen.contains("may not start maker's template \\\"secret\\\""), "{seen}");
     assert!(seen.contains("Make: a chair"), "{seen}");
     w.stop().await;
