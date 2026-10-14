@@ -75,6 +75,26 @@ async fn realms_have_their_own_knowledge() {
     let lab_brief = c6_head::memex::brief(st, "lab", &["ci:buildkite".to_owned()], "fix CI").await;
     assert!(lab_brief.contains("Lab CI runs on Buildkite"), "{lab_brief}");
     assert!(!c6_head::memex::brief(st, "home", &["ci:buildkite".to_owned()], "fix CI").await.contains("Buildkite"));
+    // The explorer reads lab's knowledge: counts, lists, a thing and its facts.
+    let sum: c6_api::RealmSummary = http.get(format!("{api}/realms/lab/summary")).send().await.unwrap().json().await.unwrap();
+    assert!(sum.knowledge, "{sum:?}");
+    assert!(sum.entries.iter().any(|e| e.section == "items:note" && e.count >= 1), "{:?}", sum.entries);
+    assert!(sum.entries.iter().any(|e| e.section.starts_with("facts:") && e.count >= 1), "{:?}", sum.entries);
+    let things: Vec<c6_api::ExRef> = http.get(format!("{api}/realms/lab/list?section=things:")).send().await.unwrap().json().await.unwrap();
+    assert!(!things.is_empty());
+    let t: c6_api::ExObject =
+        http.get(format!("{api}/realms/lab/object?kind=thing&id=ci:buildkite")).send().await.unwrap().json().await.unwrap();
+    let facts = t.connected.iter().find(|g| g.label == "Facts about it").expect("facts");
+    assert_eq!(facts.items[0].title, "Lab CI runs on Buildkite");
+    let notes: Vec<c6_api::ExRef> =
+        http.get(format!("{api}/realms/lab/list?section=items:note")).send().await.unwrap().json().await.unwrap();
+    let item: c6_api::ExObject =
+        http.get(format!("{api}/realms/lab/object?kind=item&id={}", notes[0].id)).send().await.unwrap().json().await.unwrap();
+    assert!(item.body.contains("eu-west"), "{item:?}");
+    // Home's mail and photos link out to their own pages.
+    let home: c6_api::RealmSummary = http.get(format!("{api}/realms/home/summary")).send().await.unwrap().json().await.unwrap();
+    assert!(home.knowledge);
+
     // Its own database, under home's.
     assert!(dir.path().join("memex/realms/lab/memex.db").exists());
     // Mail and the like are home's.

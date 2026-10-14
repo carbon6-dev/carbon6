@@ -7,6 +7,7 @@ pub mod calendar;
 pub mod contacts;
 pub mod docs;
 pub mod embed;
+mod explore;
 pub mod faces;
 pub mod google;
 pub mod ingest;
@@ -828,6 +829,9 @@ impl Memex {
                 let limit = params["limit"].as_u64().unwrap_or(40).min(150) as u32;
                 Ok(json!(review::graph(&self.store, params["id"].as_str().unwrap_or_default(), &allowed, limit).await?))
             }
+            "memex.explore.inventory" => explore::inventory(self, &allowed).await,
+            "memex.explore.list" => explore::list(self, &params, &allowed).await,
+            "memex.explore.thing" => explore::about_thing(self, params["id"].as_str().unwrap_or_default(), &allowed).await,
             "memex.months" => Ok(review::histogram(&self.store, params["id"].as_str().unwrap_or_default(), &allowed).await?),
             "memex.knowledge.record" => knowledge::record(self, &params).await,
             "memex.knowledge.verify" => knowledge::verify(self, &params).await,

@@ -11,6 +11,7 @@ pub mod config;
 mod convert;
 mod cron;
 pub mod decisions;
+pub mod explorer;
 mod export;
 pub mod fabric;
 pub mod google;

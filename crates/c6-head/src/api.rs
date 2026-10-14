@@ -143,6 +143,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
+        .route("/api/v1/explorer/map", get(explorer_map))
+        .route("/api/v1/realms/{id}/summary", get(realm_summary))
+        .route("/api/v1/realms/{id}/activity", get(realm_activity))
+        .route("/api/v1/realms/{id}/list", get(realm_list))
+        .route("/api/v1/realms/{id}/object", get(realm_object))
         .route("/api/v1/apps", get(list_apps).post(install_app))
         .route("/api/v1/apps/plan", post(plan_app))
         .route("/api/v1/apps/export", get(export_app))
@@ -908,16 +913,27 @@ async fn delete_memory(State(st): State<Arc<HeadState>>, Path(id): Path<String>)
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_automations(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Automation>>> {
+/// Triggers the caller may see; `?realm=`: one realm's.
+async fn list_automations(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::Automation>>> {
+    let caller = match r.realm.as_deref().filter(|x| !x.is_empty()) {
+        Some(x) => Caller::in_realm(&caller.realm_for_new(Some(x))?),
+        None => caller,
+    };
     Ok(Json(crate::triggers::list(&st, &caller).await?))
 }
 
+/// A new trigger in `?realm=` (default: the caller's, else home).
 async fn create_automation(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
     Json(e): Json<api::AutomationEdit>,
 ) -> ApiResult<Json<api::Automation>> {
-    let realm = caller.realm_for_new(None)?;
+    let realm = realm_for(&st, &caller, &r).await?;
     Ok(Json(crate::triggers::create(&st, e, &realm).await?))
 }
 
@@ -2208,6 +2224,86 @@ async fn delete_realm(State(st): State<Arc<HeadState>>, Path(id): Path<String>) 
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- The realm explorer (docs/explorer.md) -----------------------------------
+
+async fn explorer_map(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::explorer::map(&st).await?))
+}
+
+/// The realm asked for, if the caller may see it.
+async fn explored(st: &HeadState, caller: &Caller, id: &str) -> anyhow::Result<()> {
+    if !caller.sees(id) {
+        return Err(crate::forbidden(format!("this token is limited to realm {}", caller.realm.as_deref().unwrap_or(""))));
+    }
+    if !crate::realms::exists(st, id).await? {
+        return Err(crate::not_found("no such realm"));
+    }
+    Ok(())
+}
+
+async fn realm_summary(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::RealmSummary>> {
+    explored(&st, &caller, &id).await?;
+    Ok(Json(crate::explorer::summary(&st, &id).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ActivityQuery {
+    /// ms; default a day ago.
+    #[serde(default)]
+    since: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn realm_activity(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<ActivityQuery>,
+) -> ApiResult<Json<Vec<api::ExRef>>> {
+    explored(&st, &caller, &id).await?;
+    let since = q.since.unwrap_or_else(|| c6_core::now_ms() - 86_400_000);
+    Ok(Json(crate::explorer::activity(&st, &id, since, q.limit.unwrap_or(100).clamp(1, 500)).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ExListQuery {
+    /// From the summary's entries: collection:<name>, series, things:<kind>, items:<kind>, facts:<status>, sessions, decisions:open, decisions:closed, triggers, list:<key>, memory, secrets, grants:in, grants:out, workers, connections.
+    section: String,
+    #[serde(default)]
+    q: String,
+}
+
+async fn realm_list(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<ExListQuery>,
+) -> ApiResult<Json<Vec<api::ExRef>>> {
+    explored(&st, &caller, &id).await?;
+    Ok(Json(crate::explorer::list(&st, &id, &q.section, &q.q).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ExObjectQuery {
+    kind: String,
+    id: String,
+}
+
+async fn realm_object(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<ExObjectQuery>,
+) -> ApiResult<Json<api::ExObject>> {
+    explored(&st, &caller, &id).await?;
+    Ok(Json(crate::explorer::object(&st, &id, &q.kind, &q.id).await?))
+}
+
 // --- Apps (docs/os.md §5) ----------------------------------------------------
 
 async fn list_apps(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::AppInstall>>> {
@@ -2467,9 +2563,10 @@ async fn list_decisions(
 async fn add_decision(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
     Json(d): Json<api::DecisionIn>,
 ) -> ApiResult<Json<api::Decision>> {
-    let realm = caller.realm_for_new(None)?;
+    let realm = realm_for(&st, &caller, &r).await?;
     Ok(Json(crate::decisions::open(&st, &d, &realm, "").await?))
 }
 

@@ -15,6 +15,7 @@ mod collections;
 mod commands;
 mod decisions;
 mod examples;
+mod explorer;
 mod fixtures;
 mod grants;
 mod hooks;

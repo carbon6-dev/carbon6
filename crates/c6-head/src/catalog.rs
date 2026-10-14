@@ -171,6 +171,7 @@ const AREAS: &[(&str, &str)] = &[
         "apps",
         "Apps: packages of configuration (collections, series, triggers, views, skills, templates…) installed into realms of their own; install, upgrade, export, remove.",
     ),
+    ("explorer", "The realm explorer: what each realm holds, what happened lately, and every object with what is connected to it."),
     ("views", "Views: a realm's configured screens (tables, boards, records, charts, feeds, pages) and their actions."),
     ("series", "Series: numbers over time in a realm (points with dimensions), summarized over windows; thresholds are triggers."),
     ("system", "carbon6 itself: realms, upgrades of its databases, and the backups made before each."),
@@ -255,6 +256,13 @@ fn build() -> Vec<Op> {
     v.extend(list_setting!("settings.channels.get", "settings.channels.put", "notifications", "/api/v1/settings/channels", api::Channel, "Notification channels (push, ntfy, Slack, Discord, webhook, email) and what goes to each."));
     v.extend(list_setting!("settings.prices.get", "settings.prices.put", "usage", "/api/v1/settings/prices", api::Price, "Model prices, for cost estimates."));
     v.extend(list_setting!("settings.budgets.get", "settings.budgets.put", "usage", "/api/v1/settings/budgets", api::Budget, "Budgets: spending limits per period and label, warn or stop."));
+    v.extend([
+        op!("explorer.map", "explorer", "GET" "/api/v1/explorer/map", Read, Input::None, "Every realm with what it holds (counts by data, knowledge, work, config), its app, spend this month, what needs attention, and the grants between realms."),
+        op!("explorer.summary", "explorer", "GET" "/api/v1/realms/{id}/summary", Read, Input::None, "A realm's inventory (each collection, series, kind of knowledge, sessions, decisions, triggers, settings lists with what root gives it, grants, workers), what needs attention, and spend this month.", choices = &[("id", "realms.list")]),
+        op!("explorer.activity", "explorer", "GET" "/api/v1/realms/{id}/activity", Read, Input::Query(schema::<crate::api::ActivityQuery>), "What happened in a realm lately: records changed, decisions, sessions, trigger runs, points, knowledge added; newest first.", choices = &[("id", "realms.list")]),
+        op!("explorer.list", "explorer", "GET" "/api/v1/realms/{id}/list", Read, Input::Query(schema::<crate::api::ExListQuery>), "The objects of one section of a realm's inventory (the section names come from its summary).", choices = &[("id", "realms.list")]),
+        op!("explorer.object", "explorer", "GET" "/api/v1/realms/{id}/object", Read, Input::Query(schema::<crate::api::ExObjectQuery>), "One object of a realm (collection, record <collection>/<id>, series, thing, item, fact, session, decision, trigger, grant, view, entry) with everything connected to it: the things a record links to, sessions and decisions about it, triggers that watch or wrote it, and so on.", choices = &[("id", "realms.list")]),
+    ]);
     v.extend([
         op!("apps.list", "apps", "GET" "/api/v1/apps", Read, Input::None, "Installed apps: each a package of configuration in a realm of its own, with its version and state."),
         op!("apps.plan", "apps", "POST" "/api/v1/apps/plan", Read, Input::Body(schema::<api::AppPackage>), "What installing a package would create, what it needs, and why it could not go ahead."),

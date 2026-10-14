@@ -688,11 +688,11 @@ pub async fn run_template(name: String, input: String) -> Result<c6_api::Templat
 }
 
 pub async fn automations() -> Result<Vec<c6_api::Automation>, String> {
-    json(Request::get("/api/v1/automations").send().await).await
+    json(Request::get(&format!("/api/v1/automations{}", in_realm('?'))).send().await).await
 }
 
 pub async fn create_automation(e: c6_api::AutomationEdit) -> Result<c6_api::Automation, String> {
-    send_json(Request::post("/api/v1/automations"), &e).await
+    send_json(Request::post(&format!("/api/v1/automations{}", in_realm('?'))), &e).await
 }
 
 pub async fn update_automation(id: String, e: c6_api::AutomationEdit) -> Result<c6_api::Automation, String> {

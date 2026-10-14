@@ -52,9 +52,7 @@ async fn example_apps_install_and_work() {
     }
 
     // Everything the factory brings is there.
-    let count = |path: String| {
-        async move { ok(send(M::GET, &path, json!({})).await).await.as_array().map(Vec::len).unwrap_or(0) }
-    };
+    let count = |path: String| async move { ok(send(M::GET, &path, json!({})).await).await.as_array().map(Vec::len).unwrap_or(0) };
     let cols = ok(send(M::GET, "collections?realm=factory", json!({})).await).await;
     let mine: Vec<&str> = cols.as_array().unwrap().iter().filter(|c| c["system"] == false).map(|c| c["name"].as_str().unwrap()).collect();
     assert_eq!(mine, vec!["candidates", "incidents", "services"]);

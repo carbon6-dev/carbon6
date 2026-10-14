@@ -287,6 +287,98 @@ pub struct RecordQuery {
     pub within: serde_json::Map<String, serde_json::Value>,
 }
 
+/// An object the realm explorer shows (docs/explorer.md): a record, a
+/// thing, a session…, by kind and id.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExRef {
+    /// collection, record, series, thing, item, fact, session, decision,
+    /// trigger, grant, view, entry, secret, worker, connection, realm.
+    pub kind: String,
+    /// A record's id is <collection>/<id>; a settings entry's <list>/<name>.
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub sub: String,
+    #[serde(default)]
+    pub at: Option<UnixMs>,
+}
+
+/// One line of a realm's inventory.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExEntry {
+    /// data, knowledge, work, config, flow or infrastructure.
+    pub group: String,
+    /// What `GET …/list?section=` takes (e.g. collection:deals, things:person).
+    pub section: String,
+    pub label: String,
+    pub count: i64,
+    /// Entries inherited from root (settings lists).
+    #[serde(default)]
+    pub inherited: i64,
+    #[serde(default)]
+    pub changed_at: Option<UnixMs>,
+    /// A page of carbon6 that owns it, when the explorer links out.
+    #[serde(default)]
+    pub link: Option<String>,
+}
+
+/// `GET /api/v1/realms/{id}/summary`: what a realm holds, and what needs
+/// attention.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RealmSummary {
+    pub realm: Realm,
+    #[serde(default)]
+    pub app: Option<AppInstall>,
+    pub entries: Vec<ExEntry>,
+    /// What needs attention, each with what it is about.
+    pub health: Vec<ExRef>,
+    /// Model spend this month, at today's prices.
+    pub spend_month: f64,
+    #[serde(default)]
+    pub last_activity: Option<UnixMs>,
+    /// Whether its knowledge could be read (a memex is connected).
+    pub knowledge: bool,
+}
+
+/// Related objects, under a heading.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExGroup {
+    pub label: String,
+    pub items: Vec<ExRef>,
+    /// How many more there are than shown.
+    #[serde(default)]
+    pub more: i64,
+}
+
+/// `GET /api/v1/realms/{id}/object?kind=&id=`: one object and everything
+/// connected to it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExObject {
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub sub: String,
+    /// Text to show (Markdown): a document, a summary, a definition.
+    #[serde(default)]
+    pub body: String,
+    /// Its fields, as label and value.
+    #[serde(default)]
+    pub fields: Vec<(String, String)>,
+    /// The page of carbon6 where it is edited.
+    #[serde(default)]
+    pub open: Option<String>,
+    pub connected: Vec<ExGroup>,
+    /// The object as its own API returns it.
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
 /// An app (docs/os.md §5): a package of configuration, with no code,
 /// installed into a realm of its own.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
