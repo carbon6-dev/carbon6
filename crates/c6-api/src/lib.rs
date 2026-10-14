@@ -578,6 +578,10 @@ pub struct PackageIn {
     /// Its files: path → base64.
     #[serde(default)]
     pub files: std::collections::BTreeMap<String, String>,
+    /// Text files, as they are (UTF-8): path → text. Packages written by
+    /// hand put their Dockerfile and scripts here.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub text_files: std::collections::BTreeMap<String, String>,
 }
 
 /// A package installed: in a realm (apps, libraries), or for every worker

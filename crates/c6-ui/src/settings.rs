@@ -413,7 +413,7 @@ fn Apps() -> impl IntoView {
         if v.get("manifest").is_some() {
             serde_json::from_value(v).map_err(|e| e.to_string())
         } else {
-            Ok(c6_api::PackageIn { manifest: v, files: Default::default() })
+            Ok(c6_api::PackageIn { manifest: v, ..Default::default() })
         }
     };
     let add = move |then_install: bool| {

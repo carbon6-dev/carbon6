@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 const FACTORY: &str = include_str!("../../../../examples/apps/service-factory.json");
 const CRM: &str = include_str!("../../../../examples/apps/personal-crm.json");
 const DECKS: &str = include_str!("../../../../examples/apps/decks.json");
+const DECKS_RENDER: &str = include_str!("../../../../examples/packages/decks-render.json");
 
 #[tokio::test]
 async fn example_apps_install_and_work() {
@@ -42,6 +43,9 @@ async fn example_apps_install_and_work() {
         async move { http.get(format!("{api}/decisions")).send().await.unwrap().json::<Vec<Decision>>().await.unwrap() }
     };
 
+    // The kit decks requires, in the registry first.
+    let kit = ok(send(M::POST, "packages", serde_json::from_str(DECKS_RENDER).unwrap()).await).await;
+    assert_eq!(kit["roles"], json!(["kit"]));
     for (pkg, realm) in [(FACTORY, "factory"), (CRM, "crm"), (DECKS, "decks")] {
         let p: Value = serde_json::from_str(pkg).unwrap();
         let plan: AppPlan = send(M::POST, "apps/plan", p.clone()).await.json().await.unwrap();
@@ -52,7 +56,11 @@ async fn example_apps_install_and_work() {
         assert!(r.status().is_success(), "{realm}: {}", r.text().await.unwrap());
     }
 
-    // The decks app: its themes, skills, templates and views.
+    // The decks app, with the kit it renders with.
+    let installs = ok(send(M::GET, "installs", json!({})).await).await;
+    let render = installs.as_array().unwrap().iter().find(|i| i["package"] == "decks-render").expect("decks-render installed with decks");
+    assert_eq!(render["state"], "installed");
+    // Its themes, skills, templates and views.
     let themes = ok(send(M::GET, "collections/themes/records?realm=decks", json!({})).await).await;
     assert_eq!(themes["total"], 3);
     assert!(themes["records"].as_array().unwrap().iter().all(|t| t["fields"]["css"].as_str().unwrap().contains("--accent")));

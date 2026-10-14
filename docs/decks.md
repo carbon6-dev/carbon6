@@ -16,6 +16,8 @@ carbon6 makes presentation decks the way Claude does: from a prompt to an outlin
 - **Tools show images to the model.** `read` on an image file returns the image, and the browser's `screenshot` returns what it captures. It can capture one element (`selector`, e.g. one slide), the whole page, or the window at a set size (`width`, `height`). Tool images are kept in the conversation (the latest 12) and shown in the transcript. Every provider gets them (Anthropic, OpenAI Responses, Chat Completions).
 - **The browser prints PDFs:** `pdf {path}` uses the page's CSS `@page` size and includes backgrounds.
 
+- **The decks-render kit** (`examples/packages/decks-render.json`, docs/packages.md): headless Chromium, poppler, python-pptx and open fonts in an image every worker builds for itself, run in a sandbox with no network. Its tools: `pdf`, `slides` (a PNG per slide), `slide` (one) and `pptx` (a picture per slide). The decks app requires it (version 1.1), so a worker needs only Docker or Podman; the app's skills use `kit_run` instead of the browser.
+
 ## 3. The decks app (`examples/apps/decks.json`)
 
 - **Collections:**
@@ -33,9 +35,9 @@ carbon6 makes presentation decks the way Claude does: from a prompt to an outlin
     2. write the outline, then ask you as a decision (approve, or say what to change);
     3. ask which theme;
     4. build;
-    5. look at every slide and fix it;
-    6. print the PDF;
-    7. publish the HTML and the PDF;
+    5. look at every slide (rendered by the kit) and fix it;
+    6. print the PDF (and PowerPoint, when asked);
+    7. publish the files;
     8. mark the deck delivered.
 
     The agent waits for each answer, which arrives as a message.

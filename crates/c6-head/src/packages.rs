@@ -241,6 +241,14 @@ pub async fn add_in(st: &HeadState, p: api::PackageIn) -> anyhow::Result<api::Pa
         let data = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|e| bad_request(format!("{path}: {e}")))?;
         files.insert(path, data);
     }
+    for (path, text) in p.text_files {
+        if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+            return Err(bad_request(format!("{path:?} is not a file path inside the package")));
+        }
+        if files.insert(path.clone(), text.into_bytes()).is_some() {
+            return Err(bad_request(format!("{path} is given twice")));
+        }
+    }
     add(st, p.manifest, files, "local").await
 }
 
