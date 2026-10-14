@@ -203,6 +203,8 @@ struct Actor {
     turns: u64,
     inbox: Arc<Mutex<Vec<PendingInput>>>,
     env: Arc<Env>,
+    /// What the model is told when the conversation is compacted.
+    compact: c6_agent::CompactPrompts,
 }
 
 impl Actor {
@@ -249,8 +251,20 @@ impl Actor {
             labels: row.all_labels(),
         });
         let conv = Conversation { history: history_from_events(&c6_agent::effective_events(&events)), context_tokens: 0 };
-        let mut actor =
-            Actor { st, session_id, sink, model, system_prompt, started, applied, conv: Some(conv), turns, inbox: Arc::default(), env };
+        let mut actor = Actor {
+            compact: crate::prompts::compact(&st, crate::realms::ROOT).await,
+            st,
+            session_id,
+            sink,
+            model,
+            system_prompt,
+            started,
+            applied,
+            conv: Some(conv),
+            turns,
+            inbox: Arc::default(),
+            env,
+        };
         let mut running: Option<(tokio::task::JoinHandle<Option<Conversation>>, CancellationToken)> = None;
         loop {
             tokio::select! {
@@ -371,6 +385,7 @@ impl Actor {
             effort: Some(self.model.effort.clone()).filter(|e| !e.is_empty()).or_else(|| info.default_effort.map(str::to_owned)),
             context_window: info.context_window,
             web_search: false,
+            compact: self.compact.clone(),
         };
         let _ = provider;
         let mut conv = self.conv.take().unwrap_or(Conversation { history: Vec::new(), context_tokens: 0 });
@@ -951,13 +966,10 @@ async fn choices(st: &HeadState, op: &str, input: Value) -> anyhow::Result<Vec<a
         .collect())
 }
 
-/// The assistant's instructions.
-pub fn prompt(context: &str) -> String {
-    let areas: String = catalog::areas().iter().map(|(a, d)| format!("- {a}: {d}\n")).collect();
-    format!(
-        "You are the carbon6 assistant. carbon6 is the user's self-hosted command center for AI agents: a head (this server, with the \
-web UI) and workers (machines that run agent sessions), plus a memex (their knowledge store, with mail, calendar, documents and \
-photos). You can do anything the user can do in the UI, through operations.
+/// The assistant's instructions (an editable prompt, `assistant.base`).
+pub const PROMPT: &str = "You are the carbon6 assistant. carbon6 is the user's self-hosted command center for AI agents: a head (this \
+server, with the web UI) and workers (machines that run agent sessions), plus a memex (their knowledge store, with mail, calendar, \
+documents and photos). You can do anything the user can do in the UI, through operations.
 
 How to work:
 - Find operations with c6_discover; read one with c6_describe before using it; run it with c6_call. Answer questions about the \
@@ -975,11 +987,16 @@ vision, transcription) in settings.memex, yourself in settings.assistant. A conn
 tell the user; for something recurring, create an automation or workflow.
 
 Areas of carbon6:
-{areas}
-{}Today is {}.",
-        if context.trim().is_empty() { String::new() } else { format!("The user is looking at: {}\n\n", context.trim()) },
-        chrono::Utc::now().format("%A %-d %B %Y")
-    )
+{{areas}}
+{{context}}Today is {{today}}.";
+
+/// The assistant's instructions, from its prompt.
+pub async fn prompt(st: &HeadState, context: &str) -> String {
+    let areas: String = catalog::areas().iter().map(|(a, d)| format!("- {a}: {d}\n")).collect();
+    let context = if context.trim().is_empty() { String::new() } else { format!("The user is looking at: {}\n\n", context.trim()) };
+    let today = chrono::Utc::now().format("%A %-d %B %Y").to_string();
+    let template = crate::prompts::get(st, "assistant.base", crate::realms::ROOT).await;
+    c6_api::prompts::fill(&template, &[("areas", &areas), ("context", &context), ("today", &today)])
 }
 
 /// The model for a new conversation: the setting, else the routes for the

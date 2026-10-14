@@ -556,9 +556,8 @@ pub async fn events(m: &Memex) -> anyhow::Result<usize> {
     Ok(made)
 }
 
-const LOOK: &str = "Describe this for a private photo archive, so it can be found by search later. JSON only: {\"caption\": one \
-     plain sentence, \"scene\": a few words (e.g. beach at sunset, office meeting), \"objects\": up to 8 short nouns of what is \
-     visible, \"text\": legible text in it, or \"\"}. Do not guess who people are.";
+/// The default photo prompt (`memex.look`).
+const LOOK: &str = api::prompts::LOOK;
 
 /// Has the vision model look at one more photo or video. Whether it did.
 pub async fn look(m: &Memex) -> anyhow::Result<bool> {
@@ -603,9 +602,9 @@ async fn see(m: &Memex, task: &Task, version: &str, r: &sqlx::sqlite::SqliteRow)
         blocks.push(Block::Image { media_type: "image/jpeg".into(), data: tokio::fs::read(m.blob_path(p)).await? });
     }
     let intro = if r.get::<String, _>("kind") == "video" { "These are frames from one video, in order. " } else { "" };
-    blocks.push(Block::Text(format!("{intro}{LOOK}")));
-    let answer =
-        llm::ask(&m.link, task, "You describe pictures faithfully and briefly. Answer with one JSON object.", blocks, 2500).await?;
+    blocks.push(Block::Text(format!("{intro}{}", m.prompt("memex.look", LOOK))));
+    let system = m.prompt("memex.look.system", api::prompts::LOOK_SYSTEM);
+    let answer = llm::ask(&m.link, task, &system, blocks, 2500).await?;
     let v = llm::json_of(&answer)?;
     let s = |k: &str| v[k].as_str().unwrap_or("").trim().to_owned();
     let (caption, scene, seen_text) = (s("caption"), s("scene"), s("text"));

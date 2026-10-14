@@ -2,6 +2,7 @@
 //! Must stay wasm-compatible: no tokio, no std-only dependencies.
 
 pub mod labels;
+pub mod prompts;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -155,6 +156,28 @@ pub struct Session {
 
 fn home_realm() -> String {
     "home".to_owned()
+}
+
+/// `GET /api/v1/settings/prompts`: a prompt carbon6 gives models, with its
+/// default (docs/os.md §4.6).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PromptInfo {
+    pub name: String,
+    /// What it is for, and the placeholders it may use.
+    pub description: String,
+    pub body: String,
+    pub default: String,
+    /// Changed from the default.
+    pub edited: bool,
+}
+
+/// `PUT /api/v1/settings/prompts/{name}`: an empty body (or the default's
+/// text) returns the prompt to following the default.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PromptIn {
+    pub body: String,
 }
 
 /// A collection: a typed table in a realm (docs/os.md §4.1).

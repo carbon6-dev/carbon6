@@ -99,6 +99,13 @@ pub const LISTS: &[List] = &[
         key_fields: &["name"],
         merge: Merge::Override,
     },
+    List {
+        key: "prompts",
+        description: "What carbon6 tells models: sessions, the assistant, the memex.",
+        realm: ROOT,
+        key_fields: &["name"],
+        merge: Merge::Override,
+    },
 ];
 
 pub fn list(key: &str) -> Option<&'static List> {

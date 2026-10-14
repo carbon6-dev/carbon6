@@ -47,6 +47,8 @@ pub struct Memex {
     dir: std::path::PathBuf,
     /// Watched folders, from the head's settings.
     folders: Mutex<Vec<api::MemexFolder>>,
+    /// The memex's prompts as edited (docs/os.md §4.6), by name.
+    prompts: Mutex<std::collections::HashMap<String, String>>,
     /// Wakes the folder scanner (settings changed).
     rescan: tokio::sync::Notify,
     pub google: google::Google,
@@ -91,6 +93,11 @@ fn task_of(v: &Value) -> Option<llm::Task> {
 pub(crate) const MAX_FILE: u64 = 50 * 1024 * 1024;
 
 impl Memex {
+    /// One of the memex's prompts, as edited, else its default.
+    pub fn prompt(&self, name: &str, default: &str) -> String {
+        self.prompts.lock().unwrap().get(name).filter(|p| !p.trim().is_empty()).cloned().unwrap_or_else(|| default.to_owned())
+    }
+
     pub async fn open(dir: &Path, link: Arc<HeadLink>) -> anyhow::Result<Arc<Self>> {
         let store = Store::open(&dir.join("memex.db")).await?;
         Ok(Arc::new(Self {
@@ -104,6 +111,7 @@ impl Memex {
             rescan: tokio::sync::Notify::new(),
             accounts: Mutex::default(),
             contacts_auto: Default::default(),
+            prompts: Default::default(),
             resync: tokio::sync::Notify::new(),
             tasks: Mutex::default(),
             wake: tokio::sync::Notify::new(),
@@ -166,6 +174,7 @@ impl Memex {
                             if new_accounts {
                                 m.resync.notify_one();
                             }
+                            *m.prompts.lock().unwrap() = serde_json::from_value(c["prompts"].clone()).unwrap_or_default();
                             let folders: Vec<api::MemexFolder> = serde_json::from_value(c["folders"].clone()).unwrap_or_default();
                             let changed = *m.folders.lock().unwrap() != folders;
                             *m.folders.lock().unwrap() = folders;
@@ -996,13 +1005,8 @@ impl Memex {
             if !facts.is_empty() {
                 let now = c6_core::now_ms();
                 let lines: Vec<String> = facts.iter().map(|f| knowledge::brief_line(f, now)).collect();
-                sections.push(format!(
-                    "## Environment knowledge\nWhat earlier sessions learned about the systems around this work. Each fact says how it is known \
-(reviewed by the user, verified by a check, observed once, inferred) and where it applies; facts marked only for other labels do not \
-apply here. Rely on reviewed and verified facts; re-check observed or inferred ones before acting on them. Record what you learn with \
-knowledge_record and re-checks with knowledge_verify; never stop to ask the user about it (todo_add raises a question for later).\n{}",
-                    lines.join("\n")
-                ));
+                let guidance = self.prompt("memex.brief.knowledge", api::prompts::BRIEF_KNOWLEDGE);
+                sections.push(format!("## Environment knowledge\n{guidance}\n{}", lines.join("\n")));
             }
         }
         let mut seen = std::collections::HashSet::new();

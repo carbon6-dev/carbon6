@@ -38,6 +38,7 @@ fn cfg() -> TurnConfig {
         effort: None,
         context_window: 128_000,
         web_search: false,
+        compact: Default::default(),
     }
 }
 

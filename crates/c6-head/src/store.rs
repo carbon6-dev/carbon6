@@ -148,6 +148,7 @@ impl Store {
             .foreign_keys(true);
         let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
         crate::lists::ensure(&pool).await?;
+        crate::prompts::seed(&pool).await?;
         Ok((Self { pool }, report))
     }
 

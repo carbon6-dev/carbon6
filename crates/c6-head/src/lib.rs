@@ -21,6 +21,7 @@ pub mod memory;
 pub mod notify;
 pub mod oauth;
 pub mod pki;
+pub mod prompts;
 pub mod push;
 pub mod realms;
 pub mod registry;

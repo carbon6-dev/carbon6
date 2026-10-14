@@ -79,3 +79,58 @@ async fn records_are_searchable() {
         .await;
     stop.cancel();
 }
+
+/// The memex's prompts are editable (docs/os.md §4.6): an edited one
+/// reaches the memex, here the guidance briefs give before facts.
+#[tokio::test]
+async fn edited_prompts_reach_the_memex() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let stop = CancellationToken::new();
+    let dir = tempfile::tempdir().unwrap();
+    let e = c6_head::api::new_enrollment(&head.state, Some("memex")).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
+    let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
+    let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
+    m.spawn_jobs();
+    w.set_extension(m);
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
+    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+
+    let r = http
+        .post(format!("{api}/memex/rpc"))
+        .json(&json!({"method": "memex.knowledge.record", "params": {"claim": "CI runs on Argo", "about": ["ci:argo"], "status": "inferred"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let labels = vec!["ci:argo".to_owned()];
+    let brief = || c6_head::memex::brief(&head.state, "home", &labels, "fix the build");
+    let first = eventually("a brief with the fact", async || {
+        let b = brief().await;
+        b.contains("CI runs on Argo").then_some(b)
+    })
+    .await;
+    assert!(first.contains("What earlier sessions learned"), "the default guidance: {first}");
+    let r = http
+        .put(format!("{api}/settings/prompts/memex.brief.knowledge"))
+        .json(&json!({"body": "CUSTOM-GUIDANCE: trust nothing."}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    eventually("the edited guidance in briefs", async || brief().await.contains("CUSTOM-GUIDANCE: trust nothing.").then_some(())).await;
+    stop.cancel();
+}

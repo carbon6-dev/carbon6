@@ -16,9 +16,6 @@ use crate::journal::Journal;
 use crate::link::HeadLink;
 use crate::session::Writer;
 
-const SUBAGENT_NOTE: &str = "\n\n---\nYou are a subagent working for another agent, which cannot see this conversation. \
-Work autonomously. When you are done, reply with a concise but complete report of what you found or did; that report is all the other agent receives.";
-
 /// What a subagent inherits from its parent session.
 pub struct Parent {
     pub session_id: String,
@@ -109,7 +106,8 @@ impl Subagents for Runner {
             link: p.link.clone(),
             next_seq: tokio::sync::Mutex::new(2),
         });
-        let text = format!("{prompt}{SUBAGENT_NOTE}");
+        let note = crate::session::spec_prompt(&p.spec, "session.subagent", c6_agent::SUBAGENT_NOTE);
+        let text = format!("{prompt}\n\n---\n{note}");
         writer
             .append(session_event::Kind::User(UserMessage { command_id: String::new(), text: text.clone(), ..Default::default() }))
             .await

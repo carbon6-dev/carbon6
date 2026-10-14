@@ -277,6 +277,17 @@ pub async fn usage(days: u32, labels: Vec<String>) -> Result<c6_api::UsageReport
     json(Request::get(&format!("/api/v1/usage?days={days}&labels={labels}")).send().await).await
 }
 
+pub async fn prompts() -> Result<Vec<c6_api::PromptInfo>, String> {
+    json(Request::get("/api/v1/settings/prompts").send().await).await
+}
+
+pub async fn set_prompt(name: String, body: String) -> Result<(), String> {
+    match Request::put(&format!("/api/v1/settings/prompts/{}", enc(&name))).json(&c6_api::PromptIn { body }) {
+        Ok(r) => empty(r.send().await).await,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 pub async fn upgrades() -> Result<Vec<c6_api::Upgrade>, String> {
     json(Request::get("/api/v1/system/upgrades").send().await).await
 }

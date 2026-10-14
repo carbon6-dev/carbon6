@@ -8,10 +8,11 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// The sections of Settings: (id, title, what is in it).
-const SECTIONS: [(&str, &str, &str); 11] = [
+const SECTIONS: [(&str, &str, &str); 12] = [
     ("models", "Models", "Connections, model routing, the assistant"),
     ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
     ("rules", "Policies", "Ask or deny the agent's tool calls"),
+    ("prompts", "Prompts", "What carbon6 tells models: sessions, the assistant, the memex"),
     ("automation", "Automation", "Templates, workflows, automations"),
     ("notifications", "Notifications", "Channels, push on this device, links"),
     ("spending", "Prices and budgets", "What models cost, and spending limits"),
@@ -213,6 +214,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     }.into_any(),
                     "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
                     "system" => view! { <Upgrades /> }.into_any(),
+                    "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
                             Some(s) if s.required => view! { <crate::auth::SignInSettings after_link=note.get_value().as_deref() == Some("link") /> }.into_any(),
@@ -235,6 +237,54 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 }}
             </div>
         </main>
+    }
+}
+
+/// carbon6's prompts (docs/os.md §4.6): each editable, with its default.
+#[component]
+fn Prompts() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let list = LocalResource::new(move || {
+        tick.track();
+        crate::api::prompts()
+    });
+    view! {
+        <section class="space-y-3">
+            <p class="text-sm text-zinc-500">"Everything carbon6 tells a model is here: what agent sessions start with, how conversations are compacted, what subagents and the assistant are told, how action items are worked on, and how the memex reads your records. Change any of them; {{placeholders}} are filled in. A prompt you have not changed follows carbon6's default when a new version improves it."</p>
+            {move || list.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(ps) => ps.into_iter().map(|p| {
+                    let body = RwSignal::new(p.body.clone());
+                    let error = RwSignal::new(None::<String>);
+                    let name = StoredValue::new(p.name.clone());
+                    let save = move |text: String| {
+                        spawn_local(async move {
+                            match crate::api::set_prompt(name.get_value(), text).await {
+                                Ok(()) => { error.set(None); tick.update(|t| *t += 1); }
+                                Err(e) => error.set(Some(e)),
+                            }
+                        });
+                    };
+                    view! {
+                        <details class="rounded-md border border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                            <summary class="cursor-pointer select-none text-sm">
+                                <span class="font-mono font-medium">{p.name.clone()}</span>
+                                {p.edited.then(|| view! { <span class="ml-2 rounded bg-amber-100 px-1 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">"edited"</span> })}
+                                <span class="ml-2 text-zinc-500">{p.description.clone()}</span>
+                            </summary>
+                            <div class="mt-2 space-y-2">
+                                <textarea class=format!("{INPUT} h-48 font-mono text-xs") prop:value=move || body.get() on:input=move |ev| body.set(event_target_value(&ev))></textarea>
+                                {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                                <div class="flex gap-2">
+                                    <button class=BUTTON on:click=move |_| save(body.get_untracked())>"Save"</button>
+                                    {p.edited.then(|| view! { <button class=BUTTON_QUIET on:click=move |_| save(String::new())>"Back to the default"</button> })}
+                                </div>
+                            </div>
+                        </details>
+                    }
+                }).collect_view().into_any(),
+            })}
+        </section>
     }
 }
 

@@ -22,6 +22,7 @@ mod memory;
 mod notify;
 mod outputs;
 mod policies;
+mod prompts;
 mod push;
 mod realms;
 mod rewind;

@@ -213,7 +213,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
-        base_prompt: crate::assistant::prompt(&req.context),
+        base_prompt: crate::assistant::prompt(st, &req.context).await,
         labels,
         ..Default::default()
     };
@@ -294,11 +294,6 @@ fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
     Ok(effort)
 }
 
-/// Added to the base prompt of side chats.
-const SIDE_CHAT_NOTE: &str = "This is a side chat: the user branched off the conversation above to ask about it. \
-The main session continues on its own and does not see this chat. Answer the user's questions here; \
-look at files and run read-only commands as needed, but do not change files unless the user asks you to.";
-
 /// The worker-side spec of a session, from its row. `seed` is the branched-
 /// from conversation of a side chat.
 /// Your policies, after the built-in one: agents' mail and invitations
@@ -324,8 +319,10 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
     let memex = st.registry.memex().is_some();
     let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
+    let base = crate::prompts::get(st, "session.base", &row.realm).await;
     let base_prompt =
-        if row.fork_seq.is_some() { format!("{}\n\n{SIDE_CHAT_NOTE}", c6_agent::BASE_PROMPT) } else { c6_agent::BASE_PROMPT.into() };
+        if row.fork_seq.is_some() { format!("{base}\n\n{}", crate::prompts::get(st, "session.side_chat", &row.realm).await) } else { base };
     Ok(CreateSession {
         model: Some(ModelSpec {
             connection_id: row.connection_id.clone(),
@@ -353,6 +350,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         memex_tools: memex,
         memex_mail: memex && scope.iter().any(|k| k == "email"),
         memex_calendar: memex && scope.iter().any(|k| k == "event"),
+        prompts_json: crate::prompts::for_worker(st, &row.realm).await,
         seed,
     })
 }

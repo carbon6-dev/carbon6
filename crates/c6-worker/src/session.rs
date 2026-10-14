@@ -1065,6 +1065,7 @@ impl Actor {
                 .or_else(|| (model.connection_kind != "claude_code").then_some(info.default_effort).flatten().map(str::to_owned)),
             context_window: info.context_window,
             web_search: provider != Provider::OpenAiChat,
+            compact: compact_prompts(&self.spec),
         };
         let mut conv = self.conv.take().expect("no turn is running");
         let sub = crate::subagent::Parent {
@@ -1573,6 +1574,24 @@ fn prune_browser_profiles(dir: &Path, age: std::time::Duration) {
         if old && let Err(err) = std::fs::remove_dir_all(e.path()) {
             warn!(path = %e.path().display(), "removing an old browser profile: {err}");
         }
+    }
+}
+
+/// A prompt from the session's spec, as edited, or its default.
+pub(crate) fn spec_prompt(spec: &CreateSession, name: &str, default: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(&spec.prompts_json)
+        .ok()
+        .and_then(|v| v[name].as_str().map(str::to_owned))
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+/// What the model is told when its conversation is compacted.
+pub(crate) fn compact_prompts(spec: &CreateSession) -> c6_agent::CompactPrompts {
+    c6_agent::CompactPrompts {
+        why_full: spec_prompt(spec, "session.compact.full", c6_agent::COMPACT_WHY),
+        why_asked: spec_prompt(spec, "session.compact.asked", c6_agent::COMPACT_WHY_ASKED),
+        instructions: spec_prompt(spec, "session.compact", c6_agent::COMPACT_PROMPT),
     }
 }
 

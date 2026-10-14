@@ -25,11 +25,31 @@ const MAX_STOP_HOOK_RUNS: usize = 10;
 /// Compact once the context reaches this share of the window.
 const COMPACT_AT: f64 = 0.85;
 const COMPACT_MAX_OUTPUT: u32 = 16_000;
-const COMPACT_WHY: &str = "Your context window is nearly full, so this conversation will be replaced by a summary that you write now.";
-const COMPACT_WHY_ASKED: &str = "The user asked to compact this conversation: it will be replaced by a summary that you write now.";
-const COMPACT_PROMPT: &str = "Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
+/// Default prompts (each an editable record of the `prompts` collection,
+/// docs/os.md §4.6): why the conversation is compacted, automatically or
+/// when asked, and what the summary must hold.
+pub const COMPACT_WHY: &str = "Your context window is nearly full, so this conversation will be replaced by a summary that you write now.";
+pub const COMPACT_WHY_ASKED: &str = "The user asked to compact this conversation: it will be replaced by a summary that you write now.";
+pub const COMPACT_PROMPT: &str = "Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
 (quote any precise instructions), key decisions and their reasons, files examined and changed with their paths, the current state \
 of the work, errors encountered and how they were resolved, and the exact next steps. Do not call any tools; reply with only the summary.";
+
+/// What the model is told when the conversation is compacted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactPrompts {
+    /// Before the summary instructions, when the context is full.
+    pub why_full: String,
+    /// Before the summary instructions, when the user asked (/compact).
+    pub why_asked: String,
+    /// What the summary must hold.
+    pub instructions: String,
+}
+
+impl Default for CompactPrompts {
+    fn default() -> Self {
+        Self { why_full: COMPACT_WHY.into(), why_asked: COMPACT_WHY_ASKED.into(), instructions: COMPACT_PROMPT.into() }
+    }
+}
 
 #[derive(Clone)]
 pub struct TurnConfig {
@@ -42,6 +62,7 @@ pub struct TurnConfig {
     pub context_window: u64,
     /// Offer the provider's built-in web search, where it has one.
     pub web_search: bool,
+    pub compact: CompactPrompts,
 }
 
 /// Mutable conversation state carried across turns.
@@ -90,7 +111,7 @@ pub async fn compact_turn(
     let reason = if conv.history.is_empty() {
         t.fail("there is nothing to compact yet".into()).await?
     } else {
-        match t.compact(conv, COMPACT_WHY_ASKED, focus, false).await? {
+        match t.compact(conv, &cfg.compact.why_asked, focus, false).await? {
             Ok(()) => TurnEndReason::Completed,
             Err(_) if cancel.is_cancelled() => TurnEndReason::Interrupted,
             Err(e) => t.fail(format!("compaction failed: {e}")).await?,
@@ -194,7 +215,7 @@ impl Turn<'_> {
             }
             if self.cfg.context_window > 0
                 && conv.context_tokens as f64 > self.cfg.context_window as f64 * COMPACT_AT
-                && let Err(e) = self.compact(conv, COMPACT_WHY, "", true).await?
+                && let Err(e) = self.compact(conv, &self.cfg.compact.why_full, "", true).await?
             {
                 return self.fail(format!("compaction failed: {e}")).await;
             }
@@ -204,7 +225,7 @@ impl Turn<'_> {
                 Ok(r) => r,
                 Err(LlmError::ContextOverflow(_)) if !compacted_for_overflow => {
                     compacted_for_overflow = true;
-                    if let Err(e) = self.compact(conv, COMPACT_WHY, "", true).await? {
+                    if let Err(e) = self.compact(conv, &self.cfg.compact.why_full, "", true).await? {
                         return self.fail(format!("context window exceeded and compaction failed: {e}")).await;
                     }
                     continue;
@@ -332,7 +353,7 @@ impl Turn<'_> {
     /// too, so the session is not stuck over its window. The outer `Result`
     /// is a journal failure; the inner one a compaction failure.
     async fn compact(&self, conv: &mut Conversation, why: &str, focus: &str, fallback: bool) -> anyhow::Result<Result<(), String>> {
-        let mut prompt = format!("{why} {COMPACT_PROMPT}");
+        let mut prompt = format!("{why} {}", self.cfg.compact.instructions);
         if !focus.trim().is_empty() {
             prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {}", focus.trim()));
         }

@@ -311,6 +311,25 @@ Skills, agents, commands, templates, workflows, hooks and MCP servers keep worki
   - the compaction prompt.
 - **A workflow's approve step** becomes a decision (4.2).
 
+#### As built (step 2c)
+
+- **Where prompts live:** carbon6's prompts are records of the `prompts` system collection in root. A realm can override one by name.
+- **Defaults** ship in code (`prompts::DEFAULTS`; the memex's and the action-item prompt in `c6_api::prompts`, the agent's in `c6_agent`):
+  - **added at every start;**
+  - **unedited prompts follow the code:** a prompt nobody has edited (`updated_by = system`) follows its default when the default changes;
+  - **edited prompts are never touched.**
+- **The prompts:**
+  - **sessions:** the base prompt, the side-chat note, the subagent note, and the compaction prompt with its two openings (automatic, and `/compact`);
+  - **the assistant's instructions;**
+  - **the action-item session;**
+  - **the memex:** the brief's knowledge guidance, the reading system prompt and per-kind instructions (threads, papers, sessions, other), a thing's summary, system pages, and photo descriptions.
+- **Placeholders** are `{{name}}` (`c6_api::prompts::fill`).
+- **How each reaches its model:**
+  - **sessions:** the head sends the base prompt as the session's realm has it. It sends the worker's own prompts (compaction, subagent) in the spec's `prompts_json`.
+  - **the memex:** it gets its prompts with its configuration. Editing one tells it to reload.
+- **Settings → Prompts** lists them with their defaults. Each can be saved, or returned to its default, which an empty text also does. The API is `/api/v1/settings/prompts`.
+- **A gap fixed:** a session started from an action item now runs in the item's realm.
+
 ### 4.7 Knowledge
 
 - **The memex is partitioned by realm.** Search, briefs, facts, notes and trails stay inside the realm and its grants.
@@ -685,4 +704,7 @@ Choices the design left open, made while building, for review.
 | 2b | Facts, commitments and trails stay in the memex for now | They are already strict tables there; moving them into the head means rewriting the memex's knowledge code, which step 4 revisits along with per-realm memex queries |
 | 2b | System collections are written through Settings and remember/forget only, never through the generic records API | Their writers check them; and a session must not be able to give itself hooks or loosen policies |
 | 2b | Upgrades check each migration right after it runs | A later migration may rename a table an earlier check reads |
+| 2c | carbon6's prompts are a `prompts` system collection in root, not root skills | Skills are things agents load by name; these are carbon6's own instructions, with defaults that follow the code until edited |
+| 2c | A prompt nobody edited follows its default when the default changes; an edited one never does | Improvements reach you unless you chose otherwise |
+| 2c | Tool descriptions stay in code | They describe what the code does, and change with it; editing one could misdescribe a tool |
 

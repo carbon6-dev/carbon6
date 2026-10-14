@@ -443,6 +443,10 @@ message CreateSession {
   // the mail and calendar tools.
   bool memex_mail = 19;
   bool memex_calendar = 20;
+  // Prompts the worker gives the model, by name (JSON object): the
+  // compaction prompts and the subagent note, as edited (docs/os.md §4.6).
+  // Missing ones are the defaults.
+  string prompts_json = 21;
 }
 
 message ModelSpec {

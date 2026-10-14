@@ -345,6 +345,8 @@ fn build() -> Vec<Op> {
         op!("records.put", "collections", "PUT" "/api/v1/collections/{name}/records/{id}", Write, Input::Body(schema::<api::RecordIn>), "Replaces a record's fields, giving the version you read.", choices = &[("name", "collections.list")]),
         op!("records.delete", "collections", "DELETE" "/api/v1/collections/{name}/records/{id}", Destructive, Input::None, "Deletes a record (its history stays).", choices = &[("name", "collections.list")]),
         op!("records.history", "collections", "GET" "/api/v1/collections/{name}/records/{id}/history", Read, Input::None, "Every version of a record, with who changed it.", choices = &[("name", "collections.list")]),
+        op!("settings.prompts.get", "settings", "GET" "/api/v1/settings/prompts", Read, Input::None, "The prompts carbon6 gives models (sessions, compaction, subagents, the assistant, action items, the memex), with their defaults and whether they were changed."),
+        op!("settings.prompts.put", "settings", "PUT" "/api/v1/settings/prompts/{name}", Write, Input::Body(schema::<api::PromptIn>), "Changes one of carbon6's prompts (an empty body returns it to the default).", choices = &[("name", "settings.prompts.get")]),
         op!("realms.list", "system", "GET" "/api/v1/realms", Read, Input::None, "Realms: root (carbon6's administration) and home (your sessions, knowledge and data); each owns its own sessions, action items, memory notes, automations, secrets and knowledge."),
         op!("system.upgrades", "system", "GET" "/api/v1/system/upgrades", Read, Input::None, "Upgrades of carbon6's databases (the head's and the memex's), newest first: versions, what changed, and where the backup is."),
         op!("auth.tokens.list", "account", "GET" "/api/v1/auth/tokens", Read, Input::None, "API tokens (for the c6 CLI and scripts)."),
@@ -417,6 +419,9 @@ pub fn list_schema(key: &str) -> Option<Value> {
         "hosts" => schema::<api::Host>(),
         "memex_folders" => schema::<api::MemexFolder>(),
         "memex_scopes" => schema::<api::MemexScope>(),
+        "prompts" => json!({"type": "object", "required": ["name", "body"], "properties": {
+            "name": {"type": "string"}, "description": {"type": "string"}, "body": {"type": "string"}
+        }}),
         "memory" => json!({"type": "object", "required": ["text"], "properties": {
             "scope": {"type": "string", "description": "One label, or empty: every session"},
             "text": {"type": "string", "maxLength": 2000},

@@ -276,6 +276,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "google_people": crate::google::endpoints().people,
         "contacts_auto": s.contacts_auto.unwrap_or(false),
         "understanding": task(&s.understanding),
+        "prompts": crate::prompts::for_memex(st).await,
         "vision": task(&s.vision),
         "transcription": task(&s.transcription),
         "calls_per_day": s.calls_per_day.unwrap_or(500),

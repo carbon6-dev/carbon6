@@ -135,6 +135,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms))
+        .route("/api/v1/settings/prompts", get(list_prompts))
+        .route("/api/v1/settings/prompts/{name}", put(put_prompt))
         .route("/api/v1/collections", get(list_collections).post(create_collection))
         .route("/api/v1/collections/{name}", get(get_collection).patch(update_collection).delete(drop_collection))
         .route("/api/v1/collections/{name}/query", post(query_records))
@@ -2099,6 +2101,16 @@ async fn record_history(
 ) -> ApiResult<Json<Vec<api::RecordChange>>> {
     let realm = realm_for(&st, &caller, &r).await?;
     Ok(Json(crate::collections::changes(&st, &realm, &name, &id).await?))
+}
+
+/// carbon6's prompts, with their defaults.
+async fn list_prompts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::PromptInfo>>> {
+    Ok(Json(crate::prompts::list(&st).await?))
+}
+
+async fn put_prompt(State(st): State<Arc<HeadState>>, Path(name): Path<String>, Json(p): Json<api::PromptIn>) -> ApiResult<StatusCode> {
+    crate::prompts::set(&st, &name, &p.body).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The realms the caller may see.

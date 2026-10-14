@@ -500,13 +500,10 @@ pub async fn page_step(m: &Memex) -> anyhow::Result<bool> {
     let now = c6_core::now_ms();
     let lines: Vec<String> = facts.iter().map(|f| brief_line(f, now)).collect();
     crate::understand::count_call(m).await?;
-    let prompt = format!(
-        "Write a short, current page about the system \"{name}\" ({key}) for engineers and agents: what it is, how it is reached and used, \
-and the procedures that matter. Use only these facts; keep their caveats (mark what is only observed or inferred, and what applies only in \
-some places). Plain Markdown, at most 250 words.\n\n{}",
-        lines.join("\n")
-    );
-    let page = crate::llm::ask(&m.link, &task, "You curate a knowledge base faithfully.", vec![c6_llm::Block::Text(prompt)], 3000).await?;
+    let template = m.prompt("memex.page", api::prompts::PAGE);
+    let prompt = api::prompts::fill(&template, &[("name", &name), ("key", &key), ("facts", &lines.join("\n"))]);
+    let system = m.prompt("memex.page.system", api::prompts::PAGE_SYSTEM);
+    let page = crate::llm::ask(&m.link, &task, &system, vec![c6_llm::Block::Text(prompt)], 3000).await?;
     sqlx::query("UPDATE things SET page = ?, page_at = ? WHERE id = ?")
         .bind(page.trim())
         .bind(now)
