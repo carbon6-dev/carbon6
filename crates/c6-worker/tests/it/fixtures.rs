@@ -128,6 +128,23 @@ async fn make_head_fixture() {
     post("automations", json!({"name": "alerts", "template": "triage", "trigger": "webhook"})).await;
     post("auth/tokens", json!({"name": "fixture script"})).await;
 
+    // A collection with records, one changed (history).
+    post("collections", json!({"name": "candidates", "description": "Gaps worth a look", "keys": ["name"], "schema": {"type": "object", "required": ["name", "stage"], "properties": {
+        "name": {"type": "string"}, "stage": {"enum": ["found", "approved", "build"]}, "score": {"type": "number"}, "tags": {"type": "array", "items": {"type": "string"}}
+    }}}))
+    .await;
+    let rec = post(
+        "collections/candidates/records",
+        json!({"fields": {"name": "csv sync", "stage": "found", "score": 7}, "links": ["ecosystem:shopify"]}),
+    )
+    .await;
+    post("collections/candidates/records", json!({"fields": {"name": "pdf invoices", "stage": "approved", "tags": ["stripe"]}})).await;
+    put(
+        &format!("collections/candidates/records/{}", rec["id"].as_str().unwrap()),
+        json!({"fields": {"name": "csv sync", "stage": "build", "score": 8}, "version": 1}),
+    )
+    .await;
+
     // A finished session with a tool call (events, usage), labels.
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hello"}"#.into())]));
     mock.push(Reply::Text("Said hello.".into()));
@@ -332,6 +349,20 @@ async fn head_fixtures_upgrade_and_serve() {
         let all = sessions.as_array().unwrap();
         assert!(all.iter().all(|s| s["realm"] == "home" || s["realm"] == "root"), "{name}: {sessions}");
         assert!(all.iter().any(|s| s["realm"] == "root"), "{name}: the assistant's conversation is in root");
+        // Collections (from version 29 on): the records and their history.
+        if name.as_str() >= "c6h-v0029.db" {
+            let page = reqwest::Client::new()
+                .post(format!("{api}/collections/candidates/query"))
+                .json(&json!({"sort": "name"}))
+                .send()
+                .await
+                .unwrap();
+            let page: Value = page.json().await.unwrap();
+            assert_eq!(page["total"], 2, "{name}: {page}");
+            let id = page["records"][0]["id"].as_str().unwrap();
+            let h = get(&format!("collections/candidates/records/{id}/history")).await;
+            assert_eq!(h.as_array().map(Vec::len), Some(2), "{name}: {h}");
+        }
         // Its upgrade history includes the fixture's own creation.
         assert!(get("system/upgrades").await.as_array().is_some_and(|u| !u.is_empty()), "{name}");
         head.shutdown_token().cancel();

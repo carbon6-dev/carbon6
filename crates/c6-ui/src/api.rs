@@ -692,3 +692,40 @@ pub async fn edit_todo(id: i64, body: serde_json::Value) -> Result<c6_api::Todo,
 pub async fn todo_session(id: i64) -> Result<c6_api::Session, String> {
     send_json(Request::post(&format!("/api/v1/todos/{id}/session")), &serde_json::json!({})).await
 }
+
+// --- Collections (docs/os.md §4.1) ---------------------------------------------
+
+pub async fn collections() -> Result<Vec<c6_api::Collection>, String> {
+    json(Request::get("/api/v1/collections").send().await).await
+}
+
+pub async fn collection(name: String) -> Result<c6_api::Collection, String> {
+    json(Request::get(&format!("/api/v1/collections/{}", enc(&name))).send().await).await
+}
+
+pub async fn create_collection(c: c6_api::CollectionIn) -> Result<c6_api::Collection, String> {
+    send_json(Request::post("/api/v1/collections"), &c).await
+}
+
+pub async fn drop_collection(name: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/collections/{}", enc(&name))).send().await).await
+}
+
+pub async fn query_records(name: String, q: c6_api::RecordQuery) -> Result<c6_api::RecordPage, String> {
+    send_json(Request::post(&format!("/api/v1/collections/{}/query", enc(&name))), &q).await
+}
+
+pub async fn save_record(name: String, id: Option<String>, r: c6_api::RecordIn) -> Result<c6_api::Record, String> {
+    match id {
+        Some(id) => send_json(Request::put(&format!("/api/v1/collections/{}/records/{}", enc(&name), enc(&id))), &r).await,
+        None => send_json(Request::post(&format!("/api/v1/collections/{}/records", enc(&name))), &r).await,
+    }
+}
+
+pub async fn delete_record(name: String, id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/collections/{}/records/{}", enc(&name), enc(&id))).send().await).await
+}
+
+pub async fn record_history(name: String, id: String) -> Result<Vec<c6_api::RecordChange>, String> {
+    json(Request::get(&format!("/api/v1/collections/{}/records/{}/history", enc(&name), enc(&id))).send().await).await
+}

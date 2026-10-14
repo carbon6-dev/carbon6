@@ -135,6 +135,12 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms))
+        .route("/api/v1/collections", get(list_collections).post(create_collection))
+        .route("/api/v1/collections/{name}", get(get_collection).patch(update_collection).delete(drop_collection))
+        .route("/api/v1/collections/{name}/query", post(query_records))
+        .route("/api/v1/collections/{name}/records", get(list_records).post(create_record))
+        .route("/api/v1/collections/{name}/records/{id}", get(get_record).put(put_record).delete(delete_record))
+        .route("/api/v1/collections/{name}/records/{id}/history", get(record_history))
         .route("/api/v1/catalog/call", post(call_catalog))
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
@@ -1945,7 +1951,151 @@ async fn get_catalog() -> Json<serde_json::Value> {
     }))
 }
 
-/// Runs an operation (the CLI): destructive ones need `confirmed`.
+// --- Collections (docs/os.md §4.1) ---------------------------------------------
+
+/// The realm a collection request is for: `?realm=` (you), the token's
+/// realm, else home; it must exist.
+async fn realm_for(st: &HeadState, caller: &Caller, asked: &api::InRealm) -> anyhow::Result<String> {
+    let realm = caller.realm_for_new(asked.realm.as_deref())?;
+    if !crate::realms::exists(st, &realm).await? {
+        return Err(crate::bad_request(format!("no realm {realm:?}")));
+    }
+    Ok(realm)
+}
+
+/// Who a write is by, for history.
+fn writer(caller: &Caller) -> String {
+    match &caller.realm {
+        Some(r) => format!("token:{r}"),
+        None => "you".into(),
+    }
+}
+
+async fn list_collections(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::Collection>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::list(&st, &realm).await?))
+}
+
+async fn create_collection(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(c): Json<api::CollectionIn>,
+) -> ApiResult<Json<api::Collection>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::create(&st, &realm, &c, &writer(&caller), false).await?))
+}
+
+async fn get_collection(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<api::Collection>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::get(&st, &realm, &name).await?))
+}
+
+async fn update_collection(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(c): Json<api::CollectionIn>,
+) -> ApiResult<Json<api::Collection>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::update(&st, &realm, &name, &c).await?))
+}
+
+async fn drop_collection(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::collections::drop(&st, &realm, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn query_records(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(q): Json<api::RecordQuery>,
+) -> ApiResult<Json<api::RecordPage>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::query(&st, &realm, &name, &q).await?))
+}
+
+async fn list_records(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<api::RecordPage>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::query(&st, &realm, &name, &api::RecordQuery::default()).await?))
+}
+
+async fn create_record(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(rec): Json<api::RecordIn>,
+) -> ApiResult<Json<api::Record>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::put(&st, &realm, &name, None, &rec, &writer(&caller)).await?))
+}
+
+async fn get_record(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((name, id)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<api::Record>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::record(&st, &realm, &name, &id).await?))
+}
+
+async fn put_record(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((name, id)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+    Json(rec): Json<api::RecordIn>,
+) -> ApiResult<Json<api::Record>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::put(&st, &realm, &name, Some(&id), &rec, &writer(&caller)).await?))
+}
+
+async fn delete_record(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((name, id)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::collections::delete(&st, &realm, &name, &id, &writer(&caller)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn record_history(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((name, id)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::RecordChange>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::collections::changes(&st, &realm, &name, &id).await?))
+}
+
 /// The realms the caller may see.
 async fn list_realms(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Realm>>> {
     Ok(Json(crate::realms::list(&st, &caller).await?))
@@ -1976,6 +2126,7 @@ async fn get_openapi(State(st): State<Arc<HeadState>>) -> Json<serde_json::Value
     Json(crate::catalog::openapi(&crate::notify::api_urls(&st).await))
 }
 
+/// Runs an operation (the CLI): destructive ones need `confirmed`.
 async fn call_catalog(State(st): State<Arc<HeadState>>, Json(c): Json<api::CatalogCall>) -> ApiResult<Json<serde_json::Value>> {
     let op = crate::catalog::find(&c.op).ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("no operation {:?}", c.op)))?;
     if op.effect == crate::catalog::Effect::Destructive && !c.confirmed {

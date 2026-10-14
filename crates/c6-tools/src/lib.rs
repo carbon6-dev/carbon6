@@ -15,6 +15,7 @@ mod patch;
 mod plan;
 pub mod profiles;
 pub mod publish;
+pub mod records;
 pub mod remote;
 mod search;
 mod util;

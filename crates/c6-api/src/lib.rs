@@ -157,6 +157,134 @@ fn home_realm() -> String {
     "home".to_owned()
 }
 
+/// A collection: a typed table in a realm (docs/os.md §4.1).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Collection {
+    pub realm: String,
+    pub name: String,
+    pub description: String,
+    /// A JSON Schema for its records' fields. Strict: fields it does not
+    /// name are rejected.
+    pub schema: serde_json::Value,
+    pub schema_version: i64,
+    /// Fields whose values are unique among its records.
+    pub keys: Vec<String>,
+    /// carbon6's own (configuration): not mirrored into the memex.
+    pub system: bool,
+    pub records: i64,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+/// `POST /api/v1/collections` and `PATCH /api/v1/collections/{name}`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CollectionIn {
+    /// Letters, digits, - and _ (creating only).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// An object schema with properties. A new schema must accept every
+    /// record already in the collection.
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
+}
+
+/// A record in a collection.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Record {
+    pub id: String,
+    pub realm: String,
+    pub collection: String,
+    pub fields: serde_json::Value,
+    /// Memex things and items it links to (keys like client:acme, or item ids).
+    pub links: Vec<String>,
+    pub labels: Vec<String>,
+    pub version: i64,
+    /// you, session:<id>, trigger:<name> or token:<name>.
+    pub created_by: String,
+    pub updated_by: String,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+/// `POST /api/v1/collections/{name}/records` and `PUT …/records/{id}`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecordIn {
+    /// All its fields (a whole record, checked against the schema).
+    pub fields: serde_json::Value,
+    #[serde(default)]
+    pub links: Option<Vec<String>>,
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    /// Updating: the version you read. A newer one means someone else
+    /// changed it since, and the write is refused.
+    #[serde(default)]
+    pub version: Option<i64>,
+}
+
+/// `POST /api/v1/collections/{name}/query`: which records, in what order.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecordQuery {
+    /// field → a value (equal), or an object of comparisons: $eq, $ne, $in,
+    /// $nin, $gt, $gte, $lt, $lte, $contains (text, or an item of a list).
+    #[serde(default, rename = "where")]
+    pub filter: serde_json::Map<String, serde_json::Value>,
+    /// Words anywhere in the record.
+    #[serde(default)]
+    pub text: String,
+    /// A field, or -field for descending; also created_at and updated_at.
+    /// Default: -updated_at.
+    #[serde(default)]
+    pub sort: String,
+    /// Count the matching records per value of this field instead.
+    #[serde(default)]
+    pub group_by: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+/// The records a query found (or, with group_by, the counts).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecordPage {
+    pub records: Vec<Record>,
+    /// All that match.
+    pub total: i64,
+    /// With group_by: (value, count), most first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<(serde_json::Value, i64)>,
+}
+
+/// A version of a record.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecordChange {
+    pub version: i64,
+    /// create, update or delete.
+    pub op: String,
+    pub fields: serde_json::Value,
+    pub changed_by: String,
+    pub changed_at: UnixMs,
+}
+
+/// `?realm=`: which realm (you; a realm's token is always in its own).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InRealm {
+    #[serde(default)]
+    pub realm: Option<String>,
+}
+
 /// `GET /api/v1/realms`: a realm, which owns sessions, knowledge and data
 /// (docs/os.md §3).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1817,11 +1945,11 @@ pub struct SessionMatch {
 
 /// What kinds of items there are. Sessions see the default kinds, plus what
 /// their scope rules add.
-pub const MEMEX_KINDS: [&str; 12] =
-    ["session", "output", "web", "note", "document", "paper", "fact", "email", "event", "photo", "video", "spam"];
+pub const MEMEX_KINDS: [&str; 13] =
+    ["session", "output", "web", "note", "document", "paper", "fact", "record", "email", "event", "photo", "video", "spam"];
 /// What every session may search unless a scope rule says more (facts:
 /// environment knowledge, for every session).
-pub const MEMEX_DEFAULT_SCOPE: [&str; 7] = ["session", "output", "web", "note", "document", "paper", "fact"];
+pub const MEMEX_DEFAULT_SCOPE: [&str; 8] = ["session", "output", "web", "note", "document", "paper", "fact", "record"];
 
 /// An item to store (head → memex `memex.ingest`). The same source and
 /// external id again replaces it.

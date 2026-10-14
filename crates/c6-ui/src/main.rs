@@ -5,6 +5,7 @@ mod api;
 mod assistant;
 mod auth;
 mod calendar;
+mod collections;
 mod contacts;
 mod files;
 mod fleet;
@@ -99,6 +100,7 @@ fn Main() -> impl IntoView {
                     </Go>
                     <todos::TodoLink class=NAV />
                     <span class="hidden sm:contents"><NavLink to=View::Mission label="Mission" /></span>
+                    <span class="hidden lg:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
                     <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                 </nav>
                 <span class="flex-1"></span>
@@ -146,6 +148,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <todos::TodoLink class=MENU />
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
                     <Go to=View::Mail class=MENU>"Mail"</Go>
                     <Go to=View::Calendar class=MENU>"Calendar"</Go>
                     <Go to=View::Contacts class=MENU>"Contacts"</Go>

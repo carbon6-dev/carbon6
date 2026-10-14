@@ -84,6 +84,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 Ok(json!({"text": text}))
             }
             "openapi" => Ok(crate::catalog::openapi(&crate::notify::api_urls(st).await)),
+            // Collections, in the session's realm (docs/os.md §4.1).
+            "collections" | "records_query" | "records_get" | "records_put" | "records_delete" => {
+                let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+                crate::collections::for_session(st, &realm, &target, what, &params).await
+            }
             other => Err(bad_request(format!("a worker may not call session.{other}"))),
         };
     }

@@ -99,6 +99,16 @@ How it works:
 - **Its model is set under Settings → Assistant.** Its conversations have the label `assistant`, so routes, policies and budgets for that label apply.
 - **The design is in [docs/assistant.md](docs/assistant.md).**
 
+### Collections
+
+Collections are typed tables of records in a realm, for anything apps and agents keep: candidates, contacts, experiments, inventories. See them under **Collections**.
+
+- **Strict:** each collection has a JSON Schema. A record must match it exactly: no fields the schema doesn't name, every required one, the right types and values. Optional unique keys (such as `name`) are kept unique.
+- **Safe to share:** an update gives the version it read, so two writers can't silently overwrite each other. Every change is kept, with who made it (you, a session, or a token).
+- **Agents:** sessions use `records_query`, `records_get`, `records_put` and `records_delete`, within their realm. Records are also searchable in the memex and can appear in session briefs.
+- **Code:** `/api/v1/collections…` (see `carbon6_api` or `/api/v1/openapi.json`). A query filters by field (`{"where": {"score": {"$gte": 8}}}`), by words, sorts, pages, or counts per value.
+- **Changing a schema:** a new schema is accepted if every record already there still fits.
+
 ### Environment knowledge and To do
 
 - **Environment knowledge:** agents record what they learn about the systems around the code (CI, clusters, networks, hosts) as facts in the memex. Each fact says how it is known (reviewed, verified, observed, inferred), where it applies, and how to re-check it. Every session starts with the relevant facts, and contradictions become action items.

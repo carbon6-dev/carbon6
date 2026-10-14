@@ -64,6 +64,11 @@ pub enum View {
     Contacts,
     Photos,
     Todos,
+    /// Collections; one by name, or (empty) the list.
+    Collections {
+        #[serde(default)]
+        name: String,
+    },
 }
 
 /// A place in a session: the transcript element to reveal, the side chats
@@ -124,6 +129,8 @@ impl View {
             View::Contacts => "/contacts".into(),
             View::Photos => "/photos".into(),
             View::Todos => "/todos".into(),
+            View::Collections { name } if name.is_empty() => "/collections".into(),
+            View::Collections { name } => format!("/collections/{name}"),
         }
     }
 
@@ -188,6 +195,8 @@ impl View {
             ["contacts"] => View::Contacts,
             ["photos"] => View::Photos,
             ["todos"] => View::Todos,
+            ["collections"] => View::Collections { name: String::new() },
+            ["collections", name] => View::Collections { name: (*name).to_owned() },
             _ => View::Sessions,
         }
     }
@@ -218,6 +227,8 @@ impl View {
             View::Contacts => "Contacts".into(),
             View::Photos => "Photos".into(),
             View::Todos => "To do".into(),
+            View::Collections { name } if name.is_empty() => "Collections".into(),
+            View::Collections { name } => format!("Collection · {name}"),
         }
     }
 
@@ -230,7 +241,7 @@ impl View {
     /// and search swap one section for another in place instead of
     /// stacking columns.
     fn is_section(&self) -> bool {
-        !matches!(self, View::Session { .. } | View::Worker { .. })
+        !matches!(self, View::Session { .. } | View::Worker { .. }) && !matches!(self, View::Collections { name } if !name.is_empty())
     }
 }
 
@@ -965,6 +976,7 @@ fn render_view(view: View) -> AnyView {
                     View::Contacts => view! { <crate::contacts::ContactsPage /> }.into_any(),
                     View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
                     View::Todos => view! { <crate::todos::TodosPage /> }.into_any(),
+                    View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>

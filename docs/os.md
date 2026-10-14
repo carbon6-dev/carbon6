@@ -195,6 +195,17 @@ record_history(record_id, version, fields JSON, changed_by, changed_at)
 - **Effects:** deleting a record or dropping a collection is destructive, and asks first (4.2).
 - **Where they live:** in the head's database. The head is the always-on core, next to the triggers that react to changes. The memex is optional and may run on another machine, so it only holds the search mirror.
 
+#### As built (step 2a)
+
+- **Storage:** tables `collections`, `records` and `record_history` in the head (migration `0029`). The schema checker (`schema.rs`) is carbon6's own: it covers types, properties, required fields, enums and consts, items, `anyOf`/`oneOf`/`allOf`, `$ref` into `$defs`, ranges, lengths and patterns. Objects are closed unless `additionalProperties` says otherwise; an object schema with no properties at all stays open, for free-form maps.
+- **Schema changes:** a new schema is accepted only if every record already there still fits, and new keys only if they are already unique. A change that would reject records answers "needs a migration"; that path arrives with decisions (step 3).
+- **Queries:** the JSON filter covers `$eq`, `$ne`, `$in`, `$nin`, `$gt(e)`, `$lt(e)`, `$contains` (text, or an item of a list), plus words, sorting, paging and `group_by` counts. Field names are checked (letters, digits and `_`) before they reach SQL.
+- **History:** every create, update and delete is kept in `record_history`, with who made it: `you`, `token:<realm>` or `session:<id>`.
+- **API:** `/api/v1/collections…`, with `?realm=` for you (a realm's token is always in its own realm). Every route has a catalog operation, so the assistant, the API reference and the OpenAPI document cover collections.
+- **Agents:** sessions get `records_query` (which lists the collections when given none), `records_get`, `records_put` and `records_delete`, which reach only the session's realm.
+- **The memex:** records of non-system collections are mirrored into it as kind `record` (in the default scope) and removed when deleted.
+- **UI:** **Collections** shows a page per collection, with a table, search, forms generated from the schema (required fields first; a choice for enums, a checkbox for booleans, a comma-separated list for lists of strings, JSON for anything else), each record's history, and deleting.
+
 ### 4.2 Decisions
 
 A **decision** is any time carbon6 needs you.
@@ -647,4 +658,8 @@ Choices the design left open, made while building, for review.
 | 1 | A valid token scopes even with sign-in off | A script given a realm's token expects to stay in that realm |
 | 1 | Secrets are asked for as `secret:NAME@<session>`, not with a new protocol field | Keeps the worker's per-session cache separate with no protocol change; older workers still get home's secrets |
 | 1 | Tokens cannot be limited to root | A root token is one with no realm |
+| 2a | The schema checker is written in carbon6, not a JSON Schema library | Collections need a strict subset (closed objects), clear messages, and no large new dependency |
+| 2a | A schema change is allowed exactly when every existing record still fits | That is "additive" stated as a rule the head can check; anything else needs a migration (step 3) |
+| 2a | Records are mirrored into the memex only for non-system collections | System collections are configuration (step 2b), not knowledge |
+| 2a | Forms list required fields first, then the rest alphabetically | JSON objects come back sorted, so the schema's own order is lost |
 

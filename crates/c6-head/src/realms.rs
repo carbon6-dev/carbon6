@@ -129,6 +129,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["automations", id, ..] => owned("automations", "automation", (*id).to_owned()).await,
         // Starting a template's sessions (in the caller's realm).
         ["templates", _, "run"] if method == Method::POST => Ok(()),
+        // Collections: always addressed within the caller's realm.
+        ["collections", ..] => Ok(()),
         // The memex: the head puts the caller's realm on every call.
         ["memex", ..] | ["mail", "attachment"] => Ok(()),
         _ => Err((StatusCode::FORBIDDEN, format!("this token is limited to realm {realm}; that is carbon6's administration"))),

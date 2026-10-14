@@ -5,4 +5,5 @@ mod docs;
 mod fixtures;
 mod knowledge;
 mod memex;
+mod records;
 mod understanding;

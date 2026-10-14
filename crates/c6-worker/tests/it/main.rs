@@ -10,6 +10,7 @@ mod attachments;
 mod automations;
 mod background;
 mod chaos;
+mod collections;
 mod commands;
 mod fixtures;
 mod hooks;
