@@ -25,6 +25,26 @@ pub trait Subagents: Send + Sync {
         background: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<String, String>;
+
+    /// Whether `to` (one of this session's subagents, by session id or
+    /// background task id) is running now. `Err`: it is not one of them.
+    async fn running(&self, to: &str) -> Result<bool, String>;
+
+    /// Sends `message` to the subagent `to`. If it is running, the message
+    /// joins its turn and `Ok(None)` returns at once. Otherwise it starts a
+    /// turn, and the turn's report comes back as from `run` (`background`:
+    /// the background task it runs as, if it does).
+    async fn send(
+        &self,
+        call_id: &str,
+        to: &str,
+        message: &str,
+        background: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Option<String>, String>;
+
+    /// What the subagent `to` has done so far.
+    async fn peek(&self, to: &str) -> Result<String, String>;
 }
 
 /// A named subagent (from the head's settings): its instructions, the tools
@@ -147,6 +167,86 @@ impl Tool for Task {
         match agents.run(&ctx.call_id, description, prompt, agent, None, ctx.cancel.clone()).await {
             Ok(answer) => ToolOutput::limited(answer, false),
             // What it did and how it ended.
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+}
+
+/// Continues one of this session's subagents: a follow-up for one that is
+/// idle (with its whole conversation), or a message that joins the turn
+/// of one that is running.
+pub struct SendMessage {
+    claude: bool,
+}
+
+impl SendMessage {
+    pub fn generic() -> Self {
+        Self { claude: false }
+    }
+
+    pub fn claude() -> Self {
+        Self { claude: true }
+    }
+
+    pub fn is_send(name: &str) -> bool {
+        name == "SendMessage" || name == "send_message"
+    }
+}
+
+#[async_trait]
+impl Tool for SendMessage {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: if self.claude { "SendMessage" } else { "send_message" }.into(),
+            description: "Sends a message to a subagent you started, which keeps its whole conversation: to give one that \
+                          finished a follow-up task, to continue one that was stopped or lost, or to steer one running in the \
+                          background. An idle subagent starts working on it and its report comes back like Task's (or as a \
+                          notice, with run_in_background); one that is running sees it at its next step and its report comes \
+                          when it finishes."
+                .into(),
+            parameters: json!({"type": "object", "properties": {
+                "to": {"type": "string", "description": "The subagent's id (from Task's result or notice), or its background task id"},
+                "message": {"type": "string", "description": "What to tell it"},
+                "run_in_background": {"type": "boolean", "description": "Continue it in the background; its report arrives as a notice"}
+            }, "required": ["to", "message"], "additionalProperties": false}),
+        }
+    }
+
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Shared
+    }
+
+    async fn call(&self, ctx: &ToolCtx, input: Value) -> ToolOutput {
+        let Some(agents) = ctx.session.subagents() else { return ToolOutput::err("subagents are not available here") };
+        let to = input["to"].as_str().unwrap_or_default().trim();
+        let Some(message) = input["message"].as_str().filter(|m| !m.trim().is_empty()) else {
+            return ToolOutput::err("message is required");
+        };
+        let running = match agents.running(to).await {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(e),
+        };
+        if running {
+            return match agents.send(&ctx.call_id, to, message, None, ctx.cancel.clone()).await {
+                Ok(_) => ToolOutput::ok(format!(
+                    "Sent: subagent {to} is running and will see your message at its next step. Its report comes when it finishes."
+                )),
+                Err(e) => ToolOutput::err(e),
+            };
+        }
+        if input["run_in_background"].as_bool() == Some(true) {
+            let (id, cancel) = ctx.session.background.start_agent(&format!("continue {to}"), true);
+            let (session, call_id, to, message, task) = (ctx.session.clone(), ctx.call_id.clone(), to.to_owned(), message.to_owned(), id.clone());
+            tokio::spawn(async move {
+                let result = agents.send(&call_id, &to, &message, Some(&task), cancel).await.map(Option::unwrap_or_default);
+                session.background.finish_agent(&task, result);
+            });
+            return ToolOutput::ok(format!(
+                "Continuing the subagent in the background as {id}. Its report will arrive as a notice when it finishes."
+            ));
+        }
+        match agents.send(&ctx.call_id, to, message, None, ctx.cancel.clone()).await {
+            Ok(answer) => ToolOutput::limited(answer.unwrap_or_default(), false),
             Err(e) => ToolOutput::err(e),
         }
     }

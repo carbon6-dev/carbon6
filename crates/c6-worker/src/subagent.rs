@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use c6_agent::{EventSink, PendingInput, TurnConfig};
 use c6_llm::ModelClient;
 use c6_proto::{CreateSession, Delegation, ModelSpec, SessionStarted, SubagentSpawned, TurnEndReason, session_event};
-use c6_tools::{AgentDef, Subagents, Task, Tool};
+use c6_tools::{AgentDef, SendMessage, Subagents, Task, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -43,8 +43,8 @@ impl Runner {
     }
 }
 
-/// What a subagent's journaled spec says about its agent, to rebuild its
-/// tools when it is loaded again.
+/// What a subagent's journaled spec says about its agent (a reloaded
+/// subagent keeps the tools its `SessionStarted` lists).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AgentJson {
     name: String,
@@ -52,25 +52,15 @@ struct AgentJson {
     tools: Vec<String>,
 }
 
-/// The tools a subagent has, of those its session would otherwise get:
-/// those its named agent allows, and no Task below the depth limit.
-pub(crate) fn delegated_tools(d: &Delegation, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
-    let agent = serde_json::from_str::<AgentJson>(&d.agent_json).ok().map(|a| AgentDef {
-        name: a.name,
-        description: String::new(),
-        tools: a.tools,
-        model: String::new(),
-        prompt: String::new(),
-    });
-    filter_tools(tools, agent.as_ref(), d.depth)
-}
-
+/// The tools a subagent has, of its parent's: those its named agent
+/// allows, and none that start or continue subagents at the depth limit.
 fn filter_tools(tools: Vec<Arc<dyn Tool>>, agent: Option<&AgentDef>, depth: u32) -> Vec<Arc<dyn Tool>> {
     tools
         .into_iter()
         .filter(|t| {
             let name = t.spec().name;
-            !(Task::is_task(&name) && depth >= MAX_DEPTH) && agent.is_none_or(|a| a.allows(&name))
+            let delegates = Task::is_task(&name) || SendMessage::is_send(&name);
+            !(delegates && depth >= MAX_DEPTH) && agent.is_none_or(|a| a.allows(&name))
         })
         .collect()
 }
@@ -158,8 +148,94 @@ impl Subagents for Runner {
             delegated_by: parent_call_id.to_owned(),
             ..Default::default()
         };
+        self.delegate(&child_id, &child, input, cancel).await
+    }
+
+    async fn running(&self, to: &str) -> Result<bool, String> {
+        let child = self.resolve(to).await?;
+        Ok(self.parent.manager.is_running(&child))
+    }
+
+    async fn send(
+        &self,
+        call_id: &str,
+        to: &str,
+        message: &str,
+        background: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Option<String>, String> {
+        let p = &self.parent;
+        let child_id = self.resolve(to).await?;
+        let child = match p.manager.actor_for(&child_id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return Err(format!("subagent {to} is no longer on this worker")),
+            Err(e) => return Err(format!("subagent {to} could not be loaded: {e:#}")),
+        };
+        let input = PendingInput {
+            command_id: format!("delegation:{}", uuid::Uuid::now_v7()),
+            text: message.to_owned(),
+            delegated_by: call_id.to_owned(),
+            ..Default::default()
+        };
+        // Running: the message joins its turn; the report comes as it would.
+        if p.manager.is_running(&child_id) && background.is_none() {
+            child.send(crate::session::ActorMsg::Delegate(Box::new(input), None)).map_err(|_| format!("subagent {to} stopped"))?;
+            return Ok(None);
+        }
+        self.delegate(&child_id, &child, input, cancel).await.map(Some)
+    }
+
+    async fn peek(&self, to: &str) -> Result<String, String> {
+        let p = &self.parent;
+        let child_id = self.resolve(to).await?;
+        let journal = p.manager.journal();
+        let status = if p.manager.is_running(&child_id) {
+            "running"
+        } else {
+            let events = journal.events_after(&child_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
+            match events.iter().rev().find_map(|e| match &e.kind {
+                Some(session_event::Kind::TurnEnded(t)) => Some(TurnEndReason::try_from(t.reason).unwrap_or_default()),
+                _ => None,
+            }) {
+                Some(r) => status_of(r, "x"),
+                None => "not started",
+            }
+        };
+        Ok(digest(journal, &child_id, status, "").await)
+    }
+}
+
+impl Runner {
+    /// The session id of one of this session's subagents, named by its
+    /// session id or background task id (it must have been started here).
+    async fn resolve(&self, to: &str) -> Result<String, String> {
+        let p = &self.parent;
+        let events = p.manager.journal().events_after(&p.session_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
+        events
+            .iter()
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::SubagentSpawned(sp))
+                    if !to.is_empty() && (sp.child_session_id == to || sp.background_task_id == to) =>
+                {
+                    Some(sp.child_session_id.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| format!("no subagent {to:?} was started in this session"))
+    }
+
+    /// Gives the subagent `input` and waits for the turn that takes it:
+    /// its report, or (as `Err`) a digest of what it did.
+    async fn delegate(
+        &self,
+        child_id: &str,
+        child: &tokio::sync::mpsc::UnboundedSender<crate::session::ActorMsg>,
+        input: PendingInput,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
+        let p = &self.parent;
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        child.send(crate::session::ActorMsg::Delegate(Box::new(input), tx)).map_err(|_| "the subagent stopped before it started".to_owned())?;
+        child.send(crate::session::ActorMsg::Delegate(Box::new(input), Some(tx))).map_err(|_| "the subagent stopped before it started".to_owned())?;
         // Stopping the parent's turn (or this background task) stops the
         // subagent's turn; its log keeps what it did. The delegation's
         // outcome follows once that turn closes.
@@ -183,9 +259,9 @@ impl Subagents for Runner {
                 let status = status_of(o.reason, &o.report);
                 // Stopped from elsewhere than this call: by you.
                 let by = if o.reason == TurnEndReason::Interrupted && !stopped_here { "user" } else { "" };
-                Err(partial(&p.spec, &digest(journal, &child_id, status, by).await))
+                Err(partial(&p.spec, &digest(journal, child_id, status, by).await))
             }
-            Err(_) => Err(partial(&p.spec, &digest(journal, &child_id, "failed", "").await)),
+            Err(_) => Err(partial(&p.spec, &digest(journal, child_id, "failed", "").await)),
         }
     }
 }

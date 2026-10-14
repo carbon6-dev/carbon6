@@ -233,7 +233,13 @@ The breadcrumb shows the chain, for example "*main session* › *Find all caller
 
 ## 12. Steps
 
-As built: steps 1 and 2 on 2026-10-14. A background subagent's session is found through `SubagentSpawned.background_task_id`, so `BackgroundTask` gained no field. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
+As built: steps 1–3 on 2026-10-14.
+
+- A background subagent's session is found through `SubagentSpawned.background_task_id`, so `BackgroundTask` gained no field.
+- A reloaded or restored subagent keeps the tools its `SessionStarted` lists, so `Delegation.agent_json` is informational.
+- Without its parent on the worker (both were trimmed), a restored subagent runs with hooks of its own.
+- An agent may message a subagent that has a `SubagentSpawned` in its own log, by session id or background task id.
+- Resume is `POST /sessions/{id}/resume`: it sends the realm's `session.subagent_resume` prompt as a message with `command: "resume"`, and only after a turn that was interrupted, failed or lost. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
 
 1. **Actor-backed subagents.** `Delegation` in `CreateSession`, `SubagentSpawned`, the child built and reloaded as an actor, interrupts cascaded through the actor. Depth limit 1, so visible behavior stays as today. Tested by killing the worker mid-subagent and reloading.
 2. **Partial results.** The digest; foreground and background results for every outcome; recovery writing results for dangling delegations; the corrected `lost` text; the head columns.

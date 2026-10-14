@@ -321,7 +321,7 @@ pub async fn send_message(
         Some((c, m, e)) => (Some(c), Some(m), Some(e).filter(|e| !e.is_empty())),
         None => (None, None, None),
     };
-    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, attachments, connection_id, model, effort })
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, attachments, connection_id, model, effort, wake: false })
         .await
 }
 

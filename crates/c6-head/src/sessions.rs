@@ -250,9 +250,6 @@ pub async fn route_for(st: &HeadState, connection: &str, model: &str, labels: &[
 /// A side chat on `parent_id`, branching after event `anchor_seq`.
 pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateSideChat) -> anyhow::Result<api::Session> {
     let parent = st.store.session(parent_id).await?.ok_or_else(|| not_found("no such session"))?;
-    if parent.parent_call_id.is_some() {
-        return Err(bad_request("subagent sessions cannot have side chats"));
-    }
     if parent.status == "failed" {
         return Err(bad_request("the session failed to start"));
     }
@@ -644,9 +641,6 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    if session.parent_call_id.is_some() {
-        return Err(bad_request("subagent sessions run once and cannot take messages"));
-    }
     if let Some(why) = crate::usage::blocked(st, &session.all_labels(), &session.realm).await? {
         return Err(bad_request(format!("not sent: {why}")));
     }
@@ -662,11 +656,13 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     let id = Uuid::now_v7().to_string();
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
+    // To a subagent: whether its report should wake its parent.
+    let wake = req.wake && session.parent_call_id.is_some();
     let input = with_command(
         st,
         &session.realm,
         session.head_labels(),
-        UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() },
+        UserInput { text: text.to_owned(), model, attachments: files, wake, ..Default::default() },
     )
     .await?;
     let data = input_command(&id, session_id, input);
@@ -674,6 +670,30 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
     Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None })
+}
+
+/// Continues a subagent whose last turn did not finish, with the realm's
+/// resume prompt.
+pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) -> anyhow::Result<api::QueuedInput> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.parent_call_id.is_none() {
+        return Err(bad_request("only subagents are resumed; send the session a message instead"));
+    }
+    if !matches!(session.end_reason.as_str(), "interrupted" | "error" | "worker_restarted") || session.status == "running" {
+        return Err(bad_request("its last turn finished; send it a message instead"));
+    }
+    if let Some(why) = crate::usage::blocked(st, &session.all_labels(), &session.realm).await? {
+        return Err(bad_request(format!("not sent: {why}")));
+    }
+    let text = crate::prompts::get(st, "session.subagent_resume", &session.realm).await;
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    let id = Uuid::now_v7().to_string();
+    let input = UserInput { text: text.clone(), command: "resume".into(), wake: req.wake, labels: session.head_labels(), ..Default::default() };
+    let data = input_command(&id, session_id, input);
+    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&text) }).await?;
+    publish_queue(st, session_id).await;
+    st.registry.deliver(worker_id);
+    Ok(api::QueuedInput { command_id: id, text, created_at: now_ms(), rejected: None })
 }
 
 /// Queues a rewind (applied after a running turn is interrupted). Commands
@@ -1109,7 +1129,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
 /// Queues a `Restore` and a fresh copy of the rejected input, in that order.
 async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
     let Some(session) = st.store.session(session_id).await? else { return Ok(false) };
-    if session.status == "failed" || session.parent_call_id.is_some() || session.worker_id != worker_id.to_string() {
+    if session.status == "failed" || session.worker_id != worker_id.to_string() {
         return Ok(false);
     }
     let Some((text, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
@@ -1129,7 +1149,22 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         },
         _ => Vec::new(),
     };
-    let spec = session_spec(st, &session, false, seed).await?;
+    let mut spec = session_spec(st, &session, false, seed).await?;
+    // A subagent's spec says whose it is; its tools and prompt come from
+    // its log.
+    if let (Some(parent), Some(call)) = (&session.parent_id, &session.parent_call_id) {
+        let depth = match events.first().and_then(|e| e.kind.as_ref()) {
+            Some(session_event::Kind::Started(s)) => s.depth.max(1),
+            _ => 1,
+        };
+        spec.delegation = Some(c6_proto::Delegation {
+            parent_session_id: parent.clone(),
+            parent_call_id: call.clone(),
+            root_session_id: session.root_id.clone().unwrap_or_else(|| parent.clone()),
+            agent_json: String::new(),
+            depth,
+        });
+    }
     let restore_id = Uuid::now_v7().to_string();
     let cmd = SessionCommand {
         command_id: restore_id.clone(),

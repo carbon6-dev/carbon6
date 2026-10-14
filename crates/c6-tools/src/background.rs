@@ -287,6 +287,11 @@ impl Background {
         (id, cancel)
     }
 
+    /// Whether `id` is a background shell command (not a subagent).
+    pub fn is_command(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|p| p.kind == TaskKind::Shell)
+    }
+
     /// Records a background subagent's report (or failure).
     pub fn finish_agent(&self, id: &str, result: Result<String, String>) {
         let Some(p) = self.get(id) else { return };
@@ -418,6 +423,13 @@ impl Tool for BashOutput {
 
     async fn call(&self, ctx: &ToolCtx, input: Value) -> ToolOutput {
         let id = input[self.id_key].as_str().unwrap_or_default();
+        // A subagent (by its task id or session id): what it has done so far.
+        if !ctx.session.background.is_command(id)
+            && let Some(agents) = ctx.session.subagents()
+            && let Ok(digest) = agents.peek(id).await
+        {
+            return ToolOutput::limited(digest, false);
+        }
         let Some((text, status, skipped)) = ctx.session.background.read_new(id) else {
             return ToolOutput::err(format!("no background command {id:?}"));
         };

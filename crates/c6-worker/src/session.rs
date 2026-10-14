@@ -40,6 +40,8 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 struct Handle {
     tx: mpsc::UnboundedSender<ActorMsg>,
     tools: Arc<SessionTools>,
+    /// A turn is running.
+    running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How a delegation's turn ended.
@@ -165,7 +167,14 @@ pub(crate) enum ActorMsg {
     },
     /// A subagent's task from its parent: run it as given (no command
     /// expansion, mentions or prompt hooks) and say how its turn ended.
-    Delegate(Box<PendingInput>, tokio::sync::oneshot::Sender<Outcome>),
+    /// Without a sender it joins the running turn (or starts one), and the
+    /// report goes to the parent as a notice unless a call waits on it.
+    Delegate(Box<PendingInput>, Option<tokio::sync::oneshot::Sender<Outcome>>),
+    /// What a subagent did in a turn no call waited on, for its parent.
+    ChildReport {
+        text: String,
+        wake: bool,
+    },
 }
 
 /// Background-task notices may start this many turns per hour in an idle
@@ -186,6 +195,21 @@ impl SessionManager {
 
     pub(crate) fn journal(&self) -> &Arc<Journal> {
         &self.journal
+    }
+
+    /// Whether the session's actor is running a turn.
+    pub(crate) fn is_running(&self, session_id: &str) -> bool {
+        self.actors
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|a| !a.tx.is_closed() && a.running.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// The session's actor, started from the journal if needed (boxed: an
+    /// actor reaches others, whose actors it may start).
+    pub(crate) fn actor_for<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<mpsc::UnboundedSender<ActorMsg>>>> {
+        Box::pin(self.actor(session_id))
     }
 
     fn live(&self, session_id: &str) -> Option<mpsc::UnboundedSender<ActorMsg>> {
@@ -279,6 +303,7 @@ impl SessionManager {
                     text: input.text,
                     attachments: input.attachments,
                     command: input.command,
+                    wake: input.wake,
                     ..Default::default()
                 };
                 let choice = CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels };
@@ -686,8 +711,9 @@ impl SessionManager {
                 let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
                 let (secret_values, _) = fetch_secrets(&self.link, &on_behalf_of, &names).await;
                 let built = build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels, &secret_values).await.tools;
+                // A subagent keeps the tools it started with.
                 match &delegation {
-                    Some(d) => crate::subagent::delegated_tools(d, built),
+                    Some(_) => built.into_iter().filter(|t| started.tools.contains(&t.spec().name)).collect(),
                     None => built,
                 }
             }
@@ -701,13 +727,17 @@ impl SessionManager {
         session_tools.browser.set_profile(self.state_dir.join("browser").join(session_id));
         let mut hooks = None;
         let mut policies = None;
-        if let Some(d) = &delegation {
-            // A subagent works with its parent's tool hooks and policies
-            // (held calls wait in the parent), publisher, memory, notices
-            // and way to the head.
-            let parent = self.parent_tools(&d.parent_session_id).await?.ok_or_else(|| {
-                anyhow::anyhow!("the parent session {} of subagent {session_id} is not on this worker", d.parent_session_id)
-            })?;
+        // A subagent works with its parent's tool hooks and policies (held
+        // calls wait in the parent), publisher, memory, notices and way to
+        // the head. Without its parent here (it was trimmed), its own.
+        let parent = match &delegation {
+            Some(d) => self.parent_tools(&d.parent_session_id).await.unwrap_or_else(|e| {
+                warn!(session = %session_id, parent = %d.parent_session_id, "a subagent without its parent: {e:#}");
+                None
+            }),
+            None => None,
+        };
+        if let Some(parent) = &parent {
             session_tools.set_hooks(parent.hooks().map(|h| Arc::new(crate::subagent::SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
             session_tools.set_publisher(parent.publisher());
             session_tools.set_memory(parent.memory());
@@ -715,9 +745,9 @@ impl SessionManager {
             session_tools.set_head(parent.head());
         } else {
             hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
-            session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: session_id.to_owned() })));
+            session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: on_behalf_of.clone() })));
         }
-        if started.tool_profile != crate::claude_code::PROFILE && delegation.is_none() {
+        if started.tool_profile != crate::claude_code::PROFILE && parent.is_none() {
             // Policies first (a denial wins), then your hooks.
             let (ap_tx, mut ap_rx) = mpsc::unbounded_channel();
             policies = crate::policy::Policies::new(&spec.policies_json, &labels, ap_tx);
@@ -809,8 +839,10 @@ impl SessionManager {
             on_behalf_of,
             waiting: Vec::new(),
             manager: self.clone(),
+            running_flag: Arc::default(),
+            report: None,
         };
-        let handle = Handle { tx, tools: actor.session_tools.clone() };
+        let handle = Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone() };
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
         Ok(handle)
@@ -961,6 +993,12 @@ struct Actor {
     waiting: Vec<(String, tokio::sync::oneshot::Sender<Outcome>)>,
     /// To start subagents.
     manager: SessionManager,
+    /// Shared with the manager: a turn is running.
+    running_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// A subagent's inputs since its last report that no call waits on
+    /// (yours, notices, messages joining a turn): what they said, and
+    /// whether the report should wake the parent.
+    report: Option<(Vec<String>, bool)>,
 }
 
 impl Actor {
@@ -985,6 +1023,7 @@ impl Actor {
                     return;
                 }
                 running = Some(self.start_turn());
+                self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             tokio::select! {
                 msg = rx.recv() => match msg {
@@ -1031,6 +1070,11 @@ impl Actor {
                                 input.prompt = format!("{}\n\n<user-prompt-submit-hook>\n{context}\n</user-prompt-submit-hook>", input.model_text());
                             }
                         }
+                        if self.spec.delegation.is_some() && !input.is_compact() {
+                            let r = self.report.get_or_insert_with(Default::default);
+                            r.0.push(input.text.clone());
+                            r.1 |= input.wake;
+                        }
                         let held: Vec<PendingInput> = std::mem::take(&mut self.deferred);
                         let mut inbox = self.inbox.lock().unwrap();
                         for n in held {
@@ -1042,8 +1086,29 @@ impl Actor {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
                     }
                     Some(ActorMsg::Delegate(input, done)) => {
-                        self.waiting.push((input.command_id.clone(), done));
-                        self.inbox.lock().unwrap().push(*input, None);
+                        match done {
+                            Some(done) => self.waiting.push((input.command_id.clone(), done)),
+                            None => self.report.get_or_insert_with(Default::default).0.push(String::new()),
+                        }
+                        // Notices held for the next input come with it.
+                        let held: Vec<PendingInput> = std::mem::take(&mut self.deferred);
+                        let mut inbox = self.inbox.lock().unwrap();
+                        for n in held {
+                            inbox.push(n, None);
+                        }
+                        inbox.push(*input, None);
+                    }
+                    Some(ActorMsg::ChildReport { text, wake }) => {
+                        let input = PendingInput {
+                            command_id: format!("subagent:{}", uuid::Uuid::now_v7()),
+                            text,
+                            command: "task-notification".into(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = self.queue_notice(input, running.is_some(), wake).await {
+                            error!(session = %self.writer.session_id, "queueing a subagent's report: {e:#}");
+                            return;
+                        }
                     }
                     Some(ActorMsg::Task(ev)) => {
                         let state = match ev.state {
@@ -1135,6 +1200,7 @@ impl Actor {
                 },
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     running = None;
+                    self.running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
                     match done {
                         Ok(Some(conv)) => {
@@ -1159,11 +1225,10 @@ impl Actor {
     }
 
     /// Tells delegations whose input a turn took (no longer queued) how
-    /// that turn ended: the last turn in the log.
+    /// that turn ended: the last turn in the log. A subagent's turn that no
+    /// call waited on goes to its parent as a notice.
     async fn settle_delegations(&mut self) -> anyhow::Result<()> {
-        if self.waiting.is_empty() {
-            return Ok(());
-        }
+        let Some(d) = self.spec.delegation.clone() else { return Ok(()) };
         let settled: Vec<_> = {
             let inbox = self.inbox.lock().unwrap();
             let (done, still): (Vec<_>, Vec<_>) =
@@ -1171,13 +1236,72 @@ impl Actor {
             self.waiting = still;
             done
         };
-        if settled.is_empty() {
+        // A call still waiting gets this turn's report: nothing to tell.
+        let told = settled.iter().any(|(_, tx)| !tx.is_closed());
+        if settled.is_empty() && self.report.is_none() {
             return Ok(());
         }
         let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
-        for (_, tx) in settled {
-            let _ = tx.send(last_turn_outcome(&events));
+        let outcome = last_turn_outcome(&events);
+        let report = self.report.take();
+        if !told && let Some((said, wake)) = report {
+            let sid = self.writer.session_id.clone();
+            let body = if outcome.reason == TurnEndReason::Completed && !outcome.report.trim().is_empty() {
+                format!("<subagent id=\"{sid}\" status=\"completed\">\nReport:\n{}\n</subagent>", outcome.report.trim_end())
+            } else {
+                let status = crate::subagent::status_of(outcome.reason, &outcome.report);
+                crate::subagent::partial(&self.spec, &crate::subagent::digest(&self.journal, &sid, status, "").await)
+            };
+            let said: Vec<String> = said.into_iter().filter(|s| !s.trim().is_empty()).collect();
+            let text = if said.is_empty() {
+                format!("Subagent {sid} worked on its own (no call of yours waited on it):\n{body}")
+            } else {
+                format!("The user messaged subagent {sid} directly: \"{}\"\n{body}", said.join("\" / \""))
+            };
+            match self.manager.actor_for(&d.parent_session_id).await {
+                Ok(Some(parent)) => {
+                    let _ = parent.send(ActorMsg::ChildReport { text, wake });
+                }
+                Ok(None) => warn!(session = %sid, "a subagent's report has no parent on this worker"),
+                Err(e) => warn!(session = %sid, "a subagent's report could not reach its parent: {e:#}"),
+            }
         }
+        for (_, tx) in settled {
+            let _ = tx.send(Outcome { reason: outcome.reason, report: outcome.report.clone(), error: outcome.error.clone() });
+        }
+        Ok(())
+    }
+
+    /// Queues a notice for the agent: it joins a running turn at its next
+    /// step; in an idle session it starts a turn if `wake` (within the
+    /// hourly limit), else it waits for the next input.
+    async fn queue_notice(&mut self, input: PendingInput, busy: bool, wake: bool) -> anyhow::Result<()> {
+        if busy || !self.inbox.lock().unwrap().queue.is_empty() {
+            self.inbox.lock().unwrap().push(input, None);
+            return Ok(());
+        }
+        if !wake {
+            self.deferred.push(input);
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(3600)) {
+            self.auto_turns.pop_front();
+        }
+        if self.auto_turns.len() < AUTO_TURNS_PER_HOUR {
+            self.auto_turns.push_back(now);
+            self.inbox.lock().unwrap().push(input, None);
+            return Ok(());
+        }
+        warn!(session = %self.writer.session_id, "notice held: too many automatic turns this hour");
+        self.deferred.push(input);
+        self.writer
+            .append(session_event::Kind::Error(ErrorEvent {
+                message: format!(
+                    "A notice for the agent will come with your next message: notices already started {AUTO_TURNS_PER_HOUR} turns in the last hour."
+                ),
+            }))
+            .await?;
         Ok(())
     }
 

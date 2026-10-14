@@ -1104,6 +1104,19 @@ pub struct SendMessage {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// To a subagent: when its report comes and its parent is idle, start a
+    /// turn there (else the parent hears with its next input).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake: bool,
+}
+
+/// `POST /api/v1/sessions/{id}/resume`: continue a subagent whose turn did
+/// not finish, with the realm's `session.subagent_resume` prompt.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ResumeRequest {
+    #[serde(default)]
+    pub wake: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1205,6 +1218,9 @@ pub enum EventKind {
         /// you did.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         delegated_by: String,
+        /// Sent to a subagent with "wake the parent".
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        wake: bool,
     },
     TurnStarted {
         turn: u64,

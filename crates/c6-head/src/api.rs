@@ -69,6 +69,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
+        .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
@@ -1747,6 +1748,14 @@ async fn put_policies(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::P
     crate::sessions::check_policies(&p)?;
     st.store.set_setting(crate::sessions::POLICIES, &serde_json::to_string(&p).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_session(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::ResumeRequest>,
+) -> ApiResult<Json<api::QueuedInput>> {
+    Ok(Json(crate::sessions::resume(&st, &id, &req).await?))
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

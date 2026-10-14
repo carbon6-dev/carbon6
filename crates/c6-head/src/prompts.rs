@@ -36,6 +36,11 @@ pub const DEFAULTS: &[Prompt] = &[
     Prompt { name: "session.side_chat", description: "Added for side chats.", default: SIDE_CHAT_NOTE },
     Prompt { name: "session.subagent", description: "Added to a subagent's task.", default: c6_agent::SUBAGENT_NOTE },
     Prompt {
+        name: "session.subagent_resume",
+        description: "Sent to a subagent when you resume it after a turn that did not finish.",
+        default: c6_agent::SUBAGENT_RESUME,
+    },
+    Prompt {
         name: "session.subagent_partial",
         description: "Told to an agent after the summary of a subagent that did not finish.",
         default: c6_agent::SUBAGENT_PARTIAL,

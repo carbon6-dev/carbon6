@@ -8,7 +8,8 @@ use c6_llm::{ToolProfile, ToolSpec};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ApplyPatch, Bash, BashOutput, Concurrency, Edit, Glob, Grep, KillShell, Plan, Read, Task, Tool, ToolCtx, ToolOutput, WebFetch, Write,
+    ApplyPatch, Bash, BashOutput, Concurrency, Edit, Glob, Grep, KillShell, Plan, Read, SendMessage, Task, Tool, ToolCtx, ToolOutput, WebFetch,
+    Write,
 };
 
 pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
@@ -25,6 +26,7 @@ pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
             Arc::new(WebFetch::generic()),
             Arc::new(Plan::update_plan()),
             Arc::new(Task::generic()),
+            Arc::new(SendMessage::generic()),
         ],
         ToolProfile::Claude => claude(),
         ToolProfile::Codex => vec![Arc::new(Shell), Arc::new(ApplyPatch), Arc::new(Plan::update_plan()), Arc::new(WebFetch::generic())],
@@ -165,6 +167,7 @@ fn claude() -> Vec<Arc<dyn Tool>> {
         Arc::new(WebFetch::claude()),
         Arc::new(Plan::todo_write()),
         Arc::new(Task::claude()),
+        Arc::new(SendMessage::claude()),
     ]
 }
 

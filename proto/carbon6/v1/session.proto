@@ -195,6 +195,8 @@ message UserMessage {
   string blocked = 6;
   // In a subagent: the parent's tool call that sent it; empty when you did.
   string delegated_by = 7;
+  // UserInput.wake, as sent.
+  bool wake = 8;
 }
 
 message Attachment {
@@ -513,6 +515,10 @@ message UserInput {
   repeated string labels = 6;
   // 7 was context (follow-through, removed).
   reserved 7;
+  // To a subagent with no call waiting on it: start a turn in its idle
+  // parent when its report arrives (else the parent hears with its next
+  // input).
+  bool wake = 8;
 }
 
 message Interrupt {}

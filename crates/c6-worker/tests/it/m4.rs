@@ -155,8 +155,6 @@ async fn subagents_mcp_skills_and_otlp() {
     assert!(children[0].parent_call_id.as_deref().unwrap().contains("task"));
     let listed: Vec<Session> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
     assert_eq!(listed.len(), 1);
-    let r = http.post(format!("{api}/sessions/{}/messages", children[0].id)).json(&json!({"text": "more"})).send().await.unwrap();
-    assert_eq!(r.status(), 400, "subagent sessions take no messages");
 
     // OTLP: one export per finished turn (parent + child), with GenAI spans.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

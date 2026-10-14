@@ -177,7 +177,7 @@ async fn a_subagent_is_a_session_and_stops_with_its_parent() {
     let out = &task_result.0;
     assert!(out.contains(&format!("<subagent id=\"{child_id}\" status=\"interrupted\"")), "{out}");
     assert!(out.contains("tool_calls=\"1\"") && out.contains("turns=\"1\""), "{out}");
-    assert!(out.contains("can be continued"), "the partial prompt follows: {out}");
+    assert!(out.contains("send it a message"), "the partial prompt follows: {out}");
     let d = env.detail(&child_id).await.unwrap();
     assert_eq!(d.session.status, SessionStatus::Idle);
     assert_eq!(d.session.end_reason, Some(TurnEndReason::Interrupted));
@@ -312,4 +312,266 @@ async fn a_lost_background_subagent_is_reported_with_its_work() {
     assert!(notice.contains(&format!("<subagent id=\"{child_id}\" status=\"lost\"")), "{notice}");
     assert!(!notice.contains("output is gone"), "{notice}");
     stop_second.cancel();
+}
+
+fn user_messages(events: &[Event]) -> Vec<(String, String, String)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::User { text, command, delegated_by, .. } => Some((text.clone(), command.clone(), delegated_by.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The text of every message in a model request.
+fn request_text(req: &Value) -> String {
+    req["messages"].to_string()
+}
+
+/// Starts a session whose subagent runs a command and is then stopped with
+/// its parent; returns (parent, subagent).
+async fn interrupted_subagent(env: &Env, worker: &Worker, project: &Path) -> (String, String) {
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"dig","prompt":"Look for the needle."}"#.into())]));
+    env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo found-half"}"#.into())]));
+    let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
+    let id = env.create(worker, project, "go").await;
+    let child_id = until("subagent working", 15, async || {
+        let c = env.children(&id).await.into_iter().next()?;
+        let ev = env.events(&c.id).await;
+        ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("found-half"))).then_some(c.id)
+    })
+    .await;
+    env.http.post(format!("{}/sessions/{id}/interrupt", env.api)).send().await.unwrap();
+    for sid in [&id, &child_id] {
+        until("stopped", 15, async || (turn_end(&env.events(sid).await) == Some(TurnEndReason::Interrupted)).then_some(())).await;
+    }
+    until("idle", 15, async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle && d.queued.is_empty())).await;
+    (id, child_id)
+}
+
+/// The parent continues a stopped subagent with SendMessage: same session,
+/// its earlier work in the conversation, the report back as the result.
+#[tokio::test]
+async fn the_parent_continues_a_stopped_subagent() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let (id, child_id) = interrupted_subagent(&env, &worker, project.path()).await;
+
+    env.mock.push(Reply::ToolCalls(vec![("send_message".into(), json!({"to": child_id, "message": "Carry on."}).to_string())]));
+    env.mock.push(Reply::Text("The needle is in the haystack.".into())); // the subagent
+    env.mock.push(Reply::Text("Found it.".into())); // the parent
+    let before = env.mock.requests().len();
+    env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "continue it"})).send().await.unwrap();
+    let parent = until("parent done", 15, async || {
+        let ev = env.events(&id).await;
+        (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
+    })
+    .await;
+    let (call_id, out) = parent
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolResult { call_id, tool, output, .. } if tool == "send_message" => Some((call_id.clone(), output.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert!(out.starts_with("The needle is in the haystack."), "{out}");
+    assert_eq!(env.children(&id).await.len(), 1, "the same subagent");
+    let msgs = user_messages(&env.events(&child_id).await);
+    assert_eq!(msgs.last().unwrap(), &("Carry on.".to_owned(), String::new(), call_id));
+    // The subagent saw what it had done before.
+    let reqs = env.mock.requests();
+    let child_req = reqs[before..].iter().find(|r| request_text(r).contains("Carry on.")).unwrap();
+    assert!(request_text(child_req).contains("found-half"));
+    stop.cancel();
+}
+
+/// You message a subagent directly: its report reaches the idle parent
+/// with the parent's next input, or at once with wake.
+#[tokio::test]
+async fn your_message_to_a_subagent_reports_back() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let (id, child_id) = interrupted_subagent(&env, &worker, project.path()).await;
+    let parent_seq = env.detail(&id).await.unwrap().session.last_seq;
+
+    // Without wake: the parent stays idle.
+    env.mock.push(Reply::Text("Half the haystack is searched.".into()));
+    let r = env.http.post(format!("{}/sessions/{child_id}/messages", env.api)).json(&json!({"text": "How far did you get?"})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    until("subagent answered", 15, async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(env.detail(&id).await.unwrap().session.last_seq, parent_seq, "nothing ran in the parent");
+
+    // Its next input brings the report.
+    env.mock.push(Reply::Text("Noted.".into()));
+    let before = env.mock.requests().len();
+    env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "status?"})).send().await.unwrap();
+    until("parent answered", 15, async || {
+        let ev = env.events(&id).await;
+        (ev.last().unwrap().seq > parent_seq && turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(())
+    })
+    .await;
+    let req = request_text(&env.mock.requests()[before]);
+    assert!(req.contains("How far did you get?") && req.contains("Half the haystack is searched."), "{req}");
+
+    // With wake: the parent starts a turn by itself.
+    env.mock.push(Reply::Text("All of it now.".into())); // the subagent
+    env.mock.push(Reply::Text("Great.".into())); // the parent, woken
+    let seq = env.detail(&id).await.unwrap().session.last_seq;
+    env.http
+        .post(format!("{}/sessions/{child_id}/messages", env.api))
+        .json(&json!({"text": "Search the rest.", "wake": true}))
+        .send()
+        .await
+        .unwrap();
+    let ev = until("parent woken", 15, async || {
+        let ev = env.events(&id).await;
+        (ev.last().unwrap().seq > seq && turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
+    })
+    .await;
+    let notice = user_messages(&ev).into_iter().rev().find(|(_, c, _)| c == "task-notification").unwrap();
+    assert!(notice.0.contains("All of it now."), "{notice:?}");
+    let msgs = user_messages(&env.events(&child_id).await);
+    assert_eq!(msgs.last().unwrap().0, "Search the rest.");
+    stop.cancel();
+}
+
+/// Resume sends the resume prompt to a stopped subagent; a finished one is
+/// not resumed.
+#[tokio::test]
+async fn resume_continues_a_stopped_subagent() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let (id, child_id) = interrupted_subagent(&env, &worker, project.path()).await;
+
+    let r = env.http.post(format!("{}/sessions/{id}/resume", env.api)).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 400, "only subagents are resumed");
+    env.mock.push(Reply::Text("Found it after all.".into()));
+    let r = env.http.post(format!("{}/sessions/{child_id}/resume", env.api)).json(&json!({})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    until("resumed", 15, async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
+    let (text, command, _) = user_messages(&env.events(&child_id).await).pop().unwrap();
+    assert_eq!(command, "resume");
+    assert!(text.contains("stopped partway"), "{text}");
+    let r = env.http.post(format!("{}/sessions/{child_id}/resume", env.api)).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 400, "its last turn finished");
+
+    // A side chat on the subagent sees its conversation.
+    let anchor = env.events(&child_id).await.last().unwrap().seq;
+    env.mock.push(Reply::Text("It searched with echo.".into()));
+    let before = env.mock.requests().len();
+    let side: Value = env
+        .http
+        .post(format!("{}/sessions/{child_id}/side-chats", env.api))
+        .json(&json!({"anchor_seq": anchor, "prompt": "How did it search?", "connection_id": env.conn_id, "model": "m"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let side_id = side["id"].as_str().unwrap().to_owned();
+    until("side chat answered", 15, async || (turn_end(&env.events(&side_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
+    let req = request_text(&env.mock.requests()[before]);
+    assert!(req.contains("found-half") && req.contains("How did it search?"), "{req}");
+    stop.cancel();
+}
+
+/// The parent steers a subagent running in the background: the message
+/// joins the subagent's turn, and its report comes as the task's notice.
+#[tokio::test]
+async fn the_parent_steers_a_running_subagent() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+
+    env.mock.push(Reply::ToolCalls(vec![
+        ("task".into(), r#"{"description":"dig","prompt":"Dig.","run_in_background":true}"#.into()),
+        ("bash".into(), r#"{"command":"sleep 1"}"#.into()),
+    ]));
+    env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"sleep 3"}"#.into())])); // the subagent
+    env.mock.push(Reply::ToolCalls(vec![("send_message".into(), r#"{"to":"bg1","message":"Also check the shed."}"#.into())]));
+    env.mock.push(Reply::Text("Waiting for it.".into()));
+    env.mock.push(Reply::Text("Dug, and the shed is empty.".into())); // the subagent, steered
+    env.mock.push(Reply::Text("Good.".into())); // the parent, told
+    let id = env.create(&worker, project.path(), "go").await;
+    let ev = until("parent told", 20, async || {
+        let ev = env.events(&id).await;
+        user_messages(&ev).iter().any(|(t, c, _)| c == "task-notification" && t.contains("shed is empty")).then_some(ev)
+    })
+    .await;
+    let sent = ev
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolResult { tool, output, .. } if tool == "send_message" => Some(output.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(sent.starts_with("Sent:"), "{sent}");
+    let child_id = env.children(&id).await[0].id.clone();
+    let msgs = user_messages(&env.events(&child_id).await);
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert_eq!(msgs[1].0, "Also check the shed.");
+    // One turn: the message joined it.
+    let turns = env.events(&child_id).await.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { .. })).count();
+    assert_eq!(turns, 1);
+    stop.cancel();
+}
+
+/// A worker that lost its journal gets a subagent back from the head when
+/// you message it (without its parent there, with its own hooks), and the
+/// subagent keeps its conversation and tools.
+#[tokio::test]
+async fn a_lost_subagent_is_restored_from_the_head() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let (_id, child_id) = interrupted_subagent(&env, &worker, project.path()).await;
+    let tools = match &env.events(&child_id).await[0].kind {
+        EventKind::Started { tools, .. } => tools.clone(),
+        _ => panic!(),
+    };
+    assert!(!tools.iter().any(|t| t == "task" || t == "send_message"), "{tools:?}");
+    stop.cancel();
+    drop(worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Same identity, empty state: the journal is gone.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(c6_worker::identity::identity_dir(fresh.path())).unwrap();
+    for f in std::fs::read_dir(c6_worker::identity::identity_dir(state.path())).unwrap().flatten() {
+        std::fs::copy(f.path(), c6_worker::identity::identity_dir(fresh.path()).join(f.file_name())).unwrap();
+    }
+    let (_reborn, stop2) = run_worker(fresh.path()).await;
+    env.mock.push(Reply::Text("Picking up where I was.".into()));
+    let before = env.mock.requests().len();
+    env.http.post(format!("{}/sessions/{child_id}/messages", env.api)).json(&json!({"text": "Go on."})).send().await.unwrap();
+    until("restored subagent answered", 20, async || {
+        let ev = env.events(&child_id).await;
+        (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(())
+    })
+    .await;
+    let req = &env.mock.requests()[before];
+    assert!(request_text(req).contains("found-half"), "history restored");
+    let offered: Vec<String> = req["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect();
+    let mut a = offered.clone();
+    a.sort();
+    let mut b = tools.clone();
+    b.sort();
+    assert_eq!(a, b, "the same tools");
+    stop2.cancel();
 }

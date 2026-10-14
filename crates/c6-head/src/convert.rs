@@ -34,6 +34,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             prompt: u.prompt.clone(),
             blocked: u.blocked.clone(),
             delegated_by: u.delegated_by.clone(),
+            wake: u.wake,
         },
         Kind::SubagentSpawned(s) => api::EventKind::SubagentSpawned {
             call_id: s.call_id.clone(),

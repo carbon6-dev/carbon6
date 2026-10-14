@@ -23,8 +23,14 @@ Work autonomously. When you are done, reply with a concise but complete report o
 
 /// What an agent is told after the digest of a subagent that did not
 /// finish (docs/subagents.md §10: an editable prompt).
-pub const SUBAGENT_PARTIAL: &str = "The subagent did not finish. Its work so far is summarized above and its whole conversation is kept, \
-so it can be continued with what it already did rather than started again. Check its changes before relying on them.";
+pub const SUBAGENT_PARTIAL: &str = "The subagent did not finish. Its work so far is summarized above and its whole conversation is kept: \
+to continue it with what it already did, send it a message with the send-message tool (to: its id) rather than starting a new one. \
+Check its changes before relying on them.";
+
+/// What a subagent is told when you resume it after a turn that did not
+/// finish (an editable prompt).
+pub const SUBAGENT_RESUME: &str = "You were stopped partway through. Your work so far is above. Check where you left off, \
+then continue the task and finish with your report.";
 
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.
@@ -52,6 +58,8 @@ pub struct PendingInput {
     pub blocked: String,
     /// In a subagent: the parent's tool call that sent it.
     pub delegated_by: String,
+    /// In a subagent: its report should start a turn in its idle parent.
+    pub wake: bool,
 }
 
 impl PendingInput {
@@ -65,6 +73,7 @@ impl PendingInput {
             prompt: self.prompt.clone(),
             blocked: self.blocked.clone(),
             delegated_by: self.delegated_by.clone(),
+            wake: self.wake,
         })
     }
 
