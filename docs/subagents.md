@@ -52,7 +52,6 @@ The child then gets everything an actor already has for free: inbox delivery at 
 | Event | Log | New fields | Purpose |
 |---|---|---|---|
 | `SubagentSpawned` | parent | `call_id`, `child_session_id`, `agent`, `description`, `background_task_id` | Written before the child starts. The parent's log now links to its children itself, so the UI can show a thread at once and recovery knows which calls were delegations. |
-| `BackgroundTask` | parent | `+ child_session_id` | A background subagent's notices and the running-tasks pill can point at the session. |
 | `UserMessage` | child | `+ delegated_by` (a parent call id, or empty when you sent it), `+ wake` | Each turn of the child is tied to its delegation. The UI marks turns "from its parent" or "from you"; `wake` is what you chose for reporting back (§6). |
 | `SessionStarted` | child | `+ agent`, `+ depth` | Shown in the UI; used again on reload. |
 
@@ -60,7 +59,7 @@ No new turn-end reasons are needed.
 
 ### Head
 
-- **Migration:** `sessions.agent` (the named agent, `''` for general-purpose), `sessions.end_reason` (the last `TurnEnded` reason, set at ingest), `sessions.root_id` (the top-level session, set at creation) and `sessions.observed` (§8). With these, thread headers and the subagents strip (§9) can show states without loading each child's log, and whole trees can be queried without recursion.
+- **Migration:** `sessions.agent` (the named agent, `''` for general-purpose), `sessions.end_reason` (the last `TurnEnded` reason, set at ingest), `sessions.root_id` (the top-level session, set at creation, `NULL` for a top-level one; migration 0040 fills it in for existing side chats and subagents) and `sessions.observed` (§8). With these, thread headers and the subagents strip (§9) can show states without loading each child's log, and whole trees can be queried without recursion.
 - **`GET /sessions/{id}/children`** returns these columns, plus the `delegated_by` call of each child turn. `?tree=1` returns the whole subtree by `root_id`.
 - **Lift the refusals.** Messages to subagent sessions are allowed (§6). Side chats on subagents are allowed too; they're seeded from the child's log as usual. `Restore` is allowed, so a trimmed child can still be resumed. Rewind stays refused, since it would change what the parent was already told.
 - **Trees, not one level.** Everything that follows `parent_id` one step today follows the whole tree:
@@ -234,7 +233,7 @@ The breadcrumb shows the chain, for example "*main session* › *Find all caller
 
 ## 12. Steps
 
-As built: step 1 on 2026-10-14. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
+As built: steps 1 and 2 on 2026-10-14. A background subagent's session is found through `SubagentSpawned.background_task_id`, so `BackgroundTask` gained no field. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
 
 1. **Actor-backed subagents.** `Delegation` in `CreateSession`, `SubagentSpawned`, the child built and reloaded as an actor, interrupts cascaded through the actor. Depth limit 1, so visible behavior stays as today. Tested by killing the worker mid-subagent and reloading.
 2. **Partial results.** The digest; foreground and background results for every outcome; recovery writing results for dangling delegations; the corrected `lost` text; the head columns.

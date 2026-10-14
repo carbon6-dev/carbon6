@@ -292,7 +292,7 @@ impl Background {
         let Some(p) = self.get(id) else { return };
         let (code, text) = match result {
             Ok(report) => (0, report),
-            Err(e) => (1, format!("The subagent failed: {e}")),
+            Err(e) => (1, e),
         };
         p.push_output(text.as_bytes());
         *p.status.lock().unwrap() = Some(code);

@@ -143,6 +143,8 @@ pub(crate) enum ActorMsg {
         description: String,
         notify: bool,
         pgid: i32,
+        /// A subagent's session.
+        child: String,
     },
     /// Stop a background task (the user asked).
     StopTask(String),
@@ -182,6 +184,10 @@ impl SessionManager {
         self.actors.lock().unwrap().iter().filter(|(_, a)| !a.tx.is_closed()).map(|(id, _)| id.clone()).collect()
     }
 
+    pub(crate) fn journal(&self) -> &Arc<Journal> {
+        &self.journal
+    }
+
     fn live(&self, session_id: &str) -> Option<mpsc::UnboundedSender<ActorMsg>> {
         self.actors.lock().unwrap().get(session_id).map(|a| a.tx.clone())
     }
@@ -190,8 +196,15 @@ impl SessionManager {
     pub async fn recover(&self) -> anyhow::Result<()> {
         for (session_id, last_seq, turn) in self.journal.open_turns().await? {
             warn!(session = %session_id, turn, "closing turn interrupted by worker restart");
+            // A subagent the turn was waiting on: its call gets what it did.
+            let mut seq = last_seq;
+            for result in self.lost_delegations(&session_id).await? {
+                seq += 1;
+                let ev = SessionEvent { seq, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::ToolResult(result)) };
+                self.journal.append(&session_id, &ev).await?;
+            }
             let ev = SessionEvent {
-                seq: last_seq + 1,
+                seq: seq + 1,
                 ts_ms: c6_core::now_ms(),
                 kind: Some(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::WorkerRestarted as i32 })),
             };
@@ -205,6 +218,45 @@ impl SessionManager {
             }
         }
         Ok(())
+    }
+
+    /// Results for the calls of a session's open turn that wait on a
+    /// subagent (foreground, no result yet): the subagent's digest, lost.
+    async fn lost_delegations(&self, session_id: &str) -> anyhow::Result<Vec<c6_proto::ToolResult>> {
+        let Some((spec, events)) = self.journal.load_session(session_id).await? else { return Ok(Vec::new()) };
+        let answered: HashSet<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::ToolResult(r)) => Some(r.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let tool_of = |call_id: &str| {
+            events.iter().find_map(|e| match &e.kind {
+                Some(session_event::Kind::Assistant(a)) => a.blocks.iter().find_map(|b| match &b.block {
+                    Some(c6_proto::content_block::Block::ToolUse(u)) if u.id == call_id => Some(u.name.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+        };
+        let mut out = Vec::new();
+        for e in &events {
+            if let Some(session_event::Kind::SubagentSpawned(sp)) = &e.kind
+                && sp.background_task_id.is_empty()
+                && !answered.contains(sp.call_id.as_str())
+            {
+                let digest = crate::subagent::digest(&self.journal, &sp.child_session_id, "lost", "").await;
+                out.push(c6_proto::ToolResult {
+                    call_id: sp.call_id.clone(),
+                    tool: tool_of(&sp.call_id).unwrap_or_else(|| "Task".into()),
+                    output: crate::subagent::partial(&spec, &digest),
+                    is_error: true,
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Applies a command from the head. `Err` is a rejection reason for the head.
@@ -552,8 +604,21 @@ impl SessionManager {
         }
         let _ = tx.send(ActorMsg::Reserve(highest));
         for t in open {
-            let _ =
-                tx.send(ActorMsg::Lost { task_id: t.task_id, kind: t.kind, description: t.description, notify: t.notify, pgid: t.pgid });
+            let child = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    Some(session_event::Kind::SubagentSpawned(sp)) if sp.background_task_id == t.task_id => Some(sp.child_session_id.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let _ = tx.send(ActorMsg::Lost {
+                task_id: t.task_id,
+                kind: t.kind,
+                description: t.description,
+                notify: t.notify,
+                pgid: t.pgid,
+                child,
+            });
         }
         Ok(Some(handle))
     }
@@ -1005,12 +1070,18 @@ impl Actor {
                             return;
                         }
                     }
-                    Some(ActorMsg::Lost { task_id, kind, description, notify, pgid }) => {
+                    Some(ActorMsg::Lost { task_id, kind, description, notify, pgid, child }) => {
                         // It may outlive the worker (its own process group):
                         // stop it, since nothing reads its output any more.
                         stop_orphan(pgid, &description);
+                        // A subagent's log is kept: what it did so far.
+                        let report = if child.is_empty() {
+                            String::new()
+                        } else {
+                            crate::subagent::partial(&self.spec, &crate::subagent::digest(&self.journal, &child, "lost", "").await)
+                        };
                         let record = BackgroundTask { task_id, kind, description, state: "lost".into(), notify, ..Default::default() };
-                        let notice = notify.then(|| task_notice(&record, ""));
+                        let notice = notify.then(|| task_notice(&record, &report));
                         if let Err(e) = self.task_event(record, notice, running.is_some()).await {
                             error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
                             return;
@@ -1673,21 +1744,25 @@ fn stop_orphan(pgid: i32, command: &str) {
 }
 
 /// What the agent is told when a background task ends.
-fn task_notice(t: &BackgroundTask, output: &str) -> String {
-    let secs = t.elapsed_ms / 1000;
-    let elapsed = if secs >= 3600 {
+pub(crate) fn duration_text(secs: u64) -> String {
+    if secs >= 3600 {
         format!("{}h {}m", secs / 3600, secs % 3600 / 60)
     } else if secs >= 60 {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{secs}s")
-    };
+    }
+}
+
+fn task_notice(t: &BackgroundTask, output: &str) -> String {
+    let elapsed = duration_text(t.elapsed_ms / 1000);
     let agent = t.kind == "agent";
     let status = match t.state.as_str() {
         "finished" if agent && t.exit_code == 0 => "finished".to_owned(),
         "finished" if agent => "failed".to_owned(),
         "finished" => format!("exited with code {}", t.exit_code),
         "stopped_by_user" => "stopped by the user".to_owned(),
+        "lost" if agent => "lost: the worker restarted while it was running".to_owned(),
         "lost" => "lost: the worker restarted while it was running; it has been stopped and its output is gone".to_owned(),
         other => other.to_owned(),
     };

@@ -14,6 +14,7 @@ use c6_tools::{AgentDef, Subagents, Task, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::journal::Journal;
 use crate::session::{SessionManager, Writer};
 
 /// How deep subagents may nest: the top-level session is depth 0, so its
@@ -163,16 +164,163 @@ impl Subagents for Runner {
         // subagent's turn; its log keeps what it did. The delegation's
         // outcome follows once that turn closes.
         let mut guard = InterruptOnDrop(Some(child.clone()));
+        let mut stopped_here = false;
         let outcome = tokio::select! {
             o = &mut rx => o,
             _ = cancel.cancelled() => {
+                stopped_here = true;
                 let _ = child.send(crate::session::ActorMsg::Interrupt);
                 (&mut rx).await
             }
         };
         guard.0 = None;
-        finish(&child_id, outcome.ok())
+        let journal = p.manager.journal();
+        match outcome {
+            Ok(o) if o.reason == TurnEndReason::Completed && !o.report.trim().is_empty() => {
+                Ok(format!("{}\n\n[subagent session {child_id}]", o.report))
+            }
+            Ok(o) => {
+                let status = status_of(o.reason, &o.report);
+                // Stopped from elsewhere than this call: by you.
+                let by = if o.reason == TurnEndReason::Interrupted && !stopped_here { "user" } else { "" };
+                Err(partial(&p.spec, &digest(journal, &child_id, status, by).await))
+            }
+            Err(_) => Err(partial(&p.spec, &digest(journal, &child_id, "failed", "").await)),
+        }
     }
+}
+
+/// How a delegation's turn ended, as the digest names it.
+pub(crate) fn status_of(reason: TurnEndReason, report: &str) -> &'static str {
+    match reason {
+        TurnEndReason::Completed if report.trim().is_empty() => "completed without a report",
+        TurnEndReason::Completed => "completed",
+        TurnEndReason::Interrupted => "interrupted",
+        TurnEndReason::WorkerRestarted => "lost",
+        _ => "failed",
+    }
+}
+
+/// A digest followed by what the agent is told about it (an editable
+/// prompt).
+pub(crate) fn partial(spec: &CreateSession, digest: &str) -> String {
+    format!("{digest}\n{}", crate::session::spec_prompt(spec, "session.subagent_partial", c6_agent::SUBAGENT_PARTIAL))
+}
+
+/// What a subagent did, from its log, for an agent that did not get its
+/// report: how far it got, the files it changed (by its own calls, so other
+/// agents' edits do not show), its errors and its own subagents.
+pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: &str) -> String {
+    let events = journal.events_after(child_id, 0, u32::MAX).await.unwrap_or_default();
+    let mut turns = 0;
+    let mut calls = 0;
+    let mut last_text = String::new();
+    let mut edits: Vec<(String, Vec<String>)> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut children: Vec<(String, String)> = Vec::new();
+    for e in &events {
+        match &e.kind {
+            Some(session_event::Kind::TurnStarted(_)) => turns += 1,
+            Some(session_event::Kind::Assistant(a)) => {
+                for b in &a.blocks {
+                    match &b.block {
+                        Some(c6_proto::content_block::Block::Text(t)) if !t.trim().is_empty() => last_text = t.trim().to_owned(),
+                        Some(c6_proto::content_block::Block::ToolUse(u)) => {
+                            let paths = edited_paths(&u.name, &u.input_json);
+                            if !paths.is_empty() {
+                                edits.push((u.id.clone(), paths));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(session_event::Kind::ToolResult(r)) => {
+                calls += 1;
+                if r.is_error {
+                    failed.push(r.call_id.clone());
+                    errors.push(format!("{}: {}", r.tool, first_line(&r.output)));
+                } else if let Some((_, paths)) = edits.iter().find(|(id, _)| id == &r.call_id) {
+                    for p in paths {
+                        if !changed.contains(p) {
+                            changed.push(p.clone());
+                        }
+                    }
+                }
+            }
+            Some(session_event::Kind::Error(err)) => errors.push(first_line(&err.message)),
+            Some(session_event::Kind::SubagentSpawned(sp)) => children.push((sp.child_session_id.clone(), sp.description.clone())),
+            _ => {}
+        }
+    }
+    let elapsed = match (events.first(), events.last()) {
+        (Some(a), Some(b)) => crate::session::duration_text(((b.ts_ms - a.ts_ms).max(0) / 1000) as u64),
+        _ => "0s".into(),
+    };
+    let by = if by.is_empty() { String::new() } else { format!(" by=\"{by}\"") };
+    let mut out = format!("<subagent id=\"{child_id}\" status=\"{status}\"{by} turns=\"{turns}\" tool_calls=\"{calls}\" elapsed=\"{elapsed}\">\n");
+    if !last_text.is_empty() {
+        out.push_str(&format!("Last message: {}\n", clip(&last_text, 800)));
+    }
+    if !changed.is_empty() {
+        out.push_str(&format!("Changed: {}\n", changed.join(", ")));
+    }
+    if !errors.is_empty() {
+        out.push_str(&format!("Errors: {} (last: {})\n", errors.len(), clip(errors.last().unwrap(), 200)));
+    }
+    if !children.is_empty() {
+        let mut list = Vec::new();
+        for (id, description) in &children {
+            let ev = journal.events_after(id, 0, u32::MAX).await.unwrap_or_default();
+            let state = ev
+                .iter()
+                .rev()
+                .find_map(|e| match &e.kind {
+                    Some(session_event::Kind::TurnEnded(t)) => Some(status_of(TurnEndReason::try_from(t.reason).unwrap_or_default(), "x")),
+                    Some(session_event::Kind::TurnStarted(_)) => Some("running"),
+                    _ => None,
+                })
+                .unwrap_or("not started");
+            list.push(format!("{id} \"{description}\" ({state})"));
+        }
+        out.push_str(&format!("Subagents: {}\n", list.join(", ")));
+    }
+    out.push_str("</subagent>");
+    out
+}
+
+/// The files a call to a file-changing tool names.
+fn edited_paths(tool: &str, input_json: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(input_json).unwrap_or_default();
+    match tool.to_ascii_lowercase().as_str() {
+        "write" | "edit" | "multiedit" | "notebookedit" => {
+            v["file_path"].as_str().or(v["path"].as_str()).map(|p| vec![p.to_owned()]).unwrap_or_default()
+        }
+        "apply_patch" => v["input"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "].iter().find_map(|p| l.strip_prefix(p))
+            })
+            .map(|p| p.trim().to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().to_owned()
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 /// Interrupts the subagent if the call is dropped before it returns.
@@ -182,18 +330,6 @@ impl Drop for InterruptOnDrop {
     fn drop(&mut self) {
         if let Some(c) = &self.0 {
             let _ = c.send(crate::session::ActorMsg::Interrupt);
-        }
-    }
-}
-
-/// The tool result for a delegation's outcome.
-fn finish(child_id: &str, outcome: Option<crate::session::Outcome>) -> Result<String, String> {
-    let Some(o) = outcome else { return Err(format!("the subagent stopped unexpectedly [subagent session {child_id}]")) };
-    match o.reason {
-        TurnEndReason::Completed if !o.report.trim().is_empty() => Ok(format!("{}\n\n[subagent session {child_id}]", o.report)),
-        reason => {
-            let why = if o.error.is_empty() { String::new() } else { format!(": {}", o.error) };
-            Err(format!("the subagent ended ({reason:?}) without a report{why}"))
         }
     }
 }

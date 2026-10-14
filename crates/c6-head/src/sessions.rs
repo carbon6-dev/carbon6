@@ -156,6 +156,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         awaiting: 0,
         subagent_model,
         realm,
+        agent: String::new(),
+        end_reason: String::new(),
+        root_id: None,
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     // Context from the memex, for what is known at creation.
@@ -223,6 +226,9 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         awaiting: 0,
         subagent_model: String::new(),
         realm: realm.clone(),
+        agent: String::new(),
+        end_reason: String::new(),
+        root_id: None,
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
@@ -290,6 +296,9 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         subagent_model: parent.subagent_model.clone(),
         // A side chat is in its parent's realm.
         realm: parent.realm.clone(),
+        agent: String::new(),
+        end_reason: String::new(),
+        root_id: Some(parent.root_id.clone().unwrap_or_else(|| parent.id.clone())),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;

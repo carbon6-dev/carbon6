@@ -183,6 +183,14 @@ pub fn session(r: &SessionRow) -> api::Session {
         ssh: Some(r.ssh_target.clone()).filter(|t| !t.is_empty()),
         awaiting_approval: r.awaiting > 0,
         realm: r.realm.clone(),
+        agent: r.agent.clone(),
+        end_reason: match r.end_reason.as_str() {
+            "" => None,
+            "completed" => Some(api::TurnEndReason::Completed),
+            "interrupted" => Some(api::TurnEndReason::Interrupted),
+            "worker_restarted" => Some(api::TurnEndReason::WorkerRestarted),
+            _ => Some(api::TurnEndReason::Error),
+        },
     }
 }
 

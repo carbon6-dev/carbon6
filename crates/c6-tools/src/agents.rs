@@ -146,7 +146,8 @@ impl Tool for Task {
         }
         match agents.run(&ctx.call_id, description, prompt, agent, None, ctx.cancel.clone()).await {
             Ok(answer) => ToolOutput::limited(answer, false),
-            Err(e) => ToolOutput::err(format!("subagent failed: {e}")),
+            // What it did and how it ended.
+            Err(e) => ToolOutput::err(e),
         }
     }
 }

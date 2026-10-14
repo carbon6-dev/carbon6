@@ -36,6 +36,11 @@ pub const DEFAULTS: &[Prompt] = &[
     Prompt { name: "session.side_chat", description: "Added for side chats.", default: SIDE_CHAT_NOTE },
     Prompt { name: "session.subagent", description: "Added to a subagent's task.", default: c6_agent::SUBAGENT_NOTE },
     Prompt {
+        name: "session.subagent_partial",
+        description: "Told to an agent after the summary of a subagent that did not finish.",
+        default: c6_agent::SUBAGENT_PARTIAL,
+    },
+    Prompt {
         name: "session.compact",
         description: "What a summary must hold when a conversation is compacted.",
         default: c6_agent::COMPACT_PROMPT,
@@ -164,7 +169,7 @@ pub async fn get(st: &HeadState, name: &str, realm: &str) -> String {
 /// The prompts a worker gives the model itself, for a session's spec.
 pub async fn for_worker(st: &HeadState, realm: &str) -> String {
     let all = all(st, realm).await;
-    let picked: Map<String, Value> = all.into_iter().filter(|(k, _)| k == "session.subagent" || k.starts_with("session.compact")).collect();
+    let picked: Map<String, Value> = all.into_iter().filter(|(k, _)| k.starts_with("session.subagent") || k.starts_with("session.compact")).collect();
     Value::Object(picked).to_string()
 }
 

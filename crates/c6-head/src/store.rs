@@ -412,6 +412,13 @@ pub struct SessionRow {
     pub subagent_model: String,
     /// The realm it runs in (docs/os.md §3).
     pub realm: String,
+    /// Subagents: the named agent; empty for a general-purpose one.
+    pub agent: String,
+    /// How its last turn ended (`completed`, `interrupted`, `error`,
+    /// `worker_restarted`); empty before one did.
+    pub end_reason: String,
+    /// The top-level session of its tree; `None` for a top-level session.
+    pub root_id: Option<String>,
 }
 
 impl SessionRow {
@@ -465,7 +472,7 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model, realm) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm, root_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -484,6 +491,7 @@ impl Store {
         .bind(&s.ssh_target)
         .bind(&s.subagent_model)
         .bind(&s.realm)
+        .bind(&s.root_id)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -714,10 +722,20 @@ impl Store {
                 }
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
-                Some(Kind::TurnEnded(_)) => {
+                Some(Kind::TurnEnded(t)) => {
                     status = "idle".into();
+                    let reason = match c6_proto::TurnEndReason::try_from(t.reason) {
+                        Ok(c6_proto::TurnEndReason::Completed) => "completed",
+                        Ok(c6_proto::TurnEndReason::Interrupted) => "interrupted",
+                        Ok(c6_proto::TurnEndReason::WorkerRestarted) => "worker_restarted",
+                        _ => "error",
+                    };
                     // Nothing waits past its turn.
-                    sqlx::query("UPDATE sessions SET awaiting = 0 WHERE id = ?").bind(session_id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE sessions SET awaiting = 0, end_reason = ? WHERE id = ?")
+                        .bind(reason)
+                        .bind(session_id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
                 Some(Kind::ModelSwitched(m)) => {
                     let spec = m.model.clone().unwrap_or_default();
@@ -797,7 +815,7 @@ async fn create_subagent_session(
         return Ok(false);
     }
     let parent = sqlx::query(
-        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm FROM sessions WHERE id = ? AND worker_id = ?",
+        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
     )
     .bind(&s.parent_session_id)
     .bind(worker_id.to_string())
@@ -807,7 +825,7 @@ async fn create_subagent_session(
     let now = c6_core::now_ms();
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name, ssh_target, realm) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target, realm, agent, root_id) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -825,6 +843,8 @@ async fn create_subagent_session(
     .bind(parent.get::<String, _>("ssh_target"))
     // A subagent works in its parent's realm.
     .bind(parent.get::<String, _>("realm"))
+    .bind(&s.agent)
+    .bind(parent.get::<String, _>("root"))
     .execute(&mut *tx)
     .await?;
     Ok(true)

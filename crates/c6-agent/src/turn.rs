@@ -32,7 +32,7 @@ pub const COMPACT_WHY: &str = "Your context window is nearly full, so this conve
 pub const COMPACT_WHY_ASKED: &str = "The user asked to compact this conversation: it will be replaced by a summary that you write now.";
 pub const COMPACT_PROMPT: &str = "Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
 (quote any precise instructions), key decisions and their reasons, files examined and changed with their paths, the current state \
-of the work, errors encountered and how they were resolved, and the exact next steps. Do not call any tools; reply with only the summary.";
+of the work, errors encountered and how they were resolved, the ids of subagents that may need continuing, and the exact next steps. Do not call any tools; reply with only the summary.";
 
 /// What the model is told when the conversation is compacted.
 #[derive(Clone, Debug, PartialEq)]

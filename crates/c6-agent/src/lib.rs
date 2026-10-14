@@ -21,6 +21,11 @@ pub use turn::{COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, C
 pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which cannot see this conversation. \
 Work autonomously. When you are done, reply with a concise but complete report of what you found or did; that report is all the other agent receives.";
 
+/// What an agent is told after the digest of a subagent that did not
+/// finish (docs/subagents.md §10: an editable prompt).
+pub const SUBAGENT_PARTIAL: &str = "The subagent did not finish. Its work so far is summarized above and its whole conversation is kept, \
+so it can be continued with what it already did rather than started again. Check its changes before relying on them.";
+
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.
 #[async_trait]

@@ -158,6 +158,12 @@ pub struct Session {
     /// The realm it runs in (docs/os.md §3).
     #[serde(default = "home_realm")]
     pub realm: String,
+    /// Subagents: the named agent; empty for a general-purpose one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    /// How its last turn ended; none before one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<TurnEndReason>,
 }
 
 fn home_realm() -> String {
