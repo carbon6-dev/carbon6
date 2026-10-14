@@ -145,6 +145,15 @@ async fn make_head_fixture() {
     )
     .await;
 
+    // A realm of its own, granted a read of home's candidates.
+    post("realms", json!({"id": "lab", "name": "Lab", "description": "experiments"})).await;
+    post(
+        "grants",
+        json!({"from_realm": "home", "to_realm": "lab", "kind": "collection", "mode": "read",
+               "scope": {"collection": "candidates", "where": {"stage": "build"}}, "note": "fixture"}),
+    )
+    .await;
+
     // A finished session with a tool call (events, usage), labels.
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hello"}"#.into())]));
     mock.push(Reply::Text("Said hello.".into()));
@@ -345,7 +354,13 @@ async fn head_fixtures_upgrade_and_serve() {
         // Realms: root and home; the assistant's conversations in root,
         // everything else in home.
         let realms = get("realms").await;
-        assert_eq!(realms.as_array().map(Vec::len), Some(2), "{name}: {realms}");
+        let ids: Vec<&str> = realms.as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(&ids[..2], ["root", "home"], "{name}: {realms}");
+        // Grants (from version 33 on).
+        if name.as_str() >= "c6h-v0033.db" {
+            let g = get("grants").await;
+            assert!(g.as_array().unwrap().iter().any(|g| g["to_realm"] == "lab" && g["state"] == "active"), "{name}: {g}");
+        }
         let all = sessions.as_array().unwrap();
         assert!(all.iter().all(|s| s["realm"] == "home" || s["realm"] == "root"), "{name}: {sessions}");
         assert!(all.iter().any(|s| s["realm"] == "root"), "{name}: the assistant's conversation is in root");

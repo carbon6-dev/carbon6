@@ -229,6 +229,34 @@ simple_tool!(
 );
 
 simple_tool!(
+    GrantRequest,
+    "grant_request",
+    "GrantRequest",
+    "Asks the user to let this realm use another realm's data, without stopping: the request comes to them as a decision, and \
+     its answer arrives as a message. kind collection with mode read (its records; scope {collection, where?}), append (add \
+     records) or snapshot (a copy once); kind memex with mode read (its knowledge; scope {kinds?}); kind operations with mode \
+     call (scope {methods: [\"memex.mail.draft\", …]}). Once allowed, give realm on records_* calls to reach the collection; \
+     memex searches include the granted knowledge, and granted operations run in the realm that owns them.",
+    json!({"type": "object", "properties": {
+        "from_realm": {"type": "string", "description": "The realm whose data you need"},
+        "kind": {"type": "string", "enum": ["collection", "memex", "operations"]},
+        "mode": {"type": "string", "enum": ["read", "append", "snapshot", "call"]},
+        "scope": {"type": "object"},
+        "why": {"type": "string", "description": "What you need it for, for the user"}
+    }, "required": ["from_realm", "kind", "mode", "scope", "why"], "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| {
+        result(call(ctx, "session.grant_request", input).await, |v| {
+            format!(
+                "grant {} requested (decision #{}); carry on, and the answer will arrive as a message",
+                v["grant"].as_str().unwrap_or(""),
+                v["decision"]
+            )
+        })
+    }
+);
+
+simple_tool!(
     TodoResolve,
     "todo_resolve",
     "TodoResolve",

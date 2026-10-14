@@ -399,7 +399,7 @@ pub async fn query(st: &HeadState, realm: &str, collection: &str, q: &api::Recor
     get(st, realm, collection).await?;
     let mut sql = String::from(" FROM records WHERE realm = ? AND collection = ?");
     let mut binds: Vec<Value> = vec![json!(realm), json!(collection)];
-    for (field, cond) in &q.filter {
+    for (field, cond) in q.filter.iter().chain(&q.within) {
         let col = column(field)?;
         let conds: Vec<(String, Value)> = match cond {
             Value::Object(ops) if ops.keys().all(|k| k.starts_with('$')) => ops.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -530,16 +530,37 @@ async fn unmirror(st: &HeadState, realm: &str, collection: &str, id: &str) {
 
 /// An agent's call on collections, in its session's realm.
 pub async fn for_session(st: &HeadState, realm: &str, session_id: &str, what: &str, p: &Value) -> anyhow::Result<Value> {
-    let by = format!("session:{session_id}");
+    let mut by = format!("session:{session_id}");
     let name = p["collection"].as_str().unwrap_or_default();
     let id = p["id"].as_str().unwrap_or_default();
+    // Another realm's collection, through a grant.
+    let mode = match what {
+        "records_put" if id.is_empty() => "append",
+        "records_put" | "records_delete" => "write",
+        _ => "read",
+    };
+    let to = if what == "collections" {
+        crate::grants::Reach { realm: realm.to_owned(), within: None, grant: None }
+    } else {
+        crate::grants::reach(st, realm, p["realm"].as_str(), name, mode, &by).await?
+    };
+    if let Some(g) = &to.grant {
+        by = format!("realm:{realm} {by} grant:{g}");
+    }
+    let realm = to.realm.as_str();
     match what {
         "collections" => Ok(json!(list(st, realm).await?)),
         "records_query" => {
-            let q: api::RecordQuery = serde_json::from_value(p["query"].clone()).unwrap_or_default();
+            let mut q: api::RecordQuery = serde_json::from_value(p["query"].clone()).unwrap_or_default();
+            if let Some(w) = &to.within {
+                crate::grants::narrow(&mut q, w);
+            }
             Ok(json!(query(st, realm, name, &q).await?))
         }
-        "records_get" => Ok(json!(record(st, realm, name, id).await?)),
+        "records_get" => {
+            crate::grants::check_within(st, &to, name, id).await?;
+            Ok(json!(record(st, realm, name, id).await?))
+        }
         "records_put" => {
             let r: api::RecordIn = serde_json::from_value(json!({
                 "fields": p["fields"], "links": p.get("links"), "labels": p.get("labels"), "version": p.get("version")

@@ -137,6 +137,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
+        .route("/api/v1/grants", get(list_grants).post(create_grant))
+        .route("/api/v1/grants/{id}", get(get_grant).delete(revoke_grant))
+        .route("/api/v1/grants/{id}/uses", get(grant_uses))
         .route("/api/v1/workers/{id}/realms", put(set_worker_realms))
         .route("/api/v1/connections/{id}/realms", put(set_connection_realms))
         .route("/api/v1/settings/prompts", get(list_prompts))
@@ -1174,11 +1177,14 @@ async fn memex_search(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
     Query(q): Query<MemexSearchQuery>,
-) -> ApiResult<Json<Vec<api::MemexHit>>> {
+) -> ApiResult<Json<serde_json::Value>> {
     let query = api::MemexQuery { query: q.q, kinds: list_param(&q.kinds), about: list_param(&q.about), limit: q.limit };
-    let v =
-        crate::memex::call_in(&st, caller.memex_realm(), "memex.search", serde_json::to_value(query).map_err(anyhow::Error::from)?).await?;
-    Ok(Json(serde_json::from_value(v).map_err(anyhow::Error::from)?))
+    let params = serde_json::to_value(query).map_err(anyhow::Error::from)?;
+    // A realm's token: with what other realms granted it (docs/os.md §3.7).
+    Ok(Json(match &caller.realm {
+        Some(realm) => crate::fabric::search_granted(&st, realm, &format!("token:{realm}"), params).await?,
+        None => crate::memex::call_in(&st, caller.memex_realm(), "memex.search", params).await?,
+    }))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -1194,7 +1200,11 @@ async fn memex_get(
     Extension(caller): Extension<Caller>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.get", serde_json::json!({"id": q.id})).await?))
+    let params = serde_json::json!({"id": q.id});
+    Ok(Json(match &caller.realm {
+        Some(realm) => crate::fabric::get_granted(&st, realm, &format!("token:{realm}"), params).await?,
+        None => crate::memex::call_in(&st, caller.memex_realm(), "memex.get", params).await?,
+    }))
 }
 
 async fn memex_mentions(
@@ -1992,6 +2002,15 @@ async fn realm_for(st: &HeadState, caller: &Caller, asked: &api::InRealm) -> any
     Ok(realm)
 }
 
+/// A collection request that may reach another realm's collection through
+/// a grant (`?realm=` from a realm-scoped token).
+async fn reach(st: &HeadState, caller: &Caller, asked: &api::InRealm, name: &str, mode: &str) -> anyhow::Result<crate::grants::Reach> {
+    match &caller.realm {
+        Some(mine) => crate::grants::reach(st, mine, asked.realm.as_deref(), name, mode, &writer(caller)).await,
+        None => Ok(crate::grants::Reach { realm: realm_for(st, caller, asked).await?, within: None, grant: None }),
+    }
+}
+
 /// Who a write is by, for history.
 fn writer(caller: &Caller) -> String {
     match &caller.realm {
@@ -2025,8 +2044,8 @@ async fn get_collection(
     Path(name): Path<String>,
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<Json<api::Collection>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::get(&st, &realm, &name).await?))
+    let to = reach(&st, &caller, &r, &name, "read").await?;
+    Ok(Json(crate::collections::get(&st, &to.realm, &name).await?))
 }
 
 async fn update_collection(
@@ -2056,10 +2075,13 @@ async fn query_records(
     Extension(caller): Extension<Caller>,
     Path(name): Path<String>,
     Query(r): Query<api::InRealm>,
-    Json(q): Json<api::RecordQuery>,
+    Json(mut q): Json<api::RecordQuery>,
 ) -> ApiResult<Json<api::RecordPage>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::query(&st, &realm, &name, &q).await?))
+    let to = reach(&st, &caller, &r, &name, "read").await?;
+    if let Some(w) = &to.within {
+        crate::grants::narrow(&mut q, w);
+    }
+    Ok(Json(crate::collections::query(&st, &to.realm, &name, &q).await?))
 }
 
 async fn list_records(
@@ -2068,8 +2090,12 @@ async fn list_records(
     Path(name): Path<String>,
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<Json<api::RecordPage>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::query(&st, &realm, &name, &api::RecordQuery::default()).await?))
+    let to = reach(&st, &caller, &r, &name, "read").await?;
+    let mut q = api::RecordQuery::default();
+    if let Some(w) = &to.within {
+        crate::grants::narrow(&mut q, w);
+    }
+    Ok(Json(crate::collections::query(&st, &to.realm, &name, &q).await?))
 }
 
 async fn create_record(
@@ -2079,8 +2105,12 @@ async fn create_record(
     Query(r): Query<api::InRealm>,
     Json(rec): Json<api::RecordIn>,
 ) -> ApiResult<Json<api::Record>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::put(&st, &realm, &name, None, &rec, &writer(&caller)).await?))
+    let to = reach(&st, &caller, &r, &name, "append").await?;
+    let by = match &to.grant {
+        Some(g) => format!("{} grant:{g}", writer(&caller)),
+        None => writer(&caller),
+    };
+    Ok(Json(crate::collections::put(&st, &to.realm, &name, None, &rec, &by).await?))
 }
 
 async fn get_record(
@@ -2089,8 +2119,9 @@ async fn get_record(
     Path((name, id)): Path<(String, String)>,
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<Json<api::Record>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::record(&st, &realm, &name, &id).await?))
+    let to = reach(&st, &caller, &r, &name, "read").await?;
+    crate::grants::check_within(&st, &to, &name, &id).await?;
+    Ok(Json(crate::collections::record(&st, &to.realm, &name, &id).await?))
 }
 
 async fn put_record(
@@ -2121,8 +2152,9 @@ async fn record_history(
     Path((name, id)): Path<(String, String)>,
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<Json<Vec<api::RecordChange>>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::changes(&st, &realm, &name, &id).await?))
+    let to = reach(&st, &caller, &r, &name, "read").await?;
+    crate::grants::check_within(&st, &to, &name, &id).await?;
+    Ok(Json(crate::collections::changes(&st, &to.realm, &name, &id).await?))
 }
 
 /// carbon6's prompts, with their defaults.
@@ -2150,6 +2182,28 @@ async fn update_realm(
 async fn delete_realm(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     crate::realms::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `?realm=`: the grants given by or to one realm.
+async fn list_grants(State(st): State<Arc<HeadState>>, Query(r): Query<api::InRealm>) -> ApiResult<Json<Vec<api::Grant>>> {
+    Ok(Json(crate::grants::list(&st, r.realm.as_deref().filter(|r| !r.is_empty())).await?))
+}
+
+async fn create_grant(State(st): State<Arc<HeadState>>, Json(g): Json<api::GrantIn>) -> ApiResult<Json<api::Grant>> {
+    Ok(Json(crate::grants::create(&st, &g, "you", "active").await?))
+}
+
+async fn get_grant(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::Grant>> {
+    Ok(Json(crate::grants::get(&st, &id).await?.ok_or_else(|| crate::not_found("no such grant"))?))
+}
+
+async fn revoke_grant(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::grants::revoke(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn grant_uses(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<api::GrantUse>>> {
+    Ok(Json(crate::grants::uses(&st, &id).await?))
 }
 
 async fn set_worker_realms(

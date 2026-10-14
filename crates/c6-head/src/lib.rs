@@ -13,6 +13,7 @@ pub mod decisions;
 mod export;
 pub mod fabric;
 pub mod google;
+pub mod grants;
 pub mod guard;
 pub mod hosts;
 pub mod hub;

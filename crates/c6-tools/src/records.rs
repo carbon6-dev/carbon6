@@ -53,6 +53,7 @@ records_tool!(
      $lt, $lte, $contains), by words (text), sorts (sort: field or -field), pages (limit, offset), or counts per value (group_by).",
     json!({"type": "object", "properties": {
         "collection": {"type": "string"},
+        "realm": {"type": "string", "description": "Another realm's collection, through a grant it gave yours"},
         "query": {"type": "object", "properties": {
             "where": {"type": "object"}, "text": {"type": "string"}, "sort": {"type": "string"}, "group_by": {"type": "string"},
             "limit": {"type": "integer"}, "offset": {"type": "integer"}
@@ -63,8 +64,12 @@ records_tool!(
         if collection.is_empty() {
             return call(ctx, "session.collections", json!({})).await;
         }
-        call(ctx, "session.records_query", json!({"collection": collection, "query": input.get("query").cloned().unwrap_or(json!({}))}))
-            .await
+        call(
+            ctx,
+            "session.records_query",
+            json!({"collection": collection, "realm": input.get("realm"), "query": input.get("query").cloned().unwrap_or(json!({}))}),
+        )
+        .await
     }
 );
 
@@ -74,7 +79,8 @@ records_tool!(
     "RecordsGet",
     Concurrency::Shared,
     "A record by its id, with its version (give the version back when you update it).",
-    json!({"type": "object", "properties": {"collection": {"type": "string"}, "id": {"type": "string"}}, "required": ["collection", "id"], "additionalProperties": false}),
+    json!({"type": "object", "properties": {"collection": {"type": "string"},
+        "realm": {"type": "string", "description": "Another realm's collection, through a grant it gave yours"}, "id": {"type": "string"}}, "required": ["collection", "id"], "additionalProperties": false}),
     |ctx, input| { call(ctx, "session.records_get", input).await }
 );
 
@@ -88,6 +94,7 @@ records_tool!(
      things and items it is about (e.g. client:acme); labels are labels.",
     json!({"type": "object", "properties": {
         "collection": {"type": "string"},
+        "realm": {"type": "string", "description": "Another realm's collection, through a grant it gave yours"},
         "id": {"type": "string"},
         "fields": {"type": "object"},
         "version": {"type": "integer"},
@@ -103,6 +110,7 @@ records_tool!(
     "RecordsDelete",
     Concurrency::Exclusive,
     "Deletes a record (its history is kept).",
-    json!({"type": "object", "properties": {"collection": {"type": "string"}, "id": {"type": "string"}}, "required": ["collection", "id"], "additionalProperties": false}),
+    json!({"type": "object", "properties": {"collection": {"type": "string"},
+        "realm": {"type": "string", "description": "Another realm's collection, through a grant it gave yours"}, "id": {"type": "string"}}, "required": ["collection", "id"], "additionalProperties": false}),
     |ctx, input| { call(ctx, "session.records_delete", input).await }
 );

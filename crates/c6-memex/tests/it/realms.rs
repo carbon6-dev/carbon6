@@ -94,6 +94,41 @@ async fn realms_have_their_own_knowledge() {
         .unwrap();
     assert!(found.to_string().contains("eu-west") && !found.to_string().contains("us-east"), "{found}");
 
+    // A grant lets lab read home's notes: its searches include them, from
+    // home; each use is logged; revoked, they're gone again.
+    let g: Value = http
+        .post(format!("{api}/grants"))
+        .json(&json!({"from_realm": "home", "to_realm": "lab", "kind": "memex", "mode": "read", "scope": {"kinds": ["note"]}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lab_search = || {
+        let (http, api, tok) = (http.clone(), api.clone(), tok["token"].as_str().unwrap().to_owned());
+        async move { http.get(format!("{api}/memex/search?q=staging")).bearer_auth(tok).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let found = lab_search().await;
+    let hits = found.as_array().unwrap();
+    let from_home = hits.iter().find(|h| h["snippet"].as_str().unwrap_or("").contains("us-east")).expect("home's note, granted");
+    assert_eq!(from_home["realm"], "home");
+    assert!(hits.iter().any(|h| h["snippet"].as_str().unwrap_or("").contains("eu-west")), "{found}");
+    let item: Value = http
+        .get(format!("{api}/memex/get?id={}", from_home["id"].as_str().unwrap()))
+        .bearer_auth(tok["token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(item["realm"], "home", "{item}");
+    let uses: Value = http.get(format!("{api}/grants/{}/uses", g["id"].as_str().unwrap())).send().await.unwrap().json().await.unwrap();
+    assert_eq!(uses.as_array().unwrap().len(), 2, "{uses}");
+    assert!(http.delete(format!("{api}/grants/{}", g["id"].as_str().unwrap())).send().await.unwrap().status().is_success());
+    assert!(!lab_search().await.to_string().contains("us-east"));
+
     // Deleting the realm drops its knowledge.
     let r = http.delete(format!("{api}/realms/lab")).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());

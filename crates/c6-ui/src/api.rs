@@ -141,6 +141,22 @@ pub async fn delete_realm(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await
 }
 
+pub async fn grants() -> Result<Vec<c6_api::Grant>, String> {
+    json(Request::get("/api/v1/grants").send().await).await
+}
+
+pub async fn create_grant(g: c6_api::GrantIn) -> Result<c6_api::Grant, String> {
+    send_json(Request::post("/api/v1/grants"), &g).await
+}
+
+pub async fn revoke_grant(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/grants/{}", enc(&id))).send().await).await
+}
+
+pub async fn grant_uses(id: String) -> Result<Vec<c6_api::GrantUse>, String> {
+    json(Request::get(&format!("/api/v1/grants/{}/uses", enc(&id))).send().await).await
+}
+
 /// Which realms a worker ("workers") or connection ("connections") serves.
 pub async fn set_availability(what: &'static str, id: String, realms: Vec<String>) -> Result<(), String> {
     empty(Request::put(&format!("/api/v1/{what}/{id}/realms")).json(&c6_api::RealmsIn { realms }).map_err(|e| e.to_string())?.send().await)

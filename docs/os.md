@@ -185,6 +185,28 @@ grant(id, from_realm, to_realm,
 - **Back to the head:** what a realm's memex raises carries its realm. Its disputes open decisions in that realm, and its events reach only that realm's automations.
 - **Deleting a realm** queues `memex.drop_realm`, which removes its database and blobs.
 
+### 3.14 As built (step 4c)
+
+- **Grants:** a `grants` table (migration `0033`) and a log of each use (`grant_uses`). Only you create and revoke them: `/api/v1/grants`, and **Settings → System → Grants**, which lists each grant with its uses. A grant is between two realms that hold data, never root.
+- **Kinds and modes:**
+
+| Kind | Modes | Scope |
+|---|---|---|
+| collection | read, append, snapshot | `{collection, where?}`: `where` limits a read to some records |
+| memex | read | `{kinds?}`: none means what the session may see anyway |
+| operations | call | `{methods: [...]}`, such as `memex.mail.draft` |
+
+- **Collections:**
+  - **Reaching another realm's collection:** a realm-scoped token gives `?realm=`, and an agent gives `realm` on `records_*`. The head checks for a grant on every call.
+  - **What each mode allows:** read covers listing, querying, getting and history. Append covers adding only. Changing or deleting another realm's records is never granted.
+  - **Grants on some records:** a grant's `where` is a second filter that must also hold. A query cannot widen it, and getting a record outside it answers 404.
+- **Provenance:**
+  - **Appends:** what a realm adds through a grant records who added it and through which grant (`token:factory grant:<id>`).
+  - **Snapshots:** a snapshot copies the records into the receiving realm's collection of the same name, creating it with the same schema if needed. Each copy is labelled `from:<realm>` and `grant:<id>`, and linked to its original.
+- **Knowledge:** a session's (or a realm token's) memex search also searches the realms that granted it reads, limited to the grant's kinds. Hits from there carry `realm`. Getting an item by id falls back to those realms.
+- **Operations:** a granted operation runs in the realm that owns it, which is how a realm drafts mail through home's accounts. Each call is logged on the grant.
+- **Requests:** an agent's `grant_request` creates a requested grant and a decision (Allow or Deny). Your answer puts the grant in force, or denies it, and the session hears the answer as a message. Revoking a request settles its decision.
+
 ## 4. Primitives
 
 Every primitive is scoped by realm, has operations in the catalog (so the assistant, the CLI, the API reference and the OpenAPI document get them automatically), and has agent tools where agents need them.
@@ -752,4 +774,9 @@ Choices the design left open, made while building, for review.
 | 4a | The realm switcher lives in the browser, and "All realms" shows everything | Single user: it is a view, not a permission |
 | 4b | Another realm's memex knowledge is a separate database, not realm columns on shared tables | Isolation by construction: no query can leak, things are naturally per realm, a realm's knowledge is deleted with its file, and grants (4c) become reads across databases |
 | 4b | Deleting a realm drops its memex knowledge too | A realm is deleted only when it owns no sessions, records or decisions; what the memex derived from them goes with it |
-
+| 4c | A grant's `where` is kept as a second filter, not merged into the query's | Merging lets a query's own condition on the same field replace the grant's |
+| 4c | Changing or deleting another realm's records has no grant mode | The design's modes are read, append, snapshot and call; a realm that should change records owns them |
+| 4c | A memex read grant with no kinds allows what the session may see anyway | The grant opens the realm; the session's scope still decides the kinds, as in its own realm |
+| 4c | A granted mail or calendar operation also lets that call see email and events | The grant names the operation; without the kinds it could not work |
+| 4c | Grants are root-only in the API; agents ask with `grant_request` | Only you create grants (3.7) |
+| 4c | Searching across granted realms merges hits by score, each tagged with its realm | One search answers across what the realm may read, and you can see where each hit came from |

@@ -135,7 +135,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["automations", id, ..] => owned("automations", "automation", (*id).to_owned()).await,
         // Starting a template's sessions (in the caller's realm).
         ["templates", _, "run"] if method == Method::POST => Ok(()),
-        // Collections: always addressed within the caller's realm.
+        // Collections: within the caller's realm, or another's through a
+        // grant (checked by each call).
         ["collections", ..] => Ok(()),
         // The memex: the head puts the caller's realm on every call.
         ["memex", ..] | ["mail", "attachment"] => Ok(()),

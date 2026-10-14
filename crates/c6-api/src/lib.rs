@@ -280,6 +280,11 @@ pub struct RecordQuery {
     pub limit: Option<u32>,
     #[serde(default)]
     pub offset: Option<u32>,
+    /// A filter that must hold as well (a grant's on some records); set by
+    /// the head, never taken from a request.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub within: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The records a query found (or, with group_by, the counts).
@@ -312,6 +317,60 @@ pub struct RecordChange {
 pub struct InRealm {
     #[serde(default)]
     pub realm: Option<String>,
+}
+
+/// A grant (docs/os.md §3.7): realm `from`'s data may flow into realm `to`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Grant {
+    pub id: String,
+    pub from_realm: String,
+    pub to_realm: String,
+    /// collection, memex or operations.
+    pub kind: String,
+    /// collection: {"collection": name, "where": {filter}}; memex: {"kinds": […]}
+    /// (empty: every kind but spam); operations: {"methods": ["memex.mail.draft", …]}.
+    pub scope: serde_json::Value,
+    /// read, append or snapshot (collections); read (memex); call (operations).
+    pub mode: String,
+    /// active, requested, revoked or denied.
+    pub state: String,
+    #[serde(default)]
+    pub expires_at: Option<UnixMs>,
+    #[serde(default)]
+    pub note: String,
+    pub created_by: String,
+    pub created_at: UnixMs,
+    #[serde(default)]
+    pub revoked_at: Option<UnixMs>,
+    /// Times it was used.
+    #[serde(default)]
+    pub uses: i64,
+}
+
+/// `POST /api/v1/grants`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GrantIn {
+    pub from_realm: String,
+    pub to_realm: String,
+    pub kind: String,
+    #[serde(default)]
+    pub scope: serde_json::Value,
+    pub mode: String,
+    #[serde(default)]
+    pub expires_at: Option<UnixMs>,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// One use of a grant.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GrantUse {
+    pub at: UnixMs,
+    pub by: String,
+    pub what: String,
 }
 
 /// `POST /api/v1/realms` (and `PATCH …/{id}`: name and description).

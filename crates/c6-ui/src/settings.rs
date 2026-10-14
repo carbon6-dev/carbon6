@@ -221,7 +221,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
-                    "system" => view! { <Realms /> <Upgrades /> }.into_any(),
+                    "system" => view! { <Realms /> <Grants /> <Upgrades /> }.into_any(),
                     "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
@@ -348,6 +348,159 @@ fn Realms() -> impl IntoView {
                         </div>
                     }
                 }).collect_view())}
+            </div>
+        </section>
+    }
+}
+
+/// Grants (docs/os.md §3.7): how data may flow between realms, each use
+/// logged; requests from agents arrive as decisions.
+#[component]
+fn Grants() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let grants = LocalResource::new(move || {
+        tick.track();
+        crate::api::grants()
+    });
+    let (from, to, kind, mode) = (
+        RwSignal::new(String::new()),
+        RwSignal::new(String::new()),
+        RwSignal::new("collection".to_owned()),
+        RwSignal::new("read".to_owned()),
+    );
+    let (what, filter, note) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let error = RwSignal::new(None::<String>);
+    let shown = RwSignal::new(None::<(String, Vec<c6_api::GrantUse>)>);
+    let after = move |r: Result<(), String>| match r {
+        Ok(()) => {
+            error.set(None);
+            tick.update(|t| *t += 1);
+        }
+        Err(e) => error.set(Some(e)),
+    };
+    let create = move |_| {
+        let list: Vec<String> = what.get_untracked().split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect();
+        let scope = match kind.get_untracked().as_str() {
+            "collection" => {
+                let mut s = serde_json::json!({"collection": list.first().cloned().unwrap_or_default()});
+                let f = filter.get_untracked();
+                if !f.trim().is_empty() {
+                    match serde_json::from_str::<serde_json::Value>(&f) {
+                        Ok(w) => s["where"] = w,
+                        Err(e) => return error.set(Some(format!("the filter is not JSON: {e}"))),
+                    }
+                }
+                s
+            }
+            "memex" => serde_json::json!({"kinds": list}),
+            _ => serde_json::json!({"methods": list}),
+        };
+        let g = c6_api::GrantIn {
+            from_realm: from.get_untracked(),
+            to_realm: to.get_untracked(),
+            kind: kind.get_untracked(),
+            scope,
+            mode: mode.get_untracked(),
+            expires_at: None,
+            note: note.get_untracked(),
+        };
+        spawn_local(async move {
+            let r = crate::api::create_grant(g).await.map(|_| {
+                what.set(String::new());
+                filter.set(String::new());
+                note.set(String::new());
+            });
+            after(r);
+        });
+    };
+    let modes = move || match kind.get().as_str() {
+        "collection" => vec!["read", "append", "snapshot"],
+        "memex" => vec!["read"],
+        _ => vec!["call"],
+    };
+    const SELECT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900";
+    view! {
+        <section class="space-y-3 pt-4">
+            <h2 class="font-medium">"Grants"</h2>
+            <p class="text-sm text-zinc-500">"Realms share nothing unless you grant it: one realm reading another's collection (or some of its records), adding to it, taking a copy once, reading its knowledge, or calling its operations (drafting mail through home's accounts). Every use is logged; revoking stops the flow, and what already crossed stays. Agents ask for grants as decisions."</p>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || grants.get().and_then(Result::ok).map(|gs| {
+                if gs.is_empty() {
+                    return view! { <p class="text-sm text-zinc-500">"No grants."</p> }.into_any();
+                }
+                gs.into_iter().map(|g| {
+                    let (gid, gid2) = (g.id.clone(), g.id.clone());
+                    let live = g.state == "active" || g.state == "requested";
+                    let summary = match g.kind.as_str() {
+                        "collection" => format!("collection {}{}", g.scope["collection"].as_str().unwrap_or("?"), g.scope.get("where").map(|w| format!(" where {w}")).unwrap_or_default()),
+                        "memex" => format!("knowledge {}", g.scope["kinds"].as_array().filter(|k| !k.is_empty()).map(|k| k.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "(all kinds)".into())),
+                        _ => format!("operations {}", g.scope["methods"].as_array().map(|k| k.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+                    };
+                    view! {
+                        <div class="rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="font-mono">{format!("{} → {}", g.from_realm, g.to_realm)}</span>
+                                <span class="rounded bg-zinc-100 px-1.5 text-xs dark:bg-zinc-800">{g.mode.clone()}</span>
+                                <span class="min-w-0 flex-1 truncate">{summary}</span>
+                                <span class=if g.state == "active" { "text-xs text-emerald-600" } else { "text-xs text-zinc-500" }>{g.state.clone()}</span>
+                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                    let gid = gid.clone();
+                                    if shown.get_untracked().is_some_and(|(s, _)| s == gid) {
+                                        return shown.set(None);
+                                    }
+                                    spawn_local(async move {
+                                        match crate::api::grant_uses(gid.clone()).await {
+                                            Ok(u) => shown.set(Some((gid, u))),
+                                            Err(e) => error.set(Some(e)),
+                                        }
+                                    });
+                                }>{format!("{} uses", g.uses)}</button>
+                                {live.then(|| view! {
+                                    <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                        let gid = gid2.clone();
+                                        spawn_local(async move { after(crate::api::revoke_grant(gid).await) });
+                                    }>"Revoke"</button>
+                                })}
+                            </div>
+                            {(!g.note.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">{g.note.clone()}</p> })}
+                            {
+                                let id = g.id.clone();
+                                move || shown.get().filter(|(s, _)| *s == id).map(|(_, uses)| view! {
+                                    <ul class="mt-1 space-y-0.5 text-xs text-zinc-500">
+                                        {uses.into_iter().map(|u| view! {
+                                            <li>{format!("{} · {} · {}", crate::util::ago(crate::util::now_ms() - u.at), u.by, u.what)}</li>
+                                        }).collect_view()}
+                                    </ul>
+                                })
+                            }
+                        </div>
+                    }
+                }).collect_view().into_any()
+            })}
+            <div class="flex flex-wrap gap-2">
+                <input class=format!("{INPUT} w-28") placeholder="from realm" prop:value=move || from.get() on:input=move |ev| from.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} w-28") placeholder="to realm" prop:value=move || to.get() on:input=move |ev| to.set(event_target_value(&ev)) />
+                <select class=SELECT prop:value=move || kind.get() on:change=move |ev| {
+                    let k = event_target_value(&ev);
+                    mode.set(if k == "operations" { "call" } else { "read" }.to_owned());
+                    kind.set(k);
+                }>
+                    <option value="collection">"collection"</option>
+                    <option value="memex">"knowledge"</option>
+                    <option value="operations">"operations"</option>
+                </select>
+                <select class=SELECT prop:value=move || mode.get() on:change=move |ev| mode.set(event_target_value(&ev))>
+                    {move || modes().into_iter().map(|m| view! { <option value=m selected=move || mode.get() == m>{m}</option> }).collect_view()}
+                </select>
+                <input class=format!("{INPUT} min-w-0 flex-1") prop:value=move || what.get() on:input=move |ev| what.set(event_target_value(&ev))
+                    placeholder=move || match kind.get().as_str() { "collection" => "collection name", "memex" => "kinds (e.g. note, document; empty: all)", _ => "operations (e.g. memex.mail.draft)" } />
+            </div>
+            <div class="flex flex-wrap gap-2">
+                {move || (kind.get() == "collection").then(|| view! {
+                    <input class=format!("{INPUT} w-64") placeholder=r#"only records where (JSON, e.g. {"tier": "gold"})"# prop:value=move || filter.get() on:input=move |ev| filter.set(event_target_value(&ev)) />
+                })}
+                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="Why (a note)" prop:value=move || note.get() on:input=move |ev| note.set(event_target_value(&ev)) />
+                <button class=BUTTON on:click=create>"Grant"</button>
             </div>
         </section>
     }

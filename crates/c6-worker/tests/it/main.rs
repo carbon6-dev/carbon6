@@ -14,6 +14,7 @@ mod collections;
 mod commands;
 mod decisions;
 mod fixtures;
+mod grants;
 mod hooks;
 mod ide;
 mod journal;

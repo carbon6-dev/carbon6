@@ -305,6 +305,18 @@ async fn act(
                 return Err(bad_request("the conversation is not running"));
             }
         }
+        (Some("grant"), Some(id), _) => {
+            let allow = option == Some("Allow");
+            crate::grants::answer_request(st, id, allow).await?;
+            // The session that asked hears the answer.
+            if let Some(session) = d.context["session"].as_str() {
+                let text =
+                    format!("Your grant request was {} (decision #{}: {}).", if allow { "allowed" } else { "denied" }, d.id, d.title);
+                if let Err(e) = crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await {
+                    warn!(decision = d.id, "telling the session: {e:#}");
+                }
+            }
+        }
         (Some("session"), Some(session), _) => {
             // An agent asked without stopping: its answer, as a message.
             let mut text = format!("Your question was answered (decision #{}: {}).", d.id, d.title);

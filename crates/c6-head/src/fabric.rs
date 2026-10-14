@@ -84,6 +84,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                     .map_err(bad_request)?;
                 Ok(json!({"text": text}))
             }
+            // Asking for another realm's data (docs/os.md §3.7).
+            "grant_request" => {
+                let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+                crate::grants::request(st, &target, &realm, &params).await
+            }
             "openapi" => Ok(crate::catalog::openapi(&crate::notify::api_urls(st).await)),
             // Collections, in the session's realm (docs/os.md §4.1).
             "collections" | "records_query" | "records_get" | "records_put" | "records_delete" => {
@@ -108,5 +113,83 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     if method == "memex.note" && params["labels"].as_array().is_none_or(|a| a.is_empty()) {
         params["labels"] = json!(labels.into_iter().filter(|l| !l.starts_with("model:")).collect::<Vec<_>>());
     }
-    crate::memex::call_in(st, &session.realm, method, params).await
+    let by = format!("session:{session_id}");
+    // Another realm's operation, through a grant (docs/os.md §3.7): it runs
+    // there, as that realm (mail drafted through home's accounts).
+    if let Some(owner) = crate::grants::caller_of(st, &session.realm, method, &by).await {
+        if let Some(kinds) = params["scope"].as_array_mut() {
+            kinds.extend([json!("email"), json!("event")]);
+        }
+        return crate::memex::call_in(st, &owner, method, params).await;
+    }
+    match method {
+        "memex.search" => search_granted(st, &session.realm, &by, params).await,
+        "memex.get" => get_granted(st, &session.realm, &by, params).await,
+        _ => crate::memex::call_in(st, &session.realm, method, params).await,
+    }
+}
+
+/// The scope a read grant allows: its kinds, else what the session may see.
+fn granted_scope(params: &Value, kinds: &[String]) -> Value {
+    if kinds.is_empty() { params["scope"].clone() } else { json!(kinds) }
+}
+
+/// A search over the session's realm and the realms that granted it reads
+/// of their knowledge; hits from those say which realm they are from.
+pub async fn search_granted(st: &HeadState, realm: &str, by: &str, params: Value) -> anyhow::Result<Value> {
+    let mut hits: Vec<Value> = match crate::memex::call_in(st, realm, "memex.search", params.clone()).await? {
+        Value::Array(h) => h,
+        other => return Ok(other),
+    };
+    let grants = crate::grants::memex_reads(st, realm).await;
+    if grants.is_empty() {
+        return Ok(json!(hits));
+    }
+    for (grant, from, kinds) in grants {
+        let mut p = params.clone();
+        p["scope"] = granted_scope(&params, &kinds);
+        match crate::memex::call_in(st, &from, "memex.search", p).await {
+            Ok(Value::Array(found)) => {
+                if !found.is_empty() {
+                    crate::grants::log_memex_read(
+                        st,
+                        &grant,
+                        by,
+                        &format!("search {:?}: {} hits", params["query"].as_str().unwrap_or(""), found.len()),
+                    )
+                    .await;
+                }
+                hits.extend(found.into_iter().map(|mut h| {
+                    h["realm"] = json!(from);
+                    h
+                }));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("searching realm {from} through grant {grant}: {e:#}"),
+        }
+    }
+    hits.sort_by(|a, b| b["score"].as_f64().unwrap_or(0.0).total_cmp(&a["score"].as_f64().unwrap_or(0.0)));
+    hits.truncate(params["limit"].as_u64().unwrap_or(10).clamp(1, 50) as usize);
+    Ok(json!(hits))
+}
+
+/// An item or thing by id: the session's realm's, else one a granting
+/// realm lets it read.
+pub async fn get_granted(st: &HeadState, realm: &str, by: &str, params: Value) -> anyhow::Result<Value> {
+    let own = crate::memex::call_in(st, realm, "memex.get", params.clone()).await;
+    if own.as_ref().is_ok_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty())) {
+        return own;
+    }
+    for (grant, from, kinds) in crate::grants::memex_reads(st, realm).await {
+        let mut p = params.clone();
+        p["scope"] = granted_scope(&params, &kinds);
+        if let Ok(mut v) = crate::memex::call_in(st, &from, "memex.get", p).await
+            && v.as_object().is_some_and(|o| !o.is_empty())
+        {
+            crate::grants::log_memex_read(st, &grant, by, &format!("get {}", params["id"].as_str().unwrap_or(""))).await;
+            v["realm"] = json!(from);
+            return Ok(v);
+        }
+    }
+    own
 }
