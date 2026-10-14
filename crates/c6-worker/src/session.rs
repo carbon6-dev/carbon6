@@ -371,7 +371,7 @@ impl SessionManager {
             let profile = model_info(provider, &model.model).tool_profile;
             // Secrets go into MCP servers' configs (and, per turn, commands).
             let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
-            let (secret_values, _) = fetch_secrets(&self.link, &names).await;
+            let (secret_values, _) = fetch_secrets(&self.link, session_id, &names).await;
             let built = build_tools(&spec, &local, profile, &labels, &secret_values).await;
             setup_errors = built.errors;
             let mut prompt = system_prompt;
@@ -558,7 +558,7 @@ impl SessionManager {
                 let labels =
                     session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
                 let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
-                let (secret_values, _) = fetch_secrets(&self.link, &names).await;
+                let (secret_values, _) = fetch_secrets(&self.link, session_id, &names).await;
                 build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels, &secret_values).await.tools
             }
         };
@@ -1104,7 +1104,7 @@ impl Actor {
             let sink: Arc<dyn EventSink> = writer.clone();
             // Secrets for this turn's commands (values only in memory).
             if !secret_names.is_empty() {
-                let (values, errors) = fetch_secrets(&link, &secret_names).await;
+                let (values, errors) = fetch_secrets(&link, &writer.session_id, &secret_names).await;
                 for e in errors {
                     warn!(session = %writer.session_id, "secret unavailable: {e}");
                 }
@@ -1296,11 +1296,13 @@ pub(crate) fn applicable_secrets(spec: &CreateSession, labels: &[String]) -> Vec
 
 /// The values of the secrets that apply, from the head (cached on the
 /// worker for a few minutes, in memory only).
-async fn fetch_secrets(link: &HeadLink, names: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+/// Each is asked for on behalf of `session_id`, so the head can check the
+/// secret belongs to the session's realm.
+async fn fetch_secrets(link: &HeadLink, session_id: &str, names: &[String]) -> (Vec<(String, String)>, Vec<String>) {
     let mut values = Vec::new();
     let mut errors = Vec::new();
     for name in names {
-        match link.credential(&format!("secret:{name}")).await {
+        match link.credential(&format!("secret:{name}@{session_id}")).await {
             Ok(g) => values.push((name.clone(), g.bearer)),
             Err(e) => errors.push(format!("{name}: {e:#}")),
         }

@@ -16,6 +16,9 @@ pub mod mail;
 pub mod media;
 pub mod review;
 pub mod store;
+
+/// The realm everything in the memex belongs to, so far (docs/os.md §3).
+pub const REALM_HOME: &str = "home";
 pub mod understand;
 
 use std::collections::HashMap;
@@ -548,6 +551,11 @@ impl Memex {
     }
 
     pub async fn handle_method(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        // Every call is for one realm (the head stamps it). Only home keeps
+        // knowledge here so far; the others' arrive with creatable realms
+        // (docs/os.md §9, step 4), and until then nothing crosses.
+        let realm = params["realm"].as_str().unwrap_or(REALM_HOME);
+        anyhow::ensure!(realm == REALM_HOME, "realm {realm} keeps no knowledge in the memex yet (only home does)");
         let allowed = Self::allowed(&params);
         match method {
             "memex.ingest" => ingest::ingest(self, params).await,

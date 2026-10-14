@@ -237,6 +237,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked() && !on_ssh,
+            realm: None,
         };
         storage_set("c6.where", if on_ssh { "ssh" } else { "worker" });
         if on_ssh {

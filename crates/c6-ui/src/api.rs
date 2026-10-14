@@ -489,8 +489,12 @@ pub async fn api_tokens() -> Result<Vec<c6_api::ApiToken>, String> {
     json(Request::get("/api/v1/auth/tokens").send().await).await
 }
 
-pub async fn create_api_token(name: String) -> Result<c6_api::ApiToken, String> {
-    send_json(Request::post("/api/v1/auth/tokens"), &c6_api::CreateApiToken { name }).await
+pub async fn create_api_token(name: String, realm: Option<String>) -> Result<c6_api::ApiToken, String> {
+    send_json(Request::post("/api/v1/auth/tokens"), &c6_api::CreateApiToken { name, realm }).await
+}
+
+pub async fn realms() -> Result<Vec<c6_api::Realm>, String> {
+    json(Request::get("/api/v1/realms").send().await).await
 }
 
 pub async fn delete_api_token(id: String) -> Result<(), String> {

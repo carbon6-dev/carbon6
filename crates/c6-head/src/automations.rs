@@ -55,8 +55,13 @@ async fn with_recent(st: &HeadState, mut a: api::Automation) -> anyhow::Result<a
     Ok(a)
 }
 
-pub async fn list(st: &HeadState) -> anyhow::Result<Vec<api::Automation>> {
-    let rows = sqlx::query("SELECT * FROM automations ORDER BY name").fetch_all(&st.store.pool).await?;
+/// The automations the caller may see.
+pub async fn list(st: &HeadState, caller: &crate::realms::Caller) -> anyhow::Result<Vec<api::Automation>> {
+    let rows = sqlx::query("SELECT * FROM automations WHERE (? IS NULL OR realm = ?) ORDER BY name")
+        .bind(&caller.realm)
+        .bind(&caller.realm)
+        .fetch_all(&st.store.pool)
+        .await?;
     let mut out = Vec::new();
     for r in &rows {
         out.push(with_recent(st, row_to_api(r)).await?);
@@ -143,7 +148,7 @@ impl EventFilter {
 /// The memex reported an event: runs the automations waiting for it, with
 /// the event as their input.
 pub async fn on_memex_event(st: &HeadState, kind: &str, data: &serde_json::Value) {
-    let all = match list(st).await {
+    let all = match list(st, &crate::realms::Caller::root()).await {
         Ok(a) => a,
         Err(e) => {
             warn!("loading automations: {e:#}");
@@ -173,7 +178,8 @@ pub async fn on_memex_event(st: &HeadState, kind: &str, data: &serde_json::Value
 }
 
 /// Creates an automation; a webhook's response carries its URL (once).
-pub async fn create(st: &HeadState, e: api::AutomationEdit) -> anyhow::Result<api::Automation> {
+/// A new automation in `realm` (its runs' sessions run there).
+pub async fn create(st: &HeadState, e: api::AutomationEdit, realm: &str) -> anyhow::Result<api::Automation> {
     let name = e.name.unwrap_or_default().trim().to_owned();
     let template = e.template.unwrap_or_default();
     let trigger = e.trigger.unwrap_or_else(|| "schedule".into());
@@ -182,8 +188,8 @@ pub async fn create(st: &HeadState, e: api::AutomationEdit) -> anyhow::Result<ap
     let id = uuid::Uuid::now_v7().simple().to_string();
     let token = (trigger == "webhook").then(new_token);
     sqlx::query(
-        "INSERT INTO automations (id, name, template, trigger, cron, input, token_hash, enabled, created_at, disable_after) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO automations (id, name, template, trigger, cron, input, token_hash, enabled, created_at, disable_after, realm) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
@@ -195,6 +201,7 @@ pub async fn create(st: &HeadState, e: api::AutomationEdit) -> anyhow::Result<ap
     .bind(e.enabled.unwrap_or(true) as i64)
     .bind(now_ms())
     .bind(e.disable_after.unwrap_or(0) as i64)
+    .bind(realm)
     .execute(&st.store.pool)
     .await?;
     let mut a = get(st, &id).await?;
@@ -262,15 +269,21 @@ pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &st
     // A workflow, when no template has the name: the run is the workflow's,
     // and its outcome arrives when it finishes (`workflow_finished`).
     let is_template = crate::templates::templates(st).await?.iter().any(|t| t.name == a.template);
+    // Its sessions run in the automation's realm.
+    let realm: String = sqlx::query_scalar("SELECT realm FROM automations WHERE id = ?")
+        .bind(&a.id)
+        .fetch_optional(&st.store.pool)
+        .await?
+        .unwrap_or_else(|| crate::realms::HOME.to_owned());
     let workflow = !is_template && crate::workflows::workflows(st).await?.iter().any(|w| w.name == a.template);
     let result = if workflow {
-        crate::workflows::start(st, &a.template, input, trigger).await.map(|r| api::TemplateRun {
+        crate::workflows::start(st, &a.template, input, trigger, &realm).await.map(|r| api::TemplateRun {
             run_id: r.id,
             sessions: Vec::new(),
             errors: Vec::new(),
         })
     } else {
-        crate::templates::run(st, &a.template, input, &[format!("automation:{}", label_safe(&a.name))]).await
+        crate::templates::run(st, &a.template, input, &[format!("automation:{}", label_safe(&a.name))], &realm).await
     };
     let (run_id, error) = match &result {
         Ok(r) => (Some(r.run_id.clone()), (!r.errors.is_empty()).then(|| r.errors.join("; "))),
@@ -543,7 +556,7 @@ pub fn spawn_scheduler(st: Arc<HeadState>) {
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
             let now = Local::now();
-            let due: Vec<api::Automation> = match list(&st).await {
+            let due: Vec<api::Automation> = match list(&st, &crate::realms::Caller::root()).await {
                 Ok(all) => all.into_iter().filter(|a| a.enabled && a.trigger == "schedule").filter(|a| due(&a.cron, last, now)).collect(),
                 Err(e) => {
                     warn!("loading automations: {e:#}");

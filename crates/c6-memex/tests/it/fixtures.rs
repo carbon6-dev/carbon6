@@ -242,5 +242,18 @@ async fn memex_fixtures_upgrade_and_serve() {
         assert!(count("SELECT count(*) FROM items WHERE kind = 'note'").await >= 1, "{name}: notes");
         assert!(count("SELECT count(*) FROM trail_steps").await >= 1, "{name}: trails");
         assert!(!store.upgrades().await.unwrap().is_empty(), "{name}: upgrade history");
+        drop(store);
+
+        // Served: home's knowledge answers; another realm's call is refused
+        // (only home keeps knowledge in the memex so far).
+        c6_llm::install_crypto_provider();
+        let m =
+            c6_memex::Memex::open(&state.path().join("memex"), std::sync::Arc::new(c6_worker::link::HeadLink::default())).await.unwrap();
+        let found = m.handle_method("memex.search", json!({"query": "engine", "realm": "home"})).await.unwrap();
+        assert!(found.to_string().contains("analytical engine"), "{name}: {found}");
+        let found = m.handle_method("memex.search", json!({"query": "engine"})).await.unwrap();
+        assert!(found.to_string().contains("analytical engine"), "{name}: no realm means home");
+        let refused = m.handle_method("memex.search", json!({"query": "engine", "realm": "lab"})).await.unwrap_err();
+        assert!(refused.to_string().contains("realm lab keeps no knowledge"), "{name}: {refused}");
     }
 }

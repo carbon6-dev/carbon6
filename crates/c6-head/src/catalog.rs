@@ -160,7 +160,7 @@ const AREAS: &[(&str, &str)] = &[
     ("hosts", "The SSH host inventory."),
     ("settings", "Tools and context for sessions: MCP servers, skills, commands, agents, hooks, secrets, web search."),
     ("account", "Sign-in: passkeys, signed-in browsers, API tokens, one-time codes."),
-    ("system", "carbon6 itself: upgrades of its databases, and the backups made before each."),
+    ("system", "carbon6 itself: realms, upgrades of its databases, and the backups made before each."),
     ("todos", "Action items: things for the user to settle when they want to (facts to confirm, disputes, open questions)."),
 ];
 
@@ -329,6 +329,7 @@ fn build() -> Vec<Op> {
         op!("auth.passkeys.delete", "account", "DELETE" "/api/v1/auth/passkeys/{id}", Destructive, Input::None, "Deletes a passkey (it can no longer sign in).", choices = &[("id", "auth.passkeys.list")]),
         op!("auth.sessions.list", "account", "GET" "/api/v1/auth/sessions", Read, Input::None, "Browsers signed in to carbon6."),
         op!("auth.sessions.delete", "account", "DELETE" "/api/v1/auth/sessions/{id}", Destructive, Input::None, "Signs a browser out.", choices = &[("id", "auth.sessions.list")]),
+        op!("realms.list", "system", "GET" "/api/v1/realms", Read, Input::None, "Realms: root (carbon6's administration) and home (your sessions, knowledge and data); each owns its own sessions, action items, memory notes, automations, secrets and knowledge."),
         op!("system.upgrades", "system", "GET" "/api/v1/system/upgrades", Read, Input::None, "Upgrades of carbon6's databases (the head's and the memex's), newest first: versions, what changed, and where the backup is."),
         op!("auth.tokens.list", "account", "GET" "/api/v1/auth/tokens", Read, Input::None, "API tokens (for the c6 CLI and scripts)."),
         op!("auth.tokens.create", "account", "POST" "/api/v1/auth/tokens", Secret, Input::Body(schema::<api::CreateApiToken>), "Creates an API token for the c6 CLI or a script.", secret = &["token"]),

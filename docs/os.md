@@ -148,6 +148,25 @@ grant(id, from_realm, to_realm,
 - **Memex scopes by label** become label scopes inside home.
 - **Until you create a second realm, nothing behaves differently.** The full upgrade plan is in 13.
 
+### 3.11 As built (step 1)
+
+- **Realms:** a `realms` table in the head holds root and home. Migration `0028` gives sessions, memory notes, action items, automations, workflow runs, secrets and usage a `realm`. Everything moves to home, except the assistant's conversations, which do administration and move to root. API tokens get a `realm` that is empty for a root token, so every existing token stays a root token. Upgrade checks prove each move against the data.
+- **Callers:** the auth layer identifies a `Caller` for every request:
+  - **Root callers:** you, signed in (or with sign-in off), and a root token reach every realm.
+  - **Realm-scoped tokens:** a token limited to a realm passes `realms::admit` first. It reaches its realm's sessions (and everything under a session), search, action items, memory notes, automations, template runs and the memex, each checked per object. Another realm's object answers 404. It can read workers, connections and their models, commands, the catalog, the OpenAPI document and its own realm. Everything else is administration and answers 403, including `/api/v1/catalog/call` (it would run operations as an internal call) and `/api/v1/live`.
+  - **Tokens and sign-in:** a valid token scopes even with sign-in off.
+  - **Creating tokens:** `c6h api-token --realm home`, or the realm selector under **Settings → Sign-in → API tokens**.
+- **Sessions:**
+  - **Where they run:** a session runs in the realm it is created in: the API's `realm`, else the caller's, else home. Never root (only the assistant's conversations are there), and only in a realm that exists.
+  - **Inheritance:** side chats and subagents take their parent's realm. Template runs, automations and workflow runs start their sessions in their own realm.
+  - **What a session gets:** only its realm's memory notes and secrets.
+  - **Secret requests:** a worker asks for a secret on behalf of a session (`secret:NAME@<session>`), and the head checks the secret is in that session's realm. A bare name, from an older worker, gets only home's secrets.
+- **The memex:**
+  - **Migration:** `0007` gives the memex's data a `realm` (all home).
+  - **Every call carries a realm:** the head stamps the caller's or session's realm on each call, overwriting any realm a client sends. Root keeps no knowledge, so the assistant's conversations are no longer sent to the memex. The memex refuses any realm but home.
+  - **Per-realm queries:** queries partitioned by realm, and things keyed per realm, come with step 4, together with grants on memex data. Until then nothing crosses, because only home's data is there.
+- **Test databases:** `c6h-v0027.db` was regenerated with an assistant conversation, so the move to root is exercised. `c6h-v0028.db` and `memex-v0007.db` hold the new shape. The `realms` integration test covers tokens, admission, sessions in realms, and secrets, memory notes and action items not crossing realms; a second realm is inserted directly for it.
+
 ## 4. Primitives
 
 Every primitive is scoped by realm, has operations in the catalog (so the assistant, the CLI, the API reference and the OpenAPI document get them automatically), and has agent tools where agents need them.
@@ -611,4 +630,21 @@ Workers' journals hold sessions' events, and need no migration. The head decides
 - **Head first.** Until the memex is upgraded, the head treats it as home-only and leaves the realm features that need it (grants on memex data, commons) unavailable.
 - **The memex next,** whenever it next starts on the new version. It migrates in the background (13.1, rule 6).
 - **Workers whenever you like** (13.4).
+
+## 14. Decisions made while building
+
+Choices the design left open, made while building, for review.
+
+| Step | Decision | Why |
+|---|---|---|
+| 0 | The upgrade machinery lives in `c6_core::upgrade` (feature `upgrade`), shared by the head and the memex | One implementation of backups, checks and restore for both databases |
+| 0 | The fixtures are filled through the real API, then one synthetic row goes into each table the API didn't reach | Realistic shapes where it matters (settings, sessions, approvals), and full coverage everywhere else |
+| 1 | The assistant's conversations move to root | They do carbon6's administration (3.6) |
+| 1 | Root keeps no memex knowledge: its sessions' digests are no longer sent to the memex | Root is administration; the memex has no root partition |
+| 1 | The memex gets realm columns and a gatekeeper in step 1; per-realm queries and things keyed per realm come in step 4 | Grants on memex data (step 4) redo the same queries; until a second realm can exist, only home's data is there and nothing can cross |
+| 1 | A realm-scoped token may read workers, connections and their models, commands, the catalog and the OpenAPI document | It needs them to start sessions; they hold no realm's data |
+| 1 | Usage, live updates, settings and workflows are root-only for tokens | They span realms, or are configuration (until step 2 makes configuration per realm) |
+| 1 | A valid token scopes even with sign-in off | A script given a realm's token expects to stay in that realm |
+| 1 | Secrets are asked for as `secret:NAME@<session>`, not with a new protocol field | Keeps the worker's per-session cache separate with no protocol change; older workers still get home's secrets |
+| 1 | Tokens cannot be limited to root | A root token is one with no realm |
 

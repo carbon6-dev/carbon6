@@ -742,7 +742,8 @@ pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str) ->
     match &op.via {
         Via::Memex { method } => {
             args["made_by"] = json!(made_by);
-            Ok(crate::memex::call(st, method, args).await?)
+            // As you, on your home knowledge.
+            Ok(crate::memex::call_in(st, crate::realms::HOME, method, args).await?)
         }
         Via::Http { method, path } => {
             let router = st.assistant.router.get().ok_or_else(|| anyhow::anyhow!("the head is starting"))?.clone();

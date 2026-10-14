@@ -49,7 +49,7 @@ async fn headless_cli() {
     .await
     .unwrap();
     let url = format!("http://127.0.0.1:{}", head.ui_addrs[0].port());
-    let token = head.state.store.create_api_token("test").await.unwrap().token.unwrap();
+    let token = head.state.store.create_api_token("test", None).await.unwrap().token.unwrap();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
     let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();

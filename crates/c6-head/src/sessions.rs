@@ -100,6 +100,8 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         }
     }
     let labels = check_labels(&req_labels)?;
+    let realm = req.realm.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| crate::realms::HOME.to_owned());
+    crate::realms::check_for_sessions(st, &realm).await?;
     let cwd = req.cwd.trim().to_owned();
     let (connection_id, model, subagent_model) = {
         let mut route_labels = labels.clone();
@@ -145,6 +147,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         ssh_target: ssh.clone(),
         awaiting: 0,
         subagent_model,
+        realm,
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     // Context from the memex, for what is known at creation.
@@ -157,7 +160,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         "",
         &row.ssh_target,
     ));
-    spec.memex_brief = crate::memex::brief(st, &brief_labels, prompt.unwrap_or("")).await;
+    spec.memex_brief = crate::memex::brief(st, &row.realm, &brief_labels, prompt.unwrap_or("")).await;
     insert(st, row, spec, prompt.map(|p| (p, files))).await
 }
 
@@ -205,6 +208,8 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         ssh_target: String::new(),
         awaiting: 0,
         subagent_model: String::new(),
+        // The assistant does carbon6's administration.
+        realm: crate::realms::ROOT.to_owned(),
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
@@ -270,6 +275,8 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         ssh_target: parent.ssh_target.clone(),
         awaiting: 0,
         subagent_model: parent.subagent_model.clone(),
+        // A side chat is in its parent's realm.
+        realm: parent.realm.clone(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -334,11 +341,12 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting(HOOKS).await?.unwrap_or_else(|| "[]".into()),
         agents_json: st.store.setting(AGENTS).await?.unwrap_or_else(|| "[]".into()),
-        secrets_json: serde_json::to_string(&st.store.secrets().await?)?,
+        // Only its realm's secrets.
+        secrets_json: serde_json::to_string(&st.store.secrets(Some(&row.realm)).await?)?,
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
-        memories_json: crate::memory::for_sessions(st).await?,
+        memories_json: crate::memory::for_sessions(st, &row.realm).await?,
         policies_json: with_builtin_policies(st, st.store.setting(POLICIES).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
         memex_brief: String::new(),
@@ -1084,11 +1092,33 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     Ok(true)
 }
 
-/// A secret's value for a worker, as a credential. A secret scoped to
-/// `worker:` labels is only given to those workers.
-async fn secret_credential(st: &HeadState, worker_name: &str, name: &str, mut grant: CredentialGrant) -> CredentialGrant {
+/// A secret's value for a worker, as a credential: `name@session` asks on
+/// behalf of one of the worker's sessions, and the secret must be in that
+/// session's realm; a bare name (an older worker) gets only home's. A
+/// secret scoped to `worker:` labels is only given to those workers.
+async fn secret_credential(
+    st: &HeadState,
+    worker_id: WorkerId,
+    worker_name: &str,
+    name: &str,
+    mut grant: CredentialGrant,
+) -> CredentialGrant {
+    let (name, realm) = match name.split_once('@') {
+        Some((name, session_id)) => match st.store.session(session_id).await {
+            Ok(Some(s)) if s.worker_id == worker_id.to_string() => (name, s.realm),
+            _ => {
+                grant.error = "no such session on this worker".into();
+                return grant;
+            }
+        },
+        None => (name, crate::realms::HOME.to_owned()),
+    };
     let (blob, applies_to) = match st.store.secret(name).await {
-        Ok(Some(s)) => s,
+        Ok(Some((blob, applies_to, secret_realm))) if secret_realm == realm => (blob, applies_to),
+        Ok(Some(_)) => {
+            grant.error = format!("no secret named {name} in realm {realm}");
+            return grant;
+        }
         Ok(None) => {
             grant.error = format!("no secret named {name}");
             return grant;
@@ -1123,7 +1153,7 @@ pub async fn credential(st: &HeadState, worker_id: WorkerId, req: CredentialRequ
     let mut grant = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id.clone(), ..Default::default() };
     if let Some(name) = req.connection_id.strip_prefix("secret:") {
         let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
-        return secret_credential(st, &worker_name, name, grant).await;
+        return secret_credential(st, worker_id, &worker_name, name, grant).await;
     }
     // Google accounts: for the memex only (it syncs mail, calendars and
     // contacts); workers reach them through the memex.

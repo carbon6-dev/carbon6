@@ -155,6 +155,11 @@ async fn make_head_fixture() {
     };
     done(s.id.clone()).await;
 
+    // An assistant conversation (it runs in the head).
+    mock.push(Reply::Text("You have one worker.".into()));
+    let a: Session = serde_json::from_value(post("assistant", json!({"prompt": "what workers do I have?"})).await).unwrap();
+    done(a.id.clone()).await;
+
     // A session waiting for approval (an "ask" policy), left waiting.
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"git push origin main"}"#.into())]));
     let waiting: Session = serde_json::from_value(
@@ -320,6 +325,13 @@ async fn head_fixtures_upgrade_and_serve() {
         assert!(get("automations").await.as_array().is_some_and(|a| a.len() >= 2), "{name}");
         assert!(get("memories").await.as_array().is_some_and(|m| m.len() >= 2), "{name}");
         assert!(get("workflows/runs").await.to_string().contains("check-then-fix"), "{name}");
+        // Realms: root and home; the assistant's conversations in root,
+        // everything else in home.
+        let realms = get("realms").await;
+        assert_eq!(realms.as_array().map(Vec::len), Some(2), "{name}: {realms}");
+        let all = sessions.as_array().unwrap();
+        assert!(all.iter().all(|s| s["realm"] == "home" || s["realm"] == "root"), "{name}: {sessions}");
+        assert!(all.iter().any(|s| s["realm"] == "root"), "{name}: the assistant's conversation is in root");
         // Its upgrade history includes the fixture's own creation.
         assert!(get("system/upgrades").await.as_array().is_some_and(|u| !u.is_empty()), "{name}");
         head.shutdown_token().cancel();

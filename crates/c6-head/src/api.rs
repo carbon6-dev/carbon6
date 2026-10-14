@@ -8,12 +8,13 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
 use rust_embed::RustEmbed;
 
 use crate::HeadState;
+use crate::realms::Caller;
 
 pub fn router(state: Arc<HeadState>) -> Router {
     Router::new()
@@ -133,6 +134,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
+        .route("/api/v1/realms", get(list_realms))
         .route("/api/v1/catalog/call", post(call_catalog))
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
@@ -154,6 +156,7 @@ impl From<anyhow::Error> for ApiErr {
         match e.downcast_ref::<crate::UserError>() {
             Some(crate::UserError::BadRequest(m)) => return Self(StatusCode::BAD_REQUEST, m.clone()),
             Some(crate::UserError::NotFound(m)) => return Self(StatusCode::NOT_FOUND, m.clone()),
+            Some(crate::UserError::Forbidden(m)) => return Self(StatusCode::FORBIDDEN, m.clone()),
             None => {}
         }
         tracing::warn!("api error: {e:#}");
@@ -510,11 +513,16 @@ pub async fn sessions_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Sessio
     Ok(st.store.sessions(SESSION_LIST_LIMIT).await?.iter().map(crate::convert::session).collect())
 }
 
-async fn list_sessions(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Session>>> {
-    Ok(Json(sessions_snapshot(&st).await?))
+async fn list_sessions(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Session>>> {
+    Ok(Json(sessions_snapshot(&st).await?.into_iter().filter(|s| caller.sees(&s.realm)).collect()))
 }
 
-async fn create_session(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateSession>) -> ApiResult<Json<api::Session>> {
+async fn create_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(mut req): Json<api::CreateSession>,
+) -> ApiResult<Json<api::Session>> {
+    req.realm = Some(caller.realm_for_new(req.realm.as_deref())?);
     Ok(Json(crate::sessions::create(&st, req).await?))
 }
 
@@ -581,8 +589,14 @@ async fn session_matches(
     Ok(Json(crate::search::session_matches(&st.store, &id, &f.q).await?))
 }
 
-async fn search(State(st): State<Arc<HeadState>>, Query(q): Query<api::SearchQuery>) -> ApiResult<Json<api::SearchResponse>> {
-    Ok(Json(crate::search::search(&st.store, &q).await?))
+async fn search(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<api::SearchQuery>,
+) -> ApiResult<Json<api::SearchResponse>> {
+    let mut found = crate::search::search(&st.store, &q).await?;
+    found.results.retain(|r| caller.sees(&r.session.realm));
+    Ok(Json(found))
 }
 
 async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::SessionDetail>> {
@@ -798,7 +812,7 @@ async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api:
         "" => {}
         "brave" | "tavily" if s.secret.is_empty() => return bad("choose the secret that holds the API key"),
         "brave" | "tavily" => {
-            if !st.store.secrets().await?.iter().any(|x| x.name == s.secret) {
+            if !st.store.secrets(None).await?.iter().any(|x| x.name == s.secret) {
                 return bad("no secret by that name (add it under Secrets first)");
             }
         }
@@ -822,13 +836,18 @@ async fn put_templates(State(st): State<Arc<HeadState>>, Json(templates): Json<V
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_memories(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Memory>>> {
-    Ok(Json(crate::memory::list(&st).await?))
+async fn list_memories(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Memory>>> {
+    Ok(Json(crate::memory::list(&st, &caller).await?))
 }
 
-async fn create_memory(State(st): State<Arc<HeadState>>, Json(mut m): Json<api::Memory>) -> ApiResult<Json<api::Memory>> {
+async fn create_memory(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(mut m): Json<api::Memory>,
+) -> ApiResult<Json<api::Memory>> {
     m.id = String::new();
-    Ok(Json(crate::memory::put(&st, m).await?))
+    let realm = caller.realm_for_new(None)?;
+    Ok(Json(crate::memory::put(&st, m, &realm).await?))
 }
 
 async fn update_memory(
@@ -837,7 +856,8 @@ async fn update_memory(
     Json(mut m): Json<api::Memory>,
 ) -> ApiResult<Json<api::Memory>> {
     m.id = id;
-    Ok(Json(crate::memory::put(&st, m).await?))
+    // Admitted only if the note is in the caller's realm; it stays there.
+    Ok(Json(crate::memory::put(&st, m, crate::realms::HOME).await?))
 }
 
 async fn delete_memory(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
@@ -845,12 +865,17 @@ async fn delete_memory(State(st): State<Arc<HeadState>>, Path(id): Path<String>)
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_automations(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Automation>>> {
-    Ok(Json(crate::automations::list(&st).await?))
+async fn list_automations(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Automation>>> {
+    Ok(Json(crate::automations::list(&st, &caller).await?))
 }
 
-async fn create_automation(State(st): State<Arc<HeadState>>, Json(e): Json<api::AutomationEdit>) -> ApiResult<Json<api::Automation>> {
-    Ok(Json(crate::automations::create(&st, e).await?))
+async fn create_automation(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(e): Json<api::AutomationEdit>,
+) -> ApiResult<Json<api::Automation>> {
+    let realm = caller.realm_for_new(None)?;
+    Ok(Json(crate::automations::create(&st, e, &realm).await?))
 }
 
 async fn update_automation(
@@ -892,15 +917,17 @@ async fn call_webhook(
 
 async fn run_template(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Path(name): Path<String>,
     body: Option<Json<api::RunTemplate>>,
 ) -> ApiResult<Json<api::TemplateRun>> {
     let input = body.map(|Json(b)| b.input).unwrap_or_default();
-    Ok(Json(crate::templates::run(&st, &name, &input, &[]).await?))
+    let realm = caller.realm_for_new(None)?;
+    Ok(Json(crate::templates::run(&st, &name, &input, &[], &realm).await?))
 }
 
 async fn list_secrets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::SecretInfo>>> {
-    Ok(Json(st.store.secrets().await?))
+    Ok(Json(st.store.secrets(None).await?))
 }
 
 async fn put_secret(State(st): State<Arc<HeadState>>, Path(name): Path<String>, Json(req): Json<api::PutSecret>) -> ApiResult<StatusCode> {
@@ -1121,9 +1148,14 @@ fn list_param(s: &str) -> Vec<String> {
     s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()
 }
 
-async fn memex_search(State(st): State<Arc<HeadState>>, Query(q): Query<MemexSearchQuery>) -> ApiResult<Json<Vec<api::MemexHit>>> {
+async fn memex_search(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<MemexSearchQuery>,
+) -> ApiResult<Json<Vec<api::MemexHit>>> {
     let query = api::MemexQuery { query: q.q, kinds: list_param(&q.kinds), about: list_param(&q.about), limit: q.limit };
-    let v = crate::memex::call(&st, "memex.search", serde_json::to_value(query).map_err(anyhow::Error::from)?).await?;
+    let v =
+        crate::memex::call_in(&st, caller.memex_realm(), "memex.search", serde_json::to_value(query).map_err(anyhow::Error::from)?).await?;
     Ok(Json(serde_json::from_value(v).map_err(anyhow::Error::from)?))
 }
 
@@ -1135,20 +1167,32 @@ pub(crate) struct IdQuery {
     q: String,
 }
 
-async fn memex_get(State(st): State<Arc<HeadState>>, Query(q): Query<IdQuery>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::memex::call(&st, "memex.get", serde_json::json!({"id": q.id})).await?))
+async fn memex_get(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<IdQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.get", serde_json::json!({"id": q.id})).await?))
 }
 
-async fn memex_mentions(State(st): State<Arc<HeadState>>, Query(q): Query<IdQuery>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::memex::call(&st, "memex.mention", serde_json::json!({"q": q.q})).await?))
+async fn memex_mentions(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<IdQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.mention", serde_json::json!({"q": q.q})).await?))
 }
 
-async fn memex_note(State(st): State<Arc<HeadState>>, Json(n): Json<api::MemexNoteIn>) -> ApiResult<Json<serde_json::Value>> {
+async fn memex_note(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(n): Json<api::MemexNoteIn>,
+) -> ApiResult<Json<serde_json::Value>> {
     if n.text.trim().is_empty() {
         return Err(crate::bad_request("a note needs text").into());
     }
     let params = serde_json::json!({"text": n.text, "labels": n.about, "made_by": "you"});
-    Ok(Json(crate::memex::call(&st, "memex.note", params).await?))
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.note", params).await?))
 }
 
 async fn get_google_client(State(st): State<Arc<HeadState>>, headers: HeaderMap) -> ApiResult<Json<api::GoogleClient>> {
@@ -1198,7 +1242,11 @@ struct RpcIn {
 /// The mail client, calendar, contacts, photos and the memex's review,
 /// commitments and graph call the memex through here (you, signed in:
 /// everything is in scope).
-async fn memex_rpc(State(st): State<Arc<HeadState>>, Json(r): Json<RpcIn>) -> ApiResult<Json<serde_json::Value>> {
+async fn memex_rpc(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(r): Json<RpcIn>,
+) -> ApiResult<Json<serde_json::Value>> {
     let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge."].iter().any(|p| r.method.starts_with(p))
         || r.method.starts_with("memex.media.")
         || matches!(
@@ -1232,7 +1280,7 @@ async fn memex_rpc(State(st): State<Arc<HeadState>>, Json(r): Json<RpcIn>) -> Ap
     }
     let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
     params["made_by"] = serde_json::json!("you");
-    Ok(Json(crate::memex::call(&st, &r.method, params).await?))
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), &r.method, params).await?))
 }
 
 #[derive(serde::Deserialize)]
@@ -1244,9 +1292,15 @@ struct AttachmentQuery {
 
 /// A mail attachment, served like an output (nosniff; sandboxed when it
 /// could run script) and as a download unless it is an image or PDF.
-async fn mail_attachment(State(st): State<Arc<HeadState>>, Query(q): Query<AttachmentQuery>) -> ApiResult<Response> {
+async fn mail_attachment(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<AttachmentQuery>,
+) -> ApiResult<Response> {
     use base64::Engine;
-    let v = crate::memex::call(&st, "memex.mail.attachment", serde_json::json!({"item_id": q.item, "index": q.index})).await?;
+    let v =
+        crate::memex::call_in(&st, caller.memex_realm(), "memex.mail.attachment", serde_json::json!({"item_id": q.item, "index": q.index}))
+            .await?;
     let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(anyhow::Error::from)?;
     let name = v["name"].as_str().unwrap_or("attachment").replace(['"', '\\', '\n', '\r'], "_");
     let mime = v["mime"].as_str().unwrap_or("application/octet-stream").to_owned();
@@ -1268,9 +1322,13 @@ async fn mail_attachment(State(st): State<Arc<HeadState>>, Query(q): Query<Attac
     Ok(resp)
 }
 
-async fn memex_upload(State(st): State<Arc<HeadState>>, Json(u): Json<api::MemexUpload>) -> ApiResult<Json<serde_json::Value>> {
+async fn memex_upload(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(u): Json<api::MemexUpload>,
+) -> ApiResult<Json<serde_json::Value>> {
     crate::sessions::check_labels(&u.labels)?;
-    Ok(Json(crate::memex::call(&st, "memex.upload", serde_json::to_value(u).map_err(anyhow::Error::from)?).await?))
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.upload", serde_json::to_value(u).map_err(anyhow::Error::from)?).await?))
 }
 
 #[derive(serde::Deserialize)]
@@ -1279,14 +1337,19 @@ struct FrameQuery {
 }
 
 /// A photo's thumbnail (or a video's keyframe), as JPEG.
-async fn memex_thumb(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Query<FrameQuery>) -> ApiResult<Response> {
-    let v = crate::memex::call(&st, "memex.media.thumb", serde_json::json!({"id": id, "frame": q.frame})).await?;
+async fn memex_thumb(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<FrameQuery>,
+) -> ApiResult<Response> {
+    let v = crate::memex::call_in(&st, caller.memex_realm(), "memex.media.thumb", serde_json::json!({"id": id, "frame": q.frame})).await?;
     jpeg_response(&v)
 }
 
 /// The clearest face of a person, as JPEG.
-async fn memex_face(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Response> {
-    let v = crate::memex::call(&st, "memex.media.face", serde_json::json!({"id": id})).await?;
+async fn memex_face(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>, Path(id): Path<String>) -> ApiResult<Response> {
+    let v = crate::memex::call_in(&st, caller.memex_realm(), "memex.media.face", serde_json::json!({"id": id})).await?;
     jpeg_response(&v)
 }
 
@@ -1296,19 +1359,20 @@ fn jpeg_response(v: &serde_json::Value) -> ApiResult<Response> {
     Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=3600")], data).into_response())
 }
 
-async fn memex_scan(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::memex::call(&st, "memex.scan", serde_json::json!({})).await?))
+async fn memex_scan(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.scan", serde_json::json!({})).await?))
 }
 
 /// An item's original (a document's file), served like an output: never
 /// sniffed, and sandboxed when it could run script.
 async fn memex_content(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> ApiResult<Response> {
     use base64::Engine;
-    let v = crate::memex::call(&st, "memex.content", serde_json::json!({"id": id})).await?;
+    let v = crate::memex::call_in(&st, caller.memex_realm(), "memex.content", serde_json::json!({"id": id})).await?;
     let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(anyhow::Error::from)?;
     let name = v["name"].as_str().unwrap_or("file").replace(['"', '\\', '\n', '\r'], "_");
     let mime = v["mime"].as_str().unwrap_or("application/octet-stream").to_owned();
@@ -1332,12 +1396,16 @@ async fn memex_content(
     Ok(resp)
 }
 
-async fn memex_trails(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::memex::call(&st, "memex.trails", serde_json::json!({})).await?))
+async fn memex_trails(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.trails", serde_json::json!({})).await?))
 }
 
-async fn memex_trail(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(crate::memex::call(&st, "memex.trail", serde_json::json!({"id": id})).await?))
+async fn memex_trail(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.trail", serde_json::json!({"id": id})).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -1348,9 +1416,13 @@ pub(crate) struct TrailStepIn {
     comment: String,
 }
 
-async fn memex_trail_append(State(st): State<Arc<HeadState>>, Json(s): Json<TrailStepIn>) -> ApiResult<Json<serde_json::Value>> {
+async fn memex_trail_append(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(s): Json<TrailStepIn>,
+) -> ApiResult<Json<serde_json::Value>> {
     let params = serde_json::json!({"trail": s.trail, "target": s.target, "comment": s.comment, "made_by": "you"});
-    Ok(Json(crate::memex::call(&st, "memex.trail_append", params).await?))
+    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.trail_append", params).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -1361,18 +1433,37 @@ pub(crate) struct TrailEdit {
     description: Option<String>,
 }
 
-async fn memex_trail_update(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Json(e): Json<TrailEdit>) -> ApiResult<StatusCode> {
-    crate::memex::call(&st, "memex.trail_update", serde_json::json!({"id": id, "name": e.name, "description": e.description})).await?;
+async fn memex_trail_update(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(e): Json<TrailEdit>,
+) -> ApiResult<StatusCode> {
+    crate::memex::call_in(
+        &st,
+        caller.memex_realm(),
+        "memex.trail_update",
+        serde_json::json!({"id": id, "name": e.name, "description": e.description}),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn memex_trail_delete(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    crate::memex::call(&st, "memex.trail_delete", serde_json::json!({"id": id})).await?;
+async fn memex_trail_delete(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    crate::memex::call_in(&st, caller.memex_realm(), "memex.trail_delete", serde_json::json!({"id": id})).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn memex_trail_remove_step(State(st): State<Arc<HeadState>>, Path((_, step)): Path<(String, i64)>) -> ApiResult<StatusCode> {
-    crate::memex::call(&st, "memex.trail_remove_step", serde_json::json!({"step": step})).await?;
+async fn memex_trail_remove_step(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((_, step)): Path<(String, i64)>,
+) -> ApiResult<StatusCode> {
+    crate::memex::call_in(&st, caller.memex_realm(), "memex.trail_remove_step", serde_json::json!({"step": step})).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1387,8 +1478,12 @@ async fn put_memex_folders(State(st): State<Arc<HeadState>>, Json(f): Json<Vec<a
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn memex_delete(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    let v = crate::memex::call(&st, "memex.delete", serde_json::json!({"id": id})).await?;
+async fn memex_delete(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let v = crate::memex::call_in(&st, caller.memex_realm(), "memex.delete", serde_json::json!({"id": id})).await?;
     if v["deleted"].as_bool() == Some(true) { Ok(StatusCode::NO_CONTENT) } else { Err(crate::not_found("no such item").into()) }
 }
 
@@ -1407,7 +1502,7 @@ async fn run_workflow(
     Path(name): Path<String>,
     Json(r): Json<api::RunWorkflow>,
 ) -> ApiResult<Json<api::WorkflowRun>> {
-    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual").await?))
+    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual", crate::realms::HOME).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -1851,6 +1946,11 @@ async fn get_catalog() -> Json<serde_json::Value> {
 }
 
 /// Runs an operation (the CLI): destructive ones need `confirmed`.
+/// The realms the caller may see.
+async fn list_realms(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Realm>>> {
+    Ok(Json(crate::realms::list(&st, &caller).await?))
+}
+
 /// Upgrades of the head's database and, if one is connected, the memex's.
 async fn get_upgrades(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Upgrade>>> {
     let as_api = |service: &str, r: c6_core::upgrade::Report| api::Upgrade {
@@ -1917,16 +2017,25 @@ pub(crate) struct TodoQuery {
     state: String,
 }
 
-async fn list_todos(State(st): State<Arc<HeadState>>, Query(q): Query<TodoQuery>) -> ApiResult<Json<Vec<api::Todo>>> {
-    Ok(Json(crate::todos::list(&st, &q.state).await?))
+async fn list_todos(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<TodoQuery>,
+) -> ApiResult<Json<Vec<api::Todo>>> {
+    Ok(Json(crate::todos::list(&st, &q.state, &caller).await?))
 }
 
-async fn add_todo(State(st): State<Arc<HeadState>>, Json(t): Json<api::TodoIn>) -> ApiResult<Json<api::Todo>> {
-    Ok(Json(crate::todos::add(&st, &t).await?))
+async fn add_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(t): Json<api::TodoIn>,
+) -> ApiResult<Json<api::Todo>> {
+    let realm = caller.realm_for_new(None)?;
+    Ok(Json(crate::todos::add(&st, &t, &realm).await?))
 }
 
-async fn count_todos(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(serde_json::json!({"open": crate::todos::open_count(&st).await?})))
+async fn count_todos(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({"open": crate::todos::open_count(&st, &caller).await?})))
 }
 
 async fn get_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Todo>> {

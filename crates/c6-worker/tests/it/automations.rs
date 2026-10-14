@@ -37,7 +37,7 @@ async fn automations_start_templates() {
     .await
     .unwrap();
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
-    let token = head.state.store.create_api_token("t").await.unwrap().token.unwrap();
+    let token = head.state.store.create_api_token("t", None).await.unwrap().token.unwrap();
     let mut auth = reqwest::header::HeaderMap::new();
     auth.insert("authorization", format!("Bearer {token}").parse().unwrap());
     let http = reqwest::Client::builder().default_headers(auth).build().unwrap();

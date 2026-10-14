@@ -22,6 +22,7 @@ mod notify;
 mod outputs;
 mod policies;
 mod push;
+mod realms;
 mod rewind;
 mod routing;
 mod runs;

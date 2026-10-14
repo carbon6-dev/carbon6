@@ -50,7 +50,38 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// What upgrades of the head database check, and which migrations may
 /// remove rows (docs/os.md §13).
 pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
-    checks: &[],
+    checks: &[
+        c6_core::upgrade::Check {
+            version: 28,
+            name: "every session has a realm",
+            before: "SELECT count(*) FROM before.sessions",
+            after: "SELECT count(*) FROM sessions WHERE realm IN ('home', 'root')",
+        },
+        c6_core::upgrade::Check {
+            version: 28,
+            name: "the assistant's conversations are in root",
+            before: "SELECT count(*) FROM before.sessions WHERE worker_id IN (SELECT id FROM before.workers WHERE role = 'head')",
+            after: "SELECT count(*) FROM sessions WHERE realm = 'root'",
+        },
+        c6_core::upgrade::Check {
+            version: 28,
+            name: "memory notes, action items, automations and secrets are in home",
+            before: "SELECT (SELECT count(*) FROM before.memories) + (SELECT count(*) FROM before.todos) + (SELECT count(*) FROM before.automations) + (SELECT count(*) FROM before.secrets)",
+            after: "SELECT (SELECT count(*) FROM memories WHERE realm = 'home') + (SELECT count(*) FROM todos WHERE realm = 'home') + (SELECT count(*) FROM automations WHERE realm = 'home') + (SELECT count(*) FROM secrets WHERE realm = 'home')",
+        },
+        c6_core::upgrade::Check {
+            version: 28,
+            name: "usage totals are unchanged",
+            before: "SELECT coalesce(sum(input + output + cache_read + cache_write), 0) FROM before.usage",
+            after: "SELECT coalesce(sum(input + output + cache_read + cache_write), 0) FROM usage",
+        },
+        c6_core::upgrade::Check {
+            version: 28,
+            name: "API tokens still reach every realm",
+            before: "SELECT count(*) FROM before.api_tokens",
+            after: "SELECT count(*) FROM api_tokens WHERE realm IS NULL",
+        },
+    ],
     allow: &[
         // Follow-through was removed (its tables and settings).
         c6_core::upgrade::Allow { version: 27, table: "tracker_observations" },
@@ -275,6 +306,8 @@ pub struct SessionRow {
     pub awaiting: i64,
     /// The model for subagents, from a routing rule; empty: `model`.
     pub subagent_model: String,
+    /// The realm it runs in (docs/os.md §3).
+    pub realm: String,
 }
 
 impl SessionRow {
@@ -328,7 +361,7 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -346,6 +379,7 @@ impl Store {
         .bind(&s.worker_name)
         .bind(&s.ssh_target)
         .bind(&s.subagent_model)
+        .bind(&s.realm)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -370,8 +404,14 @@ impl Store {
         Ok(sqlx::query_as("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at").bind(parent_id).fetch_all(&self.pool).await?)
     }
 
-    pub async fn secrets(&self) -> anyhow::Result<Vec<c6_api::SecretInfo>> {
-        let rows = sqlx::query("SELECT name, description, applies_to, updated_at FROM secrets ORDER BY name").fetch_all(&self.pool).await?;
+    /// Secrets (names and descriptions), of one realm or (`None`) all.
+    pub async fn secrets(&self, realm: Option<&str>) -> anyhow::Result<Vec<c6_api::SecretInfo>> {
+        let rows =
+            sqlx::query("SELECT name, description, applies_to, updated_at FROM secrets WHERE (? IS NULL OR realm = ?) ORDER BY name")
+                .bind(realm)
+                .bind(realm)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows
             .iter()
             .map(|r| c6_api::SecretInfo {
@@ -383,10 +423,10 @@ impl Store {
             .collect())
     }
 
-    /// (encrypted value, applies_to) of a secret.
-    pub async fn secret(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Vec<String>)>> {
-        let row = sqlx::query("SELECT value, applies_to FROM secrets WHERE name = ?").bind(name).fetch_optional(&self.pool).await?;
-        Ok(row.map(|r| (r.get("value"), serde_json::from_str(&r.get::<String, _>("applies_to")).unwrap_or_default())))
+    /// (encrypted value, applies_to, realm) of a secret.
+    pub async fn secret(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Vec<String>, String)>> {
+        let row = sqlx::query("SELECT value, applies_to, realm FROM secrets WHERE name = ?").bind(name).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| (r.get("value"), serde_json::from_str(&r.get::<String, _>("applies_to")).unwrap_or_default(), r.get("realm"))))
     }
 
     /// Creates or updates a secret; `value: None` keeps the current value
@@ -629,17 +669,18 @@ async fn create_subagent_session(
     if s.parent_session_id.is_empty() {
         return Ok(false);
     }
-    let parent =
-        sqlx::query("SELECT connection_id, model, effort, labels, worker_name, ssh_target FROM sessions WHERE id = ? AND worker_id = ?")
-            .bind(&s.parent_session_id)
-            .bind(worker_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await?;
+    let parent = sqlx::query(
+        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm FROM sessions WHERE id = ? AND worker_id = ?",
+    )
+    .bind(&s.parent_session_id)
+    .bind(worker_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(parent) = parent else { return Ok(false) };
     let now = c6_core::now_ms();
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name, ssh_target) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target, realm) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -655,6 +696,8 @@ async fn create_subagent_session(
     .bind(parent.get::<String, _>("labels"))
     .bind(parent.get::<String, _>("worker_name"))
     .bind(parent.get::<String, _>("ssh_target"))
+    // A subagent works in its parent's realm.
+    .bind(parent.get::<String, _>("realm"))
     .execute(&mut *tx)
     .await?;
     Ok(true)

@@ -36,6 +36,10 @@ enum Command {
         /// What it is for.
         #[arg(default_value = "c6 CLI")]
         name: String,
+        /// Limit it to one realm's data (e.g. home); without this it reaches
+        /// every realm and carbon6's administration.
+        #[arg(long)]
+        realm: Option<String>,
     },
     /// Upgrade the head's database to this version without starting the
     /// head (starting it upgrades too). A backup is made first, and a failed
@@ -79,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Open one of these within 15 minutes; it works once. Then add a passkey under Settings → Sign-in.");
             Ok(())
         }
-        Command::ApiToken { name } => {
-            println!("{}", c6_head::offline_api_token(cfg, &name).await.context("creating API token")?);
+        Command::ApiToken { name, realm } => {
+            println!("{}", c6_head::offline_api_token(cfg, &name, realm.as_deref()).await.context("creating API token")?);
             Ok(())
         }
         Command::Upgrade { check } => {

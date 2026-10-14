@@ -76,7 +76,7 @@ c6 login https://head.example:7700 --token c6_… --ca carbon6-ca.pem   # --ca o
 - **`c6 send <id> "…"`** continues a session (a unique id prefix is enough). Also: `c6 wait`, `c6 show` (Markdown), `c6 stop`, `c6 sessions`, `c6 search` and `c6 workers`.
 - **`c6 ops [words]`** finds operations, meaning everything you can do in carbon6 (with no words, it lists the areas; with an operation's name, it shows its input).
 - **`c6 op <name> key=value…`** runs one and prints the result as JSON, for example `c6 op workers.enrollments.create body='{"name":"build-1"}'` or `c6 op connections.models id=<id>`. Destructive operations ask first, or skip the question with `--yes`.
-- **API tokens** reach the whole API except sign-in management. Revoke them in Settings. `C6_URL`, `C6_TOKEN` and `C6_CA` override the saved login.
+- **API tokens** reach the whole API except sign-in management, or only one realm's data if you limit them (`c6h api-token --realm home`, or the realm choice under Settings → Sign-in → API tokens). Revoke them in Settings. `C6_URL`, `C6_TOKEN` and `C6_CA` override the saved login.
 - **The API reference:**
   - `GET /api/v1/openapi.json` describes the whole API as OpenAPI 3.1, generated from the same catalog, for code generation.
   - Agents writing an integration in a session use the `carbon6_api` tool. It gives the base URL, how to authenticate, and each operation's method, path and input, and can save the OpenAPI document into the project. It only reads the reference; the code it writes calls carbon6 with your token.

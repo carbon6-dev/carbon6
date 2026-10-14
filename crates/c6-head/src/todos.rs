@@ -8,6 +8,7 @@ use c6_core::now_ms;
 use serde_json::{Value, json};
 use sqlx::Row;
 
+use crate::realms::Caller;
 use crate::{HeadState, bad_request, not_found};
 
 const KINDS: [&str; 6] = ["confirm", "dispute", "kit", "provide", "question", "follow_up"];
@@ -31,8 +32,9 @@ fn todo_of(r: &sqlx::sqlite::SqliteRow) -> api::Todo {
     }
 }
 
-/// Adds an item; an open item of the same group is raised again instead.
-pub async fn add(st: &HeadState, t: &api::TodoIn) -> anyhow::Result<api::Todo> {
+/// Adds an item to `realm`; an open item of the same group there is raised
+/// again instead.
+pub async fn add(st: &HeadState, t: &api::TodoIn, realm: &str) -> anyhow::Result<api::Todo> {
     let title = t.title.trim();
     if title.is_empty() || title.len() > 500 {
         return Err(bad_request("an action item needs a title (up to 500 characters)"));
@@ -41,10 +43,12 @@ pub async fn add(st: &HeadState, t: &api::TodoIn) -> anyhow::Result<api::Todo> {
     let priority = if matches!(t.priority.as_str(), "high" | "low") { t.priority.as_str() } else { "normal" };
     let now = now_ms();
     if !t.group.is_empty()
-        && let Some(id) = sqlx::query_scalar::<_, i64>("SELECT id FROM todos WHERE grp = ? AND state IN ('open', 'snoozed') LIMIT 1")
-            .bind(&t.group)
-            .fetch_optional(&st.store.pool)
-            .await?
+        && let Some(id) =
+            sqlx::query_scalar::<_, i64>("SELECT id FROM todos WHERE grp = ? AND realm = ? AND state IN ('open', 'snoozed') LIMIT 1")
+                .bind(&t.group)
+                .bind(realm)
+                .fetch_optional(&st.store.pool)
+                .await?
     {
         sqlx::query("UPDATE todos SET count = count + 1, updated_at = ?, detail = CASE WHEN ? = '' THEN detail ELSE ? END WHERE id = ?")
             .bind(now)
@@ -57,7 +61,7 @@ pub async fn add(st: &HeadState, t: &api::TodoIn) -> anyhow::Result<api::Todo> {
         return get(st, id).await?.ok_or_else(|| anyhow::anyhow!("action item gone"));
     }
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO todos (kind, title, detail, context, source, priority, grp, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO todos (kind, title, detail, context, source, priority, grp, created_at, updated_at, realm) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(kind)
     .bind(title)
@@ -68,6 +72,7 @@ pub async fn add(st: &HeadState, t: &api::TodoIn) -> anyhow::Result<api::Todo> {
     .bind(&t.group)
     .bind(now)
     .bind(now)
+    .bind(realm)
     .fetch_one(&st.store.pool)
     .await?;
     st.registry.bump();
@@ -78,31 +83,43 @@ pub async fn get(st: &HeadState, id: i64) -> anyhow::Result<Option<api::Todo>> {
     Ok(sqlx::query("SELECT * FROM todos WHERE id = ?").bind(id).fetch_optional(&st.store.pool).await?.as_ref().map(todo_of))
 }
 
-/// Items in a state ("open" includes snoozed ones whose time has come).
-pub async fn list(st: &HeadState, state: &str) -> anyhow::Result<Vec<api::Todo>> {
+/// Items in a state ("open" includes snoozed ones whose time has come),
+/// that the caller may see.
+pub async fn list(st: &HeadState, state: &str, caller: &Caller) -> anyhow::Result<Vec<api::Todo>> {
     let now = now_ms();
     let rows = match state {
         "" | "open" => {
             sqlx::query(
-                "SELECT * FROM todos WHERE state = 'open' OR (state = 'snoozed' AND snooze_until <= ?) \
+                "SELECT * FROM todos WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)) AND (? IS NULL OR realm = ?) \
                  ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, updated_at DESC",
             )
             .bind(now)
+            .bind(&caller.realm)
+            .bind(&caller.realm)
             .fetch_all(&st.store.pool)
             .await?
         }
         s => {
-            sqlx::query("SELECT * FROM todos WHERE state = ? ORDER BY updated_at DESC LIMIT 200").bind(s).fetch_all(&st.store.pool).await?
+            sqlx::query("SELECT * FROM todos WHERE state = ? AND (? IS NULL OR realm = ?) ORDER BY updated_at DESC LIMIT 200")
+                .bind(s)
+                .bind(&caller.realm)
+                .bind(&caller.realm)
+                .fetch_all(&st.store.pool)
+                .await?
         }
     };
     Ok(rows.iter().map(todo_of).collect())
 }
 
-pub async fn open_count(st: &HeadState) -> anyhow::Result<i64> {
-    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM todos WHERE state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)")
-        .bind(now_ms())
-        .fetch_one(&st.store.pool)
-        .await?)
+pub async fn open_count(st: &HeadState, caller: &Caller) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM todos WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)) AND (? IS NULL OR realm = ?)",
+    )
+    .bind(now_ms())
+    .bind(&caller.realm)
+    .bind(&caller.realm)
+    .fetch_one(&st.store.pool)
+    .await?)
 }
 
 /// Settles, snoozes, dismisses or reopens an item.
@@ -174,8 +191,10 @@ confirm, correct or retire, knowledge_record for anything new, and todo_resolve 
     Ok(session)
 }
 
-/// An agent settles the item it was started for (or raises a new one).
+/// An agent settles the item it was started for (or raises a new one), in
+/// its session's realm.
 pub async fn from_session(st: &HeadState, session_id: &str, what: &str, params: &Value) -> anyhow::Result<Value> {
+    let realm = crate::realms::of_session(st, session_id).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
     match what {
         "todo" => {
             let mut t: api::TodoIn = serde_json::from_value(params.clone()).map_err(|e| bad_request(format!("{e}")))?;
@@ -183,11 +202,16 @@ pub async fn from_session(st: &HeadState, session_id: &str, what: &str, params: 
             let mut ctx = if t.context.is_object() { t.context.clone() } else { json!({}) };
             ctx["session"] = json!(session_id);
             t.context = ctx;
-            let todo = add(st, &t).await?;
+            let todo = add(st, &t, &realm).await?;
             Ok(json!({"id": todo.id, "count": todo.count}))
         }
         "todo_resolve" => {
             let id = params["id"].as_i64().ok_or_else(|| bad_request("id is required"))?;
+            let theirs: Option<String> =
+                sqlx::query_scalar("SELECT realm FROM todos WHERE id = ?").bind(id).fetch_optional(&st.store.pool).await?;
+            if theirs.as_deref() != Some(realm.as_str()) {
+                return Err(not_found("no such action item"));
+            }
             let t = edit(
                 st,
                 id,

@@ -222,41 +222,54 @@ impl Store {
     }
 
     /// A new API token; the secret is returned once.
-    pub async fn create_api_token(&self, name: &str) -> anyhow::Result<api::ApiToken> {
+    /// A new API token, reaching one realm or (`None`) every realm; the
+    /// secret is returned once.
+    pub async fn create_api_token(&self, name: &str, realm: Option<&str>) -> anyhow::Result<api::ApiToken> {
         let token = format!("c6_{}", new_token());
         let id = uuid::Uuid::now_v7().to_string();
         let now = now_ms();
-        sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at, realm) VALUES (?, ?, ?, ?, ?)")
             .bind(&id)
             .bind(name)
             .bind(sha256_hex(&token))
             .bind(now)
+            .bind(realm)
             .execute(&self.pool)
             .await?;
-        Ok(api::ApiToken { id, name: name.to_owned(), created_at: now, last_used_at: None, token: Some(token) })
+        Ok(api::ApiToken {
+            id,
+            name: name.to_owned(),
+            realm: realm.map(str::to_owned),
+            created_at: now,
+            last_used_at: None,
+            token: Some(token),
+        })
     }
 
-    async fn check_api_token(&self, token: &str) -> anyhow::Result<bool> {
+    /// Who a token speaks for: `None` if it is not a valid token.
+    async fn check_api_token(&self, token: &str) -> anyhow::Result<Option<crate::realms::Caller>> {
         let hash = sha256_hex(token);
         let now = now_ms();
         let Some(row) =
-            sqlx::query("SELECT last_used_at FROM api_tokens WHERE token_hash = ?").bind(&hash).fetch_optional(&self.pool).await?
+            sqlx::query("SELECT last_used_at, realm FROM api_tokens WHERE token_hash = ?").bind(&hash).fetch_optional(&self.pool).await?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
             sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
         }
-        Ok(true)
+        Ok(Some(crate::realms::Caller { realm: row.get("realm") }))
     }
 
     async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
-        let rows =
-            sqlx::query("SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY created_at").fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT id, name, realm, created_at, last_used_at FROM api_tokens ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .iter()
             .map(|r| api::ApiToken {
                 id: r.get("id"),
+                realm: r.get("realm"),
                 name: r.get("name"),
                 created_at: r.get("created_at"),
                 last_used_at: r.get("last_used_at"),
@@ -329,29 +342,49 @@ const PUBLIC: [&str; 6] = [
     "/api/v1/auth/passkeys/login/finish",
 ];
 
-pub async fn require(State(st): State<Arc<HeadState>>, req: Request, next: Next) -> Response {
+pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: Next) -> Response {
+    use crate::realms::Caller;
+    // Who is calling: you (signed in, the head calling itself, or with
+    // sign-in off) reach every realm; an API token may be limited to one.
+    req.extensions_mut().insert(Caller::root());
     // The head calling itself (the assistant, as you).
     if req.extensions().get::<crate::assistant::InternalCall>().is_some() {
         return next.run(req).await;
     }
-    let path = req.uri().path();
+    let path = req.uri().path().to_owned();
     // Webhooks carry their own credential (the token in the URL).
-    if !st.auth.required || !path.starts_with("/api/") || PUBLIC.contains(&path) || path.starts_with("/api/v1/webhooks/") {
+    if !path.starts_with("/api/") || PUBLIC.contains(&path.as_str()) || path.starts_with("/api/v1/webhooks/") {
         return next.run(req).await;
     }
+    // A valid API token always speaks for its realm, even with sign-in off
+    // (a script given a realm's token stays in that realm).
     if let Some(token) = bearer_token(req.headers()) {
         // API tokens cannot manage sign-in (no minting codes, tokens or
         // passkeys with one).
-        let ok = !path.starts_with("/api/v1/auth/")
-            && st.store.check_api_token(&token).await.unwrap_or_else(|e| {
-                tracing::warn!("checking API token: {e:#}");
-                false
-            });
-        return if ok {
-            next.run(req).await
+        let caller = if path.starts_with("/api/v1/auth/") {
+            None
         } else {
-            (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response()
+            st.store.check_api_token(&token).await.unwrap_or_else(|e| {
+                tracing::warn!("checking API token: {e:#}");
+                None
+            })
         };
+        match caller {
+            Some(caller) => {
+                if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), &path).await {
+                    return (status, Json(api::ApiError { error })).into_response();
+                }
+                req.extensions_mut().insert(caller);
+                return next.run(req).await;
+            }
+            None if st.auth.required => {
+                return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response();
+            }
+            None => return next.run(req).await,
+        }
+    }
+    if !st.auth.required {
+        return next.run(req).await;
     }
     let ok = match cookie_token(req.headers()) {
         Some(t) => st.store.check_auth_session(&t).await.unwrap_or_else(|e| {
@@ -670,7 +703,16 @@ async fn create_token(State(st): State<Arc<HeadState>>, Json(req): Json<api::Cre
     if name.is_empty() {
         return Err(bad_request("a token needs a name").into());
     }
-    Ok((StatusCode::CREATED, Json(st.store.create_api_token(&name).await?)))
+    let realm = req.realm.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if realm == Some(crate::realms::ROOT) {
+        return Err(bad_request("a token for root is one with no realm: leave the realm out").into());
+    }
+    if let Some(r) = realm
+        && !crate::realms::exists(&st, r).await?
+    {
+        return Err(bad_request(format!("no realm {r:?}")).into());
+    }
+    Ok((StatusCode::CREATED, Json(st.store.create_api_token(&name, realm).await?)))
 }
 
 async fn delete_token(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> Res<StatusCode> {

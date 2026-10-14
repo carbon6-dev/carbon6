@@ -28,7 +28,29 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// What upgrades of the memex database check, and which migrations may
 /// remove rows (docs/os.md §13).
-pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan { checks: &[], allow: &[] };
+pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
+    checks: &[
+        c6_core::upgrade::Check {
+            version: 7,
+            name: "items, things and links are in home",
+            before: "SELECT (SELECT count(*) FROM before.items) + (SELECT count(*) FROM before.things) + (SELECT count(*) FROM before.links)",
+            after: "SELECT (SELECT count(*) FROM items WHERE realm = 'home') + (SELECT count(*) FROM things WHERE realm = 'home') + (SELECT count(*) FROM links WHERE realm = 'home')",
+        },
+        c6_core::upgrade::Check {
+            version: 7,
+            name: "facts, trails, commitments and reviews are in home",
+            before: "SELECT (SELECT count(*) FROM before.facts) + (SELECT count(*) FROM before.trails) + (SELECT count(*) FROM before.commitments) + (SELECT count(*) FROM before.review)",
+            after: "SELECT (SELECT count(*) FROM facts WHERE realm = 'home') + (SELECT count(*) FROM trails WHERE realm = 'home') + (SELECT count(*) FROM commitments WHERE realm = 'home') + (SELECT count(*) FROM review WHERE realm = 'home')",
+        },
+        c6_core::upgrade::Check {
+            version: 7,
+            name: "mail, calendars, contacts, media and files are in home",
+            before: "SELECT (SELECT count(*) FROM before.mail) + (SELECT count(*) FROM before.calendars) + (SELECT count(*) FROM before.contacts) + (SELECT count(*) FROM before.media) + (SELECT count(*) FROM before.files) + (SELECT count(*) FROM before.outgoing)",
+            after: "SELECT (SELECT count(*) FROM mail WHERE realm = 'home') + (SELECT count(*) FROM calendars WHERE realm = 'home') + (SELECT count(*) FROM contacts WHERE realm = 'home') + (SELECT count(*) FROM media WHERE realm = 'home') + (SELECT count(*) FROM files WHERE realm = 'home') + (SELECT count(*) FROM outgoing WHERE realm = 'home')",
+        },
+    ],
+    allow: &[],
+};
 
 /// Runs the memex database's upgrade on a copy (`c6m upgrade --check`).
 pub async fn check_upgrade(path: &Path) -> anyhow::Result<c6_core::upgrade::Report> {

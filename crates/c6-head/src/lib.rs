@@ -20,6 +20,7 @@ pub mod notify;
 pub mod oauth;
 pub mod pki;
 pub mod push;
+pub mod realms;
 pub mod registry;
 pub mod search;
 pub mod secrets;
@@ -55,12 +56,14 @@ pub use config::HeadConfig;
 pub enum UserError {
     BadRequest(String),
     NotFound(String),
+    /// Not allowed for this caller (a realm-scoped token).
+    Forbidden(String),
 }
 
 impl std::fmt::Display for UserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UserError::BadRequest(m) | UserError::NotFound(m) => f.write_str(m),
+            UserError::BadRequest(m) | UserError::NotFound(m) | UserError::Forbidden(m) => f.write_str(m),
         }
     }
 }
@@ -69,6 +72,10 @@ impl std::error::Error for UserError {}
 
 pub(crate) fn bad_request(msg: impl Into<String>) -> anyhow::Error {
     UserError::BadRequest(msg.into()).into()
+}
+
+pub(crate) fn forbidden(msg: impl Into<String>) -> anyhow::Error {
+    UserError::Forbidden(msg.into()).into()
 }
 
 pub(crate) fn not_found(msg: impl Into<String>) -> anyhow::Error {
@@ -337,10 +344,15 @@ pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> 
 }
 
 /// A new API token, minted on the head machine (`c6h api-token`).
-pub async fn offline_api_token(cfg: HeadConfig, name: &str) -> anyhow::Result<String> {
+pub async fn offline_api_token(cfg: HeadConfig, name: &str, realm: Option<&str>) -> anyhow::Result<String> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
-    Ok(store.create_api_token(name).await?.token.unwrap_or_default())
+    if let Some(r) = realm {
+        anyhow::ensure!(r != realms::ROOT, "a token for root is one with no realm: leave --realm out");
+        let known: Option<String> = sqlx::query_scalar("SELECT id FROM realms WHERE id = ?").bind(r).fetch_optional(&store.pool).await?;
+        anyhow::ensure!(known.is_some(), "no realm {r:?}");
+    }
+    Ok(store.create_api_token(name, realm).await?.token.unwrap_or_default())
 }
 
 pub async fn offline_enrollment(mut cfg: HeadConfig, name: Option<&str>) -> anyhow::Result<c6_api::Enrollment> {

@@ -40,6 +40,29 @@ impl Feed {
     }
 }
 
+/// Whether `realm` keeps knowledge in the memex. Root is carbon6's
+/// administration, with none.
+pub fn has_memex(realm: &str) -> bool {
+    realm != crate::realms::ROOT
+}
+
+/// `params` for a call on behalf of `realm` (the memex keeps each realm's
+/// data apart).
+pub fn in_realm(mut params: Value, realm: &str) -> Value {
+    if let Some(o) = params.as_object_mut() {
+        o.insert("realm".into(), json!(realm));
+    }
+    params
+}
+
+/// Calls the memex now, for `realm`. Err if none is connected.
+pub async fn call_in(st: &HeadState, realm: &str, method: &str, params: Value) -> anyhow::Result<Value> {
+    if !has_memex(realm) {
+        return Err(bad_request(format!("realm {realm} keeps no knowledge in the memex")));
+    }
+    call(st, method, in_realm(params, realm)).await
+}
+
 /// Calls the memex now. Err if none is connected.
 pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
     let id = st.registry.memex().ok_or_else(|| bad_request("no memex is connected (Settings → Memex)"))?;
@@ -137,8 +160,9 @@ async fn send_memories(st: &HeadState) -> anyhow::Result<()> {
     if st.store.setting(MEMORIES_SENT).await?.is_some() {
         return Ok(());
     }
-    for m in crate::memory::list(st).await? {
-        enqueue(st, "memex.ingest", json!(memory_item(&m.id, &m.scope, &m.text))).await;
+    let home = crate::realms::Caller::in_realm(crate::realms::HOME);
+    for m in crate::memory::list(st, &home).await? {
+        enqueue(st, "memex.ingest", in_realm(json!(memory_item(&m.id, &m.scope, &m.text)), crate::realms::HOME)).await;
     }
     st.store.set_setting(MEMORIES_SENT, "1").await
 }
@@ -283,14 +307,17 @@ fn item_labels(session: &SessionRow) -> Vec<String> {
 
 /// A brief for a new session about `labels`, or "" (no memex, nothing
 /// known, or it took too long).
-pub async fn brief(st: &HeadState, labels: &[String], text: &str) -> String {
+pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -> String {
     let Some(id) = st.registry.memex() else { return String::new() };
+    if !has_memex(realm) {
+        return String::new();
+    }
     let chars = settings(st).await.ok().and_then(|s| s.brief_chars).unwrap_or(4000);
     if chars == 0 {
         return String::new();
     }
     let scope = scope_for(st, labels).await;
-    let params = json!({"labels": labels, "text": text, "chars": chars, "scope": scope});
+    let params = json!({"labels": labels, "text": text, "chars": chars, "scope": scope, "realm": realm});
     match st.registry.call(id, "memex.brief", params, BRIEF_TIMEOUT).await {
         Ok(v) => serde_json::from_value::<api::MemexBrief>(v).map(|b| b.text).unwrap_or_default(),
         Err(e) => {
@@ -332,6 +359,11 @@ pub async fn on_events(st: &HeadState, session_id: &str, events: &[SessionEvent]
         return;
     }
     let Ok(Some(session)) = st.store.session(session_id).await else { return };
+    // What a session does goes to its realm's knowledge (root keeps none).
+    if !has_memex(&session.realm) {
+        return;
+    }
+    let realm = session.realm.clone();
     let labels = item_labels(&session);
     for ev in events {
         match &ev.kind {
@@ -352,24 +384,24 @@ pub async fn on_events(st: &HeadState, session_id: &str, events: &[SessionEvent]
                     meta: json!({"session_id": session_id, "name": o.name, "mime": o.mime, "seq": ev.seq, "size": o.data.len()}),
                     ..Default::default()
                 };
-                enqueue(st, "memex.ingest", json!(item)).await;
+                enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await;
             }
             Some(Kind::Memory(m)) if m.op == "forget" => {
-                enqueue(st, "memex.delete", json!({"source": "memory", "external_id": m.id})).await;
+                enqueue(st, "memex.delete", in_realm(json!({"source": "memory", "external_id": m.id}), &realm)).await;
             }
             Some(Kind::Memory(m)) => {
                 let mut item = memory_item(&m.id, &m.scope, &m.text);
                 item.meta = json!({"session_id": session_id});
-                enqueue(st, "memex.ingest", json!(item)).await;
+                enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await;
             }
             Some(Kind::ToolResult(r)) if is_web_tool(&r.tool) && !r.is_error => {
                 if let Some(item) = web_item(st, &session, ev, r).await {
-                    enqueue(st, "memex.ingest", json!(item)).await;
+                    enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await;
                 }
             }
             Some(Kind::TurnEnded(_)) if session.parent_call_id.is_none() => {
                 if let Some(item) = digest(st, &session, labels.clone()).await {
-                    enqueue(st, "memex.ingest", json!(item)).await;
+                    enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await;
                 }
             }
             _ => {}

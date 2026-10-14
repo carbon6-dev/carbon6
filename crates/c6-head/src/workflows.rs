@@ -143,7 +143,8 @@ pub async fn check(st: &HeadState, list: &[api::Workflow]) -> anyhow::Result<()>
 }
 
 /// Starts a workflow; its run (driven in the background).
-pub async fn start(st: &HeadState, name: &str, input: &str, trigger: &str) -> anyhow::Result<api::WorkflowRun> {
+/// Starts a run of the workflow; its sessions run in `realm`.
+pub async fn start(st: &HeadState, name: &str, input: &str, trigger: &str, realm: &str) -> anyhow::Result<api::WorkflowRun> {
     let w = workflows(st).await?.into_iter().find(|w| w.name == name).ok_or_else(|| not_found(format!("no workflow named {name:?}")))?;
     if !w.enabled {
         return Err(bad_request(format!("workflow {name:?} is switched off")));
@@ -156,7 +157,7 @@ pub async fn start(st: &HeadState, name: &str, input: &str, trigger: &str) -> an
         .map(|s| api::WorkflowStepRun { id: s.id.clone(), kind: s.kind.clone(), status: "pending".into(), ..Default::default() })
         .collect();
     sqlx::query(
-        "INSERT INTO workflow_runs (id, workflow, input, started_at, trigger, status, steps, definition) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+        "INSERT INTO workflow_runs (id, workflow, input, started_at, trigger, status, steps, definition, realm) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)",
     )
     .bind(&id)
     .bind(name)
@@ -165,6 +166,7 @@ pub async fn start(st: &HeadState, name: &str, input: &str, trigger: &str) -> an
     .bind(trigger)
     .bind(serde_json::to_string(&steps)?)
     .bind(serde_json::to_string(&w)?)
+    .bind(realm)
     .execute(&st.store.pool)
     .await?;
     info!(workflow = %name, run = %id, "workflow started");
@@ -178,6 +180,8 @@ struct Run {
     input: String,
     status: String,
     steps: Vec<api::WorkflowStepRun>,
+    /// Where its sessions run.
+    realm: String,
 }
 
 async fn load(st: &HeadState, id: &str) -> anyhow::Result<Run> {
@@ -192,6 +196,7 @@ async fn load(st: &HeadState, id: &str) -> anyhow::Result<Run> {
         input: r.get("input"),
         status: r.get("status"),
         steps: serde_json::from_str(&r.get::<String, _>("steps"))?,
+        realm: r.get("realm"),
     })
 }
 
@@ -304,7 +309,7 @@ async fn drive(st: &HeadState, id: &str) -> anyhow::Result<()> {
                 match def.kind.as_str() {
                     "run" => {
                         let input = render(&def.input, &run.input, &run.steps);
-                        match crate::templates::run(st, &def.template, &input, &labels(&run.workflow, id)).await {
+                        match crate::templates::run(st, &def.template, &input, &labels(&run.workflow, id), &run.realm).await {
                             Ok(r) => {
                                 let key = step_key(id, &def.id);
                                 for s in &r.sessions {

@@ -355,7 +355,10 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
 #[component]
 fn ApiTokens() -> impl IntoView {
     let tokens = LocalResource::new(api::api_tokens);
+    let realms = LocalResource::new(api::realms);
     let name = RwSignal::new(String::new());
+    // Empty: every realm (and administration).
+    let realm = RwSignal::new(String::new());
     let created = RwSignal::new(None::<c6_api::ApiToken>);
     let error = RwSignal::new(None::<String>);
     let create = move || {
@@ -363,8 +366,9 @@ fn ApiTokens() -> impl IntoView {
         if n.trim().is_empty() {
             return;
         }
+        let r = Some(realm.get_untracked()).filter(|r| !r.is_empty());
         spawn_local(async move {
-            match api::create_api_token(n).await {
+            match api::create_api_token(n, r).await {
                 Ok(t) => {
                     error.set(None);
                     name.set(String::new());
@@ -380,11 +384,18 @@ fn ApiTokens() -> impl IntoView {
         <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
             <div class="font-medium">"API tokens"</div>
             <p class="text-zinc-500">
-                "For scripts and the "<code>"c6"</code>" command line. A token can do anything but manage sign-in. It is shown once."
+                "For scripts and the "<code>"c6"</code>" command line. A token can do anything but manage sign-in, unless you limit it to one realm: then it reaches only that realm's sessions, action items, notes, automations and knowledge, and none of carbon6's administration. It is shown once."
             </p>
             <form class="mt-2 flex gap-2" on:submit=move |ev| { ev.prevent_default(); create(); }>
                 <input class=format!("{INPUT} flex-1") placeholder="What it is for, e.g. laptop CLI" prop:value=move || name.get()
                     on:input=move |ev| name.set(event_target_value(&ev)) />
+                <select class=INPUT title="Which realm it reaches" prop:value=move || realm.get() on:change=move |ev| realm.set(event_target_value(&ev))>
+                    <option value="">"Every realm"</option>
+                    {move || realms.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|r| r.id != "root").map(|r| {
+                        let id = r.id.clone();
+                        view! { <option value=id>{format!("Only {}", r.name)}</option> }
+                    }).collect_view()}
+                </select>
                 <button class=format!("{BUTTON} shrink-0") type="submit">"Create an API token"</button>
             </form>
             {move || error.get().map(|e| view! { <div class="mt-2"><ErrorBox message=e /></div> })}
@@ -405,7 +416,7 @@ fn ApiTokens() -> impl IntoView {
                         view! {
                             <div class="flex items-center justify-between gap-3 py-1.5">
                                 <div class="min-w-0">
-                                    <div class="truncate">{t.name.clone()}</div>
+                                    <div class="truncate">{t.name.clone()}{t.realm.clone().map(|r| view! { <span class="ml-2 rounded bg-zinc-100 px-1 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">{format!("realm {r}")}</span> })}</div>
                                     <div class="text-xs text-zinc-500">{format!("created {} · {}", ago(now_ms() - t.created_at), t.last_used_at.map_or("never used".to_owned(), |u| format!("used {}", ago(now_ms() - u))))}</div>
                                 </div>
                                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {

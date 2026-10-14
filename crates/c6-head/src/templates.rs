@@ -44,7 +44,8 @@ pub fn fill(prompt: &str, input: &str, target: &str) -> String {
 
 /// Starts the template `name`: a session per target. `labels` are added to
 /// the template's (e.g. automation:<name>).
-pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String]) -> anyhow::Result<api::TemplateRun> {
+/// Starts the template's sessions in `realm`.
+pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String], realm: &str) -> anyhow::Result<api::TemplateRun> {
     let t = templates(st).await?.into_iter().find(|t| t.name == name).ok_or_else(|| not_found(format!("no template named {name:?}")))?;
     if !t.enabled {
         return Err(bad_request(format!("template {name:?} is switched off")));
@@ -133,6 +134,7 @@ pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String]) -> 
             ssh,
             effort: Some(t.effort.clone()).filter(|e| !e.is_empty()),
             worktree: false,
+            realm: Some(realm.to_owned()),
         };
         match crate::sessions::create(st, req).await {
             Ok(s) => sessions.push(s),

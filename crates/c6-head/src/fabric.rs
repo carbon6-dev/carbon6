@@ -45,8 +45,10 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             }
             // A disputed fact, for you to settle.
             "todo.add" => {
+                // From the memex, about one realm's knowledge.
+                let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
                 let t: c6_api::TodoIn = serde_json::from_value(params).map_err(|e| bad_request(format!("{e}")))?;
-                Ok(json!({"id": crate::todos::add(st, &t).await?.id}))
+                Ok(json!({"id": crate::todos::add(st, &t, &realm).await?.id}))
             }
             "notify" => {
                 let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
@@ -100,5 +102,5 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     if method == "memex.note" && params["labels"].as_array().is_none_or(|a| a.is_empty()) {
         params["labels"] = json!(labels.into_iter().filter(|l| !l.starts_with("model:")).collect::<Vec<_>>());
     }
-    crate::memex::call(st, method, params).await
+    crate::memex::call_in(st, &session.realm, method, params).await
 }

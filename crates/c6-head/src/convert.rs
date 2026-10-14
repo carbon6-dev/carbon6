@@ -173,6 +173,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         auto_labels: r.all_labels().split_off(r.user_labels().len()),
         ssh: Some(r.ssh_target.clone()).filter(|t| !t.is_empty()),
         awaiting_approval: r.awaiting > 0,
+        realm: r.realm.clone(),
     }
 }
 

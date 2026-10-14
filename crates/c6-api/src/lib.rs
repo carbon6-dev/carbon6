@@ -148,6 +148,29 @@ pub struct Session {
     /// A tool call is waiting for your approval.
     #[serde(default)]
     pub awaiting_approval: bool,
+    /// The realm it runs in (docs/os.md §3).
+    #[serde(default = "home_realm")]
+    pub realm: String,
+}
+
+fn home_realm() -> String {
+    "home".to_owned()
+}
+
+/// `GET /api/v1/realms`: a realm, which owns sessions, knowledge and data
+/// (docs/os.md §3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Realm {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub created_at: UnixMs,
+    /// system, you, or app:<name>.
+    pub created_by: String,
+    /// The app it was made for, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
 }
 
 /// A side chat: a new session that branches from `anchor_seq` of a session
@@ -195,6 +218,9 @@ pub struct CreateSession {
     /// Run in a new git worktree on a new `c6/…` branch.
     #[serde(default)]
     pub worktree: bool,
+    /// The realm to run in. Default: the API token's realm, else home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -814,6 +840,9 @@ pub struct Passkey {
 pub struct ApiToken {
     pub id: String,
     pub name: String,
+    /// The one realm it reaches (none: every realm, and administration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
     pub created_at: UnixMs,
     pub last_used_at: Option<UnixMs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -824,6 +853,9 @@ pub struct ApiToken {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateApiToken {
     pub name: String,
+    /// Limit it to one realm's data (none: every realm, and administration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
 }
 
 /// A hook: a shell command run on the worker at a point in each session
