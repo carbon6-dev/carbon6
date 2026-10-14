@@ -436,17 +436,14 @@ fn Apps() -> impl IntoView {
             done(r);
         });
     };
-    let load = move |ev: leptos::ev::Event| {
-        use wasm_bindgen::JsCast;
-        let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
-        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
-        spawn_local(async move {
-            match wasm_bindgen_futures::JsFuture::from(file.text()).await {
-                Ok(v) => text.set(v.as_string().unwrap_or_default()),
-                Err(_) => error.set(Some("could not read the file".into())),
-            }
-        });
-    };
+    // Choosing a package file: on this device, the head or a worker.
+    let picking = RwSignal::new(false);
+    let picked = Callback::new(move |(name, content): (String, String)| {
+        picking.set(false);
+        error.set(None);
+        text.set(content);
+        note.set(Some(format!("Loaded `{name}`. Add it to the registry, or add and install it.")));
+    });
     view! {
         <section class="space-y-3 pt-4">
             <h2 class="font-medium">"Packages"</h2>
@@ -508,7 +505,10 @@ fn Apps() -> impl IntoView {
             <textarea class=format!("{INPUT} min-h-32 font-mono text-xs") placeholder=r#"{"package": "crm", "version": "1.0.0", "realm": "crm", "requires": {...}, "contents": {...}} — or {"manifest": {...}, "files": {"Dockerfile": "<base64>"}} for a kit"#
                 prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
             <div class="flex flex-wrap items-center gap-2">
-                <input type="file" accept=".json,application/json" class="text-xs" on:change=load />
+                <button class=BUTTON_QUIET on:click=move |_| picking.set(true)>"Choose a file…"</button>
+                {move || picking.get().then(|| view! {
+                    <crate::files::FilePicker title="Choose a package file" extensions=&[".json"] on_pick=picked on_cancel=Callback::new(move |()| picking.set(false)) />
+                })}
                 <span class="flex-1"></span>
                 <input class=format!("{INPUT} w-40 py-1 text-sm") placeholder="realm (libraries)" prop:value=move || realm.get() on:input=move |ev| realm.set(event_target_value(&ev)) />
                 <button class=BUTTON_QUIET on:click=move |_| add(false)>"Add to registry"</button>

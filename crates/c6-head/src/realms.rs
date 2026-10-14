@@ -141,7 +141,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["decisions", id, ..] => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,
         ["automations" | "triggers", id, ..] => owned("triggers", "trigger", (*id).to_owned()).await,
-        // Starting a template's sessions (in the caller's realm).
+        // Its templates, and starting their sessions (in the caller's realm).
+        ["templates"] if method == Method::GET => Ok(()),
         ["templates", _, "run"] if method == Method::POST => Ok(()),
         // Its own realm in the explorer.
         ["realms", id, "summary" | "activity" | "list" | "object" | "search" | "neighborhood"] if *id == realm => Ok(()),

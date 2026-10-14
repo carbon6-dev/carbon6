@@ -403,19 +403,22 @@ pub fn live_status(id: &str) -> Option<SessionStatus> {
 fn RunTemplate() -> impl IntoView {
     let (ws, col) = (use_workspace(), use_column());
     let filter = crate::labels::use_filter().0;
-    let templates = LocalResource::new(api::templates);
+    // Every realm's templates (an app's are in its realm).
+    let templates = LocalResource::new(api::all_templates);
+    // "realm/name".
     let chosen = RwSignal::new(String::new());
     let input = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let result = RwSignal::new(None::<Result<String, String>>);
     let run = move || {
-        let name = chosen.get_untracked();
-        if name.is_empty() || pending.get_untracked() {
+        let key = chosen.get_untracked();
+        let Some((realm, name)) = key.split_once('/').map(|(r, n)| (r.to_owned(), n.to_owned())) else { return };
+        if pending.get_untracked() {
             return;
         }
         pending.set(true);
         spawn_local(async move {
-            match api::run_template(name, input.get_untracked()).await {
+            match api::run_template(name, input.get_untracked(), Some(realm)).await {
                 Ok(r) => {
                     let mut note = format!("Started {} session{}", r.sessions.len(), if r.sessions.len() == 1 { "" } else { "s" });
                     if !r.errors.is_empty() {
@@ -439,11 +442,19 @@ fn RunTemplate() -> impl IntoView {
         });
     };
     move || {
-        let list: Vec<c6_api::Template> =
-            templates.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|t| t.enabled).collect();
+        let list: Vec<c6_api::RealmTemplate> =
+            templates.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|t| t.template.enabled).collect();
         (!list.is_empty()).then(|| {
-            let descriptions: Vec<(String, String)> = list.iter().map(|t| (t.name.clone(), t.description.clone())).collect();
-            let takes_input: Vec<String> = list.iter().filter(|t| t.prompt.contains("{{input}}")).map(|t| t.name.clone()).collect();
+            // (key, label, description): another realm's templates say whose.
+            let descriptions: Vec<(String, String, String)> = list
+                .iter()
+                .map(|t| {
+                    let label = if t.realm == "home" { t.template.name.clone() } else { format!("{} ({})", t.template.name, t.realm) };
+                    (format!("{}/{}", t.realm, t.template.name), label, t.template.description.clone())
+                })
+                .collect();
+            let takes_input: Vec<String> =
+                list.iter().filter(|t| t.template.prompt.contains("{{input}}")).map(|t| format!("{}/{}", t.realm, t.template.name)).collect();
             let takes_input = StoredValue::new(takes_input);
             let wants_input = move || takes_input.with_value(|v| v.contains(&chosen.get()));
             view! {
@@ -452,7 +463,7 @@ fn RunTemplate() -> impl IntoView {
                         <span class="text-sm font-medium">"Run a template"</span>
                         <select class=format!("{INPUT} w-auto!") prop:value=move || chosen.get() on:change=move |ev| chosen.set(event_target_value(&ev))>
                             <option value="">"Choose…"</option>
-                            {descriptions.iter().map(|(n, d)| view! { <option value=n.clone() title=d.clone()>{n.clone()}</option> }).collect_view()}
+                            {descriptions.iter().map(|(k, l, d)| view! { <option value=k.clone() title=d.clone()>{l.clone()}</option> }).collect_view()}
                         </select>
                         <input class=format!("{INPUT} min-w-48 flex-1") placeholder=move || if wants_input() { "input for {{input}}" } else { "(this template takes no input)" }
                             prop:disabled=move || !wants_input() prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev))

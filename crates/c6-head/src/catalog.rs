@@ -317,7 +317,8 @@ fn build() -> Vec<Op> {
         op!("triggers.run", "automation", "POST" "/api/v1/triggers/{id}/run", Write, Input::None, "Runs a trigger's action now.", choices = &[("id", "triggers.list")]),
         op!("triggers.runs", "automation", "GET" "/api/v1/triggers/{id}/runs", Read, Input::Query(schema::<RunsQuery>), "A trigger's recent runs: what fired each, the chain of triggers that caused it, how it went, its cost.", choices = &[("id", "triggers.list")]),
         op!("triggers.rotate", "automation", "POST" "/api/v1/triggers/{id}/rotate", Secret, Input::None, "Gives a webhook trigger a new URL (the old one stops working).", secret = &["url", "token"], choices = &[("id", "triggers.list")]),
-        op!("templates.run", "automation", "POST" "/api/v1/templates/{name}/run", Write, Input::None, "Starts sessions from a template (on each matching worker, for a fleet run).", choices = &[("name", "settings.templates.get")]),
+        op!("templates.list", "automation", "GET" "/api/v1/templates", Read, Input::None, "Every template you can run, with the realm it is in (an app's templates are in its realm)."),
+        op!("templates.run", "automation", "POST" "/api/v1/templates/{name}/run", Write, Input::Body(schema::<api::RunTemplate>), "Starts sessions from a template (on each matching worker, for a fleet run); realm: the template's realm (default: the one that has it).", choices = &[("name", "templates.list")]),
         op!("workflows.run", "automation", "POST" "/api/v1/workflows/{name}/run", Write, Input::Body(schema::<api::RunWorkflow>), "Runs a workflow.", choices = &[("name", "settings.workflows.get")]),
         op!("workflows.runs", "automation", "GET" "/api/v1/workflows/runs", Read, Input::Query(schema::<WorkflowRunsQuery>), "Workflow runs, newest first."),
         op!("workflows.runs.get", "automation", "GET" "/api/v1/workflows/runs/{id}", Read, Input::None, "A workflow run with its steps.", choices = &[("id", "workflows.runs")]),
@@ -499,6 +500,8 @@ pub fn list_schema(key: &str) -> Option<Value> {
 /// these).
 pub const NOT_OPERATIONS: &[(&str, &str, &str)] = &[
     ("GET", "/api/v1/live", "a live WebSocket for the UI"),
+    ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only"),
+    ("GET", "/api/v1/head/fs/read", "the head's own files, for the UI's file picker only"),
     ("GET", "/api/v1/automations", "the old name of /api/v1/triggers"),
     ("POST", "/api/v1/automations", "the old name of /api/v1/triggers"),
     ("PATCH", "/api/v1/automations/{id}", "the old name of /api/v1/triggers"),

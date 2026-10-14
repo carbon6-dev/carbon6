@@ -383,3 +383,216 @@ pub fn FolderPicker(
         </div>
     }
 }
+
+/// Where a file is picked from.
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    /// This browser's device (its own file chooser).
+    Device,
+    /// The head's disk.
+    Head,
+    /// A worker's disk: (id, name).
+    Worker(String, String),
+}
+
+impl Source {
+    fn key(&self) -> String {
+        match self {
+            Source::Device => "device".into(),
+            Source::Head => "head".into(),
+            Source::Worker(id, _) => id.clone(),
+        }
+    }
+}
+
+/// Modal file chooser: a file on this device, on the head or on a worker
+/// (with folder navigation). `extensions` are the endings offered (others
+/// behind "All files"). `on_pick` receives the file's name and text.
+#[component]
+pub fn FilePicker(
+    title: &'static str,
+    extensions: &'static [&'static str],
+    on_pick: Callback<(String, String)>,
+    on_cancel: Callback<()>,
+) -> impl IntoView {
+    let live = api::live();
+    let workers = Memo::new(move |_| {
+        live.workers.with(|ws| {
+            ws.iter()
+                .filter(|w| w.status == c6_api::WorkerStatus::Online)
+                .map(|w| (w.id.to_string(), w.name.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    // Where you picked from last time, and the folder you were in there.
+    let remembered = crate::util::storage_get("c6.pick.source").unwrap_or_else(|| "head".into());
+    let source = RwSignal::new(match remembered.as_str() {
+        "device" => Source::Device,
+        "head" => Source::Head,
+        id => workers.get_untracked().into_iter().find(|(w, _)| w == id).map_or(Source::Head, |(w, n)| Source::Worker(w, n)),
+    });
+    let dir_of = |s: &Source| crate::util::storage_get(&format!("c6.pick.dir.{}", s.key())).unwrap_or_default();
+    let dir = RwSignal::new(dir_of(&source.get_untracked()));
+    let hidden = RwSignal::new(false);
+    let all = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let listing = LocalResource::new(move || {
+        let (s, d, h) = (source.get(), dir.get(), hidden.get());
+        async move {
+            match s {
+                Source::Device => Ok(Value::Null),
+                Source::Head => api::head_fs_list(d, h).await,
+                Source::Worker(id, _) => api::fs_list(id, d, h).await,
+            }
+        }
+    });
+    let current = Memo::new(move |_| listing.get().and_then(|r| r.ok()).and_then(|l| l["path"].as_str().map(str::to_owned)));
+    // A remembered folder that no longer exists: fall back to home.
+    Effect::new(move || {
+        if let Some(Err(_)) = listing.get()
+            && !dir.get_untracked().is_empty()
+        {
+            dir.set(String::new());
+        }
+    });
+    let choose = move |s: Source| {
+        crate::util::storage_set("c6.pick.source", &s.key());
+        dir.set(dir_of(&s));
+        error.set(None);
+        source.set(s);
+    };
+    let read = move |path: String, name: String| {
+        busy.set(true);
+        let s = source.get_untracked();
+        if let Some(base) = current.get_untracked() {
+            crate::util::storage_set(&format!("c6.pick.dir.{}", s.key()), &base);
+        }
+        spawn_local(async move {
+            let r = match s {
+                Source::Worker(id, _) => api::fs_read(id, path).await,
+                _ => api::head_fs_read(path).await,
+            };
+            busy.set(false);
+            match r {
+                Ok(v) if v["binary"].as_bool() == Some(true) => error.set(Some(format!("{name} is not a text file"))),
+                Ok(v) if v["truncated"].as_bool() == Some(true) => error.set(Some(format!("{name} is too large to load"))),
+                Ok(v) => on_pick.run((name, v["content"].as_str().unwrap_or_default().to_owned())),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let device_input = NodeRef::<leptos::html::Input>::new();
+    let from_device = move |ev: leptos::ev::Event| {
+        use wasm_bindgen::JsCast;
+        let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
+        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
+        let name = file.name();
+        spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(file.text()).await {
+                Ok(v) => on_pick.run((name, v.as_string().unwrap_or_default())),
+                Err(_) => error.set(Some("could not read the file".into())),
+            }
+        });
+    };
+    let accept = extensions.join(",");
+    let tab = "rounded-md px-2.5 py-1 text-sm";
+    view! {
+        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 px-4" on:click=move |_| on_cancel.run(())>
+            <div class="flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 rounded-lg bg-white p-4 shadow-xl dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
+                <h2 class="font-medium">{title}</h2>
+                <div class="flex flex-wrap gap-1">
+                    {move || {
+                        let mut sources = vec![(Source::Head, "Head".to_owned()), (Source::Device, "This device".to_owned())];
+                        sources.extend(workers.get().into_iter().map(|(id, name)| (Source::Worker(id, name.clone()), format!("Worker {name}"))));
+                        sources.into_iter().map(|(s, label)| {
+                            let on = s.clone();
+                            view! {
+                                <button class=move || format!("{tab} {}", if source.with(|c| *c == on) { "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" } else { "hover:bg-zinc-100 dark:hover:bg-zinc-800" })
+                                    on:click=move |_| choose(s.clone())>{label}</button>
+                            }
+                        }).collect_view()
+                    }}
+                </div>
+                {move || if source.get() == Source::Device {
+                    view! {
+                        <div class="flex min-h-48 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-zinc-300 p-6 text-sm text-zinc-500 dark:border-zinc-700">
+                            <p>"A file on the device you are using now."</p>
+                            <button class=crate::util::BUTTON on:click=move |_| if let Some(i) = device_input.get_untracked() { i.click(); }>"Choose a file…"</button>
+                            <input node_ref=device_input type="file" accept=accept.clone() class="hidden" on:change=from_device />
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {
+                        // Breadcrumbs: each segment is clickable.
+                        <div class="flex flex-wrap items-center gap-0.5 font-mono text-xs">
+                            {move || {
+                                let path = current.get().unwrap_or_default();
+                                let mut acc = String::new();
+                                let mut crumbs = vec![("/".to_owned(), "/".to_owned())];
+                                for seg in path.split('/').filter(|s| !s.is_empty()) {
+                                    acc.push('/');
+                                    acc.push_str(seg);
+                                    crumbs.push((format!("{seg}/"), acc.clone()));
+                                }
+                                crumbs.into_iter().map(|(label, target)| view! {
+                                    <button class="rounded px-1 py-0.5 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| dir.set(target.clone())>{label}</button>
+                                }).collect_view()
+                            }}
+                            <button class="ml-1 rounded px-1 py-0.5 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Home folder" on:click=move |_| dir.set("~".into())>"~"</button>
+                        </div>
+                        <div class="min-h-48 flex-1 overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+                            <Suspense fallback=|| view! { <p class="p-3 text-sm text-zinc-500">"Loading…"</p> }>
+                                {move || listing.get().map(|r| match r {
+                                    Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
+                                    Ok(l) => {
+                                        let base = l["path"].as_str().unwrap_or("").to_owned();
+                                        let show_all = all.get();
+                                        let rows: Vec<(String, bool)> = l["entries"].as_array().into_iter().flatten()
+                                            .filter_map(|e| Some((e["name"].as_str()?.to_owned(), e["kind"] == "dir")))
+                                            .filter(|(n, d)| *d || show_all || extensions.iter().any(|x| n.to_lowercase().ends_with(x)))
+                                            .collect();
+                                        if rows.is_empty() {
+                                            return view! { <p class="p-3 text-sm text-zinc-500">"Nothing to pick here."</p> }.into_any();
+                                        }
+                                        view! {
+                                            <ul class="divide-y divide-zinc-100 text-sm dark:divide-zinc-900">
+                                                {rows.into_iter().map(|(name, is_dir)| {
+                                                    let full = if base.ends_with('/') { format!("{base}{name}") } else { format!("{base}/{name}") };
+                                                    let shown = name.clone();
+                                                    view! {
+                                                        <li><button class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                                            on:click=move |_| if is_dir { dir.set(full.clone()) } else { read(full.clone(), name.clone()) }>
+                                                            <span class="w-3 text-zinc-400">{if is_dir { "▸" } else { "" }}</span>
+                                                            <span class=if is_dir { "truncate" } else { "truncate font-mono text-xs" }>{shown}</span>
+                                                        </button></li>
+                                                    }
+                                                }).collect_view()}
+                                            </ul>
+                                        }.into_any()
+                                    }
+                                })}
+                            </Suspense>
+                        </div>
+                    }.into_any()
+                }}
+                {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                <div class="flex flex-wrap items-center gap-3">
+                    {move || (source.get() != Source::Device).then(|| view! {
+                        <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                            <input type="checkbox" prop:checked=move || all.get() on:change=move |ev| all.set(event_target_checked(&ev)) />
+                            {format!("All files (not only {})", extensions.join(", "))}
+                        </label>
+                        <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                            <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
+                            "Show hidden"
+                        </label>
+                    })}
+                    <span class="flex-1"></span>
+                    {move || busy.get().then(|| view! { <span class="text-xs text-zinc-500">"Reading…"</span> })}
+                    <button class=crate::util::BUTTON_QUIET on:click=move |_| on_cancel.run(())>"Cancel"</button>
+                </div>
+            </div>
+        </div>
+    }
+}

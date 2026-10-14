@@ -368,6 +368,16 @@ pub async fn fs_list(worker: String, path: String, hidden: bool) -> Result<serde
     json(Request::get(&format!("/api/v1/workers/{worker}/fs/list?path={}&hidden={hidden}", enc(&path))).send().await).await
 }
 
+/// A folder on the head's own disk (its home folder when `path` is empty).
+pub async fn head_fs_list(path: String, hidden: bool) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/head/fs/list?path={}&hidden={hidden}", enc(&path))).send().await).await
+}
+
+/// A text file on the head's own disk.
+pub async fn head_fs_read(path: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/head/fs/read?path={}", enc(&path))).send().await).await
+}
+
 pub async fn fs_read(worker: String, path: String) -> Result<serde_json::Value, String> {
     json(Request::get(&format!("/api/v1/workers/{worker}/fs/read?path={}", enc(&path))).send().await).await
 }
@@ -744,8 +754,13 @@ pub async fn templates() -> Result<Vec<c6_api::Template>, String> {
     json(Request::get("/api/v1/settings/templates").send().await).await
 }
 
-pub async fn run_template(name: String, input: String) -> Result<c6_api::TemplateRun, String> {
-    send_json(Request::post(&format!("/api/v1/templates/{name}/run")), &c6_api::RunTemplate { input }).await
+/// Every template you can run, with its realm.
+pub async fn all_templates() -> Result<Vec<c6_api::RealmTemplate>, String> {
+    json(Request::get("/api/v1/templates").send().await).await
+}
+
+pub async fn run_template(name: String, input: String, realm: Option<String>) -> Result<c6_api::TemplateRun, String> {
+    send_json(Request::post(&format!("/api/v1/templates/{name}/run")), &c6_api::RunTemplate { input, realm }).await
 }
 
 pub async fn automations() -> Result<Vec<c6_api::Automation>, String> {

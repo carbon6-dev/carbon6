@@ -18,6 +18,36 @@ pub async fn templates_for(st: &HeadState, realm: &str) -> anyhow::Result<Vec<ap
     Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
+/// Every template, with its realm: home's (root's apply everywhere and
+/// are listed as home's), then each other realm's own.
+pub async fn all(st: &HeadState, caller: &crate::realms::Caller) -> anyhow::Result<Vec<api::RealmTemplate>> {
+    let mut out = Vec::new();
+    for r in crate::realms::list(st, caller).await? {
+        let list: Vec<api::Template> = if r.id == crate::realms::HOME {
+            templates_for(st, &r.id).await?
+        } else if r.id == crate::realms::ROOT {
+            continue;
+        } else {
+            crate::lists::read(&st.store.pool, TEMPLATES, &r.id).await?.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()
+        };
+        out.extend(list.into_iter().map(|template| api::RealmTemplate { realm: r.id.clone(), template }));
+    }
+    Ok(out)
+}
+
+/// The realm to run template `name` in when none was named: home if it
+/// has one, else the one realm that does.
+pub async fn realm_of(st: &HeadState, name: &str) -> anyhow::Result<String> {
+    let all = all(st, &crate::realms::Caller::root()).await?;
+    let realms: Vec<&str> = all.iter().filter(|t| t.template.name == name).map(|t| t.realm.as_str()).collect();
+    match realms.as_slice() {
+        [] => Err(not_found(format!("no template named {name:?}"))),
+        r if r.contains(&crate::realms::HOME) => Ok(crate::realms::HOME.to_owned()),
+        [one] => Ok((*one).to_owned()),
+        several => Err(bad_request(format!("templates named {name:?} are in several realms ({}): name the realm", several.join(", ")))),
+    }
+}
+
 /// Checks a list of templates before it is saved.
 pub fn check(templates: &[api::Template]) -> anyhow::Result<()> {
     let mut names = std::collections::HashSet::new();

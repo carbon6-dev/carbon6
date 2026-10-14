@@ -139,6 +139,14 @@ async fn apps_install_export_upgrade_remove() {
     assert_eq!(views[0]["title"], "My people", "yours kept");
     let templates = ok(send(M::GET, "settings/templates?realm=crm", json!({})).await).await;
     assert_eq!(templates[0]["prompt"], "Draft a warm note to {{input}}");
+    // Every realm's templates, each with its realm; one is run in its app's
+    // realm without naming it.
+    let all = ok(send(M::GET, "templates", json!({})).await).await;
+    assert!(all.as_array().unwrap().iter().any(|t| t["realm"] == "crm" && t["name"] == "reach-out"), "{all}");
+    assert_eq!(send(M::POST, "templates/nope/run", json!({})).await.status(), 404);
+    assert_eq!(send(M::POST, "templates/reach-out/run", json!({"realm": "home"})).await.status(), 404, "not home's");
+    let r = send(M::POST, "templates/reach-out/run", json!({"input": "Ann"})).await;
+    assert_ne!(r.status(), 404, "found in crm: {}", r.text().await.unwrap());
     assert!(ok(send(M::GET, "collections?realm=crm", json!({})).await).await.to_string().contains("\"notes\""));
     let apps: Vec<AppInstall> = send(M::GET, "apps", json!({})).await.json().await.unwrap();
     assert_eq!(apps[0].version, "2.0.0");

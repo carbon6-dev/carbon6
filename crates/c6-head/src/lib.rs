@@ -12,6 +12,7 @@ mod convert;
 mod cron;
 pub mod decisions;
 pub mod explorer;
+pub mod files;
 mod export;
 pub mod fabric;
 pub mod google;
@@ -123,6 +124,8 @@ pub struct HeadState {
     /// The assistant: its conversations run in the head.
     pub assistant: assistant::Assistant,
     pub shutdown: CancellationToken,
+    /// Its database, PKI and keys (never offered by `files`).
+    pub data_dir: std::path::PathBuf,
 }
 
 /// A running head.
@@ -215,6 +218,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         memex_feed: Default::default(),
         assistant: Default::default(),
         shutdown: shutdown.clone(),
+        data_dir: cfg.data_dir.clone(),
     });
 
     let mut tasks = JoinSet::new();

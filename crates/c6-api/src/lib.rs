@@ -2058,6 +2058,19 @@ pub struct Template {
 pub struct RunTemplate {
     #[serde(default)]
     pub input: String,
+    /// The realm whose template it is (and its sessions run in). Empty: the
+    /// caller's; for you, the one realm that has a template of that name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
+}
+
+/// `GET /api/v1/templates`: a template and the realm it is in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RealmTemplate {
+    pub realm: String,
+    #[serde(flatten)]
+    pub template: Template,
 }
 
 /// The sessions a template run started (one per target).

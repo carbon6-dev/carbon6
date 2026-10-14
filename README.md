@@ -313,7 +313,7 @@ A template (**Settings → Templates**) is a saved way to start a session:
 - **How:** connection, model and labels.
 - **What to ask:** a prompt, where `{{input}}`, `{{target}}`, `{{date}}` and `{{time}}` are filled in.
 
-**Running one:** run a template from the Sessions page ("Run a template"), with `c6 run -t <name> [input]`, or on a schedule or from a webhook (see Automations).
+**Running one:** run a template from the Sessions page ("Run a template"; an app's templates are marked with its realm and run there), with `c6 run -t <name> [input]` (it finds the realm that has the template), or on a schedule or from a webhook (see Automations).
 
 **Fleet runs:** a template with several targets starts one session per target, all sharing a `run:<id>` label. The UI opens mission control filtered to the run, and `c6 run -t` waits for them all and prints each one's last reply.
 

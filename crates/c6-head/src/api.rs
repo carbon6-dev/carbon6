@@ -47,6 +47,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/hooks", get(get_hooks).put(put_hooks))
         .route("/api/v1/settings/secrets", get(list_secrets))
         .route("/api/v1/settings/templates", get(get_templates).put(put_templates))
+        .route("/api/v1/templates", get(all_templates))
         .route("/api/v1/templates/{name}/run", post(run_template))
         .route("/api/v1/memories", get(list_memories).post(create_memory))
         .route("/api/v1/memories/{id}", put(update_memory).delete(delete_memory))
@@ -120,6 +121,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/config", get(session_config))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
+        .route("/api/v1/head/fs/list", get(head_fs_list))
+        .route("/api/v1/head/fs/read", get(head_fs_read))
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
         .route("/api/v1/workers/{id}/fs/read", get(fs_read))
         .route("/api/v1/workers/{id}/fs/find", get(fs_find))
@@ -1027,9 +1030,18 @@ async fn run_template(
     Path(name): Path<String>,
     body: Option<Json<api::RunTemplate>>,
 ) -> ApiResult<Json<api::TemplateRun>> {
-    let input = body.map(|Json(b)| b.input).unwrap_or_default();
-    let realm = caller.realm_for_new(None)?;
-    Ok(Json(crate::templates::run(&st, &name, &input, &[], &realm).await?))
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let realm = match body.realm.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => caller.realm_for_new(Some(r))?,
+        // You: the realm that has it (an app's template is in the app's).
+        None if caller.realm.is_none() => crate::templates::realm_of(&st, &name).await?,
+        None => caller.realm_for_new(None)?,
+    };
+    Ok(Json(crate::templates::run(&st, &name, &body.input, &[], &realm).await?))
+}
+
+async fn all_templates(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmTemplate>>> {
+    Ok(Json(crate::templates::all(&st, &caller).await?))
 }
 
 async fn list_secrets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::SecretInfo>>> {
@@ -1908,6 +1920,22 @@ fn params_json(q: std::collections::HashMap<String, String>) -> serde_json::Valu
         m.insert(k, v);
     }
     serde_json::Value::Object(m)
+}
+
+#[derive(serde::Deserialize)]
+struct HeadFsQuery {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    hidden: String,
+}
+
+async fn head_fs_list(Query(q): Query<HeadFsQuery>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::files::list(&q.path, matches!(q.hidden.as_str(), "true" | "1")).await?))
+}
+
+async fn head_fs_read(State(st): State<Arc<HeadState>>, Query(q): Query<HeadFsQuery>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::files::read(&st, &q.path).await?))
 }
 
 async fn fs_list(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Params) -> ApiResult<Json<serde_json::Value>> {
