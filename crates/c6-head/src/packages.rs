@@ -149,9 +149,6 @@ fn check_manifest(p: &api::AppPackage, files: &BTreeMap<String, Vec<u8>>) -> Vec
                 problems.push(format!("the kit's file {f} is not among the package's files"));
             }
         }
-        if k.tools.is_empty() && !p.permissions.shell {
-            problems.push("a kit offers tools (or a shell)".into());
-        }
         for t in &k.tools {
             if t.name.is_empty() || !t.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || t.command.is_empty() {
                 problems.push(format!("tool {:?}: a name (letters, digits, - and _) and a command", t.name));
@@ -1129,6 +1126,104 @@ pub async fn remove_app(st: &HeadState, realm: &str) -> anyhow::Result<api::AppI
     let (cur, m) = app_in(st, realm).await?.ok_or_else(|| not_found(format!("no app installed in {realm}")))?;
     let i = remove(st, cur.id).await?;
     Ok(app_install(&i, &m.description))
+}
+
+// --- Kits, for workers ---------------------------------------------------------------
+
+/// The local image tag of a kit version, given its dependencies' tags: it
+/// changes when the kit or anything it is built from changes.
+fn image_tag(name: &str, digest: &str, dep_tags: &[String]) -> String {
+    let mut text = digest.to_owned();
+    for t in dep_tags {
+        text.push('\n');
+        text.push_str(t);
+    }
+    format!("c6kit/{name}:{}", &c6_core::sha256_hex(text.as_bytes())[..16])
+}
+
+/// The kit installs a realm may use: what its apps and libraries require,
+/// directly or through what they require (kits they are built from too).
+pub async fn kits_for_realm(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::Install>> {
+    let all = installs(st).await?;
+    let mut want: Vec<String> = Vec::new();
+    let mut queue: Vec<&api::Install> = all.iter().filter(|i| i.realm == realm && i.state == "installed").collect();
+    while let Some(i) = queue.pop() {
+        for d in i.locks.values() {
+            if let Some(dep) = all.iter().find(|x| &x.digest == d && x.state == "installed")
+                && !want.contains(&dep.digest)
+            {
+                if dep.roles.iter().any(|r| r == "kit") {
+                    want.push(dep.digest.clone());
+                }
+                queue.push(dep);
+            }
+        }
+    }
+    Ok(all.into_iter().filter(|i| i.roles.iter().any(|r| r == "kit") && want.contains(&i.digest)).collect())
+}
+
+/// What a worker needs to build and run a kit a realm may use: the builds
+/// in order (each with its Dockerfile, `kit:` resolved, and files), the
+/// image to run, its tools, and the permissions approved.
+pub async fn kit_spec(st: &HeadState, realm: &str, name: &str) -> anyhow::Result<Value> {
+    let kits = kits_for_realm(st, realm).await?;
+    let Some(kit) = kits.iter().find(|k| k.package == name) else {
+        let names: Vec<&str> = kits.iter().map(|k| k.package.as_str()).collect();
+        return Err(bad_request(if names.is_empty() {
+            format!("no kits are installed for realm {realm}")
+        } else {
+            format!("no kit {name} here (this realm has: {})", names.join(", "))
+        }));
+    };
+    let all = installs(st).await?;
+    let mut builds: Vec<Value> = Vec::new();
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    // Depth first: what a kit is built from, then the kit.
+    async fn build_of(st: &HeadState, all: &[api::Install], digest: &str, builds: &mut Vec<Value>, tags: &mut BTreeMap<String, String>, depth: usize) -> anyhow::Result<String> {
+        if let Some(t) = tags.get(digest) {
+            return Ok(t.clone());
+        }
+        anyhow::ensure!(depth < 32, "kits built from kits too deep");
+        let (p, _) = by_digest(st, digest).await?.ok_or_else(|| anyhow::anyhow!("package {digest} is gone"))?;
+        let k = p.kit.clone().ok_or_else(|| bad_request(format!("{} is not a kit", p.app)))?;
+        let inst = all.iter().find(|i| i.digest == digest);
+        let mut dockerfile = String::from_utf8_lossy(&file(st, digest, &k.build.dockerfile).await?).into_owned();
+        let mut dep_tags = Vec::new();
+        for r in kit_refs(&dockerfile) {
+            let dep = inst.and_then(|i| i.locks.get(&r)).cloned().ok_or_else(|| bad_request(format!("{} builds from kit:{r}, which is not installed with it", p.app)))?;
+            let t = Box::pin(build_of(st, all, &dep, builds, tags, depth + 1)).await?;
+            dockerfile = dockerfile.replace(&format!("kit:{r}"), &t);
+            dep_tags.push(t);
+        }
+        let tag = image_tag(&p.app, digest, &dep_tags);
+        let mut files = serde_json::Map::new();
+        for f in &k.build.files {
+            files.insert(f.clone(), json!(base64::engine::general_purpose::STANDARD.encode(file(st, digest, f).await?)));
+        }
+        builds.push(json!({"name": p.app, "version": p.version, "tag": tag, "dockerfile": dockerfile, "files": files}));
+        tags.insert(digest.to_owned(), tag.clone());
+        Ok(tag)
+    }
+    let tag = build_of(st, &all, &kit.digest, &mut builds, &mut tags, 0).await?;
+    let (p, _) = by_digest(st, &kit.digest).await?.unwrap_or_default();
+    let approved: api::Permissions = serde_json::from_str(&row(st, kit.id).await?.get::<String, _>("approved")).unwrap_or_default();
+    Ok(json!({"name": p.app, "version": p.version, "image": tag, "builds": builds, "tools": p.kit.map(|k| k.tools).unwrap_or_default(), "permissions": approved}))
+}
+
+/// The kits a realm may use, and their tools, in words for an agent.
+pub async fn kits_text(st: &HeadState, realm: &str) -> anyhow::Result<Value> {
+    let mut out = Vec::new();
+    for k in kits_for_realm(st, realm).await? {
+        let (p, _) = by_digest(st, &k.digest).await?.unwrap_or_default();
+        let approved: api::Permissions = serde_json::from_str(&row(st, k.id).await?.get::<String, _>("approved")).unwrap_or_default();
+        // Kits only built from offer nothing to run.
+        if p.kit.as_ref().is_none_or(|k| k.tools.is_empty()) && !approved.shell {
+            continue;
+        }
+        out.push(json!({"kit": p.app, "version": p.version, "description": p.description, "shell": approved.shell,
+                        "tools": p.kit.map(|k| k.tools).unwrap_or_default()}));
+    }
+    Ok(json!(out))
 }
 
 #[cfg(test)]

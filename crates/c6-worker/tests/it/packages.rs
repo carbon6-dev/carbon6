@@ -199,3 +199,110 @@ where
     let all: Vec<Install> = send(reqwest::Method::GET, "installs", json!({})).await.json().await.unwrap();
     all.into_iter().find(|i| i.id == id).unwrap()
 }
+
+/// A kit built from a kit, run by an agent in the sandbox: no network, a
+/// read-only root, not root, the session's folder at /work. Needs Docker or
+/// Podman with debian:bookworm-slim already pulled; skipped otherwise.
+#[tokio::test]
+async fn kits_build_and_run_sandboxed() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    let Some(rt) = c6_tools::kits::runtime().await else {
+        eprintln!("no container runtime; skipped");
+        return;
+    };
+    let has_base = tokio::process::Command::new(&rt).args(["image", "inspect", "debian:bookworm-slim"]).output().await.unwrap().status.success();
+    if !has_base {
+        eprintln!("debian:bookworm-slim is not pulled; skipped");
+        return;
+    }
+    let mock = MockLlm::start().await;
+    let (head_dir, state, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    use reqwest::Method as M;
+    let send = |method: M, path: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.request(method, &url).json(&body).send().await.unwrap() }
+    };
+    let ok = async |r: reqwest::Response| -> Value {
+        let s = r.status();
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    let conn: c6_api::Connection =
+        send(M::POST, "connections", json!({"name": "m", "base_url": mock.base_url()})).await.json().await.unwrap();
+
+    // A base kit, a kit built from it, and a library in the home realm that
+    // requires the kit.
+    let nonce = format!("{:x}", c6_core::now_ms());
+    let base = format!("c6test-base-{nonce}");
+    let probe = format!("c6test-probe-{nonce}");
+    ok(send(M::POST, "packages", json!({"manifest": {"package": base, "version": "1.0.0", "kit": {"tools": []}},
+        "files": {"Dockerfile": b64("FROM debian:bookworm-slim\nRUN echo base > /opt/base.txt\n")}})).await).await;
+    let script = "echo \"routes: $(tail -n +2 /proc/net/route | wc -l)\"; echo \"uid: $(id -u)\"; cat /opt/base.txt; \
+                  touch /etc/x 2>/dev/null && echo root-writable || echo root-read-only; echo made > \"$1\"; echo \"tmp: $(touch /tmp/t && echo ok)\"\n";
+    ok(send(M::POST, "packages", json!({"manifest": {"package": probe, "version": "1.0.0", "requires": {&base: "^1"},
+        "kit": {"build": {"files": ["probe.sh"]}, "tools": [{"name": "probe", "description": "Looks around.", "command": ["sh", "/opt/probe.sh", "{out}"], "args": {"out": "path"}}]}},
+        "files": {"Dockerfile": b64(&format!("FROM kit:{base}\nCOPY probe.sh /opt/probe.sh\n")), "probe.sh": b64(script)}})).await).await;
+    ok(send(M::POST, "packages", json!({"manifest": {"package": "probe-lib", "version": "1.0.0", "requires": {&probe: "*"},
+        "contents": {"skills": [{"name": "probing", "body": "Use kit_run."}]}}, "files": {}})).await).await;
+    let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "probe-lib", "realm": "home"})).await).await).unwrap();
+    let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+
+    mock.push(Reply::ToolCalls(vec![("kit_run".into(), json!({}).to_string())]));
+    mock.push(Reply::ToolCalls(vec![("kit_run".into(), json!({"kit": probe, "tool": "probe", "args": {"out": "out/made.txt"}}).to_string())]));
+    mock.push(Reply::ToolCalls(vec![("kit_run".into(), json!({"kit": probe, "tool": "probe", "args": {"out": "../escape.txt"}}).to_string())]));
+    mock.push(Reply::ToolCalls(vec![("kit_shell".into(), json!({"kit": probe, "command": "id"}).to_string())]));
+    mock.push(Reply::Text("Done.".into()));
+    std::fs::create_dir(work.path().join("out")).unwrap();
+    let wid = worker.identity.meta.worker_id.0;
+    ok(send(M::POST, "sessions", json!({"worker_id": wid, "cwd": work.path(), "connection_id": conn.id, "model": "m", "prompt": "probe"})).await).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let seen = loop {
+        let reqs = mock.requests();
+        if reqs.len() >= 5 {
+            break reqs.last().unwrap()["messages"].to_string();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "timed out; {} requests", reqs.len());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(!seen.contains(&format!("\\\"kit\\\": \\\"{base}")), "build-only kits are not listed: {seen}");
+    for want in ["Looks around.", "routes: 0", "uid: ", "base", "root-read-only", "tmp: ok", "outside the session's folder", "does not allow a shell"] {
+        assert!(seen.contains(want), "{want} in {seen}");
+    }
+    assert!(!seen.contains("uid: 0\\"), "not root: {seen}");
+    assert_eq!(std::fs::read_to_string(work.path().join("out/made.txt")).unwrap().trim(), "made");
+
+    // Clean up the test images.
+    let tags = tokio::process::Command::new(&rt).args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]).output().await.unwrap();
+    for t in String::from_utf8_lossy(&tags.stdout).lines().filter(|t| t.contains(&nonce)) {
+        let _ = tokio::process::Command::new(&rt).args(["rmi", t]).output().await;
+    }
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}

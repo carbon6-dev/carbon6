@@ -7,6 +7,7 @@ mod bash;
 pub mod browser;
 mod files;
 pub mod hooks;
+pub mod kits;
 pub mod knowledge;
 pub mod memex;
 pub mod memory;
@@ -275,6 +276,11 @@ impl SessionTools {
 
     pub fn hooks(&self) -> Option<Arc<dyn Hooks>> {
         self.hooks.lock().unwrap().clone()
+    }
+
+    /// Whether the session works on another machine (over SSH).
+    pub fn is_remote(&self) -> bool {
+        self.ssh.is_some()
     }
 
     pub fn cwd(&self) -> PathBuf {

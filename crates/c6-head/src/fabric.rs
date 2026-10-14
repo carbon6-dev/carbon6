@@ -93,6 +93,15 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                     .map_err(bad_request)?;
                 Ok(json!({"text": text}))
             }
+            // Kits the session's realm may use (docs/packages.md §5).
+            "kits" | "kit_spec" => {
+                let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+                if what == "kits" {
+                    crate::packages::kits_text(st, &realm).await
+                } else {
+                    crate::packages::kit_spec(st, &realm, params["kit"].as_str().unwrap_or_default()).await
+                }
+            }
             // Series, in the session's realm (docs/os.md §4.4).
             "series_record" | "series_query" => {
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());

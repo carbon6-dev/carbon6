@@ -137,6 +137,8 @@ What requiring means depends on the role of what's required:
    - worker runtime detection, builds in dependency order with `kit:` resolved, and sandboxed runs;
    - `kit_run` and `kit_shell`;
    - a session sees the kits its realm requires.
+
+   *As built:* a kit is in a session when an install in the session's realm requires it, directly or through others; kits that offer no tools and no shell (bases, only built from) aren't listed. The worker uses `docker`, then `podman` (or `C6_CONTAINER_RUNTIME`). A build's context is a temporary folder, removed after; builds stop after 30 minutes. Runs are as the owner of the session's folder (nobody if that's root), with `HOME=/tmp`, 512 processes and a 512 MB /tmp; interrupting a call or reaching the timeout kills the container. Path arguments that leave the session's folder are refused, as are kits in sessions working over SSH. A kit with no tools is allowed (a base to build from).
 3. **Libraries,** added to the requiring realm, and **apps requiring apps:** exports, the template grant, `template_start`.
 4. **`decks-render`:** a kit with headless Chromium, python-pptx and open fonts, offering `screenshot`, `pdf` and `pptx`. **decks** requires it, so a worker needs only a container runtime.
 5. **Later:** remote registries and sync, network allow-lists by host, Apple's `container`, WASM kits for workers without a runtime, GPU.
