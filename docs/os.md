@@ -411,6 +411,21 @@ view(realm, name, kind /* table | board | record | chart | feed | page */,
 - **Agents' one-off pages** stay as Outputs. Views are for what an app shows every day.
 - **Each realm has its own menu** of views, next to the sessions, decisions and memex pages every realm has.
 
+**As built (step 7):**
+- **Views are the `views` system list:**
+  - **Storage:** one record per view, edited under Settings → Views for the realm picked in the header, and inherited from root like the other lists. Migration `0037` moves a collection of your own named `views` to `views_1` first.
+  - **API:** `/api/v1/views` lists a realm's views (root's and its own), and `/api/v1/views/{name}/act` runs an action. Realm tokens reach their realm's views.
+  - **Checks on save:** names, kinds, each kind's source, a board's column field, and that actions do something.
+- **Kinds, as rendered:**
+  - **table:** the fields as columns; a record's first field opens it.
+  - **board:** columns from the view's list, the field's enum, or the values present. ← and → move a card by setting the field.
+  - **record** (`/views/<name>/<id>`): fields, links, labels, the sessions labelled `record:<id>`, and history.
+  - **chart:** bars per hour or day of a series, with totals per dimension value.
+  - **feed:** open decisions with their options as buttons, or sessions with given labels, newest first.
+  - **page:** Markdown with `{{view:name}}` embedding any view but a page.
+- **Actions** are buttons on each record. They set fields and/or start a template with the record as `{{input}}`, its sessions labelled `record:<id>`. Answering decisions and opening a record's sessions are built into feeds and records.
+- **The menu:** "Views ▾" in the header lists the realm's views. Below the `xl` width, it and the less-used links go into the ☰ menu, which now shows at every width up to `xl` (the header no longer overlaps at 1024px).
+
 ### 4.6 Programs
 
 Skills, agents, commands, templates, workflows, hooks and MCP servers keep working as they do, but belong to a realm and inherit from root (3.3).
@@ -857,3 +872,9 @@ Choices the design left open, made while building, for review.
 | 6 | A threshold with nothing recorded counts from when the trigger was made, for silence | A heartbeat that never started is as silent as one that stopped |
 | 6 | Series aren't covered by grants yet | No example needed series across realms; a grant of kind series can follow the collection grant's shape when one does |
 | 6 | The memex's model-call budget stays in the memex | It is the memex's own database; it can become a series when the memex reports points to the head |
+
+| 7 | Views are a system list, not a table of their own | They are configuration: per realm, inherited from root, with history, and edited like every other list |
+| 7 | The usage and decisions pages stay; views reproduce them as presets (a chart of `model_spend`, a feed of open decisions) | Those pages do more than a view can yet (budget editing, forms, snoozing); a preset shows the same data the configurable way |
+| 7 | A page cannot embed a page | No loops, and one level is what dashboards need |
+| 7 | An action's template runs in the view's realm, with the record as JSON input | The record's id, fields and links are all an agent needs, and the label ties the sessions back to the record |
+| 7 | Below `xl` the header's less-used links and Views go into the ☰ menu | The header overflowed at 1024px once the realm switcher arrived; now everything stays reachable without overlap |

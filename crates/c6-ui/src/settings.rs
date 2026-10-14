@@ -8,19 +8,20 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// The sections of Settings: (id, title, what is in it).
-const SECTIONS: [(&str, &str, &str); 12] = [
+const SECTIONS: [(&str, &str, &str); 13] = [
     ("models", "Models", "Connections, model routing, the assistant"),
     ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
     ("rules", "Policies", "Ask or deny the agent's tool calls"),
     ("prompts", "Prompts", "What carbon6 tells models: sessions, the assistant, the memex"),
     ("automation", "Automation", "Templates, workflows, triggers"),
+    ("views", "Views", "Tables, boards, charts, feeds and pages of each realm"),
     ("notifications", "Notifications", "Channels, push on this device, links"),
     ("spending", "Prices and budgets", "What models cost, and spending limits"),
     ("hosts", "Hosts", "Machines reached over SSH"),
     ("memex", "Memory and memex", "Memory notes, the memex, its folders and scopes"),
     ("mail", "Mail and calendar", "Google accounts"),
     ("account", "Sign-in", "Passkeys, signed-in browsers, API tokens"),
-    ("system", "System", "Upgrades of carbon6's databases, and their backups"),
+    ("system", "System", "Realms, grants, upgrades of carbon6's databases, and their backups"),
 ];
 
 /// A section's title, for column headers.
@@ -134,6 +135,16 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         help="Rules for the agent's tool calls in sessions with given labels: deny them, or have them wait for your approval (in the transcript, the inbox and a notification; an hour without an answer means no). Tools is a regular expression over tool names (Bash, Edit, Write, … work with every model); Pattern one over the call's input. The first matching policy applies. Claude Code sessions are not covered."
                         fields=POLICY_FIELDS
                         examples=policy_examples
+                    />
+                    }.into_any(),
+                    "views" => view! {
+                    <ListSetting
+                        name="views"
+                        title="Views"
+                        noun="view"
+                        help="The screens of this realm's Views menu, built from its data: a table or board of a collection's records (a board's columns are a field's values, and moving a card sets the field), one record with its history and sessions, a chart of a series, a feed of open decisions or of sessions, or a page of Markdown embedding other views with {{view:name}}. Actions are buttons on each record: they set fields and/or start a template with the record as its input. Pick the realm in the header to edit its views."
+                        fields=VIEW_FIELDS
+                        examples=view_examples
                     />
                     }.into_any(),
                     "automation" => view! {
@@ -1393,6 +1404,8 @@ enum FieldKind {
     Labels,
     /// One of these values.
     Choice(&'static [&'static str]),
+    /// JSON (an object or a list), several lines.
+    Json,
 }
 
 /// A field of a list setting's items. The first is the item's name, shown
@@ -2040,8 +2053,10 @@ fn ListItem(
 ) -> impl IntoView {
     // Labels fields hold lists, shown as comma-separated text.
     let get = move |k: &'static str| {
+        let json = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Json);
         move || {
             item.with(|m| match m.get(k) {
+                Some(v) if json => serde_json::to_string_pretty(v).unwrap_or_default(),
                 Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
                 Some(serde_json::Value::Number(n)) => n.to_string(),
                 Some(v) => v.as_str().unwrap_or("").to_owned(),
@@ -2051,8 +2066,12 @@ fn ListItem(
     };
     let set = move |k: &'static str, v: String| {
         let labels = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Labels);
+        let json = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Json);
         item.update(|m| {
-            let value = if labels {
+            let value = if json {
+                // Kept as text until it parses (the head then says what is wrong).
+                serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v))
+            } else if labels {
                 serde_json::Value::Array(c6_api::labels::parse_labels(&v).into_iter().map(serde_json::Value::String).collect())
             } else {
                 serde_json::Value::String(v)
@@ -2062,8 +2081,8 @@ fn ListItem(
     };
     let enabled = move || item.with(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true));
     let (first, rest) = fields.split_first().expect("a name field");
-    let lines: Vec<&'static Field> = rest.iter().filter(|f| f.kind != FieldKind::Text).collect();
-    let texts: Vec<&'static Field> = rest.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    let lines: Vec<&'static Field> = rest.iter().filter(|f| !matches!(f.kind, FieldKind::Text | FieldKind::Json)).collect();
+    let texts: Vec<&'static Field> = rest.iter().filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Json)).collect();
     let input_class = |f: &Field| {
         format!("{INPUT} py-1 {}", if matches!(f.kind, FieldKind::Mono | FieldKind::Labels) { "font-mono text-xs" } else { "text-sm" })
     };
@@ -2316,6 +2335,58 @@ fn when(ms: i64) -> String {
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
     let s: String = d.to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED).into();
     s
+}
+
+const VIEW_FIELDS: &[Field] = &[
+    Field { key: "name", label: "Name", placeholder: "e.g. pipeline (its address: /views/pipeline)", kind: FieldKind::Mono },
+    Field { key: "title", label: "Title", placeholder: "e.g. Pipeline", kind: FieldKind::Line },
+    Field { key: "kind", label: "Kind", placeholder: "", kind: FieldKind::Choice(&["table", "board", "record", "chart", "feed", "page"]) },
+    Field { key: "group_by", label: "Board: the column field", placeholder: "e.g. stage", kind: FieldKind::Mono },
+    Field { key: "fields", label: "Fields shown (empty: all)", placeholder: "name, stage, value", kind: FieldKind::Labels },
+    Field {
+        key: "columns",
+        label: "Board: columns in order (empty: the field's values)",
+        placeholder: "new, talking, won, lost",
+        kind: FieldKind::Labels,
+    },
+    Field {
+        key: "source",
+        label: "Source (JSON)",
+        placeholder: r#"{"collection": "deals", "where": {"stage": {"$ne": "lost"}}, "sort": "-updated_at"}  ·  {"series": "revenue", "bucket": "day", "minutes": 43200}  ·  {"decisions": "open"}"#,
+        kind: FieldKind::Json,
+    },
+    Field {
+        key: "actions",
+        label: "Actions (JSON)",
+        placeholder: r#"[{"label": "Draft follow-up", "start": "follow-up"}, {"label": "Won", "set": {"stage": "won"}}]"#,
+        kind: FieldKind::Json,
+    },
+    Field { key: "body", label: "Page: Markdown ({{view:name}} embeds a view)", placeholder: "", kind: FieldKind::Text },
+];
+
+fn view_examples() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "Board of a collection by stage",
+            serde_json::json!({"name": "pipeline", "title": "Pipeline", "kind": "board", "group_by": "stage", "source": {"collection": "deals"}, "actions": []}),
+        ),
+        (
+            "Table of a collection",
+            serde_json::json!({"name": "clients", "title": "Clients", "kind": "table", "source": {"collection": "clients", "sort": "name"}}),
+        ),
+        (
+            "Daily model spend",
+            serde_json::json!({"name": "spend", "title": "Model spend", "kind": "chart", "source": {"series": "model_spend", "bucket": "day", "minutes": 43200, "group_by": "model"}}),
+        ),
+        (
+            "Open decisions",
+            serde_json::json!({"name": "waiting", "title": "Waiting for me", "kind": "feed", "source": {"decisions": "open"}}),
+        ),
+        (
+            "Dashboard page",
+            serde_json::json!({"name": "today", "title": "Today", "kind": "page", "body": "## What needs me\n{{view:waiting}}\n\n## Spend\n{{view:spend}}"}),
+        ),
+    ]
 }
 
 /// Settings: triggers (automations before): an event, a filter, an

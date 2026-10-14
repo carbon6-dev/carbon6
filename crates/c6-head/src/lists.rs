@@ -100,6 +100,13 @@ pub const LISTS: &[List] = &[
         merge: Merge::Override,
     },
     List {
+        key: "views",
+        description: "Views: the screens of a realm's menu (tables, boards, charts, feeds, pages).",
+        realm: HOME,
+        key_fields: &["name"],
+        merge: Merge::Override,
+    },
+    List {
         key: "prompts",
         description: "What carbon6 tells models: sessions, the assistant, the memex.",
         realm: ROOT,

@@ -38,5 +38,6 @@ mod session;
 mod side_chat;
 mod triggers;
 mod usage;
+mod views;
 mod websearch;
 mod workflows;

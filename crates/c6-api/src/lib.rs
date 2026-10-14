@@ -287,6 +287,63 @@ pub struct RecordQuery {
     pub within: serde_json::Map<String, serde_json::Value>,
 }
 
+/// A view (docs/os.md §4.5): a configured screen of a realm, in its menu.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct View {
+    /// Letters, digits, - and _; its address (/views/<name>).
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    /// table, board, record, chart, feed or page.
+    pub kind: String,
+    /// What it shows: {collection, where?, sort?, limit?} (table, board,
+    /// record); {series, agg?, minutes?, bucket?, group_by?} (chart);
+    /// {decisions: "open"} or {sessions: {labels}} (feed). A page has none.
+    #[serde(default)]
+    pub source: serde_json::Value,
+    /// The fields shown (default: the schema's).
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// A board's column field (e.g. stage).
+    #[serde(default)]
+    pub group_by: String,
+    /// A board's columns, in order (default: the field's enum, or the
+    /// values present).
+    #[serde(default)]
+    pub columns: Vec<String>,
+    /// A page's Markdown; {{view:name}} embeds another view.
+    #[serde(default)]
+    pub body: String,
+    /// Buttons on each record.
+    #[serde(default)]
+    pub actions: Vec<ViewAction>,
+    /// In the realm's menu.
+    #[serde(default = "enabled_default")]
+    pub menu: bool,
+}
+
+/// A button on a view's records: starts a template with the record as its
+/// {{input}} (its sessions are labelled record:<id>), and/or sets fields.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ViewAction {
+    pub label: String,
+    #[serde(default)]
+    pub start: String,
+    #[serde(default)]
+    pub set: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /api/v1/views/{name}/act`: one of a view's actions on a record.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ViewAct {
+    /// The action's label.
+    pub action: String,
+    pub record: String,
+}
+
 /// A series (docs/os.md §4.4): numbers over time in a realm.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

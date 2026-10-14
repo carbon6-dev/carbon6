@@ -167,6 +167,7 @@ const AREAS: &[(&str, &str)] = &[
         "collections",
         "Collections: typed tables of records in a realm, for anything apps and agents keep (strict schemas, unique keys, history).",
     ),
+    ("views", "Views: a realm's configured screens (tables, boards, records, charts, feeds, pages) and their actions."),
     ("series", "Series: numbers over time in a realm (points with dimensions), summarized over windows; thresholds are triggers."),
     ("system", "carbon6 itself: realms, upgrades of its databases, and the backups made before each."),
     (
@@ -250,6 +251,7 @@ fn build() -> Vec<Op> {
     v.extend(list_setting!("settings.channels.get", "settings.channels.put", "notifications", "/api/v1/settings/channels", api::Channel, "Notification channels (push, ntfy, Slack, Discord, webhook, email) and what goes to each."));
     v.extend(list_setting!("settings.prices.get", "settings.prices.put", "usage", "/api/v1/settings/prices", api::Price, "Model prices, for cost estimates."));
     v.extend(list_setting!("settings.budgets.get", "settings.budgets.put", "usage", "/api/v1/settings/budgets", api::Budget, "Budgets: spending limits per period and label, warn or stop."));
+    v.extend(list_setting!("settings.views.get", "settings.views.put", "views", "/api/v1/settings/views", api::View, "A realm's views (?realm=), its configured screens: name, title, kind (table, board, record, chart, feed, page), source ({collection, where?, sort?, limit?} for table, board and record; {series, agg?, minutes?, bucket?, group_by?} for chart; {decisions: \"open\"} or {sessions: {labels}} for feed), fields, group_by (a board's column field), columns, body (a page's Markdown; {{view:name}} embeds another view), actions ({label, start: template, set: {field: value}}), menu."));
     v.extend(list_setting!("settings.hosts.get", "settings.hosts.put", "hosts", "/api/v1/settings/hosts", api::Host, "The SSH host inventory: name, target, worker to reach it through, labels."));
     v.extend(list_setting!("settings.workflows.get", "settings.workflows.put", "automation", "/api/v1/settings/workflows", api::Workflow, "Workflows: steps of sessions, approvals and conditions."));
     v.extend(list_setting!("settings.memex_scopes.get", "settings.memex_scopes.put", "knowledge", "/api/v1/settings/memex_scopes", api::MemexScope, "Memex scope rules: which kinds of items (email, photo…) sessions with given labels may see."));
@@ -360,6 +362,8 @@ fn build() -> Vec<Op> {
         op!("realms.delete", "system", "DELETE" "/api/v1/realms/{id}", Destructive, Input::None, "Deletes a realm that owns nothing yet.", choices = &[("id", "realms.list")]),
         op!("workers.realms", "fleet", "PUT" "/api/v1/workers/{id}/realms", Write, Input::Body(schema::<api::RealmsIn>), "Sets which realms a worker runs sessions for (empty: all; one: dedicated to it).", choices = &[("id", "workers.list")]),
         op!("connections.realms", "connections", "PUT" "/api/v1/connections/{id}/realms", Write, Input::Body(schema::<api::RealmsIn>), "Sets which realms' sessions may use a model connection (empty: all).", choices = &[("id", "connections.list")]),
+        op!("views.list", "views", "GET" "/api/v1/views", Read, Input::Query(schema::<api::InRealm>), "The views a realm shows in its menu: root's and its own."),
+        op!("views.act", "views", "POST" "/api/v1/views/{name}/act", Write, Input::Body(schema::<api::ViewAct>), "Runs a view's action on a record: sets its fields, and/or starts its template with the record as input (sessions labelled record:<id>).", choices = &[("name", "views.list")]),
         op!("series.list", "series", "GET" "/api/v1/series", Read, Input::Query(schema::<api::InRealm>), "Series: numbers over time in a realm (revenue, uptime pings, costs), each with its unit, dimensions and latest point; plus model_spend, model_tokens and model_calls, computed from model usage."),
         op!("series.get", "series", "GET" "/api/v1/series/{name}", Read, Input::Query(schema::<api::InRealm>), "A series.", choices = &[("name", "series.list")]),
         op!("series.create", "series", "POST" "/api/v1/series", Write, Input::Body(schema::<api::SeriesIn>), "Creates a series: name, unit, description, dimensions (names points may carry, e.g. service), retention_days."),
@@ -444,6 +448,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
         "hosts" => schema::<api::Host>(),
         "memex_folders" => schema::<api::MemexFolder>(),
         "memex_scopes" => schema::<api::MemexScope>(),
+        "views" => schema::<api::View>(),
         "prompts" => json!({"type": "object", "required": ["name", "body"], "properties": {
             "name": {"type": "string"}, "description": {"type": "string"}, "body": {"type": "string"}
         }}),

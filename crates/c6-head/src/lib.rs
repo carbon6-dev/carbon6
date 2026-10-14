@@ -40,6 +40,7 @@ pub mod tls;
 pub mod triggers;
 pub mod ui_ca;
 pub mod usage;
+pub mod views;
 mod webauthn;
 pub mod workflows;
 

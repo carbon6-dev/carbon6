@@ -145,6 +145,14 @@ async fn make_head_fixture() {
     )
     .await;
 
+    // Views of home's candidates.
+    put(
+        "settings/views",
+        json!([{"name": "candidates", "title": "Candidates", "kind": "board", "group_by": "stage", "source": {"collection": "candidates"},
+                "actions": [{"label": "Approve", "set": {"stage": "approved"}}]}]),
+    )
+    .await;
+
     // A realm of its own, granted a read of home's candidates.
     post("realms", json!({"id": "lab", "name": "Lab", "description": "experiments"})).await;
     post(
@@ -360,6 +368,11 @@ async fn head_fixtures_upgrade_and_serve() {
         {
             assert!(ids.contains(&"commons"), "{name}: {realms}");
             assert_eq!(realms[1]["reads_commons"], true, "{name}: {realms}");
+        }
+        // Views (from version 37 on).
+        if name.as_str() >= "c6h-v0037.db" {
+            let v = get("views").await;
+            assert_eq!(v[0]["name"], "candidates", "{name}: {v}");
         }
         // Grants (from version 33 on).
         if name.as_str() >= "c6h-v0033.db" {

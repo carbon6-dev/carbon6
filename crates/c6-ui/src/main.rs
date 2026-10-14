@@ -27,6 +27,7 @@ mod term;
 mod understanding;
 mod usage;
 mod util;
+mod views;
 mod workspace;
 
 use leptos::prelude::*;
@@ -99,16 +100,17 @@ fn Main() -> impl IntoView {
                         </span>
                     </Go>
                     <decisions::DecisionLink class=NAV />
-                    <span class="hidden sm:contents"><NavLink to=View::Mission label="Mission" /></span>
-                    <span class="hidden lg:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
+                    <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
+                    <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
                     <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                 </nav>
                 <span class="flex-1"></span>
+                <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
                 <RealmSwitch />
                 <assistant::AskButton />
                 <span class="hidden md:contents"><search::SearchBox /></span>
                 {move || (tiles() < workspace::MAX_TILES).then(|| view! {
-                    <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 md:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="New tile (or ⌘-click any link) · ⌘1–4 switch tiles · ⌘[ ⌘] back and forward"
                         on:click=move |_| ws.new_tile()>"+ Tile"</button>
                 })}
@@ -125,7 +127,7 @@ fn Main() -> impl IntoView {
     .into_any()
 }
 
-/// Phones: the nav and search in a menu.
+/// Phones and narrower windows: the nav, views and search in a menu.
 #[component]
 fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
     let menu = NodeRef::<leptos::html::Details>::new();
@@ -136,7 +138,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
         }
     };
     view! {
-        <details node_ref=menu class="relative md:hidden">
+        <details node_ref=menu class="relative xl:hidden">
             <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400">
                 "☰"
                 {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
@@ -150,6 +152,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
+                    <views::ViewsMenu class=MENU />
                     <Go to=View::Mail class=MENU>"Mail"</Go>
                     <Go to=View::Calendar class=MENU>"Calendar"</Go>
                     <Go to=View::Contacts class=MENU>"Contacts"</Go>
@@ -165,7 +168,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
 
 const MENU: &str = "rounded-md px-2 py-2 hover:bg-zinc-100 dark:hover:bg-zinc-800";
 
-const NAV: &str = "shrink-0 rounded-md px-2.5 py-1 text-zinc-600 hover:bg-zinc-200/60 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+const NAV: &str = "shrink-0 rounded-md px-2 py-1 text-zinc-600 hover:bg-zinc-200/60 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
 #[component]
 fn NavLink(to: View, label: &'static str) -> impl IntoView {

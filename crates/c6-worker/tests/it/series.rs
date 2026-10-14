@@ -89,8 +89,8 @@ async fn series_record_summarize_and_alert() {
         assert!(s.is_success(), "{s}: {v}");
         v
     };
-    let query = |name: &'static str, q: Value| {
-        async move { send(M::POST, &format!("series/{name}/query"), q).await.json::<SeriesResult>().await.unwrap() }
+    let query = |name: &'static str, q: Value| async move {
+        send(M::POST, &format!("series/{name}/query"), q).await.json::<SeriesResult>().await.unwrap()
     };
     let (hook, got) = receiver().await;
     ok(send(M::PUT, "settings/channels", json!([{"name": "phone", "kind": "webhook", "url": hook}])).await).await;

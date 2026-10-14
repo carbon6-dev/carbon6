@@ -143,6 +143,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
+        .route("/api/v1/settings/views", get(get_views_setting).put(put_views))
+        .route("/api/v1/views", get(list_views))
+        .route("/api/v1/views/{name}/act", post(view_act))
         .route("/api/v1/series", get(list_series).post(create_series))
         .route("/api/v1/series/{name}", get(get_series).patch(update_series).delete(delete_series))
         .route("/api/v1/series/{name}/points", post(record_point))
@@ -2198,6 +2201,40 @@ async fn update_realm(
 async fn delete_realm(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     crate::realms::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Views (docs/os.md §4.5) -------------------------------------------------
+
+async fn get_views_setting(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::View>>> {
+    Ok(Json(crate::views::views(&st).await?))
+}
+
+async fn put_views(State(st): State<Arc<HeadState>>, Json(v): Json<Vec<api::View>>) -> ApiResult<StatusCode> {
+    crate::views::check_views(&v)?;
+    st.store.set_setting(crate::views::KEY, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
+    st.registry.bump();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The views a realm shows (root's and its own).
+async fn list_views(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::View>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::views::effective(&st, &realm).await?))
+}
+
+async fn view_act(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(a): Json<api::ViewAct>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::views::act(&st, &realm, &name, &a, &writer(&caller)).await?))
 }
 
 // --- Series (docs/os.md §4.4) ------------------------------------------------

@@ -143,8 +143,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["automations" | "triggers", id, ..] => owned("triggers", "trigger", (*id).to_owned()).await,
         // Starting a template's sessions (in the caller's realm).
         ["templates", _, "run"] if method == Method::POST => Ok(()),
-        // Series: always within the caller's realm.
-        ["series", ..] => Ok(()),
+        // Series and views: always within the caller's realm.
+        ["series", ..] | ["views", ..] => Ok(()),
         // Collections: within the caller's realm, or another's through a
         // grant (checked by each call).
         ["collections", ..] => Ok(()),

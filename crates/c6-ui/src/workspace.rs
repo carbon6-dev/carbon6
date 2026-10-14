@@ -69,6 +69,12 @@ pub enum View {
         #[serde(default)]
         name: String,
     },
+    /// A realm's view (docs/os.md §4.5); with a record, that record.
+    App {
+        name: String,
+        #[serde(default)]
+        record: String,
+    },
 }
 
 /// A place in a session: the transcript element to reveal, the side chats
@@ -131,6 +137,8 @@ impl View {
             View::Decisions => "/decisions".into(),
             View::Collections { name } if name.is_empty() => "/collections".into(),
             View::Collections { name } => format!("/collections/{name}"),
+            View::App { name, record } if record.is_empty() => format!("/views/{name}"),
+            View::App { name, record } => format!("/views/{name}/{record}"),
         }
     }
 
@@ -197,6 +205,8 @@ impl View {
             ["decisions"] | ["todos"] => View::Decisions,
             ["collections"] => View::Collections { name: String::new() },
             ["collections", name] => View::Collections { name: (*name).to_owned() },
+            ["views", name] => View::App { name: (*name).to_owned(), record: String::new() },
+            ["views", name, record] => View::App { name: (*name).to_owned(), record: (*record).to_owned() },
             _ => View::Sessions,
         }
     }
@@ -229,6 +239,8 @@ impl View {
             View::Decisions => "Decisions".into(),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
+            View::App { name, record } if record.is_empty() => name.clone(),
+            View::App { name, .. } => format!("{name} · record"),
         }
     }
 
@@ -241,7 +253,9 @@ impl View {
     /// and search swap one section for another in place instead of
     /// stacking columns.
     fn is_section(&self) -> bool {
-        !matches!(self, View::Session { .. } | View::Worker { .. }) && !matches!(self, View::Collections { name } if !name.is_empty())
+        !matches!(self, View::Session { .. } | View::Worker { .. })
+            && !matches!(self, View::Collections { name } if !name.is_empty())
+            && !matches!(self, View::App { record, .. } if !record.is_empty())
     }
 }
 
@@ -977,6 +991,7 @@ fn render_view(view: View) -> AnyView {
                     View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
                     View::Decisions => view! { <crate::decisions::DecisionsPage /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
+                    View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>

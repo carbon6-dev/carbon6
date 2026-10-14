@@ -765,6 +765,15 @@ pub async fn collections() -> Result<Vec<c6_api::Collection>, String> {
     json(Request::get(&format!("/api/v1/collections{}", in_realm('?'))).send().await).await
 }
 
+/// The views of the realm you are looking at (home's when "All realms").
+pub async fn views() -> Result<Vec<c6_api::View>, String> {
+    json(Request::get(&format!("/api/v1/views{}", in_realm('?'))).send().await).await
+}
+
+pub async fn view_act(name: String, a: c6_api::ViewAct) -> Result<serde_json::Value, String> {
+    send_json(Request::post(&format!("/api/v1/views/{}/act{}", enc(&name), in_realm('?'))), &a).await
+}
+
 pub async fn series() -> Result<Vec<c6_api::Series>, String> {
     json(Request::get(&format!("/api/v1/series{}", in_realm('?'))).send().await).await
 }
