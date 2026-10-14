@@ -765,6 +765,22 @@ pub async fn collections() -> Result<Vec<c6_api::Collection>, String> {
     json(Request::get(&format!("/api/v1/collections{}", in_realm('?'))).send().await).await
 }
 
+pub async fn series() -> Result<Vec<c6_api::Series>, String> {
+    json(Request::get(&format!("/api/v1/series{}", in_realm('?'))).send().await).await
+}
+
+pub async fn create_series(s: c6_api::SeriesIn) -> Result<c6_api::Series, String> {
+    send_json(Request::post(&format!("/api/v1/series{}", in_realm('?'))), &s).await
+}
+
+pub async fn delete_series(name: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/series/{}{}", enc(&name), in_realm('?'))).send().await).await
+}
+
+pub async fn query_series(name: String, q: c6_api::SeriesQuery) -> Result<c6_api::SeriesResult, String> {
+    send_json(Request::post(&format!("/api/v1/series/{}/query{}", enc(&name), in_realm('?'))), &q).await
+}
+
 pub async fn collection(name: String) -> Result<c6_api::Collection, String> {
     json(Request::get(&format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))).send().await).await
 }

@@ -127,6 +127,14 @@ pub async fn check_now(st: &HeadState, name: &str) -> anyhow::Result<api::HostCh
     .bind(check.latency_ms as i64)
     .execute(&st.store.pool)
     .await?;
+    // Its history, as series (docs/os.md §4.4).
+    let dims = serde_json::Map::from_iter([("host".to_owned(), serde_json::json!(name))]);
+    for (series, value) in [("host_up", if check.ok { 1.0 } else { 0.0 }), ("host_check_ms", check.latency_ms as f64)] {
+        let p = api::Point { ts: check.at_ms, value, dims: dims.clone() };
+        if let Err(e) = crate::series::record(st, crate::realms::HOME, series, &p, "host check").await {
+            warn!(host = %name, "recording a host check: {e:#}");
+        }
+    }
     // Tell you when a host goes down (or its first check fails) and when it
     // comes back.
     if before != Some(check.ok) && !(before.is_none() && check.ok) {

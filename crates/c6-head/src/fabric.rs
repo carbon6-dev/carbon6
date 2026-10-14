@@ -84,6 +84,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                     .map_err(bad_request)?;
                 Ok(json!({"text": text}))
             }
+            // Series, in the session's realm (docs/os.md §4.4).
+            "series_record" | "series_query" => {
+                let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+                crate::series::for_session(st, &realm, &target, what, &params).await
+            }
             // Asking for another realm's data (docs/os.md §3.7).
             "grant_request" => {
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());

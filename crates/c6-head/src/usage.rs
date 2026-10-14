@@ -189,6 +189,49 @@ async fn calls_since(st: &HeadState, since_ms: i64) -> anyhow::Result<Vec<Call>>
         .collect())
 }
 
+/// Model usage in `realm` as points of a usage series (docs/os.md §4.4):
+/// `model_spend` (at today's prices), `model_tokens` or `model_calls`,
+/// each with the dimensions model and connection.
+pub async fn as_points(
+    st: &HeadState,
+    realm: &str,
+    series: &str,
+    from: i64,
+    to: i64,
+) -> anyhow::Result<Vec<(i64, f64, serde_json::Map<String, serde_json::Value>)>> {
+    let prices = prices(st).await?;
+    let rows = sqlx::query("SELECT * FROM usage WHERE realm = ? AND ts >= ? AND ts < ? ORDER BY ts LIMIT 200000")
+        .bind(realm)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&st.store.pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let c = Call {
+                session_id: r.get("session_id"),
+                ts: r.get("ts"),
+                connection_id: r.get("connection_id"),
+                model: r.get("model"),
+                input: r.get::<i64, _>("input") as u64,
+                output: r.get::<i64, _>("output") as u64,
+                cache_read: r.get::<i64, _>("cache_read") as u64,
+                cache_write: r.get::<i64, _>("cache_write") as u64,
+            };
+            let value = match series {
+                "model_spend" => c.cost(&prices).unwrap_or(0.0),
+                "model_tokens" => (c.input + c.output + c.cache_read + c.cache_write) as f64,
+                _ => 1.0,
+            };
+            let mut dims = serde_json::Map::new();
+            dims.insert("model".into(), c.model.clone().into());
+            dims.insert("connection".into(), c.connection_id.clone().into());
+            (c.ts, value, dims)
+        })
+        .collect())
+}
+
 /// The sessions calls were made in, loaded once each.
 #[derive(Default)]
 struct Sessions(HashMap<String, Option<SessionRow>>);

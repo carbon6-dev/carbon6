@@ -30,6 +30,7 @@ pub mod registry;
 pub mod schema;
 pub mod search;
 pub mod secrets;
+pub mod series;
 pub mod sessions;
 pub mod store;
 pub mod telemetry;
@@ -216,6 +217,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
 
     // Scheduled automations.
     triggers::spawn_scheduler(state.clone());
+    // Series thresholds and retention.
+    series::spawn_sweeper(state.clone());
     notify::spawn(state.clone());
     usage::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());

@@ -143,6 +143,10 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
+        .route("/api/v1/series", get(list_series).post(create_series))
+        .route("/api/v1/series/{name}", get(get_series).patch(update_series).delete(delete_series))
+        .route("/api/v1/series/{name}/points", post(record_point))
+        .route("/api/v1/series/{name}/query", post(query_series))
         .route("/api/v1/grants", get(list_grants).post(create_grant))
         .route("/api/v1/grants/{id}", get(get_grant).delete(revoke_grant))
         .route("/api/v1/grants/{id}/uses", get(grant_uses))
@@ -2194,6 +2198,81 @@ async fn update_realm(
 async fn delete_realm(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     crate::realms::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Series (docs/os.md §4.4) ------------------------------------------------
+
+async fn list_series(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::Series>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::series::list(&st, &realm).await?))
+}
+
+async fn create_series(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(s): Json<api::SeriesIn>,
+) -> ApiResult<Json<api::Series>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::series::create(&st, &realm, &s, &writer(&caller)).await?))
+}
+
+async fn get_series(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<api::Series>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::series::get(&st, &realm, &name).await?))
+}
+
+async fn update_series(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(s): Json<api::SeriesIn>,
+) -> ApiResult<Json<api::Series>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::series::update(&st, &realm, &name, &s).await?))
+}
+
+async fn delete_series(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::series::delete(&st, &realm, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn record_point(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(p): Json<api::Point>,
+) -> ApiResult<Json<api::Point>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::series::record(&st, &realm, &name, &p, &writer(&caller)).await?))
+}
+
+async fn query_series(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(q): Json<api::SeriesQuery>,
+) -> ApiResult<Json<api::SeriesResult>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::series::query(&st, &realm, &name, &q).await?))
 }
 
 /// `?realm=`: the grants given by or to one realm.

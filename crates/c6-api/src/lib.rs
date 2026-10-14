@@ -287,6 +287,106 @@ pub struct RecordQuery {
     pub within: serde_json::Map<String, serde_json::Value>,
 }
 
+/// A series (docs/os.md §4.4): numbers over time in a realm.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Series {
+    pub realm: String,
+    pub name: String,
+    pub unit: String,
+    pub description: String,
+    /// The dimensions its points may carry (e.g. service).
+    pub dimensions: Vec<String>,
+    /// Points older than this many days are dropped; 0: kept.
+    pub retention_days: u32,
+    /// carbon6's own: host checks, or model usage (computed from the
+    /// usage ledger, so not written to).
+    pub system: bool,
+    #[serde(default)]
+    pub computed: bool,
+    pub created_by: String,
+    pub created_at: UnixMs,
+    /// How many points it has, and the latest.
+    #[serde(default)]
+    pub points: i64,
+    #[serde(default)]
+    pub last: Option<Point>,
+}
+
+/// `POST /api/v1/series` and `PATCH /api/v1/series/{name}`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SeriesIn {
+    /// Letters, digits and _ (creating only).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub dimensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+}
+
+/// A point of a series.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Point {
+    /// When; default now.
+    #[serde(default)]
+    pub ts: UnixMs,
+    pub value: f64,
+    /// Values of the series' dimensions.
+    #[serde(default)]
+    pub dims: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /api/v1/series/{name}/query`: a summary of a window.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SeriesQuery {
+    /// sum (default), avg, min, max, last or count.
+    #[serde(default)]
+    pub agg: String,
+    /// The last this many minutes (default 1440, a day), unless from is given.
+    #[serde(default)]
+    pub minutes: Option<u64>,
+    #[serde(default)]
+    pub from: Option<UnixMs>,
+    #[serde(default)]
+    pub to: Option<UnixMs>,
+    /// Only points whose dimensions have these values.
+    #[serde(default, rename = "where")]
+    pub filter: serde_json::Map<String, serde_json::Value>,
+    /// A value per value of this dimension.
+    #[serde(default)]
+    pub group_by: String,
+    /// A value per hour or day.
+    #[serde(default)]
+    pub bucket: String,
+}
+
+/// What a series query found.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SeriesResult {
+    pub series: String,
+    pub agg: String,
+    pub from: UnixMs,
+    pub to: UnixMs,
+    /// Over the whole window (null: no points).
+    pub value: Option<f64>,
+    pub points: i64,
+    /// With group_by: (dimension value, value), largest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<(serde_json::Value, f64)>,
+    /// With bucket: (start, value), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<(UnixMs, f64)>,
+}
+
 /// The records a query found (or, with group_by, the counts).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

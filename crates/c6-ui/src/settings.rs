@@ -2338,6 +2338,7 @@ fn AutomationsSetting() -> impl IntoView {
     let (collection, ops, labels) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let (action, params, conditions) = (RwSignal::new("start".to_owned()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let per_hour = RwSignal::new(60u32);
+    let threshold = RwSignal::new(String::new());
     let digest = move |_| {
         name.set("Morning digest of open decisions".into());
         trigger.set("schedule".into());
@@ -2378,6 +2379,13 @@ fn AutomationsSetting() -> impl IntoView {
         }
         if ev == "session" {
             event_params["labels"] = serde_json::json!(list_of(labels.get_untracked()));
+        }
+        if ev == "series" {
+            match parse("The threshold", threshold.get_untracked()) {
+                Ok(serde_json::Value::Object(t)) => event_params.as_object_mut().into_iter().for_each(|e| e.extend(t.clone())),
+                Ok(_) => {}
+                Err(e) => return status.set(Some(Err(e))),
+            }
         }
         let e = c6_api::AutomationEdit {
             name: Some(name.get_untracked()),
@@ -2536,16 +2544,22 @@ fn AutomationsSetting() -> impl IntoView {
                         <option value="record">"When a record changes"</option>
                         <option value="decision">"When a decision is opened or answered"</option>
                         <option value="session">"When a session finishes, fails or needs approval"</option>
+                        <option value="series">"When a series crosses a threshold"</option>
                     </select>
+                </label>
+                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "series">
+                    <span class="text-xs text-zinc-500">"Threshold (JSON): agg over minutes compared with value, or silent_minutes for points that stop arriving"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=r#"{"series": "model_spend", "agg": "sum", "minutes": 1440, "op": ">", "value": 5}"#
+                        prop:value=move || threshold.get() on:input=move |ev| threshold.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "record">
                     <span class="text-xs text-zinc-500">"Collection"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. clients" prop:value=move || collection.get() on:input=move |ev| collection.set(event_target_value(&ev)) />
                 </label>
-                <label class="space-y-0.5" class:hidden=move || !matches!(trigger.get().as_str(), "record" | "decision" | "session")>
+                <label class="space-y-0.5" class:hidden=move || !matches!(trigger.get().as_str(), "record" | "decision" | "session" | "series")>
                     <span class="text-xs text-zinc-500">"Which (empty: all)"</span>
                     <input class=format!("{INPUT} py-1 text-sm") prop:value=move || ops.get() on:input=move |ev| ops.set(event_target_value(&ev))
-                        placeholder=move || match trigger.get().as_str() { "record" => "created, updated, deleted", "decision" => "opened, answered, expired", _ => "finished, failed, needs_approval" } />
+                        placeholder=move || match trigger.get().as_str() { "record" => "created, updated, deleted", "decision" => "opened, answered, expired", "series" => "crossed, cleared", _ => "finished, failed, needs_approval" } />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "session">
                     <span class="text-xs text-zinc-500">"Sessions with these labels (empty: all)"</span>
@@ -2580,6 +2594,7 @@ fn AutomationsSetting() -> impl IntoView {
                         <option value="write">"Write a record"</option>
                         <option value="ask">"Ask (open a decision)"</option>
                         <option value="notify">"Notify"</option>
+                        <option value="record">"Record a value in a series"</option>
                     </select>
                 </label>
                 <label class="space-y-0.5" class:hidden=move || action.get() != "start">
@@ -2600,6 +2615,7 @@ fn AutomationsSetting() -> impl IntoView {
                         placeholder=move || match action.get().as_str() {
                             "write" => r#"{"collection": "payments", "fields": {"amount": "$.body.amount", "from": "$.body.customer"}}"#,
                             "ask" => r#"{"title": "Follow up with {{$.record.fields.name}}?", "options": [{"label": "Yes"}, {"label": "No"}]}"#,
+                            "record" => r#"{"series": "revenue", "value": "$.body.amount", "dims": {"service": "$.body.service"}}"#,
                             _ => r#"{"title": "{{$.session.title}} failed", "message": "{{$.message}}"}"#,
                         }></textarea>
                 </label>

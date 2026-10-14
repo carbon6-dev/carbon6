@@ -42,6 +42,7 @@ fn CollectionList() -> impl IntoView {
                     view! {
                         {mine.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"No collections yet. Agents create them with the records tools, apps bring their own, or make one here."</p> })}
                         {mine.into_iter().map(card).collect_view()}
+                        <SeriesList />
                         {(!system.is_empty()).then(|| view! {
                             <details class="pt-2">
                                 <summary class="cursor-pointer select-none text-sm text-zinc-500">{format!("carbon6's own configuration ({})", system.len())}</summary>
@@ -52,6 +53,94 @@ fn CollectionList() -> impl IntoView {
                 }
             })}
         </main>
+    }
+}
+
+/// Series (docs/os.md §4.4): numbers over time, with today's and the
+/// week's totals at a glance.
+#[component]
+fn SeriesList() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let list = LocalResource::new(move || {
+        tick.track();
+        api::realm().track();
+        api::series()
+    });
+    let (name, unit, dims) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let error = RwSignal::new(None::<String>);
+    let create = move |_| {
+        let s = c6_api::SeriesIn {
+            name: name.get_untracked(),
+            unit: Some(unit.get_untracked()),
+            dimensions: Some(dims.get_untracked().split(',').map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect()),
+            ..Default::default()
+        };
+        spawn_local(async move {
+            match api::create_series(s).await {
+                Ok(_) => {
+                    name.set(String::new());
+                    unit.set(String::new());
+                    dims.set(String::new());
+                    error.set(None);
+                    tick.update(|t| *t += 1);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <section class="space-y-2 pt-4">
+            <h2 class="font-medium">"Series"</h2>
+            <p class="text-sm text-zinc-500">"Numbers over time: points recorded by triggers, agents (series_record) or the API, with dimensions such as service. Triggers watch them for thresholds. Model usage is here too, computed from the usage ledger."</p>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || list.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(all) => all.into_iter().map(|s| {
+                    let totals = LocalResource::new({
+                        let n = s.name.clone();
+                        move || {
+                            let n = n.clone();
+                            async move {
+                                let day = api::query_series(n.clone(), c6_api::SeriesQuery { minutes: Some(1440), ..Default::default() }).await.ok();
+                                let week = api::query_series(n, c6_api::SeriesQuery { minutes: Some(7 * 1440), ..Default::default() }).await.ok();
+                                (day.and_then(|d| d.value), week.and_then(|w| w.value))
+                            }
+                        }
+                    });
+                    let n = s.name.clone();
+                    let unit = s.unit.clone();
+                    let fmt = move |v: Option<f64>| v.map(|v| if v.fract() == 0.0 { format!("{v}") } else { format!("{v:.2}") }).unwrap_or_else(|| "—".into());
+                    view! {
+                        <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
+                            <span class="font-mono font-medium">{s.name.clone()}</span>
+                            <span class="text-xs text-zinc-500">{s.unit.clone()}</span>
+                            {(!s.dimensions.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("by {}", s.dimensions.join(", "))}</span> })}
+                            <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{s.description.clone()}</span>
+                            <span class="text-xs">{move || totals.get().map(|(d, w)| format!("sum 24h {} · 7d {} {unit}", fmt(d), fmt(w)))}</span>
+                            {(!s.system).then(|| view! {
+                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                    let n = n.clone();
+                                    if window().confirm_with_message(&format!("Delete series {n} and its points?")).unwrap_or(false) {
+                                        spawn_local(async move {
+                                            match api::delete_series(n).await {
+                                                Ok(()) => tick.update(|t| *t += 1),
+                                                Err(e) => error.set(Some(e)),
+                                            }
+                                        });
+                                    }
+                                }>"Delete"</button>
+                            })}
+                        </div>
+                    }
+                }).collect_view().into_any(),
+            })}
+            <div class="flex flex-wrap gap-2">
+                <input class=format!("{INPUT} w-40") placeholder="name (e.g. revenue)" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} w-24") placeholder="unit" prop:value=move || unit.get() on:input=move |ev| unit.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="dimensions (e.g. service)" prop:value=move || dims.get() on:input=move |ev| dims.set(event_target_value(&ev)) />
+                <button class=BUTTON on:click=create>"New series"</button>
+            </div>
+        </section>
     }
 }
 

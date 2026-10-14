@@ -94,13 +94,11 @@ async fn triggers_react_to_events() {
     };
     let (hook, got) = receiver().await;
     ok(send(M::PUT, "settings/channels", json!([{"name": "phone", "kind": "webhook", "url": hook}])).await).await;
-    let collection = |name: &'static str, props: Value| {
-        async move {
-            let required: Vec<&String> = props.as_object().unwrap().keys().collect();
-            let schema = json!({"type": "object", "required": required, "properties": props});
-            let r = send(M::POST, "collections", json!({"name": name, "schema": schema})).await;
-            assert!(r.status().is_success(), "{name}");
-        }
+    let collection = |name: &'static str, props: Value| async move {
+        let required: Vec<&String> = props.as_object().unwrap().keys().collect();
+        let schema = json!({"type": "object", "required": required, "properties": props});
+        let r = send(M::POST, "collections", json!({"name": name, "schema": schema})).await;
+        assert!(r.status().is_success(), "{name}");
     };
     collection("deals", json!({"name": {"type": "string"}, "stage": {"type": "string"}})).await;
     collection("invoices", json!({"client": {"type": "string"}, "note": {"type": "string"}})).await;
@@ -110,14 +108,12 @@ async fn triggers_react_to_events() {
             http.get(format!("{api}/collections/{name}/records")).send().await.unwrap().json::<Value>().await.unwrap()["records"].clone()
         }
     };
-    let trigger = |body: Value| {
-        async move {
-            let r = send(M::POST, "triggers", body).await;
-            let s = r.status();
-            let v: Value = r.json().await.unwrap();
-            assert!(s.is_success(), "{v}");
-            serde_json::from_value::<Automation>(v).unwrap()
-        }
+    let trigger = |body: Value| async move {
+        let r = send(M::POST, "triggers", body).await;
+        let s = r.status();
+        let v: Value = r.json().await.unwrap();
+        assert!(s.is_success(), "{v}");
+        serde_json::from_value::<Automation>(v).unwrap()
     };
 
     // Checked: events, actions and filters.

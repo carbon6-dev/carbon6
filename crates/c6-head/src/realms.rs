@@ -143,6 +143,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["automations" | "triggers", id, ..] => owned("triggers", "trigger", (*id).to_owned()).await,
         // Starting a template's sessions (in the caller's realm).
         ["templates", _, "run"] if method == Method::POST => Ok(()),
+        // Series: always within the caller's realm.
+        ["series", ..] => Ok(()),
         // Collections: within the caller's realm, or another's through a
         // grant (checked by each call).
         ["collections", ..] => Ok(()),
@@ -207,6 +209,7 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
         ("collections", "collections", " AND system = 0"),
         ("decisions", "decisions", ""),
         ("triggers", "triggers", ""),
+        ("series", "series", " AND system = 0"),
         ("secrets", "secrets", ""),
     ] {
         let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table} WHERE realm = ?{cond}")))
@@ -223,6 +226,8 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM records WHERE realm = ?").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM collections WHERE realm = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM points WHERE realm = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM series WHERE realm = ?").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM api_tokens WHERE realm = ?").bind(id).execute(&mut *tx).await?;
     // Its grants end (their log stays).
     sqlx::query("UPDATE grants SET state = 'revoked', revoked_at = ?1 WHERE (from_realm = ?2 OR to_realm = ?2) AND state IN ('active', 'requested')")

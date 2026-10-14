@@ -33,6 +33,7 @@ mod runs;
 mod scratch;
 mod search;
 mod secrets;
+mod series;
 mod session;
 mod side_chat;
 mod triggers;

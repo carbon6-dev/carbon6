@@ -370,6 +370,22 @@ threshold(series, condition /* e.g. sum over 7 days < 10, no point for 2 hours *
 - **Sources:** trigger mappings (4.3), agents (`series_record`), the API, and carbon6 itself.
 - **Built in:** carbon6 records model spend, tokens and session counts per realm and label as series. **Usage and budgets move onto series:** a budget is a threshold whose action is to stop spending.
 
+**As built (step 6):**
+- **Storage:** migration `0036` adds `series` (per realm: unit, description, dimensions, retention) and `points` (time, value, dimensions, source).
+- **API:** `/api/v1/series` lists, creates, changes and deletes series; `…/{name}/points` adds a point, and `…/{name}/query` summarizes.
+- **Queries:** sum, avg, min, max, last or count over the last N minutes (default a day) or from/to. Optionally only points with some dimension values, per dimension value (`group_by`), or per hour or day (`bucket`).
+- **Where points come from:**
+  - the API;
+  - agents, with `series_record` and `series_query` (which lists series when given none);
+  - triggers, with the "record a value" action (`{series, value: "$.body.amount", dims}`);
+  - host checks, which now keep history in home's `host_up` and `host_check_ms` (each host's latest check moved in on upgrade).
+- **Model usage as series:** `model_spend` (at today's prices), `model_tokens` and `model_calls`, per realm, by model and connection, computed from the usage ledger. They read like any series and are never written to.
+- **Thresholds are trigger events:**
+  - **The condition:** `{series, agg, minutes, op, value, where?}`, or `{series, silent_minutes, where?}` for points that stop arriving.
+  - **When it fires:** once when the condition becomes true (`crossed`) and once when it stops being true (`cleared`).
+  - **When it's checked:** at once when a point is recorded, and every minute (also for silence and model usage). A sweeper drops points past their series' retention.
+- **UI:** the Collections page lists the realm's series with their 24-hour and 7-day sums, and creates and deletes them. The Triggers form has the series event and the "record a value" action.
+
 ### 4.5 Views
 
 A **view** is a configured screen, rendered by carbon6's UI.
@@ -834,3 +850,10 @@ Choices the design left open, made while building, for review.
 | 5 | Changes to system collections (settings) are not record events | They are written through Settings, not as records, and firing on configuration changes invites loops |
 | 5 | Series events and "record a value" wait for series (step 6) | They need the primitive |
 | 5 | Per-trigger budgets are the existing budgets on the `automation:<name>` label | Start actions' sessions already carry it; other actions cost nothing |
+| 6 | Model usage stays in its ledger and is offered as computed series, not copied into points | The ledger is keyed per call (exactly-once from workers), and cost is applied at today's prices so fixing a price corrects history; stored spend points could not do either |
+| 6 | Budgets stay budgets (a list in Settings that stops spending) | They already check the same spend the `model_spend` series shows; thresholds on `model_spend` add warnings and actions on top |
+| 6 | Host check history goes into home | Hosts are your infrastructure, and home's triggers can then watch them; root holds no data |
+| 6 | Thresholds fire on the change (crossed, cleared), not on every check | A threshold that stays crossed would otherwise notify every minute |
+| 6 | A threshold with nothing recorded counts from when the trigger was made, for silence | A heartbeat that never started is as silent as one that stopped |
+| 6 | Series aren't covered by grants yet | No example needed series across realms; a grant of kind series can follow the collection grant's shape when one does |
+| 6 | The memex's model-call budget stays in the memex | It is the memex's own database; it can become a series when the memex reports points to the head |

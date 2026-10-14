@@ -127,6 +127,14 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
             after: "SELECT count(*) FROM decisions WHERE state = 'answered'",
         },
         c6_core::upgrade::Check {
+            version: 36,
+            name: "each host's latest check is a point of host_up and host_check_ms",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(name || '=' || ok || '/' || latency_ms || '@' || at, '|'), '') FROM (SELECT * FROM before.host_checks ORDER BY name)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(json_extract(u.dims, '$.host') || '=' || CAST(u.value AS INTEGER) || '/' || CAST(l.value AS INTEGER) || '@' || u.ts, '|'), '') \
+                    FROM (SELECT * FROM points WHERE series = 'host_up' ORDER BY json_extract(dims, '$.host')) u \
+                    JOIN points l ON l.series = 'host_check_ms' AND l.dims = u.dims AND l.ts = u.ts",
+        },
+        c6_core::upgrade::Check {
             version: 35,
             name: "every automation is a trigger, with its id, name, schedule and webhook token",
             before: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || name || '/' || trigger || '/' || cron || '/' || token_hash || '/' || template, '|'), '') \

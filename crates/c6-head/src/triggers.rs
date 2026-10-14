@@ -33,9 +33,10 @@ pub const MAX_WEBHOOK_BODY: usize = 1024 * 1024;
 /// Triggers whose actions cause other triggers, at most this deep.
 pub const MAX_DEPTH: usize = 5;
 
-pub const EVENTS: [&str; 6] = ["schedule", "webhook", "memex", "record", "decision", "session"];
-pub const ACTIONS: [&str; 4] = ["start", "write", "ask", "notify"];
-const OPS: [(&str, &[&str]); 3] = [
+pub const EVENTS: [&str; 7] = ["schedule", "webhook", "memex", "record", "decision", "session", "series"];
+pub const ACTIONS: [&str; 5] = ["start", "write", "ask", "notify", "record"];
+const OPS: [(&str, &[&str]); 4] = [
+    ("series", &["crossed", "cleared"]),
     ("record", &["created", "updated", "deleted"]),
     ("decision", &["opened", "answered", "expired", "dismissed"]),
     ("session", &["finished", "failed", "needs_approval"]),
@@ -135,6 +136,17 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
         "schedule" => Schedule::parse(&a.cron).map(drop).map_err(bad_request)?,
         "webhook" => {}
         "memex" => EventFilter::parse(&a.cron).map(drop).map_err(bad_request)?,
+        "series" => {
+            let p = &a.event_params;
+            let name = p["series"].as_str().unwrap_or_default();
+            crate::series::get(st, realm, name).await.map_err(|_| bad_request(format!("no series {name:?} in realm {realm}")))?;
+            let silent = p["silent_minutes"].as_f64().is_some_and(|m| m > 0.0);
+            if !silent && (!matches!(p["op"].as_str(), Some(">" | ">=" | "<" | "<=")) || !p["value"].is_number()) {
+                return Err(bad_request(
+                    "a threshold is {series, agg (sum, avg, min, max, last, count), minutes, op (>, >=, <, <=), value}, or {series, silent_minutes}",
+                ));
+            }
+        }
         "record" | "decision" | "session" => {
             let allowed = OPS.iter().find(|(k, _)| *k == a.trigger).map(|(_, o)| *o).unwrap_or_default();
             for op in a.event_params["ops"].as_array().into_iter().flatten() {
@@ -179,6 +191,16 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
             return Err(bad_request("a notify gives a title or a message"));
         }
         "ask" | "notify" => {}
+        "record" => {
+            let name = p["series"].as_str().unwrap_or_default();
+            let s = crate::series::get(st, realm, name).await.map_err(|_| bad_request(format!("no series {name:?} in realm {realm}")))?;
+            if s.computed {
+                return Err(bad_request(format!("{name} is computed from model usage")));
+            }
+            if p["value"].is_null() {
+                return Err(bad_request("record a value gives the value: {\"series\": …, \"value\": \"$.body.amount\"}"));
+            }
+        }
         other => return Err(bad_request(format!("{other:?} is not an action ({})", ACTIONS.join(", ")))),
     }
     Ok(())
@@ -308,6 +330,10 @@ fn interpolate(s: &str, event: &Value) -> String {
         out.push_str(&match at(event, path) {
             Some(Value::String(v)) => v.clone(),
             Some(Value::Null) | None => String::new(),
+            // 105, not 105.0.
+            Some(Value::Number(n)) if n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() < 1e15) => {
+                format!("{}", n.as_f64().unwrap_or(0.0) as i64)
+            }
             Some(v) => v.to_string(),
         });
         rest = &rest[i + j + 2..];
@@ -379,6 +405,87 @@ pub async fn on_session(st: &HeadState, session_id: &str, op: &str, message: &st
     let event = json!({"type": "session", "op": op, "message": message,
                        "session": {"id": s.id, "title": s.title, "labels": s.all_labels(), "realm": s.realm}});
     dispatch(st, &s.realm, "session", op, event).await;
+}
+
+/// Checks series thresholds (in `realm`, of `series`, or all): a trigger
+/// fires when its threshold becomes crossed ("crossed") and when it stops
+/// being so ("cleared").
+pub async fn watch_series(st: &HeadState, realm: Option<&str>, series: Option<&str>) {
+    let rows = match sqlx::query("SELECT id, realm FROM triggers WHERE event = 'series' AND enabled = 1 AND (?1 IS NULL OR realm = ?1)")
+        .bind(realm)
+        .fetch_all(&st.store.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("loading series triggers: {e:#}");
+            return;
+        }
+    };
+    for r in rows {
+        let (id, realm): (String, String) = (r.get("id"), r.get("realm"));
+        let Ok(a) = get(st, &id).await else { continue };
+        let p = &a.event_params;
+        let name = p["series"].as_str().unwrap_or_default();
+        if series.is_some_and(|s| s != name) {
+            continue;
+        }
+        let filter = p["where"].as_object().cloned().unwrap_or_default();
+        let (crossed, value) = if let Some(m) = p["silent_minutes"].as_f64().filter(|m| *m > 0.0) {
+            let last = crate::series::latest_ts(st, &realm, name, &filter).await.ok().flatten();
+            // Silent since the last point, or since the trigger was made.
+            let since = last.unwrap_or(a.created_at);
+            (now_ms() - since > (m * 60_000.0) as i64, last.map(|t| json!(t)).unwrap_or(Value::Null))
+        } else {
+            let q = api::SeriesQuery {
+                agg: p["agg"].as_str().unwrap_or("sum").to_owned(),
+                minutes: Some(p["minutes"].as_u64().unwrap_or(60)),
+                filter,
+                ..Default::default()
+            };
+            let Ok(res) = crate::series::query(st, &realm, name, &q).await else { continue };
+            let Some(v) = res.value else { continue };
+            let t = p["value"].as_f64().unwrap_or(0.0);
+            let crossed = match p["op"].as_str() {
+                Some(">") => v > t,
+                Some(">=") => v >= t,
+                Some("<") => v < t,
+                _ => v <= t,
+            };
+            (crossed, json!(v))
+        };
+        let was: Option<bool> = sqlx::query_scalar("SELECT crossed FROM series_alerts WHERE trigger_id = ?")
+            .bind(&id)
+            .fetch_optional(&st.store.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|c: i64| c != 0);
+        if was == Some(crossed) || (was.is_none() && !crossed) {
+            if was.is_none() {
+                let _ = sqlx::query("INSERT OR REPLACE INTO series_alerts (trigger_id, crossed, at) VALUES (?, 0, ?)")
+                    .bind(&id)
+                    .bind(now_ms())
+                    .execute(&st.store.pool)
+                    .await;
+            }
+            continue;
+        }
+        let _ = sqlx::query("INSERT OR REPLACE INTO series_alerts (trigger_id, crossed, at) VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(crossed as i64)
+            .bind(now_ms())
+            .execute(&st.store.pool)
+            .await;
+        let op = if crossed { "crossed" } else { "cleared" };
+        if a.event_params["ops"].as_array().is_some_and(|o| !o.is_empty() && !o.iter().any(|x| x == op)) {
+            continue;
+        }
+        let event = json!({"type": "series", "op": op, "series": name, "value": value, "threshold": a.event_params, "realm": realm});
+        if passes(&a.filter, &event) {
+            Box::pin(act(st, &a, &event, &event_text(&event), "series")).await;
+        }
+    }
 }
 
 /// What a start action gets as {{input}} when the trigger doesn't say.
@@ -553,6 +660,15 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
                 ..Default::default()
             };
             crate::decisions::open(st, &d, &realm, "").await?;
+        }
+        "record" => {
+            let value = match &p["value"] {
+                Value::String(s) => s.trim().parse::<f64>().ok(),
+                v => v.as_f64(),
+            }
+            .ok_or_else(|| anyhow::anyhow!("the value is not a number: {}", p["value"]))?;
+            let point = api::Point { ts: p["ts"].as_i64().unwrap_or(0), value, dims: p["dims"].as_object().cloned().unwrap_or_default() };
+            crate::series::record(st, &realm, p["series"].as_str().unwrap_or_default(), &point, &by).await?;
         }
         "notify" => {
             st.notifier.send(crate::notify::Note {

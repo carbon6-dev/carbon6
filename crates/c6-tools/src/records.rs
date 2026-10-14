@@ -114,3 +114,37 @@ records_tool!(
         "realm": {"type": "string", "description": "Another realm's collection, through a grant it gave yours"}, "id": {"type": "string"}}, "required": ["collection", "id"], "additionalProperties": false}),
     |ctx, input| { call(ctx, "session.records_delete", input).await }
 );
+
+records_tool!(
+    SeriesRecord,
+    "series_record",
+    "SeriesRecord",
+    Concurrency::Shared,
+    "Adds a point to a series (numbers over time in your realm, such as revenue or a service's uptime): value, and dims for \
+     the series' dimensions (e.g. {\"service\": \"invoicer\"}); ts in ms, default now.",
+    json!({"type": "object", "properties": {
+        "series": {"type": "string"},
+        "value": {"type": "number"},
+        "dims": {"type": "object"},
+        "ts": {"type": "integer"}
+    }, "required": ["series", "value"], "additionalProperties": false}),
+    |ctx, input| { call(ctx, "session.series_record", input).await }
+);
+
+records_tool!(
+    SeriesQuery,
+    "series_query",
+    "SeriesQuery",
+    Concurrency::Shared,
+    "Summarizes a series over a window: agg (sum, avg, min, max, last, count), minutes (default a day) or from/to (ms), where \
+     (dimension values), group_by (a dimension), bucket (hour or day). Without a series: lists your realm's series, including \
+     model_spend, model_tokens and model_calls.",
+    json!({"type": "object", "properties": {
+        "series": {"type": "string"},
+        "query": {"type": "object", "properties": {
+            "agg": {"type": "string"}, "minutes": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+            "where": {"type": "object"}, "group_by": {"type": "string"}, "bucket": {"type": "string"}
+        }}
+    }, "additionalProperties": false}),
+    |ctx, input| { call(ctx, "session.series_query", input).await }
+);
