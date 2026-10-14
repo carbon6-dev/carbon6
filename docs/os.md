@@ -234,6 +234,22 @@ decision(id, realm, kind /* approve | choose | provide | confirm | question */,
 - **Batching:** decisions in the same group are presented together, and a scheduled digest lists what's open. This is what makes "my only involvement is approval" practical.
 - **The document matters.** A decision should be answerable from the document alone, so the asking prompt (a skill) says what it must contain: the case, the evidence, the cost, the risk, and what each option does.
 
+#### As built (step 3)
+
+- **Storage:** migration `0031` turns `todos` into `decisions` in place: ids kept, `detail` becomes `document`, `resolution` becomes `note`, done becomes answered. New columns hold options, a form, a deadline with a default answer, the answer, how it was answered, and `ref`, naming what waits on it.
+- **Kinds and states:** kinds are approve, choose, confirm, provide, question, dispute and follow_up. States are open, snoozed, answered, dismissed, expired and withdrawn.
+- **What opens one** (`decisions.rs`):
+  - **A tool call held by a policy** (`approval:<session>:<call>`): Allow or Deny, a one-hour deadline, default Deny.
+  - **A workflow's approve step** (`workflow:<run>:<step>`): Go ahead or Stop.
+  - **The assistant's questions** (`question:<session>:<call>`): its fields as a form. A question asking for a secret gets no form; it is answered in the conversation, and secrets are never stored in decisions.
+  - **An agent's `decision_request`** (`session:<session>:<id>`): non-blocking. The agent carries on, and the answer arrives in its session as a message ("Your question was answered (decision #N …)").
+  - **`todo_add`, the memex's disputes, and you:** nothing waits on these.
+- **Answering:** answering one answers what waits on it (the approval, the workflow, the question, or a message to the session). If that fails, the decision stays open. Answering the waiting thing elsewhere (in the session, through its link, or by it timing out) settles the decision. Answers are checked: an option must be one offered, required fields must be filled, choices must be valid, and there are no extra fields. Nothing that waits can be dismissed.
+- **Deadlines:** every half minute (`sweep`), an open decision past its deadline takes its default answer, or "no", and becomes expired.
+- **Notifications:** a new decision with options sends a `decision` notification (on by default), with a signed link (`/approve/{token}`, prefix `dc:`) whose page offers the options as buttons.
+- **Reconcile at start:** the head opens decisions for whatever already waits without one (held tool calls, approve steps), so an upgrade loses nothing.
+- **API:** `/api/v1/decisions…` (list, count, get, add, `answer`, edit to snooze, dismiss or reopen, `session`). Every route has a catalog operation. The **Decisions** page replaces **To do**, and `/todos` still opens it.
+
 ### 4.3 Events and triggers
 
 Automations generalize into **triggers**: an event, an optional filter, and an action.
@@ -707,4 +723,10 @@ Choices the design left open, made while building, for review.
 | 2c | carbon6's prompts are a `prompts` system collection in root, not root skills | Skills are things agents load by name; these are carbon6's own instructions, with defaults that follow the code until edited |
 | 2c | A prompt nobody edited follows its default when the default changes; an edited one never does | Improvements reach you unless you chose otherwise |
 | 2c | Tool descriptions stay in code | They describe what the code does, and change with it; editing one could misdescribe a tool |
+| 3 | Decisions are the `todos` table, renamed and widened, not a new table | Ids stay the same by construction, so references keep working |
+| 3 | An agent's `decision_request` never blocks; the answer arrives as a message | No new waiting machinery on workers; the agent keeps working, and the answer resumes it like any message |
+| 3 | Tool-call approvals keep their own path (the session's buttons, the signed link) and open a decision alongside | The worker's approval protocol stays as it is; the decision is the one place you see everything, and either side settles the other |
+| 3 | A question asking for a secret is never answered through decisions | Answers are stored; secrets must not be |
+| 3 | The memex's review queue stays in the memex for now | It needs the memex to raise and resolve decisions over the fabric; step 4 revisits the memex |
+| 3 | Digests are left for triggers (step 5) | A digest is a scheduled notification of open decisions, which is exactly a trigger |
 

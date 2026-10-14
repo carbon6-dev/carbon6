@@ -202,8 +202,13 @@ async fn links(st: &HeadState, note: &Note) -> anyhow::Result<Links> {
     if base.is_empty() {
         return Ok(Links::default());
     }
-    // Workflow approvals ("wf:<run>") have no session page.
-    let session_url = note.session_id.as_ref().filter(|id| !id.starts_with("wf:")).map(|id| format!("{base}/sessions/{id}"));
+    // Workflow approvals ("wf:<run>") have no session page; decisions
+    // ("dc:") have the decisions page.
+    let session_url = note
+        .session_id
+        .as_ref()
+        .filter(|id| !id.starts_with("wf:"))
+        .map(|id| if id.starts_with("dc:") { format!("{base}/decisions") } else { format!("{base}/sessions/{id}") });
     let approve_url = match (&note.session_id, &note.call_id) {
         (Some(s), Some(c)) => Some(format!("{base}/approve/{}", sign(st, s, c, c6_core::now_ms() + LINK_TTL_MS).await?)),
         _ => None,
@@ -411,6 +416,22 @@ const INVALID: &str = "<p>This link is not valid or has expired. Open the sessio
 /// previews in chat apps cannot answer).
 pub async fn approve_page(State(st): State<Arc<HeadState>>, Path(token): Path<String>) -> Html<String> {
     let Some((session_id, call_id)) = verify(&st, &token).await else { return page("Approval", INVALID) };
+    // A decision ("dc:", its id): its options as buttons.
+    if session_id == "dc:" {
+        let d = match call_id.parse::<i64>().ok() {
+            Some(id) => crate::decisions::get(&st, id).await.ok().flatten(),
+            None => None,
+        };
+        let Some(d) = d.filter(|d| matches!(d.state.as_str(), "open" | "snoozed")) else {
+            return page("Decision", "<p>This was already answered (or withdrawn).</p>");
+        };
+        let buttons: String = d
+            .options
+            .iter()
+            .map(|o| format!("<button class=allow name=option value=\"{0}\" title=\"{1}\">{0}</button>", esc(&o.label), esc(&o.does)))
+            .collect();
+        return page(&d.title, &format!("<pre>{}</pre><form method=post>{buttons}</form>", esc(&d.document)));
+    }
     if let Some(run) = session_id.strip_prefix("wf:") {
         let Some((workflow, title, message)) = crate::workflows::waiting(&st, run, &call_id).await else {
             return page("Approval", "<p>This step was already answered (or the run ended).</p>");
@@ -449,12 +470,24 @@ pub async fn approve_page(State(st): State<Arc<HeadState>>, Path(token): Path<St
 
 #[derive(serde::Deserialize)]
 pub struct Answer {
+    #[serde(default)]
     allow: String,
+    /// A decision's option.
+    #[serde(default)]
+    option: String,
 }
 
 /// `POST /approve/{token}`.
 pub async fn approve_answer(State(st): State<Arc<HeadState>>, Path(token): Path<String>, Form(a): Form<Answer>) -> Html<String> {
     let Some((session_id, call_id)) = verify(&st, &token).await else { return page("Approval", INVALID) };
+    if session_id == "dc:" {
+        let Ok(id) = call_id.parse::<i64>() else { return page("Decision", INVALID) };
+        let answer = api::DecisionAnswer { option: Some(a.option.clone()), ..Default::default() };
+        return match crate::decisions::answer(&st, id, &answer, "a notification link").await {
+            Ok(_) => page(&format!("Answered: {}", a.option), "<p>Sent.</p>"),
+            Err(e) => page("Not sent", &format!("<p>{}</p>", esc(&format!("{e:#}")))),
+        };
+    }
     if let Some(run) = session_id.strip_prefix("wf:") {
         let allow = a.allow == "1";
         return match crate::workflows::decide(&st, run, &call_id, allow).await {

@@ -47,8 +47,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             "todo.add" => {
                 // From the memex, about one realm's knowledge.
                 let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
-                let t: c6_api::TodoIn = serde_json::from_value(params).map_err(|e| bad_request(format!("{e}")))?;
-                Ok(json!({"id": crate::todos::add(st, &t, &realm).await?.id}))
+                let d: c6_api::DecisionIn = serde_json::from_value(params).map_err(|e| bad_request(format!("{e}")))?;
+                Ok(json!({"id": crate::decisions::open(st, &d, &realm, "").await?.id}))
             }
             "notify" => {
                 let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
@@ -75,7 +75,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         // A side chat or subagent works for its parent's conversation.
         let target = session.parent_id.clone().unwrap_or(session_id);
         return match what {
-            "todo" | "todo_resolve" => crate::todos::from_session(st, &target, what, &params).await,
+            "todo" | "todo_resolve" | "decision" => crate::decisions::from_session(st, &target, what, &params).await,
             // The API reference, for agents writing integrations.
             "api" => {
                 let urls = crate::notify::api_urls(st).await;

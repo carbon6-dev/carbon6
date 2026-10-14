@@ -190,9 +190,18 @@ async fn workflows_chain_conditions_and_approvals() {
     let r2 = run("web1").await;
     let w = status(r2.id.clone(), &["waiting"]).await;
     assert_eq!(steps(&w), "check=ok tell=skipped ok=waiting fix=pending");
-    let r = http.post(format!("{api}/workflows/runs/{}/steps/ok/decide", r2.id)).json(&json!({"allow": false})).send().await.unwrap();
-    assert_eq!(r.status(), reqwest::StatusCode::NO_CONTENT);
+    // The step is a decision too: answered there, the run stops.
+    let source = format!("workflow:{}", r2.id);
+    let decisions: Vec<c6_api::Decision> = http.get(format!("{api}/decisions")).send().await.unwrap().json().await.unwrap();
+    let d = decisions.into_iter().find(|d| d.source == source).expect("the step's decision");
+    assert!(d.waiting && d.title == "Clean up?" && d.options.len() == 2, "{d:?}");
+    let r = http.post(format!("{api}/decisions/{}/answer", d.id)).json(&json!({"option": "Stop"})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     assert_eq!(status(r2.id.clone(), &["denied"]).await.status, "denied");
+    // Run 1's, answered by its link, was settled too.
+    let answered: Vec<c6_api::Decision> = http.get(format!("{api}/decisions?state=answered")).send().await.unwrap().json().await.unwrap();
+    let first = answered.iter().find(|d| d.source == format!("workflow:{}", r1.id)).expect("run 1's decision");
+    assert_eq!((first.answered_via.as_str(), first.answer.as_ref().unwrap()["option"].as_str()), ("the workflow", Some("Go ahead")));
 
     // 3: fine now: reported (changed), nothing to approve or fix.
     mock.push(Reply::Text("Disk at 40%.\nRESULT: OK".into()));

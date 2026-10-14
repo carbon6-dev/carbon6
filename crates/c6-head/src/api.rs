@@ -125,10 +125,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/live", get(live))
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
-        .route("/api/v1/todos", get(list_todos).post(add_todo))
-        .route("/api/v1/todos/count", get(count_todos))
-        .route("/api/v1/todos/{id}", get(get_todo).patch(edit_todo))
-        .route("/api/v1/todos/{id}/session", post(todo_session))
+        .route("/api/v1/decisions", get(list_decisions).post(add_decision))
+        .route("/api/v1/decisions/count", get(count_decisions))
+        .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
+        .route("/api/v1/decisions/{id}/answer", post(answer_decision))
+        .route("/api/v1/decisions/{id}/session", post(decision_session))
         .route("/api/v1/assistant", post(ask_assistant))
         .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
         .route("/api/v1/catalog", get(get_catalog))
@@ -2158,63 +2159,66 @@ async fn answer_question(
     Path((id, call_id)): Path<(String, String)>,
     Json(a): Json<api::AnswerIn>,
 ) -> ApiResult<StatusCode> {
-    let session = st.store.session(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
-    let cmd = c6_proto::SessionCommand {
-        command_id: uuid::Uuid::now_v7().to_string(),
-        session_id: id,
-        kind: Some(c6_proto::session_command::Kind::Answer(c6_proto::Answer {
-            call_id,
-            values_json: serde_json::Value::Object(a.values).to_string(),
-            cancelled: a.cancelled,
-        })),
-    };
-    let worker: WorkerId = session.worker_id.parse().map_err(anyhow::Error::from)?;
-    if st.registry.send_command(worker, cmd) {
+    if crate::sessions::answer_question(&st, &id, &call_id, a.values, a.cancelled).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "the conversation is not running".into()))
     }
 }
 
-// --- Action items ---------------------------------------------------------------
+// --- Decisions (docs/os.md §4.2) ---------------------------------------------
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
-pub(crate) struct TodoQuery {
-    /// open (default; includes snoozed items now due), snoozed, done or dismissed.
+pub(crate) struct DecisionQuery {
+    /// open (default; includes snoozed ones now due), snoozed, answered, dismissed, expired or withdrawn.
     #[serde(default)]
     state: String,
 }
 
-async fn list_todos(
+async fn list_decisions(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
-    Query(q): Query<TodoQuery>,
-) -> ApiResult<Json<Vec<api::Todo>>> {
-    Ok(Json(crate::todos::list(&st, &q.state, &caller).await?))
+    Query(q): Query<DecisionQuery>,
+) -> ApiResult<Json<Vec<api::Decision>>> {
+    Ok(Json(crate::decisions::list(&st, &q.state, &caller).await?))
 }
 
-async fn add_todo(
+async fn add_decision(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
-    Json(t): Json<api::TodoIn>,
-) -> ApiResult<Json<api::Todo>> {
+    Json(d): Json<api::DecisionIn>,
+) -> ApiResult<Json<api::Decision>> {
     let realm = caller.realm_for_new(None)?;
-    Ok(Json(crate::todos::add(&st, &t, &realm).await?))
+    Ok(Json(crate::decisions::open(&st, &d, &realm, "").await?))
 }
 
-async fn count_todos(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(serde_json::json!({"open": crate::todos::open_count(&st, &caller).await?})))
+async fn count_decisions(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({"open": crate::decisions::open_count(&st, &caller).await?})))
 }
 
-async fn get_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Todo>> {
-    Ok(Json(crate::todos::get(&st, id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such action item".into()))?))
+async fn get_decision(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Decision>> {
+    Ok(Json(crate::decisions::get(&st, id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such decision".into()))?))
 }
 
-async fn edit_todo(State(st): State<Arc<HeadState>>, Path(id): Path<i64>, Json(e): Json<api::TodoEdit>) -> ApiResult<Json<api::Todo>> {
-    Ok(Json(crate::todos::edit(&st, id, &e).await?))
+async fn edit_decision(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<i64>,
+    Json(e): Json<api::DecisionEdit>,
+) -> ApiResult<Json<api::Decision>> {
+    Ok(Json(crate::decisions::edit(&st, id, &e).await?))
 }
 
-/// Starts a session that helps you settle the item.
-async fn todo_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
-    Ok(Json(crate::todos::start_session(&st, id).await?))
+async fn answer_decision(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<i64>,
+    Json(a): Json<api::DecisionAnswer>,
+) -> ApiResult<Json<api::Decision>> {
+    let via = if caller.realm.is_some() { "an API token" } else { "carbon6" };
+    Ok(Json(crate::decisions::answer(&st, id, &a, via).await?))
+}
+
+/// Starts a session that helps you settle the decision.
+async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::decisions::start_session(&st, id).await?))
 }

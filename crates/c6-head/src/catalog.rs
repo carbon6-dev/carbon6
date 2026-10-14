@@ -11,8 +11,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::{
-    After, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TodoQuery, TrailEdit, TrailStepIn, UpdateSession,
-    UsageQuery, WorkflowRunsQuery,
+    After, DecisionQuery, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TrailEdit, TrailStepIn,
+    UpdateSession, UsageQuery, WorkflowRunsQuery,
 };
 
 /// What an operation does to carbon6.
@@ -165,7 +165,10 @@ const AREAS: &[(&str, &str)] = &[
         "Collections: typed tables of records in a realm, for anything apps and agents keep (strict schemas, unique keys, history).",
     ),
     ("system", "carbon6 itself: realms, upgrades of its databases, and the backups made before each."),
-    ("todos", "Action items: things for the user to settle when they want to (facts to confirm, disputes, open questions)."),
+    (
+        "decisions",
+        "Decisions: every time carbon6 needs the user — agents' questions, approvals of tool calls and workflow steps, the assistant's questions, facts to confirm, disputes.",
+    ),
 ];
 
 pub fn areas() -> &'static [(&'static str, &'static str)] {
@@ -281,12 +284,13 @@ fn build() -> Vec<Op> {
         op!("workflows.steps.decide", "automation", "POST" "/api/v1/workflows/runs/{id}/steps/{step}/decide", Write, Input::Body(schema::<api::ApprovalDecision>), "Approves or rejects a workflow step waiting for you.", choices = &[("id", "workflows.runs")]),
 
         // Action items.
-        op!("todos.list", "todos", "GET" "/api/v1/todos", Read, Input::Query(schema::<TodoQuery>), "Action items (open by default), most important first."),
-        op!("todos.count", "todos", "GET" "/api/v1/todos/count", Read, Input::None, "How many action items are open."),
-        op!("todos.get", "todos", "GET" "/api/v1/todos/{id}", Read, Input::None, "An action item with its context.", choices = &[("id", "todos.list")]),
-        op!("todos.add", "todos", "POST" "/api/v1/todos", Write, Input::Body(schema::<api::TodoIn>), "Adds an action item for the user (an open question, something to confirm or follow up)."),
-        op!("todos.edit", "todos", "PATCH" "/api/v1/todos/{id}", Write, Input::Body(schema::<api::TodoEdit>), "Settles (done, with a resolution), snoozes, dismisses or reopens an action item.", choices = &[("id", "todos.list")]),
-        op!("todos.session", "todos", "POST" "/api/v1/todos/{id}/session", Write, Input::None, "Starts a session that helps the user settle an action item, with its context.", choices = &[("id", "todos.list")]),
+        op!("decisions.list", "decisions", "GET" "/api/v1/decisions", Read, Input::Query(schema::<DecisionQuery>), "Decisions (open by default): what waits first, then by priority."),
+        op!("decisions.count", "decisions", "GET" "/api/v1/decisions/count", Read, Input::None, "How many decisions are open."),
+        op!("decisions.get", "decisions", "GET" "/api/v1/decisions/{id}", Read, Input::None, "A decision: its case, options or form, context, and answer.", choices = &[("id", "decisions.list")]),
+        op!("decisions.add", "decisions", "POST" "/api/v1/decisions", Write, Input::Body(schema::<api::DecisionIn>), "Adds a decision for the user (a question, something to confirm or provide, a choice between options)."),
+        op!("decisions.answer", "decisions", "POST" "/api/v1/decisions/{id}/answer", Write, Input::Body(schema::<api::DecisionAnswer>), "Answers a decision (an option, the form's fields, a note); what waits on it gets the answer.", choices = &[("id", "decisions.list")]),
+        op!("decisions.edit", "decisions", "PATCH" "/api/v1/decisions/{id}", Write, Input::Body(schema::<api::DecisionEdit>), "Snoozes, dismisses or reopens a decision.", choices = &[("id", "decisions.list")]),
+        op!("decisions.session", "decisions", "POST" "/api/v1/decisions/{id}/session", Write, Input::None, "Starts a session that helps the user settle a decision, with its context.", choices = &[("id", "decisions.list")]),
 
         // Hosts.
         op!("hosts.list", "hosts", "GET" "/api/v1/hosts", Read, Input::None, "Hosts in the inventory with their last check."),

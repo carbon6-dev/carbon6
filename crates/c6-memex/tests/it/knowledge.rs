@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use c6_api::{Connection, Fact, Session, SessionDetail, SessionStatus, Todo};
+use c6_api::{Connection, Decision, Fact, Session, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
@@ -181,8 +181,8 @@ async fn knowledge_and_action_items() {
     idle(s3.id.clone()).await;
     let old: Vec<Fact> = serde_json::from_value(rpc("memex.knowledge.get", json!({"ids": [argo.id]})).await).unwrap();
     assert_eq!(old[0].status, "disputed");
-    let todos: Vec<Todo> = eventually("the action items", async || {
-        let t: Vec<Todo> = http.get(format!("{api}/todos")).send().await.ok()?.json().await.ok()?;
+    let todos: Vec<Decision> = eventually("the action items", async || {
+        let t: Vec<Decision> = http.get(format!("{api}/decisions")).send().await.ok()?.json().await.ok()?;
         (t.len() == 2).then_some(t)
     })
     .await;
@@ -191,7 +191,7 @@ async fn knowledge_and_action_items() {
     let token = todos.iter().find(|t| t.kind == "provide").unwrap();
     assert_eq!(token.context["worker"], "build-1");
     assert_eq!(token.source, format!("session:{}", s1.id));
-    let count: Value = http.get(format!("{api}/todos/count")).send().await.unwrap().json().await.unwrap();
+    let count: Value = http.get(format!("{api}/decisions/count")).send().await.unwrap().json().await.unwrap();
     assert_eq!(count["open"], 2);
 
     // You settle it: the new one is right (confirmed), the old one retired.
@@ -199,8 +199,8 @@ async fn knowledge_and_action_items() {
     rpc("memex.knowledge.set", json!({"id": new_id, "status": "reviewed"})).await;
     rpc("memex.knowledge.set", json!({"id": argo.id, "status": "retired"})).await;
     let r = http
-        .patch(format!("{api}/todos/{}", dispute.id))
-        .json(&json!({"state": "done", "resolution": "the namespace moved to ci-v2"}))
+        .post(format!("{api}/decisions/{}/answer", dispute.id))
+        .json(&json!({"note": "the namespace moved to ci-v2"}))
         .send()
         .await
         .unwrap();
@@ -222,15 +222,15 @@ async fn knowledge_and_action_items() {
         json!({"id": token.id, "resolution": "the user added ARGO_TOKEN"}).to_string(),
     )]));
     mock.push(Reply::Text("Settled.".into()));
-    let work: Session = http.post(format!("{api}/todos/{}/session", token.id)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(work.labels, vec!["todo".to_owned()]);
+    let work: Session = http.post(format!("{api}/decisions/{}/session", token.id)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(work.labels, vec!["decision".to_owned()]);
     idle(work.id.clone()).await;
     let asked = mock.requests().iter().map(|r| r.to_string()).find(|r| r.contains(&format!("Action item #{}", token.id))).unwrap();
     assert!(asked.contains("Argo token for build-1") && asked.contains("todo_resolve"), "{asked}");
-    let t: Todo = http.get(format!("{api}/todos/{}", token.id)).send().await.unwrap().json().await.unwrap();
-    assert_eq!((t.state.as_str(), t.resolution.as_str()), ("done", "the user added ARGO_TOKEN"));
+    let t: Decision = http.get(format!("{api}/decisions/{}", token.id)).send().await.unwrap().json().await.unwrap();
+    assert_eq!((t.state.as_str(), t.note.as_str()), ("answered", "the user added ARGO_TOKEN"));
     assert_eq!(t.sessions, vec![work.id.clone()]);
-    let count: Value = http.get(format!("{api}/todos/count")).send().await.unwrap().json().await.unwrap();
+    let count: Value = http.get(format!("{api}/decisions/count")).send().await.unwrap().json().await.unwrap();
     assert_eq!(count["open"], 0);
     stop.cancel();
 }

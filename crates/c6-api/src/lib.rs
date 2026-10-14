@@ -725,29 +725,60 @@ pub struct Fact {
     pub updated_at: UnixMs,
 }
 
-/// An action item: something for you to settle when you want to.
+/// A decision: any time carbon6 needs you (docs/os.md §4.2) — an agent's
+/// question, an approval of a tool call or a workflow step, something to
+/// confirm or provide, a dispute to settle.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct Todo {
+pub struct Decision {
     pub id: i64,
-    /// confirm, dispute, kit, provide, question or follow_up.
+    pub realm: String,
+    /// approve, choose, confirm, provide, question, dispute or follow_up.
     pub kind: String,
     pub title: String,
+    /// The case: what is asked, the evidence, what each option does
+    /// (Markdown).
     #[serde(default)]
-    pub detail: String,
-    /// What it is about: facts, things, sessions, kits, links (JSON).
+    pub document: String,
+    /// What it is about: facts, things, sessions, links (JSON).
     #[serde(default)]
     pub context: serde_json::Value,
-    /// Who raised it: a session, the memex, a kit.
+    /// Who asked: session:<id>, memex, workflow:<run>, you.
     pub source: String,
     /// high, normal or low.
     pub priority: String,
-    /// open, snoozed, done or dismissed.
+    /// Shown together with others of the same group.
+    #[serde(default)]
+    pub group: String,
+    /// The answers to choose from (none: settle it in your own words).
+    #[serde(default)]
+    pub options: Vec<DecisionOption>,
+    /// What to fill in (for provide and question).
+    #[serde(default)]
+    pub form: Vec<FormField>,
+    /// open, snoozed, answered, dismissed, expired or withdrawn.
     pub state: String,
     #[serde(default)]
     pub snooze_until: Option<UnixMs>,
+    /// Unanswered by then: the default answer is taken (else "no").
     #[serde(default)]
-    pub resolution: String,
+    pub deadline: Option<UnixMs>,
+    #[serde(default)]
+    pub default_answer: Option<String>,
+    /// {"option": …, "values": {…}} once answered.
+    #[serde(default)]
+    pub answer: Option<serde_json::Value>,
+    /// Your words with the answer.
+    #[serde(default)]
+    pub note: String,
+    /// Where it was answered: carbon6, a link, the session, expired.
+    #[serde(default)]
+    pub answered_via: String,
+    #[serde(default)]
+    pub answered_at: Option<UnixMs>,
+    /// Something waits on the answer (an agent, a tool call, a workflow).
+    #[serde(default)]
+    pub waiting: bool,
     /// Sessions started to settle it.
     #[serde(default)]
     pub sessions: Vec<String>,
@@ -758,41 +789,90 @@ pub struct Todo {
     pub updated_at: UnixMs,
 }
 
-/// `POST /api/v1/todos`.
+/// One answer a decision offers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct TodoIn {
-    #[serde(default = "todo_kind")]
+pub struct DecisionOption {
+    pub label: String,
+    /// What happens if you choose it.
+    #[serde(default)]
+    pub does: String,
+}
+
+/// A field a decision asks you to fill in.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FormField {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    /// text, long or choice.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// `POST /api/v1/decisions` (and what agents raise).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DecisionIn {
+    #[serde(default = "decision_kind")]
     pub kind: String,
     pub title: String,
-    #[serde(default)]
-    pub detail: String,
+    #[serde(default, alias = "detail")]
+    pub document: String,
     #[serde(default)]
     pub context: serde_json::Value,
     #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub priority: String,
-    /// Items with the same group are one item (raised again: its count).
+    /// Decisions with the same group are one (raised again: its count).
     #[serde(default)]
     pub group: String,
+    #[serde(default)]
+    pub options: Vec<DecisionOption>,
+    #[serde(default)]
+    pub form: Vec<FormField>,
+    #[serde(default)]
+    pub deadline: Option<UnixMs>,
+    /// One of the options, taken at the deadline.
+    #[serde(default)]
+    pub default_answer: Option<String>,
 }
 
-fn todo_kind() -> String {
+fn decision_kind() -> String {
     "question".into()
 }
 
-/// `PATCH /api/v1/todos/{id}`.
+/// `PATCH /api/v1/decisions/{id}`: snooze, dismiss, or reopen.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct TodoEdit {
-    /// open, snoozed, done or dismissed.
+pub struct DecisionEdit {
+    /// open, snoozed or dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snooze_until: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `POST /api/v1/decisions/{id}/answer`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DecisionAnswer {
+    /// One of its options (when it has options).
+    #[serde(default)]
+    pub option: Option<String>,
+    /// Its form's fields.
+    #[serde(default)]
+    pub values: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub note: String,
 }
 
 /// One input the assistant asks for.
@@ -1511,8 +1591,8 @@ pub struct Channel {
     /// the SMTP password, or a bearer token for a webhook.
     #[serde(default)]
     pub secret: String,
-    /// Which events (see `NOTIFY_EVENTS`); empty: approvals, failures,
-    /// notices, automation failures and budgets.
+    /// Which events (see `NOTIFY_EVENTS`); empty: approvals, decisions,
+    /// failures, notices, automation failures, budgets and hosts.
     #[serde(default)]
     pub events: Vec<String>,
     /// Labels a session must all have; empty: every session.
@@ -1523,8 +1603,9 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 8] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 9] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
+    ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
     ("finished", "a turn finished"),
     ("notice", "the agent sent you a notification (notify)"),
@@ -1535,7 +1616,7 @@ pub const NOTIFY_EVENTS: [(&str, &str); 8] = [
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 6] = ["approval", "failed", "notice", "automation", "budget", "host"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 7] = ["approval", "decision", "failed", "notice", "automation", "budget", "host"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.

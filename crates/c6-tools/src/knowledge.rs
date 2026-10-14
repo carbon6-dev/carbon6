@@ -197,6 +197,38 @@ simple_tool!(
 );
 
 simple_tool!(
+    DecisionRequest,
+    "decision_request",
+    "DecisionRequest",
+    "Asks the user to decide something, without stopping: carry on with what you can meanwhile, and the answer arrives later in \
+     this conversation as a message (\"Your question was answered (decision #N …)\"). Give the case in document: what you need, \
+     why, the evidence, and what you do meanwhile. Offer options when there are a few clear answers (each with what it does), or a \
+     form for values to fill in. With a deadline (in minutes), give the default answer taken if nobody answers by then.",
+    json!({"type": "object", "properties": {
+        "title": {"type": "string", "description": "The question, in a line"},
+        "document": {"type": "string", "description": "The case (Markdown)"},
+        "options": {"type": "array", "items": {"type": "object", "properties": {
+            "label": {"type": "string"}, "does": {"type": "string", "description": "What happens if chosen"}
+        }, "required": ["label"]}},
+        "form": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "label": {"type": "string"}, "kind": {"type": "string", "enum": ["text", "long", "choice"]},
+            "choices": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}
+        }, "required": ["name"]}},
+        "priority": {"type": "string", "enum": ["high", "normal", "low"]},
+        "deadline_minutes": {"type": "integer", "description": "Answer needed within this many minutes"},
+        "default_answer": {"type": "string", "description": "The option taken at the deadline"},
+        "group": {"type": "string", "description": "Shown together with others of the same group"},
+        "context": {"type": "object"}
+    }, "required": ["title", "document"], "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| {
+        result(call(ctx, "session.decision", input).await, |v| {
+            format!("decision #{} asked; carry on, and its answer will arrive as a message", v["id"])
+        })
+    }
+);
+
+simple_tool!(
     TodoResolve,
     "todo_resolve",
     "TodoResolve",

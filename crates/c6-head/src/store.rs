@@ -107,6 +107,18 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
                     FROM (SELECT * FROM records WHERE collection = 'memory' ORDER BY id)",
         },
         c6_core::upgrade::Check {
+            version: 31,
+            name: "every action item is a decision with its id, title and context",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || title || '/' || context, '|'), '') FROM (SELECT * FROM before.todos ORDER BY id)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || title || '/' || context, '|'), '') FROM (SELECT * FROM decisions ORDER BY id)",
+        },
+        c6_core::upgrade::Check {
+            version: 31,
+            name: "done action items are answered decisions",
+            before: "SELECT count(*) FROM before.todos WHERE state = 'done'",
+            after: "SELECT count(*) FROM decisions WHERE state = 'answered'",
+        },
+        c6_core::upgrade::Check {
             version: 30,
             name: "the original settings are kept",
             before: "SELECT count(*) FROM before.settings WHERE key IN ('skills', 'agents', 'commands', 'hooks', 'mcp_servers', 'templates', 'workflows', \
@@ -119,6 +131,8 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
         c6_core::upgrade::Allow { version: 30, table: "settings" },
         // Memory notes moved into records (kept as legacy_memories).
         c6_core::upgrade::Allow { version: 30, table: "memories" },
+        // Action items became decisions (the same table, renamed).
+        c6_core::upgrade::Allow { version: 31, table: "todos" },
         // Follow-through was removed (its tables and settings).
         c6_core::upgrade::Allow { version: 27, table: "tracker_observations" },
         c6_core::upgrade::Allow { version: 27, table: "trackers" },

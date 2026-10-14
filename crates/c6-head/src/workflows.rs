@@ -361,6 +361,8 @@ async fn drive(st: &HeadState, id: &str) -> anyhow::Result<()> {
                         run.steps[i].output = message.clone();
                         run.steps[i].started_at = Some(now_ms());
                         save_steps(st, id, &run.steps, "waiting").await?;
+                        let d = crate::decisions::workflow_decision(id, &def.id, &title, &message, &run.workflow.name);
+                        crate::decisions::open(st, &d, &run.realm, &format!("workflow:{id}:{}", def.id)).await?;
                         st.notifier.send(crate::notify::Note {
                             event: "approval",
                             title: format!("Approval needed: {}", if title.is_empty() { &run.workflow.name } else { &title }),
@@ -457,6 +459,15 @@ pub async fn decide(st: &HeadState, run_id: &str, step: &str, allow: bool) -> an
     }
     let Some(s) = run.steps.iter_mut().find(|s| s.id == step && s.status == "waiting") else { return Ok(false) };
     s.status = if allow { "ok" } else { "denied" }.into();
+    let option = if allow { "Go ahead" } else { "Stop" };
+    crate::decisions::settle_ref(
+        st,
+        &format!("workflow:{run_id}:{step}"),
+        "answered",
+        serde_json::json!({"option": option}),
+        "the workflow",
+    )
+    .await;
     s.finished_at = Some(now_ms());
     if allow {
         save_steps(st, run_id, &run.steps, "running").await?;
@@ -466,6 +477,23 @@ pub async fn decide(st: &HeadState, run_id: &str, step: &str, allow: bool) -> an
         finish(st, run_id, "denied", Some(format!("you said no at {step}"))).await?;
     }
     Ok(true)
+}
+
+/// Every approve step waiting for an answer: (run, step, title, message,
+/// workflow, realm).
+pub async fn all_waiting(st: &HeadState) -> anyhow::Result<Vec<(String, String, String, String, String, String)>> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM workflow_runs WHERE status = 'waiting'").fetch_all(&st.store.pool).await?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Ok(run) = load(st, &id).await else { continue };
+        for s in run.steps.iter().filter(|s| s.status == "waiting") {
+            if let Some(def) = run.workflow.steps.iter().find(|d| d.id == s.id) {
+                let title = render(&def.title, &run.input, &run.steps);
+                out.push((id.clone(), s.id.clone(), title, s.output.clone(), run.workflow.name.clone(), run.realm.clone()));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// What an approve step asks, if it still waits: (workflow, title, message).

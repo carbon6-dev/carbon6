@@ -109,11 +109,18 @@ Collections are typed tables of records in a realm, for anything apps and agents
 - **Code:** `/api/v1/collections…` (see `carbon6_api` or `/api/v1/openapi.json`). A query filters by field (`{"where": {"score": {"$gte": 8}}}`), by words, sorts, pages, or counts per value.
 - **Changing a schema:** a new schema is accepted if every record already there still fits.
 
-### Environment knowledge and To do
+### Environment knowledge and Decisions
 
-- **Environment knowledge:** agents record what they learn about the systems around the code (CI, clusters, networks, hosts) as facts in the memex. Each fact says how it is known (reviewed, verified, observed, inferred), where it applies, and how to re-check it. Every session starts with the relevant facts, and contradictions become action items.
-- **To do:** what agents cannot settle becomes an action item instead of a question that stops them. It is listed under To do with its context, and you can settle it inline or start a session for it.
-- **The design:** see [docs/follow-through.md](docs/follow-through.md) §6–7.
+- **Environment knowledge:** agents record what they learn about the systems around the code (CI, clusters, networks, hosts) as facts in the memex. Each fact says how it is known (reviewed, verified, observed, inferred), where it applies, and how to re-check it. Every session starts with the relevant facts, and contradictions become decisions.
+- **Decisions:** everything that needs you is in one list under **Decisions**:
+  - tool calls waiting for approval;
+  - workflow steps waiting for a go-ahead;
+  - the assistant's questions;
+  - questions agents asked without stopping (`decision_request`: the answer comes back to the session as a message);
+  - facts to confirm, and disputes.
+
+  Answer with an option, a form or a note, or start a session that helps you settle one. Answering one answers what waits on it, and answering in the session settles the decision. With options, a notification carries a link that answers it from your phone. With a deadline, an unanswered decision takes its default answer.
+- **The design:** see [docs/os.md](docs/os.md) §4.2 and [docs/follow-through.md](docs/follow-through.md) §6.
 
 ### Configuration
 

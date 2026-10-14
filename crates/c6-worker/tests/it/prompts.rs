@@ -108,7 +108,7 @@ async fn prompts_are_editable() {
 
     // An action item's session gets its prompt, filled in.
     let t: Value = http
-        .post(format!("{api}/todos"))
+        .post(format!("{api}/decisions"))
         .json(&json!({"kind": "confirm", "title": "Is CI on Argo?"}))
         .send()
         .await
@@ -117,7 +117,7 @@ async fn prompts_are_editable() {
         .await
         .unwrap();
     mock.push(Reply::Text("ok".into()));
-    let r = http.post(format!("{api}/todos/{}/session", t["id"])).send().await.unwrap();
+    let r = http.post(format!("{api}/decisions/{}/session", t["id"])).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     eventually("the action item's session", async || (mock.requests().len() >= 3).then_some(())).await;
     let first = mock.requests()[2]["messages"].to_string();

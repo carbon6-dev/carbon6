@@ -116,8 +116,23 @@ async fn assistant_discovers_asks_acts_and_asks_first() {
     assert_eq!(fields[1].r#type, "choice");
     let names: Vec<&str> = fields[1].choices.iter().map(|c| c.label.as_str()).collect();
     assert_eq!(names, vec!["m", "old"]);
+    // The question is a decision too: answered there, the conversation goes on.
+    let d = eventually("the question's decision", async || {
+        let ds: Vec<c6_api::Decision> = http.get(format!("{api}/decisions")).send().await.ok()?.json().await.ok()?;
+        ds.into_iter().find(|d| d.context["call_id"] == call_id)
+    })
+    .await;
+    assert_eq!((d.kind.as_str(), d.waiting, d.form.len()), ("question", true, 2), "{d:?}");
+    assert_eq!(d.form[1].choices, vec![conn.id.clone(), old.id.clone()]);
     let r = http
-        .post(format!("{api}/sessions/{}/answers/{call_id}", s.id))
+        .post(format!("{api}/decisions/{}/answer", d.id))
+        .json(&json!({"values": {"name": "build-1", "connection": "not-a-connection"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "choices are checked");
+    let r = http
+        .post(format!("{api}/decisions/{}/answer", d.id))
         .json(&json!({"values": {"name": "build-1", "connection": conn.id}}))
         .send()
         .await

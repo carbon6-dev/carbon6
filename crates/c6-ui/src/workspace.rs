@@ -63,7 +63,7 @@ pub enum View {
     Calendar,
     Contacts,
     Photos,
-    Todos,
+    Decisions,
     /// Collections; one by name, or (empty) the list.
     Collections {
         #[serde(default)]
@@ -128,7 +128,7 @@ impl View {
             View::Calendar => "/calendar".into(),
             View::Contacts => "/contacts".into(),
             View::Photos => "/photos".into(),
-            View::Todos => "/todos".into(),
+            View::Decisions => "/decisions".into(),
             View::Collections { name } if name.is_empty() => "/collections".into(),
             View::Collections { name } => format!("/collections/{name}"),
         }
@@ -194,7 +194,7 @@ impl View {
             ["calendar"] => View::Calendar,
             ["contacts"] => View::Contacts,
             ["photos"] => View::Photos,
-            ["todos"] => View::Todos,
+            ["decisions"] | ["todos"] => View::Decisions,
             ["collections"] => View::Collections { name: String::new() },
             ["collections", name] => View::Collections { name: (*name).to_owned() },
             _ => View::Sessions,
@@ -226,7 +226,7 @@ impl View {
             View::Calendar => "Calendar".into(),
             View::Contacts => "Contacts".into(),
             View::Photos => "Photos".into(),
-            View::Todos => "To do".into(),
+            View::Decisions => "Decisions".into(),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
         }
@@ -975,7 +975,7 @@ fn render_view(view: View) -> AnyView {
                     View::Calendar => view! { <crate::calendar::CalendarPage /> }.into_any(),
                     View::Contacts => view! { <crate::contacts::ContactsPage /> }.into_any(),
                     View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
-                    View::Todos => view! { <crate::todos::TodosPage /> }.into_any(),
+                    View::Decisions => view! { <crate::decisions::DecisionsPage /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}

@@ -7,6 +7,7 @@ mod auth;
 mod calendar;
 mod collections;
 mod contacts;
+mod decisions;
 mod files;
 mod fleet;
 mod labels;
@@ -23,7 +24,6 @@ mod sessions;
 mod settings;
 mod tasks;
 mod term;
-mod todos;
 mod understanding;
 mod usage;
 mod util;
@@ -98,7 +98,7 @@ fn Main() -> impl IntoView {
                             {move || (attention() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention()}</span> })}
                         </span>
                     </Go>
-                    <todos::TodoLink class=NAV />
+                    <decisions::DecisionLink class=NAV />
                     <span class="hidden sm:contents"><NavLink to=View::Mission label="Mission" /></span>
                     <span class="hidden lg:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
                     <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
@@ -145,7 +145,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                 <div class="flex flex-col text-sm">
                     <Go to=View::Sessions class=MENU>"Sessions"</Go>
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
-                    <todos::TodoLink class=MENU />
+                    <decisions::DecisionLink class=MENU />
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>

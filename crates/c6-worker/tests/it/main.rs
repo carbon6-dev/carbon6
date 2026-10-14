@@ -12,6 +12,7 @@ mod background;
 mod chaos;
 mod collections;
 mod commands;
+mod decisions;
 mod fixtures;
 mod hooks;
 mod ide;

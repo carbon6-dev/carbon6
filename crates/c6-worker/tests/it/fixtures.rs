@@ -122,8 +122,8 @@ async fn make_head_fixture() {
     // Memory notes, action items, an automation, an API token.
     post("memories", json!({"scope": "host:web1", "text": "web1 runs nginx behind the load balancer."})).await;
     post("memories", json!({"scope": "", "text": "Prefer small commits."})).await;
-    post("todos", json!({"kind": "confirm", "title": "Is CI on Argo?", "detail": "Assumed yes.", "context": {"things": ["ci:argo"]}, "priority": "high"})).await;
-    post("todos", json!({"kind": "question", "title": "Which region for staging?", "group": "staging-region"})).await;
+    post("decisions", json!({"kind": "confirm", "title": "Is CI on Argo?", "detail": "Assumed yes.", "context": {"things": ["ci:argo"]}, "priority": "high"})).await;
+    post("decisions", json!({"kind": "question", "title": "Which region for staging?", "group": "staging-region"})).await;
     post("automations", json!({"name": "nightly check", "template": "check", "trigger": "schedule", "cron": "0 3 * * *"})).await;
     post("automations", json!({"name": "alerts", "template": "triage", "trigger": "webhook"})).await;
     post("auth/tokens", json!({"name": "fixture script"})).await;
@@ -338,7 +338,7 @@ async fn head_fixtures_upgrade_and_serve() {
             assert!(v.as_array().is_some_and(|a| !a.is_empty()), "{name}: settings/{setting} is empty: {v}");
         }
         assert_eq!(get("settings/public_url").await["url"], "https://c6.example.net", "{name}");
-        assert!(get("todos?state=open").await.as_array().is_some_and(|t| t.len() >= 2), "{name}");
+        assert!(get("decisions?state=open").await.as_array().is_some_and(|t| t.len() >= 2), "{name}");
         assert!(get("automations").await.as_array().is_some_and(|a| a.len() >= 2), "{name}");
         assert!(get("memories").await.as_array().is_some_and(|m| m.len() >= 2), "{name}");
         assert!(get("workflows/runs").await.to_string().contains("check-then-fix"), "{name}");
@@ -362,6 +362,24 @@ async fn head_fixtures_upgrade_and_serve() {
             let id = page["records"][0]["id"].as_str().unwrap();
             let h = get(&format!("collections/candidates/records/{id}/history")).await;
             assert_eq!(h.as_array().map(Vec::len), Some(2), "{name}: {h}");
+        }
+        // What already waited (a held tool call, a workflow's approve
+        // step) has its decision once the head is up.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ds = get("decisions").await;
+            let kinds: Vec<String> = ds
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|d| d["waiting"] == true)
+                .map(|d| d["source"].as_str().unwrap_or("").to_owned())
+                .collect();
+            if kinds.iter().any(|k| k.starts_with("session:")) && kinds.iter().any(|k| k.starts_with("workflow:")) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{name}: no decisions for what waits: {ds}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // Its upgrade history includes the fixture's own creation.
         assert!(get("system/upgrades").await.as_array().is_some_and(|u| !u.is_empty()), "{name}");

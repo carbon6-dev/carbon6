@@ -193,13 +193,13 @@ async fn realms_keep_data_apart() {
     assert_eq!(all.len(), 2);
 
     // Action items stay in their realm.
-    let t: Value = as_(&home, M::POST, "todos", Some(json!({"title": "Home question"}))).await.unwrap().json().await.unwrap();
-    as_(&root, M::POST, "todos", Some(json!({"title": "Lab question"}))).await.unwrap();
-    sqlx::query("UPDATE todos SET realm = 'lab' WHERE title = 'Lab question'").execute(&db).await.unwrap();
-    let todos: Value = as_(&home, M::GET, "todos", None).await.unwrap().json().await.unwrap();
+    let t: Value = as_(&home, M::POST, "decisions", Some(json!({"title": "Home question"}))).await.unwrap().json().await.unwrap();
+    as_(&root, M::POST, "decisions", Some(json!({"title": "Lab question"}))).await.unwrap();
+    sqlx::query("UPDATE decisions SET realm = 'lab' WHERE title = 'Lab question'").execute(&db).await.unwrap();
+    let todos: Value = as_(&home, M::GET, "decisions", None).await.unwrap().json().await.unwrap();
     assert_eq!(todos.as_array().unwrap().len(), 1, "{todos}");
     assert_eq!(todos[0]["id"], t["id"]);
-    let count: Value = as_(&home, M::GET, "todos/count", None).await.unwrap().json().await.unwrap();
+    let count: Value = as_(&home, M::GET, "decisions/count", None).await.unwrap().json().await.unwrap();
     assert_eq!(count["open"], 1);
 
     stop.cancel();

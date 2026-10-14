@@ -671,7 +671,7 @@ fn ThingKnowledge(label: String) -> impl IntoView {
                 <h3 class="text-xs font-medium uppercase text-zinc-500">"What sessions learned"</h3>
                 {(!page.is_empty()).then(|| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&page)></div> })}
                 <ul class="space-y-2">
-                    {current.into_iter().map(|f| view! { <crate::todos::FactRow f on_change=Callback::new(move |()| tick.update(|t| *t += 1)) /> }).collect_view()}
+                    {current.into_iter().map(|f| view! { <crate::decisions::FactRow f on_change=Callback::new(move |()| tick.update(|t| *t += 1)) /> }).collect_view()}
                 </ul>
                 {(!old.is_empty()).then(|| view! {
                     <details class="text-xs text-zinc-500">

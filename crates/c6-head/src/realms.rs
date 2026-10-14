@@ -128,9 +128,9 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
     };
     match segments.as_slice() {
         // Collections whose lists and creations are filtered by realm.
-        ["sessions"] | ["search"] | ["todos"] | ["todos", "count"] | ["memories"] | ["automations"] => Ok(()),
+        ["sessions"] | ["search"] | ["decisions"] | ["decisions", "count"] | ["memories"] | ["automations"] => Ok(()),
         ["sessions", id, ..] => owned("sessions", "session", (*id).to_owned()).await,
-        ["todos", id, ..] => owned("todos", "action item", (*id).to_owned()).await,
+        ["decisions", id, ..] => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,
         ["automations", id, ..] => owned("automations", "automation", (*id).to_owned()).await,
         // Starting a template's sessions (in the caller's realm).

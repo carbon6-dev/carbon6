@@ -9,6 +9,7 @@ pub mod collections;
 pub mod config;
 mod convert;
 mod cron;
+pub mod decisions;
 mod export;
 pub mod fabric;
 pub mod google;
@@ -34,7 +35,6 @@ pub mod telemetry;
 pub mod templates;
 pub mod terminals;
 pub mod tls;
-pub mod todos;
 pub mod ui_ca;
 pub mod usage;
 mod webauthn;
@@ -219,6 +219,15 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     hosts::spawn_checks(state.clone());
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
+    decisions::spawn_sweeper(state.clone());
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = decisions::reconcile(&st).await {
+                tracing::warn!("opening decisions for what waits: {e:#}");
+            }
+        });
+    }
     assistant::start(state.clone(), api::router(state.clone())).await?;
 
     // Build the search index in the background (first start, or new format).

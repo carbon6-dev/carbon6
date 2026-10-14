@@ -726,6 +726,28 @@ pub async fn decide(st: &HeadState, session_id: &str, call_id: &str, allow: bool
     Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
 }
 
+/// Answers the assistant's question `call_id` in a conversation. Whether
+/// it reached the conversation.
+pub async fn answer_question(
+    st: &HeadState,
+    session_id: &str,
+    call_id: &str,
+    values: serde_json::Map<String, serde_json::Value>,
+    cancelled: bool,
+) -> anyhow::Result<bool> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let cmd = SessionCommand {
+        command_id: Uuid::now_v7().to_string(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::Answer(c6_proto::Answer {
+            call_id: call_id.to_owned(),
+            values_json: serde_json::Value::Object(values).to_string(),
+            cancelled,
+        })),
+    };
+    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+}
+
 /// Where a new session runs: the connection, model, effort and subagent
 /// model.
 #[derive(Debug, Default)]
@@ -876,6 +898,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     }
     notify_events(st, &batch.session_id, &ing.events).await;
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
+    crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.
     for ev in &ing.events {
         if let Some(c6_proto::session_event::Kind::TurnEnded(t)) = &ev.kind {
