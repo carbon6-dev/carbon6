@@ -306,7 +306,7 @@ async fn dispute(m: &Memex, id: &str, newer: &api::Fact, by: &str) -> anyhow::Re
 
 /// Raises an action item on the head (best effort: knowledge never waits).
 pub async fn todo(m: &Memex, kind: &str, title: &str, detail: &str, context: Value, group: &str, priority: &str) {
-    let p = json!({"kind": kind, "title": title, "detail": detail, "context": context, "source": "memex", "group": group, "priority": priority});
+    let p = json!({"kind": kind, "title": title, "detail": detail, "context": context, "source": "memex", "group": group, "priority": priority, "realm": m.realm});
     if let Err(e) = m.link.call("todo.add", p).await {
         tracing::warn!("raising an action item: {e:#}");
     }

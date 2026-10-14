@@ -147,8 +147,10 @@ impl EventFilter {
 
 /// The memex reported an event: runs the automations waiting for it, with
 /// the event as their input.
-pub async fn on_memex_event(st: &HeadState, kind: &str, data: &serde_json::Value) {
-    let all = match list(st, &crate::realms::Caller::root()).await {
+/// A memex event, from one realm's knowledge: only that realm's
+/// automations hear it.
+pub async fn on_memex_event(st: &HeadState, realm: &str, kind: &str, data: &serde_json::Value) {
+    let all = match list(st, &crate::realms::Caller::in_realm(realm)).await {
         Ok(a) => a,
         Err(e) => {
             warn!("loading automations: {e:#}");

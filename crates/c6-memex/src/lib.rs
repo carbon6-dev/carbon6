@@ -39,6 +39,11 @@ const RRF_K: f64 = 60.0;
 const CANDIDATES: u32 = 60;
 
 pub struct Memex {
+    /// The realm whose knowledge this is (docs/os.md §3): home's memex
+    /// holds every other realm's, each with its own database.
+    pub realm: String,
+    /// Other realms' memexes, opened when first used (home's only).
+    realms: tokio::sync::Mutex<std::collections::HashMap<String, Arc<Memex>>>,
     pub store: Store,
     pub embed: embed::Embedder,
     link: Arc<HeadLink>,
@@ -98,9 +103,17 @@ impl Memex {
         self.prompts.lock().unwrap().get(name).filter(|p| !p.trim().is_empty()).cloned().unwrap_or_else(|| default.to_owned())
     }
 
+    /// Home's memex (the one `c6m` runs), in `dir`.
     pub async fn open(dir: &Path, link: Arc<HeadLink>) -> anyhow::Result<Arc<Self>> {
+        Self::open_in(dir, link, REALM_HOME).await
+    }
+
+    async fn open_in(dir: &Path, link: Arc<HeadLink>, realm: &str) -> anyhow::Result<Arc<Self>> {
+        std::fs::create_dir_all(dir)?;
         let store = Store::open(&dir.join("memex.db")).await?;
         Ok(Arc::new(Self {
+            realm: realm.to_owned(),
+            realms: Default::default(),
             store,
             embed: embed::Embedder::new(link.clone()),
             google: google::Google::new(link.clone()),
@@ -128,10 +141,13 @@ impl Memex {
     /// Background work: keeps the settings fresh from the head, and embeds
     /// passages that have no vector yet.
     pub fn spawn_jobs(self: &Arc<Self>) {
-        self.spawn_scanner();
-        self.spawn_google();
+        // Mail, calendars, contacts, folders and photos are home's.
+        if self.is_home() {
+            self.spawn_scanner();
+            self.spawn_google();
+            media::spawn(self.clone());
+        }
         understand::spawn(self.clone());
-        media::spawn(self.clone());
         let m = self.clone();
         tokio::spawn(async move {
             let mut refreshed: Option<std::time::Instant> = None;
@@ -143,7 +159,9 @@ impl Memex {
                                 connection_id: id.to_owned(),
                                 model: c["embedding"]["model"].as_str().unwrap_or_default().to_owned(),
                             }));
-                            let accounts: Vec<google::Account> = serde_json::from_value(c["google"].clone()).unwrap_or_default();
+                            let home = m.is_home();
+                            let accounts: Vec<google::Account> =
+                                if home { serde_json::from_value(c["google"].clone()).unwrap_or_default() } else { Vec::new() };
                             let new_accounts = *m.accounts.lock().unwrap() != accounts;
                             *m.accounts.lock().unwrap() = accounts;
                             if let Some(p) = c["google_people"].as_str() {
@@ -155,17 +173,19 @@ impl Memex {
                                 transcription: task_of(&c["transcription"]),
                                 per_day: c["calls_per_day"].as_u64().unwrap_or(500) as u32,
                             };
-                            let places = c["places_file"].as_str().filter(|p| !p.is_empty()).map(str::to_owned);
-                            let current = m.places.lock().unwrap().as_ref().map(|p| p.file.clone());
-                            if places != current {
-                                m.set_places(places).await;
+                            if home {
+                                let places = c["places_file"].as_str().filter(|p| !p.is_empty()).map(str::to_owned);
+                                let current = m.places.lock().unwrap().as_ref().map(|p| p.file.clone());
+                                if places != current {
+                                    m.set_places(places).await;
+                                }
+                                faces::configure(
+                                    &m,
+                                    c["face_detector"].as_str().filter(|p| !p.is_empty()).map(str::to_owned),
+                                    c["face_embedder"].as_str().filter(|p| !p.is_empty()).map(str::to_owned),
+                                )
+                                .await;
                             }
-                            faces::configure(
-                                &m,
-                                c["face_detector"].as_str().filter(|p| !p.is_empty()).map(str::to_owned),
-                                c["face_embedder"].as_str().filter(|p| !p.is_empty()).map(str::to_owned),
-                            )
-                            .await;
                             if *m.tasks.lock().unwrap() != tasks {
                                 *m.tasks.lock().unwrap() = tasks;
                                 m.wake.notify_waiters();
@@ -175,7 +195,8 @@ impl Memex {
                                 m.resync.notify_one();
                             }
                             *m.prompts.lock().unwrap() = serde_json::from_value(c["prompts"].clone()).unwrap_or_default();
-                            let folders: Vec<api::MemexFolder> = serde_json::from_value(c["folders"].clone()).unwrap_or_default();
+                            let folders: Vec<api::MemexFolder> =
+                                if home { serde_json::from_value(c["folders"].clone()).unwrap_or_default() } else { Vec::new() };
                             let changed = *m.folders.lock().unwrap() != folders;
                             *m.folders.lock().unwrap() = folders;
                             if changed {
@@ -348,7 +369,7 @@ impl Memex {
 
     /// Tells the head something happened (automations can start on it).
     pub async fn emit(&self, kind: &str, data: Value) {
-        if let Err(e) = self.link.call("event", json!({"type": kind, "data": data})).await {
+        if let Err(e) = self.link.call("event", json!({"type": kind, "data": data, "realm": self.realm})).await {
             warn!(%kind, "telling the head: {e:#}");
         }
     }
@@ -559,12 +580,60 @@ impl Memex {
         }
     }
 
+    /// Forgets a deleted realm's knowledge: its database and blobs.
+    async fn drop_realm(&self, realm: &str) -> anyhow::Result<Value> {
+        anyhow::ensure!(self.is_home() && realm != REALM_HOME, "home's knowledge stays");
+        if let Some(m) = self.realms.lock().await.remove(realm) {
+            m.store.pool.close().await;
+        }
+        let dir = self.dir.join("realms").join(realm);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        info!(%realm, "a realm's memex dropped");
+        Ok(json!({"dropped": realm}))
+    }
+
+    pub fn is_home(&self) -> bool {
+        self.realm == REALM_HOME
+    }
+
+    /// Another realm's memex (home's only): its own database under
+    /// `realms/<realm>/`, opened and started when first used.
+    async fn realm_memex(&self, realm: &str) -> anyhow::Result<Arc<Memex>> {
+        anyhow::ensure!(self.is_home(), "only home's memex keeps other realms'");
+        anyhow::ensure!(
+            !realm.is_empty() && realm.len() <= 32 && realm.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{realm:?} is not a realm"
+        );
+        let mut realms = self.realms.lock().await;
+        if let Some(m) = realms.get(realm) {
+            return Ok(m.clone());
+        }
+        let m = Self::open_in(&self.dir.join("realms").join(realm), self.link.clone(), realm).await?;
+        m.spawn_jobs();
+        info!(%realm, "a realm's memex opened");
+        realms.insert(realm.to_owned(), m.clone());
+        Ok(m)
+    }
+
     pub async fn handle_method(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        // Every call is for one realm (the head stamps it). Only home keeps
-        // knowledge here so far; the others' arrive with creatable realms
-        // (docs/os.md §9, step 4), and until then nothing crosses.
-        let realm = params["realm"].as_str().unwrap_or(REALM_HOME);
-        anyhow::ensure!(realm == REALM_HOME, "realm {realm} keeps no knowledge in the memex yet (only home does)");
+        // Every call is for one realm (the head stamps it): another realm's
+        // goes to that realm's memex, with its own database, so nothing
+        // crosses. Mail, calendars, contacts, photos and folders are home's.
+        let realm = params["realm"].as_str().unwrap_or(&self.realm).to_owned();
+        if realm != self.realm {
+            const HOME_ONLY: [&str; 7] =
+                ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.media.", "memex.google", "memex.scan", "memex.upgrades"];
+            if HOME_ONLY.iter().any(|p| method.starts_with(p)) {
+                anyhow::bail!("{method} is home's (mail, calendars, contacts, photos and folders belong to home)");
+            }
+            if method == "memex.drop_realm" {
+                return self.drop_realm(&realm).await;
+            }
+            let other = self.realm_memex(&realm).await?;
+            return Box::pin(other.handle_method(method, params)).await;
+        }
         let allowed = Self::allowed(&params);
         match method {
             "memex.ingest" => ingest::ingest(self, params).await,
@@ -776,6 +845,9 @@ impl Memex {
             "memex.knowledge.page" => knowledge::page(self, params["key"].as_str().or(params["id"].as_str()).unwrap_or_default()).await,
             "memex.reload" => {
                 self.reload.notify_one();
+                for m in self.realms.lock().await.values() {
+                    m.reload.notify_one();
+                }
                 Ok(json!({}))
             }
             "memex.mention" => Ok(json!(self.store.find_things(params["q"].as_str().unwrap_or(""), 20).await?)),

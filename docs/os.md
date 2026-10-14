@@ -174,6 +174,17 @@ grant(id, from_realm, to_realm,
 - **Per-realm settings:** a Settings request with `?realm=` reads and writes that realm's own lists. A request-scoped value (`SETTINGS_REALM`) tells the settings store which realm, so every settings endpoint and form works per realm unchanged.
 - **UI:** a realm switcher in the header, remembered per browser ("All realms" by default; shown once a realm beyond home exists). Sessions, decisions and collections show the realm's own, new sessions start in it, and Settings edits its lists, with a note saying so. **Settings → System → Realms** creates and deletes realms, and sets which realms each worker and connection serves.
 
+### 3.13 As built (step 4b)
+
+- **The memex keeps each realm's knowledge in a database of its own:** home's memex (the one `c6m` runs) opens another realm's memex under `realms/<id>/` when first asked.
+  - **Isolation by construction:** each has its own items, things, links, facts, trails and passages, so search, briefs, facts, notes and things are per realm, and nothing in the queries could leak.
+  - **Upgrades:** each database upgrades itself through the same machinery.
+- **Routing:** every call carries its realm (the head stamps it), and home's memex hands another realm's call to that realm's memex.
+  - **Home's only:** mail, calendars, contacts, photos, folders and upgrades are refused for other realms.
+  - **Their jobs:** another realm's memex runs only the understanding and embedding jobs.
+- **Back to the head:** what a realm's memex raises carries its realm. Its disputes open decisions in that realm, and its events reach only that realm's automations.
+- **Deleting a realm** queues `memex.drop_realm`, which removes its database and blobs.
+
 ## 4. Primitives
 
 Every primitive is scoped by realm, has operations in the catalog (so the assistant, the CLI, the API reference and the OpenAPI document get them automatically), and has agent tools where agents need them.
@@ -739,4 +750,6 @@ Choices the design left open, made while building, for review.
 | 4a | A realm is deleted only when it owns nothing | Removing a realm with its data belongs to an app's uninstall (step 9), with an export first |
 | 4a | Per-realm settings use a request-scoped realm read by the settings store | Every settings endpoint and form works per realm without being rewritten |
 | 4a | The realm switcher lives in the browser, and "All realms" shows everything | Single user: it is a view, not a permission |
+| 4b | Another realm's memex knowledge is a separate database, not realm columns on shared tables | Isolation by construction: no query can leak, things are naturally per realm, a realm's knowledge is deleted with its file, and grants (4c) become reads across databases |
+| 4b | Deleting a realm drops its memex knowledge too | A realm is deleted only when it owns no sessions, records or decisions; what the memex derived from them goes with it |
 

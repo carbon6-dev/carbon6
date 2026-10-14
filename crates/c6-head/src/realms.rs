@@ -216,6 +216,8 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM api_tokens WHERE realm = ?").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM realms WHERE id = ?").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
+    // Its knowledge in the memex goes too (when the memex is next there).
+    crate::memex::enqueue(st, "memex.drop_realm", serde_json::json!({"realm": id})).await;
     st.registry.bump();
     Ok(())
 }
