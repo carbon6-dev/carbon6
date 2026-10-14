@@ -1,0 +1,192 @@
+{
+  "app": "decks",
+  "version": "1.0.0",
+  "realm": "decks",
+  "description": "Presentation decks from a brief: an outline you approve, a theme you choose, then slides built as HTML, checked by eye and delivered as HTML and PDF.",
+  "needs": {
+    "secrets": [],
+    "workers": "any",
+    "grants": []
+  },
+  "contents": {
+    "collections": [
+      {
+        "name": "decks",
+        "description": "Decks: the brief, the outline, the theme, where it is, and the files.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "title",
+            "brief",
+            "stage"
+          ],
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "brief": {
+              "type": "string"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "minutes": {
+              "type": "integer",
+              "description": "How long the talk is"
+            },
+            "theme": {
+              "type": "string"
+            },
+            "outline": {
+              "type": "string",
+              "description": "Markdown"
+            },
+            "stage": {
+              "type": "string",
+              "enum": [
+                "outlining",
+                "choosing",
+                "building",
+                "reviewing",
+                "delivered"
+              ]
+            },
+            "folder": {
+              "type": "string"
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "themes",
+        "description": "Looks for decks: colours, type and accents as CSS variables over the base CSS (skill deck-html).",
+        "schema": {
+          "type": "object",
+          "required": [
+            "name",
+            "css"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "mood": {
+              "type": "string"
+            },
+            "css": {
+              "type": "string"
+            }
+          }
+        },
+        "keys": [
+          "name"
+        ]
+      }
+    ],
+    "records": {
+      "themes": [
+        {
+          "name": "Paper",
+          "mood": "Light and editorial: serif display type, warm paper, ink-blue accent. For narratives, strategy, research.",
+          "css": ":root { --bg: #faf7f2; --fg: #1d1d1f; --muted: #6b6760; --accent: #1f4e8c; --accent-bg: #1f4e8c; --accent-fg: #faf7f2; --surface: #efe9df; --font-display: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif; --font-body: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; --display-weight: 600; }"
+        },
+        {
+          "name": "Night",
+          "mood": "Dark and high-contrast: near-black, bright text, electric accent. For product launches, keynotes, demos.",
+          "css": ":root { --bg: #0e1116; --fg: #f2f4f8; --muted: #9aa3b2; --accent: #6ee7b7; --accent-bg: #6ee7b7; --accent-fg: #0e1116; --surface: #1a1f29; --font-display: 'SF Pro Display', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; --font-body: 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; --display-weight: 700; }"
+        },
+        {
+          "name": "Signal",
+          "mood": "Clean and light: white, graphite text, one strong orange accent. For business reviews, data, updates.",
+          "css": ":root { --bg: #ffffff; --fg: #1f2328; --muted: #6e7781; --accent: #e8590c; --accent-bg: #1f2328; --accent-fg: #ffffff; --surface: #f3f4f6; --font-display: 'Helvetica Neue', 'Segoe UI', Arial, sans-serif; --font-body: 'Helvetica Neue', 'Segoe UI', Arial, sans-serif; --display-weight: 700; }"
+        }
+      ]
+    },
+    "skills": [
+      {
+        "name": "deck-storyline",
+        "description": "Turning a brief into a deck's storyline: audience, arc, one message per slide.",
+        "body": "Before any slide, decide what the audience should think or do afterwards: that is the deck's one-sentence point.\n\nThen the arc. Pick the one that fits:\n- Situation → complication → resolution (decisions, proposals).\n- Why now → what → how → what we need (pitches, plans).\n- Headline → evidence → implications (reviews, research).\n\nRules for the outline:\n- One message per slide. Write each slide's title as the message itself, a full sentence (\"Churn halved after onboarding changed\"), not a topic (\"Churn\").\n- Under each title, the evidence: 1–3 points, a number, or the chart that proves it. Say which visual each slide needs (chart of what, diagram of what, a big number, a quote).\n- Length: about one slide per minute of talk; 8–14 slides for most briefs. Title, an agenda only when there are 4+ sections, section dividers only for long decks, a closing slide with the ask or the summary.\n- Cut anything that doesn't serve the point. Put detail in an appendix, not the main flow.\nWrite the outline as Markdown: a numbered list of slide titles, each with its layout and its content in a few lines."
+      },
+      {
+        "name": "deck-design",
+        "description": "Design rules for professional slides: grid, type, spacing, colour, one idea per slide.",
+        "body": "- Space is the main tool. Margins stay as the base CSS sets them (88px sides, 72px top). Nothing touches an edge except full-bleed images.\n- One idea per slide; at most 3–5 points, each at most two lines. If it doesn't fit at 26px, it is two slides or an appendix.\n- Type: the theme's display face for titles, body face for text; never below 18px (captions), body 24–28px. Titles state the message.\n- Colour: the theme's accent marks the one thing to look at (the key bar, the number, the takeaway). Everything else is ink and muted.\n- Alignment: left-align text; align elements to shared edges; consistent positions for titles slide to slide.\n- Data: every chart answers the slide's title. Remove gridlines, borders, legends you can replace with direct labels; label the key value; sort bars; start bars at zero.\n- Vary layouts (title, points, two columns, big number, chart, quote, section) so the deck has rhythm, but repeat each layout the same way.\n- No clip art, no stock-photo clichés, no gradients unless the theme has them, no drop shadows, no centred paragraphs of text."
+      },
+      {
+        "name": "deck-html",
+        "description": "How to write a deck as HTML: the markup, layouts and base CSS, and printing it to PDF.",
+        "body": "Write one file, deck.html, in the deck's folder. Put the base CSS below and then the chosen theme's CSS (from the themes collection) in a <style>. Each slide is <section class=\"slide [title|section|quote]\">. Use the classes below for layouts: .kicker, h1/h2, ul.points, .cols (and .cols.wide-left), .big, .card, .grid3, figure/figcaption, .footer (slide number and the deck's short name on every slide but the title). No external scripts, fonts or images from the network: inline SVG for charts and icons, local files for images.\n\nTo see it: open file://<folder>/deck.html in the browser, screenshot each slide with selector \"section.slide:nth-of-type(N)\" and width 1280, height 720. To print it: the browser's pdf action, path deck.pdf.\n\nBase CSS:\n\n```css\n/* deck base: every slide is a 1280×720 section; the theme sets the variables. */\n@page { size: 1280px 720px; margin: 0; }\n* { box-sizing: border-box; margin: 0; padding: 0; }\nhtml, body { background: #888; }\nbody { font-family: var(--font-body); color: var(--fg); -webkit-font-smoothing: antialiased; }\n.slide { width: 1280px; height: 720px; overflow: hidden; position: relative; background: var(--bg); margin: 0 auto 24px;\n  padding: 72px 88px; display: flex; flex-direction: column; break-after: page; page-break-after: always; }\n@media print { html, body { background: none; } .slide { margin: 0; } }\n.kicker { font: 600 18px/1.2 var(--font-body); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 20px; }\nh1 { font: var(--display-weight) 72px/1.05 var(--font-display); letter-spacing: -.02em; }\nh2 { font: var(--display-weight) 44px/1.15 var(--font-display); letter-spacing: -.01em; margin-bottom: 36px; max-width: 1000px; }\np, li { font-size: 26px; line-height: 1.45; color: var(--fg); }\n.muted { color: var(--muted); }\nul.points { list-style: none; display: grid; gap: 22px; }\nul.points li { padding-left: 32px; position: relative; }\nul.points li::before { content: \"\"; position: absolute; left: 0; top: .6em; width: 12px; height: 12px; border-radius: 3px; background: var(--accent); }\n.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; flex: 1; align-items: start; }\n.cols.wide-left { grid-template-columns: 3fr 2fr; }\n.big { font: var(--display-weight) 160px/1 var(--font-display); color: var(--accent); letter-spacing: -.03em; }\n.footer { position: absolute; left: 88px; right: 88px; bottom: 32px; display: flex; justify-content: space-between; font-size: 15px; color: var(--muted); }\n.slide.title { justify-content: flex-end; padding-bottom: 110px; }\n.slide.title h1 { max-width: 1000px; }\n.slide.title .sub { font-size: 30px; color: var(--muted); margin-top: 24px; max-width: 900px; }\n.slide.section { justify-content: center; background: var(--accent-bg); }\n.slide.section h1 { color: var(--accent-fg); }\n.slide.quote blockquote { font: italic 44px/1.3 var(--font-display); max-width: 1000px; }\n.slide.quote cite { display: block; margin-top: 28px; font-size: 22px; color: var(--muted); font-style: normal; }\n.card { background: var(--surface); border-radius: 16px; padding: 28px 32px; }\n.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }\nfigure { flex: 1; display: flex; flex-direction: column; min-height: 0; }\nfigure svg { flex: 1; width: 100%; height: auto; }\nfigcaption { font-size: 18px; color: var(--muted); margin-top: 12px; }\n```"
+      },
+      {
+        "name": "deck-visuals",
+        "description": "Charts, diagrams and icons for slides, drawn as inline SVG.",
+        "body": "Draw visuals as inline SVG with a viewBox, so they scale and print sharply.\n- Bar and column charts: <rect> per value, sorted, starting at zero; label values directly on or beside bars; the key bar in var(--accent), others in var(--muted) at reduced opacity; no axis lines beyond a baseline.\n- Lines: one <polyline> per series, the key one in the accent, end labels instead of a legend.\n- Big numbers: a .big element with a one-line caption beats a chart with one value.\n- Diagrams: boxes (<rect rx>) and arrows (<path> with a marker) on a grid; few words per box; left to right or top to bottom.\n- Icons: simple line icons drawn as SVG paths (2px stroke, round caps), the same size and stroke on every slide.\n- Data from carbon6: query collections and series (records_query, series_query) and chart the real numbers; say where numbers come from in a caption.\n- Images: only real ones (the user's files, screenshots, product images); fit them with object-fit: cover inside a figure."
+      },
+      {
+        "name": "deck-review",
+        "description": "Checking each rendered slide and fixing what is wrong.",
+        "body": "Look at every slide's screenshot. For each, check and fix:\n- Nothing overflows or is cut off; nothing touches the edges; the footer is clear of content.\n- The title states the message and fits on at most two lines.\n- Text is readable: no more than about 40 words of body text; no line under 18px.\n- Alignment: elements share edges; spacing is even; columns line up.\n- The eye goes first to what matters (the accent marks it); nothing competes with it.\n- Charts: the right chart for the point, labelled, sorted, no clutter; numbers are right.\n- Consistency: same layout used the same way across slides; same title position.\nFix in deck.html and screenshot again until every slide passes. Then look at the whole deck once more as a sequence: does the story flow, is there rhythm, is anything repeated?"
+      }
+    ],
+    "templates": [
+      {
+        "name": "deck",
+        "description": "A deck from a brief: outline → theme → build → review → HTML and PDF.",
+        "prompt": "Make a presentation deck from this brief:\n\n{{input}}\n\nUse the skills deck-storyline, deck-design, deck-html, deck-visuals and deck-review. Work in a folder decks/<short-name>/ under the working directory.\n\n1. Add a record to the decks collection (title, brief, audience, stage outlining, folder).\n2. Write the outline (deck-storyline). Ask the user to approve it with decision_request: the outline in the document, options \"Looks good\" and \"Change it\" (they say what in the note), group decks. Then end your turn and wait: the answer comes back as a message. Revise and ask again until they approve. Save the outline in the record.\n3. Read the themes collection. Ask which theme with decision_request (one option per theme, its mood as what it does). Wait for the answer. Set the record's stage to building and its theme.\n4. Build deck.html (deck-html, deck-visuals, deck-design).\n5. Review: open it in the browser and screenshot every slide (selector \"section.slide:nth-of-type(N)\", width 1280, height 720). Fix what deck-review finds and look again, until every slide passes. Set the stage to reviewing while you do.\n6. Print deck.pdf with the browser's pdf action. Publish deck.html and deck.pdf with publish_file.\n7. Update the record: stage delivered, the files. Tell the user what you made in two lines."
+      },
+      {
+        "name": "deck-revise",
+        "description": "Changes to a delivered deck from notes.",
+        "prompt": "Revise a delivered deck. Its record and the user's notes:\n\n{{input}}\n\nUse the deck skills. Open the deck's folder, change deck.html as the notes ask, review the changed slides by screenshot (deck-review), print the PDF again, publish both files again (a new version), and update the record."
+      }
+    ],
+    "views": [
+      {
+        "name": "decks",
+        "title": "Decks",
+        "kind": "board",
+        "group_by": "stage",
+        "source": {
+          "collection": "decks"
+        },
+        "fields": [
+          "title",
+          "audience",
+          "theme"
+        ],
+        "actions": [
+          {
+            "label": "Revise",
+            "start": "deck-revise"
+          }
+        ]
+      },
+      {
+        "name": "themes",
+        "title": "Deck themes",
+        "kind": "table",
+        "source": {
+          "collection": "themes",
+          "sort": "name"
+        },
+        "fields": [
+          "name",
+          "mood"
+        ]
+      }
+    ],
+    "memory": [
+      {
+        "scope": "",
+        "text": "This realm makes presentation decks. Every deck is HTML first (deck.html), checked slide by slide in the browser, and delivered as HTML and PDF."
+      }
+    ]
+  }
+}

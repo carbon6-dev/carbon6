@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 const FACTORY: &str = include_str!("../../../../examples/apps/service-factory.json");
 const CRM: &str = include_str!("../../../../examples/apps/personal-crm.json");
+const DECKS: &str = include_str!("../../../../examples/apps/decks.json");
 
 #[tokio::test]
 async fn example_apps_install_and_work() {
@@ -41,7 +42,7 @@ async fn example_apps_install_and_work() {
         async move { http.get(format!("{api}/decisions")).send().await.unwrap().json::<Vec<Decision>>().await.unwrap() }
     };
 
-    for (pkg, realm) in [(FACTORY, "factory"), (CRM, "crm")] {
+    for (pkg, realm) in [(FACTORY, "factory"), (CRM, "crm"), (DECKS, "decks")] {
         let p: Value = serde_json::from_str(pkg).unwrap();
         let plan: AppPlan = send(M::POST, "apps/plan", p.clone()).await.json().await.unwrap();
         assert!(plan.problems.is_empty(), "{realm}: {:?}", plan.problems);
@@ -50,6 +51,16 @@ async fn example_apps_install_and_work() {
         let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
         assert!(r.status().is_success(), "{realm}: {}", r.text().await.unwrap());
     }
+
+    // The decks app: its themes, skills, templates and views.
+    let themes = ok(send(M::GET, "collections/themes/records?realm=decks", json!({})).await).await;
+    assert_eq!(themes["total"], 3);
+    assert!(themes["records"].as_array().unwrap().iter().all(|t| t["fields"]["css"].as_str().unwrap().contains("--accent")));
+    let skills = ok(send(M::GET, "settings/skills?realm=decks", json!({})).await).await;
+    assert!(skills.to_string().contains("@page { size: 1280px 720px"), "the base CSS is in deck-html");
+    assert_eq!(skills.as_array().unwrap().len(), 5);
+    assert_eq!(ok(send(M::GET, "settings/templates?realm=decks", json!({})).await).await.as_array().unwrap().len(), 2);
+    assert_eq!(ok(send(M::GET, "views?realm=decks", json!({})).await).await.as_array().unwrap().len(), 2);
 
     // Everything the factory brings is there.
     let count = |path: String| async move { ok(send(M::GET, &path, json!({})).await).await.as_array().map(Vec::len).unwrap_or(0) };

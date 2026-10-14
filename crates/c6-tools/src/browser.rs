@@ -382,13 +382,14 @@ impl Tool for BrowserTool {
                           screenshot: see the page as an image (selector: just that element, e.g. one slide; full_page: \
                           the whole page; width and height: set the window size first, e.g. 1280×720; save: true also \
                           puts it in the session's Outputs for the user). Use it to check how something you made looks. \
-                          evaluate {script}: run JavaScript \
+                          pdf {path}: print the page to a PDF file (page size from the page's CSS @page, backgrounds \
+                          included; save: true also puts it in Outputs). evaluate {script}: run JavaScript \
                           in the page and get its JSON value. close. Element numbers change when the page does: read again \
                           after a page changes. Prefer web search and fetching for plain lookups; use the browser for pages \
                           that need JavaScript, signing in, or filling forms."
                 .into(),
             parameters: json!({"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["open", "read", "click", "type", "select", "press", "scroll", "back", "screenshot", "evaluate", "close"]},
+                "action": {"type": "string", "enum": ["open", "read", "click", "type", "select", "press", "scroll", "back", "screenshot", "pdf", "evaluate", "close"]},
                 "url": {"type": "string"},
                 "ref": {"type": "integer", "description": "An element's number from read"},
                 "text": {"type": "string"},
@@ -402,7 +403,8 @@ impl Tool for BrowserTool {
                 "full_page": {"type": "boolean"},
                 "width": {"type": "integer"},
                 "height": {"type": "integer"},
-                "save": {"type": "boolean", "description": "screenshot: also put it in the session's Outputs"}
+                "save": {"type": "boolean", "description": "screenshot, pdf: also put it in the session's Outputs"},
+                "path": {"type": "string", "description": "pdf: the file to write"}
             }, "required": ["action"], "additionalProperties": false}),
         }
     }
@@ -618,6 +620,25 @@ async fn act(b: &mut Browser, ctx: &ToolCtx, action: &str, input: &Value) -> Res
             b.shot = Some(data);
             Ok(said)
         }
+        "pdf" => {
+            let path = input["path"].as_str().filter(|p| !p.trim().is_empty()).ok_or("path (the PDF file to write) is required")?;
+            let v = b.call("Page.printToPDF", json!({"printBackground": true, "preferCSSPageSize": true})).await?;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(v["data"].as_str().unwrap_or(""))
+                .map_err(|e| format!("reading the PDF: {e}"))?;
+            let full = ctx.session.resolve(path);
+            ctx.session.fs_write(&full, &data).await?;
+            let mut said = format!("Wrote {} ({} KB).", full.display(), data.len() / 1024);
+            if input["save"].as_bool() == Some(true) {
+                let sink = ctx.session.publisher().ok_or("Outputs are not available here")?;
+                let (title, _) = b.location().await;
+                let name = full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "page.pdf".into());
+                sink.send(crate::Published { name: name.clone(), title, mime: "application/pdf".into(), data })
+                    .map_err(|_| "Outputs are not available here".to_owned())?;
+                said.push_str(&format!(" Saved as {name} in the session's Outputs."));
+            }
+            Ok(said)
+        }
         "evaluate" => {
             let script = input["script"].as_str().filter(|s| !s.trim().is_empty()).ok_or("script is required")?;
             let v = b.eval(script).await?;
@@ -726,6 +747,9 @@ mod tests {
         assert_eq!(el.images.len(), 1, "{}", el.content);
         let missing = tool.call(&ctx, json!({"action": "screenshot", "selector": "#nope"})).await;
         assert!(missing.is_error && missing.content.contains("nothing on the page matches"));
+        let pdf = call(json!({"action": "pdf", "path": "page.pdf"})).await;
+        assert!(pdf.contains("page.pdf"), "{pdf}");
+        assert!(std::fs::read(dir.path().join("page.pdf")).unwrap().starts_with(b"%PDF"));
         assert!(call(json!({"action": "screenshot", "save": true})).await.contains("screenshot-1.png"));
         let shot = pub_rx.try_recv().unwrap();
         assert_eq!((shot.mime.as_str(), &shot.data[1..4]), ("image/png", b"PNG".as_slice()));
