@@ -271,6 +271,21 @@ pub async fn caller_of(st: &HeadState, to: &str, method: &str, by: &str) -> Opti
     Some(g.from_realm)
 }
 
+/// Whether realm `to` may start realm `from`'s template (granted when an
+/// app requiring `from`'s app was installed, docs/packages.md §3).
+pub async fn may_start(st: &HeadState, from: &str, to: &str, template: &str, by: &str) -> bool {
+    let method = format!("template:{template}");
+    let Some(g) = in_force(st, Some(from), to, "operations", "call")
+        .await
+        .into_iter()
+        .find(|g| g.scope["methods"].as_array().is_some_and(|m| m.iter().any(|x| x == method.as_str())))
+    else {
+        return false;
+    };
+    record_use(st, &g.id, by, &method).await;
+    true
+}
+
 pub async fn log_memex_read(st: &HeadState, grant: &str, by: &str, what: &str) {
     record_use(st, grant, by, what).await;
 }

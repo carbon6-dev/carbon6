@@ -18,6 +18,7 @@ pub mod profiles;
 pub mod publish;
 pub mod records;
 pub mod remote;
+pub mod templates;
 mod search;
 mod util;
 mod web;

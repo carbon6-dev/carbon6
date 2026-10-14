@@ -205,11 +205,8 @@ where
 /// Podman with debian:bookworm-slim already pulled; skipped otherwise.
 #[tokio::test]
 async fn kits_build_and_run_sandboxed() {
-    use c6_testkit::{MockLlm, Reply};
-    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    use c6_testkit::Reply;
     use std::time::Duration;
-    use tokio::sync::watch;
-    use tokio_util::sync::CancellationToken;
 
     let Some(rt) = c6_tools::kits::runtime().await else {
         eprintln!("no container runtime; skipped");
@@ -220,27 +217,11 @@ async fn kits_build_and_run_sandboxed() {
         eprintln!("debian:bookworm-slim is not pulled; skipped");
         return;
     }
-    let mock = MockLlm::start().await;
-    let (head_dir, state, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let head = c6_head::start(HeadConfig {
-        data_dir: head_dir.path().to_owned(),
-        bind: vec!["127.0.0.1".parse().unwrap()],
-        ui_port: 0,
-        worker_port: 0,
-        auth: false,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let work = tempfile::tempdir().unwrap();
+    let w = with_worker().await;
+    let (mock, wid) = (&w.mock, w.wid);
+    let api = w.api.clone();
     let http = reqwest::Client::new();
-    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
-    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
-    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    let stop = CancellationToken::new();
-    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
     use reqwest::Method as M;
     let send = |method: M, path: &str, body: Value| {
         let (http, url) = (http.clone(), format!("{api}/{path}"));
@@ -253,8 +234,7 @@ async fn kits_build_and_run_sandboxed() {
         v
     };
     let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
-    let conn: c6_api::Connection =
-        send(M::POST, "connections", json!({"name": "m", "base_url": mock.base_url()})).await.json().await.unwrap();
+    let conn = w.conn.clone();
 
     // A base kit, a kit built from it, and a library in the home realm that
     // requires the kit.
@@ -280,7 +260,6 @@ async fn kits_build_and_run_sandboxed() {
     mock.push(Reply::ToolCalls(vec![("kit_shell".into(), json!({"kit": probe, "command": "id"}).to_string())]));
     mock.push(Reply::Text("Done.".into()));
     std::fs::create_dir(work.path().join("out")).unwrap();
-    let wid = worker.identity.meta.worker_id.0;
     ok(send(M::POST, "sessions", json!({"worker_id": wid, "cwd": work.path(), "connection_id": conn.id, "model": "m", "prompt": "probe"})).await).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     let seen = loop {
@@ -303,6 +282,110 @@ async fn kits_build_and_run_sandboxed() {
     for t in String::from_utf8_lossy(&tags.stdout).lines().filter(|t| t.contains(&nonce)) {
         let _ = tokio::process::Command::new(&rt).args(["rmi", t]).output().await;
     }
-    stop.cancel();
-    head.shutdown().await.unwrap();
+    w.stop().await;
+}
+
+/// A head with a connected worker and a mock model.
+struct WithWorker {
+    head: c6_head::Head,
+    api: String,
+    wid: uuid::Uuid,
+    conn: c6_api::Connection,
+    mock: c6_testkit::MockLlm,
+    stop: tokio_util::sync::CancellationToken,
+    _dirs: (tempfile::TempDir, tempfile::TempDir),
+}
+
+impl WithWorker {
+    async fn stop(self) {
+        self.stop.cancel();
+        self.head.shutdown().await.unwrap();
+    }
+}
+
+async fn with_worker() -> WithWorker {
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = c6_testkit::MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    let conn: c6_api::Connection = reqwest::Client::new()
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    WithWorker { head, api, wid: worker.identity.meta.worker_id.0, conn, mock, stop, _dirs: (head_dir, state) }
+}
+
+/// An app requiring an app may start the templates it exports, from its
+/// sessions; nothing else of that realm.
+#[tokio::test]
+async fn template_start_through_an_export() {
+    use c6_testkit::Reply;
+    let w = with_worker().await;
+    let http = reqwest::Client::new();
+    let api = w.api.clone();
+    use reqwest::Method as M;
+    let send = |method: M, path: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.request(method, &url).json(&body).send().await.unwrap() }
+    };
+    let ok = async |r: reqwest::Response| -> Value {
+        let s = r.status();
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let templates = json!([{"name": "make", "prompt": "Make: {{input}}"}, {"name": "secret", "prompt": "Secret: {{input}}"}]);
+    ok(send(M::POST, "packages", json!({"manifest": {"package": "maker", "version": "1.0.0", "realm": "maker",
+        "contents": {"templates": templates}, "exports": {"templates": ["make"]}}, "files": {}})).await).await;
+    ok(send(M::POST, "packages", json!({"manifest": {"package": "user", "version": "1.0.0", "realm": "user", "requires": {"maker": "^1"},
+        "contents": {"skills": [{"name": "s", "body": "b"}]}}, "files": {}})).await).await;
+    let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "user"})).await).await).unwrap();
+    let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+
+    w.mock.push(Reply::ToolCalls(vec![("template_start".into(), json!({"realm": "maker", "template": "secret", "input": "x"}).to_string())]));
+    w.mock.push(Reply::ToolCalls(vec![("template_start".into(), json!({"realm": "maker", "template": "make", "input": "a chair"}).to_string())]));
+    w.mock.push(Reply::Text("Started.".into()));
+    w.mock.push(Reply::Text("Made.".into()));
+    let s: c6_api::Session = serde_json::from_value(
+        ok(send(M::POST, "sessions", json!({"worker_id": w.wid, "cwd": "", "connection_id": w.conn.id, "model": "m", "prompt": "go", "realm": "user"})).await)
+            .await,
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let started = loop {
+        let all: Vec<c6_api::Session> = send(M::GET, "sessions", json!({})).await.json().await.unwrap();
+        if let Some(x) = all.into_iter().find(|x| x.labels.contains(&format!("started-by:{}", s.id))) {
+            break x;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no started session");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(started.realm, "maker");
+    let seen = w.mock.requests().iter().map(|r| r["messages"].to_string()).collect::<Vec<_>>().join("\n");
+    assert!(seen.contains("may not start maker's template \\\"secret\\\""), "{seen}");
+    assert!(seen.contains("Make: a chair"), "{seen}");
+    w.stop().await;
 }

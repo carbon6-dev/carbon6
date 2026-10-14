@@ -102,6 +102,19 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                     crate::packages::kit_spec(st, &realm, params["kit"].as_str().unwrap_or_default()).await
                 }
             }
+            // A template, in the session's realm or one whose app exports it
+            // to this one (docs/packages.md §6).
+            "template_start" => {
+                let own = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+                let realm = params["realm"].as_str().filter(|r| !r.is_empty()).unwrap_or(&own).to_owned();
+                let template = params["template"].as_str().unwrap_or_default();
+                if realm != own && !crate::grants::may_start(st, &realm, &own, template, &format!("session:{target}")).await {
+                    return Err(bad_request(format!("realm {own} may not start {realm}'s template {template:?}; no grant allows it")));
+                }
+                let run = crate::templates::run(st, template, params["input"].as_str().unwrap_or_default(), &[format!("started-by:{target}")], &realm)
+                    .await?;
+                Ok(json!({"run_id": run.run_id, "realm": realm, "sessions": run.sessions.iter().map(|s| &s.id).collect::<Vec<_>>(), "errors": run.errors}))
+            }
             // Series, in the session's realm (docs/os.md §4.4).
             "series_record" | "series_query" => {
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
