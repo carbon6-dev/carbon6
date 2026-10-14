@@ -619,6 +619,25 @@ A realm that keeps you in touch with people who matter, using your mail without 
 - **Decisions in batches** were needed by both apps: "send these five?", and a weekly digest of open gates.
 - Neither example needed code in carbon6.
 
+### 6.4 As built (step 10)
+
+- **The packages:** both examples are in `examples/apps/` (`service-factory.json`, `personal-crm.json`). A test installs them as they are and exercises their wiring:
+  - their contents and grant requests;
+  - a payment webhook writing revenue per service with no session;
+  - a strong candidate firing the deep dive;
+  - the realm's own budget showing in usage;
+  - home's mail reaching the CRM through its grant.
+- **Gates** are agents' `decision_request`s with a `group` (gate-1 … gate-5) and the record in their context. Decision triggers filter on the group and the option, and map the context into the next template's input.
+- **Fixed while writing them:**
+  - Templates and workflows a realm brings were never used: running one read home's list. Now runs, triggers and workflow checks use the realm's own list plus root's.
+  - Budgets in a realm's own list were ignored. Now they apply to that realm's sessions, and the usage report shows them as `name (realm x)`.
+  - Memex events (mail arriving) reached only the realm that owns the knowledge. Now a realm granted reads of that kind hears them too, and each one is logged on the grant.
+- **Gaps they showed, left for later:**
+  - **Scoping:** grants are no narrower than a kind of knowledge. There is no "mail metadata only" for the CRM, and no "one mail account" for the factory's support inbox.
+  - **Filters can't look anything up:** a trigger can't say "mail from someone in `relationships`". The CRM's mail trigger hears all mail it may read and its agent ignores the rest, bounded by its hourly limit.
+  - **Thresholds compare a series with a number,** once for the whole series. "Revenue below costs, per service" needs comparing two series per dimension value, so the factory's sunset trigger uses a fixed bar.
+  - **Nothing fires when a date in a record arrives** (a follow-up due today). The CRM uses a daily schedule whose agent checks, and mappings can't format dates.
+
 ## 7. Guarantees
 
 1. **Default deny between realms.** Only grants cross, with provenance and a log.
@@ -910,3 +929,6 @@ Choices the design left open, made while building, for review.
 | 9 | Secrets are never part of a package or an install decision | Decisions are stored; secret values go in through Settings → Secrets only |
 | 9 | Removing keeps model usage in the ledger | Spend already happened; budgets and history should still see it |
 | 9 | Two test races fixed on the way (decisions, usage) | They read a result right after a signal that can arrive first; they now wait for the result itself |
+| 10 | A realm's templates and workflows are its own plus root's, not home's | Home is a realm like the others; an app must run with the templates it brought, and nothing of home's should leak into it |
+| 10 | Memex events reach realms granted reads of that kind | A read grant on mail is the permission to know about new mail; each event is logged on the grant |
+| 10 | The gaps the examples found are written down, not worked around in code | They need new primitives (finer grant scopes, lookups in filters, per-dimension and series-to-series thresholds, date events); the examples work around them in configuration |

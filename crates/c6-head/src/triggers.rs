@@ -169,8 +169,8 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
     let p = &a.action_params;
     match a.action.as_str() {
         "start" => {
-            if !crate::templates::templates(st).await?.iter().any(|t| t.name == a.template)
-                && !crate::workflows::workflows(st).await?.iter().any(|w| w.name == a.template)
+            if !crate::templates::templates_for(st, realm).await?.iter().any(|t| t.name == a.template)
+                && !crate::workflows::workflows_for(st, realm).await?.iter().any(|w| w.name == a.template)
             {
                 return Err(bad_request(format!("no template or workflow named {:?}", a.template)));
             }
@@ -880,10 +880,10 @@ fn automation_labels(a: &api::Automation) -> Vec<String> {
 pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &str, cause: &[String]) -> anyhow::Result<api::TemplateRun> {
     // A workflow, when no template has the name: the run is the workflow's,
     // and its outcome arrives when it finishes (`workflow_finished`).
-    let is_template = crate::templates::templates(st).await?.iter().any(|t| t.name == a.template);
-    // Its sessions run in the trigger's realm.
+    // Its sessions run in the trigger's realm, with the realm's templates.
     let realm = realm_of(st, &a.id).await;
-    let workflow = !is_template && crate::workflows::workflows(st).await?.iter().any(|w| w.name == a.template);
+    let is_template = crate::templates::templates_for(st, &realm).await?.iter().any(|t| t.name == a.template);
+    let workflow = !is_template && crate::workflows::workflows_for(st, &realm).await?.iter().any(|w| w.name == a.template);
     let result = if workflow {
         crate::workflows::start(st, &a.template, input, trigger, &realm).await.map(|r| api::TemplateRun {
             run_id: r.id,

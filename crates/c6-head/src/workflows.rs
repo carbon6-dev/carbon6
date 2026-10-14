@@ -76,6 +76,11 @@ pub async fn workflows(st: &HeadState) -> anyhow::Result<Vec<api::Workflow>> {
     Ok(serde_json::from_str(&st.store.setting(WORKFLOWS).await?.unwrap_or_default()).unwrap_or_default())
 }
 
+/// The workflows a realm uses: root's and its own.
+pub async fn workflows_for(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::Workflow>> {
+    Ok(serde_json::from_str(&st.store.setting_for(WORKFLOWS, realm).await?.unwrap_or_default()).unwrap_or_default())
+}
+
 /// Default step ids (step1, step2, …) where none is given.
 fn normalized(mut w: api::Workflow) -> api::Workflow {
     for (i, s) in w.steps.iter_mut().enumerate() {
@@ -92,7 +97,9 @@ fn plain_name(n: &str) -> bool {
 }
 
 pub async fn check(st: &HeadState, list: &[api::Workflow]) -> anyhow::Result<()> {
-    let templates = crate::templates::templates(st).await?;
+    // The templates of the realm being edited (root's and its own).
+    let realm = crate::store::SETTINGS_REALM.try_with(Clone::clone).unwrap_or_else(|_| crate::realms::HOME.to_owned());
+    let templates = crate::templates::templates_for(st, &realm).await?;
     let mut names = std::collections::HashSet::new();
     for w in list {
         let n = w.name.trim();
@@ -145,7 +152,11 @@ pub async fn check(st: &HeadState, list: &[api::Workflow]) -> anyhow::Result<()>
 /// Starts a workflow; its run (driven in the background).
 /// Starts a run of the workflow; its sessions run in `realm`.
 pub async fn start(st: &HeadState, name: &str, input: &str, trigger: &str, realm: &str) -> anyhow::Result<api::WorkflowRun> {
-    let w = workflows(st).await?.into_iter().find(|w| w.name == name).ok_or_else(|| not_found(format!("no workflow named {name:?}")))?;
+    let w = workflows_for(st, realm)
+        .await?
+        .into_iter()
+        .find(|w| w.name == name)
+        .ok_or_else(|| not_found(format!("no workflow named {name:?}")))?;
     if !w.enabled {
         return Err(bad_request(format!("workflow {name:?} is switched off")));
     }

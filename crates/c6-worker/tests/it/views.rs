@@ -89,7 +89,7 @@ async fn views_per_realm_and_their_actions() {
     let deal = ok(send(M::POST, "collections/deals/records?realm=crm", json!({"fields": {"name": "Acme", "stage": "new"}})).await).await;
     ok(send(
         M::PUT,
-        "settings/templates",
+        "settings/templates?realm=crm",
         json!([{"name": "follow-up", "prompt": "Follow up on this deal:\n{{input}}", "connection": conn.id, "model": "m"}]),
     )
     .await)

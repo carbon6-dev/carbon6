@@ -1,0 +1,205 @@
+{
+  "app": "service-factory",
+  "version": "1.0.0",
+  "description": "Finds gaps in app ecosystems, builds small services on a shared base, launches and runs them, with you approving at five gates.",
+  "realm": "factory",
+  "needs": {
+    "secrets": ["GITHUB_TOKEN", "CLOUD_TOKEN", "PAYMENTS_API_KEY"],
+    "workers": "dedicated",
+    "grants": [
+      {
+        "from_realm": "home",
+        "kind": "memex",
+        "mode": "read",
+        "scope": {"kinds": ["email"]},
+        "note": "Support mail for the services (triggers pick the support address). A grant scoped to one mail account would be narrower."
+      }
+    ]
+  },
+  "contents": {
+    "collections": [
+      {
+        "name": "candidates",
+        "description": "Gaps worth a look: what is missing, where, the evidence, how it scores, and where it is in the pipeline.",
+        "schema": {
+          "type": "object",
+          "required": ["name", "ecosystem", "gap", "stage"],
+          "properties": {
+            "name": {"type": "string"},
+            "ecosystem": {"type": "string", "description": "e.g. shopify, notion, figma"},
+            "gap": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Links"},
+            "score": {"type": "number", "description": "0–10 against the rubric"},
+            "rubric_notes": {"type": "string"},
+            "stage": {"type": "string", "enum": ["found", "approved", "validating", "build", "rejected"]},
+            "gates": {"type": "array", "items": {"type": "integer"}, "description": "Decision ids of its gates"}
+          }
+        },
+        "keys": ["name"]
+      },
+      {
+        "name": "services",
+        "description": "Services built and run: where they live, what they use, and when to stop them.",
+        "schema": {
+          "type": "object",
+          "required": ["name", "stage"],
+          "properties": {
+            "name": {"type": "string"},
+            "candidate": {"type": "string"},
+            "repository": {"type": "string"},
+            "deployed_at": {"type": "string"},
+            "listing": {"type": "string"},
+            "secrets": {"type": "array", "items": {"type": "string"}, "description": "Secret names (never values)"},
+            "stage": {"type": "string", "enum": ["building", "in_review", "live", "sunsetting", "retired"]},
+            "kill_criteria": {"type": "string"}
+          }
+        },
+        "keys": ["name"]
+      },
+      {
+        "name": "incidents",
+        "description": "What went wrong with a service, and what was done.",
+        "schema": {
+          "type": "object",
+          "required": ["service", "what", "severity", "state"],
+          "properties": {
+            "service": {"type": "string"},
+            "what": {"type": "string"},
+            "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+            "state": {"type": "string", "enum": ["open", "resolved"]},
+            "sessions": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    ],
+    "series": [
+      {"name": "revenue", "unit": "USD", "description": "Payments received.", "dimensions": ["service"]},
+      {"name": "hosting_cost", "unit": "USD", "description": "What hosting costs.", "dimensions": ["service"]},
+      {"name": "model_cost", "unit": "USD", "description": "Model spend attributed to a service.", "dimensions": ["service"]},
+      {"name": "uptime", "unit": "", "description": "1 per successful health check.", "dimensions": ["service"], "retention_days": 90},
+      {"name": "support_tickets", "unit": "", "description": "1 per support message.", "dimensions": ["service"]}
+    ],
+    "skills": [
+      {
+        "name": "gap-rubric",
+        "description": "How to find and score gaps in app ecosystems.",
+        "body": "Look for gaps: frequent requests in marketplaces' reviews and forums with no good app, apps abandoned or badly rated, and workflows people describe doing by hand. Score 0–10: demand (evidence of people asking, 0–3), reachability (one marketplace listing reaches them, 0–2), build size (fits the shared base in days, 0–2), price (people already pay for nearby things, 0–2), risk (legal, platform, support load; subtract up to 3). Keep links as evidence. Never pursue anything that breaks a platform's terms."
+      },
+      {
+        "name": "gate-documents",
+        "description": "How to write a gate's decision.",
+        "body": "A gate is a decision_request. Title: the question in a line. Document: the case in five parts (what, evidence with links, cost so far and to come, risks, your recommendation). Options with what each does. Put the record's collection and id in context ({\"collection\": \"candidates\", \"id\": \"...\"}), and the gate in group (gate-1 … gate-5), so triggers can act on the answer."
+      },
+      {
+        "name": "shared-base",
+        "description": "Building on the template repository.",
+        "body": "Every service starts from the template repository (auth, billing through the payment provider, a health endpoint that reports uptime, logs). Keep services small: one job done well. The health endpoint's success is an uptime point (series uptime, dims service)."
+      },
+      {
+        "name": "operate",
+        "description": "Running a live service.",
+        "body": "Daily: check health, errors and open incidents; record incidents in the incidents collection; reply to support with the support template. Anything that spends money, publishes, deploys to production or emails outside the templates waits for the user's approval."
+      }
+    ],
+    "templates": [
+      {"name": "scan", "description": "Research gaps and record candidates.", "prompt": "Find new gaps in app ecosystems using the gap-rubric skill. For each strong one, add a record to candidates (stage found, a score, evidence links). Do not repeat existing candidates.\n\n{{input}}"},
+      {"name": "deep-dive", "description": "One candidate's case, ending at gate 1.", "prompt": "Study this candidate in depth (market, competitors, effort on the shared base). Then ask gate 1 with decision_request, following the gate-documents skill: 'Pursue <name>?' with options Pursue and Reject, group gate-1, and the record in context.\n\nCandidate:\n{{input}}"},
+      {"name": "validate", "description": "Test demand cheaply, ending at gate 2.", "prompt": "Plan a cheap test of demand for this candidate (a landing page or waitlist). Ask gate 2 with decision_request: 'Spend $X to test <name>?' (options Test and Stop, group gate-2, record in context). If approved later, run the test, then set the candidate's stage to build or rejected with your evidence.\n\n{{input}}"},
+      {"name": "build", "description": "Build the service on the shared base, ending at gate 3.", "prompt": "Build this service on the shared base (shared-base skill). Create its services record (stage building). When it works end to end, ask gate 3 with decision_request: 'Release <name>?' (options Release and Hold, group gate-3, the services record in context).\n\n{{input}}"},
+      {"name": "launch", "description": "Prepare the listing, ending at gate 4.", "prompt": "Prepare this service's marketplace listing and launch checklist. Ask gate 4 with decision_request: 'Submit the listing for <name>?' (options Submit and Hold, group gate-4). Never submit without that approval.\n\n{{input}}"},
+      {"name": "operate", "description": "The daily check of every live service.", "prompt": "Run the daily check of every live service with the operate skill. Summarize what changed. {{input}}"},
+      {"name": "triage", "description": "One support message.", "prompt": "Triage this support message: which service, how urgent, a draft reply from the support template, and an incident if something is broken. Record a support_tickets point (dims service).\n\n{{input}}"},
+      {"name": "sunset", "description": "Shut a service down, ending at gate 5.", "prompt": "This service earns less than it costs. Prepare a shutdown plan (notice to users, data export, refunds) and ask gate 5 with decision_request: 'Sunset <name>?' (options Sunset and Keep, group gate-5).\n\n{{input}}"}
+    ],
+    "triggers": [
+      {"name": "weekly scan", "trigger": "schedule", "cron": "0 9 * * mon", "action": "start", "template": "scan"},
+      {
+        "name": "strong candidate",
+        "trigger": "record",
+        "event_params": {"collection": "candidates", "ops": ["created"]},
+        "filter": {"$.record.fields.score": {"$gte": 7}},
+        "action": "start",
+        "template": "deep-dive"
+      },
+      {
+        "name": "gate 1 pursued",
+        "trigger": "decision",
+        "event_params": {"ops": ["answered"]},
+        "filter": {"$.decision.group": "gate-1", "$.option": "Pursue"},
+        "action": "start",
+        "template": "validate",
+        "action_params": {"input": "Candidate {{$.decision.context.id}}: {{$.decision.title}}"}
+      },
+      {
+        "name": "candidate to build",
+        "trigger": "record",
+        "event_params": {"collection": "candidates", "ops": ["updated"]},
+        "filter": {"$.record.fields.stage": "build", "$.changed": {"$contains": "stage"}},
+        "action": "start",
+        "template": "build"
+      },
+      {
+        "name": "gate 3 released",
+        "trigger": "decision",
+        "event_params": {"ops": ["answered"]},
+        "filter": {"$.decision.group": "gate-3", "$.option": "Release"},
+        "action": "start",
+        "template": "launch",
+        "action_params": {"input": "Service {{$.decision.context.id}}: {{$.decision.title}}"}
+      },
+      {"name": "daily operate", "trigger": "schedule", "cron": "0 7 * * *", "action": "start", "template": "operate"},
+      {
+        "name": "payments",
+        "trigger": "webhook",
+        "filter": {"$.body.amount": {"$gt": 0}},
+        "action": "record",
+        "action_params": {"series": "revenue", "value": "$.body.amount", "dims": {"service": "$.body.metadata.service"}}
+      },
+      {
+        "name": "support mail",
+        "trigger": "memex",
+        "cron": "mail.received to:support@",
+        "action": "start",
+        "template": "triage"
+      },
+      {
+        "name": "earning too little",
+        "trigger": "series",
+        "event_params": {"series": "revenue", "agg": "sum", "minutes": 86400, "op": "<", "value": 50, "ops": ["crossed"]},
+        "action": "start",
+        "template": "sunset",
+        "action_params": {"input": "Revenue over 60 days is {{$.value}}, under the bar of 50."}
+      },
+      {
+        "name": "weekly gates digest",
+        "trigger": "schedule",
+        "cron": "0 8 * * fri",
+        "filter": {"$.open_decisions.count": {"$gt": 0}},
+        "action": "notify",
+        "action_params": {"title": "Factory: {{$.open_decisions.count}} gates waiting", "message": "{{$.open_decisions.text}}"}
+      }
+    ],
+    "views": [
+      {"name": "candidates", "title": "Candidates", "kind": "board", "group_by": "stage", "source": {"collection": "candidates", "sort": "-score"}, "fields": ["name", "ecosystem", "score", "gap"],
+       "actions": [{"label": "Deep dive", "start": "deep-dive"}, {"label": "Reject", "set": {"stage": "rejected"}}]},
+      {"name": "services", "title": "Services", "kind": "board", "group_by": "stage", "source": {"collection": "services"}, "fields": ["name", "listing", "deployed_at"]},
+      {"name": "revenue", "title": "Revenue", "kind": "chart", "source": {"series": "revenue", "bucket": "day", "minutes": 129600, "group_by": "service"}},
+      {"name": "costs", "title": "Hosting costs", "kind": "chart", "source": {"series": "hosting_cost", "bucket": "day", "minutes": 129600, "group_by": "service"}},
+      {"name": "incidents", "title": "Incidents", "kind": "table", "source": {"collection": "incidents", "where": {"state": "open"}, "sort": "-updated_at"}},
+      {"name": "gates", "title": "Gates", "kind": "feed", "source": {"decisions": "open"}},
+      {"name": "factory", "title": "Factory", "kind": "page", "body": "## Waiting for you\n{{view:gates}}\n\n## Money\n{{view:revenue}}\n{{view:costs}}\n\n## Open incidents\n{{view:incidents}}"}
+    ],
+    "policies": [
+      {"name": "ask before spending", "tools": "Bash", "pattern": "(stripe|paddle|billing|purchase|buy)", "action": "ask", "message": "This may spend money."},
+      {"name": "ask before deploying", "tools": "Bash", "pattern": "(deploy|--prod|production)", "action": "ask", "message": "Deploying to production."},
+      {"name": "ask before publishing", "tools": "Bash", "pattern": "(publish|submit|release)", "action": "ask", "message": "This publishes something."},
+      {"name": "never delete repositories", "tools": "Bash", "pattern": "(gh repo delete|repos/.*/delete)", "action": "deny", "message": "Repositories are never deleted by agents."}
+    ],
+    "budgets": [
+      {"name": "factory monthly", "period": "month", "limit": 100, "action": "block"}
+    ],
+    "memory": [
+      {"scope": "", "text": "This realm is the service factory: every outward step (spending, publishing, launching, sunsetting) waits for a gate decision from the user."}
+    ]
+  }
+}

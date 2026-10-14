@@ -91,6 +91,32 @@ pub async fn budgets(st: &HeadState) -> anyhow::Result<Vec<api::Budget>> {
     Ok(serde_json::from_str(&st.store.setting(BUDGETS).await?.unwrap_or_default()).unwrap_or_default())
 }
 
+/// Every budget in force: root's, for every session, and each realm's own,
+/// for that realm's sessions only.
+async fn all_budgets(st: &HeadState) -> anyhow::Result<Vec<(api::Budget, Option<String>)>> {
+    let mut out: Vec<(api::Budget, Option<String>)> = crate::lists::read(&st.store.pool, BUDGETS, crate::realms::ROOT)
+        .await?
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .map(|b| (b, None))
+        .collect();
+    let realms: Vec<String> = sqlx::query_scalar("SELECT id FROM realms WHERE id != 'root'").fetch_all(&st.store.pool).await?;
+    for r in realms {
+        for v in crate::lists::read(&st.store.pool, BUDGETS, &r).await? {
+            if let Ok(b) = serde_json::from_value::<api::Budget>(v) {
+                out.push((b, Some(r.clone())));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a budget covers a session: its labels, and its realm's budgets
+/// only its realm.
+fn covers(b: &api::Budget, realm: &Option<String>, labels: &[String], session_realm: &str) -> bool {
+    realm.as_deref().is_none_or(|r| r == session_realm) && api::labels::applies(&b.applies_to, labels)
+}
+
 pub fn check_prices(prices: &[api::Price]) -> anyhow::Result<()> {
     for p in prices {
         if p.model.trim().is_empty() {
@@ -270,12 +296,18 @@ fn period_end(period: &str, start: DateTime<Local>) -> DateTime<Local> {
 }
 
 /// What sessions a budget covers have spent this period.
-async fn spent(st: &HeadState, b: &api::Budget, prices: &[api::Price], sessions: &mut Sessions) -> anyhow::Result<f64> {
+async fn spent(
+    st: &HeadState,
+    b: &api::Budget,
+    realm: &Option<String>,
+    prices: &[api::Price],
+    sessions: &mut Sessions,
+) -> anyhow::Result<f64> {
     let start = period_start(&b.period, Local::now());
     let mut total = 0.0;
     for c in calls_since(st, start.timestamp_millis()).await? {
         let Some(s) = sessions.get(st, &c.session_id).await else { continue };
-        if api::labels::applies(&b.applies_to, &s.all_labels()) {
+        if covers(b, realm, &s.all_labels(), &s.realm) {
             total += c.cost(prices).unwrap_or(0.0);
         }
     }
@@ -284,17 +316,17 @@ async fn spent(st: &HeadState, b: &api::Budget, prices: &[api::Price], sessions:
 
 /// Why new work in a session with `labels` is refused: a blocking budget
 /// that applies is used up.
-pub async fn blocked(st: &HeadState, labels: &[String]) -> anyhow::Result<Option<String>> {
-    let budgets = budgets(st).await?;
-    let applicable: Vec<&api::Budget> =
-        budgets.iter().filter(|b| b.enabled && b.action == "block" && api::labels::applies(&b.applies_to, labels)).collect();
+pub async fn blocked(st: &HeadState, labels: &[String], realm: &str) -> anyhow::Result<Option<String>> {
+    let budgets = all_budgets(st).await?;
+    let applicable: Vec<&(api::Budget, Option<String>)> =
+        budgets.iter().filter(|(b, r)| b.enabled && b.action == "block" && covers(b, r, labels, realm)).collect();
     if applicable.is_empty() {
         return Ok(None);
     }
     let prices = prices(st).await?;
     let mut sessions = Sessions::default();
-    for b in applicable {
-        let spent = spent(st, b, &prices, &mut sessions).await?;
+    for (b, r) in applicable {
+        let spent = spent(st, b, r, &prices, &mut sessions).await?;
         if spent >= b.limit {
             let until = period_end(&b.period, period_start(&b.period, Local::now()));
             return Ok(Some(format!(
@@ -318,7 +350,7 @@ pub async fn after_calls(st: &HeadState, session_id: &str) {
 }
 
 async fn enforce(st: &HeadState, session_id: &str) -> anyhow::Result<()> {
-    let budgets = budgets(st).await?;
+    let budgets = all_budgets(st).await?;
     if budgets.is_empty() {
         return Ok(());
     }
@@ -326,8 +358,8 @@ async fn enforce(st: &HeadState, session_id: &str) -> anyhow::Result<()> {
     let labels = session.all_labels();
     let prices = prices(st).await?;
     let mut sessions = Sessions::default();
-    for b in budgets.iter().filter(|b| b.enabled && api::labels::applies(&b.applies_to, &labels)) {
-        let spent = spent(st, b, &prices, &mut sessions).await?;
+    for (b, r) in budgets.iter().filter(|(b, r)| b.enabled && covers(b, r, &labels, &session.realm)) {
+        let spent = spent(st, b, r, &prices, &mut sessions).await?;
         if spent < b.limit {
             continue;
         }
@@ -344,7 +376,7 @@ async fn enforce(st: &HeadState, session_id: &str) -> anyhow::Result<()> {
         if b.action == "block" {
             let running: Vec<SessionRow> =
                 sqlx::query_as("SELECT * FROM sessions WHERE status = 'running'").fetch_all(&st.store.pool).await?;
-            for s in running.iter().filter(|s| api::labels::applies(&b.applies_to, &s.all_labels())) {
+            for s in running.iter().filter(|s| covers(b, r, &s.all_labels(), &s.realm)) {
                 if crate::sessions::interrupt(st, &s.id).await.unwrap_or(false) {
                     stopped += 1;
                 }
@@ -464,11 +496,15 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String]) -> anyhow::Res
     };
     let mut budget_status = Vec::new();
     let mut spent_sessions = Sessions::default();
-    for b in budgets(st).await? {
-        let spent = spent(st, &b, &prices, &mut spent_sessions).await?;
+    for (b, r) in all_budgets(st).await? {
+        let spent = spent(st, &b, &r, &prices, &mut spent_sessions).await?;
         budget_status.push(api::BudgetStatus {
             blocking: b.enabled && b.action == "block" && spent >= b.limit,
-            name: b.name,
+            // A realm's own budget says so.
+            name: match &r {
+                Some(r) => format!("{} (realm {r})", b.name),
+                None => b.name,
+            },
             period: b.period,
             limit: b.limit,
             spent,

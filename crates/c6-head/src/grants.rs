@@ -219,6 +219,24 @@ pub async fn memex_reads(st: &HeadState, to: &str) -> Vec<(String, String, Vec<S
     reads
 }
 
+/// The realms `from` lets read its knowledge of `kind`: (grant, realm).
+pub async fn memex_readers(st: &HeadState, from: &str, kind: &str) -> Vec<(String, String)> {
+    let rows = sqlx::query(
+        "SELECT g.*, 0 AS uses FROM grants g WHERE from_realm = ? AND kind = 'memex' AND mode = 'read' AND state = 'active' \
+         AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(from)
+    .bind(now_ms())
+    .fetch_all(&st.store.pool)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .map(grant_of)
+        .filter(|g| g.scope["kinds"].as_array().is_none_or(|k| k.is_empty() || k.iter().any(|x| x == kind)))
+        .map(|g| (g.id, g.to_realm))
+        .collect()
+}
+
 /// Whether `realm` reads commons (you can turn it off per realm).
 pub async fn reads_commons(st: &HeadState, realm: &str) -> bool {
     realm != COMMONS

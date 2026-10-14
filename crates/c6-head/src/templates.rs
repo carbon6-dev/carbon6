@@ -12,6 +12,12 @@ pub async fn templates(st: &HeadState) -> anyhow::Result<Vec<api::Template>> {
     Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
+/// The templates a realm uses: root's and its own.
+pub async fn templates_for(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::Template>> {
+    let raw = st.store.setting_for(TEMPLATES, realm).await?.unwrap_or_else(|| "[]".into());
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
 /// Checks a list of templates before it is saved.
 pub fn check(templates: &[api::Template]) -> anyhow::Result<()> {
     let mut names = std::collections::HashSet::new();
@@ -46,7 +52,11 @@ pub fn fill(prompt: &str, input: &str, target: &str) -> String {
 /// the template's (e.g. automation:<name>).
 /// Starts the template's sessions in `realm`.
 pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String], realm: &str) -> anyhow::Result<api::TemplateRun> {
-    let t = templates(st).await?.into_iter().find(|t| t.name == name).ok_or_else(|| not_found(format!("no template named {name:?}")))?;
+    let t = templates_for(st, realm)
+        .await?
+        .into_iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| not_found(format!("no template named {name:?}")))?;
     if !t.enabled {
         return Err(bad_request(format!("template {name:?} is switched off")));
     }

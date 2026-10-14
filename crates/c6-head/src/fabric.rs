@@ -42,6 +42,15 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 let kind = params["type"].as_str().unwrap_or_default().to_owned();
                 let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
                 crate::triggers::on_memex_event(st, &realm, &kind, &params["data"]).await;
+                // Realms granted reads of that knowledge hear it too.
+                let item_kind = match kind.as_str() {
+                    "mail.received" => "email",
+                    other => other.split('.').next().unwrap_or(other),
+                };
+                for (grant, to) in crate::grants::memex_readers(st, &realm, item_kind).await {
+                    crate::grants::log_memex_read(st, &grant, "memex event", &kind).await;
+                    crate::triggers::on_memex_event(st, &to, &kind, &params["data"]).await;
+                }
                 Ok(json!({}))
             }
             // A disputed fact, for you to settle.

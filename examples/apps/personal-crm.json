@@ -1,0 +1,225 @@
+{
+  "app": "personal-crm",
+  "version": "1.0.0",
+  "description": "Keeps you in touch with people who matter, using your mail without being able to read the rest of it.",
+  "realm": "crm",
+  "needs": {
+    "secrets": [],
+    "workers": "any",
+    "grants": [
+      {
+        "from_realm": "home",
+        "kind": "memex",
+        "mode": "read",
+        "scope": {
+          "kinds": [
+            "email"
+          ]
+        },
+        "note": "To notice mail with people in the CRM (its triggers pick those people). A grant limited to mail metadata would be narrower."
+      },
+      {
+        "from_realm": "home",
+        "kind": "operations",
+        "mode": "call",
+        "scope": {
+          "methods": [
+            "memex.mail.draft"
+          ]
+        },
+        "note": "To prepare check-in emails as drafts. Sending stays with you."
+      }
+    ]
+  },
+  "contents": {
+    "collections": [
+      {
+        "name": "relationships",
+        "description": "People you want to stay in touch with, and how often.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "name",
+            "email",
+            "tier",
+            "every_days"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "email": {
+              "type": "string"
+            },
+            "person": {
+              "type": "string",
+              "description": "The person thing in your knowledge, e.g. person:ada@example.com"
+            },
+            "tier": {
+              "type": "string",
+              "enum": [
+                "close",
+                "regular",
+                "occasional"
+              ]
+            },
+            "every_days": {
+              "type": "integer",
+              "description": "How often you want to be in touch"
+            },
+            "last_contact": {
+              "type": "string",
+              "description": "YYYY-MM-DD"
+            },
+            "next_due": {
+              "type": "string",
+              "description": "YYYY-MM-DD"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        "keys": [
+          "email"
+        ]
+      },
+      {
+        "name": "touchpoints",
+        "description": "Each time you were in touch: when, how, what about, and what to follow up.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "relationship",
+            "date",
+            "channel"
+          ],
+          "properties": {
+            "relationship": {
+              "type": "string",
+              "description": "Their email"
+            },
+            "date": {
+              "type": "string",
+              "description": "YYYY-MM-DD"
+            },
+            "channel": {
+              "type": "string",
+              "enum": [
+                "email",
+                "call",
+                "meeting",
+                "message"
+              ]
+            },
+            "summary": {
+              "type": "string"
+            },
+            "follow_up": {
+              "type": "string",
+              "description": "YYYY-MM-DD, if something is promised"
+            }
+          }
+        }
+      }
+    ],
+    "skills": [
+      {
+        "name": "check-in-voice",
+        "description": "How to write a check-in the way the user would.",
+        "body": "Short, warm, specific: mention the last thing you talked about (from touchpoints and their mail), one real question, no filler, no 'just checking in'. Sign with the user's first name. Drafts only: the user sends."
+      },
+      {
+        "name": "touchpoints",
+        "description": "What counts as a touchpoint.",
+        "body": "A touchpoint is an exchange: an email they sent or one sent to them that got a reply, a call or meeting on the calendar with them, a message. Newsletters and automatic mail are not. Record date, channel, a one-line summary and any follow-up promised, then update the relationship's last_contact and next_due (last_contact + every_days)."
+      }
+    ],
+    "templates": [
+      {
+        "name": "log-touchpoint",
+        "description": "Record a touchpoint from new mail.",
+        "prompt": "New mail arrived. If it is with someone in relationships (match their email), record a touchpoint following the touchpoints skill and update the relationship. Otherwise do nothing.\n\n{{input}}"
+      },
+      {
+        "name": "weekly-check-ins",
+        "description": "Draft check-ins for everyone overdue, as one decision.",
+        "prompt": "Find relationships whose next_due is today or past. For each, draft a check-in (check-in-voice skill) with memex.mail.draft through the call grant. Then ask one decision with decision_request: 'Send these N check-ins?', listing each person and a line of their draft in the document, options 'Send all' and 'Let me review', group check-ins. The drafts wait in the user's mail either way.\n\n{{input}}"
+      },
+      {
+        "name": "follow-ups",
+        "description": "Remind about follow-ups that are due.",
+        "prompt": "Find touchpoints whose follow_up is today or past and not yet done. For each, ask a decision with decision_request: 'Follow up with <name>: <what>?' with options Done, Snooze a week, Drop, group follow-ups.\n\n{{input}}"
+      }
+    ],
+    "triggers": [
+      {
+        "name": "mail with people",
+        "trigger": "memex",
+        "cron": "mail.received",
+        "action": "start",
+        "template": "log-touchpoint",
+        "per_hour": 30
+      },
+      {
+        "name": "weekly check-ins",
+        "trigger": "schedule",
+        "cron": "0 9 * * mon",
+        "action": "start",
+        "template": "weekly-check-ins"
+      },
+      {
+        "name": "daily follow-ups",
+        "trigger": "schedule",
+        "cron": "0 8 * * *",
+        "action": "start",
+        "template": "follow-ups"
+      }
+    ],
+    "views": [
+      {
+        "name": "people",
+        "title": "People",
+        "kind": "table",
+        "source": {
+          "collection": "relationships",
+          "sort": "next_due"
+        },
+        "fields": [
+          "name",
+          "tier",
+          "next_due",
+          "last_contact",
+          "email"
+        ],
+        "actions": [
+          {
+            "label": "Draft a check-in",
+            "start": "weekly-check-ins"
+          }
+        ]
+      },
+      {
+        "name": "touchpoints",
+        "title": "Touchpoints",
+        "kind": "table",
+        "source": {
+          "collection": "touchpoints",
+          "sort": "-date"
+        }
+      },
+      {
+        "name": "crm",
+        "title": "CRM",
+        "kind": "page",
+        "body": "## Due\n{{view:people}}\n\n## Lately\n{{view:touchpoints}}"
+      }
+    ],
+    "memory": [
+      {
+        "scope": "",
+        "text": "This realm is the user's personal CRM. It never sends mail: it drafts, and the user sends."
+      }
+    ]
+  }
+}

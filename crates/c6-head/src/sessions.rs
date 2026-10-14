@@ -109,7 +109,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     let (connection_id, model, subagent_model) = {
         let mut route_labels = labels.clone();
         route_labels.extend(api::labels::auto_labels(&worker.name, "", if cwd.starts_with('/') { &cwd } else { "" }, "", "", &ssh));
-        if let Some(why) = crate::usage::blocked(st, &route_labels).await? {
+        if let Some(why) = crate::usage::blocked(st, &route_labels, &realm).await? {
             return Err(bad_request(format!("not started: {why}")));
         }
         let routed = route(st, &req.connection_id, &req.model, &route_labels, &realm).await?;
@@ -193,7 +193,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         return Err(bad_request(format!("no realm {realm:?} for the assistant")));
     }
     let labels = vec![crate::assistant::LABEL.to_owned()];
-    if let Some(why) = crate::usage::blocked(st, &labels).await? {
+    if let Some(why) = crate::usage::blocked(st, &labels, &realm).await? {
         return Err(bad_request(format!("not started: {why}")));
     }
     let now = now_ms();
@@ -637,7 +637,7 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     if session.parent_call_id.is_some() {
         return Err(bad_request("subagent sessions run once and cannot take messages"));
     }
-    if let Some(why) = crate::usage::blocked(st, &session.all_labels()).await? {
+    if let Some(why) = crate::usage::blocked(st, &session.all_labels(), &session.realm).await? {
         return Err(bad_request(format!("not sent: {why}")));
     }
     if session.status == "failed" {

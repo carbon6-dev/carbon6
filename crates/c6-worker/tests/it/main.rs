@@ -14,6 +14,7 @@ mod chaos;
 mod collections;
 mod commands;
 mod decisions;
+mod examples;
 mod fixtures;
 mod grants;
 mod hooks;
