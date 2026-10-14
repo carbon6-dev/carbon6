@@ -89,6 +89,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
                 crate::grants::request(st, &target, &realm, &params).await
             }
+            // Proposing a record or fact for commons (docs/os.md §3.3).
+            "commons_publish" => {
+                let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+                crate::commons::from_session(st, &target, &realm, &params).await
+            }
             "openapi" => Ok(crate::catalog::openapi(&crate::notify::api_urls(st).await)),
             // Collections, in the session's realm (docs/os.md §4.1).
             "collections" | "records_query" | "records_get" | "records_put" | "records_delete" => {

@@ -129,6 +129,35 @@ async fn realms_have_their_own_knowledge() {
     assert!(http.delete(format!("{api}/grants/{}", g["id"].as_str().unwrap())).send().await.unwrap().status().is_success());
     assert!(!lab_search().await.to_string().contains("us-east"));
 
+    // Commons: lab publishes its fact, you review it, and another realm
+    // finds it in search and briefs.
+    let facts = call("lab", "memex.knowledge.list", json!({})).await.unwrap();
+    let fact = facts[0]["id"].as_str().unwrap().to_owned();
+    let refused = c6_head::commons::propose_fact(st, "lab", "you", &fact).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("append grant"), "{refused:#}");
+    let r = http
+        .post(format!("{api}/grants"))
+        .json(&json!({"from_realm": "commons", "to_realm": "lab", "kind": "memex", "mode": "append"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let d = c6_head::commons::propose_fact(st, "lab", "session:abc", &fact).await.unwrap();
+    assert!(d.document.contains("Lab CI runs on Buildkite"), "{d:?}");
+    let r = http.post(format!("{api}/decisions/{}/answer", d.id)).json(&json!({"option": "Publish"})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let shared = call("commons", "memex.knowledge.list", json!({})).await.unwrap();
+    assert_eq!(
+        (shared[0]["claim"].as_str(), shared[0]["status"].as_str()),
+        (Some("Lab CI runs on Buildkite"), Some("reviewed")),
+        "{shared}"
+    );
+    let home_brief = c6_head::memex::brief(st, "home", &["ci:buildkite".to_owned()], "fix CI").await;
+    assert!(home_brief.contains("From commons") && home_brief.contains("Buildkite"), "{home_brief}");
+    // Not for a realm that doesn't read commons.
+    http.patch(format!("{api}/realms/home")).json(&json!({"reads_commons": false})).send().await.unwrap();
+    assert!(!c6_head::memex::brief(st, "home", &["ci:buildkite".to_owned()], "fix CI").await.contains("Buildkite"));
+
     // Deleting the realm drops its knowledge.
     let r = http.delete(format!("{api}/realms/lab")).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod automations;
 pub mod catalog;
 pub mod collections;
+pub mod commons;
 pub mod config;
 mod convert;
 mod cron;

@@ -317,6 +317,9 @@ async fn act(
                 }
             }
         }
+        (Some("publish"), _, _) => {
+            crate::commons::answer(st, d, option == Some("Publish")).await?;
+        }
         (Some("session"), Some(session), _) => {
             // An agent asked without stopping: its answer, as a message.
             let mut text = format!("Your question was answered (decision #{}: {}).", d.id, d.title);

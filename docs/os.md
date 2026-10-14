@@ -207,6 +207,23 @@ grant(id, from_realm, to_realm,
 - **Operations:** a granted operation runs in the realm that owns it, which is how a realm drafts mail through home's accounts. Each call is logged on the grant.
 - **Requests:** an agent's `grant_request` creates a requested grant and a decision (Allow or Deny). Your answer puts the grant in force, or denies it, and the session hears the answer as a message. Revoking a request settles its decision.
 
+### 3.15 As built (step 4d)
+
+- **Commons is a realm** (migration `0034`), created on upgrade.
+  - **Who reads it:** every realm, without a grant row, until you untick **reads commons** for that realm under Settings → System → Realms.
+  - **What can't happen in it:** sessions don't run there, tokens can't be limited to it, and it can't be deleted.
+  - **Grants:** a grant can't point into it.
+- **Reading:**
+  - **Collections:** commons' collections answer `?realm=commons` (or `realm` on `records_*`).
+  - **Search:** a realm's memex searches include commons' knowledge.
+  - **Briefs:** a session's brief adds what commons knows about the same things, under "From commons".
+- **Publishing:**
+  - **Grants:** a realm needs an append grant from commons, either on a collection or on knowledge (kind memex, mode append, which exists only for commons).
+  - **Records:** adding a record to commons' collection then answers 202, with a decision in commons. The record is checked against the schema up front, and nothing is in commons until you choose **Publish**.
+  - **Facts:** an agent's `commons_publish` proposes a record, or a fact of its realm's knowledge by id.
+  - **When you choose Publish:** a record goes in with `from:<realm>` and "published from realm X, reviewed by you". A fact goes in as reviewed, with its evidence. Reject publishes nothing.
+- **Deleting a realm** now also revokes its grants (their log stays).
+
 ## 4. Primitives
 
 Every primitive is scoped by realm, has operations in the catalog (so the assistant, the CLI, the API reference and the OpenAPI document get them automatically), and has agent tools where agents need them.
@@ -780,3 +797,10 @@ Choices the design left open, made while building, for review.
 | 4c | A granted mail or calendar operation also lets that call see email and events | The grant names the operation; without the kinds it could not work |
 | 4c | Grants are root-only in the API; agents ask with `grant_request` | Only you create grants (3.7) |
 | 4c | Searching across granted realms merges hits by score, each tagged with its realm | One search answers across what the realm may read, and you can see where each hit came from |
+| 4d | Commons is a realm like any other, made on upgrade | Collections, knowledge, briefs and grants work there unchanged; only its rules differ |
+| 4d | Reading commons needs no grant row; a per-realm switch turns it off | "Every realm reads commons by default; you can turn that off per realm" (3.7), without a grant per realm to manage |
+| 4d | A proposal is a decision holding the item; nothing is written to commons until you publish it | Nothing unreviewed is ever readable by other realms, and rejecting leaves nothing to clean up |
+| 4d | Knowledge gets an append mode only for commons | Publishing facts needs it; a realm's knowledge is otherwise its own |
+| 4d | A published fact enters commons as reviewed | You reviewed it as you published it |
+| 4d | Commons' proposals are decisions in commons | The review queue belongs to commons, and you see all realms' decisions anyway |
+| 4d | Deleting a realm revokes its grants instead of deleting them | The log of what flowed is kept |

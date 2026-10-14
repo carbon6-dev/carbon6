@@ -13,6 +13,8 @@ use crate::{HeadState, bad_request, forbidden};
 pub const ROOT: &str = "root";
 /// Everything that existed before realms, and the default.
 pub const HOME: &str = "home";
+/// Knowledge meant for every realm, published into with your review.
+pub const COMMONS: &str = "commons";
 
 /// Who is calling the API.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -55,9 +57,11 @@ impl Caller {
 }
 
 pub async fn list(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Realm>> {
-    let rows = sqlx::query("SELECT * FROM realms ORDER BY CASE id WHEN 'root' THEN 0 WHEN 'home' THEN 1 ELSE 2 END, created_at, id")
-        .fetch_all(&st.store.pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT * FROM realms ORDER BY CASE id WHEN 'root' THEN 0 WHEN 'home' THEN 1 WHEN 'commons' THEN 2 ELSE 3 END, created_at, id",
+    )
+    .fetch_all(&st.store.pool)
+    .await?;
     Ok(rows
         .iter()
         .map(|r| api::Realm {
@@ -67,6 +71,7 @@ pub async fn list(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Re
             created_at: r.get("created_at"),
             created_by: r.get("created_by"),
             app: r.get("app"),
+            reads_commons: r.get::<i64, _>("reads_commons") != 0,
         })
         .filter(|r| caller.sees(&r.id))
         .collect())
@@ -81,6 +86,9 @@ pub async fn exists(st: &HeadState, realm: &str) -> anyhow::Result<bool> {
 pub async fn check_for_sessions(st: &HeadState, realm: &str) -> anyhow::Result<()> {
     if realm == ROOT {
         return Err(bad_request("sessions do not run in root; it is carbon6's administration (ask the assistant instead)"));
+    }
+    if realm == COMMONS {
+        return Err(bad_request("sessions do not run in commons; realms publish into it, and you review what they publish"));
     }
     if !exists(st, realm).await? {
         return Err(bad_request(format!("no realm {realm:?}")));
@@ -173,9 +181,10 @@ pub async fn create(st: &HeadState, r: &api::RealmIn, by: &str) -> anyhow::Resul
 
 pub async fn update(st: &HeadState, id: &str, r: &api::RealmIn) -> anyhow::Result<api::Realm> {
     let current = list(st, &Caller::root()).await?.into_iter().find(|x| x.id == id).ok_or_else(|| crate::not_found("no such realm"))?;
-    sqlx::query("UPDATE realms SET name = ?, description = ? WHERE id = ?")
+    sqlx::query("UPDATE realms SET name = ?, description = ?, reads_commons = ? WHERE id = ?")
         .bind(if r.name.trim().is_empty() { current.name.as_str() } else { r.name.trim() })
         .bind(r.description.trim())
+        .bind(r.reads_commons.unwrap_or(current.reads_commons))
         .bind(id)
         .execute(&st.store.pool)
         .await?;
@@ -185,7 +194,7 @@ pub async fn update(st: &HeadState, id: &str, r: &api::RealmIn) -> anyhow::Resul
 /// Deletes a realm that owns nothing yet (removing an app's realm with its
 /// data is the app's uninstall).
 pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
-    if id == ROOT || id == HOME {
+    if id == ROOT || id == HOME || id == COMMONS {
         return Err(bad_request(format!("{id} is carbon6's own and stays")));
     }
     if !exists(st, id).await? {
@@ -215,6 +224,12 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM records WHERE realm = ?").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM collections WHERE realm = ?").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM api_tokens WHERE realm = ?").bind(id).execute(&mut *tx).await?;
+    // Its grants end (their log stays).
+    sqlx::query("UPDATE grants SET state = 'revoked', revoked_at = ?1 WHERE (from_realm = ?2 OR to_realm = ?2) AND state IN ('active', 'requested')")
+        .bind(c6_core::now_ms())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM realms WHERE id = ?").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     // Its knowledge in the memex goes too (when the memex is next there).
@@ -226,7 +241,7 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
 /// Sets which realms a worker or connection is available to (empty: all).
 pub async fn set_availability(st: &HeadState, table: &'static str, id: &str, realms: &[String]) -> anyhow::Result<()> {
     for r in realms {
-        if !exists(st, r).await? || r == ROOT {
+        if !exists(st, r).await? || r == ROOT || r == COMMONS {
             return Err(bad_request(format!("no realm {r:?} that sessions run in")));
         }
     }

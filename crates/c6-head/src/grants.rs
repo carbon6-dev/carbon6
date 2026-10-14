@@ -12,10 +12,14 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use tracing::warn;
 
-use crate::realms::ROOT;
+use crate::realms::{COMMONS, ROOT};
 use crate::{HeadState, bad_request, not_found};
 
-const MODES: [(&str, &[&str]); 3] = [("collection", &["read", "append", "snapshot"]), ("memex", &["read"]), ("operations", &["call"])];
+const MODES: [(&str, &[&str]); 3] =
+    [("collection", &["read", "append", "snapshot"]), ("memex", &["read", "append"]), ("operations", &["call"])];
+
+/// What every realm that reads commons has without a grant row.
+pub const COMMONS_READ: &str = "commons";
 
 fn grant_of(r: &sqlx::sqlite::SqliteRow) -> api::Grant {
     api::Grant {
@@ -43,6 +47,18 @@ async fn check(st: &HeadState, g: &api::GrantIn) -> anyhow::Result<()> {
     }
     if g.from_realm == g.to_realm {
         return Err(bad_request("a grant is between two realms"));
+    }
+    if g.to_realm == COMMONS {
+        return Err(bad_request(
+            "nothing flows into commons except what a realm publishes, with your review: grant the realm append to commons",
+        ));
+    }
+    if g.from_realm == COMMONS && g.kind == "operations" {
+        return Err(bad_request("commons has no operations"));
+    }
+    // Adding to knowledge is publishing to commons (each item reviewed).
+    if g.kind == "memex" && g.mode == "append" && g.from_realm != COMMONS {
+        return Err(bad_request("a realm's knowledge is its own: append to knowledge is only publishing to commons"));
     }
     let Some((_, modes)) = MODES.iter().find(|(k, _)| *k == g.kind) else {
         return Err(bad_request("a grant's kind is collection, memex or operations"));
@@ -155,6 +171,9 @@ async fn in_force(st: &HeadState, from: Option<&str>, to: &str, kind: &str, mode
 }
 
 async fn record_use(st: &HeadState, grant: &str, by: &str, what: &str) {
+    if grant == COMMONS_READ {
+        return;
+    }
     if let Err(e) = sqlx::query("INSERT INTO grant_uses (grant_id, at, by, what) VALUES (?, ?, ?, ?)")
         .bind(grant)
         .bind(now_ms())
@@ -170,6 +189,10 @@ async fn record_use(st: &HeadState, grant: &str, by: &str, what: &str) {
 /// May `to` use realm `from`'s collection `name` this way? The grant (its
 /// id and the filter it narrows reads to), and the use logged.
 pub async fn collection(st: &HeadState, from: &str, to: &str, name: &str, mode: &str, by: &str) -> anyhow::Result<(String, Option<Value>)> {
+    // Every realm reads commons, unless you turned that off for it.
+    if from == COMMONS && mode == "read" && reads_commons(st, to).await {
+        return Ok((COMMONS_READ.to_owned(), None));
+    }
     let g = in_force(st, Some(from), to, "collection", mode).await.into_iter().find(|g| g.scope["collection"] == name);
     let Some(g) = g else {
         return Err(crate::forbidden(format!("realm {to} has no {mode} grant on {from}'s collection {name}")));
@@ -181,7 +204,7 @@ pub async fn collection(st: &HeadState, from: &str, to: &str, name: &str, mode: 
 /// Realm `to`'s read grants on others' knowledge: (realm, kinds; empty:
 /// every kind but spam).
 pub async fn memex_reads(st: &HeadState, to: &str) -> Vec<(String, String, Vec<String>)> {
-    in_force(st, None, to, "memex", "read")
+    let mut reads: Vec<(String, String, Vec<String>)> = in_force(st, None, to, "memex", "read")
         .await
         .into_iter()
         .map(|g| {
@@ -189,7 +212,35 @@ pub async fn memex_reads(st: &HeadState, to: &str) -> Vec<(String, String, Vec<S
                 g.scope["kinds"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_owned)).collect()).unwrap_or_default();
             (g.id, g.from_realm, kinds)
         })
-        .collect()
+        .collect();
+    if to != COMMONS && !reads.iter().any(|(_, from, _)| from == COMMONS) && reads_commons(st, to).await {
+        reads.push((COMMONS_READ.to_owned(), COMMONS.to_owned(), Vec::new()));
+    }
+    reads
+}
+
+/// Whether `realm` reads commons (you can turn it off per realm).
+pub async fn reads_commons(st: &HeadState, realm: &str) -> bool {
+    realm != COMMONS
+        && realm != ROOT
+        && sqlx::query_scalar::<_, i64>("SELECT reads_commons FROM realms WHERE id = ?")
+            .bind(realm)
+            .fetch_optional(&st.store.pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|r| r != 0)
+}
+
+/// Whether realm `to` may publish to commons (records of `collection`, or
+/// knowledge with `None`).
+pub async fn may_publish(st: &HeadState, to: &str, collection: Option<&str>) -> Option<String> {
+    let kind = if collection.is_some() { "collection" } else { "memex" };
+    in_force(st, Some(COMMONS), to, kind, "append")
+        .await
+        .into_iter()
+        .find(|g| collection.is_none_or(|c| g.scope["collection"] == c))
+        .map(|g| g.id)
 }
 
 /// The realm whose operation `method` realm `to` may call through a grant.

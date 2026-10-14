@@ -276,7 +276,12 @@ fn Realms() -> impl IntoView {
         });
     };
     let create = move |_| {
-        let r = c6_api::RealmIn { id: id.get_untracked(), name: name.get_untracked(), description: description.get_untracked() };
+        let r = c6_api::RealmIn {
+            id: id.get_untracked(),
+            name: name.get_untracked(),
+            description: description.get_untracked(),
+            reads_commons: None,
+        };
         run(Box::pin(async move {
             crate::api::create_realm(r).await?;
             id.set(String::new());
@@ -290,16 +295,28 @@ fn Realms() -> impl IntoView {
     view! {
         <section class="space-y-3">
             <h2 class="font-medium">"Realms"</h2>
-            <p class="text-sm text-zinc-500">"A realm keeps an app or a project apart: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more for apps. A realm inherits root's settings."</p>
+            <p class="text-sm text-zinc-500">"A realm keeps an app or a project apart: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more for apps. A realm inherits root's settings. Commons holds what every realm may read: realms publish into it, and you review each item (Decisions) before it is there."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || realms.get().and_then(Result::ok).map(|rs| rs.into_iter().map(|r| {
                 let rid = r.id.clone();
-                let removable = r.id != "root" && r.id != "home";
+                let removable = r.id != "root" && r.id != "home" && r.id != "commons";
+                let holds = r.id != "root" && r.id != "commons";
+                let (cid, cname, cdesc, reads) = (r.id.clone(), r.name.clone(), r.description.clone(), r.reads_commons);
                 view! {
                     <div class="flex items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                         <span class="font-mono font-medium">{r.id.clone()}</span>
                         <span>{r.name.clone()}</span>
                         <span class="min-w-0 flex-1 truncate text-zinc-500">{r.description.clone()}</span>
+                        {holds.then(|| view! {
+                            <label class="flex items-center gap-1 text-xs text-zinc-500" title="Every realm reads commons, the knowledge shared by all, unless you turn it off">
+                                <input type="checkbox" prop:checked=reads on:change=move |ev| {
+                                    let r = c6_api::RealmIn { id: String::new(), name: cname.clone(), description: cdesc.clone(), reads_commons: Some(event_target_checked(&ev)) };
+                                    let cid = cid.clone();
+                                    run(Box::pin(async move { crate::api::update_realm(cid, r).await.map(|_| ()) }));
+                                } />
+                                "reads commons"
+                            </label>
+                        })}
                         {removable.then(|| view! {
                             <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
                                 let rid = rid.clone();

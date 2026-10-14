@@ -62,7 +62,7 @@ async fn realms_keep_data_apart() {
     // Realms: root and home.
     let realms: Value = http.get(format!("{api}/realms")).send().await.unwrap().json().await.unwrap();
     let ids: Vec<&str> = realms.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["root", "home"]);
+    assert_eq!(ids, vec!["root", "home", "commons"]);
     // A second realm, made directly (realms can't be created through the API yet).
     let db = sqlx::sqlite::SqlitePoolOptions::new()
         .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(head_dir.path().join("c6h.db")))
@@ -255,7 +255,10 @@ async fn creating_realms() {
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     assert_eq!(send(M::POST, "realms", json!({"id": "factory"})).await.status(), StatusCode::BAD_REQUEST);
     let realms: Value = http.get(format!("{api}/realms")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(realms.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["root", "home", "factory"]);
+    assert_eq!(
+        realms.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["root", "home", "commons", "factory"]
+    );
     // It has its own system collections.
     let cols: Value = http.get(format!("{api}/collections?realm=factory")).send().await.unwrap().json().await.unwrap();
     assert!(cols.as_array().unwrap().iter().any(|c| c["name"] == "skills" && c["system"] == true), "{cols}");

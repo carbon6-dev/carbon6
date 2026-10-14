@@ -356,6 +356,11 @@ async fn head_fixtures_upgrade_and_serve() {
         let realms = get("realms").await;
         let ids: Vec<&str> = realms.as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
         assert_eq!(&ids[..2], ["root", "home"], "{name}: {realms}");
+        // Commons (from version 34 on), read by home.
+        {
+            assert!(ids.contains(&"commons"), "{name}: {realms}");
+            assert_eq!(realms[1]["reads_commons"], true, "{name}: {realms}");
+        }
         // Grants (from version 33 on).
         if name.as_str() >= "c6h-v0033.db" {
             let g = get("grants").await;

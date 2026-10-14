@@ -257,6 +257,29 @@ simple_tool!(
 );
 
 simple_tool!(
+    CommonsPublish,
+    "commons_publish",
+    "CommonsPublish",
+    "Proposes something for commons, the knowledge every realm reads: a fact of this realm's knowledge (its id), or a record \
+     for one of commons' collections (collection and fields, matching its schema). The user reviews each proposal before it is \
+     published; this realm needs their append grant to commons. Read commons with records_query (realm commons); its facts \
+     come up in searches and briefs.",
+    json!({"type": "object", "properties": {
+        "fact": {"type": "string", "description": "A fact's id"},
+        "collection": {"type": "string"},
+        "fields": {"type": "object"},
+        "links": {"type": "array", "items": {"type": "string"}},
+        "labels": {"type": "array", "items": {"type": "string"}}
+    }, "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| {
+        result(call(ctx, "session.commons_publish", input).await, |v| {
+            format!("proposed for commons (decision #{}); it is published once the user reviews it", v["decision"])
+        })
+    }
+);
+
+simple_tool!(
     TodoResolve,
     "todo_resolve",
     "TodoResolve",

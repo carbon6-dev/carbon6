@@ -318,13 +318,25 @@ pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -
         return String::new();
     }
     let scope = scope_for(st, labels).await;
-    let params = json!({"labels": labels, "text": text, "chars": chars, "scope": scope, "realm": realm});
-    match st.registry.call(id, "memex.brief", params, BRIEF_TIMEOUT).await {
-        Ok(v) => serde_json::from_value::<api::MemexBrief>(v).map(|b| b.text).unwrap_or_default(),
-        Err(e) => {
-            debug!("memex brief: {e}");
-            String::new()
+    let one = async |realm: &str| {
+        let params = json!({"labels": labels, "text": text, "chars": chars, "scope": scope, "realm": realm});
+        match st.registry.call(id, "memex.brief", params, BRIEF_TIMEOUT).await {
+            Ok(v) => serde_json::from_value::<api::MemexBrief>(v).map(|b| b.text).unwrap_or_default(),
+            Err(e) => {
+                debug!("memex brief: {e}");
+                String::new()
+            }
         }
+    };
+    let own = one(realm).await;
+    // What commons knows about the same things (docs/os.md §3.3).
+    if !crate::grants::reads_commons(st, realm).await {
+        return own;
+    }
+    match one(crate::realms::COMMONS).await {
+        c if c.trim().is_empty() => own,
+        c if own.trim().is_empty() => format!("From commons (shared by every realm):\n{c}"),
+        c => format!("{own}\n\nFrom commons (shared by every realm):\n{c}"),
     }
 }
 

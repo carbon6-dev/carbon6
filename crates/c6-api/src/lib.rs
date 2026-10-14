@@ -384,6 +384,9 @@ pub struct RealmIn {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Whether the realm reads commons (updating only; unset: unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_commons: Option<bool>,
 }
 
 /// `PUT /api/v1/workers/{id}/realms` and `…/connections/{id}/realms`.
@@ -408,6 +411,9 @@ pub struct Realm {
     /// The app it was made for, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// Whether it reads commons (docs/os.md §3.3).
+    #[serde(default)]
+    pub reads_commons: bool,
 }
 
 /// A side chat: a new session that branches from `anchor_seq` of a session

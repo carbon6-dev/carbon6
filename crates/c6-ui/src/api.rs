@@ -137,6 +137,10 @@ pub async fn create_realm(r: c6_api::RealmIn) -> Result<c6_api::Realm, String> {
     send_json(Request::post("/api/v1/realms"), &r).await
 }
 
+pub async fn update_realm(id: String, r: c6_api::RealmIn) -> Result<c6_api::Realm, String> {
+    send_json(Request::patch(&format!("/api/v1/realms/{}", enc(&id))), &r).await
+}
+
 pub async fn delete_realm(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await
 }

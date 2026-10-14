@@ -127,6 +127,13 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
             after: "SELECT count(*) FROM decisions WHERE state = 'answered'",
         },
         c6_core::upgrade::Check {
+            version: 34,
+            name: "commons exists, and every realm reads it",
+            before: "SELECT 'yes'",
+            after: "SELECT CASE WHEN EXISTS (SELECT 1 FROM realms WHERE id = 'commons') \
+                    AND NOT EXISTS (SELECT 1 FROM realms WHERE reads_commons != 1) THEN 'yes' ELSE 'no' END",
+        },
+        c6_core::upgrade::Check {
             version: 30,
             name: "the original settings are kept",
             before: "SELECT count(*) FROM before.settings WHERE key IN ('skills', 'agents', 'commands', 'hooks', 'mcp_servers', 'templates', 'workflows', \

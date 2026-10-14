@@ -566,6 +566,12 @@ pub async fn for_session(st: &HeadState, realm: &str, session_id: &str, what: &s
                 "fields": p["fields"], "links": p.get("links"), "labels": p.get("labels"), "version": p.get("version")
             }))
             .map_err(|e| bad_request(format!("{e}")))?;
+            // A record for commons waits for the user's review.
+            if realm == crate::realms::COMMONS && to.grant.is_some() && id.is_empty() {
+                let own = crate::realms::of_session(st, session_id).await?.unwrap_or_default();
+                let d = crate::commons::propose_record(st, &own, &format!("session:{session_id}"), name, &r).await?;
+                return Ok(json!({"proposed": true, "decision": d.id, "note": "it waits for the user's review"}));
+            }
             Ok(json!(put(st, realm, name, (!id.is_empty()).then_some(id), &r, &by).await?))
         }
         "records_delete" => {

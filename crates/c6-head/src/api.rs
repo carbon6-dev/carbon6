@@ -2104,13 +2104,19 @@ async fn create_record(
     Path(name): Path<String>,
     Query(r): Query<api::InRealm>,
     Json(rec): Json<api::RecordIn>,
-) -> ApiResult<Json<api::Record>> {
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     let to = reach(&st, &caller, &r, &name, "append").await?;
+    // Another realm's record for commons waits for your review.
+    if to.realm == crate::realms::COMMONS && to.grant.is_some() {
+        let d = crate::commons::propose_record(&st, caller.realm.as_deref().unwrap_or_default(), &writer(&caller), &name, &rec).await?;
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"proposed": true, "decision": d.id}))).into_response());
+    }
     let by = match &to.grant {
         Some(g) => format!("{} grant:{g}", writer(&caller)),
         None => writer(&caller),
     };
-    Ok(Json(crate::collections::put(&st, &to.realm, &name, None, &rec, &by).await?))
+    Ok(Json(crate::collections::put(&st, &to.realm, &name, None, &rec, &by).await?).into_response())
 }
 
 async fn get_record(

@@ -707,6 +707,9 @@ async fn create_token(State(st): State<Arc<HeadState>>, Json(req): Json<api::Cre
     if realm == Some(crate::realms::ROOT) {
         return Err(bad_request("a token for root is one with no realm: leave the realm out").into());
     }
+    if realm == Some(crate::realms::COMMONS) {
+        return Err(bad_request("commons is written only by publishing from a realm, with your review").into());
+    }
     if let Some(r) = realm
         && !crate::realms::exists(&st, r).await?
     {
