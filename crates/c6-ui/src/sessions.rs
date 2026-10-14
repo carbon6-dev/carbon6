@@ -49,12 +49,14 @@ pub fn SessionsPage() -> impl IntoView {
                         let q = query.get().to_lowercase();
                         let st = status_filter.get();
                         let wanted = label_filter.get();
+                        let realm = crate::api::realm().get();
                         let sessions: Vec<Session> = live
                             .sessions
                             .get()
                             .into_iter()
                             .filter(|s| st.is_empty() || serde_json::to_value(s.status).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
                             .filter(|s| crate::labels::matches(s, &wanted))
+                            .filter(|s| realm.is_empty() || s.realm == realm)
                             .filter(|s| {
                                 q.is_empty()
                                     || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
@@ -237,7 +239,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked() && !on_ssh,
-            realm: None,
+            // In the realm you are looking at (else home).
+            realm: Some(crate::api::realm().get_untracked()).filter(|r| !r.is_empty()),
         };
         storage_set("c6.where", if on_ssh { "ssh" } else { "worker" });
         if on_ssh {

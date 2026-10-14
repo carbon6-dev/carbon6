@@ -112,6 +112,41 @@ pub fn signed_out() -> RwSignal<bool> {
     SIGNED_OUT.with(|s| *s)
 }
 
+thread_local! {
+    /// The realm you are looking at ("": every realm), remembered in this
+    /// browser (docs/os.md §3).
+    static REALM: RwSignal<String> = RwSignal::new(crate::util::storage_get("c6.realm").unwrap_or_default());
+}
+
+/// The realm you are looking at ("": every realm).
+pub fn realm() -> RwSignal<String> {
+    REALM.with(|r| *r)
+}
+
+/// `?realm=…` for the realm you are looking at, or "".
+fn in_realm(sep: char) -> String {
+    let r = realm().get_untracked();
+    if r.is_empty() { String::new() } else { format!("{sep}realm={}", enc(&r)) }
+}
+
+pub async fn realms() -> Result<Vec<c6_api::Realm>, String> {
+    json(Request::get("/api/v1/realms").send().await).await
+}
+
+pub async fn create_realm(r: c6_api::RealmIn) -> Result<c6_api::Realm, String> {
+    send_json(Request::post("/api/v1/realms"), &r).await
+}
+
+pub async fn delete_realm(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await
+}
+
+/// Which realms a worker ("workers") or connection ("connections") serves.
+pub async fn set_availability(what: &'static str, id: String, realms: Vec<String>) -> Result<(), String> {
+    empty(Request::put(&format!("/api/v1/{what}/{id}/realms")).json(&c6_api::RealmsIn { realms }).map_err(|e| e.to_string())?.send().await)
+        .await
+}
+
 async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, String> {
     let resp = resp.map_err(|e| e.to_string())?;
     if resp.ok() {
@@ -269,7 +304,7 @@ pub async fn children(id: String) -> Result<Vec<Session>, String> {
 }
 
 pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/settings/{name}")).send().await).await
+    json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
 }
 
 pub async fn usage(days: u32, labels: Vec<String>) -> Result<c6_api::UsageReport, String> {
@@ -436,7 +471,7 @@ pub async fn test_channel(name: String) -> Result<(), String> {
 }
 
 pub async fn put_setting(name: &'static str, value: serde_json::Value) -> Result<(), String> {
-    empty(Request::put(&format!("/api/v1/settings/{name}")).json(&value).map_err(|e| e.to_string())?.send().await).await
+    empty(Request::put(&format!("/api/v1/settings/{name}{}", in_realm('?'))).json(&value).map_err(|e| e.to_string())?.send().await).await
 }
 
 pub async fn fs_mkdir(worker: String, path: String) -> Result<serde_json::Value, String> {
@@ -502,10 +537,6 @@ pub async fn api_tokens() -> Result<Vec<c6_api::ApiToken>, String> {
 
 pub async fn create_api_token(name: String, realm: Option<String>) -> Result<c6_api::ApiToken, String> {
     send_json(Request::post("/api/v1/auth/tokens"), &c6_api::CreateApiToken { name, realm }).await
-}
-
-pub async fn realms() -> Result<Vec<c6_api::Realm>, String> {
-    json(Request::get("/api/v1/realms").send().await).await
 }
 
 pub async fn delete_api_token(id: String) -> Result<(), String> {
@@ -711,36 +742,36 @@ pub async fn decision_session(id: i64) -> Result<c6_api::Session, String> {
 // --- Collections (docs/os.md §4.1) ---------------------------------------------
 
 pub async fn collections() -> Result<Vec<c6_api::Collection>, String> {
-    json(Request::get("/api/v1/collections").send().await).await
+    json(Request::get(&format!("/api/v1/collections{}", in_realm('?'))).send().await).await
 }
 
 pub async fn collection(name: String) -> Result<c6_api::Collection, String> {
-    json(Request::get(&format!("/api/v1/collections/{}", enc(&name))).send().await).await
+    json(Request::get(&format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))).send().await).await
 }
 
 pub async fn create_collection(c: c6_api::CollectionIn) -> Result<c6_api::Collection, String> {
-    send_json(Request::post("/api/v1/collections"), &c).await
+    send_json(Request::post(&format!("/api/v1/collections{}", in_realm('?'))), &c).await
 }
 
 pub async fn drop_collection(name: String) -> Result<(), String> {
-    empty(Request::delete(&format!("/api/v1/collections/{}", enc(&name))).send().await).await
+    empty(Request::delete(&format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))).send().await).await
 }
 
 pub async fn query_records(name: String, q: c6_api::RecordQuery) -> Result<c6_api::RecordPage, String> {
-    send_json(Request::post(&format!("/api/v1/collections/{}/query", enc(&name))), &q).await
+    send_json(Request::post(&format!("/api/v1/collections/{}/query{}", enc(&name), in_realm('?'))), &q).await
 }
 
 pub async fn save_record(name: String, id: Option<String>, r: c6_api::RecordIn) -> Result<c6_api::Record, String> {
     match id {
-        Some(id) => send_json(Request::put(&format!("/api/v1/collections/{}/records/{}", enc(&name), enc(&id))), &r).await,
-        None => send_json(Request::post(&format!("/api/v1/collections/{}/records", enc(&name))), &r).await,
+        Some(id) => send_json(Request::put(&format!("/api/v1/collections/{}/records/{}{}", enc(&name), enc(&id), in_realm('?'))), &r).await,
+        None => send_json(Request::post(&format!("/api/v1/collections/{}/records{}", enc(&name), in_realm('?'))), &r).await,
     }
 }
 
 pub async fn delete_record(name: String, id: String) -> Result<(), String> {
-    empty(Request::delete(&format!("/api/v1/collections/{}/records/{}", enc(&name), enc(&id))).send().await).await
+    empty(Request::delete(&format!("/api/v1/collections/{}/records/{}{}", enc(&name), enc(&id), in_realm('?'))).send().await).await
 }
 
 pub async fn record_history(name: String, id: String) -> Result<Vec<c6_api::RecordChange>, String> {
-    json(Request::get(&format!("/api/v1/collections/{}/records/{}/history", enc(&name), enc(&id))).send().await).await
+    json(Request::get(&format!("/api/v1/collections/{}/records/{}/history{}", enc(&name), enc(&id), in_realm('?'))).send().await).await
 }

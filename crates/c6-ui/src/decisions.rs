@@ -48,7 +48,8 @@ pub fn DecisionsPage() -> impl IntoView {
         tick.track();
         live.sessions.track();
         let s = state.get();
-        async move { api::decisions(s).await }
+        let realm = api::realm().get();
+        async move { api::decisions(s).await.map(|ds| ds.into_iter().filter(|d| realm.is_empty() || d.realm == realm).collect::<Vec<_>>()) }
     });
     let refresh = Callback::new(move |()| tick.update(|t| *t += 1));
     view! {

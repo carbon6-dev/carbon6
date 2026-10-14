@@ -205,3 +205,109 @@ async fn realms_keep_data_apart() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+/// Realms you create (docs/os.md §3): each has its own settings lists,
+/// workers and connections can be kept to some realms, and a realm is
+/// deleted only once it owns nothing.
+#[tokio::test]
+async fn creating_realms() {
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    let wid = worker.identity.meta.worker_id.0;
+    let conn: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let send = |method: reqwest::Method, path: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.request(method, &url).json(&body).send().await.unwrap() }
+    };
+    use reqwest::Method as M;
+
+    // Create: ids are checked and unique.
+    assert_eq!(send(M::POST, "realms", json!({"id": "Bad Id"})).await.status(), StatusCode::BAD_REQUEST);
+    let r =
+        send(M::POST, "realms", json!({"id": "factory", "name": "Service factory", "description": "Finds gaps, builds services"})).await;
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    assert_eq!(send(M::POST, "realms", json!({"id": "factory"})).await.status(), StatusCode::BAD_REQUEST);
+    let realms: Value = http.get(format!("{api}/realms")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(realms.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["root", "home", "factory"]);
+    // It has its own system collections.
+    let cols: Value = http.get(format!("{api}/collections?realm=factory")).send().await.unwrap().json().await.unwrap();
+    assert!(cols.as_array().unwrap().iter().any(|c| c["name"] == "skills" && c["system"] == true), "{cols}");
+
+    // Settings for one realm: its own lists.
+    let put =
+        send(M::PUT, "settings/skills?realm=factory", json!([{"name": "rubric", "description": "FACTORY-RUBRIC", "body": "x"}])).await;
+    assert!(put.status().is_success());
+    send(M::PUT, "settings/skills", json!([{"name": "greet", "description": "HOME-GREET", "body": "x"}])).await;
+    let get = |path: &'static str| {
+        let (http, api) = (http.clone(), api.clone());
+        async move { http.get(format!("{api}/{path}")).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    assert_eq!(get("settings/skills?realm=factory").await[0]["name"], "rubric");
+    assert_eq!(get("settings/skills").await[0]["name"], "greet");
+    assert_eq!(http.get(format!("{api}/settings/skills?realm=nowhere")).send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+    // A worker dedicated to the factory runs only its sessions.
+    assert!(send(M::PUT, &format!("workers/{wid}/realms"), json!({"realms": ["factory"]})).await.status().is_success());
+    assert_eq!(send(M::PUT, &format!("workers/{wid}/realms"), json!({"realms": ["root"]})).await.status(), StatusCode::BAD_REQUEST);
+    let workers: Value = get("workers").await;
+    assert_eq!(workers[0]["realms"], json!(["factory"]));
+    let start = |realm: &'static str| {
+        send(
+            M::POST,
+            "sessions",
+            json!({"worker_id": wid, "cwd": "", "connection_id": conn.id, "model": "m", "prompt": "hi", "realm": realm}),
+        )
+    };
+    let r = start("home").await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("not available to realm home"));
+    mock.push(Reply::Text("ok".into()));
+    let r = start("factory").await;
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    eventually("the factory session's call", async || (!mock.requests().is_empty()).then_some(())).await;
+    let sys = mock.requests()[0]["messages"][0]["content"].as_str().unwrap().to_owned();
+    assert!(sys.contains("FACTORY-RUBRIC") && !sys.contains("HOME-GREET"), "{sys}");
+    // A connection kept to home: the factory's sessions cannot use it.
+    send(M::PUT, &format!("workers/{wid}/realms"), json!({"realms": []})).await;
+    assert!(send(M::PUT, &format!("connections/{}/realms", conn.id), json!({"realms": ["home"]})).await.status().is_success());
+    let r = start("factory").await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("not available to realm factory"));
+
+    // Deleting: only an empty realm; root and home stay.
+    let r = send(M::DELETE, "realms/factory", json!({})).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("still owns 1 sessions"));
+    send(M::POST, "realms", json!({"id": "scratch"})).await;
+    assert_eq!(send(M::DELETE, "realms/scratch", json!({})).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(send(M::DELETE, "realms/home", json!({})).await.status(), StatusCode::BAD_REQUEST);
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}

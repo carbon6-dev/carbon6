@@ -39,6 +39,9 @@ pub struct Worker {
     /// sessions); empty until it first connects.
     #[serde(default)]
     pub role: String,
+    /// The realms it may run sessions for (empty: all).
+    #[serde(default)]
+    pub realms: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -82,6 +85,9 @@ pub struct Connection {
     #[serde(default)]
     pub supports_effort: bool,
     pub created_at: UnixMs,
+    /// The realms whose sessions may use it (empty: all).
+    #[serde(default)]
+    pub realms: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -306,6 +312,27 @@ pub struct RecordChange {
 pub struct InRealm {
     #[serde(default)]
     pub realm: Option<String>,
+}
+
+/// `POST /api/v1/realms` (and `PATCH …/{id}`: name and description).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RealmIn {
+    /// Lowercase letters, digits and - (creating only).
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `PUT /api/v1/workers/{id}/realms` and `…/connections/{id}/realms`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RealmsIn {
+    /// The realms it is available to (empty: all).
+    pub realms: Vec<String>,
 }
 
 /// `GET /api/v1/realms`: a realm, which owns sessions, knowledge and data

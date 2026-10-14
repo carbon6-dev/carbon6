@@ -102,6 +102,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     let labels = check_labels(&req_labels)?;
     let realm = req.realm.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| crate::realms::HOME.to_owned());
     crate::realms::check_for_sessions(st, &realm).await?;
+    if !crate::realms::available(&worker.realms, &realm) {
+        return Err(bad_request(format!("{} is not available to realm {realm}", worker.name)));
+    }
     let cwd = req.cwd.trim().to_owned();
     let (connection_id, model, subagent_model) = {
         let mut route_labels = labels.clone();
@@ -115,6 +118,11 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         }
         (routed.connection, routed.model, routed.subagent_model)
     };
+    if let Some(c) = st.store.connection(&connection_id).await?
+        && !crate::realms::available(&c.realms, &realm)
+    {
+        return Err(bad_request(format!("the connection {} is not available to realm {realm}", c.name)));
+    }
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let files = attachments(&req.attachments)?;

@@ -23,6 +23,7 @@ fn CollectionList() -> impl IntoView {
     let tick = RwSignal::new(0u32);
     let list = LocalResource::new(move || {
         tick.track();
+        api::realm().track();
         api::collections()
     });
     let creating = RwSignal::new(false);

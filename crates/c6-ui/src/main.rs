@@ -104,6 +104,7 @@ fn Main() -> impl IntoView {
                     <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                 </nav>
                 <span class="flex-1"></span>
+                <RealmSwitch />
                 <assistant::AskButton />
                 <span class="hidden md:contents"><search::SearchBox /></span>
                 {move || (tiles() < workspace::MAX_TILES).then(|| view! {
@@ -180,5 +181,28 @@ fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
             }></span>
             <span class="hidden sm:inline">{move || if connected.get() { "live" } else { "reconnecting…" }}</span>
         </span>
+    }
+}
+
+/// Which realm you are looking at (docs/os.md §3): sessions, decisions and
+/// collections show its own, new sessions start in it, and Settings edits
+/// its lists. Remembered in this browser.
+#[component]
+fn RealmSwitch() -> impl IntoView {
+    let realms = LocalResource::new(api::realms);
+    let current = api::realm();
+    view! {
+        {move || realms.get().and_then(Result::ok).filter(|rs| rs.iter().filter(|r| r.id != "root").count() > 1).map(|rs| view! {
+            <select class="hidden rounded-md border border-zinc-300 bg-white px-1 py-0.5 text-xs md:block dark:border-zinc-700 dark:bg-zinc-900"
+                title="The realm you are looking at" prop:value=move || current.get()
+                on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    util::storage_set("c6.realm", &v);
+                    current.set(v);
+                }>
+                <option value="">"All realms"</option>
+                {rs.into_iter().filter(|r| r.id != "root").map(|r| view! { <option value=r.id.clone()>{r.name.clone()}</option> }).collect_view()}
+            </select>
+        })}
     }
 }

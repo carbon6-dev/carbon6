@@ -135,7 +135,10 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
-        .route("/api/v1/realms", get(list_realms))
+        .route("/api/v1/realms", get(list_realms).post(create_realm))
+        .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
+        .route("/api/v1/workers/{id}/realms", put(set_worker_realms))
+        .route("/api/v1/connections/{id}/realms", put(set_connection_realms))
         .route("/api/v1/settings/prompts", get(list_prompts))
         .route("/api/v1/settings/prompts/{name}", put(put_prompt))
         .route("/api/v1/collections", get(list_collections).post(create_collection))
@@ -148,6 +151,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
         .fallback(static_asset)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), settings_realm))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
         .with_state(state)
 }
@@ -205,6 +209,7 @@ pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>
                 rtt_us: live.as_ref().and_then(|l| l.rtt_us),
                 capabilities: live.map(|l| l.capabilities).unwrap_or_default(),
                 role: r.role,
+                realms: serde_json::from_str(&r.realms).unwrap_or_default(),
             })
         })
         .collect())
@@ -291,6 +296,7 @@ fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
         default_model: c.default_model,
         has_api_key: c.api_key.is_some(),
         created_at: c.created_at,
+        realms: serde_json::from_str(&c.realms).unwrap_or_default(),
     }
 }
 
@@ -329,6 +335,7 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         api_key,
         default_model: req.default_model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
         created_at: now_ms(),
+        realms: "[]".into(),
     };
     st.store.insert_connection(&row).await?;
     Ok(Json(connection_view(row)))
@@ -406,6 +413,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         api_key: Some(secret),
         default_model: None,
         created_at: now_ms(),
+        realms: "[]".into(),
     };
     st.store.insert_connection(&row).await?;
     Ok(connection_view(row))
@@ -1959,6 +1967,19 @@ async fn get_catalog() -> Json<serde_json::Value> {
     }))
 }
 
+/// `?realm=` on a Settings request: its lists are that realm's own.
+async fn settings_realm(State(st): State<Arc<HeadState>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let realm = (req.uri().path().starts_with("/api/v1/settings/"))
+        .then(|| req.uri().query().and_then(|q| q.split('&').find_map(|p| p.strip_prefix("realm=")).map(str::to_owned)))
+        .flatten()
+        .filter(|r| !r.is_empty());
+    let Some(realm) = realm else { return next.run(req).await };
+    match crate::realms::exists(&st, &realm).await {
+        Ok(true) => crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await,
+        _ => ApiErr(StatusCode::BAD_REQUEST, format!("no realm {realm:?}")).into_response(),
+    }
+}
+
 // --- Collections (docs/os.md §4.1) ---------------------------------------------
 
 /// The realm a collection request is for: `?realm=` (you), the token's
@@ -2111,6 +2132,41 @@ async fn list_prompts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<ap
 
 async fn put_prompt(State(st): State<Arc<HeadState>>, Path(name): Path<String>, Json(p): Json<api::PromptIn>) -> ApiResult<StatusCode> {
     crate::prompts::set(&st, &name, &p.body).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_realm(State(st): State<Arc<HeadState>>, Json(r): Json<api::RealmIn>) -> ApiResult<Json<api::Realm>> {
+    Ok(Json(crate::realms::create(&st, &r, "you").await?))
+}
+
+async fn update_realm(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(r): Json<api::RealmIn>,
+) -> ApiResult<Json<api::Realm>> {
+    Ok(Json(crate::realms::update(&st, &id, &r).await?))
+}
+
+async fn delete_realm(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::realms::delete(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_worker_realms(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(r): Json<api::RealmsIn>,
+) -> ApiResult<StatusCode> {
+    crate::realms::set_availability(&st, "workers", &id, &r.realms).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_connection_realms(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(r): Json<api::RealmsIn>,
+) -> ApiResult<StatusCode> {
+    crate::realms::set_availability(&st, "connections", &id, &r.realms).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -248,7 +248,8 @@ pub async fn ensure(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     for (key, description) in LISTS.iter().map(|l| (l.key, l.description)).chain(memory) {
         let l = (key, description);
         let schema = crate::catalog::list_schema(l.0).unwrap_or_else(|| json!({"type": "object", "additionalProperties": true}));
-        for realm in [ROOT, HOME] {
+        let realms: Vec<String> = sqlx::query_scalar("SELECT id FROM realms").fetch_all(pool).await?;
+        for realm in realms.iter().map(String::as_str).chain([ROOT, HOME]) {
             sqlx::query(
                 "INSERT INTO collections (realm, name, description, schema, keys, system, created_by, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, '[]', 1, 'system', ?, ?) \

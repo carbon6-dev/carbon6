@@ -167,6 +167,13 @@ grant(id, from_realm, to_realm,
   - **Per-realm queries:** queries partitioned by realm, and things keyed per realm, come with step 4, together with grants on memex data. Until then nothing crosses, because only home's data is there.
 - **Test databases:** `c6h-v0027.db` was regenerated with an assistant conversation, so the move to root is exercised. `c6h-v0028.db` and `memex-v0007.db` hold the new shape. The `realms` integration test covers tokens, admission, sessions in realms, and secrets, memory notes and action items not crossing realms; a second realm is inserted directly for it.
 
+### 3.12 As built (step 4a)
+
+- **Creating realms:** `POST /api/v1/realms` (id: lowercase letters, digits and `-`), rename, and delete. Only a realm that owns nothing can be deleted, and root and home stay. A new realm gets its own system collections at once.
+- **Availability:** workers and connections carry a `realms` list (migration `0032`; empty means every realm), set with `PUT /api/v1/workers/{id}/realms` and `…/connections/{id}/realms`. A session cannot start on a worker, or with a connection, that its realm may not use.
+- **Per-realm settings:** a Settings request with `?realm=` reads and writes that realm's own lists. A request-scoped value (`SETTINGS_REALM`) tells the settings store which realm, so every settings endpoint and form works per realm unchanged.
+- **UI:** a realm switcher in the header, remembered per browser ("All realms" by default; shown once a realm beyond home exists). Sessions, decisions and collections show the realm's own, new sessions start in it, and Settings edits its lists, with a note saying so. **Settings → System → Realms** creates and deletes realms, and sets which realms each worker and connection serves.
+
 ## 4. Primitives
 
 Every primitive is scoped by realm, has operations in the catalog (so the assistant, the CLI, the API reference and the OpenAPI document get them automatically), and has agent tools where agents need them.
@@ -729,4 +736,7 @@ Choices the design left open, made while building, for review.
 | 3 | A question asking for a secret is never answered through decisions | Answers are stored; secrets must not be |
 | 3 | The memex's review queue stays in the memex for now | It needs the memex to raise and resolve decisions over the fabric; step 4 revisits the memex |
 | 3 | Digests are left for triggers (step 5) | A digest is a scheduled notification of open decisions, which is exactly a trigger |
+| 4a | A realm is deleted only when it owns nothing | Removing a realm with its data belongs to an app's uninstall (step 9), with an export first |
+| 4a | Per-realm settings use a request-scoped realm read by the settings store | Every settings endpoint and form works per realm without being rewritten |
+| 4a | The realm switcher lives in the browser, and "All realms" shows everything | Single user: it is a view, not a permission |
 

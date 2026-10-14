@@ -77,6 +77,14 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 <div>
                     <h1 class="text-lg font-semibold">{move || heading().0}</h1>
                     <p class="text-sm text-zinc-500">{move || heading().1}</p>
+                    {move || {
+                        let r = crate::api::realm().get();
+                        (!r.is_empty()).then(|| view! {
+                            <p class="mt-2 rounded-md bg-sky-50 px-3 py-2 text-sm text-sky-900 dark:bg-sky-950 dark:text-sky-200">
+                                {format!("Lists here are realm {r}'s own. It also uses root's: its own replace root's of the same name (policies and budgets from root always apply). Choose \"All realms\" in the header for where each list lives by default.")}
+                            </p>
+                        })
+                    }}
                 </div>
                 {move || match current.get().as_str() {
                     "tools" => view! {
@@ -213,7 +221,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
-                    "system" => view! { <Upgrades /> }.into_any(),
+                    "system" => view! { <Realms /> <Upgrades /> }.into_any(),
                     "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
@@ -237,6 +245,111 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 }}
             </div>
         </main>
+    }
+}
+
+/// Realms (docs/os.md §3): yours, and which workers and connections serve
+/// each.
+#[component]
+fn Realms() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let realms = LocalResource::new(move || {
+        tick.track();
+        crate::api::realms()
+    });
+    let connections = LocalResource::new(move || {
+        tick.track();
+        crate::api::connections()
+    });
+    let live = crate::api::live();
+    let (id, name, description) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let error = RwSignal::new(None::<String>);
+    let run = move |f: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>| {
+        spawn_local(async move {
+            match f.await {
+                Ok(()) => {
+                    error.set(None);
+                    tick.update(|t| *t += 1);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let create = move |_| {
+        let r = c6_api::RealmIn { id: id.get_untracked(), name: name.get_untracked(), description: description.get_untracked() };
+        run(Box::pin(async move {
+            crate::api::create_realm(r).await?;
+            id.set(String::new());
+            name.set(String::new());
+            description.set(String::new());
+            Ok(())
+        }));
+    };
+    // "a, b": a list of realms (empty: all).
+    let parse = |s: String| s.split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect::<Vec<_>>();
+    view! {
+        <section class="space-y-3">
+            <h2 class="font-medium">"Realms"</h2>
+            <p class="text-sm text-zinc-500">"A realm keeps an app or a project apart: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more for apps. A realm inherits root's settings."</p>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || realms.get().and_then(Result::ok).map(|rs| rs.into_iter().map(|r| {
+                let rid = r.id.clone();
+                let removable = r.id != "root" && r.id != "home";
+                view! {
+                    <div class="flex items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
+                        <span class="font-mono font-medium">{r.id.clone()}</span>
+                        <span>{r.name.clone()}</span>
+                        <span class="min-w-0 flex-1 truncate text-zinc-500">{r.description.clone()}</span>
+                        {removable.then(|| view! {
+                            <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                let rid = rid.clone();
+                                if window().confirm_with_message(&format!("Delete realm {rid}? Only a realm that owns nothing can be deleted.")).unwrap_or(false) {
+                                    run(Box::pin(async move { crate::api::delete_realm(rid).await }));
+                                }
+                            }>"Delete"</button>
+                        })}
+                    </div>
+                }
+            }).collect_view())}
+            <div class="flex flex-wrap gap-2">
+                <input class=format!("{INPUT} w-32") placeholder="id (e.g. factory)" prop:value=move || id.get() on:input=move |ev| id.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} w-40") placeholder="Name" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="What it is for" prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
+                <button class=BUTTON on:click=create>"Create a realm"</button>
+            </div>
+            <h3 class="pt-2 text-sm font-medium">"Which realms each worker and connection serves"</h3>
+            <p class="text-xs text-zinc-500">"Empty: every realm. One realm: dedicated to it (a realm whose files must stay apart needs a worker of its own)."</p>
+            <div class="space-y-1 text-sm">
+                {move || live.workers.get().into_iter().filter(|w| w.role != "memex" && w.role != "head").map(|w| {
+                    let text = RwSignal::new(w.realms.join(", "));
+                    let wid = w.id.to_string();
+                    view! {
+                        <div class="flex items-center gap-2">
+                            <span class="w-48 truncate">{format!("Worker {}", w.name)}</span>
+                            <input class=format!("{INPUT} min-w-0 flex-1 py-1") placeholder="every realm" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
+                            <button class=BUTTON_QUIET on:click=move |_| {
+                                let (wid, realms) = (wid.clone(), parse(text.get_untracked()));
+                                run(Box::pin(async move { crate::api::set_availability("workers", wid, realms).await }));
+                            }>"Save"</button>
+                        </div>
+                    }
+                }).collect_view()}
+                {move || connections.get().and_then(Result::ok).map(|cs| cs.into_iter().map(|c| {
+                    let text = RwSignal::new(c.realms.join(", "));
+                    let cid = c.id.clone();
+                    view! {
+                        <div class="flex items-center gap-2">
+                            <span class="w-48 truncate">{format!("Connection {}", c.name)}</span>
+                            <input class=format!("{INPUT} min-w-0 flex-1 py-1") placeholder="every realm" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
+                            <button class=BUTTON_QUIET on:click=move |_| {
+                                let (cid, realms) = (cid.clone(), parse(text.get_untracked()));
+                                run(Box::pin(async move { crate::api::set_availability("connections", cid, realms).await }));
+                            }>"Save"</button>
+                        </div>
+                    }
+                }).collect_view())}
+            </div>
+        </section>
     }
 }
 

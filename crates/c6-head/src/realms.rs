@@ -143,6 +143,108 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
     }
 }
 
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') && !id.starts_with('-')
+}
+
+/// A new realm, with its own system collections (it inherits root's).
+pub async fn create(st: &HeadState, r: &api::RealmIn, by: &str) -> anyhow::Result<api::Realm> {
+    let id = r.id.trim();
+    if !valid_id(id) {
+        return Err(bad_request("a realm's id is lowercase letters, digits and - (up to 32)"));
+    }
+    let name = if r.name.trim().is_empty() { id } else { r.name.trim() };
+    let done = sqlx::query("INSERT OR IGNORE INTO realms (id, name, description, created_at, created_by) VALUES (?, ?, ?, ?, ?)")
+        .bind(id)
+        .bind(name)
+        .bind(r.description.trim())
+        .bind(c6_core::now_ms())
+        .bind(by)
+        .execute(&st.store.pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(bad_request(format!("there is already a realm {id:?}")));
+    }
+    crate::lists::ensure(&st.store.pool).await?;
+    st.registry.bump();
+    list(st, &Caller::root()).await?.into_iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("realm gone"))
+}
+
+pub async fn update(st: &HeadState, id: &str, r: &api::RealmIn) -> anyhow::Result<api::Realm> {
+    let current = list(st, &Caller::root()).await?.into_iter().find(|x| x.id == id).ok_or_else(|| crate::not_found("no such realm"))?;
+    sqlx::query("UPDATE realms SET name = ?, description = ? WHERE id = ?")
+        .bind(if r.name.trim().is_empty() { current.name.as_str() } else { r.name.trim() })
+        .bind(r.description.trim())
+        .bind(id)
+        .execute(&st.store.pool)
+        .await?;
+    list(st, &Caller::root()).await?.into_iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("realm gone"))
+}
+
+/// Deletes a realm that owns nothing yet (removing an app's realm with its
+/// data is the app's uninstall).
+pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
+    if id == ROOT || id == HOME {
+        return Err(bad_request(format!("{id} is carbon6's own and stays")));
+    }
+    if !exists(st, id).await? {
+        return Err(crate::not_found("no such realm"));
+    }
+    let mut owned = Vec::new();
+    for (table, what, cond) in [
+        ("sessions", "sessions", ""),
+        ("records", "records", " AND collection NOT IN (SELECT name FROM collections WHERE realm = records.realm AND system = 1)"),
+        ("collections", "collections", " AND system = 0"),
+        ("decisions", "decisions", ""),
+        ("automations", "automations", ""),
+        ("secrets", "secrets", ""),
+    ] {
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table} WHERE realm = ?{cond}")))
+            .bind(id)
+            .fetch_one(&st.store.pool)
+            .await?;
+        if n > 0 {
+            owned.push(format!("{n} {what}"));
+        }
+    }
+    if !owned.is_empty() {
+        return Err(bad_request(format!("realm {id} still owns {}", owned.join(", "))));
+    }
+    let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("DELETE FROM records WHERE realm = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM collections WHERE realm = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM api_tokens WHERE realm = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM realms WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    st.registry.bump();
+    Ok(())
+}
+
+/// Sets which realms a worker or connection is available to (empty: all).
+pub async fn set_availability(st: &HeadState, table: &'static str, id: &str, realms: &[String]) -> anyhow::Result<()> {
+    for r in realms {
+        if !exists(st, r).await? || r == ROOT {
+            return Err(bad_request(format!("no realm {r:?} that sessions run in")));
+        }
+    }
+    let done = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET realms = ? WHERE id = ?")))
+        .bind(serde_json::to_string(realms)?)
+        .bind(id)
+        .execute(&st.store.pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(crate::not_found("no such worker or connection"));
+    }
+    st.registry.bump();
+    Ok(())
+}
+
+/// Whether a worker or connection with these realms serves `realm`.
+pub fn available(realms_json: &str, realm: &str) -> bool {
+    let realms: Vec<String> = serde_json::from_str(realms_json).unwrap_or_default();
+    realms.is_empty() || realms.iter().any(|r| r == realm)
+}
+
 /// The realm a session runs in.
 pub async fn of_session(st: &HeadState, session_id: &str) -> anyhow::Result<Option<String>> {
     Ok(sqlx::query("SELECT realm FROM sessions WHERE id = ?")

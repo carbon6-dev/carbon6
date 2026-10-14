@@ -26,6 +26,8 @@ pub struct WorkerRow {
     pub revoked_at: Option<i64>,
     /// "worker" or "memex"; empty until it first attaches.
     pub role: String,
+    /// The realms it is available to (JSON array; empty: all).
+    pub realms: String,
 }
 
 impl WorkerRow {
@@ -42,6 +44,12 @@ pub struct NewWorker<'a> {
     pub arch: &'a str,
     pub version: &'a str,
     pub cert_serial: &'a str,
+}
+
+tokio::task_local! {
+    /// The realm a Settings request is for (`?realm=`): its lists are read
+    /// and written there instead of where each list lives by default.
+    pub static SETTINGS_REALM: String;
 }
 
 /// The head database's migrations.
@@ -279,6 +287,8 @@ pub struct ConnectionRow {
     pub api_key: Option<Vec<u8>>,
     pub default_model: Option<String>,
     pub created_at: i64,
+    /// The realms it is available to (JSON array; empty: all).
+    pub realms: String,
 }
 
 impl Store {
@@ -528,10 +538,12 @@ impl Store {
     }
 
     /// A setting's value. A system list (docs/os.md §12.2) is read from its
-    /// collection in the realm it lives in, as a JSON array.
+    /// collection in the realm it lives in (or, during a Settings request
+    /// for one realm, that realm's own entries), as a JSON array.
     pub async fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
         if let Some(l) = crate::lists::list(key) {
-            return Ok(Some(serde_json::to_string(&crate::lists::read(&self.pool, key, l.realm).await?)?));
+            let realm = SETTINGS_REALM.try_with(Clone::clone).unwrap_or_else(|_| l.realm.to_owned());
+            return Ok(Some(serde_json::to_string(&crate::lists::read(&self.pool, key, &realm).await?)?));
         }
         Ok(sqlx::query("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&self.pool).await?.map(|r| r.get("value")))
     }
@@ -550,7 +562,8 @@ impl Store {
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
         if let Some(l) = crate::lists::list(key) {
             let entries: Vec<serde_json::Value> = serde_json::from_str(value)?;
-            return crate::lists::write(&self.pool, key, l.realm, &entries, "you").await;
+            let realm = SETTINGS_REALM.try_with(Clone::clone).unwrap_or_else(|_| l.realm.to_owned());
+            return crate::lists::write(&self.pool, key, &realm, &entries, "you").await;
         }
         sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .bind(key)
