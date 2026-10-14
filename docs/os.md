@@ -872,7 +872,6 @@ Choices the design left open, made while building, for review.
 | 6 | A threshold with nothing recorded counts from when the trigger was made, for silence | A heartbeat that never started is as silent as one that stopped |
 | 6 | Series aren't covered by grants yet | No example needed series across realms; a grant of kind series can follow the collection grant's shape when one does |
 | 6 | The memex's model-call budget stays in the memex | It is the memex's own database; it can become a series when the memex reports points to the head |
-
 | 7 | Views are a system list, not a table of their own | They are configuration: per realm, inherited from root, with history, and edited like every other list |
 | 7 | The usage and decisions pages stay; views reproduce them as presets (a chart of `model_spend`, a feed of open decisions) | Those pages do more than a view can yet (budget editing, forms, snoozing); a preset shows the same data the configurable way |
 | 7 | A page cannot embed a page | No loops, and one level is what dashboards need |
