@@ -549,6 +549,23 @@ carbon6 follows a microkernel and Unix approach. A small kernel provides orthogo
 | Commitments, trails, the hosts inventory | Collections | Collections with links into the memex |
 | Memory notes (`remember`, `forget`), memex notes (`memex_note`), facts (`knowledge_record`), action items (`todo_add`) | Overlapping tools | One knowledge model: memory notes become a collection whose records are always in briefs. Agents get `records_*`, `decision_request` and the memex tools, each doing one thing. |
 
+#### As built (step 2b)
+
+- **The lists are system collections:** skills, agents, commands, hooks, MCP servers, templates, workflows, policies, model routes, prices, budgets, notification channels, hosts, and memex folders and scopes.
+  - **Where they live:** policies, budgets, routes and prices in root, the rest in home (`lists.rs`).
+  - **Moving in:** migration `0030` splits each stored list into records, in order (a new `position` column), and keeps the original values in `legacy_settings`. Checks prove every entry arrived unchanged and in order.
+  - **Schemas follow the code:** each system collection's schema comes from the entry's Rust type, refreshed at every start.
+- **Reading and writing through the settings store:** the head's settings store routes these keys to the collections. Every existing reader, endpoint and form works unchanged.
+  - **Reading** a list assembles it from records.
+  - **Writing** one updates the records matched by each entry's identity (name, model or path; for skills, agents and commands, name and labels; for hooks, their event, matcher and command). Each entry keeps its own history.
+- **Inheritance** (`lists::effective`): a session gets its realm's effective lists, used for its skills, agents, hooks, MCP servers, policies, commands and routing.
+  - **Skills, agents, commands, MCP servers and the rest:** root's entries, with the realm's replacing root's of the same identity.
+  - **Policies, budgets and hooks:** root's first, then the realm's.
+  - **Routes:** the realm's first.
+- **Memory notes:** records of the `memory` collection, keeping their ids. The table stays as `legacy_memories`. Remember, forget and the Settings form keep working, now with history.
+- **Writing system collections:** system collections can be read through the collections API, but writes go through Settings (or remember/forget). A session therefore cannot add itself a hook or a policy through `records_put`.
+- **Upgrades** now apply pending migrations one version at a time, with each version's checks run straight after it, while the tables those checks read still exist.
+
 ### 12.3 Services and apps: move outside the kernel
 
 | Built today | Is really | Becomes |
@@ -662,4 +679,10 @@ Choices the design left open, made while building, for review.
 | 2a | A schema change is allowed exactly when every existing record still fits | That is "additive" stated as a rule the head can check; anything else needs a migration (step 3) |
 | 2a | Records are mirrored into the memex only for non-system collections | System collections are configuration (step 2b), not knowledge |
 | 2a | Forms list required fields first, then the rest alphabetically | JSON objects come back sorted, so the schema's own order is lost |
+| 2b | The head's settings store routes the list keys to system collections | Every endpoint, form and reader keeps working with no rewrite; only what builds a session's configuration asks for the realm's effective lists |
+| 2b | Settings forms stay hand-written for now | They write the same records; generating them from the schemas (decision above) can replace them one by one once a generated form does everything a hand-written one does |
+| 2b | The single settings (public URL, web search, the assistant's model, memex settings) stay as they are | They are root configuration, not lists; there is no gain yet in making them records |
+| 2b | Facts, commitments and trails stay in the memex for now | They are already strict tables there; moving them into the head means rewriting the memex's knowledge code, which step 4 revisits along with per-realm memex queries |
+| 2b | System collections are written through Settings and remember/forget only, never through the generic records API | Their writers check them; and a session must not be able to give itself hooks or loosen policies |
+| 2b | Upgrades check each migration right after it runs | A later migration may rename a table an earlier check reads |
 

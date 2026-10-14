@@ -109,7 +109,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         if let Some(why) = crate::usage::blocked(st, &route_labels).await? {
             return Err(bad_request(format!("not started: {why}")));
         }
-        let routed = route(st, &req.connection_id, &req.model, &route_labels).await?;
+        let routed = route(st, &req.connection_id, &req.model, &route_labels, &realm).await?;
         if effort.is_none() {
             effort = check_effort(Some(routed.effort))?;
         }
@@ -224,7 +224,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
 
 /// The connection and model a new session with these labels gets.
 pub async fn route_for(st: &HeadState, connection: &str, model: &str, labels: &[String]) -> anyhow::Result<(String, String)> {
-    let r = route(st, connection, model, labels).await?;
+    let r = route(st, connection, model, labels, crate::realms::ROOT).await?;
     Ok((r.connection, r.model))
 }
 
@@ -337,17 +337,17 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         cwd: row.cwd.clone(),
         base_prompt,
         worktree,
-        mcp_servers_json: st.store.setting(MCP_SERVERS).await?.unwrap_or_else(|| "[]".into()),
-        skills_json: st.store.setting(SKILLS).await?.unwrap_or_else(|| "[]".into()),
-        hooks_json: st.store.setting(HOOKS).await?.unwrap_or_else(|| "[]".into()),
-        agents_json: st.store.setting(AGENTS).await?.unwrap_or_else(|| "[]".into()),
+        mcp_servers_json: st.store.setting_for(MCP_SERVERS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
+        skills_json: st.store.setting_for(SKILLS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
+        hooks_json: st.store.setting_for(HOOKS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
+        agents_json: st.store.setting_for(AGENTS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
         // Only its realm's secrets.
         secrets_json: serde_json::to_string(&st.store.secrets(Some(&row.realm)).await?)?,
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
         memories_json: crate::memory::for_sessions(st, &row.realm).await?,
-        policies_json: with_builtin_policies(st, st.store.setting(POLICIES).await?.unwrap_or_default()).await,
+        policies_json: with_builtin_policies(st, st.store.setting_for(POLICIES, &row.realm).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
         memex_brief: String::new(),
         memex_tools: memex,
@@ -398,6 +398,7 @@ async fn insert(
     let worker_id: WorkerId = row.worker_id.parse()?;
     let session_id = row.id.clone();
     let labels = row.head_labels();
+    let realm = row.realm.clone();
     let create_id = Uuid::now_v7().to_string();
     let create =
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
@@ -411,7 +412,7 @@ async fn insert(
             data: input_command(
                 &input_id,
                 &session_id,
-                with_command(st, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() }).await?,
+                with_command(st, &realm, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() }).await?,
             ),
             text: Some(text),
         });
@@ -465,16 +466,16 @@ fn attachments(uploads: &[api::AttachmentUpload]) -> anyhow::Result<Vec<c6_proto
     Ok(out)
 }
 
-/// The enabled custom slash commands in the head's settings.
-pub async fn custom_commands(st: &HeadState) -> anyhow::Result<Vec<api::CommandDef>> {
-    let raw = st.store.setting(COMMANDS).await?.unwrap_or_else(|| "[]".into());
+/// The enabled custom slash commands `realm` uses.
+pub async fn custom_commands(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::CommandDef>> {
+    let raw = st.store.setting_for(COMMANDS, realm).await?.unwrap_or_else(|| "[]".into());
     Ok(serde_json::from_str::<Vec<api::CommandDef>>(&raw).unwrap_or_default().into_iter().filter(|c| c.enabled).collect())
 }
 
 /// Attaches the variants of the custom command the text invokes, if any,
 /// and the session's labels, so the worker can pick the variant for the
 /// session: commands apply as they are when the message is sent.
-async fn with_command(st: &HeadState, labels: Vec<String>, mut input: UserInput) -> anyhow::Result<UserInput> {
+async fn with_command(st: &HeadState, realm: &str, labels: Vec<String>, mut input: UserInput) -> anyhow::Result<UserInput> {
     input.labels = labels;
     // @memex:<label or id>: what the memex knows about it, attached.
     for key in crate::memex::mentions(&input.text) {
@@ -495,7 +496,7 @@ async fn with_command(st: &HeadState, labels: Vec<String>, mut input: UserInput)
     if !api::valid_command_name(name) {
         return Ok(input);
     }
-    let variants: Vec<serde_json::Value> = custom_commands(st)
+    let variants: Vec<serde_json::Value> = custom_commands(st, realm)
         .await?
         .into_iter()
         .filter(|c| c.name == name)
@@ -552,9 +553,11 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
     use c6_api::labels::{applies, best};
     let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
     let labels = row.all_labels();
+    let realm = row.realm.as_str();
     let setting = |key: &'static str| async move {
         anyhow::Ok(
-            serde_json::from_str::<serde_json::Value>(&st.store.setting(key).await?.unwrap_or_else(|| "[]".into())).unwrap_or_default(),
+            serde_json::from_str::<serde_json::Value>(&st.store.setting_for(key, realm).await?.unwrap_or_else(|| "[]".into()))
+                .unwrap_or_default(),
         )
     };
     // (name, enabled, applies_to) of each item, in order.
@@ -638,9 +641,13 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     let id = Uuid::now_v7().to_string();
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
-    let input =
-        with_command(st, session.head_labels(), UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() })
-            .await?;
+    let input = with_command(
+        st,
+        &session.realm,
+        session.head_labels(),
+        UserInput { text: text.to_owned(), model, attachments: files, ..Default::default() },
+    )
+    .await?;
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
@@ -736,7 +743,9 @@ struct Routed {
 /// rule matching `labels` on that connection (any, if none was given);
 /// then the connection of your latest session (if none was given) and
 /// its default model, or the model of your latest session on it.
-async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String]) -> anyhow::Result<Routed> {
+/// The connection and model for a new session in `realm` with these
+/// labels: the realm's routing rules first, then root's.
+async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String], realm: &str) -> anyhow::Result<Routed> {
     let connections = st.store.connections().await?;
     let connection = connection.trim();
     let model = model.trim();
@@ -748,7 +757,7 @@ async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String])
         let connection = if connection.is_empty() { first()? } else { connection.to_owned() };
         return Ok(Routed { connection, model: model.to_owned(), ..Default::default() });
     }
-    let routes: Vec<api::Route> = serde_json::from_str(&st.store.setting(ROUTES).await?.unwrap_or_default()).unwrap_or_default();
+    let routes: Vec<api::Route> = serde_json::from_str(&st.store.setting_for(ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
     // A rule's connection, by name or id: None when it names one that is gone.
     let rule_connection = |r: &api::Route| -> Option<String> {
         let want = r.connection.trim();

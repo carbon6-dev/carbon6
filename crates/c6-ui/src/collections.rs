@@ -36,8 +36,26 @@ fn CollectionList() -> impl IntoView {
             {move || creating.get().then(|| view! { <NewCollection done=Callback::new(move |()| { creating.set(false); tick.update(|t| *t += 1); }) /> })}
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                Ok(cs) if cs.is_empty() => view! { <p class="text-sm text-zinc-500">"No collections yet. Agents create them with the records tools, apps bring their own, or make one here."</p> }.into_any(),
-                Ok(cs) => cs.into_iter().map(|c| view! {
+                Ok(cs) => {
+                    let (system, mine): (Vec<Collection>, Vec<Collection>) = cs.into_iter().partition(|c| c.system);
+                    view! {
+                        {mine.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"No collections yet. Agents create them with the records tools, apps bring their own, or make one here."</p> })}
+                        {mine.into_iter().map(card).collect_view()}
+                        {(!system.is_empty()).then(|| view! {
+                            <details class="pt-2">
+                                <summary class="cursor-pointer select-none text-sm text-zinc-500">{format!("carbon6's own configuration ({})", system.len())}</summary>
+                                <div class="mt-2 space-y-2">{system.into_iter().map(card).collect_view()}</div>
+                            </details>
+                        })}
+                    }.into_any()
+                }
+            })}
+        </main>
+    }
+}
+
+fn card(c: Collection) -> impl IntoView {
+    view! {
                     <Go to=View::Collections { name: c.name.clone() } class="block rounded-md border border-zinc-200 px-4 py-3 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900">
                         <div class="flex items-baseline gap-2">
                             <span class="font-medium">{c.name.clone()}</span>
@@ -46,9 +64,6 @@ fn CollectionList() -> impl IntoView {
                         </div>
                         <div class="text-sm text-zinc-500">{c.description.clone()}</div>
                     </Go>
-                }).collect_view().into_any(),
-            })}
-        </main>
     }
 }
 
@@ -140,7 +155,8 @@ fn CollectionView(name: String) -> impl IntoView {
                             <h1 class="text-lg font-semibold">{c.with_value(|c| c.name.clone())}</h1>
                             <span class="flex-1 text-sm text-zinc-500">{c.with_value(|c| c.description.clone())}</span>
                             <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Search" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
-                            <button class=BUTTON on:click=move |_| editing.set(Some(None))>"Add a record"</button>
+                            {(!c.with_value(|c| c.system)).then(|| view! { <button class=BUTTON on:click=move |_| editing.set(Some(None))>"Add a record"</button> })}
+                            {c.with_value(|c| c.system).then(|| view! { <span class="text-xs text-zinc-500">"carbon6's own: change it under Settings"</span> })}
                             {(!c.with_value(|c| c.system)).then(|| view! {
                                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
                                     let n = name.get_value();
@@ -178,7 +194,7 @@ fn CollectionView(name: String) -> impl IntoView {
                                                 let row = r.clone();
                                                 view! {
                                                     <tr class="cursor-pointer border-t border-zinc-200 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
-                                                        on:click=move |_| editing.set(Some(Some(row.clone())))>
+                                                        on:click=move |_| if !c.with_value(|c| c.system) { editing.set(Some(Some(row.clone()))) }>
                                                         {columns.get_value().into_iter().map(|col| view! { <td class="max-w-xs truncate px-3 py-1.5">{cell(r.fields.get(&col))}</td> }).collect_view()}
                                                         <td class="whitespace-nowrap px-3 py-1.5 text-xs text-zinc-500">{format!("{} · {}", ago(now_ms() - r.updated_at), r.updated_by)}</td>
                                                     </tr>

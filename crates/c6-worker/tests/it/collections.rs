@@ -237,7 +237,17 @@ async fn collections_and_records() {
     let r = http.get(format!("{api}/collections?realm=lab")).bearer_auth(tok).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     let mine: Value = http.get(format!("{api}/collections")).bearer_auth(tok).send().await.unwrap().json().await.unwrap();
-    assert_eq!(mine.as_array().unwrap().len(), 1);
+    let names: Vec<&str> = mine.as_array().unwrap().iter().filter(|c| c["system"] == false).map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["candidates"]);
+    // carbon6's own lists are collections too, written only through Settings.
+    assert!(mine.as_array().unwrap().iter().any(|c| c["name"] == "skills" && c["system"] == true));
+    let r = http
+        .post(format!("{api}/collections/skills/records"))
+        .json(&json!({"fields": {"name": "x", "description": "y", "body": "z"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
     // Deleting keeps the history; dropping removes the records.
     let (s, _) = body(send(M::DELETE, &format!("collections/candidates/records/{}", b["id"].as_str().unwrap()), None).await.unwrap()).await;
@@ -250,6 +260,110 @@ async fn collections_and_records() {
     let (s, _) = body(send(M::GET, &format!("collections/candidates/records/{}", c["id"].as_str().unwrap()), None).await.unwrap()).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}
+
+/// carbon6's lists are system collections (docs/os.md §12.2): a realm uses
+/// root's entries and its own, its own replacing root's of the same name,
+/// and root's policies apply first.
+#[tokio::test]
+async fn realms_inherit_lists_from_root() {
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    let wid = worker.identity.meta.worker_id.0;
+    let conn: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(head_dir.path().join("c6h.db")))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO realms (id, name, created_at, created_by) VALUES ('lab', 'Lab', 0, 'you')").execute(&db).await.unwrap();
+    // Settings write the list where it lives: skills in home, policies in root.
+    let put = |path: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { assert!(http.put(&url).json(&body).send().await.unwrap().status().is_success(), "{url}") }
+    };
+    put("settings/skills", json!([{"name": "greet", "description": "HOME-GREET", "body": "x"}])).await;
+    put("settings/policies", json!([{"name": "no rm", "tools": "Bash", "pattern": "rm -rf", "action": "deny", "message": "ROOT-DENIES"}]))
+        .await;
+    let realm_of: Vec<(String, String)> =
+        sqlx::query_as("SELECT collection, realm FROM records WHERE collection IN ('skills', 'policies') ORDER BY collection")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(realm_of, vec![("policies".into(), "root".into()), ("skills".into(), "home".into())]);
+    // Root's own skills, and lab's version of greet.
+    let add = |realm: &'static str, fields: Value| {
+        let db = db.clone();
+        async move {
+            sqlx::query("INSERT INTO records (id, realm, collection, fields, version, created_by, updated_by, created_at, updated_at) VALUES (?, ?, 'skills', ?, 1, 'you', 'you', 0, 0)")
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(realm)
+                .bind(fields.to_string())
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+    };
+    add("root", json!({"name": "greet", "description": "ROOT-GREET", "body": "x"})).await;
+    add("root", json!({"name": "deploy", "description": "ROOT-DEPLOY", "body": "x"})).await;
+    add("lab", json!({"name": "greet", "description": "LAB-GREET", "body": "x"})).await;
+    // The settings endpoint still shows home's list, as it always did.
+    let skills: Value = http.get(format!("{api}/settings/skills")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(skills.as_array().unwrap().len(), 1);
+
+    let deny = r#"{"command":"rm -rf /tmp/nothing-here"}"#;
+    for (realm, n) in [("home", 2), ("lab", 4)] {
+        mock.push(Reply::ToolCalls(vec![("bash".into(), deny.into())]));
+        mock.push(Reply::Text("done".into()));
+        http.post(format!("{api}/sessions"))
+            .json(&json!({"worker_id": wid, "cwd": "", "connection_id": conn.id, "model": "m", "prompt": "hi", "realm": realm}))
+            .send()
+            .await
+            .unwrap();
+        eventually("the session's two calls", async || (mock.requests().len() >= n).then_some(())).await;
+    }
+    let reqs = mock.requests();
+    let sys = |i: usize| reqs[i]["messages"][0]["content"].as_str().unwrap().to_owned();
+    let (home, lab) = (sys(0), sys(2));
+    assert!(
+        home.contains("HOME-GREET") && home.contains("ROOT-DEPLOY") && !home.contains("ROOT-GREET") && !home.contains("LAB-GREET"),
+        "{home}"
+    );
+    assert!(
+        lab.contains("LAB-GREET") && lab.contains("ROOT-DEPLOY") && !lab.contains("ROOT-GREET") && !lab.contains("HOME-GREET"),
+        "{lab}"
+    );
+    for i in [1, 3] {
+        assert!(reqs[i]["messages"].to_string().contains("ROOT-DENIES"), "root's policy applies in every realm: {}", reqs[i]["messages"]);
+    }
     stop.cancel();
     head.shutdown().await.unwrap();
 }

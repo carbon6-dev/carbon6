@@ -143,7 +143,10 @@ async fn realms_keep_data_apart() {
     sqlx::query("UPDATE secrets SET realm = 'lab' WHERE name = 'LAB_KEY'").execute(&db).await.unwrap();
     as_(&home, M::POST, "memories", Some(json!({"text": "Home note: deploys on Fridays."}))).await.unwrap();
     as_(&root, M::POST, "memories", Some(json!({"text": "Lab note: experiments only."}))).await.unwrap();
-    sqlx::query("UPDATE memories SET realm = 'lab' WHERE text LIKE 'Lab note%'").execute(&db).await.unwrap();
+    sqlx::query("UPDATE records SET realm = 'lab' WHERE collection = 'memory' AND json_extract(fields, '$.text') LIKE 'Lab note%'")
+        .execute(&db)
+        .await
+        .unwrap();
     let notes: Value = as_(&home, M::GET, "memories", None).await.unwrap().json().await.unwrap();
     assert_eq!(notes.as_array().unwrap().len(), 1, "{notes}");
 

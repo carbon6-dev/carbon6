@@ -397,6 +397,35 @@ fn build() -> Vec<Op> {
     v
 }
 
+/// The schema of one entry of a system list (docs/os.md §12.2).
+pub fn list_schema(key: &str) -> Option<Value> {
+    Some(match key {
+        "skills" => schema::<api::SkillDef>(),
+        "agents" => schema::<api::AgentDef>(),
+        "commands" => schema::<api::CommandDef>(),
+        "hooks" => schema::<api::Hook>(),
+        "mcp_servers" => {
+            json!({"type": "object", "required": ["name"], "additionalProperties": true, "properties": {"name": {"type": "string"}}})
+        }
+        "templates" => schema::<api::Template>(),
+        "workflows" => schema::<api::Workflow>(),
+        "policies" => schema::<api::Policy>(),
+        "routes" => schema::<api::Route>(),
+        "prices" => schema::<api::Price>(),
+        "budgets" => schema::<api::Budget>(),
+        "channels" => schema::<api::Channel>(),
+        "hosts" => schema::<api::Host>(),
+        "memex_folders" => schema::<api::MemexFolder>(),
+        "memex_scopes" => schema::<api::MemexScope>(),
+        "memory" => json!({"type": "object", "required": ["text"], "properties": {
+            "scope": {"type": "string", "description": "One label, or empty: every session"},
+            "text": {"type": "string", "maxLength": 2000},
+            "session_id": {"type": ["string", "null"], "description": "The session that wrote it"}
+        }}),
+        _ => return None,
+    })
+}
+
 /// Routes the assistant does not call, and why (the parity test allows
 /// these).
 pub const NOT_OPERATIONS: &[(&str, &str, &str)] = &[

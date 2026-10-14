@@ -755,7 +755,12 @@ pub(crate) struct ForSession {
 /// `?session=`: only the commands that apply to that session (by its labels),
 /// the most specific variant of each name.
 async fn list_commands(State(st): State<Arc<HeadState>>, Query(q): Query<ForSession>) -> ApiResult<Json<Vec<api::CommandInfo>>> {
-    let all = crate::sessions::custom_commands(&st).await?;
+    // A session's realm's commands; otherwise home's.
+    let realm = match &q.session {
+        Some(id) => crate::realms::of_session(&st, id).await?.unwrap_or_else(|| crate::realms::HOME.to_owned()),
+        None => crate::realms::HOME.to_owned(),
+    };
+    let all = crate::sessions::custom_commands(&st, &realm).await?;
     let custom: Vec<api::CommandDef> = match &q.session {
         Some(id) => {
             let row = st.store.session(id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;

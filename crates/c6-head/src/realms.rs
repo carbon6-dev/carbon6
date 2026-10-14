@@ -107,7 +107,13 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
     }
     let segments: Vec<&str> = path.trim_start_matches("/api/v1/").split('/').collect();
     let owned = |table: &'static str, noun: &'static str, id: String| async move {
-        let found = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT realm FROM {table} WHERE id = ?")))
+        // Memory notes are records of the memory collection.
+        let sql = if table == "memories" {
+            "SELECT realm FROM records WHERE collection = 'memory' AND id = ?".to_owned()
+        } else {
+            format!("SELECT realm FROM {table} WHERE id = ?")
+        };
+        let found = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(id)
             .fetch_optional(&st.store.pool)
             .await

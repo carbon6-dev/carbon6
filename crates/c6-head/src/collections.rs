@@ -217,6 +217,9 @@ pub async fn put(
     by: &str,
 ) -> anyhow::Result<api::Record> {
     let c = get(st, realm, collection).await?;
+    if c.system {
+        return Err(system_list(collection));
+    }
     if !r.fields.is_object() {
         return Err(bad_request("a record's fields are an object"));
     }
@@ -333,8 +336,17 @@ async fn history(
     Ok(())
 }
 
+/// Why a system collection's records are not written here: they change
+/// through Settings (and agents' remember/forget), which check them.
+fn system_list(collection: &str) -> anyhow::Error {
+    bad_request(format!("{collection} is carbon6's own configuration: change it under Settings"))
+}
+
 /// Deletes a record; its history stays.
 pub async fn delete(st: &HeadState, realm: &str, collection: &str, id: &str, by: &str) -> anyhow::Result<()> {
+    if get(st, realm, collection).await?.system {
+        return Err(system_list(collection));
+    }
     let r = record(st, realm, collection, id).await?;
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM records WHERE id = ?").bind(id).execute(&mut *tx).await?;

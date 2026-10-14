@@ -81,8 +81,44 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
             before: "SELECT count(*) FROM before.api_tokens",
             after: "SELECT count(*) FROM api_tokens WHERE realm IS NULL",
         },
+        c6_core::upgrade::Check {
+            version: 30,
+            name: "every entry of every settings list is a record",
+            before: "SELECT coalesce(sum((SELECT count(*) FROM json_each(s.value) j WHERE j.type = 'object')), 0) FROM before.settings s \
+                     WHERE s.key IN ('skills', 'agents', 'commands', 'hooks', 'mcp_servers', 'templates', 'workflows', 'policies', 'routes', \
+                     'prices', 'budgets', 'channels', 'hosts', 'memex_folders', 'memex_scopes') AND json_valid(s.value) AND json_type(s.value) = 'array'",
+            after: "SELECT count(*) FROM records WHERE created_by = 'upgrade'",
+        },
+        c6_core::upgrade::Check {
+            version: 30,
+            name: "each list's entries are unchanged and in order",
+            before: "SELECT coalesce(group_concat(v, '|'), '') FROM (SELECT s.key || ':' || j.key || ':' || j.value AS v FROM before.settings s, json_each(s.value) j \
+                     WHERE s.key IN ('skills', 'agents', 'commands', 'hooks', 'mcp_servers', 'templates', 'workflows', 'policies', 'routes', \
+                     'prices', 'budgets', 'channels', 'hosts', 'memex_folders', 'memex_scopes') AND json_valid(s.value) AND json_type(s.value) = 'array' \
+                     AND j.type = 'object' ORDER BY s.key, j.key)",
+            after: "SELECT coalesce(group_concat(v, '|'), '') FROM (SELECT collection || ':' || position || ':' || fields AS v FROM records \
+                    WHERE created_by = 'upgrade' ORDER BY collection, position)",
+        },
+        c6_core::upgrade::Check {
+            version: 30,
+            name: "every memory note is a record, unchanged",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || scope || '/' || text, '|'), '') FROM (SELECT * FROM before.memories ORDER BY id)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || json_extract(fields, '$.scope') || '/' || json_extract(fields, '$.text'), '|'), '') \
+                    FROM (SELECT * FROM records WHERE collection = 'memory' ORDER BY id)",
+        },
+        c6_core::upgrade::Check {
+            version: 30,
+            name: "the original settings are kept",
+            before: "SELECT count(*) FROM before.settings WHERE key IN ('skills', 'agents', 'commands', 'hooks', 'mcp_servers', 'templates', 'workflows', \
+                     'policies', 'routes', 'prices', 'budgets', 'channels', 'hosts', 'memex_folders', 'memex_scopes')",
+            after: "SELECT count(*) FROM legacy_settings",
+        },
     ],
     allow: &[
+        // The lists moved into records (kept in legacy_settings).
+        c6_core::upgrade::Allow { version: 30, table: "settings" },
+        // Memory notes moved into records (kept as legacy_memories).
+        c6_core::upgrade::Allow { version: 30, table: "memories" },
         // Follow-through was removed (its tables and settings).
         c6_core::upgrade::Allow { version: 27, table: "tracker_observations" },
         c6_core::upgrade::Allow { version: 27, table: "trackers" },
@@ -111,6 +147,7 @@ impl Store {
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
         let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
+        crate::lists::ensure(&pool).await?;
         Ok((Self { pool }, report))
     }
 
@@ -475,11 +512,31 @@ impl Store {
         Ok(r.rows_affected() > 0)
     }
 
+    /// A setting's value. A system list (docs/os.md §12.2) is read from its
+    /// collection in the realm it lives in, as a JSON array.
     pub async fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        if let Some(l) = crate::lists::list(key) {
+            return Ok(Some(serde_json::to_string(&crate::lists::read(&self.pool, key, l.realm).await?)?));
+        }
         Ok(sqlx::query("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&self.pool).await?.map(|r| r.get("value")))
     }
 
+    /// A system list as `realm` uses it (root's entries and its own), as a
+    /// JSON array; any other setting as it is.
+    pub async fn setting_for(&self, key: &str, realm: &str) -> anyhow::Result<Option<String>> {
+        if crate::lists::list(key).is_some() {
+            return Ok(Some(serde_json::to_string(&crate::lists::effective(&self.pool, key, realm).await?)?));
+        }
+        self.setting(key).await
+    }
+
+    /// Sets a setting. A system list is written to its collection (its
+    /// entries become records, each with its own history).
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        if let Some(l) = crate::lists::list(key) {
+            let entries: Vec<serde_json::Value> = serde_json::from_str(value)?;
+            return crate::lists::write(&self.pool, key, l.realm, &entries, "you").await;
+        }
         sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .bind(key)
             .bind(value)

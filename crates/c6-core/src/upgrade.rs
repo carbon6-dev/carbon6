@@ -19,10 +19,12 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Connection, Row};
 use tracing::{info, warn};
 
-/// A comparison between the database before and after an upgrade, run when
-/// the upgrade applies migration `version`. `before` runs with the backup
-/// attached as `before` (write `before.table`); `after` runs on the upgraded
-/// database. Each returns one value, and they must be equal.
+/// A comparison between the database before and after an upgrade, run
+/// right after the upgrade applies migration `version`. `before` runs with
+/// the backup (the database as it was before the whole upgrade) attached
+/// as `before` (write `before.table`); `after` runs on the database as
+/// migration `version` left it. Each returns one value, and they must be
+/// equal.
 #[derive(Clone, Copy, Debug)]
 pub struct Check {
     pub version: i64,
@@ -103,8 +105,15 @@ impl Report {
                 }
             }
         }
+        let short = |s: &str| if s.chars().count() > 60 { format!("{}…", s.chars().take(60).collect::<String>()) } else { s.to_owned() };
         for c in &self.checks {
-            out.push_str(&format!("  check {}: {} ({} before, {} after)\n", c.name, if c.ok { "ok" } else { "FAILED" }, c.before, c.after));
+            out.push_str(&format!(
+                "  check {}: {} ({} before, {} after)\n",
+                c.name,
+                if c.ok { "ok" } else { "FAILED" },
+                short(&c.before),
+                short(&c.after)
+            ));
         }
         out
     }
@@ -163,9 +172,16 @@ pub async fn open(
     let before = counts(&pool).await?;
 
     let outcome = async {
-        migrator.run(&pool).await.context("a migration failed")?;
+        // One version at a time, each checked right after it is applied
+        // (while the tables its checks read still exist).
+        let mut pending_versions: Vec<i64> = pending.iter().map(|(v, _)| *v).collect();
+        pending_versions.sort();
+        let mut checks = Vec::new();
+        for v in &pending_versions {
+            migrator.run_to(*v, &pool).await.with_context(|| format!("migration {v:04} failed"))?;
+            checks.extend(run_checks(&pool, &backup, plan, &[*v]).await?);
+        }
         let after = counts(&pool).await?;
-        let pending_versions: Vec<i64> = pending.iter().map(|(v, _)| *v).collect();
         let allowed = |t: &str| plan.allow.iter().any(|a| a.table == t && pending_versions.contains(&a.version));
         let mut tables = Vec::new();
         let mut lost = Vec::new();
@@ -180,7 +196,6 @@ pub async fn open(
             tables.push(TableCount { table: t.clone(), before: *b, after: a });
         }
         anyhow::ensure!(lost.is_empty(), "rows were lost: {}", lost.join(", "));
-        let checks = run_checks(&pool, &backup, plan, &pending_versions).await?;
         let failed: Vec<&CheckResult> = checks.iter().filter(|c| !c.ok).collect();
         anyhow::ensure!(
             failed.is_empty(),
@@ -568,6 +583,34 @@ mod tests {
             vec![CheckResult { name: "every note moved".into(), before: "a,b,c".into(), after: "a,b,c".into(), ok: true }]
         );
         assert!(r.tables.contains(&TableCount { table: "notes".into(), before: 3, after: None }));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn each_version_is_checked_before_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = at_v1(dir.path()).await;
+        // 3 renames the table 2's check reads: it must run between them.
+        let m = migrator(
+            dir.path(),
+            &[
+                V1,
+                (2, "pin", "ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"),
+                (3, "retire", "ALTER TABLE notes RENAME TO legacy_notes;"),
+            ],
+        )
+        .await;
+        static ALLOW: [Allow; 1] = [Allow { version: 3, table: "notes" }];
+        static CHECK: [Check; 1] = [Check {
+            version: 2,
+            name: "notes kept, none pinned",
+            before: "SELECT count(*) FROM before.notes",
+            after: "SELECT count(*) FROM notes WHERE pinned = 0",
+        }];
+        let (pool, report) = open_db(&path, &m, &Plan { checks: &CHECK, allow: &ALLOW }).await.unwrap();
+        let r = report.unwrap();
+        assert_eq!(r.applied.len(), 2);
+        assert_eq!(r.checks, vec![CheckResult { name: "notes kept, none pinned".into(), before: "3".into(), after: "3".into(), ok: true }]);
         pool.close().await;
     }
 

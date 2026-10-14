@@ -15,6 +15,7 @@ pub mod google;
 pub mod guard;
 pub mod hosts;
 pub mod hub;
+pub mod lists;
 pub mod memex;
 pub mod memory;
 pub mod notify;
