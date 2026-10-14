@@ -52,7 +52,7 @@ pub const DEFAULTS: &[Prompt] = &[
     },
     Prompt {
         name: "assistant.base",
-        description: "The assistant's instructions. Placeholders: {{areas}}, {{context}} (what the user is looking at), {{today}}.",
+        description: "The assistant's instructions. Placeholders: {{areas}}, {{context}} (what the user is looking at), {{today}}, {{realm}} (the realm it works in).",
         default: crate::assistant::PROMPT,
     },
     Prompt {

@@ -347,8 +347,16 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
     // Who is calling: you (signed in, the head calling itself, or with
     // sign-in off) reach every realm; an API token may be limited to one.
     req.extensions_mut().insert(Caller::root());
-    // The head calling itself (the assistant, as you).
-    if req.extensions().get::<crate::assistant::InternalCall>().is_some() {
+    // The head calling itself (the assistant, as you), within the realm
+    // its conversation works in: there, as that realm's token would.
+    if let Some(call) = req.extensions().get::<crate::assistant::InternalCall>().cloned() {
+        if let Some(realm) = call.realm {
+            let caller = Caller::in_realm(&realm);
+            if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), req.uri().path()).await {
+                return (status, Json(api::ApiError { error })).into_response();
+            }
+            req.extensions_mut().insert(caller);
+        }
         return next.run(req).await;
     }
     let path = req.uri().path().to_owned();

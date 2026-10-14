@@ -2388,7 +2388,7 @@ async fn call_catalog(State(st): State<Arc<HeadState>>, Json(c): Json<api::Catal
     if op.effect == crate::catalog::Effect::Destructive && !c.confirmed {
         return Err(ApiErr(StatusCode::CONFLICT, format!("{} is destructive ({}); confirm to run it", op.name, op.summary)));
     }
-    Ok(Json(crate::assistant::execute(&st, op, c.input, "you").await?))
+    Ok(Json(crate::assistant::execute(&st, op, c.input, "you", None).await?))
 }
 
 /// Your answers to the assistant's question (a form).

@@ -204,3 +204,73 @@ async fn assistant_discovers_asks_acts_and_asks_first() {
     let list: Value = r.json().await.unwrap();
     assert_eq!(list[0]["name"], "m");
 }
+
+/// An assistant opened in a realm works in that realm only (docs/os.md
+/// §3.6): its operations reach that realm's data, administration is
+/// refused, and its instructions say where it is.
+#[tokio::test]
+async fn assistant_in_a_realm_stays_there() {
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    http.put(format!("{api}/settings/assistant")).json(&json!({"model": {"connection": "m", "model": "mock-1"}})).send().await.unwrap();
+    http.post(format!("{api}/realms")).json(&json!({"id": "crm", "name": "CRM", "description": "relationships"})).send().await.unwrap();
+    let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}});
+    http.post(format!("{api}/collections")).json(&json!({"name": "home_only", "schema": schema})).send().await.unwrap();
+
+    mock.push(Reply::ToolCalls(vec![(
+        "c6_call".into(),
+        json!({"op": "collections.create", "input": {"body": {"name": "contacts", "schema": schema}}}).to_string(),
+    )]));
+    mock.push(Reply::ToolCalls(vec![("c6_call".into(), json!({"op": "collections.list", "input": {}}).to_string())]));
+    mock.push(Reply::ToolCalls(vec![("c6_call".into(), json!({"op": "realms.create", "input": {"body": {"id": "sneaky"}}}).to_string())]));
+    mock.push(Reply::Text("Done.".into()));
+    let s: Session = http
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "set up contacts", "realm": "crm"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s.realm, "crm");
+    let results = eventually("its three calls", async || {
+        let es: Vec<Event> = http.get(format!("{api}/sessions/{}/events?after=0", s.id)).send().await.ok()?.json().await.ok()?;
+        let outs: Vec<(String, bool)> = es
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::ToolResult { output, is_error, .. } => Some((output, is_error)),
+                _ => None,
+            })
+            .collect();
+        (outs.len() == 3).then_some(outs)
+    })
+    .await;
+    assert!(!results[0].1, "{results:?}");
+    assert!(results[1].0.contains("contacts") && !results[1].0.contains("home_only"), "only crm's: {}", results[1].0);
+    assert!(results[2].1 && results[2].0.contains("limited to realm crm"), "{results:?}");
+    let crm: Value = http.get(format!("{api}/collections?realm=crm")).send().await.unwrap().json().await.unwrap();
+    assert!(crm.to_string().contains("\"contacts\""));
+    let realms: Value = http.get(format!("{api}/realms")).send().await.unwrap().json().await.unwrap();
+    assert!(!realms.to_string().contains("sneaky"));
+    // Its instructions name the realm.
+    let first = mock.requests()[0]["messages"].to_string();
+    assert!(first.contains("You work in one realm: crm (CRM: relationships)"), "{first}");
+    // Commons is not a place to work in.
+    let r = http.post(format!("{api}/assistant")).json(&json!({"prompt": "x", "realm": "commons"})).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    head.shutdown().await.unwrap();
+}

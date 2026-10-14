@@ -718,7 +718,8 @@ pub async fn decide(id: String, call_id: String, allow: bool) -> Result<(), Stri
 
 /// Asks the assistant (a new conversation).
 pub async fn ask_assistant(prompt: String, context: String) -> Result<c6_api::Session, String> {
-    send_json(Request::post("/api/v1/assistant"), &c6_api::AskAssistant { prompt, context }).await
+    let realm = Some(realm().get_untracked()).filter(|r| !r.is_empty());
+    send_json(Request::post("/api/v1/assistant"), &c6_api::AskAssistant { prompt, context, realm }).await
 }
 
 /// Your answers to the assistant's question.

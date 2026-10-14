@@ -102,6 +102,11 @@ Labels keep working as they do today, inside a realm.
 - **Administration** (workers, connections, realms, grants, app installs) runs in root, and only when you open it there.
 - An assistant never acts in another realm. It may suggest a grant, which you approve (4.2).
 
+**As built (step 8):**
+- **The realm:** the assistant works in the realm you're looking at when you open it ("All realms" is root).
+- **What it may do:** its catalog calls go through the same admission as that realm's API token, so it reaches only that realm's data, and administration stays in root.
+- **Its instructions** are the `assistant.base` prompt, overridable per realm, which now names the realm. Its memex calls go to that realm's knowledge, and its compaction prompt is the realm's.
+
 ### 3.7 Grants: information flow between realms
 
 A grant is the only way data crosses a realm boundary:
@@ -877,3 +882,6 @@ Choices the design left open, made while building, for review.
 | 7 | A page cannot embed a page | No loops, and one level is what dashboards need |
 | 7 | An action's template runs in the view's realm, with the record as JSON input | The record's id, fields and links are all an agent needs, and the label ties the sessions back to the record |
 | 7 | Below `xl` the header's less-used links and Views go into the ☰ menu | The header overflowed at 1024px once the realm switcher arrived; now everything stays reachable without overlap |
+| 8 | The assistant stays the head's built-in program, not a template on a worker | Its catalog tools run in the head; what makes it configurable is already configuration: its prompt (per realm), its model (Settings → Assistant), and routing by its label |
+| 8 | In a realm, its calls are admitted exactly as that realm's token | One rule for everything that acts in a realm; nothing new to keep in step |
+| 8 | Discovery still lists every operation | Admission refuses what a realm may not do, with a reason the assistant passes on; filtering the catalog per realm can come with apps |

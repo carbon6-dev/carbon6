@@ -186,6 +186,12 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
             "the assistant calls models directly: choose an API connection for it (Settings → Assistant), not Claude Code",
         ));
     }
+    // The realm it works in: the one you are looking at, else root (all
+    // realms, with administration).
+    let realm = req.realm.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or(crate::realms::ROOT).to_owned();
+    if !crate::realms::exists(st, &realm).await? || realm == crate::realms::COMMONS {
+        return Err(bad_request(format!("no realm {realm:?} for the assistant")));
+    }
     let labels = vec![crate::assistant::LABEL.to_owned()];
     if let Some(why) = crate::usage::blocked(st, &labels).await? {
         return Err(bad_request(format!("not started: {why}")));
@@ -216,12 +222,11 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         ssh_target: String::new(),
         awaiting: 0,
         subagent_model: String::new(),
-        // The assistant does carbon6's administration.
-        realm: crate::realms::ROOT.to_owned(),
+        realm: realm.clone(),
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
-        base_prompt: crate::assistant::prompt(st, &req.context).await,
+        base_prompt: crate::assistant::prompt(st, &req.context, &realm).await,
         labels,
         ..Default::default()
     };

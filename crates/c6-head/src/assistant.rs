@@ -39,9 +39,12 @@ const NAME: &str = "head";
 const WAIT: Duration = Duration::from_secs(3600);
 
 /// Marks a request the head makes to itself (the assistant's calls): it is
-/// you, already signed in.
-#[derive(Clone, Copy)]
-pub struct InternalCall;
+/// you, already signed in, limited to the realm the conversation works in
+/// (root, or none: every realm).
+#[derive(Clone, Default)]
+pub struct InternalCall {
+    pub realm: Option<String>,
+}
 
 #[derive(Default)]
 pub struct Assistant {
@@ -249,10 +252,11 @@ impl Actor {
             waiters: Waiters::default(),
             vault: Mutex::default(),
             labels: row.all_labels(),
+            realm: row.realm.clone(),
         });
         let conv = Conversation { history: history_from_events(&c6_agent::effective_events(&events)), context_tokens: 0 };
         let mut actor = Actor {
-            compact: crate::prompts::compact(&st, crate::realms::ROOT).await,
+            compact: crate::prompts::compact(&st, &row.realm).await,
             st,
             session_id,
             sink,
@@ -460,6 +464,8 @@ struct Env {
     /// operations get the value.
     vault: Mutex<HashMap<String, String>>,
     labels: Vec<String>,
+    /// The realm the conversation works in.
+    realm: String,
 }
 
 impl Env {
@@ -621,7 +627,7 @@ impl Tool for Call {
         if op.effect == Effect::Destructive {
             ask = Some(("assistant: destructive operations".into(), format!("{}: {}", op.name, op.summary)));
         } else if op.replaces.is_some() {
-            match removed_entries(st, op, &args).await {
+            match removed_entries(st, op, &args, &self.env.realm).await {
                 Ok(gone) if !gone.is_empty() => {
                     ask = Some(("assistant: removes entries".into(), format!("{} removes {}", op.name, gone.join(", "))));
                 }
@@ -666,7 +672,7 @@ impl Tool for Call {
                 return ToolOutput::err(format!("the user did not approve {name} ({state}); do not try another way to do it"));
             }
         }
-        let result = execute(st, op, args, "assistant").await;
+        let result = execute(st, op, args, "assistant", Some(&self.env.realm)).await;
         match result {
             Ok(mut v) => {
                 // Secrets go to the user, not the model.
@@ -732,9 +738,9 @@ async fn policy_for(st: &HeadState, labels: &[String], input: &str) -> Option<ap
 }
 
 /// Entries a list replacement would remove (by name or id).
-async fn removed_entries(st: &HeadState, op: &Op, args: &Value) -> anyhow::Result<Vec<String>> {
+async fn removed_entries(st: &HeadState, op: &Op, args: &Value, realm: &str) -> anyhow::Result<Vec<String>> {
     let Some(get) = op.replaces.and_then(catalog::find) else { return Ok(Vec::new()) };
-    let current = execute(st, get, json!({}), "assistant").await?;
+    let current = execute(st, get, json!({}), "assistant", Some(realm)).await?;
     let new = args["body"].as_array().cloned().unwrap_or_default();
     let key = |v: &Value| -> String {
         for k in ["name", "id", "path", "key"] {
@@ -750,15 +756,18 @@ async fn removed_entries(st: &HeadState, op: &Op, args: &Value) -> anyhow::Resul
 
 /// Runs an operation as you: through the head's own handlers (HTTP ops) or
 /// the memex (memex ops).
-pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str) -> anyhow::Result<Value> {
+/// Runs an operation as you, within `realm` when given (root or none:
+/// every realm, with administration).
+pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str, realm: Option<&str>) -> anyhow::Result<Value> {
     if !args.is_object() {
         args = json!({});
     }
+    let realm = realm.filter(|r| *r != crate::realms::ROOT);
     match &op.via {
         Via::Memex { method } => {
             args["made_by"] = json!(made_by);
-            // As you, on your home knowledge.
-            Ok(crate::memex::call_in(st, crate::realms::HOME, method, args).await?)
+            // As you, on the realm's knowledge (home's, from root).
+            Ok(crate::memex::call_in(st, realm.unwrap_or(crate::realms::HOME), method, args).await?)
         }
         Via::Http { method, path } => {
             let router = st.assistant.router.get().ok_or_else(|| anyhow::anyhow!("the head is starting"))?.clone();
@@ -810,7 +819,7 @@ pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str) ->
                 .uri(&uri)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(body)?;
-            req.extensions_mut().insert(InternalCall);
+            req.extensions_mut().insert(InternalCall { realm: realm.map(str::to_owned) });
             use tower::ServiceExt;
             let resp = router.oneshot(req).await?;
             let status = resp.status();
@@ -888,7 +897,7 @@ impl Tool for Ask {
                 field.label = field.name.replace('_', " ");
             }
             if let Some(from) = f["choices_from"]["op"].as_str() {
-                match choices(&self.env.st, from, f["choices_from"]["input"].clone()).await {
+                match choices(&self.env.st, from, f["choices_from"]["input"].clone(), &self.env.realm).await {
                     Ok(c) => {
                         field.choices = c;
                         field.r#type = "choice".into();
@@ -942,10 +951,10 @@ impl Tool for Ask {
 }
 
 /// A list operation's items as choices.
-async fn choices(st: &HeadState, op: &str, input: Value) -> anyhow::Result<Vec<api::Choice>> {
+async fn choices(st: &HeadState, op: &str, input: Value, realm: &str) -> anyhow::Result<Vec<api::Choice>> {
     let op = catalog::find(op).ok_or_else(|| anyhow::anyhow!("no operation {op}"))?;
     anyhow::ensure!(op.effect == Effect::Read, "{} is not a read operation", op.name);
-    let v = execute(st, op, input, "assistant").await?;
+    let v = execute(st, op, input, "assistant", Some(realm)).await?;
     let items: Vec<Value> = match v {
         Value::Array(a) => a,
         Value::Object(o) => o.into_iter().find_map(|(_, x)| x.as_array().cloned()).unwrap_or_default(),
@@ -983,20 +992,30 @@ give (an API key, a password), ask with a secret field.
 - Which model does what is in settings: sessions by settings.routes (by label), the memex's tasks (embeddings, understanding, \
 vision, transcription) in settings.memex, yourself in settings.assistant. A connection's available models: connections.models.
 - Be brief. After acting, say what you did and anything the user should do next (e.g. run a command on another machine).
+- You work in one realm: {{realm}}. In root you administer carbon6 (workers, connections, realms, grants, settings) and reach \
+every realm. In any other realm you see and change only that realm's sessions, collections, decisions, triggers, views, series and \
+knowledge, and administration is refused: for that, the user opens the assistant with \"All realms\". Never act in another realm; \
+when this realm needs another's data, suggest a grant.
 - You cannot run commands or read files yourself. For work on a machine, start a session on a worker (sessions.create) and \
-tell the user; for something recurring, create an automation or workflow.
+tell the user; for something recurring, create a trigger or workflow.
 
 Areas of carbon6:
 {{areas}}
 {{context}}Today is {{today}}.";
 
 /// The assistant's instructions, from its prompt.
-pub async fn prompt(st: &HeadState, context: &str) -> String {
+pub async fn prompt(st: &HeadState, context: &str, realm: &str) -> String {
     let areas: String = catalog::areas().iter().map(|(a, d)| format!("- {a}: {d}\n")).collect();
     let context = if context.trim().is_empty() { String::new() } else { format!("The user is looking at: {}\n\n", context.trim()) };
     let today = chrono::Utc::now().format("%A %-d %B %Y").to_string();
-    let template = crate::prompts::get(st, "assistant.base", crate::realms::ROOT).await;
-    c6_api::prompts::fill(&template, &[("areas", &areas), ("context", &context), ("today", &today)])
+    let r = crate::realms::list(st, &crate::realms::Caller::root()).await.unwrap_or_default().into_iter().find(|r| r.id == realm);
+    let realm_text = match r {
+        Some(r) if !r.description.is_empty() => format!("{} ({}: {})", r.id, r.name, r.description),
+        Some(r) => format!("{} ({})", r.id, r.name),
+        None => realm.to_owned(),
+    };
+    let template = crate::prompts::get(st, "assistant.base", realm).await;
+    c6_api::prompts::fill(&template, &[("areas", &areas), ("context", &context), ("today", &today), ("realm", &realm_text)])
 }
 
 /// The model for a new conversation: the setting, else the routes for the

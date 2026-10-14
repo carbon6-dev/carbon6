@@ -1174,6 +1174,10 @@ pub struct AskAssistant {
     /// Where you are in the UI ("Settings → Memex", "worker build-1").
     #[serde(default)]
     pub context: String,
+    /// The realm it works in: what you are looking at; none: root, with
+    /// carbon6's administration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
 }
 
 /// `GET`/`PUT /api/v1/settings/assistant`.
