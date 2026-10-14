@@ -447,7 +447,7 @@ async fn finish(st: &HeadState, id: &str, status: &str, error: Option<String>) -
             ..Default::default()
         });
     }
-    crate::automations::workflow_finished(st, id, if status == "denied" { "stopped" } else { status }).await;
+    crate::triggers::workflow_finished(st, id, if status == "denied" { "stopped" } else { status }).await;
     Ok(())
 }
 

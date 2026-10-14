@@ -13,7 +13,7 @@ const SECTIONS: [(&str, &str, &str); 12] = [
     ("tools", "Agents and tools", "MCP servers, commands, agents, skills, hooks, web search, secrets"),
     ("rules", "Policies", "Ask or deny the agent's tool calls"),
     ("prompts", "Prompts", "What carbon6 tells models: sessions, the assistant, the memex"),
-    ("automation", "Automation", "Templates, workflows, automations"),
+    ("automation", "Automation", "Templates, workflows, triggers"),
     ("notifications", "Notifications", "Channels, push on this device, links"),
     ("spending", "Prices and budgets", "What models cost, and spending limits"),
     ("hosts", "Hosts", "Machines reached over SSH"),
@@ -2318,8 +2318,8 @@ fn when(ms: i64) -> String {
     s
 }
 
-/// Settings: automations, which start templates on a schedule or from a
-/// webhook.
+/// Settings: triggers (automations before): an event, a filter, an
+/// action.
 #[component]
 fn AutomationsSetting() -> impl IntoView {
     let list = LocalResource::new(api::automations);
@@ -2335,6 +2335,17 @@ fn AutomationsSetting() -> impl IntoView {
         RwSignal::new(String::new()),
     );
     let disable_after = RwSignal::new(3u32);
+    let (collection, ops, labels) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let (action, params, conditions) = (RwSignal::new("start".to_owned()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let per_hour = RwSignal::new(60u32);
+    let digest = move |_| {
+        name.set("Morning digest of open decisions".into());
+        trigger.set("schedule".into());
+        cron.set("0 8 * * *".into());
+        action.set("notify".into());
+        params.set(r#"{"title": "{{$.open_decisions.count}} open decisions", "message": "{{$.open_decisions.text}}"}"#.into());
+        conditions.set(r#"{"$.open_decisions.count": {"$gt": 0}}"#.into());
+    };
     // The automation whose run history is open.
     let history = RwSignal::new(None::<String>);
     let status = RwSignal::new(None::<Result<String, String>>);
@@ -2347,14 +2358,40 @@ fn AutomationsSetting() -> impl IntoView {
         }
     };
     let create = move |_| {
+        let parse = |what: &str, s: String| -> Result<serde_json::Value, String> {
+            if s.trim().is_empty() {
+                Ok(serde_json::json!({}))
+            } else {
+                serde_json::from_str(&s).map_err(|e| format!("{what} is not JSON: {e}"))
+            }
+        };
+        let (filter_json, params_json) =
+            match (parse("The filter", conditions.get_untracked()), parse("The action's parameters", params.get_untracked())) {
+                (Ok(f), Ok(p)) => (f, p),
+                (Err(e), _) | (_, Err(e)) => return status.set(Some(Err(e))),
+            };
+        let list_of = |s: String| s.split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect::<Vec<_>>();
+        let ev = trigger.get_untracked();
+        let mut event_params = serde_json::json!({"ops": list_of(ops.get_untracked())});
+        if ev == "record" {
+            event_params["collection"] = serde_json::json!(collection.get_untracked());
+        }
+        if ev == "session" {
+            event_params["labels"] = serde_json::json!(list_of(labels.get_untracked()));
+        }
         let e = c6_api::AutomationEdit {
             name: Some(name.get_untracked()),
             template: Some(template.get_untracked()),
-            trigger: Some(trigger.get_untracked()),
+            trigger: Some(ev),
             cron: Some(cron.get_untracked()),
             input: Some(input.get_untracked()),
             enabled: Some(true),
             disable_after: Some(disable_after.get_untracked()),
+            event_params: Some(event_params),
+            filter: Some(filter_json),
+            action: Some(action.get_untracked()),
+            action_params: Some(params_json),
+            per_hour: Some(per_hour.get_untracked()),
         };
         spawn_local(async move {
             match api::create_automation(e).await {
@@ -2376,9 +2413,9 @@ fn AutomationsSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
-                <h2 class="font-medium">"Automations"</h2>
+                <h2 class="font-medium">"Triggers"</h2>
                 <p class="text-sm text-zinc-500">
-                    "Start a template on a schedule (the head's local time) or when a webhook is called (the request body becomes the template's {{input}}; the URL is its only credential, so keep it private). Runs are labelled automation:<name> and land in your inbox when they finish."
+                    "When something happens (a schedule in the head's local time, a webhook call, mail arriving, a record changing, a decision being answered, a session finishing or failing), do something: start a template or workflow, write a record, ask you a decision, or notify you. A filter picks which events count, and parameters take the event's values: \"$.path\" is the value, {{$.path}} puts it in text. A webhook's URL is its only credential, so keep it private. Loop protection stops chains of triggers deeper than five and triggers that run more than their limit an hour."
                 </p>
             </div>
             {move || url.get().map(|u| view! {
@@ -2391,18 +2428,22 @@ fn AutomationsSetting() -> impl IntoView {
             <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No automations."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No triggers."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|a| {
                         let (id1, id2, id3, id4) = (a.id.clone(), a.id.clone(), a.id.clone(), a.id.clone());
                         let (id5, id6, id7) = (a.id.clone(), a.id.clone(), a.id.clone());
                         let recent = a.recent.clone();
                         let streak = a.disable_after;
                         let enabled = a.enabled;
-                        let what = if a.trigger == "schedule" {
-                            format!("{} · {}", a.cron, a.next_run_at.map(|t| format!("next {}", when(t))).unwrap_or_else(|| "off".into()))
-                        } else {
-                            "webhook".to_owned()
+                        let ops = a.event_params["ops"].as_array().filter(|o| !o.is_empty())
+                            .map(|o| format!(" ({})", o.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default();
+                        let what = match a.trigger.as_str() {
+                            "schedule" => format!("{} · {}", a.cron, a.next_run_at.map(|t| format!("next {}", when(t))).unwrap_or_else(|| "off".into())),
+                            "memex" => a.cron.clone(),
+                            "record" => format!("records of {}{ops}", a.event_params["collection"].as_str().unwrap_or("?")),
+                            other => format!("{other}{ops}"),
                         };
+                        let does = if a.action == "start" { format!("start {}", a.template) } else { a.action.clone() };
                         let last = a.last_run_id.clone();
                         view! {
                             <div class=format!("space-y-1 py-2 text-sm {}", if enabled { "" } else { "opacity-60" })>
@@ -2415,7 +2456,7 @@ fn AutomationsSetting() -> impl IntoView {
                                         });
                                     } />
                                     <span class="font-medium">{a.name.clone()}</span>
-                                    <span class="font-mono text-xs text-zinc-500">{format!("→ {} · {what}", a.template)}</span>
+                                    <span class="font-mono text-xs text-zinc-500">{format!("{what} → {does}")}</span>
                                     <span class="flex-1"></span>
                                     <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                         let id = id2.clone();
@@ -2487,20 +2528,28 @@ fn AutomationsSetting() -> impl IntoView {
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. Morning health check" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Template or workflow"</span>
-                    <select class=format!("{INPUT} py-1 text-sm") prop:value=move || template.get() on:change=move |ev| template.set(event_target_value(&ev))>
-                        <option value="">"Choose…"</option>
-                        {move || templates.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <option value=t.name.clone()>{t.name.clone()}</option> }).collect_view()}
-                        {move || workflow_list.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| view! { <option value=w.name.clone()>{format!("{} (workflow)", w.name)}</option> }).collect_view()}
-                    </select>
-                </label>
-                <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Trigger"</span>
+                    <span class="text-xs text-zinc-500">"When"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || trigger.get() on:change=move |ev| trigger.set(event_target_value(&ev))>
                         <option value="schedule">"On a schedule"</option>
                         <option value="webhook">"When a webhook is called"</option>
                         <option value="memex">"When mail arrives (memex)"</option>
+                        <option value="record">"When a record changes"</option>
+                        <option value="decision">"When a decision is opened or answered"</option>
+                        <option value="session">"When a session finishes, fails or needs approval"</option>
                     </select>
+                </label>
+                <label class="space-y-0.5" class:hidden=move || trigger.get() != "record">
+                    <span class="text-xs text-zinc-500">"Collection"</span>
+                    <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. clients" prop:value=move || collection.get() on:input=move |ev| collection.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5" class:hidden=move || !matches!(trigger.get().as_str(), "record" | "decision" | "session")>
+                    <span class="text-xs text-zinc-500">"Which (empty: all)"</span>
+                    <input class=format!("{INPUT} py-1 text-sm") prop:value=move || ops.get() on:input=move |ev| ops.set(event_target_value(&ev))
+                        placeholder=move || match trigger.get().as_str() { "record" => "created, updated, deleted", "decision" => "opened, answered, expired", _ => "finished, failed, needs_approval" } />
+                </label>
+                <label class="space-y-0.5" class:hidden=move || trigger.get() != "session">
+                    <span class="text-xs text-zinc-500">"Sessions with these labels (empty: all)"</span>
+                    <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. template:deploy" prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "schedule">
                     <span class="text-xs text-zinc-500">"Schedule (cron: minute hour day month weekday)"</span>
@@ -2524,7 +2573,41 @@ fn AutomationsSetting() -> impl IntoView {
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="mail.received from:@acme.com subject:invoice (from:, to:, subject:, account:)"
                         prop:value=move || cron.get() on:input=move |ev| cron.set(event_target_value(&ev)) />
                 </label>
-                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Then"</span>
+                    <select class=format!("{INPUT} py-1 text-sm") prop:value=move || action.get() on:change=move |ev| action.set(event_target_value(&ev))>
+                        <option value="start">"Start a template or workflow"</option>
+                        <option value="write">"Write a record"</option>
+                        <option value="ask">"Ask (open a decision)"</option>
+                        <option value="notify">"Notify"</option>
+                    </select>
+                </label>
+                <label class="space-y-0.5" class:hidden=move || action.get() != "start">
+                    <span class="text-xs text-zinc-500">"Template or workflow"</span>
+                    <select class=format!("{INPUT} py-1 text-sm") prop:value=move || template.get() on:change=move |ev| template.set(event_target_value(&ev))>
+                        <option value="">"Choose…"</option>
+                        {move || templates.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <option value=t.name.clone()>{t.name.clone()}</option> }).collect_view()}
+                        {move || workflow_list.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| view! { <option value=w.name.clone()>{format!("{} (workflow)", w.name)}</option> }).collect_view()}
+                    </select>
+                </label>
+                <label class="space-y-0.5 sm:col-span-2">
+                    <span class="text-xs text-zinc-500">"Only when (JSONPath conditions on the event; optional)"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=r#"{"$.record.fields.stage": "won"}"# prop:value=move || conditions.get() on:input=move |ev| conditions.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || action.get() == "start">
+                    <span class="text-xs text-zinc-500">"What to do (JSON; \"$.path\" and {{$.path}} take the event's values)"</span>
+                    <textarea class=format!("{INPUT} py-1 font-mono text-xs") rows="3" prop:value=move || params.get() on:input=move |ev| params.set(event_target_value(&ev))
+                        placeholder=move || match action.get().as_str() {
+                            "write" => r#"{"collection": "payments", "fields": {"amount": "$.body.amount", "from": "$.body.customer"}}"#,
+                            "ask" => r#"{"title": "Follow up with {{$.record.fields.name}}?", "options": [{"label": "Yes"}, {"label": "No"}]}"#,
+                            _ => r#"{"title": "{{$.session.title}} failed", "message": "{{$.message}}"}"#,
+                        }></textarea>
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"At most, runs an hour"</span>
+                    <input type="number" min="0" class=format!("{INPUT} py-1 text-sm") prop:value=move || per_hour.get().to_string() on:input=move |ev| per_hour.set(event_target_value(&ev).parse().unwrap_or(60)) />
+                </label>
+                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule" || action.get() != "start">
                     <span class="text-xs text-zinc-500">"Input (the template's {{input}})"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
                 </label>
@@ -2534,7 +2617,8 @@ fn AutomationsSetting() -> impl IntoView {
                     Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
                     Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
                 })}
-                <button class=BUTTON on:click=create>"Add automation"</button>
+                <button class=BUTTON_QUIET on:click=digest title="A schedule that notifies you of open decisions">"Digest preset"</button>
+                <button class=BUTTON on:click=create>"Add trigger"</button>
             </div>
         </section>
     }
@@ -2562,12 +2646,13 @@ fn RunHistory(id: String) -> impl IntoView {
                 Ok(v) => v.into_iter().map(|run| {
                     let took = run.finished_at.map(|f| format!(" · {}s", (f - run.started_at) / 1000)).unwrap_or_default();
                     let cost = if run.calls == 0 { String::new() } else { format!(" · {} calls · ${:.2}", run.calls, run.cost) };
+                    let cause = if run.cause.is_empty() { String::new() } else { format!(" · after {} other trigger(s)", run.cause.len()) };
                     view! {
                         <div class="space-y-0.5 border-t border-zinc-100 px-2 py-1.5 first:border-t-0 dark:border-zinc-800/60">
                             <div class="flex flex-wrap items-center gap-2">
                                 <span class=format!("h-2 w-2 rounded-full {}", outcome_dot(&run.outcome))></span>
                                 <span>{when(run.started_at)}</span>
-                                <span class="text-zinc-500">{format!("{} · {}{took}{cost}", run.trigger, run.outcome)}</span>
+                                <span class="text-zinc-500">{format!("{} · {}{took}{cost}{cause}", run.trigger, run.outcome)}</span>
                             </div>
                             {run.error.clone().map(|e| view! { <p class="pl-4 text-red-600">{e}</p> })}
                             <div class="flex flex-wrap gap-x-3 pl-4">

@@ -333,6 +333,29 @@ Automations generalize into **triggers**: an event, an optional filter, and an a
 - **Loop protection.** Every action carries the chain of events that caused it. Chains deeper than a limit, or a trigger firing too often (a rate limit per trigger), stop and notify you. Each trigger can have a budget.
 - **History,** as automations have today: each run, its cause, its outcome, its cost.
 
+**As built (step 5):**
+- **Automations became triggers in place:**
+  - **Migration `0035`** renames `automations` to `triggers` and `automation_runs` to `trigger_runs`. Ids, schedules, inputs, webhook token hashes (so URLs keep working) and run history are kept and checked.
+  - **New columns:** `event_params`, `filter`, `action` (`start` for existing automations), `action_params`, `per_hour`, and each run's `cause`.
+  - **API:** `/api/v1/triggers`, with `/api/v1/automations` kept as its old name.
+- **Events:** schedule, webhook, memex (as before), plus:
+  - **record:** created, updated or deleted in a collection. The event has the record, the fields before, and which fields changed.
+  - **decision:** opened, answered (with the option), expired or dismissed.
+  - **session:** a turn finished or failed, or the session needs approval; optionally only sessions with some labels.
+- **Filters and mapping:**
+  - **Filters:** JSONPath conditions on the event (`$.record.fields.stage`, `$.body.amount`), with the same comparisons as record queries plus `$exists`.
+  - **Mapping:** in action parameters, a string `"$.path"` becomes that value, and `{{$.path}}` inside text becomes it as text.
+- **Actions:**
+  - **start:** a template or workflow, as before. `{{input}}` is the event (a webhook's body, the mail summary, or the event as JSON), or `action_params.input` mapped from it.
+  - **write:** creates a record, or updates the one `id` names (merging fields).
+  - **ask:** opens a decision.
+  - **notify:** sends a notification as event `trigger`, which channels carry by default.
+- **Loop protection:**
+  - **Chains:** an action runs with the chain of triggers that led to it. At `MAX_DEPTH` (5) the run is stopped and you're notified.
+  - **Rate:** a trigger that ran `per_hour` times in the last hour is skipped, also with a notice. Manual runs don't count.
+  - **History:** each run records its cause.
+- **Digests:** a schedule's event has `open_decisions {count, high, text}`, so a digest is a schedule that notifies, filtered on the count. The Triggers form has a preset for it.
+
 ### 4.4 Series
 
 A **series** is numbers over time.
@@ -804,3 +827,10 @@ Choices the design left open, made while building, for review.
 | 4d | A published fact enters commons as reviewed | You reviewed it as you published it |
 | 4d | Commons' proposals are decisions in commons | The review queue belongs to commons, and you see all realms' decisions anyway |
 | 4d | Deleting a realm revokes its grants instead of deleting them | The log of what flowed is kept |
+| 5 | Automations became triggers by renaming their tables, not by moving them | Ids, webhook URLs and history stay by construction; `/api/v1/automations` keeps answering for scripts |
+| 5 | Actions run in the request that caused them, not in the background | The chain of triggers rides along with the action (a task-local), and what you change is consistent when the call returns; a start action only starts sessions |
+| 5 | The chain is not carried through sessions a start action begins | A session's later events are its own; the hourly limit still bounds triggers that start sessions that fire them |
+| 5 | Built-in notifications stay as they are; triggers add a notify action for any event | The channels' event lists already are a subscription; a trigger is how you subscribe to anything else |
+| 5 | Changes to system collections (settings) are not record events | They are written through Settings, not as records, and firing on configuration changes invites loops |
+| 5 | Series events and "record a value" wait for series (step 6) | They need the primitive |
+| 5 | Per-trigger budgets are the existing budgets on the `automation:<name>` label | Start actions' sessions already carry it; other actions cost nothing |

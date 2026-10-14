@@ -915,7 +915,12 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
                 Ok(c6_proto::TurnEndReason::Error) => "failed",
                 _ => "stopped",
             };
-            crate::automations::session_ended(st, &batch.session_id, outcome).await;
+            crate::triggers::session_ended(st, &batch.session_id, outcome).await;
+            match outcome {
+                "ok" => crate::triggers::on_session(st, &batch.session_id, "finished", "").await,
+                "failed" => crate::triggers::on_session(st, &batch.session_id, "failed", "").await,
+                _ => {}
+            }
         }
     }
     if ing.events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::Usage(_)))) {
@@ -1080,7 +1085,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
         publish_queue(st, &session_id).await;
         st.registry.bump();
         if st.store.session(&session_id).await?.is_some_and(|s| s.status == "failed") {
-            crate::automations::session_ended(st, &session_id, "failed").await;
+            crate::triggers::session_ended(st, &session_id, "failed").await;
         }
     }
     Ok(())

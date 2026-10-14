@@ -124,6 +124,10 @@ pub async fn open(st: &HeadState, d: &api::DecisionIn, realm: &str, reference: &
     st.registry.bump();
     let decision = get(st, id).await?.ok_or_else(|| anyhow::anyhow!("decision gone"))?;
     announce(st, &decision, reference).await;
+    crate::triggers::on_decision(st, &decision, "opened").await;
+    if let Some(session) = reference.strip_prefix("approval:").and_then(|r| r.split(':').next()) {
+        crate::triggers::on_session(st, session, "needs_approval", &decision.title).await;
+    }
     Ok(decision)
 }
 
@@ -270,6 +274,9 @@ async fn record(st: &HeadState, id: i64, state: &str, answer: &Value, note: &str
     .execute(&st.store.pool)
     .await?;
     st.registry.bump();
+    if let Ok(Some(d)) = get(st, id).await {
+        crate::triggers::on_decision(st, &d, state).await;
+    }
     Ok(())
 }
 

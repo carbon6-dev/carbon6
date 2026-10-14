@@ -231,6 +231,7 @@ pub async fn put(
     }
     let labels = crate::sessions::check_labels(r.labels.as_deref().unwrap_or_default())?;
     let now = now_ms();
+    let mut before: Option<Value> = None;
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     for k in &c.keys {
         if let Some(v) = r.fields.get(k) {
@@ -270,14 +271,15 @@ pub async fn put(
             (id, 1, "create")
         }
         Some(id) => {
-            let current: Option<(i64, String, String)> =
-                sqlx::query_as("SELECT version, links, labels FROM records WHERE id = ? AND realm = ? AND collection = ?")
+            let current: Option<(i64, String, String, String)> =
+                sqlx::query_as("SELECT version, links, labels, fields FROM records WHERE id = ? AND realm = ? AND collection = ?")
                     .bind(id)
                     .bind(realm)
                     .bind(collection)
                     .fetch_optional(&mut *tx)
                     .await?;
-            let (version, links, old_labels) = current.ok_or_else(|| not_found(format!("no record {id} in {collection}")))?;
+            let (version, links, old_labels, old_fields) = current.ok_or_else(|| not_found(format!("no record {id} in {collection}")))?;
+            before = serde_json::from_str(&old_fields).ok();
             match r.version {
                 Some(v) if v != version => {
                     return Err(bad_request(format!(
@@ -312,6 +314,8 @@ pub async fn put(
         mirror(st, &c, &rec).await;
     }
     st.registry.bump();
+    // Triggers waiting for it (docs/os.md §4.3).
+    crate::triggers::on_record(st, realm, if op == "create" { "created" } else { "updated" }, &rec, before.as_ref()).await;
     Ok(rec)
 }
 
@@ -354,6 +358,7 @@ pub async fn delete(st: &HeadState, realm: &str, collection: &str, id: &str, by:
     tx.commit().await?;
     unmirror(st, realm, collection, id).await;
     st.registry.bump();
+    crate::triggers::on_record(st, realm, "deleted", &r, Some(&r.fields)).await;
     Ok(())
 }
 

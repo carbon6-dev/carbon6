@@ -3,7 +3,6 @@
 pub mod api;
 pub mod assistant;
 pub mod auth;
-pub mod automations;
 pub mod catalog;
 pub mod collections;
 pub mod commons;
@@ -37,6 +36,7 @@ pub mod telemetry;
 pub mod templates;
 pub mod terminals;
 pub mod tls;
+pub mod triggers;
 pub mod ui_ca;
 pub mod usage;
 mod webauthn;
@@ -215,7 +215,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     let mut tasks = JoinSet::new();
 
     // Scheduled automations.
-    automations::spawn_scheduler(state.clone());
+    triggers::spawn_scheduler(state.clone());
     notify::spawn(state.clone());
     usage::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());

@@ -136,11 +136,11 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
     };
     match segments.as_slice() {
         // Collections whose lists and creations are filtered by realm.
-        ["sessions"] | ["search"] | ["decisions"] | ["decisions", "count"] | ["memories"] | ["automations"] => Ok(()),
+        ["sessions"] | ["search"] | ["decisions"] | ["decisions", "count"] | ["memories"] | ["automations"] | ["triggers"] => Ok(()),
         ["sessions", id, ..] => owned("sessions", "session", (*id).to_owned()).await,
         ["decisions", id, ..] => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,
-        ["automations", id, ..] => owned("automations", "automation", (*id).to_owned()).await,
+        ["automations" | "triggers", id, ..] => owned("triggers", "trigger", (*id).to_owned()).await,
         // Starting a template's sessions (in the caller's realm).
         ["templates", _, "run"] if method == Method::POST => Ok(()),
         // Collections: within the caller's realm, or another's through a
@@ -206,7 +206,7 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
         ("records", "records", " AND collection NOT IN (SELECT name FROM collections WHERE realm = records.realm AND system = 1)"),
         ("collections", "collections", " AND system = 0"),
         ("decisions", "decisions", ""),
-        ("automations", "automations", ""),
+        ("triggers", "triggers", ""),
         ("secrets", "secrets", ""),
     ] {
         let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table} WHERE realm = ?{cond}")))

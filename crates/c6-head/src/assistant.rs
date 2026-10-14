@@ -702,7 +702,7 @@ fn secret_title(op: &Op, field: &str) -> String {
         "workers.enrollments.create" => "Enrollment token".into(),
         "auth.tokens.create" => "API token".into(),
         "auth.codes.create" => "One-time sign-in code".into(),
-        "automations.rotate" => "Webhook URL".into(),
+        "triggers.rotate" => "Webhook URL".into(),
         _ => format!("{} ({field})", op.name),
     }
 }
@@ -714,7 +714,7 @@ fn secret_note(op: &Op) -> &'static str {
         }
         "auth.tokens.create" => "For the c6 CLI or a script (Authorization: Bearer <token>). Copy it now: it is not shown again.",
         "auth.codes.create" => "Enter it on the other device's sign-in page. Valid for a few minutes.",
-        "automations.rotate" => "The old URL no longer works.",
+        "triggers.rotate" => "The old URL no longer works.",
         _ => "Copy it now: it is not shown again.",
     }
 }

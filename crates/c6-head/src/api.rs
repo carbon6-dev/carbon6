@@ -55,6 +55,12 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/automations/{id}/run", post(run_automation))
         .route("/api/v1/automations/{id}/runs", get(automation_runs))
         .route("/api/v1/automations/{id}/rotate", post(rotate_automation))
+        // Triggers (docs/os.md §4.3): what automations are called now.
+        .route("/api/v1/triggers", get(list_automations).post(create_automation))
+        .route("/api/v1/triggers/{id}", axum::routing::patch(update_automation).delete(delete_automation))
+        .route("/api/v1/triggers/{id}/run", post(run_automation))
+        .route("/api/v1/triggers/{id}/runs", get(automation_runs))
+        .route("/api/v1/triggers/{id}/rotate", post(rotate_automation))
         .route("/api/v1/webhooks/{id}/{token}", post(call_webhook))
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
@@ -891,7 +897,7 @@ async fn delete_memory(State(st): State<Arc<HeadState>>, Path(id): Path<String>)
 }
 
 async fn list_automations(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Automation>>> {
-    Ok(Json(crate::automations::list(&st, &caller).await?))
+    Ok(Json(crate::triggers::list(&st, &caller).await?))
 }
 
 async fn create_automation(
@@ -900,7 +906,7 @@ async fn create_automation(
     Json(e): Json<api::AutomationEdit>,
 ) -> ApiResult<Json<api::Automation>> {
     let realm = caller.realm_for_new(None)?;
-    Ok(Json(crate::automations::create(&st, e, &realm).await?))
+    Ok(Json(crate::triggers::create(&st, e, &realm).await?))
 }
 
 async fn update_automation(
@@ -908,20 +914,20 @@ async fn update_automation(
     Path(id): Path<String>,
     Json(e): Json<api::AutomationEdit>,
 ) -> ApiResult<Json<api::Automation>> {
-    Ok(Json(crate::automations::update(&st, &id, e).await?))
+    Ok(Json(crate::triggers::update(&st, &id, e).await?))
 }
 
 async fn delete_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    crate::automations::delete(&st, &id).await?;
+    crate::triggers::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn run_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::TemplateRun>> {
-    Ok(Json(crate::automations::run_now(&st, &id).await?))
+    Ok(Json(crate::triggers::run_now(&st, &id).await?))
 }
 
 async fn rotate_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::Automation>> {
-    Ok(Json(crate::automations::rotate(&st, &id).await?))
+    Ok(Json(crate::triggers::rotate(&st, &id).await?))
 }
 
 /// A webhook call from outside (no sign-in: the token in the URL is the
@@ -931,10 +937,10 @@ async fn call_webhook(
     Path((id, token)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> ApiResult<(StatusCode, Json<api::TemplateRun>)> {
-    if body.len() > crate::automations::MAX_WEBHOOK_BODY {
+    if body.len() > crate::triggers::MAX_WEBHOOK_BODY {
         return Err(ApiErr(StatusCode::PAYLOAD_TOO_LARGE, "the body is too large".into()));
     }
-    match crate::automations::webhook(&st, &id, &token, &body).await? {
+    match crate::triggers::webhook(&st, &id, &token, &body).await? {
         Some(run) => Ok((StatusCode::ACCEPTED, Json(run))),
         None => Err(ApiErr(StatusCode::NOT_FOUND, "not found".into())),
     }
@@ -1579,7 +1585,7 @@ async fn automation_runs(
     Path(id): Path<String>,
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<Vec<api::AutomationRun>>> {
-    Ok(Json(crate::automations::runs(&st, &id, q.limit.unwrap_or(20)).await?))
+    Ok(Json(crate::triggers::runs(&st, &id, q.limit.unwrap_or(20)).await?))
 }
 
 async fn get_hosts_setting(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Host>>> {

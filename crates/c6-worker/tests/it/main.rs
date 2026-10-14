@@ -35,6 +35,7 @@ mod search;
 mod secrets;
 mod session;
 mod side_chat;
+mod triggers;
 mod usage;
 mod websearch;
 mod workflows;

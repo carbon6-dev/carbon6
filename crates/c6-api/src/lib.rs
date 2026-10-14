@@ -1392,18 +1392,45 @@ pub struct TemplateRun {
     pub errors: Vec<String>,
 }
 
-/// An automation: starts a template on a schedule or from a webhook.
+/// A trigger (docs/os.md §4.3; called an automation before): an event,
+/// an optional filter on it, and an action.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Automation {
     pub id: String,
     pub name: String,
+    /// The start action's template or workflow.
+    #[serde(default)]
     pub template: String,
-    /// "schedule" or "webhook".
+    /// The event: "schedule", "webhook", "memex", "record", "decision" or
+    /// "session".
     pub trigger: String,
     /// Schedules: five cron fields in the head's local time, or @daily etc.
+    /// Memex events: the event and its conditions (mail.received from:…).
     #[serde(default)]
     pub cron: String,
+    /// The event's parameters: records {collection, ops}; decisions {ops};
+    /// sessions {ops, labels}. ops: created, updated, deleted; opened,
+    /// answered, expired; finished, failed, needs_approval.
+    #[serde(default)]
+    pub event_params: serde_json::Value,
+    /// Conditions on the event, by JSONPath: {"$.record.fields.stage":
+    /// "won", "$.open_decisions.count": {"$gt": 0}}; all must hold.
+    #[serde(default)]
+    pub filter: serde_json::Value,
+    /// "start" (the template or workflow), "write" (a record), "ask" (a
+    /// decision) or "notify".
+    #[serde(default = "start_action")]
+    pub action: String,
+    /// The action's parameters; strings "$.path" take the event's value,
+    /// and "{{$.path}}" inside text is replaced by it. write: {collection,
+    /// fields, id?}; ask: {title, document, options, priority}; notify:
+    /// {title, message, priority}; start: {input?}.
+    #[serde(default)]
+    pub action_params: serde_json::Value,
+    /// Runs in an hour beyond this are skipped, and you are told.
+    #[serde(default = "per_hour_default")]
+    pub per_hour: u32,
     /// Schedules: the template's {{input}}.
     #[serde(default)]
     pub input: String,
@@ -1548,8 +1575,12 @@ pub struct AutomationRun {
     pub started_at: UnixMs,
     #[serde(default)]
     pub finished_at: Option<UnixMs>,
-    /// "schedule", "webhook" or "manual".
+    /// What fired it: "schedule", "webhook", "memex", "record", "decision",
+    /// "session" or "manual".
     pub trigger: String,
+    /// The triggers whose actions led to this run, first first.
+    #[serde(default)]
+    pub cause: Vec<String>,
     /// "running", "ok", "failed" or "stopped" (a turn was interrupted).
     pub outcome: String,
     /// Why it did not start (or why some of its targets did not).
@@ -1570,12 +1601,34 @@ pub struct RunSession {
     pub outcome: String,
 }
 
+fn start_action() -> String {
+    "start".into()
+}
+
+fn per_hour_default() -> u32 {
+    60
+}
+
+/// What triggers are called from now on.
+pub type Trigger = Automation;
+pub type TriggerEdit = AutomationEdit;
+
 /// `POST /api/v1/automations` (create) and `PATCH /api/v1/automations/{id}`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AutomationEdit {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub event_params: Option<serde_json::Value>,
+    #[serde(default)]
+    pub filter: Option<serde_json::Value>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub action_params: Option<serde_json::Value>,
+    #[serde(default)]
+    pub per_hour: Option<u32>,
     #[serde(default)]
     pub template: Option<String>,
     #[serde(default)]
@@ -1695,20 +1748,21 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 9] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 10] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
     ("finished", "a turn finished"),
     ("notice", "the agent sent you a notification (notify)"),
     ("output", "the agent published a file"),
-    ("automation", "an automation run failed, or failures switched one off"),
+    ("automation", "a trigger's run failed, failures switched one off, or loop protection stopped it"),
+    ("trigger", "a trigger's notify action"),
     ("budget", "a budget ran out"),
     ("host", "a host's scheduled check failed, or it is reachable again"),
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 7] = ["approval", "decision", "failed", "notice", "automation", "budget", "host"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 8] = ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.

@@ -41,7 +41,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             "event" => {
                 let kind = params["type"].as_str().unwrap_or_default().to_owned();
                 let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
-                crate::automations::on_memex_event(st, &realm, &kind, &params["data"]).await;
+                crate::triggers::on_memex_event(st, &realm, &kind, &params["data"]).await;
                 Ok(json!({}))
             }
             // A disputed fact, for you to settle.

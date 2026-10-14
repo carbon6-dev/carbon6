@@ -138,12 +138,12 @@ async fn runs_outcomes_and_streaks() {
     let bad = run_once(Reply::Status(400), 2).await;
     assert_eq!((bad.outcome.as_str(), bad.sessions[0].outcome.as_str()), ("failed", "failed"));
     let titles = || got.lock().unwrap().iter().map(|(_, v)| v["title"].as_str().unwrap_or_default().to_owned()).collect::<Vec<_>>();
-    eventually("the failure notification", async || titles().contains(&"Automation nightly failed".to_owned()).then_some(())).await;
+    eventually("the failure notification", async || titles().contains(&"Trigger nightly failed".to_owned()).then_some(())).await;
     let list: Vec<c6_api::Automation> = http.get(format!("{api}/automations")).send().await.unwrap().json().await.unwrap();
     assert!(list[0].enabled, "one failure is not a streak");
 
     run_once(Reply::Status(400), 3).await;
-    eventually("switched off", async || titles().contains(&"Automation nightly switched off".to_owned()).then_some(())).await;
+    eventually("switched off", async || titles().contains(&"Trigger nightly switched off".to_owned()).then_some(())).await;
     let list: Vec<c6_api::Automation> = http.get(format!("{api}/automations")).send().await.unwrap().json().await.unwrap();
     assert!(!list[0].enabled);
     assert_eq!(list[0].recent, ["failed", "failed", "ok"]);

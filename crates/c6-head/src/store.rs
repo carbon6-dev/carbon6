@@ -127,6 +127,20 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
             after: "SELECT count(*) FROM decisions WHERE state = 'answered'",
         },
         c6_core::upgrade::Check {
+            version: 35,
+            name: "every automation is a trigger, with its id, name, schedule and webhook token",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || name || '/' || trigger || '/' || cron || '/' || token_hash || '/' || template, '|'), '') \
+                     FROM (SELECT * FROM before.automations ORDER BY id)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || name || '/' || event || '/' || cron || '/' || token_hash || '/' || template, '|'), '') \
+                    FROM (SELECT * FROM triggers WHERE action = 'start' ORDER BY id)",
+        },
+        c6_core::upgrade::Check {
+            version: 35,
+            name: "every automation run is a trigger run",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(run_id || '=' || automation_id || '/' || outcome, '|'), '') FROM (SELECT * FROM before.automation_runs ORDER BY run_id)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(run_id || '=' || trigger_id || '/' || outcome, '|'), '') FROM (SELECT * FROM trigger_runs ORDER BY run_id)",
+        },
+        c6_core::upgrade::Check {
             version: 34,
             name: "commons exists, and every realm reads it",
             before: "SELECT 'yes'",
@@ -146,6 +160,9 @@ pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
         c6_core::upgrade::Allow { version: 30, table: "settings" },
         // Memory notes moved into records (kept as legacy_memories).
         c6_core::upgrade::Allow { version: 30, table: "memories" },
+        // Automations became triggers (the same tables, renamed).
+        c6_core::upgrade::Allow { version: 35, table: "automations" },
+        c6_core::upgrade::Allow { version: 35, table: "automation_runs" },
         // Action items became decisions (the same table, renamed).
         c6_core::upgrade::Allow { version: 31, table: "todos" },
         // Follow-through was removed (its tables and settings).
