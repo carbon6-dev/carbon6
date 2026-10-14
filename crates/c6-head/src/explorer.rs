@@ -655,15 +655,15 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             groups.push(group("Decisions about it", decisions_mentioning(st, realm, &rec.id).await?));
             let mut writers = Vec::new();
             for by in [&rec.created_by, &rec.updated_by] {
-                if let Some(s) = by.split_whitespace().find_map(|w| w.strip_prefix("session:")) {
-                    if let Ok(Some(row)) = st.store.session(s).await {
-                        writers.push(r("session", &row.id, &row.title, "wrote it", Some(row.updated_at)));
-                    }
+                if let Some(s) = by.split_whitespace().find_map(|w| w.strip_prefix("session:"))
+                    && let Ok(Some(row)) = st.store.session(s).await
+                {
+                    writers.push(r("session", &row.id, &row.title, "wrote it", Some(row.updated_at)));
                 }
-                if let Some(t) = by.split_whitespace().find_map(|w| w.strip_prefix("trigger:")) {
-                    if let Some(t) = triggers.iter().find(|x| x.name.replace(' ', "-") == t) {
-                        writers.push(r("trigger", &t.id, &t.name, "wrote it", None));
-                    }
+                if let Some(t) = by.split_whitespace().find_map(|w| w.strip_prefix("trigger:"))
+                    && let Some(t) = triggers.iter().find(|x| x.name.replace(' ', "-") == t)
+                {
+                    writers.push(r("trigger", &t.id, &t.name, "wrote it", None));
                 }
             }
             writers.dedup_by(|a, b| a.id == b.id);
@@ -841,10 +841,10 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             if let Some(col) = source.strip_prefix("collection:") {
                 groups.push(group("The record", vec![r("record", format!("{col}/{ext}"), ext, col, None)]));
             }
-            if source == "session" || source.starts_with("session") {
-                if let Ok(Some(s)) = st.store.session(ext).await {
-                    groups.push(group("The session", vec![r("session", &s.id, &s.title, &s.status, Some(s.updated_at))]));
-                }
+            if (source == "session" || source.starts_with("session"))
+                && let Ok(Some(s)) = st.store.session(ext).await
+            {
+                groups.push(group("The session", vec![r("session", &s.id, &s.title, &s.status, Some(s.updated_at))]));
             }
         }
         "fact" => {
@@ -876,10 +876,10 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
                 "About",
                 f["about"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|k| r("thing", k, k, "", None)).collect(),
             ));
-            if let Some(s) = f["made_by"].as_str().and_then(|m| m.strip_prefix("session:")) {
-                if let Ok(Some(s)) = st.store.session(s).await {
-                    groups.push(group("Recorded by", vec![r("session", &s.id, &s.title, &s.status, Some(s.updated_at))]));
-                }
+            if let Some(s) = f["made_by"].as_str().and_then(|m| m.strip_prefix("session:"))
+                && let Ok(Some(s)) = st.store.session(s).await
+            {
+                groups.push(group("Recorded by", vec![r("session", &s.id, &s.title, &s.status, Some(s.updated_at))]));
             }
             groups.push(group("Decisions about it", decisions_mentioning(st, realm, id).await?));
         }
@@ -888,7 +888,7 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             o.title = s.title.clone();
             o.sub = format!("{} · {} · {}", s.status, s.worker_name, s.model);
             o.fields = vec![("labels".into(), s.all_labels().join(", ")), ("folder".into(), s.cwd.clone())];
-            let (cost, calls) = crate::usage::cost_of(st, &[s.id.clone()]).await.unwrap_or((0.0, 0));
+            let (cost, calls) = crate::usage::cost_of(st, std::slice::from_ref(&s.id)).await.unwrap_or((0.0, 0));
             o.fields.push(("cost".into(), format!("${cost:.2} ({calls} calls)")));
             o.open = Some(format!("/sessions/{}", s.id));
             let wrote = sqlx::query(
@@ -960,10 +960,10 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             }
             groups.push(group("About", about));
             let mut from = Vec::new();
-            if let Some(s) = d.source.strip_prefix("session:") {
-                if let Ok(Some(s)) = st.store.session(s).await {
-                    from.push(r("session", &s.id, &s.title, "asked", Some(s.updated_at)));
-                }
+            if let Some(s) = d.source.strip_prefix("session:")
+                && let Ok(Some(s)) = st.store.session(s).await
+            {
+                from.push(r("session", &s.id, &s.title, "asked", Some(s.updated_at)));
             }
             if let Some(t) = d.context["trigger"].as_str().and_then(|t| triggers.iter().find(|x| x.id == t)) {
                 from.push(trigger_ref(t));

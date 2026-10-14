@@ -114,13 +114,18 @@ pub fn signed_out() -> RwSignal<bool> {
 
 thread_local! {
     /// The realm you are looking at ("": every realm), remembered in this
-    /// browser (docs/os.md §3).
-    static REALM: RwSignal<String> = RwSignal::new(crate::util::storage_get("c6.realm").unwrap_or_default());
+    /// browser (docs/os.md §3). It has an owner of its own, so it lives as
+    /// long as the page, whichever component asks for it first.
+    static REALM: (Owner, RwSignal<String>) = {
+        let owner = Owner::new_root(None);
+        let signal = owner.with(|| RwSignal::new(crate::util::storage_get("c6.realm").unwrap_or_default()));
+        (owner, signal)
+    };
 }
 
 /// The realm you are looking at ("": every realm).
 pub fn realm() -> RwSignal<String> {
-    REALM.with(|r| *r)
+    REALM.with(|r| r.1)
 }
 
 /// `?realm=…` for the realm you are looking at, or "".
@@ -143,6 +148,28 @@ pub async fn update_realm(id: String, r: c6_api::RealmIn) -> Result<c6_api::Real
 
 pub async fn delete_realm(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await
+}
+
+// --- The realm explorer (docs/explorer.md) -----------------------------------
+
+pub async fn explorer_map() -> Result<serde_json::Value, String> {
+    json(Request::get("/api/v1/explorer/map").send().await).await
+}
+
+pub async fn realm_summary(realm: String) -> Result<c6_api::RealmSummary, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/summary", enc(&realm))).send().await).await
+}
+
+pub async fn realm_activity(realm: String, since: i64) -> Result<Vec<c6_api::ExRef>, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/activity?since={since}&limit=60", enc(&realm))).send().await).await
+}
+
+pub async fn realm_list(realm: String, section: String, q: String) -> Result<Vec<c6_api::ExRef>, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/list?section={}&q={}", enc(&realm), enc(&section), enc(&q))).send().await).await
+}
+
+pub async fn realm_object(realm: String, kind: String, id: String) -> Result<c6_api::ExObject, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/object?kind={}&id={}", enc(&realm), enc(&kind), enc(&id))).send().await).await
 }
 
 pub async fn apps() -> Result<Vec<c6_api::AppInstall>, String> {

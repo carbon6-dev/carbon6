@@ -112,8 +112,37 @@ All three answer realm-scoped tokens for their own realm (admitted like collecti
 4. Graph mode (wiring, then knowledge neighborhood).
 5. Flow (grants, commons, apps) and the map's arrows.
 
-## 10. Open questions
+## 10. Decisions
 
-- **Root:** does root get an explorer (workers, connections, realms, root's lists), or only the map?
-- **Home's personal data:** mail, calendar and photos already have their own pages. Should the explorer list them as item kinds (counts and links out), or leave them out to keep the explorer about structure?
-- **Editing in place:** read-only with links out (proposed), or quick edits (a record's field, a decision's answer) in the object pane?
+- **Root** gets the map, plus an explorer of its configuration and infrastructure (it holds no data).
+- **Home's mail, calendar events and photos** are counted among its knowledge, and those lines link to the Mail, Calendar and Photos pages.
+- **Read-only:** every object has "Open ↗" to the page that edits it.
+
+## 11. As built
+
+- **Head:**
+  - **`explorer.rs`:** `summary`, `activity`, `list`, `object` and `map`, at `/api/v1/realms/{id}/summary|activity|list|object` and `/api/v1/explorer/map`. A realm's token reaches its own realm's.
+  - **The memex** answers `memex.explore.inventory` (counts by kind, latest items), `memex.explore.list` (things, items or facts by kind) and `memex.explore.thing` (a thing's items, facts and related things), per realm.
+- **Connected, as computed:**
+  - **record:** links read as thing keys (`client:acme`), records linking back, sessions labelled `record:<id>`, decisions whose context, reference or source names it, who wrote it (session or trigger), and the triggers on its collection.
+  - **thing:** facts, items, related things, records linking to its key, and sessions labelled with it.
+  - **session:** records it wrote (from history), decisions it raised, the trigger that started it, and the record it is about.
+  - **trigger:** what it involves, triggers that cause it and that it causes (from runs' causes), and its runs' sessions.
+  - **decision:** what it is about, what opened it, and the triggers listening.
+  - The other kinds as in §6.
+- **UI** (`explorer.rs`):
+  - **The pages:** `/realms` (the map with grants as arrows), `/realms/<id>` (inventory and overview), `/realms/<id>/in/<section>`, and `/realms/<id>/<kind>/<id>`.
+  - **Navigation:** links move the column in place (⌘-click opens a tile). Exploring a realm switches the header to it.
+  - **Graphs:** the overview's "How it is wired" draws sources, triggers and targets in three columns. An object's "as a graph" draws its connections in a ring; clicking one opens it.
+  - **Where to find it:** a Realms link in the header (and ☰), and "Explore" on each realm in Settings → System → Realms.
+- **Fixed on the way:**
+  - The realm signal now lives as long as the page. It used to be owned by whichever component asked for it first, and the explorer could dispose it.
+  - Triggers and decisions can be created with `?realm=`; before, a root caller could only create them in home. The Triggers form now lists and creates in the realm picked in the header.
+- **Not built:**
+  - realm-wide search in the explorer (the header's search covers sessions);
+  - "upgrade available" for apps;
+  - two-hop graphs.
+
+## 12. Open questions
+
+- Should commons show, for each realm, what it published there?

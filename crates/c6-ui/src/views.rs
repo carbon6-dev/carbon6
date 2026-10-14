@@ -75,7 +75,7 @@ pub fn ViewPage(name: String, record: String) -> impl IntoView {
 
 /// A view's content (also embedded in pages).
 #[component]
-fn ViewBody(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
+pub(crate) fn ViewBody(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
     match view.kind.as_str() {
         "table" => view! { <TableView view=view /> }.into_any(),
         "board" => view! { <BoardView view=view /> }.into_any(),

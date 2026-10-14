@@ -318,6 +318,7 @@ fn Realms() -> impl IntoView {
                         <span class="font-mono font-medium">{r.id.clone()}</span>
                         <span>{r.name.clone()}</span>
                         <span class="min-w-0 flex-1 truncate text-zinc-500">{r.description.clone()}</span>
+                        <crate::workspace::Go to=crate::workspace::View::Explore { realm: r.id.clone(), section: String::new(), kind: String::new(), id: String::new() } class=format!("{BUTTON_QUIET} text-xs")>"Explore"</crate::workspace::Go>
                         {holds.then(|| view! {
                             <label class="flex items-center gap-1 text-xs text-zinc-500" title="Every realm reads commons, the knowledge shared by all, unless you turn it off">
                                 <input type="checkbox" prop:checked=reads on:change=move |ev| {

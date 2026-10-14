@@ -69,6 +69,18 @@ pub enum View {
         #[serde(default)]
         name: String,
     },
+    /// Every realm, and the grants between them (docs/explorer.md).
+    Realms,
+    /// One realm in the explorer: a section of its inventory, an object.
+    Explore {
+        realm: String,
+        #[serde(default)]
+        section: String,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        id: String,
+    },
     /// A realm's view (docs/os.md §4.5); with a record, that record.
     App {
         name: String,
@@ -137,6 +149,13 @@ impl View {
             View::Decisions => "/decisions".into(),
             View::Collections { name } if name.is_empty() => "/collections".into(),
             View::Collections { name } => format!("/collections/{name}"),
+            View::Realms => "/realms".into(),
+            View::Explore { realm, section, kind, id } => match (kind.is_empty(), section.is_empty()) {
+                (true, true) => format!("/realms/{}", encode(realm)),
+                (true, false) => format!("/realms/{}/in/{}", encode(realm), encode(section)),
+                (false, true) => format!("/realms/{}/{}/{}", encode(realm), encode(kind), encode(id)),
+                (false, false) => format!("/realms/{}/{}/{}?in={}", encode(realm), encode(kind), encode(id), encode(section)),
+            },
             View::App { name, record } if record.is_empty() => format!("/views/{name}"),
             View::App { name, record } => format!("/views/{name}/{record}"),
         }
@@ -159,8 +178,22 @@ impl View {
             })
             .unwrap_or_default();
         let hash = loc.hash().unwrap_or_default().trim_start_matches('#').to_owned();
+        Self::parse(&path, &query, &hash)
+    }
+
+    /// The view at a path of carbon6 (e.g. a link the head gives).
+    pub fn from_path(href: &str) -> Self {
+        let (path, q) = href.split_once('?').unwrap_or((href, ""));
+        let query: HashMap<String, String> =
+            q.split('&').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.to_owned(), decode(v))).collect();
+        Self::parse(path, &query, "")
+    }
+
+    fn parse(path: &str, query: &HashMap<String, String>, hash: &str) -> Self {
+        let hash = hash.to_owned();
         let get = |k: &str| query.get(k).cloned().unwrap_or_default();
-        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let parts: Vec<String> = path.trim_matches('/').split('/').map(decode).collect();
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         match parts.as_slice() {
             ["sessions", id] => {
                 let target = (query.contains_key("q") || !hash.is_empty()).then(|| Target {
@@ -207,6 +240,16 @@ impl View {
             ["collections", name] => View::Collections { name: (*name).to_owned() },
             ["views", name] => View::App { name: (*name).to_owned(), record: String::new() },
             ["views", name, record] => View::App { name: (*name).to_owned(), record: (*record).to_owned() },
+            ["realms"] => View::Realms,
+            ["realms", realm] => {
+                View::Explore { realm: (*realm).to_owned(), section: String::new(), kind: String::new(), id: String::new() }
+            }
+            ["realms", realm, "in", section] => {
+                View::Explore { realm: (*realm).to_owned(), section: (*section).to_owned(), kind: String::new(), id: String::new() }
+            }
+            ["realms", realm, kind, id] => {
+                View::Explore { realm: (*realm).to_owned(), section: get("in"), kind: (*kind).to_owned(), id: (*id).to_owned() }
+            }
             _ => View::Sessions,
         }
     }
@@ -239,6 +282,8 @@ impl View {
             View::Decisions => "Decisions".into(),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
+            View::Realms => "Realms".into(),
+            View::Explore { realm, .. } => format!("Explore · {realm}"),
             View::App { name, record } if record.is_empty() => name.clone(),
             View::App { name, .. } => format!("{name} · record"),
         }
@@ -992,10 +1037,21 @@ fn render_view(view: View) -> AnyView {
                     View::Decisions => view! { <crate::decisions::DecisionsPage /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
                     View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
+                    View::Realms => view! { <crate::explorer::RealmsMap /> }.into_any(),
+                    View::Explore { realm, section, kind, id } => view! { <crate::explorer::ExplorePage realm=realm.clone() section=section.clone() kind=kind.clone() id=id.clone() /> }.into_any(),
                     View::Session { .. } => ().into_any(),
                 }}
             </ScrollBox>
         }
         .into_any(),
     }
+}
+
+/// A path segment, percent-encoded.
+pub fn encode(s: &str) -> String {
+    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+}
+
+fn decode(s: &str) -> String {
+    js_sys::decode_uri_component(&s.replace('+', " ")).ok().and_then(|v| v.as_string()).unwrap_or_else(|| s.to_owned())
 }

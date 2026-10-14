@@ -8,6 +8,7 @@ mod calendar;
 mod collections;
 mod contacts;
 mod decisions;
+mod explorer;
 mod files;
 mod fleet;
 mod labels;
@@ -102,6 +103,7 @@ fn Main() -> impl IntoView {
                     <decisions::DecisionLink class=NAV />
                     <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
                     <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
+                    <span class="hidden xl:contents"><NavLink to=View::Realms label="Realms" /></span>
                     <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                 </nav>
                 <span class="flex-1"></span>
@@ -152,6 +154,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
+                    <Go to=View::Realms class=MENU>"Realms"</Go>
                     <views::ViewsMenu class=MENU />
                     <Go to=View::Mail class=MENU>"Mail"</Go>
                     <Go to=View::Calendar class=MENU>"Calendar"</Go>
