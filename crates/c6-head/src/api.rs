@@ -1047,6 +1047,7 @@ async fn attachment(State(st): State<Arc<HeadState>>, Path((id, seq, index)): Pa
     let ev = st.store.events_after(&id, seq.saturating_sub(1), 1).await?;
     let a = match ev.first().filter(|e| e.seq == seq).and_then(|e| e.kind.as_ref()) {
         Some(c6_proto::session_event::Kind::User(u)) => u.attachments.get(index).cloned(),
+        Some(c6_proto::session_event::Kind::ToolResult(r)) => r.images.get(index).cloned(),
         _ => None,
     };
     let Some(a) = a else { return Err(ApiErr(StatusCode::NOT_FOUND, "no such attachment".into())) };

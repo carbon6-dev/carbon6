@@ -117,6 +117,26 @@ async fn attachments_and_mentions_reach_the_model() {
     eventually("first message", async || (mock.requests().len() > n).then_some(())).await;
     assert!(mock.requests()[n]["messages"].to_string().contains("data:image/png;base64,"));
 
+    // A tool's image reaches the model too: reading a PNG shows it, and the
+    // transcript serves what the model saw.
+    let full_png = [png.as_slice(), &[0u8; 24]].concat();
+    std::fs::write(p.join("slide-1.png"), &full_png).unwrap();
+    mock.push(Reply::ToolCalls(vec![("read".into(), json!({"path": "slide-1.png"}).to_string())]));
+    mock.push(Reply::Text("The slide looks fine.".into()));
+    let n = mock.requests().len();
+    http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "check the slide"})).send().await.unwrap();
+    eventually("the request after the read", async || (mock.requests().len() >= n + 2).then_some(())).await;
+    let after = mock.requests()[n + 1]["messages"].to_string();
+    assert!(after.contains("[image from read]") && after.contains(&b64.encode(&full_png)), "{after}");
+    let result = eventually("the tool result", async || {
+        let evs: Vec<Event> = http.get(format!("{api}/sessions/{}/events", s.id)).send().await.ok()?.json().await.ok()?;
+        evs.into_iter().find(|e| matches!(&e.kind, EventKind::ToolResult { images, .. } if *images == 1))
+    })
+    .await;
+    let img = http.get(format!("{api}/sessions/{}/attachments/{}/0", s.id, result.seq)).send().await.unwrap();
+    assert_eq!(img.headers()["content-type"], "image/png");
+    assert_eq!(img.bytes().await.unwrap().as_ref(), full_png.as_slice());
+
     // An unsupported type is refused.
     let r = http
         .post(format!("{api}/sessions/{}/messages", s.id))

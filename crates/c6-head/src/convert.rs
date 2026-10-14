@@ -68,6 +68,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             is_error: r.is_error,
             truncated: r.truncated,
             duration_ms: r.duration_ms,
+            images: r.images.len(),
         },
         Kind::Usage(u) => api::EventKind::Usage {
             model: u.model.clone(),

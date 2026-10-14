@@ -61,21 +61,37 @@ pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
     pub truncated: bool,
+    /// Images for the model to see: (media type, bytes).
+    pub images: Vec<(String, Vec<u8>)>,
 }
+
+/// Images larger than this are not shown to the model (providers refuse
+/// them); the tool says so instead.
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false, truncated: false }
+        Self { content: content.into(), is_error: false, truncated: false, images: Vec::new() }
     }
 
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, truncated: false }
+        Self { content: content.into(), is_error: true, truncated: false, images: Vec::new() }
     }
 
     /// Applies the inline size limit.
     pub fn limited(content: String, is_error: bool) -> Self {
         let (content, truncated) = util::truncate_middle(&content, MAX_OUTPUT_CHARS);
-        Self { content, is_error, truncated }
+        Self { content, is_error, truncated, images: Vec::new() }
+    }
+
+    /// With an image for the model to see (PNG, JPEG, GIF or WebP).
+    pub fn with_image(mut self, media_type: &str, data: Vec<u8>) -> Self {
+        if data.len() > MAX_IMAGE_BYTES {
+            self.content.push_str(&format!("\n(The image is {} KB, too large to show; make it smaller.)", data.len() / 1024));
+        } else {
+            self.images.push((media_type.to_owned(), data));
+        }
+        self
     }
 }
 

@@ -288,7 +288,10 @@ impl Turn<'_> {
             } else {
                 run_tools(&calls, &by_name, session_tools, self.sink, self.cancel).await
             };
+            // Images tools return go after all the results, each labelled.
+            let mut images: Vec<Block> = Vec::new();
             for (id, name, output, elapsed) in results {
+                images.extend(crate::history::tool_image_blocks(&name, &output.images));
                 self.sink
                     .append(session_event::Kind::ToolResult(ToolResult {
                         call_id: id.clone(),
@@ -297,10 +300,21 @@ impl Turn<'_> {
                         is_error: output.is_error,
                         truncated: output.truncated,
                         duration_ms: elapsed,
+                        images: output
+                            .images
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (mime, data))| c6_proto::Attachment {
+                                name: format!("image-{}", i + 1),
+                                mime: mime.clone(),
+                                data: data.clone(),
+                            })
+                            .collect(),
                     }))
                     .await?;
                 user_blocks.push(Block::ToolResult { id, content: output.content, is_error: output.is_error });
             }
+            user_blocks.extend(images);
 
             for input in pending() {
                 self.sink.append(input.event()).await?;
@@ -322,6 +336,7 @@ impl Turn<'_> {
                 return Ok(TurnEndReason::Completed);
             }
             conv.history.push(Message { role: Role::User, blocks: user_blocks });
+            crate::history::forget_old_tool_images(&mut conv.history);
         }
         self.fail(format!("stopped after {MAX_STEPS} model calls in one turn")).await
     }

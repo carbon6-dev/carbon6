@@ -24,6 +24,8 @@ struct ToolResultView {
     is_error: bool,
     truncated: bool,
     duration_ms: u64,
+    /// The images the tool showed the model.
+    images: Vec<String>,
 }
 
 /// Token usage summed over model calls.
@@ -452,9 +454,17 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         events.with(|evs| {
             evs.iter()
                 .filter_map(|e| match &e.kind {
-                    EventKind::ToolResult { call_id, output, is_error, truncated, duration_ms, .. } => Some((
+                    EventKind::ToolResult { call_id, output, is_error, truncated, duration_ms, images, .. } => Some((
                         call_id.clone(),
-                        ToolResultView { output: output.clone(), is_error: *is_error, truncated: *truncated, duration_ms: *duration_ms },
+                        ToolResultView {
+                            output: output.clone(),
+                            is_error: *is_error,
+                            truncated: *truncated,
+                            duration_ms: *duration_ms,
+                            images: (0..*images)
+                                .map(|i| format!("/api/v1/sessions/{}/attachments/{}/{i}", id.get_value(), e.seq))
+                                .collect(),
+                        },
                     )),
                     _ => None,
                 })
@@ -1454,6 +1464,19 @@ fn ToolCard(
                 })}
             </div>
         </details>
+        // What the tool showed the model, visible without expanding the card.
+        {move || result.get().filter(|r| !r.images.is_empty()).map(|r| view! {
+            <div class="mx-3 mb-2 flex flex-wrap gap-2">
+                {r.images.into_iter().map(|u| {
+                    let href = u.clone();
+                    view! {
+                    <a href=href target="_blank" title="What the model saw">
+                        <img src=u class="max-h-40 rounded border border-zinc-200 dark:border-zinc-700" loading="lazy" />
+                    </a>
+                    }
+                }).collect_view()}
+            </div>
+        })}
         // Live output of a running tool, visible without expanding the card.
         {move || result.with(Option::is_none).then(|| live_output.get()).flatten().map(|o| view! {
             <pre class="mx-3 mb-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{o}</pre>

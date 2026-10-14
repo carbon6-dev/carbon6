@@ -25,14 +25,20 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
                 }
             }
             Some(session_event::Kind::ToolResult(r)) => {
-                push_user_block(&mut msgs, Block::ToolResult { id: r.call_id.clone(), content: r.output.clone(), is_error: r.is_error })
+                push_user_block(&mut msgs, Block::ToolResult { id: r.call_id.clone(), content: r.output.clone(), is_error: r.is_error });
+                let images: Vec<(String, Vec<u8>)> = r.images.iter().map(|a| (a.mime.clone(), a.data.clone())).collect();
+                for b in tool_image_blocks(&r.tool, &images) {
+                    push_user_block(&mut msgs, b);
+                }
             }
             // Simple compaction: the summary replaces everything before it.
             Some(session_event::Kind::Compaction(c)) => msgs = vec![Message::user_text(compacted_context(&c.summary))],
             _ => {}
         }
     }
-    repair_tool_results(msgs)
+    let mut msgs = repair_tool_results(msgs);
+    forget_old_tool_images(&mut msgs);
+    msgs
 }
 
 /// A user message as model blocks: its text, then each attachment (images
@@ -266,6 +272,60 @@ pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
     Some(c6_proto::ContentBlock { block: Some(block) })
 }
 
+/// How a tool's images reach the model: each after a line saying where it
+/// came from.
+pub fn tool_image_blocks(tool: &str, images: &[(String, Vec<u8>)]) -> Vec<Block> {
+    images
+        .iter()
+        .flat_map(|(mime, data)| {
+            [Block::Text(format!("{TOOL_IMAGE}{tool}]")), Block::Image { media_type: mime.clone(), data: data.clone() }]
+        })
+        .collect()
+}
+
+const TOOL_IMAGE: &str = "[image from ";
+
+/// Tool images the model still sees: the latest few. Older ones give way
+/// to a line saying so (images are large, and a review loop makes many).
+pub const KEEP_TOOL_IMAGES: usize = 12;
+
+pub fn forget_old_tool_images(history: &mut [Message]) {
+    let mut seen = 0;
+    for m in history.iter_mut().rev().filter(|m| m.role == Role::User) {
+        let mut after_label = false;
+        for b in m.blocks.iter_mut().rev() {
+            // Walking backwards: an image, then its label.
+            match b {
+                Block::Image { .. } => after_label = true,
+                Block::Text(t) if after_label && t.starts_with(TOOL_IMAGE) => {
+                    after_label = false;
+                    seen += 1;
+                }
+                _ => after_label = false,
+            }
+        }
+        if seen <= KEEP_TOOL_IMAGES {
+            continue;
+        }
+        // Over the limit: drop this message's tool images (oldest first
+        // overall, as we walk back).
+        let mut out = Vec::with_capacity(m.blocks.len());
+        let mut blocks = std::mem::take(&mut m.blocks).into_iter().peekable();
+        while let Some(b) = blocks.next() {
+            if let Block::Text(t) = &b
+                && t.starts_with(TOOL_IMAGE)
+                && matches!(blocks.peek(), Some(Block::Image { .. }))
+            {
+                blocks.next();
+                out.push(Block::Text(format!("{t} (an earlier image, no longer shown)")));
+                continue;
+            }
+            out.push(b);
+        }
+        m.blocks = out;
+    }
+}
+
 fn push_user_block(msgs: &mut Vec<Message>, block: Block) {
     match msgs.last_mut() {
         Some(m) if m.role == Role::User => m.blocks.push(block),
@@ -311,6 +371,26 @@ fn repair_tool_results(msgs: Vec<Message>) -> Vec<Message> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_latest_tool_images_stay() {
+        use c6_llm::{Block, Message, Role};
+        let img = |n: u8| super::tool_image_blocks("browser", &[("image/png".into(), vec![n])]);
+        let mut h: Vec<Message> = (0..super::KEEP_TOOL_IMAGES as u8 + 3)
+            .map(|n| {
+                let mut blocks = vec![Block::ToolResult { id: format!("t{n}"), content: "ok".into(), is_error: false }];
+                blocks.extend(img(n));
+                Message { role: Role::User, blocks }
+            })
+            .collect();
+        // A user's own image is never dropped.
+        h.insert(0, Message { role: Role::User, blocks: vec![Block::Image { media_type: "image/png".into(), data: vec![9] }] });
+        super::forget_old_tool_images(&mut h);
+        let images = h.iter().flat_map(|m| &m.blocks).filter(|b| matches!(b, Block::Image { .. })).count();
+        assert_eq!(images, super::KEEP_TOOL_IMAGES + 1);
+        assert!(matches!(&h[1].blocks[1], Block::Text(t) if t.contains("no longer shown")));
+        assert!(matches!(&h[0].blocks[0], Block::Image { .. }));
+    }
+
     use c6_proto::{AssistantMessage, ContentBlock, ToolResult, ToolUse, UserMessage};
 
     use super::*;

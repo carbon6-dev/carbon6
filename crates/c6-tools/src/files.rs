@@ -26,7 +26,8 @@ impl Tool for Read {
             name: "read".into(),
             description: "Read a text file. Returns lines prefixed with their 1-based line numbers. Reads up to 2000 lines \
                           by default; use offset and limit for large files. Paths are relative to the working directory \
-                          unless absolute. Read a file before editing or overwriting it."
+                          unless absolute. Read a file before editing or overwriting it. An image (PNG, JPEG, GIF, WebP) is \
+                          shown to you as an image: use it to look at a chart, a rendered slide or a screenshot you made."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -58,6 +59,11 @@ impl Tool for Read {
             Ok(b) => b,
             Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
         };
+        // An image: shown, not read as text.
+        if let Some(mime) = image_type(&bytes) {
+            ctx.session.mark_seen(&path).await;
+            return ToolOutput::ok(format!("{} ({mime}, {} KB)", path.display(), bytes.len() / 1024)).with_image(mime, bytes);
+        }
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return ToolOutput::err(format!("{} looks like a binary file", path.display()));
         }
@@ -88,6 +94,21 @@ impl Tool for Read {
             out.push_str(&format!("\n(showing lines {start}-{last} of {total}; use offset/limit to see more)\n"));
         }
         ToolOutput::limited(out, false)
+    }
+}
+
+/// An image's media type, from its first bytes.
+pub fn image_type(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if b.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if b.len() > 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -264,5 +285,21 @@ mod tests {
 
         let r = Write.call(&ctx, json!({"path": "sub/new.txt", "content": "hi\n"})).await;
         assert!(r.content.starts_with("Created"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn read_shows_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 40]].concat();
+        std::fs::write(dir.path().join("slide.png"), &png).unwrap();
+        let r = Read.call(&ctx, json!({"path": "slide.png"})).await;
+        assert!(!r.is_error && r.content.contains("image/png"), "{r:?}");
+        assert_eq!(r.images, vec![("image/png".to_owned(), png)]);
+        std::fs::write(dir.path().join("big.jpg"), [vec![0xff, 0xd8, 0xff], vec![0; crate::MAX_IMAGE_BYTES]].concat()).unwrap();
+        let r = Read.call(&ctx, json!({"path": "big.jpg"})).await;
+        assert!(r.images.is_empty() && r.content.contains("too large to show"), "{}", r.content);
+        std::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2]).unwrap();
+        assert!(Read.call(&ctx, json!({"path": "blob.bin"})).await.content.contains("binary"));
     }
 }

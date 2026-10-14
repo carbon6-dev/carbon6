@@ -228,6 +228,22 @@ impl Mapper {
                         Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
                         _ => String::new(),
                     };
+                    // Images it showed the model (a Read of an image), for the transcript.
+                    let images: Vec<c6_proto::Attachment> = b["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p["type"] == "image" && p["source"]["type"] == "base64")
+                        .filter_map(|p| {
+                            use base64::Engine;
+                            let data = base64::engine::general_purpose::STANDARD.decode(p["source"]["data"].as_str()?).ok()?;
+                            Some(c6_proto::Attachment {
+                                name: "image".into(),
+                                mime: p["source"]["media_type"].as_str().unwrap_or("image/png").into(),
+                                data,
+                            })
+                        })
+                        .collect();
                     sink.append(session_event::Kind::ToolResult(ToolResult {
                         call_id: b["tool_use_id"].as_str().unwrap_or("").into(),
                         tool: String::new(),
@@ -235,6 +251,7 @@ impl Mapper {
                         is_error: b["is_error"].as_bool().unwrap_or(false),
                         truncated: false,
                         duration_ms: 0,
+                        images,
                     }))
                     .await?;
                 }

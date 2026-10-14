@@ -971,6 +971,10 @@ pub enum EventKind {
         is_error: bool,
         truncated: bool,
         duration_ms: u64,
+        /// How many images the tool returned to the model (served like a
+        /// message's attachments, by this event's seq and index).
+        #[serde(default)]
+        images: usize,
     },
     Usage {
         model: String,

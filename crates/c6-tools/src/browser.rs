@@ -120,6 +120,8 @@ pub struct Browser {
     page: String,
     last_used: Instant,
     screenshots: u32,
+    /// The last screenshot, for the model to see.
+    shot: Option<Vec<u8>>,
 }
 
 impl Browser {
@@ -164,7 +166,7 @@ impl Browser {
         let attached = cdp.call(None, "Target.attachToTarget", json!({"targetId": target_id, "flatten": true})).await?;
         let page = attached["sessionId"].as_str().ok_or("no page session")?.to_owned();
         cdp.call(Some(&page), "Page.enable", json!({})).await?;
-        Ok(Self { _child: child, cdp, page, last_used: Instant::now(), screenshots: 0 })
+        Ok(Self { _child: child, cdp, page, last_used: Instant::now(), screenshots: 0, shot: None })
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -377,7 +379,10 @@ impl Tool for BrowserTool {
                           click {ref}. type {ref, text} (replaces what is there; submit: true presses Enter after), or \
                           {ref, secret} to type a secret by name without seeing it. select {ref, value}: pick an option. \
                           press {key}: Enter, Tab, Escape, ArrowDown, …. scroll {direction: down|up}. back. \
-                          screenshot: save an image of the page to the session's Outputs. evaluate {script}: run JavaScript \
+                          screenshot: see the page as an image (selector: just that element, e.g. one slide; full_page: \
+                          the whole page; width and height: set the window size first, e.g. 1280×720; save: true also \
+                          puts it in the session's Outputs for the user). Use it to check how something you made looks. \
+                          evaluate {script}: run JavaScript \
                           in the page and get its JSON value. close. Element numbers change when the page does: read again \
                           after a page changes. Prefer web search and fetching for plain lookups; use the browser for pages \
                           that need JavaScript, signing in, or filling forms."
@@ -392,7 +397,12 @@ impl Tool for BrowserTool {
                 "value": {"type": "string", "description": "select: the option's value or label"},
                 "key": {"type": "string"},
                 "direction": {"type": "string", "enum": ["down", "up"]},
-                "script": {"type": "string"}
+                "script": {"type": "string"},
+                "selector": {"type": "string", "description": "screenshot: a CSS selector; only that element"},
+                "full_page": {"type": "boolean"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer"},
+                "save": {"type": "boolean", "description": "screenshot: also put it in the session's Outputs"}
             }, "required": ["action"], "additionalProperties": false}),
         }
     }
@@ -429,11 +439,21 @@ impl Tool for BrowserTool {
         {
             *slot = None;
         }
+        let shot = b_shot(&mut slot);
         match r {
-            Ok(text) => ToolOutput::limited(secrets.redact(&text), false),
+            Ok(text) => match shot {
+                Some(png) => ToolOutput::limited(secrets.redact(&text), false)
+                    .with_image(if png.starts_with(b"\x89PNG") { "image/png" } else { "image/jpeg" }, png),
+                None => ToolOutput::limited(secrets.redact(&text), false),
+            },
             Err(e) => ToolOutput::err(secrets.redact(&e)),
         }
     }
+}
+
+/// The screenshot the last action took, if any.
+fn b_shot(slot: &mut Option<Browser>) -> Option<Vec<u8>> {
+    slot.as_mut().and_then(|b| b.shot.take())
 }
 
 fn want_ref(input: &Value) -> Result<u64, String> {
@@ -529,22 +549,74 @@ async fn act(b: &mut Browser, ctx: &ToolCtx, action: &str, input: &Value) -> Res
             Ok(format!("Scrolled {}; now at {} of {} pixels.", if dy < 0.0 { "up" } else { "down" }, v["y"], v["h"]))
         }
         "screenshot" => {
-            let sink = ctx.session.publisher().ok_or("Outputs are not available here")?;
-            let shot = b.call("Page.captureScreenshot", json!({"format": "png"})).await?;
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(shot["data"].as_str().unwrap_or(""))
-                .map_err(|e| format!("reading the screenshot: {e}"))?;
-            b.screenshots += 1;
-            let (title, url) = b.location().await;
-            let name = format!("screenshot-{}.png", b.screenshots);
-            let published = crate::Published {
-                name: name.clone(),
-                title: if title.is_empty() { url.clone() } else { title.clone() },
-                mime: "image/png".into(),
-                data,
+            if let (Some(w), Some(h)) = (input["width"].as_u64(), input["height"].as_u64()) {
+                b.call("Emulation.setDeviceMetricsOverride", json!({"width": w, "height": h, "deviceScaleFactor": 1, "mobile": false}))
+                    .await?;
+            }
+            // What to capture: an element, the whole page, or the window.
+            let clip = if let Some(sel) = input["selector"].as_str().filter(|s| !s.trim().is_empty()) {
+                let r = b
+                    .eval(&format!(
+                        "(() => {{ const e = document.querySelector({}); if (!e) return null; e.scrollIntoView(); const r = e.getBoundingClientRect(); \
+                         return {{x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height}}; }})()",
+                        serde_json::to_string(sel).unwrap_or_default()
+                    ))
+                    .await?;
+                if r.is_null() {
+                    return Err(format!("nothing on the page matches {sel}"));
+                }
+                Some(r)
+            } else if input["full_page"].as_bool() == Some(true) {
+                Some(
+                    b.eval("({x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight})")
+                        .await?,
+                )
+            } else {
+                None
             };
-            sink.send(published).map_err(|_| "Outputs are not available here".to_owned())?;
-            Ok(format!("Saved {name} ({url}) to the session's Outputs."))
+            let capture = |format: &str| {
+                let mut p = json!({"format": format, "captureBeyondViewport": clip.is_some()});
+                if format == "jpeg" {
+                    p["quality"] = json!(75);
+                }
+                if let Some(c) = &clip {
+                    p["clip"] = json!({"x": c["x"], "y": c["y"], "width": c["width"], "height": c["height"], "scale": 1});
+                }
+                p
+            };
+            let decode = |v: &Value| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(v["data"].as_str().unwrap_or(""))
+                    .map_err(|e| format!("reading the screenshot: {e}"))
+            };
+            let mut data = decode(&b.call("Page.captureScreenshot", capture("png")).await?)?;
+            let mut mime = "image/png";
+            // Too big to show: the same as JPEG.
+            if data.len() > crate::MAX_IMAGE_BYTES {
+                data = decode(&b.call("Page.captureScreenshot", capture("jpeg")).await?)?;
+                mime = "image/jpeg";
+            }
+            let (title, url) = b.location().await;
+            let mut said = format!(
+                "Screenshot of {}{}.",
+                if title.is_empty() { &url } else { &title },
+                input["selector"].as_str().map(|s| format!(" ({s})")).unwrap_or_default()
+            );
+            if input["save"].as_bool() == Some(true) {
+                let sink = ctx.session.publisher().ok_or("Outputs are not available here")?;
+                b.screenshots += 1;
+                let name = format!("screenshot-{}.{}", b.screenshots, if mime == "image/png" { "png" } else { "jpg" });
+                sink.send(crate::Published {
+                    name: name.clone(),
+                    title: if title.is_empty() { url.clone() } else { title.clone() },
+                    mime: mime.into(),
+                    data: data.clone(),
+                })
+                .map_err(|_| "Outputs are not available here".to_owned())?;
+                said.push_str(&format!(" Saved as {name} in the session's Outputs."));
+            }
+            b.shot = Some(data);
+            Ok(said)
         }
         "evaluate" => {
             let script = input["script"].as_str().filter(|s| !s.trim().is_empty()).ok_or("script is required")?;
@@ -645,7 +717,16 @@ mod tests {
         assert!(next.contains("the page changed") && next.contains("The second page"), "{next}");
         assert!(call(json!({"action": "back"})).await.contains("Welcome"));
 
-        assert!(call(json!({"action": "screenshot"})).await.contains("screenshot-1.png"));
+        // A screenshot is shown to the model; saved to Outputs only when asked.
+        let seen = tool.call(&ctx, json!({"action": "screenshot", "width": 800, "height": 450})).await;
+        assert!(!seen.is_error && seen.images.len() == 1, "{}", seen.content);
+        assert_eq!((seen.images[0].0.as_str(), &seen.images[0].1[1..4]), ("image/png", b"PNG".as_slice()));
+        assert!(pub_rx.try_recv().is_err(), "not saved unless asked");
+        let el = tool.call(&ctx, json!({"action": "screenshot", "selector": "h1"})).await;
+        assert_eq!(el.images.len(), 1, "{}", el.content);
+        let missing = tool.call(&ctx, json!({"action": "screenshot", "selector": "#nope"})).await;
+        assert!(missing.is_error && missing.content.contains("nothing on the page matches"));
+        assert!(call(json!({"action": "screenshot", "save": true})).await.contains("screenshot-1.png"));
         let shot = pub_rx.try_recv().unwrap();
         assert_eq!((shot.mime.as_str(), &shot.data[1..4]), ("image/png", b"PNG".as_slice()));
 
