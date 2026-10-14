@@ -232,7 +232,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
-                    "system" => view! { <Realms /> <Grants /> <Upgrades /> }.into_any(),
+                    "system" => view! { <Realms /> <Apps /> <Grants /> <Upgrades /> }.into_any(),
                     "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
@@ -376,6 +376,103 @@ fn Realms() -> impl IntoView {
                         </div>
                     }
                 }).collect_view())}
+            </div>
+        </section>
+    }
+}
+
+/// Apps (docs/os.md §5): packages of configuration, each in a realm of its
+/// own; install, upgrade and remove wait for your decision.
+#[component]
+fn Apps() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let apps = LocalResource::new(move || {
+        tick.track();
+        crate::api::apps()
+    });
+    let text = RwSignal::new(String::new());
+    // The realm a pasted package upgrades (empty: a new install).
+    let target = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let note = RwSignal::new(None::<String>);
+    let parsed =
+        move || serde_json::from_str::<serde_json::Value>(&text.get_untracked()).map_err(|e| format!("The package is not JSON: {e}"));
+    let plan = move |_| match parsed() {
+        Err(e) => error.set(Some(e)),
+        Ok(p) => spawn_local(async move {
+            match crate::api::plan_app(p).await {
+                Ok(plan) => {
+                    error.set((!plan.problems.is_empty()).then(|| plan.problems.join("; ")));
+                    note.set(Some(plan.plan));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        }),
+    };
+    let go = move |_| match parsed() {
+        Err(e) => error.set(Some(e)),
+        Ok(p) => spawn_local(async move {
+            let t = target.get_untracked();
+            let r = if t.is_empty() { crate::api::install_app(p).await } else { crate::api::upgrade_app(t, p).await };
+            match r {
+                Ok(i) => {
+                    error.set(None);
+                    note.set(Some(format!("Waiting for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
+                    text.set(String::new());
+                    target.set(String::new());
+                    tick.update(|t| *t += 1);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        }),
+    };
+    let load = move |ev: leptos::ev::Event| {
+        use wasm_bindgen::JsCast;
+        let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
+        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
+        spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(file.text()).await {
+                Ok(v) => text.set(v.as_string().unwrap_or_default()),
+                Err(_) => error.set(Some("could not read the file".into())),
+            }
+        });
+    };
+    view! {
+        <section class="space-y-3 pt-4">
+            <h2 class="font-medium">"Apps"</h2>
+            <p class="text-sm text-zinc-500">"An app is a package of configuration (collections, series, triggers, views, skills, templates and more), with no code, installed into a realm of its own. Installing, upgrading and removing each wait for your decision; an upgrade keeps your edits. Export turns any realm into a package you can install again or share."</p>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || note.get().map(|n| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&n)></div> })}
+            {move || apps.get().and_then(Result::ok).map(|list| list.into_iter().map(|a| {
+                let (r1, r2, r3) = (a.realm.clone(), a.realm.clone(), a.realm.clone());
+                view! {
+                    <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
+                        <span class="font-medium">{a.app.clone()}</span>
+                        <span class="text-xs text-zinc-500">{format!("{} · realm {} · {}", a.version, a.realm, a.state)}</span>
+                        <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{a.description.clone()}</span>
+                        <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&r1, false) download=format!("{r1}.json")>"Export"</a>
+                        <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&r1, true) download=format!("{r1}-with-data.json")>"Export with data"</a>
+                        <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| { target.set(r2.clone()); note.set(Some(format!("Paste or load the new version of the app in {r2}, then Upgrade."))); }>"Upgrade…"</button>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                            let r = r3.clone();
+                            spawn_local(async move {
+                                match crate::api::remove_app(r).await {
+                                    Ok(i) => { note.set(Some(format!("Removing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default()))); tick.update(|t| *t += 1); }
+                                    Err(e) => error.set(Some(e)),
+                                }
+                            });
+                        }>"Remove…"</button>
+                    </div>
+                }
+            }).collect_view())}
+            <textarea class=format!("{INPUT} min-h-32 font-mono text-xs") placeholder=r#"{"app": "crm", "version": "1.0.0", "contents": {"collections": [...], "views": [...]}}"#
+                prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
+            <div class="flex flex-wrap items-center gap-2">
+                <input type="file" accept=".json,application/json" class="text-xs" on:change=load />
+                <span class="flex-1"></span>
+                {move || (!target.get().is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("upgrading the app in {}", target.get())}</span> })}
+                <button class=BUTTON_QUIET on:click=plan>"Plan"</button>
+                <button class=BUTTON on:click=go>{move || if target.get().is_empty() { "Install…" } else { "Upgrade…" }}</button>
             </div>
         </section>
     }

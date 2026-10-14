@@ -167,6 +167,10 @@ const AREAS: &[(&str, &str)] = &[
         "collections",
         "Collections: typed tables of records in a realm, for anything apps and agents keep (strict schemas, unique keys, history).",
     ),
+    (
+        "apps",
+        "Apps: packages of configuration (collections, series, triggers, views, skills, templates…) installed into realms of their own; install, upgrade, export, remove.",
+    ),
     ("views", "Views: a realm's configured screens (tables, boards, records, charts, feeds, pages) and their actions."),
     ("series", "Series: numbers over time in a realm (points with dimensions), summarized over windows; thresholds are triggers."),
     ("system", "carbon6 itself: realms, upgrades of its databases, and the backups made before each."),
@@ -251,6 +255,14 @@ fn build() -> Vec<Op> {
     v.extend(list_setting!("settings.channels.get", "settings.channels.put", "notifications", "/api/v1/settings/channels", api::Channel, "Notification channels (push, ntfy, Slack, Discord, webhook, email) and what goes to each."));
     v.extend(list_setting!("settings.prices.get", "settings.prices.put", "usage", "/api/v1/settings/prices", api::Price, "Model prices, for cost estimates."));
     v.extend(list_setting!("settings.budgets.get", "settings.budgets.put", "usage", "/api/v1/settings/budgets", api::Budget, "Budgets: spending limits per period and label, warn or stop."));
+    v.extend([
+        op!("apps.list", "apps", "GET" "/api/v1/apps", Read, Input::None, "Installed apps: each a package of configuration in a realm of its own, with its version and state."),
+        op!("apps.plan", "apps", "POST" "/api/v1/apps/plan", Read, Input::Body(schema::<api::AppPackage>), "What installing a package would create, what it needs, and why it could not go ahead."),
+        op!("apps.install", "apps", "POST" "/api/v1/apps", Write, Input::Body(schema::<api::AppPackage>), "Asks to install a package (JSON: app, version, description, realm, needs {secrets, workers, grants}, contents {collections, series, triggers, memory, records, and settings lists by key: views, skills, agents, commands, hooks, mcp_servers, templates, workflows, policies, routes, prices, budgets}). The user decides; then its realm and contents are created."),
+        op!("apps.upgrade", "apps", "POST" "/api/v1/apps/{realm}/upgrade", Write, Input::Body(schema::<api::AppPackage>), "Asks to upgrade the app in a realm to a new version: the user's edits are kept, and conflicts are theirs to settle.", choices = &[("realm", "apps.list")]),
+        op!("apps.export", "apps", "GET" "/api/v1/apps/export", Read, Input::Query(schema::<crate::api::ExportQuery>), "A realm's configuration as an app package (data: its records too), without secret values."),
+        op!("apps.remove", "apps", "DELETE" "/api/v1/apps/{realm}", Destructive, Input::None, "Asks to remove an app: its realm and everything in it are deleted once the user decides.", choices = &[("realm", "apps.list")]),
+    ]);
     v.extend(list_setting!("settings.views.get", "settings.views.put", "views", "/api/v1/settings/views", api::View, "A realm's views (?realm=), its configured screens: name, title, kind (table, board, record, chart, feed, page), source ({collection, where?, sort?, limit?} for table, board and record; {series, agg?, minutes?, bucket?, group_by?} for chart; {decisions: \"open\"} or {sessions: {labels}} for feed), fields, group_by (a board's column field), columns, body (a page's Markdown; {{view:name}} embeds another view), actions ({label, start: template, set: {field: value}}), menu."));
     v.extend(list_setting!("settings.hosts.get", "settings.hosts.put", "hosts", "/api/v1/settings/hosts", api::Host, "The SSH host inventory: name, target, worker to reach it through, labels."));
     v.extend(list_setting!("settings.workflows.get", "settings.workflows.put", "automation", "/api/v1/settings/workflows", api::Workflow, "Workflows: steps of sessions, approvals and conditions."));

@@ -531,6 +531,25 @@ contents:
 - **Remove:** a destructive decision. It offers an export of the data first, then deletes the realm and everything in it.
 - **Distribution:** packages are files. There's no marketplace.
 
+### 5.2a As built (step 9)
+
+- **Packages are JSON** in the shape of 5.1: `app`, `version`, `description`, `realm` (default: the app's name), and `needs` (secrets, workers, grants).
+  - **`contents`:** `collections`, `series`, `triggers`, `memory`, `records` (to start with, by collection), and any settings list by its key: views, skills, agents, commands, hooks, mcp_servers, templates, workflows, policies, routes, prices, budgets.
+- **Install** (`POST /api/v1/apps`, or Settings → System → Apps: paste or load a file, Plan, Install…):
+  - The plan waits as a decision ("Install" or "Cancel"; cancelling leaves nothing).
+  - Then carbon6 creates the realm (marked with the app), and writes its contents through the head's own API, so every entry is checked as in Settings.
+  - It asks for each grant the app needs, as its own decision.
+  - It opens a follow-up decision listing what's left for you: secrets to set in the realm, a worker to dedicate, and webhook URLs to make.
+- **Export** (`GET /api/v1/apps/export?realm=…[&data=true]`) gives any realm's configuration as a package, with secret names but not values, and the grants it has as needs. With data, it includes its records too.
+- **Upgrade** (`POST /api/v1/apps/{realm}/upgrade`) compares, item by item, the version installed, the realm now, and the new version, all normalized the way Settings stores them.
+  - **Unchanged by you:** what the new version changes is applied.
+  - **Changed by both:** a conflict, listed in the decision. "Upgrade, keeping my edits" or "Upgrade, taking the new version".
+  - **Dropped by the new version:** its triggers and list entries go, and its collections stay with their records.
+- **Remove** (`DELETE /api/v1/apps/{realm}`) is a decision that says what goes and suggests an export first.
+  - **What it deletes:** the realm's sessions (with their events), triggers and runs, workflow runs, decisions, collections and records, series and points, secrets, tokens, the realm, and its memex knowledge.
+  - **What ends or is kept:** its grants end, workers and connections kept to it serve every realm again, and model usage stays in the ledger.
+  - **When it refuses:** while any of its sessions runs.
+
 ### 5.3 Agents writing apps
 
 An agent can draft a package, using the `carbon6_api` reference and a skill that explains the format. Installing it is still your decision (5.2). This is how carbon6 grows new apps without anyone changing carbon6's code.
@@ -885,3 +904,9 @@ Choices the design left open, made while building, for review.
 | 8 | The assistant stays the head's built-in program, not a template on a worker | Its catalog tools run in the head; what makes it configurable is already configuration: its prompt (per realm), its model (Settings → Assistant), and routing by its label |
 | 8 | In a realm, its calls are admitted exactly as that realm's token | One rule for everything that acts in a realm; nothing new to keep in step |
 | 8 | Discovery still lists every operation | Admission refuses what a realm may not do, with a reason the assistant passes on; filtering the catalog per realm can come with apps |
+| 9 | Packages are JSON, not YAML | The head has no YAML parser, and adding one means a new dependency; JSON is what the API and exports speak |
+| 9 | Contents are written through the head's own API | One set of checks for Settings, agents and apps, with nothing duplicated |
+| 9 | An upgrade compares normalized entries | Settings stores entries with defaults filled in; comparing raw package text would see edits that never happened |
+| 9 | Secrets are never part of a package or an install decision | Decisions are stored; secret values go in through Settings → Secrets only |
+| 9 | Removing keeps model usage in the ledger | Spend already happened; budgets and history should still see it |
+| 9 | Two test races fixed on the way (decisions, usage) | They read a result right after a signal that can arrive first; they now wait for the result itself |

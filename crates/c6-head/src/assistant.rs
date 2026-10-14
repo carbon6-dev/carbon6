@@ -57,6 +57,11 @@ impl Assistant {
     pub fn head_id(&self) -> Option<WorkerId> {
         self.head_id.get().copied()
     }
+
+    /// The head's own API, for requests it makes to itself.
+    pub fn router(&self) -> Option<axum::Router> {
+        self.router.get().cloned()
+    }
 }
 
 /// Starts the head's own worker connection (after the router is built).

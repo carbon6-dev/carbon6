@@ -162,6 +162,17 @@ async fn make_head_fixture() {
     )
     .await;
 
+    // An app, installed (the decision answered).
+    let app = post(
+        "apps",
+        json!({"app": "notes", "version": "1.0.0", "description": "Quick notes", "contents": {
+            "collections": [{"name": "notes", "schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}}],
+            "records": {"notes": [{"text": "first"}]},
+            "views": [{"name": "notes", "kind": "table", "source": {"collection": "notes"}}]}}),
+    )
+    .await;
+    post(&format!("decisions/{}/answer", app["decision"]), json!({"option": "Install"})).await;
+
     // A finished session with a tool call (events, usage), labels.
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hello"}"#.into())]));
     mock.push(Reply::Text("Said hello.".into()));
@@ -373,6 +384,11 @@ async fn head_fixtures_upgrade_and_serve() {
         if name.as_str() >= "c6h-v0037.db" {
             let v = get("views").await;
             assert_eq!(v[0]["name"], "candidates", "{name}: {v}");
+        }
+        // Apps (from version 38 on).
+        if name.as_str() >= "c6h-v0038.db" {
+            let a = get("apps").await;
+            assert!(a.as_array().unwrap().iter().any(|x| x["app"] == "notes" && x["state"] == "installed"), "{name}: {a}");
         }
         // Grants (from version 33 on).
         if name.as_str() >= "c6h-v0033.db" {

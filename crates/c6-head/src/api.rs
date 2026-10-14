@@ -143,6 +143,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
+        .route("/api/v1/apps", get(list_apps).post(install_app))
+        .route("/api/v1/apps/plan", post(plan_app))
+        .route("/api/v1/apps/export", get(export_app))
+        .route("/api/v1/apps/{realm}", axum::routing::delete(remove_app))
+        .route("/api/v1/apps/{realm}/upgrade", post(upgrade_app))
         .route("/api/v1/settings/views", get(get_views_setting).put(put_views))
         .route("/api/v1/views", get(list_views))
         .route("/api/v1/views/{name}/act", post(view_act))
@@ -2201,6 +2206,44 @@ async fn update_realm(
 async fn delete_realm(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     crate::realms::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Apps (docs/os.md §5) ----------------------------------------------------
+
+async fn list_apps(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::AppInstall>>> {
+    Ok(Json(crate::apps::list(&st).await?))
+}
+
+async fn plan_app(State(st): State<Arc<HeadState>>, Json(p): Json<api::AppPackage>) -> ApiResult<Json<api::AppPlan>> {
+    Ok(Json(crate::apps::plan_install(&st, &p).await?))
+}
+
+async fn install_app(State(st): State<Arc<HeadState>>, Json(p): Json<api::AppPackage>) -> ApiResult<Json<api::AppInstall>> {
+    Ok(Json(crate::apps::install(&st, &p).await?))
+}
+
+async fn upgrade_app(
+    State(st): State<Arc<HeadState>>,
+    Path(realm): Path<String>,
+    Json(p): Json<api::AppPackage>,
+) -> ApiResult<Json<api::AppInstall>> {
+    Ok(Json(crate::apps::upgrade(&st, &realm, &p).await?))
+}
+
+async fn remove_app(State(st): State<Arc<HeadState>>, Path(realm): Path<String>) -> ApiResult<Json<api::AppInstall>> {
+    Ok(Json(crate::apps::remove(&st, &realm).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ExportQuery {
+    realm: String,
+    /// Its records too.
+    #[serde(default)]
+    data: bool,
+}
+
+async fn export_app(State(st): State<Arc<HeadState>>, Query(q): Query<ExportQuery>) -> ApiResult<Json<api::AppPackage>> {
+    Ok(Json(crate::apps::export(&st, &q.realm, q.data).await?))
 }
 
 // --- Views (docs/os.md §4.5) -------------------------------------------------

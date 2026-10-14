@@ -120,7 +120,7 @@ pub fn list(key: &str) -> Option<&'static List> {
 }
 
 /// An entry's identity, from its key fields.
-fn identity(l: &List, entry: &Value) -> String {
+pub fn identity(l: &List, entry: &Value) -> String {
     l.key_fields.iter().map(|k| entry.get(*k).map(|v| v.to_string()).unwrap_or_default()).collect::<Vec<_>>().join("\u{1f}")
 }
 

@@ -145,6 +145,31 @@ pub async fn delete_realm(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await
 }
 
+pub async fn apps() -> Result<Vec<c6_api::AppInstall>, String> {
+    json(Request::get("/api/v1/apps").send().await).await
+}
+
+pub async fn plan_app(p: serde_json::Value) -> Result<c6_api::AppPlan, String> {
+    send_json(Request::post("/api/v1/apps/plan"), &p).await
+}
+
+pub async fn install_app(p: serde_json::Value) -> Result<c6_api::AppInstall, String> {
+    send_json(Request::post("/api/v1/apps"), &p).await
+}
+
+pub async fn upgrade_app(realm: String, p: serde_json::Value) -> Result<c6_api::AppInstall, String> {
+    send_json(Request::post(&format!("/api/v1/apps/{}/upgrade", enc(&realm))), &p).await
+}
+
+pub async fn remove_app(realm: String) -> Result<c6_api::AppInstall, String> {
+    json(Request::delete(&format!("/api/v1/apps/{}", enc(&realm))).send().await).await
+}
+
+/// Where a realm's package downloads from.
+pub fn export_url(realm: &str, data: bool) -> String {
+    format!("/api/v1/apps/export?realm={}{}", enc(realm), if data { "&data=true" } else { "" })
+}
+
 pub async fn grants() -> Result<Vec<c6_api::Grant>, String> {
     json(Request::get("/api/v1/grants").send().await).await
 }

@@ -207,7 +207,7 @@ pub struct Collection {
 }
 
 /// `POST /api/v1/collections` and `PATCH /api/v1/collections/{name}`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CollectionIn {
     /// Letters, digits, - and _ (creating only).
@@ -285,6 +285,107 @@ pub struct RecordQuery {
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub within: serde_json::Map<String, serde_json::Value>,
+}
+
+/// An app (docs/os.md §5): a package of configuration, with no code,
+/// installed into a realm of its own.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppPackage {
+    /// Its name (lowercase letters, digits and -).
+    pub app: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    /// The realm it installs into; default: its name.
+    #[serde(default)]
+    pub realm: String,
+    #[serde(default)]
+    pub needs: AppNeeds,
+    #[serde(default)]
+    pub contents: AppContents,
+}
+
+/// What an app needs from you: secrets to set, a worker of its own, and
+/// grants from other realms (each asked as a decision).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppNeeds {
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// "any" (default) or "dedicated".
+    #[serde(default)]
+    pub workers: String,
+    #[serde(default)]
+    pub grants: Vec<AppGrant>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppGrant {
+    pub from_realm: String,
+    pub kind: String,
+    pub mode: String,
+    #[serde(default)]
+    pub scope: serde_json::Value,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// An app's contents. Besides these, any settings list by its key (views,
+/// skills, agents, commands, hooks, mcp_servers, templates, workflows,
+/// policies, routes, prices, budgets), as its entries.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppContents {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<CollectionIn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<SeriesIn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<AutomationEdit>,
+    /// Memory notes: {scope, text}.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory: Vec<serde_json::Value>,
+    /// Records to start with, by collection (an export with data has them).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub records: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    #[serde(flatten)]
+    pub lists: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+/// An installed app.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppInstall {
+    pub realm: String,
+    pub app: String,
+    pub version: String,
+    pub description: String,
+    /// installing, installed, upgrading or removing (the last three wait
+    /// for your decision).
+    pub state: String,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+    /// The decision waiting for you, if any.
+    #[serde(default)]
+    pub decision: Option<i64>,
+}
+
+/// What installing or upgrading would do.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppPlan {
+    pub realm: String,
+    /// What it creates, changes or removes (Markdown).
+    pub plan: String,
+    /// Why it cannot go ahead.
+    #[serde(default)]
+    pub problems: Vec<String>,
+    /// Upgrades: entries both you and the new version changed.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 
 /// A view (docs/os.md §4.5): a configured screen of a realm, in its menu.
@@ -371,7 +472,7 @@ pub struct Series {
 }
 
 /// `POST /api/v1/series` and `PATCH /api/v1/series/{name}`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SeriesIn {
     /// Letters, digits and _ (creating only).
@@ -1775,7 +1876,7 @@ pub type Trigger = Automation;
 pub type TriggerEdit = AutomationEdit;
 
 /// `POST /api/v1/automations` (create) and `PATCH /api/v1/automations/{id}`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AutomationEdit {
     #[serde(default)]

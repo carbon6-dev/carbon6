@@ -155,7 +155,15 @@ async fn usage_and_budgets() {
     let s: Session = create(json!(["ops"])).await.json().await.unwrap();
     calls(1).await;
     idle(s.id.clone()).await;
-    let r = report("days=1").await;
+    // The call is recorded with the turn's events (it may trail the idle state).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let r = loop {
+        let r = report("days=1").await;
+        if r.total.calls == 1 || tokio::time::Instant::now() > deadline {
+            break r;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(r.total.calls, 1);
     assert!((r.total.cost - 0.048).abs() < 1e-9, "{}", r.total.cost);
     assert_eq!((r.total.input, r.total.cache_read, r.total.output), (20, 80, 10));

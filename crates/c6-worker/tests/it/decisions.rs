@@ -170,8 +170,11 @@ async fn decisions_answer_what_waits() {
     let s3 = start("set up staging").await;
     let d3 = eventually("the agent's question", async || open().await.into_iter().find(|d| d.title == "Which region for staging?")).await;
     assert!(d3.waiting && d3.kind == "choose" && d3.source == format!("session:{}", s3.id), "{d3:?}");
-    let reply = mock.requests().last().unwrap()["messages"].to_string();
-    assert!(reply.contains(&format!("decision #{} asked; carry on", d3.id)), "{reply}");
+    // The agent heard at once that it was asked (its next request).
+    eventually("the tool's reply", async || {
+        mock.requests().iter().any(|r| r["messages"].to_string().contains(&format!("decision #{} asked; carry on", d3.id))).then_some(())
+    })
+    .await;
     // The phone got it, with a link that answers it.
     let note = eventually("the notification", async || got.lock().unwrap().iter().find(|n| n["event"] == "decision").cloned()).await;
     let link = note["approve_url"].as_str().expect("a link to answer").to_owned();

@@ -299,13 +299,20 @@ pub async fn request(st: &HeadState, session_id: &str, realm: &str, p: &Value) -
         expires_at: None,
         note: p["why"].as_str().unwrap_or_default().to_owned(),
     };
-    let grant = create(st, &g, &format!("session:{session_id}"), "requested").await?;
+    ask(st, &g, &format!("session:{session_id}")).await
+}
+
+/// A grant asked for by `source` (a session, an app): requested, with a
+/// decision for you.
+pub async fn ask(st: &HeadState, g: &api::GrantIn, source: &str) -> anyhow::Result<Value> {
+    let grant = create(st, g, source, "requested").await?;
     let d = api::DecisionIn {
         kind: "approve".into(),
         title: format!("Let realm {} {} {}'s {}?", grant.to_realm, grant.mode, grant.from_realm, describe(&grant)),
         document: format!(
-            "A session in realm **{}** asks for a grant: **{}** of realm **{}**'s {}.\n\n{}\n\nAllowing it lets that data flow into {}; \
+            "{} in realm **{}** asks for a grant: **{}** of realm **{}**'s {}.\n\n{}\n\nAllowing it lets that data flow into {}; \
              every use is logged, and you can revoke it under Settings → System → Grants.",
+            if source.starts_with("app:") { "The app" } else { "A session" },
             grant.to_realm,
             grant.mode,
             grant.from_realm,
@@ -313,8 +320,8 @@ pub async fn request(st: &HeadState, session_id: &str, realm: &str, p: &Value) -
             if grant.note.is_empty() { "(no reason given)".to_owned() } else { format!("Why: {}", grant.note) },
             grant.to_realm
         ),
-        context: json!({"grant": grant.id, "session": session_id}),
-        source: format!("session:{session_id}"),
+        context: json!({"grant": grant.id, "session": source.strip_prefix("session:")}),
+        source: source.to_owned(),
         priority: "high".into(),
         options: vec![
             api::DecisionOption { label: "Allow".into(), does: "The grant is in force.".into() },
@@ -322,7 +329,7 @@ pub async fn request(st: &HeadState, session_id: &str, realm: &str, p: &Value) -
         ],
         ..Default::default()
     };
-    let decision = crate::decisions::open(st, &d, realm, &format!("grant:{}", grant.id)).await?;
+    let decision = crate::decisions::open(st, &d, &grant.to_realm, &format!("grant:{}", grant.id)).await?;
     Ok(json!({"grant": grant.id, "decision": decision.id}))
 }
 
