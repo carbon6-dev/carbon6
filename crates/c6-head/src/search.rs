@@ -256,12 +256,13 @@ fn anchor(session_id: &str, seq: u64, data: &[u8]) -> String {
     }
 }
 
-/// Where a side chat is shown: the top-level session it branches from,
-/// with the side chats to expand on the way down (outermost first).
+/// Where a side chat or subagent is shown: the top-level session it is in,
+/// with the side chats and subagent threads to expand on the way down
+/// (outermost first).
 async fn open_in(store: &Store, row: &crate::store::SessionRow) -> anyhow::Result<Option<api::OpenIn>> {
     let mut chain = Vec::new();
     let mut cur = row.clone();
-    while let (Some(parent), Some(_)) = (cur.parent_id.clone(), cur.fork_seq) {
+    while let Some(parent) = cur.parent_id.clone() {
         chain.push(cur.id.clone());
         match store.session(&parent).await? {
             Some(p) => cur = p,
@@ -281,17 +282,19 @@ async fn open_in(store: &Store, row: &crate::store::SessionRow) -> anyhow::Resul
 /// Matches read for one session (find in session).
 const SESSION_MATCHES: usize = 1000;
 
-/// Every match of `q` in a session and its side chats, in the order the
-/// transcript shows them (a side chat right after the event it branches
-/// from), for stepping through them.
+/// Every match of `q` in a session, its side chats and its subagents, in
+/// the order the transcript shows them (a side chat right after the event
+/// it branches from, a subagent's thread at the call that started it), for
+/// stepping through them.
 pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow::Result<api::SessionMatches> {
     let (expr, terms, ignored) = fts_query(q)?;
-    // The session and its side chats, with each one's place in the page:
-    // its parent's key, then (branch event, 1 = after it, creation time).
+    // The session and everything below it, with each one's place in the
+    // page: its parent's key, then (branch event, 1 = after it, creation
+    // time).
     let rows = sqlx::query(
         "WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL \
-         SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id WHERE s.fork_seq IS NOT NULL) \
-         SELECT s.id, s.parent_id, s.fork_seq, s.created_at FROM sessions s JOIN tree ON s.id = tree.id",
+         SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id) \
+         SELECT s.id, s.parent_id, s.parent_call_id, s.fork_seq, s.created_at FROM sessions s JOIN tree ON s.id = tree.id",
     )
     .bind(session_id)
     .fetch_all(&store.pool)
@@ -299,9 +302,27 @@ pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow
     if rows.is_empty() {
         return Err(crate::not_found("no such session"));
     }
+    // A subagent's place: the event in its parent that started it.
+    let mut spawned_at: HashMap<String, i64> = HashMap::new();
+    let mut read: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &rows {
+        let (Some(parent), Some(_)) = (r.get::<Option<String>, _>("parent_id"), r.get::<Option<String>, _>("parent_call_id")) else { continue };
+        if !read.insert(parent.clone()) {
+            continue;
+        }
+        for e in store.events_after(&parent, 0, i64::MAX).await? {
+            if let Some(session_event::Kind::SubagentSpawned(sp)) = &e.kind {
+                spawned_at.insert(sp.child_session_id.clone(), e.seq as i64);
+            }
+        }
+    }
     let parents: HashMap<String, (Option<String>, i64, i64)> = rows
         .iter()
-        .map(|r| (r.get("id"), (r.get("parent_id"), r.get::<Option<i64>, _>("fork_seq").unwrap_or(0), r.get("created_at"))))
+        .map(|r| {
+            let id: String = r.get("id");
+            let fork = r.get::<Option<i64>, _>("fork_seq").or_else(|| spawned_at.get(&id).copied()).unwrap_or(0);
+            (id, (r.get("parent_id"), fork, r.get("created_at")))
+        })
         .collect();
     // Order key and side chats to open, per session in the tree.
     fn place(id: &str, root: &str, parents: &HashMap<String, (Option<String>, i64, i64)>) -> (Vec<i64>, Vec<String>) {
@@ -344,8 +365,9 @@ pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     // Several entries of one block (or a call and its output) reveal the
     // same element: step through each element once.
+    // (Per session: call ids are only unique within one.)
     let mut seen = std::collections::HashSet::new();
-    let matches = matches.into_iter().map(|(_, m)| m).filter(|m| seen.insert(m.anchor.clone())).collect();
+    let matches = matches.into_iter().map(|(_, m)| m).filter(|m| seen.insert((m.open.last().cloned(), m.anchor.clone()))).collect();
     Ok(api::SessionMatches { matches, terms, ignored, truncated })
 }
 

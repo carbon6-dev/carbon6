@@ -317,12 +317,29 @@ pub async fn send_message(
     switch: Option<(String, String, String)>,
     attachments: Vec<c6_api::AttachmentUpload>,
 ) -> Result<QueuedInput, String> {
+    send_message_waking(id, text, switch, attachments, false).await
+}
+
+/// `wake`: to a subagent, start a turn in its idle parent when its report
+/// comes.
+pub async fn send_message_waking(
+    id: String,
+    text: String,
+    switch: Option<(String, String, String)>,
+    attachments: Vec<c6_api::AttachmentUpload>,
+    wake: bool,
+) -> Result<QueuedInput, String> {
     let (connection_id, model, effort) = match switch {
         Some((c, m, e)) => (Some(c), Some(m), Some(e).filter(|e| !e.is_empty())),
         None => (None, None, None),
     };
-    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, attachments, connection_id, model, effort, wake: false })
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, attachments, connection_id, model, effort, wake })
         .await
+}
+
+/// Continues a subagent whose last turn did not finish.
+pub async fn resume(id: String, wake: bool) -> Result<QueuedInput, String> {
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/resume")), &c6_api::ResumeRequest { wake }).await
 }
 
 pub async fn interrupt(id: String) -> Result<(), String> {
@@ -385,6 +402,11 @@ pub async fn close_terminal(worker: String, id: String) -> Result<(), String> {
 
 pub async fn children(id: String) -> Result<Vec<Session>, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}/children")).send().await).await
+}
+
+/// Everything below a session (side chats and subagents, at any depth).
+pub async fn descendants(id: String) -> Result<Vec<Session>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/children?tree=1")).send().await).await
 }
 
 pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String> {

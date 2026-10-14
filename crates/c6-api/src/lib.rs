@@ -164,6 +164,16 @@ pub struct Session {
     /// How its last turn ended; none before one did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<TurnEndReason>,
+    /// Side chats and subagents: the top-level session of their tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
+    /// In the session list: how many subagents in its tree are working now.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subagents_running: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn home_realm() -> String {
@@ -2808,7 +2818,8 @@ pub struct SearchResult {
 pub struct OpenIn {
     pub session_id: String,
     pub title: String,
-    /// Side chat ids to expand, outermost first; the last is the result's.
+    /// Side chat and subagent ids to expand, outermost first; the last is
+    /// the result's.
     pub side_chats: Vec<String>,
 }
 
@@ -2838,7 +2849,7 @@ pub struct SnippetPart {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionMatches {
-    /// In transcript order, side chats included.
+    /// In transcript order, side chats and subagents included.
     pub matches: Vec<SessionMatch>,
     pub terms: Vec<String>,
     #[serde(default)]
@@ -2851,7 +2862,7 @@ pub struct SessionMatches {
 pub struct SessionMatch {
     /// The transcript element showing it (see `SearchHit::anchor`).
     pub anchor: String,
-    /// Side chats to expand first, outermost first.
+    /// Side chats and subagent threads to expand first, outermost first.
     pub open: Vec<String>,
     pub kind: String,
 }

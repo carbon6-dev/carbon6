@@ -233,7 +233,7 @@ The breadcrumb shows the chain, for example "*main session* › *Find all caller
 
 ## 12. Steps
 
-As built: steps 1–4 on 2026-10-14.
+As built: steps 1–5 on 2026-10-14.
 
 - A background subagent's session is found through `SubagentSpawned.background_task_id`, so `BackgroundTask` gained no field.
 - A reloaded or restored subagent keeps the tools its `SessionStarted` lists, so `Delegation.agent_json` is informational.
@@ -241,7 +241,9 @@ As built: steps 1–4 on 2026-10-14.
 - An agent may message a subagent that has a `SubagentSpawned` in its own log, by session id or background task id.
 - Resume is `POST /sessions/{id}/resume`: it sends the realm's `session.subagent_resume` prompt as a message with `command: "resume"`, and only after a turn that was interrupted, failed or lost.
 - The limits are the head's `subagent-limits` setting (Settings → Agents), sent in each spec as `max_subagent_depth` and `max_running_subagents`. The running limit counts delegations a parent waits on or runs in the background (not your own messages to subagents) per top-level session, on the worker.
-- Tree-wide on the head so far: cost (`usage::cost_of`, and the usage report's per-session rows), archiving, and `GET /sessions/{id}/children?tree=1`. Find in session and search links follow subagents with the UI's threads (step 5). A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
+- Tree-wide on the head: cost (`usage::cost_of`, and the usage report's per-session rows), archiving, `GET /sessions/{id}/children?tree=1`, find in session (a subagent's matches sort at its `SubagentSpawned` event) and search links (`OpenIn.side_chats` lists side chats and subagents to expand).
+- The UI learns that a subagent started or stopped working, without an event in the parent, from `Session.subagents_running` in the live session list (counted per tree by `root_id`); transcripts and the ◆ list refresh their children when it changes. A collapsed thread follows the subagent's stream only while it runs.
+- Threads show the subagent's `SessionStarted` line (its tools and prompt matter for a named agent) and skip nothing else; the peek shows the last three steps. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
 
 1. **Actor-backed subagents.** `Delegation` in `CreateSession`, `SubagentSpawned`, the child built and reloaded as an actor, interrupts cascaded through the actor. Depth limit 1, so visible behavior stays as today. Tested by killing the worker mid-subagent and reloading.
 2. **Partial results.** The digest; foreground and background results for every outcome; recovery writing results for dangling delegations; the corrected `lost` text; the head columns.

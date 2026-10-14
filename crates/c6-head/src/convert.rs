@@ -192,6 +192,8 @@ pub fn session(r: &SessionRow) -> api::Session {
             "worker_restarted" => Some(api::TurnEndReason::WorkerRestarted),
             _ => Some(api::TurnEndReason::Error),
         },
+        root_id: r.root_id.clone(),
+        subagents_running: 0,
     }
 }
 

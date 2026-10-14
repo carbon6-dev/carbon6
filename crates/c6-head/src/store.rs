@@ -512,6 +512,17 @@ impl Store {
             .await?)
     }
 
+    /// Subagents working now, per top-level session.
+    pub async fn subagents_running(&self) -> anyhow::Result<std::collections::HashMap<String, u32>> {
+        let rows = sqlx::query(
+            "SELECT root_id, COUNT(*) AS n FROM sessions WHERE root_id IS NOT NULL AND parent_call_id IS NOT NULL \
+             AND status = 'running' GROUP BY root_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| (r.get::<String, _>("root_id"), r.get::<i64, _>("n") as u32)).collect())
+    }
+
     /// Every session below `id`: its side chats and subagents, theirs, and so
     /// on, oldest first.
     pub async fn descendant_sessions(&self, id: &str) -> anyhow::Result<Vec<SessionRow>> {

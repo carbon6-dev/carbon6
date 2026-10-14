@@ -564,7 +564,14 @@ const SESSION_LIST_LIMIT: i64 = 200;
 const EVENT_PAGE: i64 = 1000;
 
 pub async fn sessions_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Session>> {
-    Ok(st.store.sessions(SESSION_LIST_LIMIT).await?.iter().map(crate::convert::session).collect())
+    let working = st.store.subagents_running().await?;
+    Ok(st
+        .store
+        .sessions(SESSION_LIST_LIMIT)
+        .await?
+        .iter()
+        .map(|r| api::Session { subagents_running: working.get(&r.id).copied().unwrap_or(0), ..crate::convert::session(r) })
+        .collect())
 }
 
 async fn list_sessions(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Session>>> {

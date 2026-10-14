@@ -419,6 +419,20 @@ The agent can start work in the background and carry on: long builds, test suite
 - **Limit.** Notices start at most 20 turns per hour in an idle session. Beyond that they're held until your next message, and the session says so.
 - **Worker restarts.** Tasks die with the worker; the agent is told they were lost, and a command left running by the old worker process is stopped.
 
+### Subagents
+
+The agent can hand work to a subagent with the Task tool. A subagent is a session of its own, shown as a thread under the call that started it (docs/subagents.md).
+
+- **Watching one.** While it works, the thread shows its last few steps live. Click the thread to open its whole conversation, or ↗ to open it in its own column. The session header's **◆** button lists every subagent in the session, at any depth, with its state. Pick one to go to its thread.
+- **Stopping one.** **■ Stop** in its thread ends its turn without stopping the agent that started it. That agent gets a summary of what the subagent did (its last message, the files it changed, its errors). Stopping the main turn stops the subagents it waits on too.
+- **Continuing one.** Its conversation is kept, so it can pick up where it was:
+  - after a stop, a failure or a worker restart, **↻ Resume** sends it the resume prompt (Settings → Prompts);
+  - you can reply to it at any time from its thread;
+  - the agent that started it can send it a message with `SendMessage`, as a follow-up or to steer one running in the background.
+- **Where its report goes.** A report from a turn the agent waited on comes back as the call's result. For a turn you started, the report goes to the agent that started the subagent: at its next step if it's working, or with its next message if it's idle. Tick **Wake the agent that started it** to have it react right away.
+- **Nesting.** Subagents can start subagents of their own. **Settings → Agents → Subagent limits** sets how deep (3 by default) and how many may work at once below one session (16).
+- **Asking about one.** **↳ Ask** works in a subagent's thread too: the side chat sees its conversation and doesn't disturb it.
+
 ### Rewind and edit
 
 Hover one of your messages: **↶ Rewind** takes the conversation back to before it, and **✎ Edit** changes it and sends it again. Either can also restore files: before each turn the worker snapshots the session's folder into a private repository in its state directory (your own git repository, if any, is never touched; folders without git work too; `node_modules/`, `target/` and the like are skipped, as are files your `.gitignore` ignores). Rewound messages stay in the transcript, folded under a marker.

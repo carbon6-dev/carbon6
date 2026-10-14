@@ -619,6 +619,17 @@ async fn subagents_nest() {
     // Five model calls in the tree, counted for the top session.
     let (_, calls) = c6_head::usage::cost_of(&env.head.state, std::slice::from_ref(&id)).await.unwrap();
     assert_eq!(calls, 5);
+    // Search opens the leaf in the top session, through the threads; find
+    // in the top session reaches it, after the call that started it.
+    let found: c6_api::SearchResponse = env.http.get(format!("{}/search?q=leaf%3A%20dug", env.api)).send().await.unwrap().json().await.unwrap();
+    let hit = found.results.iter().find(|r| r.session.id == leaf[0].id).expect("the leaf's match");
+    let open_in = hit.open_in.as_ref().expect("opened in the top session");
+    assert_eq!(open_in.session_id, id);
+    assert_eq!(open_in.side_chats, vec![middle[0].id.clone(), leaf[0].id.clone()]);
+    let m: c6_api::SessionMatches = env.http.get(format!("{}/sessions/{id}/matches?q=dug", env.api)).send().await.unwrap().json().await.unwrap();
+    let opens: Vec<Vec<String>> = m.matches.iter().map(|x| x.open.clone()).collect();
+    assert!(opens.contains(&vec![middle[0].id.clone(), leaf[0].id.clone()]), "{opens:?}");
+    assert_eq!(opens.last().unwrap(), &Vec::<String>::new(), "the parent's own report comes last: {:?}", m.matches);
 
     // A stop runs down the tree.
     env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"middle","prompt":"Again."}"#.into())]));

@@ -385,6 +385,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                         find_open.set(true);
                                     }>"Find"</button>
                                     <crate::tasks::RunningTasks session=id_stored.get_value() events />
+                                    <SubagentsPill session=id_stored.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.clone() />
                                     {move || view! { <StatusPill status=status.get() /> }}
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
                                         spawn_local(async move {
@@ -400,9 +401,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                     "The worker is offline. A running turn continues there and syncs back; queued messages are delivered when it reconnects."
                                 </p>
                             })}
-                            {s.parent_id.clone().map(|p| {
-                                let what = if s.parent_call_id.is_some() { "Subagent session · started by a Task call in " } else { "Side chat · branched from " };
-                                view! { <p class="mb-3 text-sm text-zinc-500">{what}<Go to=View::session(p) class="underline">"its parent session"</Go></p> }
+                            {s.parent_id.clone().map(|p| if s.parent_call_id.is_some() {
+                                view! { <Lineage session=d.session.clone() /> }.into_any()
+                            } else {
+                                view! { <p class="mb-3 text-sm text-zinc-500">"Side chat · branched from "<Go to=View::session(p) class="underline">"its parent session"</Go></p> }.into_any()
                             })}
                         }.into_any()
                     }
@@ -431,16 +433,162 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
         </div>
         </ScrollBox>
-            <Show when=move || tab.get() == "transcript" && !detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some())>
-            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice
-                files=Signal::derive(move || {
+            <Show when=move || tab.get() == "transcript">
+            {move || {
+                // A subagent's reply box can wake the agent that started it.
+                let subagent = detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some());
+                let wake = subagent.then(|| RwSignal::new(false));
+                let files = Signal::derive(move || {
                     // @-completion lists the worker's files: not for SSH sessions.
                     let s = detail.get().and_then(|d| d.ok())?.session;
                     let cwd = started.get()?.0;
                     s.ssh.is_none().then_some((s.worker_id.to_string(), cwd))
-                }) />
+                });
+                match wake {
+                    Some(w) => view! {
+                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error files wake=w />
+                    }.into_any(),
+                    None => view! {
+                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files />
+                    }.into_any(),
+                }
+            }}
             </Show>
         </div>
+    }
+}
+
+/// Where a subagent sits: the sessions above it, each linking to the call
+/// that started the next.
+#[component]
+fn Lineage(session: Session) -> impl IntoView {
+    let chain = LocalResource::new({
+        let session = session.clone();
+        move || {
+            let session = session.clone();
+            async move {
+                // (id, title, the call in it that started the next one).
+                let mut out: Vec<(String, String, String)> = Vec::new();
+                let mut call = session.parent_call_id.clone().unwrap_or_default();
+                let mut up = session.parent_id.clone();
+                while let Some(p) = up.take().filter(|_| out.len() < 12) {
+                    let Ok(d) = api::session(p.clone()).await else { break };
+                    out.push((p, d.session.title.clone(), call.clone()));
+                    call = d.session.parent_call_id.clone().unwrap_or_default();
+                    up = d.session.parent_id.clone().filter(|_| d.session.parent_call_id.is_some());
+                }
+                out.reverse();
+                out
+            }
+        }
+    });
+    let agent = (!session.agent.is_empty()).then(|| format!(" ({})", session.agent));
+    view! {
+        <p class="mb-3 flex flex-wrap items-center gap-1 text-sm text-zinc-500">
+            <span class="font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
+            {agent}
+            <span>"·"</span>
+            {move || chain.get().unwrap_or_default().into_iter().map(|(id, title, call)| {
+                let target = crate::workspace::Target { q: String::new(), anchor: Some(format!("call-{call}")), open: Vec::new() };
+                view! {
+                    <Go to=View::Session { id, target: Some(target) } class="max-w-60 truncate underline">{title}</Go>
+                    <span>"›"</span>
+                }
+            }).collect_view()}
+            <span class="max-w-60 truncate text-zinc-700 dark:text-zinc-300">{session.title.clone()}</span>
+        </p>
+    }
+}
+
+/// The session's subagents at any depth: counts by state, and a list that
+/// goes to each one's thread.
+#[component]
+fn SubagentsPill(session: String, tree: String, events: RwSignal<Vec<Event>>, force_open: ForceOpen, root: String) -> impl IntoView {
+    let session = StoredValue::new(session);
+    let root = StoredValue::new(root);
+    let working = tree_working(tree);
+    let marks = Memo::new(move |_| {
+        events.with(|evs| {
+            evs.iter()
+                .filter(|e| matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. }))
+                .count()
+        })
+    });
+    let tree = LocalResource::new(move || {
+        marks.track();
+        working.track();
+        api::descendants(session.get_value())
+    });
+    let list = Memo::new(move |_| {
+        let all = tree.get().and_then(Result::ok).unwrap_or_default();
+        // Subagents, each with its depth below this session.
+        let parent_of: HashMap<String, Option<String>> = all.iter().map(|s| (s.id.clone(), s.parent_id.clone())).collect();
+        all.into_iter()
+            .filter(|s| s.parent_call_id.is_some())
+            .map(|s| {
+                let mut depth = 0;
+                let mut up = s.parent_id.clone();
+                while let Some(p) = up.filter(|p| *p != session.get_value() && depth < 16) {
+                    depth += 1;
+                    up = parent_of.get(&p).cloned().flatten();
+                }
+                (s, depth)
+            })
+            .collect::<Vec<_>>()
+    });
+    let open = RwSignal::new(false);
+    let go = move |id: String| {
+        // Open the threads on the way down, then the one itself.
+        let mut chain = vec![id.clone()];
+        let rows = list.get_untracked();
+        let mut up = rows.iter().find(|(s, _)| s.id == id).and_then(|(s, _)| s.parent_id.clone());
+        while let Some(p) = up.filter(|p| *p != session.get_value() && chain.len() < 16) {
+            chain.push(p.clone());
+            up = rows.iter().find(|(s, _)| s.id == p).and_then(|(s, _)| s.parent_id.clone());
+        }
+        force_open.0.update(|ids| ids.extend(chain));
+        open.set(false);
+        reveal_when_rendered(root.get_value(), format!("sub-{id}"), "[]".into(), 0);
+    };
+    move || {
+        let rows = list.get();
+        (!rows.is_empty()).then(|| {
+            let count = |want: &str| {
+                rows.iter()
+                    .filter(|(s, _)| subagent_state(s.status == SessionStatus::Running, s.end_reason).0.ends_with(want))
+                    .count()
+            };
+            let mut parts = Vec::new();
+            for (word, n) in [("running", count("running")), ("done", count("done")), ("interrupted", count("interrupted")), ("failed", count("failed")), ("lost", count("lost"))] {
+                if n > 0 {
+                    parts.push(format!("{n} {word}"));
+                }
+            }
+            view! {
+                <div class="relative">
+                    <button class="rounded-md border border-violet-300 bg-violet-50 px-2 py-1 text-xs text-violet-800 hover:bg-violet-100 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-300"
+                        title="Subagents" on:click=move |_| open.update(|o| *o = !*o)>
+                        {format!("◆ {}", parts.join(" · "))}
+                    </button>
+                    {move || open.get().then(|| view! {
+                        <div class="absolute right-0 z-30 mt-1 max-h-96 w-[28rem] max-w-[90vw] space-y-0.5 overflow-auto rounded-md border border-zinc-200 bg-white p-2 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                            {list.get().into_iter().map(|(s, depth)| {
+                                let (pill, tone) = subagent_state(s.status == SessionStatus::Running, s.end_reason);
+                                let id = s.id.clone();
+                                view! {
+                                    <button class="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                        style=format!("padding-left: {}rem", 0.25 + depth as f32 * 1.0) on:click=move |_| go(id.clone())>
+                                        <span class=format!("w-24 shrink-0 {tone}")>{pill}</span>
+                                        <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
+                                        <span class="shrink-0 font-mono text-zinc-500">{s.model.clone()}</span>
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                    })}
+                </div>
+            }
+        })
     }
 }
 
@@ -481,20 +629,32 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         }
     });
 
-    // Child sessions: subagents (linked from their Task calls) and side
-    // chats. Refreshed as tool results arrive and after a side chat starts.
+    // Child sessions: subagents (threads under their calls) and side
+    // chats. Refreshed as subagents start and end, and after a side chat
+    // starts.
     let refresh = RwSignal::new(0u32);
+    let marks = Memo::new(move |_| {
+        events.with(|evs| {
+            evs.iter()
+                .filter(|e| matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. }))
+                .count()
+        })
+    });
+    // And as subagents anywhere in the tree start or stop working (your own
+    // messages to them leave no event here).
+    let working = tree_working(session.root_id.clone().unwrap_or_else(|| session.id.clone()));
     let children = LocalResource::new(move || {
-        results.track();
+        marks.track();
         refresh.track();
+        working.track();
         api::children(id.get_value())
     });
     let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
-    let child_of_call =
-        Memo::new(move |_| child_list.get().into_iter().filter_map(|c| Some((c.parent_call_id?, c.id))).collect::<HashMap<_, _>>());
-    provide_context(ChildLinks(child_of_call));
+    provide_context(Subagents::new(events, child_list));
 
-    let can_branch = session.parent_call_id.is_none();
+    // Side chats branch off any session; subagents are not rewound.
+    let can_branch = true;
+    let can_rewind = session.parent_call_id.is_none();
     // A side chat's setup (prompt, tools) is the parent's: not worth a line.
     let side = session.fork_seq.is_some();
     let asking = RwSignal::new(None::<u64>);
@@ -586,7 +746,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                             }}
                             {anchorable.then(|| view! {
                                 <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
-                                    {move || (is_user && by().is_none()).then(|| view! {
+                                    {move || (can_rewind && is_user && by().is_none()).then(|| view! {
                                         <button class=ubtn title="Change this message and send it again (rewinds to before it)" on:click=move |_| rewinding.set(Some((seq, true)))>"✎ Edit"</button>
                                         <button class=ubtn title="Rewind the conversation (and optionally files) to before this message" on:click=move |_| rewinding.set(Some((seq, false)))>"↶ Rewind"</button>
                                     })}
@@ -1195,8 +1355,17 @@ fn render_event(
             <p class="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400"><span>"↻"</span><span class="whitespace-pre-wrap">{text.clone()}</span></p>
         }
         .into_any(),
-        EventKind::User { text, attachments, command, prompt, blocked, .. } => {
+        EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } => {
             let url = |i: usize| format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq);
+            // In a subagent: who sent it.
+            let from = if !delegated_by.is_empty() {
+                Some("↘ from the agent that started it")
+            } else if command == "resume" {
+                Some("↻ resumed by you")
+            } else {
+                None
+            };
+            let delegated = !delegated_by.is_empty();
             let shown = attachments
                 .iter()
                 .enumerate()
@@ -1221,6 +1390,7 @@ fn render_event(
                 .collect_view();
             view! {
                 <div class="flex flex-col items-end gap-1.5">
+                    {from.map(|f| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{f}</p> })}
                     {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
                     {(!text.is_empty()).then(|| view! {
                         <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text.clone()}</div>
@@ -1230,7 +1400,7 @@ fn render_event(
                     })}
                     {(!prompt.is_empty()).then(|| view! {
                         <details class="max-w-[85%] text-xs text-zinc-500">
-                            <summary class="cursor-pointer select-none text-right">{if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
+                            <summary class="cursor-pointer select-none text-right">{if delegated { "sent with the subagent note".to_owned() } else if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
                             <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
                         </details>
                     })}
@@ -1309,8 +1479,270 @@ fn Thinking(text: String, open: bool) -> impl IntoView {
     }
 }
 
+/// A session's subagents: by the call that started each (from the log's
+/// `SubagentSpawned`, so a thread shows as soon as one starts, else from
+/// the child's row), by background task id, and their rows as last read.
 #[derive(Clone, Copy)]
-struct ChildLinks(Memo<HashMap<String, String>>);
+struct Subagents {
+    by_call: Memo<HashMap<String, String>>,
+    by_task: Memo<HashMap<String, String>>,
+    rows: Memo<HashMap<String, Session>>,
+}
+
+impl Subagents {
+    fn new(events: RwSignal<Vec<Event>>, children: Memo<Vec<Session>>) -> Self {
+        let spawned = Memo::new(move |_| {
+            events.with(|evs| {
+                evs.iter()
+                    .filter_map(|e| match &e.kind {
+                        EventKind::SubagentSpawned { call_id, child_session_id, background_task_id, .. } => {
+                            Some((call_id.clone(), child_session_id.clone(), background_task_id.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        let by_call = Memo::new(move |_| {
+            let mut m: HashMap<String, String> = children.with(|cs| cs.iter().filter_map(|c| Some((c.parent_call_id.clone()?, c.id.clone()))).collect());
+            spawned.with(|sp| m.extend(sp.iter().map(|(call, child, _)| (call.clone(), child.clone()))));
+            m
+        });
+        let by_task = Memo::new(move |_| {
+            spawned.with(|sp| sp.iter().filter(|(_, _, t)| !t.is_empty()).map(|(_, child, t)| (t.clone(), child.clone())).collect())
+        });
+        let rows = Memo::new(move |_| children.with(|cs| cs.iter().filter(|c| c.parent_call_id.is_some()).map(|c| (c.id.clone(), c.clone())).collect()));
+        Self { by_call, by_task, rows }
+    }
+
+    /// A subagent named as a SendMessage call names it: its session id or
+    /// background task id.
+    fn resolve(&self, to: &str) -> Option<String> {
+        if self.by_call.with(|m| m.values().any(|c| c == to)) {
+            return Some(to.to_owned());
+        }
+        self.by_task.with(|m| m.get(to).cloned())
+    }
+}
+
+/// How many subagents work now in the tree of the top-level session `root`
+/// (from the live session list).
+fn tree_working(root: String) -> Memo<u32> {
+    let live = api::live();
+    Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == root).map_or(0, |s| s.subagents_running)))
+}
+
+/// How a subagent stands: (pill, its colors).
+fn subagent_state(running: bool, end: Option<TurnEndReason>) -> (&'static str, &'static str) {
+    match (running, end) {
+        (true, _) => ("● running", "text-blue-600 dark:text-blue-400"),
+        (false, Some(TurnEndReason::Completed)) => ("✓ done", "text-emerald-700 dark:text-emerald-400"),
+        (false, Some(TurnEndReason::Interrupted)) => ("⏸ interrupted", "text-amber-700 dark:text-amber-400"),
+        (false, Some(TurnEndReason::WorkerRestarted)) => ("⚠ lost", "text-amber-700 dark:text-amber-400"),
+        (false, Some(_)) => ("✕ failed", "text-red-600 dark:text-red-400"),
+        (false, None) => ("○ starting", "text-zinc-500"),
+    }
+}
+
+/// Scrolls the element with this id into view.
+fn scroll_to(id: &str) {
+    if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
+        el.scroll_into_view();
+    }
+}
+
+/// A subagent's thread under the call that started it: its state, a live
+/// look at its last steps while it runs, and, opened, its conversation
+/// with Stop, Resume and a reply box. `waiting`: the call still waits on
+/// it. Returns `AnyView` to end the type recursion (threads hold
+/// transcripts that hold threads).
+fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> AnyView {
+    let key = StoredValue::new(format!("c6.sub.{id}"));
+    let saved = storage_get(&key.get_value());
+    let force = use_context::<ForceOpen>();
+    let forced = force.is_some_and(|f| f.0.with_untracked(|ids| ids.contains(&id)));
+    // Opened by you (saved), or for a deep link or the subagents list.
+    let open = RwSignal::new(forced || saved.as_deref() == Some("1"));
+    if let Some(f) = force {
+        let id = id.clone();
+        Effect::new(move || {
+            if f.0.with(|ids| ids.contains(&id)) {
+                open.set(true);
+            }
+        });
+    }
+    let row = {
+        let id = id.clone();
+        Memo::new(move |_| subagents.rows.with(|m| m.get(&id).cloned()))
+    };
+    let toggle = move |_: web_sys::MouseEvent| {
+        open.update(|o| *o = !*o);
+        storage_set(&key.get_value(), if open.get_untracked() { "1" } else { "0" });
+    };
+    // While it runs or is open, its log is followed live.
+    let busy = Signal::derive(move || waiting.get() || row.with(|r| r.as_ref().is_some_and(|r| r.status == SessionStatus::Running)));
+    let live = move || open.get() || busy.get();
+    let sid = StoredValue::new(id.clone());
+    view! {
+        <div id=format!("sub-{id}") class="mt-1 border-l-2 border-violet-300 pl-3 dark:border-violet-800">
+            {move || if live() {
+                view! { <SubagentLive id=sid.get_value() row open toggle=Callback::new(toggle) /> }.into_any()
+            } else {
+                let (pill, tone) = row.with(|r| subagent_state(false, r.as_ref().and_then(|r| r.end_reason)));
+                view! {
+                    <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
+                        <span class="inline-block w-3 shrink-0 text-[9px]">"▶"</span>
+                        <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
+                        {move || row.with(|r| r.as_ref().map(|r| r.agent.clone()).filter(|a| !a.is_empty())).map(|a| view! { <span class="font-mono">{a}</span> })}
+                        <span class=format!("shrink-0 {tone}")>{pill}</span>
+                        <span class="ml-auto shrink-0 font-mono">{move || row.with(|r| r.as_ref().map(|r| r.model.clone()).unwrap_or_default())}</span>
+                    </button>
+                }.into_any()
+            }}
+        </div>
+    }
+    .into_any()
+}
+
+/// A subagent's thread while it is followed: header with its numbers, its
+/// last steps (running, not opened) or its whole conversation (opened).
+#[component]
+fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, toggle: Callback<web_sys::MouseEvent>) -> impl IntoView {
+    let feed = Feed::open(id.clone());
+    let running = Signal::derive(move || feed.running());
+    let error = RwSignal::new(None::<String>);
+    let wake = RwSignal::new(false);
+    let sid = StoredValue::new(id.clone());
+    let end = Memo::new(move |_| {
+        feed.events.with(|evs| {
+            evs.iter().rev().find_map(|e| match &e.kind {
+                EventKind::TurnEnded { reason, .. } => Some(*reason),
+                _ => None,
+            })
+        })
+    });
+    let calls = Memo::new(move |_| feed.events.with(|evs| evs.iter().filter(|e| matches!(e.kind, EventKind::ToolResult { .. })).count()));
+    let now = RwSignal::new(js_sys::Date::now() as i64);
+    let ticker = set_interval_with_handle(move || now.set(js_sys::Date::now() as i64), std::time::Duration::from_secs(1)).ok();
+    on_cleanup(move || {
+        if let Some(t) = ticker {
+            t.clear();
+        }
+    });
+    let usage = Memo::new(move |_| feed.events.with(|evs| UsageStats::from_events(evs)));
+    // Time spent working: its turns, the running one so far.
+    let elapsed = move || {
+        let ms: i64 = usage.with(|u| u.turns.values().map(|t| t.ended.unwrap_or_else(|| now.get()) - t.started).sum());
+        (ms > 0).then(|| duration(ms))
+    };
+    let resumable = move || !running.get() && matches!(end.get(), Some(TurnEndReason::Interrupted | TurnEndReason::Error | TurnEndReason::WorkerRestarted));
+    let stop = move |_| {
+        spawn_local(async move {
+            if let Err(e) = api::interrupt(sid.get_value()).await {
+                error.set(Some(e));
+            }
+        });
+    };
+    let resume = move |_| {
+        spawn_local(async move {
+            match api::resume(sid.get_value(), wake.get_untracked()).await {
+                Ok(_) => error.set(None),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=move |ev| toggle.run(ev)>
+            <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
+            <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
+            {move || row.with(|r| r.as_ref().map(|r| r.agent.clone()).filter(|a| !a.is_empty())).map(|a| view! { <span class="font-mono">{a}</span> })}
+            {move || {
+                let (pill, tone) = subagent_state(running.get(), end.get());
+                view! { <span class=format!("shrink-0 {tone}")>{pill}</span> }
+            }}
+            <span class="shrink-0">{move || {
+                let n = calls.get();
+                let mut parts = vec![format!("{n} call{}", if n == 1 { "" } else { "s" })];
+                parts.extend(elapsed());
+                let t = usage.with(|u| u.total);
+                if t.calls > 0 {
+                    parts.push(format!("{} in · {} out", tokens(t.prompt()), tokens(t.output)));
+                }
+                parts.join(" · ")
+            }}</span>
+            <span class="ml-auto shrink-0 font-mono">{move || row.with(|r| r.as_ref().map(|r| r.model.clone()).unwrap_or_default())}</span>
+            <Go to=View::session(id.clone()) class="shrink-0 text-violet-700 hover:underline dark:text-violet-400" stop=true>"↗"</Go>
+        </button>
+        {move || if open.get() {
+            match row.get() {
+                Some(s) => view! {
+                    <div class="space-y-3 pb-2 pt-1">
+                        <Transcript session=s feed running />
+                        {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                        <div class="flex flex-wrap items-center gap-2">
+                            {move || running.get().then(|| view! {
+                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") title="Stop this subagent's turn (not the agent that started it)" on:click=stop>"■ Stop"</button>
+                            })}
+                            {move || resumable().then(|| view! {
+                                <button class=format!("{BUTTON} text-xs") title="Continue it where it stopped, with the resume prompt (Settings → Prompts)" on:click=resume>"↻ Resume"</button>
+                            })}
+                        </div>
+                        <Composer id=sid.get_value() running disabled=Signal::derive(|| false) error inline=true wake />
+                    </div>
+                }.into_any(),
+                None => view! { <p class="py-1 text-xs text-zinc-500">"Starting…"</p> }.into_any(),
+            }
+        } else {
+            view! { <SubagentPeek events=feed.events streaming=feed.streaming /> }.into_any()
+        }}
+    }
+}
+
+/// A running subagent's last few steps, followed live.
+#[component]
+fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) -> impl IntoView {
+    let lines = Memo::new(move |_| {
+        events.with(|evs| {
+            let mut out: Vec<(&'static str, String)> = Vec::new();
+            for e in evs {
+                match &e.kind {
+                    // From the agent that started it, or from you.
+                    EventKind::User { text, delegated_by, command, .. } if command != "task-notification" && !text.is_empty() => {
+                        out.push((if delegated_by.is_empty() { "✎" } else { "↘" }, text.lines().next().unwrap_or_default().to_owned()));
+                    }
+                    EventKind::Assistant { blocks, .. } => {
+                        for b in blocks {
+                            match b {
+                                ContentBlock::Text { text } if !text.trim().is_empty() => {
+                                    out.push(("", text.trim().lines().next().unwrap_or_default().to_owned()))
+                                }
+                                ContentBlock::ToolUse { name, input_json, .. } => {
+                                    let input = serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
+                                    out.push(("▸", format!("{name} {}", summarize(name, &input))));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    EventKind::Error { message } => out.push(("✕", message.lines().next().unwrap_or_default().to_owned())),
+                    _ => {}
+                }
+            }
+            let skip = out.len().saturating_sub(3);
+            out.split_off(skip)
+        })
+    });
+    view! {
+        <div class="space-y-0.5 pb-1 text-xs text-zinc-500">
+            {move || lines.get().into_iter().map(|(mark, text)| view! {
+                <p class="flex gap-2 truncate"><span class="w-3 shrink-0">{mark}</span><span class="truncate font-mono">{text}</span></p>
+            }).collect_view()}
+            {move || streaming.with(|s| s.text.trim().lines().last().map(str::to_owned)).filter(|t| !t.is_empty()).map(|t| view! {
+                <p class="flex gap-2 truncate italic"><span class="w-3 shrink-0"></span><span class="truncate">{t}</span></p>
+            })}
+        </div>
+    }
+}
 
 /// Normalizes tool names across profiles (Claude, Codex, generic).
 fn tool_kind(name: &str) -> &str {
@@ -1323,6 +1755,7 @@ fn tool_kind(name: &str) -> &str {
         "Glob" => "glob",
         "TodoWrite" | "update_plan" => "plan",
         "Task" => "task",
+        "SendMessage" => "send_message",
         "WebFetch" => "web_fetch",
         "BashOutput" => "bash_output",
         "KillShell" => "kill_shell",
@@ -1356,6 +1789,7 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             s("input").lines().filter_map(|l| l.strip_prefix("*** ").filter(|r| r.contains("File:"))).collect::<Vec<_>>().join(", ")
         }
         "task" => s("description"),
+        "send_message" => s("message").lines().next().unwrap_or("").to_owned(),
         "web_fetch" => s("url"),
         "bash_output" | "kill_shell" => input
             .get("id")
@@ -1414,12 +1848,22 @@ fn ToolCard(
         }
         "apply_patch" => input.get("input").and_then(|v| v.as_str()).map(str::to_owned),
         "task" => input.get("prompt").and_then(|v| v.as_str()).map(str::to_owned),
+        "send_message" => input.get("message").and_then(|v| v.as_str()).map(str::to_owned),
         "read" | "glob" | "grep" | "plan" | "web_fetch" | "bash_output" | "kill_shell" | "load_skill" => None,
         _ => serde_json::to_string_pretty(&input).ok(),
     };
     let plan = (kind == "plan").then(|| plan_items(&input));
-    let child = (kind == "task").then(use_context::<ChildLinks>).flatten();
-    let child_call = call_id.clone();
+    // A Task call's subagent, shown as a thread under the card; the one a
+    // SendMessage call continues.
+    let subagents = use_context::<Subagents>();
+    let thread = (kind == "task").then_some(()).and(subagents).map(|s| {
+        let call = call_id.clone();
+        (s, Memo::new(move |_| s.by_call.with(|m| m.get(&call).cloned())))
+    });
+    let continued = (kind == "send_message").then_some(()).and(subagents).map(|s| {
+        let to = input.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+        Memo::new(move |_| s.resolve(&to))
+    });
     // Where a search hit in this call's output scrolls to.
     let dom_id = format!("call-{call_id}");
     let started_open = plan.is_some();
@@ -1437,8 +1881,12 @@ fn ToolCard(
                 }}
                 <span class="font-mono text-xs font-semibold">{name.clone()}</span>
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
-                {move || child.and_then(|c| c.0.with(|m| m.get(&child_call).cloned())).map(|cid| view! {
-                    <Go to=View::session(cid) class="text-[11px] text-blue-600 hover:underline dark:text-blue-400" stop=true>"open subagent"</Go>
+                {move || continued.and_then(|c| c.get()).map(|cid| {
+                    let target = format!("sub-{cid}");
+                    view! {
+                        <button class="text-[11px] text-violet-700 hover:underline dark:text-violet-400" title="Go to its thread"
+                            on:click=move |ev| { ev.prevent_default(); ev.stop_propagation(); scroll_to(&target); }>"↻ its thread"</button>
+                    }
                 })}
                 {move || result.get().map(|r| view! { <span class="text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
             </summary>
@@ -1480,6 +1928,10 @@ fn ToolCard(
         // Live output of a running tool, visible without expanding the card.
         {move || result.with(Option::is_none).then(|| live_output.get()).flatten().map(|o| view! {
             <pre class="mx-3 mb-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{o}</pre>
+        })}
+        {thread.map(|(s, child)| {
+            let waiting = Signal::derive(move || result.with(Option::is_none));
+            move || child.get().map(|cid| view! { <div class="px-3 pb-2">{subagent_thread(cid, s, waiting)}</div> })
         })}
         </div>
     }
@@ -1568,6 +2020,9 @@ fn Composer(
     /// (worker id, directory): for @-mention completion.
     #[prop(optional, into)]
     files: Option<Signal<Option<(String, String)>>>,
+    /// A subagent's reply box: whether its report should wake its parent.
+    #[prop(optional)]
+    wake: Option<RwSignal<bool>>,
 ) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
@@ -1745,8 +2200,9 @@ fn Composer(
         attachments.set(Vec::new());
         mention.set(None);
         command.set(None);
+        let waking = wake.is_some_and(|w| w.get_untracked());
         spawn_local(async move {
-            if let Err(e) = api::send_message(id.get_value(), t.clone(), switch, uploads.clone()).await {
+            if let Err(e) = api::send_message_waking(id.get_value(), t.clone(), switch, uploads.clone(), waking).await {
                 error.set(Some(e));
                 text.set(t);
                 attachments.set(uploads);
@@ -1845,7 +2301,7 @@ fn Composer(
                         node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if inline { "Reply in this side chat (@ to mention a file, / for commands)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)" }
+                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)" } else if inline { "Reply in this side chat (@ to mention a file, / for commands)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)" }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
@@ -1908,6 +2364,13 @@ fn Composer(
                             m.switch().map(|_| view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> })
                         }}
                     </div>
+                })}
+                {wake.map(|w| view! {
+                    <label class="flex items-center gap-1.5 self-start text-xs text-zinc-500"
+                        title="Its report reaches the agent that started it at that agent's next step if it is working; otherwise with its next message, unless this wakes it now.">
+                        <input type="checkbox" prop:checked=move || w.get() on:change=move |ev| w.set(event_target_checked(&ev)) />
+                        "Wake the agent that started it"
+                    </label>
                 })}
             </div>
         </div>
