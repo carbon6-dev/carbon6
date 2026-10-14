@@ -1478,6 +1478,14 @@ impl Actor {
             applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
         };
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
+        // Claude Code's own subagents are mirrored into sessions of their own.
+        let observer = crate::claude_code::Observer {
+            journal: self.journal.clone(),
+            link: self.link.clone(),
+            session_id: self.writer.session_id.clone(),
+            spec: self.spec.clone(),
+            started: self.started.clone(),
+        };
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             // Secrets for this turn's commands (values only in memory).
@@ -1528,6 +1536,7 @@ impl Actor {
                     preamble.as_deref(),
                     claude_settings.as_deref(),
                     &sink,
+                    Some(&observer),
                     &c,
                 )
                 .await

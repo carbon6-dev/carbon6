@@ -159,6 +159,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         agent: String::new(),
         end_reason: String::new(),
         root_id: None,
+        observed: false,
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     // Context from the memex, for what is known at creation.
@@ -229,6 +230,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         agent: String::new(),
         end_reason: String::new(),
         root_id: None,
+        observed: false,
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
@@ -296,6 +298,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         agent: String::new(),
         end_reason: String::new(),
         root_id: Some(parent.root_id.clone().unwrap_or_else(|| parent.id.clone())),
+        observed: false,
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -644,6 +647,9 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.observed {
+        return Err(bad_request("this is Claude Code's own subagent: it is shown here, and Claude Code runs it"));
+    }
     if let Some(why) = crate::usage::blocked(st, &session.all_labels(), &session.realm).await? {
         return Err(bad_request(format!("not sent: {why}")));
     }
@@ -688,6 +694,9 @@ pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) 
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
     if session.parent_call_id.is_none() {
         return Err(bad_request("only subagents are resumed; send the session a message instead"));
+    }
+    if session.observed {
+        return Err(bad_request("this is Claude Code's own subagent: Claude Code continues it"));
     }
     if !matches!(session.end_reason.as_str(), "interrupted" | "error" | "worker_restarted") || session.status == "running" {
         return Err(bad_request("its last turn finished; send it a message instead"));
@@ -1139,7 +1148,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
 /// Queues a `Restore` and a fresh copy of the rejected input, in that order.
 async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
     let Some(session) = st.store.session(session_id).await? else { return Ok(false) };
-    if session.status == "failed" || session.worker_id != worker_id.to_string() {
+    if session.status == "failed" || session.observed || session.worker_id != worker_id.to_string() {
         return Ok(false);
     }
     let Some((text, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
@@ -1173,6 +1182,7 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
             root_session_id: session.root_id.clone().unwrap_or_else(|| parent.clone()),
             agent_json: String::new(),
             depth,
+            observed: session.observed,
         });
     }
     let restore_id = Uuid::now_v7().to_string();

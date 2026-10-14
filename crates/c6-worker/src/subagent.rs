@@ -132,6 +132,7 @@ impl Subagents for Runner {
                 .map(|a| serde_json::to_string(&AgentJson { name: a.name.clone(), tools: a.tools.clone() }).unwrap_or_default())
                 .unwrap_or_default(),
             depth,
+            observed: false,
         };
         // Subagents start fresh: a side chat's seed is not theirs.
         let spec = CreateSession { seed: Vec::new(), model: model_spec, delegation: Some(delegation), ..p.spec.clone() };

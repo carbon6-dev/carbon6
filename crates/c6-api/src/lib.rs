@@ -170,6 +170,9 @@ pub struct Session {
     /// In the session list: how many subagents in its tree are working now.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub subagents_running: u32,
+    /// A subagent of Claude Code's, mirrored from its stream: read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observed: bool,
 }
 
 fn is_zero(n: &u32) -> bool {

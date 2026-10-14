@@ -435,6 +435,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         </ScrollBox>
             <Show when=move || tab.get() == "transcript">
             {move || {
+                // Claude Code's own subagents take no messages.
+                if detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.observed) {
+                    return ().into_any();
+                }
                 // A subagent's reply box can wake the agent that started it.
                 let subagent = detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.parent_call_id.is_some());
                 let wake = subagent.then(|| RwSignal::new(false));
@@ -1675,6 +1679,13 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
         </button>
         {move || if open.get() {
             match row.get() {
+                // Claude Code's own subagent: shown, not run from here.
+                Some(s) if s.observed => view! {
+                    <div class="space-y-3 pb-2 pt-1">
+                        <Transcript session=s feed running />
+                        <p class="text-xs text-zinc-500">"Claude Code's own subagent: Claude Code runs and continues it."</p>
+                    </div>
+                }.into_any(),
                 Some(s) => view! {
                     <div class="space-y-3 pb-2 pt-1">
                         <Transcript session=s feed running />

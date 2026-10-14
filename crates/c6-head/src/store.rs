@@ -419,6 +419,8 @@ pub struct SessionRow {
     pub end_reason: String,
     /// The top-level session of its tree; `None` for a top-level session.
     pub root_id: Option<String>,
+    /// A subagent of Claude Code's, mirrored from its stream: read-only.
+    pub observed: bool,
 }
 
 impl SessionRow {
@@ -857,7 +859,7 @@ async fn create_subagent_session(
     let now = c6_core::now_ms();
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name, ssh_target, realm, agent, root_id) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target, realm, agent, root_id, observed) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -877,6 +879,8 @@ async fn create_subagent_session(
     .bind(parent.get::<String, _>("realm"))
     .bind(&s.agent)
     .bind(parent.get::<String, _>("root"))
+    // Claude Code's own subagents are mirrored, not run.
+    .bind(s.tool_profile == "claude_code")
     .execute(&mut *tx)
     .await?;
     Ok(true)

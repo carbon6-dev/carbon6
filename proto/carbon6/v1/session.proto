@@ -491,6 +491,8 @@ message Delegation {
   // model, prompt); empty for a general-purpose one.
   string agent_json = 4;
   uint32 depth = 5;
+  // Claude Code's own subagent, mirrored from its stream: shown, never run.
+  bool observed = 6;
 }
 
 message ModelSpec {

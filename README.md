@@ -432,6 +432,7 @@ The agent can hand work to a subagent with the Task tool. A subagent is a sessio
 - **Where its report goes.** A report from a turn the agent waited on comes back as the call's result. For a turn you started, the report goes to the agent that started the subagent: at its next step if it's working, or with its next message if it's idle. Tick **Wake the agent that started it** to have it react right away.
 - **Nesting.** Subagents can start subagents of their own. **Settings → Agents → Subagent limits** sets how deep (3 by default) and how many may work at once below one session (16).
 - **Asking about one.** **↳ Ask** works in a subagent's thread too: the side chat sees its conversation and doesn't disturb it.
+- **Claude Code sessions.** Claude Code's own subagents show as threads too, read-only: Claude Code runs and continues them.
 
 ### Rewind and edit
 

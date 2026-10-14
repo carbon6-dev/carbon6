@@ -233,7 +233,7 @@ The breadcrumb shows the chain, for example "*main session* › *Find all caller
 
 ## 12. Steps
 
-As built: steps 1–5 on 2026-10-14.
+As built: all six steps on 2026-10-14.
 
 - A background subagent's session is found through `SubagentSpawned.background_task_id`, so `BackgroundTask` gained no field.
 - A reloaded or restored subagent keeps the tools its `SessionStarted` lists, so `Delegation.agent_json` is informational.
@@ -243,6 +243,7 @@ As built: steps 1–5 on 2026-10-14.
 - The limits are the head's `subagent-limits` setting (Settings → Agents), sent in each spec as `max_subagent_depth` and `max_running_subagents`. The running limit counts delegations a parent waits on or runs in the background (not your own messages to subagents) per top-level session, on the worker.
 - Tree-wide on the head: cost (`usage::cost_of`, and the usage report's per-session rows), archiving, `GET /sessions/{id}/children?tree=1`, find in session (a subagent's matches sort at its `SubagentSpawned` event) and search links (`OpenIn.side_chats` lists side chats and subagents to expand).
 - The UI learns that a subagent started or stopped working, without an event in the parent, from `Session.subagents_running` in the live session list (counted per tree by `root_id`); transcripts and the ◆ list refresh their children when it changes. A collapsed thread follows the subagent's stream only while it runs.
+- Claude Code's subagents: `claude_code::Mapper` creates a mirror session the first time a message carries a `parent_tool_use_id`, under the session (or mirrored subagent) whose call it is, and logs `SubagentSpawned` there. It records the subagent's task, whole messages (not partial deltas) and tool results, and ends its single turn when the call's result arrives, or as interrupted (or failed) if the process stops first. Its spec has `Delegation.observed`; the head sets `sessions.observed` (migration 0041) from its `claude_code` profile and refuses messages, Resume and restores for it.
 - Threads show the subagent's `SessionStarted` line (its tools and prompt matter for a named agent) and skip nothing else; the peek shows the last three steps. A subagent uses its parent's *live* tool hooks and policies, so calls held for approval wait in the parent as before; `SessionManager` keeps each actor's `SessionTools` for this and loads the parent first when a subagent is loaded after a restart. Secrets go by the root session (`Delegation.root_session_id`), since a new child's row may not be on the head yet.
 
 1. **Actor-backed subagents.** `Delegation` in `CreateSession`, `SubagentSpawned`, the child built and reloaded as an actor, interrupts cascaded through the actor. Depth limit 1, so visible behavior stays as today. Tested by killing the worker mid-subagent and reloading.
