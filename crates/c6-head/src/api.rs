@@ -63,6 +63,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/triggers/{id}/rotate", post(rotate_automation))
         .route("/api/v1/webhooks/{id}/{token}", post(call_webhook))
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
+        .route("/api/v1/settings/subagent-limits", get(get_subagent_limits).put(put_subagent_limits))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
@@ -704,8 +705,22 @@ async fn session_events(
     Ok(Json(events.iter().filter_map(crate::convert::event).collect()))
 }
 
-async fn session_children(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<api::Session>>> {
-    Ok(Json(st.store.child_sessions(&id).await?.iter().map(crate::convert::session).collect()))
+#[derive(serde::Deserialize)]
+struct ChildrenQuery {
+    /// `1` (or `true`): the whole tree below the session, not just its
+    /// children.
+    #[serde(default)]
+    tree: String,
+}
+
+async fn session_children(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ChildrenQuery>,
+) -> ApiResult<Json<Vec<api::Session>>> {
+    let tree = matches!(q.tree.as_str(), "1" | "true");
+    let rows = if tree { st.store.descendant_sessions(&id).await? } else { st.store.child_sessions(&id).await? };
+    Ok(Json(rows.iter().map(crate::convert::session).collect()))
 }
 
 /// MCP servers and skills are stored as validated JSON arrays and included in
@@ -881,6 +896,21 @@ async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api:
         _ => return bad("the provider is brave, tavily or searxng"),
     }
     st.store.set_setting(crate::sessions::WEB_SEARCH, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_subagent_limits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SubagentLimits>> {
+    Ok(Json(crate::sessions::subagent_limits(&st).await?))
+}
+
+async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api::SubagentLimits>) -> ApiResult<StatusCode> {
+    if !(1..=8).contains(&l.max_depth) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the depth is 1 to 8".into()));
+    }
+    if !(1..=64).contains(&l.max_running) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the number running at once is 1 to 64".into()));
+    }
+    st.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &serde_json::to_string(&l).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

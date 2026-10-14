@@ -512,6 +512,19 @@ impl Store {
             .await?)
     }
 
+    /// Every session below `id`: its side chats and subagents, theirs, and so
+    /// on, oldest first.
+    pub async fn descendant_sessions(&self, id: &str) -> anyhow::Result<Vec<SessionRow>> {
+        Ok(sqlx::query_as(
+            "WITH RECURSIVE tree(id) AS (SELECT id FROM sessions WHERE parent_id = ? \
+             UNION SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id) \
+             SELECT * FROM sessions WHERE id IN (SELECT id FROM tree) ORDER BY created_at",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn child_sessions(&self, parent_id: &str) -> anyhow::Result<Vec<SessionRow>> {
         Ok(sqlx::query_as("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at").bind(parent_id).fetch_all(&self.pool).await?)
     }
@@ -624,7 +637,15 @@ impl Store {
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<bool> {
-        let r = sqlx::query("UPDATE sessions SET archived = ? WHERE id = ?").bind(archived as i64).bind(id).execute(&self.pool).await?;
+        // With its side chats and subagents, all the way down.
+        let r = sqlx::query(
+            "WITH RECURSIVE tree(id) AS (SELECT ? UNION SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id) \
+             UPDATE sessions SET archived = ? WHERE id IN (SELECT id FROM tree)",
+        )
+        .bind(id)
+        .bind(archived as i64)
+        .execute(&self.pool)
+        .await?;
         Ok(r.rows_affected() > 0)
     }
 

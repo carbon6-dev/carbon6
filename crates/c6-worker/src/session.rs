@@ -30,6 +30,26 @@ pub struct SessionManager {
     /// The worker's state directory (checkpoint repositories live here).
     state_dir: PathBuf,
     actors: Arc<Mutex<HashMap<String, Handle>>>,
+    /// Delegations running per top-level session (for its limit).
+    working: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// One delegation counted against its tree's limit until dropped.
+pub(crate) struct Working {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+    root: String,
+}
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        let mut c = self.counts.lock().unwrap();
+        if let Some(n) = c.get_mut(&self.root) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                c.remove(&self.root);
+            }
+        }
+    }
 }
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -185,7 +205,7 @@ impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
         prune_browser_profiles(&state_dir.join("browser"), std::time::Duration::from_secs(30 * 24 * 3600));
-        Self { journal, link, worktrees, state_dir, actors: Arc::default() }
+        Self { journal, link, worktrees, state_dir, actors: Arc::default(), working: Arc::default() }
     }
 
     /// Session ids with a live actor.
@@ -195,6 +215,17 @@ impl SessionManager {
 
     pub(crate) fn journal(&self) -> &Arc<Journal> {
         &self.journal
+    }
+
+    /// Counts a delegation in `root`'s tree, if fewer than `max` run.
+    pub(crate) fn working(&self, root: &str, max: usize) -> Option<Working> {
+        let mut c = self.working.lock().unwrap();
+        let n = c.entry(root.to_owned()).or_default();
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(Working { counts: self.working.clone(), root: root.to_owned() })
     }
 
     /// Whether the session's actor is running a turn.

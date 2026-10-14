@@ -1110,6 +1110,37 @@ pub struct SendMessage {
     pub wake: bool,
 }
 
+/// `GET`/`PUT /api/v1/settings/subagent-limits`: how far subagents may go
+/// (docs/subagents.md §7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SubagentLimits {
+    /// How deep subagents nest: 1 lets a session start subagents that start
+    /// none of their own.
+    #[serde(default = "default_subagent_depth")]
+    pub max_depth: u32,
+    /// How many subagents may work at once below one top-level session.
+    #[serde(default = "default_running_subagents")]
+    pub max_running: u32,
+}
+
+pub const DEFAULT_SUBAGENT_DEPTH: u32 = 3;
+pub const DEFAULT_RUNNING_SUBAGENTS: u32 = 16;
+
+fn default_subagent_depth() -> u32 {
+    DEFAULT_SUBAGENT_DEPTH
+}
+
+fn default_running_subagents() -> u32 {
+    DEFAULT_RUNNING_SUBAGENTS
+}
+
+impl Default for SubagentLimits {
+    fn default() -> Self {
+        Self { max_depth: DEFAULT_SUBAGENT_DEPTH, max_running: DEFAULT_RUNNING_SUBAGENTS }
+    }
+}
+
 /// `POST /api/v1/sessions/{id}/resume`: continue a subagent whose turn did
 /// not finish, with the realm's `session.subagent_resume` prompt.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

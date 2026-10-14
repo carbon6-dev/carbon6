@@ -545,7 +545,7 @@ async fn a_lost_subagent_is_restored_from_the_head() {
         EventKind::Started { tools, .. } => tools.clone(),
         _ => panic!(),
     };
-    assert!(!tools.iter().any(|t| t == "task" || t == "send_message"), "{tools:?}");
+    assert!(tools.iter().any(|t| t == "task"), "it may start its own (depth 1 of 3): {tools:?}");
     stop.cancel();
     drop(worker);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -574,4 +574,111 @@ async fn a_lost_subagent_is_restored_from_the_head() {
     b.sort();
     assert_eq!(a, b, "the same tools");
     stop2.cancel();
+}
+
+/// Subagents start subagents: reports go up one level at a time, the tree
+/// is listed and costed as one, and stopping the top stops every level.
+#[tokio::test]
+async fn subagents_nest() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"middle","prompt":"Delegate the digging."}"#.into())]));
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"leaf","prompt":"Dig."}"#.into())])); // middle
+    env.mock.push(Reply::Text("leaf: dug".into())); // leaf
+    env.mock.push(Reply::Text("middle: the leaf dug".into())); // middle
+    env.mock.push(Reply::Text("top: done".into())); // parent
+    let id = env.create(&worker, project.path(), "go").await;
+    let ev = until("parent done", 20, async || {
+        let ev = env.events(&id).await;
+        (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
+    })
+    .await;
+    let out = ev
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolResult { tool, output, .. } if tool == "task" => Some(output.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(out.starts_with("middle: the leaf dug"), "{out}");
+    let middle = env.children(&id).await;
+    assert_eq!(middle.len(), 1);
+    let leaf = env.children(&middle[0].id).await;
+    assert_eq!(leaf.len(), 1);
+    assert_eq!(leaf[0].parent_id.as_deref(), Some(middle[0].id.as_str()));
+    let tree: Vec<Session> = env.http.get(format!("{}/sessions/{id}/children?tree=1", env.api)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(tree.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), vec![middle[0].id.clone(), leaf[0].id.clone()]);
+    match &env.events(&leaf[0].id).await[0].kind {
+        EventKind::Started { tools, .. } => assert!(tools.iter().any(|t| t == "task"), "depth 2 of 3 may delegate: {tools:?}"),
+        _ => panic!(),
+    }
+    // Five model calls in the tree, counted for the top session.
+    let (_, calls) = c6_head::usage::cost_of(&env.head.state, std::slice::from_ref(&id)).await.unwrap();
+    assert_eq!(calls, 5);
+
+    // A stop runs down the tree.
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"middle","prompt":"Again."}"#.into())]));
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"leaf","prompt":"Again."}"#.into())]));
+    let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
+    env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "again"})).send().await.unwrap();
+    let ids = until("three levels working", 15, async || {
+        let tree: Vec<Session> = env.http.get(format!("{}/sessions/{id}/children?tree=1", env.api)).send().await.ok()?.json().await.ok()?;
+        (tree.len() == 4 && tree.iter().all(|s| s.status == SessionStatus::Running || s.end_reason.is_some())
+            && tree[3].status == SessionStatus::Running)
+            .then(|| tree.iter().skip(2).map(|s| s.id.clone()).collect::<Vec<_>>())
+    })
+    .await;
+    env.http.post(format!("{}/sessions/{id}/interrupt", env.api)).send().await.unwrap();
+    for sid in ids.iter().chain([&id]) {
+        until("stopped", 15, async || (turn_end(&env.events(sid).await) == Some(TurnEndReason::Interrupted)).then_some(())).await;
+    }
+    stop.cancel();
+}
+
+/// The subagent-limits setting: depth 1 keeps subagents from starting
+/// their own, and one at a time refuses a second.
+#[tokio::test]
+async fn subagent_limits_apply() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let r = env.http.put(format!("{}/settings/subagent-limits", env.api)).json(&json!({"max_depth": 0, "max_running": 1})).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    let r = env.http.put(format!("{}/settings/subagent-limits", env.api)).json(&json!({"max_depth": 1, "max_running": 1})).send().await.unwrap();
+    assert_eq!(r.status(), 204);
+
+    env.mock.push(Reply::ToolCalls(vec![
+        ("task".into(), r#"{"description":"one","prompt":"One."}"#.into()),
+        ("task".into(), r#"{"description":"two","prompt":"Two."}"#.into()),
+    ]));
+    env.mock.push(Reply::Text("one done".into())); // the one that runs
+    env.mock.push(Reply::Text("Only one ran.".into()));
+    let id = env.create(&worker, project.path(), "go").await;
+    let ev = until("parent done", 20, async || {
+        let ev = env.events(&id).await;
+        (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
+    })
+    .await;
+    let results: Vec<(String, bool)> = ev
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolResult { tool, output, is_error, .. } if tool == "task" => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|(o, e)| *e && o.contains("already working")), "{results:?}");
+    assert!(results.iter().any(|(o, e)| !*e && o.starts_with("one done")), "{results:?}");
+    let child = &env.children(&id).await[0];
+    match &env.events(&child.id).await[0].kind {
+        EventKind::Started { tools, .. } => assert!(!tools.iter().any(|t| t == "task" || t == "send_message"), "{tools:?}"),
+        _ => panic!(),
+    }
+    stop.cancel();
 }

@@ -473,6 +473,11 @@ message CreateSession {
   string prompts_json = 21;
   // Set for a subagent, which the worker creates itself (never the head).
   Delegation delegation = 22;
+  // Subagents (the head's subagent-limits setting): how deep they nest
+  // (the session itself is depth 0) and how many delegations may run at
+  // once in one tree. 0: the defaults (3 and 16).
+  uint32 max_subagent_depth = 23;
+  uint32 max_running_subagents = 24;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

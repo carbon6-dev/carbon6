@@ -17,9 +17,18 @@ use tracing::info;
 use crate::journal::Journal;
 use crate::session::{SessionManager, Writer};
 
-/// How deep subagents may nest: the top-level session is depth 0, so its
-/// subagents (depth 1) cannot start their own.
-const MAX_DEPTH: u32 = 1;
+/// How deep subagents nest (the session itself is depth 0) and how many
+/// delegations may run at once in one tree, unless the spec says.
+fn limits(spec: &CreateSession) -> (u32, usize) {
+    let depth = if spec.max_subagent_depth == 0 { c6_api::DEFAULT_SUBAGENT_DEPTH } else { spec.max_subagent_depth };
+    let running = if spec.max_running_subagents == 0 { c6_api::DEFAULT_RUNNING_SUBAGENTS } else { spec.max_running_subagents };
+    (depth, running as usize)
+}
+
+/// Whether a session at `depth` may start or continue subagents.
+pub(crate) fn may_delegate(spec: &CreateSession, depth: u32) -> bool {
+    depth < limits(spec).0
+}
 
 /// The session a subagent is started from.
 pub struct Parent {
@@ -54,13 +63,13 @@ struct AgentJson {
 
 /// The tools a subagent has, of its parent's: those its named agent
 /// allows, and none that start or continue subagents at the depth limit.
-fn filter_tools(tools: Vec<Arc<dyn Tool>>, agent: Option<&AgentDef>, depth: u32) -> Vec<Arc<dyn Tool>> {
+fn filter_tools(spec: &CreateSession, tools: Vec<Arc<dyn Tool>>, agent: Option<&AgentDef>, depth: u32) -> Vec<Arc<dyn Tool>> {
     tools
         .into_iter()
         .filter(|t| {
             let name = t.spec().name;
             let delegates = Task::is_task(&name) || SendMessage::is_send(&name);
-            !(delegates && depth >= MAX_DEPTH) && agent.is_none_or(|a| a.allows(&name))
+            !(delegates && !may_delegate(spec, depth)) && agent.is_none_or(|a| a.allows(&name))
         })
         .collect()
 }
@@ -80,7 +89,8 @@ impl Subagents for Runner {
         let p = &self.parent;
         let depth = p.spec.delegation.as_ref().map_or(0, |d| d.depth) + 1;
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
-        let tools = filter_tools(self.tools.clone(), agent, depth);
+        let tools = filter_tools(&p.spec, self.tools.clone(), agent, depth);
+        let _working = self.permit(&root)?;
         let mut model = self.cfg.model.clone();
         if !p.spec.subagent_model.trim().is_empty() {
             model = p.spec.subagent_model.trim().to_owned();
@@ -182,6 +192,8 @@ impl Subagents for Runner {
             child.send(crate::session::ActorMsg::Delegate(Box::new(input), None)).map_err(|_| format!("subagent {to} stopped"))?;
             return Ok(None);
         }
+        let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
+        let _working = self.permit(&root)?;
         self.delegate(&child_id, &child, input, cancel).await.map(Some)
     }
 
@@ -206,6 +218,14 @@ impl Subagents for Runner {
 }
 
 impl Runner {
+    /// Counts a delegation against its tree's limit while it runs.
+    fn permit(&self, root: &str) -> Result<crate::session::Working, String> {
+        let max = limits(&self.parent.spec).1;
+        self.parent.manager.working(root, max).ok_or_else(|| {
+            format!("{max} subagents are already working in this session; wait for one to finish (or stop one) before starting another")
+        })
+    }
+
     /// The session id of one of this session's subagents, named by its
     /// session id or background task id (it must have been started here).
     async fn resolve(&self, to: &str) -> Result<String, String> {

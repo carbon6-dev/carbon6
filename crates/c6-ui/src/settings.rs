@@ -115,6 +115,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         fields=AGENT_FIELDS
                         examples=agent_examples
                     />
+                    <SubagentLimitsSetting />
                     <ListSetting
                         name="skills"
                         title="Skills"
@@ -2378,6 +2379,55 @@ fn SecretsSetting() -> impl IntoView {
                 })}
                 {move || editing.get().then(|| view! { <button class=BUTTON_QUIET on:click=move |_| reset()>"Cancel"</button> })}
                 <button class=BUTTON on:click=save>{move || if editing.get() { "Save changes" } else { "Add secret" }}</button>
+            </div>
+        </section>
+    }
+}
+
+/// Settings: how deep subagents nest and how many work at once.
+#[component]
+fn SubagentLimitsSetting() -> impl IntoView {
+    let setting = RwSignal::new(c6_api::SubagentLimits::default());
+    let loaded = LocalResource::new(move || api::get_setting("subagent-limits"));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            setting.set(serde_json::from_value(v).unwrap_or_default());
+        }
+    });
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let save = move |_| {
+        let v = serde_json::to_value(setting.get_untracked()).unwrap_or_default();
+        spawn_local(async move {
+            status.set(Some(api::put_setting("subagent-limits", v).await.map(|_| "Saved. New sessions will use it.")));
+        });
+    };
+    let number = |ev: &leptos::ev::Event| event_target_value(ev).trim().parse::<u32>().unwrap_or(0);
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Subagent limits"</h2>
+                <p class="text-sm text-zinc-500">
+                    "Subagents can start subagents of their own, down to this depth: 1 lets a session start subagents that start none. Below one session, at most this many work at once; one more is refused until another finishes."
+                </p>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Depth (1–8)"</span>
+                    <input type="number" min="1" max="8" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.max_depth.to_string()) on:input=move |ev| setting.update(|s| s.max_depth = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Working at once (1–64)"</span>
+                    <input type="number" min="1" max="64" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.max_running.to_string()) on:input=move |ev| setting.update(|s| s.max_running = number(&ev)) />
+                </label>
+            </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=save>"Save"</button>
             </div>
         </section>
     }

@@ -411,11 +411,11 @@ pub async fn cost_of(st: &HeadState, session_ids: &[String]) -> anyhow::Result<(
     }
     let prices = prices(st).await?;
     let list = serde_json::to_string(session_ids)?;
+    // The sessions, their side chats and subagents, all the way down.
     let rows = sqlx::query(
-        "SELECT u.* FROM usage u JOIN sessions s ON s.id = u.session_id \
-         WHERE s.id IN (SELECT value FROM json_each(?)) OR s.parent_id IN (SELECT value FROM json_each(?))",
+        "WITH RECURSIVE tree(id) AS (SELECT value FROM json_each(?) UNION SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id) \
+         SELECT u.* FROM usage u JOIN tree ON tree.id = u.session_id",
     )
-    .bind(&list)
     .bind(&list)
     .fetch_all(&st.store.pool)
     .await?;
@@ -478,14 +478,15 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String]) -> anyhow::Res
         for l in labels.iter().filter(|l| report_label(l)) {
             row(&mut by_label, l.clone(), l.clone());
         }
-        // Subagents count toward the session that started them.
-        let (root, title) = match &s.parent_id {
-            Some(p) if s.parent_call_id.is_some() => {
-                let title = sessions.get(st, p).await.map(|r| r.title.clone()).unwrap_or_default();
-                (p.clone(), title)
-            }
-            _ => (s.id.clone(), s.title.clone()),
-        };
+        // Subagents count toward the session that started them (at any
+        // depth).
+        let (mut root, mut title, mut up) = (s.id.clone(), s.title.clone(), s.parent_id.clone().filter(|_| s.parent_call_id.is_some()));
+        for _ in 0..16 {
+            let Some(p) = up.take() else { break };
+            let Some(r) = sessions.get(st, &p).await else { break };
+            (root, title) = (r.id.clone(), r.title.clone());
+            up = r.parent_id.clone().filter(|_| r.parent_call_id.is_some());
+        }
         row(&mut by_session, root, title);
     }
     let by_cost = |m: BTreeMap<String, api::UsageRow>, n: usize| {

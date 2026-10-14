@@ -338,6 +338,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
     let memex = st.registry.memex().is_some();
     let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    let limits = subagent_limits(st).await?;
     // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
     let base = crate::prompts::get(st, "session.base", &row.realm).await;
     let base_prompt =
@@ -372,6 +373,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         prompts_json: crate::prompts::for_worker(st, &row.realm).await,
         seed,
         delegation: None,
+        max_subagent_depth: limits.max_depth,
+        max_running_subagents: limits.max_running,
     })
 }
 
@@ -670,6 +673,13 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
     Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None })
+}
+
+/// The subagent-limits setting.
+pub const SUBAGENT_LIMITS: &str = "subagent_limits";
+
+pub async fn subagent_limits(st: &HeadState) -> anyhow::Result<api::SubagentLimits> {
+    Ok(st.store.setting(SUBAGENT_LIMITS).await?.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
 }
 
 /// Continues a subagent whose last turn did not finish, with the realm's
