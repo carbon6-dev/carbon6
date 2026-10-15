@@ -120,14 +120,19 @@ async fn policies_deny_and_ask() {
     eventually("the last step", async || (mock.requests().len() == 3).then_some(())).await;
     let third = mock.requests()[2]["messages"].to_string();
     assert!(third.contains("Not run: you denied it") && !third.contains("dropped-the-db\\n"), "{third}");
-    let evs: Vec<Event> = http.get(format!("{api}/sessions/{}/events", s.id)).send().await.unwrap().json().await.unwrap();
-    let states: Vec<&str> = evs
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::Approval { state, .. } => Some(state.as_str()),
-            _ => None,
-        })
-        .collect();
+    // The denial reaches the head's log with the worker's next sync.
+    let states = eventually("the approvals in the log", async || {
+        let evs: Vec<Event> = http.get(format!("{api}/sessions/{}/events", s.id)).send().await.ok()?.json().await.ok()?;
+        let states: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Approval { state, .. } => Some(state.clone()),
+                _ => None,
+            })
+            .collect();
+        (states.len() >= 4).then_some(states)
+    })
+    .await;
     assert_eq!(states, ["requested", "allowed", "requested", "denied"]);
 
     stop.cancel();
