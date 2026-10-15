@@ -484,10 +484,17 @@ impl Env {
         tools
     }
 
-    /// Waits for your answer to `call_id` (or the turn's end).
-    async fn wait(&self, call_id: &str, cancel: &CancellationToken) -> Option<Reply> {
+    /// Starts listening for your answer to `call_id`. Called before the
+    /// question or approval is written, so an answer given the moment it
+    /// shows (a quick click, a notification's link) is not missed.
+    fn listen(&self, call_id: &str) -> oneshot::Receiver<Reply> {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().unwrap().insert(call_id.to_owned(), tx);
+        rx
+    }
+
+    /// Waits for the answer `listen` started on (or the turn's end).
+    async fn wait(&self, call_id: &str, rx: oneshot::Receiver<Reply>, cancel: &CancellationToken) -> Option<Reply> {
         let r = tokio::select! {
             r = rx => r.ok(),
             _ = cancel.cancelled() => None,
@@ -662,10 +669,12 @@ impl Tool for Call {
                     message: message.clone(),
                 })
             };
+            let rx = self.env.listen(&ctx.call_id);
             if let Err(e) = self.env.sink.append(approval("requested")).await {
+                self.env.waiters.lock().unwrap().remove(&ctx.call_id);
                 return ToolOutput::err(format!("could not ask for approval: {e:#}"));
             }
-            let reply = self.env.wait(&ctx.call_id, &ctx.cancel).await;
+            let reply = self.env.wait(&ctx.call_id, rx, &ctx.cancel).await;
             let allowed = matches!(reply, Some(Reply::Approve(true)));
             let state = match reply {
                 Some(Reply::Approve(true)) => "allowed",
@@ -924,10 +933,12 @@ impl Tool for Ask {
                 answer_json: if answer.is_null() { String::new() } else { answer.to_string() },
             })
         };
+        let rx = self.env.listen(&ctx.call_id);
         if let Err(e) = self.env.sink.append(question("asked", &Value::Null)).await {
+            self.env.waiters.lock().unwrap().remove(&ctx.call_id);
             return ToolOutput::err(format!("could not ask: {e:#}"));
         }
-        match self.env.wait(&ctx.call_id, &ctx.cancel).await {
+        match self.env.wait(&ctx.call_id, rx, &ctx.cancel).await {
             Some(Reply::Answer { values, cancelled: false }) => {
                 let mut for_model = serde_json::Map::new();
                 let mut for_log = serde_json::Map::new();
