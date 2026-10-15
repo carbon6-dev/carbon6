@@ -100,6 +100,7 @@ async fn attachments_and_mentions_reach_the_model() {
     assert_eq!(names, ["shot.png", "log.txt", "notes.md"]);
     let img = http.get(format!("{api}/sessions/{}/attachments/{}/0", s.id, user.seq)).send().await.unwrap();
     assert_eq!(img.headers()["content-type"], "image/png");
+    assert!(img.headers()["content-security-policy"].to_str().unwrap().starts_with("sandbox"), "opened alone, an image cannot act as you");
     assert_eq!(img.bytes().await.unwrap().as_ref(), png);
 
     // Attachments can come with a new session's first message too.

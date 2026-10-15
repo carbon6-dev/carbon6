@@ -110,7 +110,7 @@ impl Memex {
     }
 
     async fn open_in(dir: &Path, link: Arc<HeadLink>, realm: &str) -> anyhow::Result<Arc<Self>> {
-        std::fs::create_dir_all(dir)?;
+        c6_core::create_private_dir(dir)?;
         let store = Store::open(&dir.join("memex.db")).await?;
         Ok(Arc::new(Self {
             realm: realm.to_owned(),

@@ -1,6 +1,6 @@
 # carbon6 as an operating system — Design
 
-Status: design only (2026-10-13). Nothing here is built yet.
+Status: built, steps 0–10 of the build order (section 9), on 2026-10-14. The "As built" sections record what was built and where it differs from the design.
 
 ## 1. Goals
 

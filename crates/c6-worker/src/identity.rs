@@ -54,7 +54,7 @@ impl Identity {
 
     pub fn save(&self, state_dir: &Path) -> anyhow::Result<()> {
         let dir = identity_dir(state_dir);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        c6_core::create_private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         write_file(&dir.join(KEY), &self.key_pem, 0o600)?;
         write_file(&dir.join(CERT), &self.cert_pem, 0o644)?;
         write_file(&dir.join(CA), &self.ca_pem, 0o644)?;

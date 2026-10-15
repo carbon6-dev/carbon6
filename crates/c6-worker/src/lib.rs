@@ -56,7 +56,7 @@ pub struct Worker {
 impl Worker {
     pub async fn open(state_dir: &Path, identity: Identity) -> anyhow::Result<Arc<Self>> {
         c6_llm::install_crypto_provider();
-        std::fs::create_dir_all(state_dir)?;
+        c6_core::create_private_dir(state_dir)?;
         let lock_path = state_dir.join("c6w.lock");
         let lock = std::fs::File::create(&lock_path).with_context(|| format!("creating {}", lock_path.display()))?;
         if lock.try_lock().is_err() {

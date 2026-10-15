@@ -1,6 +1,6 @@
 # Memex — Design
 
-Status: v0.2 (2026-10-11). Step 1 of the build order (section 10) is built; the rest is design. v0.2 added Google accounts, calendar and contacts, and records the decisions in section 11.
+Status: v0.2 (2026-10-11). The whole build order (section 10) is built; the "As built" sections record where it differs. The Google flows and face recognition are tested only against fakes. v0.2 added Google accounts, calendar and contacts, and records the decisions in section 11.
 
 > "A memex is a device in which an individual stores all his books, records, and communications, and which is mechanized so that it may be consulted with exceeding speed and flexibility." (Vannevar Bush, *As We May Think*, 1945)
 

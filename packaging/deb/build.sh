@@ -28,6 +28,7 @@ for pkg in c6h c6w c6m c6; do
     find "$root" -type f -exec chmod 0644 {} +
     install -D -m 0755 "$bin/$pkg" "$root/usr/bin/$pkg"
     strip --strip-debug "$root/usr/bin/$pkg"
+    install -D -m 0644 "$here/copyright" "$root/usr/share/doc/$pkg/copyright"
 
     for f in postinst prerm postrm; do
         [ -f "$src/$f" ] && install -m 0755 "$src/$f" "$root/DEBIAN/$f"

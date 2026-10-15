@@ -1108,9 +1108,20 @@ async fn attachment(State(st): State<Arc<HeadState>>, Path((id, seq, index)): Pa
         _ => None,
     };
     let Some(a) = a else { return Err(ApiErr(StatusCode::NOT_FOUND, "no such attachment".into())) };
-    // Text is served as plain text, never as something a browser would run.
+    // Text is served as plain text, never as something a browser would run;
+    // an image opened on its own (an SVG can hold script) gets an origin of
+    // its own.
     let mime = if a.mime.starts_with("image/") { a.mime } else { "text/plain; charset=utf-8".into() };
-    Ok(([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into())], a.data).into_response())
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".into()),
+            (header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'".into()),
+        ],
+        a.data,
+    )
+        .into_response())
 }
 
 async fn set_session_labels(

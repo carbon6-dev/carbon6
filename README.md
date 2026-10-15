@@ -4,6 +4,8 @@ An AI coding-agent harness for running agents on many machines from one place.
 
 - **`c6h`** (head) runs centrally. It owns all configuration, credentials and session data, and serves the web UI.
 - **`c6w`** (worker) runs headless on each dev machine (macOS or Linux). It attaches to the head and runs agent sessions there.
+- **`c6m`** (memex), optional, is a knowledge store for your sessions, documents, mail and photos, attached to the head like a worker.
+- **`c6`** is the command line, for scripts and terminals.
 
 See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs/architecture.md).
 
@@ -20,7 +22,26 @@ See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs
 - **Offline-tolerant.** Workers journal every event before sending it. Sessions keep running when the head is unreachable and sync back exactly when it returns. A worker that loses its journal has its sessions restored from the head.
 - **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser.
 - **Observability:** the head exports OpenTelemetry GenAI traces over OTLP.
-- **Next: carbon6 as an operating system for agents.** Realms isolate apps from each other, and apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only. This is a design, not built yet: see [docs/os.md](docs/os.md).
+- **An operating system for agents.** Realms isolate apps from each other, and apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only, then installed as packages. See [docs/os.md](docs/os.md) and the examples in [examples/apps](examples/apps).
+
+## Status
+
+carbon6 is version 0.1: a working system its author uses every day, not a finished product.
+
+- **One user per head.** Sign-in, settings and data belong to one person. There are no accounts or roles; realm-scoped API tokens are the only way to give something less than full access.
+- **It may change.** The API, the worker protocol and the configuration can change between 0.x releases. Databases are upgraded on start, with a backup first (see [Upgrades](#upgrades)).
+- **Partly verified.** The Google mail, calendar and contacts sync, and face recognition in the memex, are tested only against fakes so far.
+
+## Security
+
+carbon6 runs agents that execute shell commands as the worker's user, so the head is as sensitive as a shell on every worker.
+
+- **The network:** by default the head binds only loopback, private (RFC 1918, IPv6 ULA) and tailnet addresses, and refuses public ones unless `allow_public_bind = true`. It answers only to its own names (against DNS rebinding) and refuses requests from other sites' pages.
+- **Sign-in** is on by default: passkeys, one-time login links made on the head, and API tokens. Outside a tailnet or `localhost`, turn on HTTPS (`ui_tls_head_ca = true`); the head warns at start when it serves plain HTTP on a LAN address.
+- **Workers** enroll with a one-time token that pins the head's CA, then connect out to the head with mutual TLS. They don't listen on any port.
+- **Secrets** (API keys, OAuth tokens, your secret store) are encrypted in the head's database under `master.key`. State directories are readable only by their owner.
+- **Agent pages and attachments** are served sandboxed, so content an agent produces can't act as you in the UI.
+- **Reporting a vulnerability:** please use GitHub's private vulnerability reporting on this repository rather than a public issue.
 
 ## Build
 
@@ -518,3 +539,7 @@ make dev-login-link               # a one-time link to sign in to the dev UI
 
 - For UI work, `cd crates/c6-ui && trunk serve` proxies `/api` to the dev head.
 - Evals: see [evals/README.md](evals/README.md).
+
+## License
+
+carbon6 is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in carbon6, as defined in the Apache-2.0 license, is dual licensed as above, without any additional terms or conditions.

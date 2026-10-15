@@ -165,7 +165,7 @@ impl Head {
 pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;
-    std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
+    c6_core::create_private_dir(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
 
     let ui_listeners = bind_all(&ips, cfg.ui_port).await.context("binding UI port")?;
     let worker_listeners = bind_all(&ips, cfg.worker_port).await.context("binding worker port")?;
@@ -302,6 +302,16 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         }
     };
 
+    if ui_tls.is_none()
+        && let Some(a) = ui_addrs.iter().find(|a| !config::is_loopback_or_tailnet(&a.ip()))
+    {
+        tracing::warn!(
+            addr = %a,
+            "the web UI is plain HTTP on {}, so sign-in links and session cookies cross that network unencrypted; \
+             set ui_tls_head_ca = true (or ui_tls_cert and ui_tls_key) in c6h.toml",
+            a.ip()
+        );
+    }
     let _ = state.ui_urls.set(ui_urls.clone());
     info!(ui = ?ui_urls, worker = ?worker_addrs, worker_url = %state.worker_url, auth = cfg.auth, "head started");
     Ok(Head { state, ui_addrs, worker_addrs, ui_urls, shutdown, tasks })
@@ -352,7 +362,7 @@ pub async fn create_enrollment(
 /// A one-time login link, made without the head running (or beside it):
 /// one URL per way to reach the UI.
 pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
+    c6_core::create_private_dir(&cfg.data_dir)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
     let token = store.create_login_link().await?;
     let port = cfg.ui_port;
@@ -371,7 +381,7 @@ pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> 
 
 /// A new API token, minted on the head machine (`c6h api-token`).
 pub async fn offline_api_token(cfg: HeadConfig, name: &str, realm: Option<&str>) -> anyhow::Result<String> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
+    c6_core::create_private_dir(&cfg.data_dir)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
     if let Some(r) = realm {
         anyhow::ensure!(r != realms::ROOT, "a token for root is one with no realm: leave --realm out");
@@ -388,7 +398,7 @@ pub async fn offline_enrollment(mut cfg: HeadConfig, name: Option<&str>) -> anyh
     let worker_addrs = config::reachable_addrs(&worker_addrs)?;
     let ips: Vec<IpAddr> = worker_addrs.iter().map(|a| a.ip()).collect();
     let (worker_url, cert_ips, dns_names) = endpoint_names(&cfg, &ips, &worker_addrs)?;
-    std::fs::create_dir_all(&cfg.data_dir)?;
+    c6_core::create_private_dir(&cfg.data_dir)?;
     let pki = pki::Pki::load_or_create(&cfg.data_dir.join("pki"), &cert_ips, &dns_names)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
     create_enrollment(&store, pki.ca_sha256(), &worker_url, name).await

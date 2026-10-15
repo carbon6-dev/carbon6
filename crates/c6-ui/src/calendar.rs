@@ -233,7 +233,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
                 <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Close"</button>
             </div>
             {move || error.get().map(|x| view! { <ErrorBox message=x /> })}
-            {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=e.conference.clone() target="_blank" rel="noopener">"Join the call ↗"</a> })}
+            {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.conference) target="_blank" rel="noopener">"Join the call ↗"</a> })}
             {(!e.description.is_empty()).then(|| view! { <pre class="max-h-48 overflow-auto whitespace-pre-wrap font-sans text-sm">{e.description.clone()}</pre> })}
             {(!e.attendees.is_empty()).then(|| view! {
                 <ul class="text-sm">
@@ -258,7 +258,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
                     </select>
                 })}
                 <button class="text-xs text-red-600 hover:underline" on:click=delete>"Delete"</button>
-                {(!e.html_link.is_empty()).then(|| view! { <a class="text-xs text-sky-700 hover:underline dark:text-sky-400" href=e.html_link.clone() target="_blank" rel="noopener">"Open in Google ↗"</a> })}
+                {(!e.html_link.is_empty()).then(|| view! { <a class="text-xs text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.html_link) target="_blank" rel="noopener">"Open in Google ↗"</a> })}
             </div>
         </section>
     }

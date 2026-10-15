@@ -24,8 +24,8 @@ pub struct HeadConfig {
     pub advertise_host: Option<String>,
     /// Extra DNS names for the head's server certificate (e.g. MagicDNS names).
     pub extra_names: Vec<String>,
-    /// Permit binding non-private addresses. The head has no login; only set
-    /// this if something else controls access.
+    /// Permit binding non-private addresses (all interfaces, or a public
+    /// one). Sign-in still protects the UI, but use HTTPS (`ui_tls_*`) there.
     pub allow_public_bind: bool,
     /// OTLP/HTTP endpoint for traces (e.g. `http://127.0.0.1:4318`); falls
     /// back to `OTEL_EXPORTER_OTLP_ENDPOINT`.
@@ -185,6 +185,15 @@ pub fn is_private(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || is_cgnat_v4(v4),
         IpAddr::V6(v6) => v6.is_loopback() || is_ula(v6),
+    }
+}
+
+/// Loopback, or a tailnet address (Tailscale's CGNAT range and its IPv6
+/// prefix), where traffic is already encrypted.
+pub fn is_loopback_or_tailnet(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || is_cgnat_v4(v4),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 

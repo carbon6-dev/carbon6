@@ -1,6 +1,7 @@
 //! Types shared by the head and workers.
 
 use std::fmt;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,21 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// Creates `dir` (and its parents) if needed and makes it private to this
+/// user (0700 on Unix): state directories hold databases, transcripts and
+/// keys.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 /// Host facts reported by a worker.
 pub fn host_os() -> &'static str {
     std::env::consts::OS
@@ -99,5 +115,22 @@ mod tests {
     fn protocol_window() {
         assert!(protocol_compatible(PROTOCOL_VERSION));
         assert!(!protocol_compatible(PROTOCOL_VERSION + 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let new = tmp.path().join("a/b");
+        create_private_dir(&new).unwrap();
+        assert_eq!(mode(&new), 0o700);
+        // An existing, looser one is tightened.
+        let old = tmp.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&old).unwrap();
+        assert_eq!(mode(&old), 0o700);
     }
 }

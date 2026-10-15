@@ -4,7 +4,7 @@ class C6 < Formula
   url "@URL@"
   version "@VERSION@"
   sha256 "@SHA256@"
-  license "Apache-2.0"
+  license any_of: ["MIT", "Apache-2.0"]
 
   bottle do
     root_url "@ROOT_URL@"

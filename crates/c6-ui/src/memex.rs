@@ -331,7 +331,7 @@ fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
                 {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-zinc-400">{m.clone()}</span> }).collect_view()}
                 <span class="flex-1"></span>
                 {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session ↗"</Go> })}
-                {h.url.clone().map(|u| view! { <a href=u.clone() target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page ↗"</a> })}
+                {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page ↗"</a> })}
             </div>
             <p class="text-sm text-zinc-600 dark:text-zinc-400">{h.snippet.clone()}</p>
         </div>

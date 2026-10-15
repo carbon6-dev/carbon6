@@ -2,6 +2,7 @@
 name = "c6-api"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 schemars = { version = "1.2.2", optional = true, features = ["uuid1"] }
