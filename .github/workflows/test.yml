@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
-      - name: Every target builds without warnings (and the web UI for wasm)
+      - name: Every target builds and passes clippy without warnings (and the web UI for wasm)
         run: make check
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test

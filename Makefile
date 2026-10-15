@@ -142,12 +142,12 @@ build: ui ## Build release binaries (c6h, c6w, c6) into target/release
 test: ## Run the test suite
 	cargo test
 
-check: ## Build every target (libraries, binaries, tests, examples; the web UI for wasm) and fail on any warning
-	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
-		if cargo build --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
-			echo "check: warnings or errors in cargo build $$args" >&2; exit 1; \
+check: ## Build and clippy every target (libraries, binaries, tests, examples; the web UI for wasm) and fail on any warning
+	@for cmd in build clippy; do for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
+		if cargo $$cmd --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
+			echo "check: warnings or errors in cargo $$cmd $$args" >&2; exit 1; \
 		fi; \
-	done; echo "check: no warnings"
+	done; done; echo "check: no warnings"
 
 dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml; state in the standard data directory)
 	cargo run -p c6h -- --config dev/c6h.toml

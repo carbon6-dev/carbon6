@@ -1,5 +1,5 @@
 name: Rust toolchain
-description: The Rust version docker/Dockerfile pins (RUST_VERSION), with the wasm32 target, and optionally Trunk (TRUNK_VERSION) for the web UI.
+description: The Rust version docker/Dockerfile pins (RUST_VERSION), with clippy and the wasm32 target, and optionally Trunk (TRUNK_VERSION) for the web UI.
 inputs:
   trunk:
     description: Also install Trunk, to build the web UI.
@@ -11,7 +11,7 @@ runs:
       shell: bash
       run: |
         rust=$(sed -n 's/^ARG RUST_VERSION=//p' docker/Dockerfile)
-        rustup toolchain install "$rust" --profile minimal --target wasm32-unknown-unknown
+        rustup toolchain install "$rust" --profile minimal --component clippy --target wasm32-unknown-unknown
         rustup default "$rust"
         rustc --version
     - name: Trunk
