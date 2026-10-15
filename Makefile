@@ -70,15 +70,17 @@ docker-login-link: ## Print a one-time web UI login link from the running head c
 
 ##@ Ubuntu packages (Docker only)
 
-docker-deb: ## Build c6h, c6w and c6m .deb packages (systemd units included) for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=24.04)
+docker-deb: ## Build .deb packages of c6h, c6w and c6m (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=24.04)
+	rm -rf $(DEB_DIR)
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
 	@ls -l $(DEB_DIR)
 
 docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubuntu-<UBUNTU>/ (the other arch is emulated: slow)
+	rm -rf $(DEB_DIR)
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
 	@ls -l $(DEB_DIR)
 
-docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, upgrade, remove
+docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, c6 sees the worker, upgrade, remove
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU) .
 	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU) $(DEB_DIR)
 

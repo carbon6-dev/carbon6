@@ -7,8 +7,8 @@
 #   test       runs the test suite
 #   c6h        runtime image for the head
 #   c6w        runtime image for a worker (it works on files in the container)
-#   debs       .deb packages of c6h, c6w and c6m with systemd units, built on
-#              ubuntu:${UBUNTU} (use with --output)
+#   debs       .deb packages of c6h, c6w and c6m with systemd units, and c6,
+#              built on ubuntu:${UBUNTU} (use with --output)
 #   deb-host   Ubuntu with systemd as PID 1, to try the packages in
 
 ARG RUST_VERSION=1.97
@@ -85,8 +85,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=c6-deb-target-${UBUNTU}-${TARGETARCH},target=/src/target \
     --mount=type=cache,target=/root/.cache/trunk \
     cd crates/c6-ui && trunk build --release && cd /src \
- && cargo build --release --locked -p c6h -p c6w -p c6m \
- && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6m /out/
+ && cargo build --release --locked -p c6h -p c6w -p c6m -p c6 \
+ && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6m target/release/c6 /out/
 ARG DEB_VERSION=0.1.0
 ARG MAINTAINER
 RUN MAINTAINER="${MAINTAINER}" packaging/deb/build.sh /out "${DEB_VERSION}" /debs

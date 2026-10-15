@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Builds the c6h, c6w and c6m .deb packages with their systemd units. Runs on
-# Debian/Ubuntu with dpkg-dev and binutils (the docker-deb build stage).
+# Builds the c6h, c6w and c6m .deb packages with their systemd units, and c6
+# (the CLI). Runs on Debian/Ubuntu with dpkg-dev and binutils (the docker-deb
+# build stage).
 #
-#   build.sh <dir with c6h, c6w and c6m> <version> <output dir>
+#   build.sh <dir with c6h, c6w, c6m and c6> <version> <output dir>
 #
-# Each package is <pkg>/root (files as installed) plus <pkg>/control, whose
+# Each package is its binary, <pkg>/root (other files as installed, if any)
+# and <pkg>/control, whose
 # @VERSION@, @ARCH@, @MAINTAINER@, @SIZE@ and @SHLIBS@ are filled in here, and
 # its maintainer scripts and conffiles. MAINTAINER defaults to "carbon6".
 set -euo pipefail
@@ -17,11 +19,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$out"
 
-for pkg in c6h c6w c6m; do
+for pkg in c6h c6w c6m c6; do
     src=$here/$pkg
     root=$work/$pkg
     mkdir -p "$root/DEBIAN"
-    cp -R "$src/root/." "$root/"
+    [ -d "$src/root" ] && cp -R "$src/root/." "$root/"
     find "$root" -type d -exec chmod 0755 {} +
     find "$root" -type f -exec chmod 0644 {} +
     install -D -m 0755 "$bin/$pkg" "$root/usr/bin/$pkg"

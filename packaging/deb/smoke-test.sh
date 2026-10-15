@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tries the .deb packages in a fresh Ubuntu container with systemd as PID 1:
 # installs them, checks the head serves, enrolls a worker (c6w@<user>) and the
-# memex, upgrades over them, then removes them.
+# memex, checks c6 (the CLI) sees the worker, upgrades over them, then removes them.
 #
 #   smoke-test.sh <image with systemd (the deb-host stage)> <dir with the .debs>
 set -euo pipefail
@@ -50,6 +50,12 @@ run "sudo -u c6m c6m --state-dir /var/lib/c6m enroll $(token memex)"
 run 'systemctl enable --now c6m'
 until_ok 'journalctl -u c6m | grep -q "attached to head"' "c6m did not attach to the head"
 
+step "CLI"
+api_token=$(run 'sudo -u c6h c6h --config /etc/c6h/c6h.toml api-token smoke-test')
+run "sudo -iu alice c6 login http://127.0.0.1:7700 --token $api_token"
+until_ok 'sudo -iu alice c6 workers | grep -qE "online +alice"' "c6 workers does not list alice online"
+run 'sudo -iu alice c6 workers'
+
 step "Clean stop (SIGINT) and restart"
 run 'systemctl restart c6h c6w@alice c6m'
 until_ok 'journalctl -u c6w@alice | grep -c "attached to head" | grep -qv "^1$"' "c6w@alice did not reattach after a restart"
@@ -61,8 +67,8 @@ run 'for u in c6h c6w@alice c6m; do systemctl is-active -q $u || exit 1; done' |
 run 'grep -q "^data_dir = \"/var/lib/c6h\"" /etc/c6h/c6h.toml'
 
 step "Remove"
-run 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq c6h c6w c6m'
+run 'DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq c6h c6w c6m c6'
 run '! systemctl is-active -q c6h c6w@alice c6m' || fail "services still running after removal"
 run 'test -f /var/lib/c6h/c6h.db' || fail "removal deleted the head's database"
 
-printf '\n\033[1;32mPASS\033[0m: c6h, c6w and c6m install, run under systemd, upgrade and remove cleanly\n'
+printf '\n\033[1;32mPASS\033[0m: c6h, c6w, c6m and c6 install, run under systemd, upgrade and remove cleanly\n'

@@ -1,0 +1,13 @@
+Package: c6
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: @SHLIBS@, ca-certificates
+Section: net
+Priority: optional
+Homepage: https://github.com/carbon6-dev/carbon6
+Description: carbon6 command line
+ Runs carbon6 agent sessions from the command line, sends follow-ups, and
+ lists and searches sessions, through a carbon6 head's API. Sign in once with
+ `c6 login <url> --token <token>`.
