@@ -1,6 +1,6 @@
 # Measurement — Design
 
-Status: design only (2026-10-14). Nothing here is built yet.
+Status: design only, deferred (2026-10-14). Nothing here is built yet.
 
 ## 1. Goals
 
