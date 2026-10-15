@@ -1,0 +1,55 @@
+# Builds the carbon6.dev website and publishes it to the GitHub Pages
+# repository (docs/site.md): on every push to main that changes what it is
+# built from, and after every release, so the install page names the new
+# version once its packages are up. Pull requests only build it.
+name: Site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - docs/**
+      - README.md
+      - CHANGELOG.md
+      - Cargo.toml
+      - .github/workflows/site.yml
+  pull_request:
+    paths:
+      - site/**
+      - docs/**
+      - README.md
+      - CHANGELOG.md
+      - Cargo.toml
+      - .github/workflows/site.yml
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time, in order.
+concurrency:
+  group: site-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  site:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: site
+      - run: make site-check
+      - run: make site
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        env:
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+        run: make site-publish

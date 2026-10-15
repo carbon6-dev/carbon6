@@ -6,6 +6,12 @@
       "runtimeExecutable": "cargo",
       "runtimeArgs": ["run", "-q", "-p", "c6h", "--", "--config", "dev/c6h.toml"],
       "port": 7700
+    },
+    {
+      "name": "site",
+      "runtimeExecutable": "make",
+      "runtimeArgs": ["site-serve"],
+      "port": 8000
     }
   ]
 }

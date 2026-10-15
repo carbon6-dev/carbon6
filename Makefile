@@ -13,6 +13,7 @@ TAG          ?= dev
 # This machine's architecture, as Docker names it (amd64 / arm64).
 ARCH         := $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 UI_PORT      ?= 7700
+SITE_PORT    ?= 8000
 WORKER_PORT  ?= 7701
 # Ubuntu release the packages are built on. It sets the minimum glibc, so they
 # also install on every later release (22.04: 22.04, 24.04, 26.04, ...).
@@ -39,7 +40,8 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test brew-dist brew brew-install brew-test release release-notes \
-        ui build test check dev-head dev-token dev-login-link dev-worker dev-memex clean
+        ui build test check dev-head dev-token dev-login-link dev-worker dev-memex clean \
+        site site-serve site-check site-publish
 
 help: ## Show this help
 	@echo "Usage: make <target> [VAR=value]"
@@ -166,6 +168,21 @@ dev-memex: ## Run the dev memex (pass TOKEN=... from Settings → Memex to enrol
 	@if [ -n "$(TOKEN)" ]; then cargo run -p c6m -- enroll --force "$(TOKEN)"; fi
 	cargo run -p c6m -- run
 
-clean: ## Remove build outputs (target/, dist/, crates/c6-ui/dist)
+clean: ## Remove build outputs (target/, site/target/, dist/, crates/c6-ui/dist)
 	cargo clean
-	rm -rf dist crates/c6-ui/dist
+	rm -rf site/target dist crates/c6-ui/dist
+
+##@ Website (carbon6.dev, see docs/site.md)
+
+site: ## Build the website into dist/site
+	cargo run --release --locked --manifest-path site/Cargo.toml -- --out dist/site
+
+site-serve: site ## Build the website and serve it on http://127.0.0.1:8000 (SITE_PORT)
+	python3 -m http.server $(SITE_PORT) --bind 127.0.0.1 --directory dist/site
+
+site-check: ## Test the website's generator and fail on any clippy warning
+	cargo clippy --locked --manifest-path site/Cargo.toml --all-targets -- -D warnings
+	cargo test --locked --manifest-path site/Cargo.toml
+
+site-publish: site ## Push dist/site to the GitHub Pages repository (SITE_REPOSITORY, default carbon6-dev/carbon6.dev)
+	site/publish.sh dist/site

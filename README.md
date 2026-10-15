@@ -78,6 +78,8 @@ make docker-token      # an enrollment token from that head
 
 **CI and releases.** GitHub Actions runs the tests on Linux and macOS for every push to `main` and every pull request. `make release BUMP=patch|minor|major` bumps the version, adds the commits since the last release to `CHANGELOG.md`, commits, tags and pushes. The tag's Release workflow tests, builds the .debs (amd64, arm64) and bottles (Apple Silicon, Intel), smoke-tests them, and publishes the GitHub release and the Homebrew tap. See [docs/releases.md](docs/releases.md).
 
+**Website.** [carbon6.dev](https://carbon6.dev) is a static site generated with Leptos from `site/`, with the docs, this README's guide and the changelog rendered from the repository. `make site-serve` builds it and serves it locally; the Site workflow publishes it to GitHub Pages. See [docs/site.md](docs/site.md).
+
 **With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
 
 ```bash

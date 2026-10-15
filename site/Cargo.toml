@@ -1,0 +1,15 @@
+# The carbon6.dev website: a static site rendered by Leptos (server-side,
+# no wasm, no JavaScript). A workspace of its own, so its Leptos (`ssr`)
+# doesn't unify features with the web UI's (`csr`) in the main workspace.
+[package]
+name = "c6-site"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+leptos = { version = "0.8", features = ["ssr"] }
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
