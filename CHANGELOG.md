@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-10-15)
+
+- Release workflow: the bottle jobs get 120 minutes (the Intel runner takes about 50)
+- A terminal's last output reaches its viewers before the exit (the pump could pick the exit first and drop it)
+
 ## 0.2.0 (2026-10-15)
 
 - Photo events are rebuilt in one transaction, so a reader never sees a trip with only some of its photos
