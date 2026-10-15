@@ -18,13 +18,21 @@ WORKER_PORT  ?= 7701
 # also install on every later release (22.04: 22.04, 24.04, 26.04, ...).
 UBUNTU       ?= 22.04
 DEB_DIR       = dist/deb/ubuntu-$(UBUNTU)
+CRATE_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+COMMIT_TIME   = $(shell git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)
 # <crate version>+git<commit time>.<commit>, so every commit sorts newer.
-DEB_VERSION  ?= $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)+git$(shell git log -1 --format=%cd.%h --date=format:%Y%m%d%H%M%S)
+DEB_VERSION  ?= $(CRATE_VERSION)+git$(COMMIT_TIME).$(shell git rev-parse --short HEAD)
 DEB_MAINTAINER ?= $(shell git config user.name) <$(shell git config user.email)>
+BREW         ?= brew
+BREW_TAP     ?= carbon6/local
+BREW_DIR      = dist/brew
+# <crate version>.<commit time>: Homebrew puts it in file:// URLs, so digits and dots only.
+BREW_VERSION ?= $(CRATE_VERSION).$(COMMIT_TIME)
+BREW_ENV      = HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSION) --build-arg "MAINTAINER=$(DEB_MAINTAINER)"
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
-        docker-deb docker-deb-all docker-deb-test \
+        docker-deb docker-deb-all docker-deb-test brew brew-install \
         ui build test dev-head dev-token dev-login-link dev-worker dev-memex clean
 
 help: ## Show this help
@@ -84,6 +92,24 @@ docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubu
 docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, c6 sees the worker, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) .
 	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) $(DEB_DIR) $(ARCH)
+
+##@ Homebrew (macOS, local toolchain)
+
+brew: build ## Build bottles and formulas of c6h, c6w, c6m (as brew services) and c6 into dist/brew/, and add them to the local tap carbon6/local (BREW_TAP)
+	rm -rf $(BREW_DIR)
+	packaging/brew/build.sh target/release $(BREW_VERSION) $(BREW_DIR)
+	@tap="$$($(BREW) --repo $(BREW_TAP))"; \
+	test -d "$$tap" || $(BREW_ENV) $(BREW) tap-new --no-git $(BREW_TAP); \
+	mkdir -p "$$tap/Formula" && cp $(BREW_DIR)/Formula/*.rb "$$tap/Formula/" && echo "Formulas in $$tap/Formula"
+
+brew-install: brew ## Install or upgrade c6h, c6w, c6m and c6 from the local tap, and restart those of their services that are running
+	@for f in c6h c6w c6m c6; do \
+		if $(BREW) list --versions $$f >/dev/null; then $(BREW_ENV) $(BREW) reinstall $(BREW_TAP)/$$f; \
+		else $(BREW_ENV) $(BREW) install $(BREW_TAP)/$$f; fi || exit 1; \
+	done
+	@for f in $$($(BREW) services list | awk '$$1 ~ /^c6[hwm]$$/ && $$2 == "started" { print $$1 }'); do \
+		$(BREW) services restart $$f; \
+	done
 
 ##@ Local toolchain
 

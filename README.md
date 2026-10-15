@@ -47,6 +47,13 @@ make docker-token      # an enrollment token from that head
 - **`c6`** is the command line, for any machine that reaches the head: `c6 login <url> --token <token>` with a token from `c6h api-token`.
 - Logs: `journalctl -u c6h` (or `c6w@<user>`, `c6m`). Upgrading a package restarts its services; removing one keeps its data.
 
+**Homebrew (macOS).** `make brew` builds bottles and formulas of `c6h`, `c6w`, `c6m` and `c6` for this Mac's architecture into `dist/brew/` (with the local toolchain) and adds them to a local tap, `carbon6/local`. `make brew-install` installs or upgrades them from it and restarts their running services. Bottles need neither Xcode nor the Command Line Tools to install, and work on macOS 11 and later. The services run as you, under launchd:
+
+- **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h --config $(brew --prefix)/etc/c6h/c6h.toml login-link`.
+- **`c6w`:** `c6w enroll <token>`, then `brew services start c6w`. It starts through a login shell, so sessions get your `PATH`.
+- **`c6m`:** `c6m enroll <token>`, then `brew services start c6m`.
+- Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`, `c6m.log`). The worker and memex keep the standard state folders (`~/Library/Application Support/c6w`, `c6m`), the same ones `make dev-worker` and `make dev-memex` use.
+
 **With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
 
 ```bash
