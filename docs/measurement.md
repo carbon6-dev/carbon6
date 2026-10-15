@@ -79,7 +79,7 @@ outcome(id, title, kind, sessions /* labelled record:<id>, os §4.5 */,
         created_at)
 ```
 
-- **One per root session, by default.** When a turn ends with nothing more queued, carbon6 creates the outcome and labels the session `record:<outcome>`. Side chats and subagents belong to their root's outcome. Linking another session to an outcome is relabeling it.
+- **One per artifact:** one outcome for each branch merged, draft sent and output name published, and one for a session's record changes, created as the artifact appears. A session with no artifacts is one outcome, rated by the judge. Each outcome's sessions are labelled `record:<outcome>`. Side chats and subagents belong to their root's outcomes. `outcome_report` may name or merge outcomes, but nothing depends on it.
 - **Artifacts are recorded as the work happens:**
   - commits made in the session's folder (from the worker's checkpoints and git);
   - mail drafts the session wrote;
@@ -112,7 +112,8 @@ For outcomes without artifacts (research, answers, advice), and to break ties wh
 
 ### 4.3 Settling
 
-- **Provisional, then settled:** a rating is provisional until `settles_at`, then fixed. The window is configurable per kind: 7 days for code, 1 day for mail, 3 days for records and outputs. Code that looks fine on day one can be reverted on day three.
+- **Provisional, then settled:** a rating is first given at 3 days (provisional) and fixed at `settles_at`, 14 days to start. Code that looks fine on day one can be reverted on day three.
+- **Windows tune themselves:** after a month, each repository's window becomes the time that catches 90% of the reverts and follow-up fixes actually observed on agent work there, and likewise for mail, records and outputs.
 - **Re-checked once:** at settling, the signals are read again. A settled outcome doesn't change afterwards, except by your override.
 - **Overrides are optional:** you can override any rating with a value and a note (`rated_by: you`). Nothing ever asks you to.
 
@@ -123,7 +124,7 @@ The counterfactual can't be observed, so it's estimated by independent methods, 
 ### 5.1 The estimators
 
 1. **Your speed, from git history.**
-   - Take commits you made without an agent: before carbon6, and any you write by hand now. They're recognized by author and by having no carbon6 session.
+   - Take commits you made without an agent (11a, "Your unassisted history"): your addresses, no carbon6 session, no agent trailer, and only from before you first used a coding agent in that repository.
    - Group them into work stretches: consecutive commits with gaps under two hours (configurable).
    - Fit a model of stretch time against the change's features: lines added and changed, files, test files, languages, new code against edits, and how familiar the files were to you (prior commits).
    - Apply it to the session's changes: how long **you** would take.
@@ -225,9 +226,10 @@ Each step is usable on its own.
 |---|---|
 | Rating | Automatic: a retained fraction from what happened to the work, provisional until settled; the judge only where there are no artifacts or signals disagree; your override optional |
 | Baseline | Automatic: the median of your git speed model, a replay of the agent's steps at human speed, and the agent's estimate; calibrated from your unassisted work; versioned |
+| Settling windows | Measured, not chosen: a provisional rating at 3 days and settling at 14 to start. After a month, each repository's window becomes the time that catches 90% of observed reverts and follow-up fixes to agent work; the same for mail, records and outputs |
+| Your unassisted history | Detected: your addresses from workers' git config and your Google accounts; every repository a session has worked in, minus exclusions in Settings; commits no session made and with no agent trailer. A repository's history counts only before you first used any coding agent in it, found from the dates (never the contents) of Claude Code's per-project transcripts (`~/.claude/projects/`) on the worker. Your commits carry no agent trailers, so without this, work done with agents outside carbon6 would read as yours. Repositories with no agent-free period don't feed the speed model. |
+| Several outcomes in a session | Split by artifact: one outcome per branch merged, draft sent and output name published; a session's record changes as one; a session without artifacts stays one outcome for the judge. `outcome_report` may name or merge, but nothing depends on it. |
 
 ## 12. Open questions
 
-- **Settling windows:** whether 7 days for code is long enough to catch reverts and follow-up fixes in how you work.
-- **Your history:** which repositories, authors and time range count as your unassisted work (for example your email addresses in git, and the date you started using agents).
-- **Several outcomes in one session:** a long session that delivers several things may need splitting, by its artifacts (one per branch, draft or output) or by the agent reporting several.
+- **Agents other than Claude Code:** detecting agent-assisted periods for tools that leave no local transcripts (an editor's built-in assistant, for example). For now, such repositories can be excluded in Settings.
