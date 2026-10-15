@@ -1,0 +1,21 @@
+# A worker in your own systemd user session:
+#   c6w enroll <token>
+#   systemctl --user enable --now c6w
+#   sudo loginctl enable-linger $USER      (to keep it running while logged out)
+[Unit]
+Description=carbon6 worker
+Documentation=https://github.com/carbon6-dev/carbon6
+
+[Service]
+# A login shell, so sessions get your PATH (~/.local/bin, ~/.cargo/bin, ...).
+ExecStart=/bin/bash -lc 'exec /usr/bin/c6w run'
+Environment=NO_COLOR=1
+# c6w shuts down cleanly on SIGINT; its sessions' processes are killed after it exits.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

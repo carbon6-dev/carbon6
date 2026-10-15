@@ -7,11 +7,16 @@
 #   test       runs the test suite
 #   c6h        runtime image for the head
 #   c6w        runtime image for a worker (it works on files in the container)
+#   debs       .deb packages of c6h, c6w and c6m with systemd units, built on
+#              ubuntu:${UBUNTU} (use with --output)
+#   deb-host   Ubuntu with systemd as PID 1, to try the packages in
 
 ARG RUST_VERSION=1.97
+ARG TRUNK_VERSION=0.21.14
+ARG UBUNTU=24.04
 
 FROM rust:${RUST_VERSION}-bookworm AS toolchain
-ARG TRUNK_VERSION=0.21.14
+ARG TRUNK_VERSION
 RUN rustup target add wasm32-unknown-unknown \
  && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-$(uname -m)-unknown-linux-gnu.tar.gz" \
     | tar -xz -C /usr/local/bin trunk \
@@ -55,3 +60,42 @@ COPY --from=build /out/c6w /usr/local/bin/c6w
 VOLUME /state
 ENTRYPOINT ["c6w", "--state-dir", "/state"]
 CMD ["run"]
+
+# Ubuntu packages. Built on the target release, so the binaries need no newer
+# glibc than it has.
+FROM ubuntu:${UBUNTU} AS deb-toolchain
+ARG RUST_VERSION
+ARG TRUNK_VERSION
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_VERSION}" --target wasm32-unknown-unknown \
+ && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-$(uname -m)-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C /usr/local/bin trunk \
+ && trunk --version
+WORKDIR /src
+
+FROM deb-toolchain AS deb-build
+ARG UBUNTU
+ARG TARGETARCH
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=c6-deb-target-${UBUNTU}-${TARGETARCH},target=/src/target \
+    --mount=type=cache,target=/root/.cache/trunk \
+    cd crates/c6-ui && trunk build --release && cd /src \
+ && cargo build --release --locked -p c6h -p c6w -p c6m \
+ && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6m /out/
+ARG DEB_VERSION=0.1.0
+ARG MAINTAINER
+RUN MAINTAINER="${MAINTAINER}" packaging/deb/build.sh /out "${DEB_VERSION}" /debs
+
+FROM scratch AS debs
+COPY --from=deb-build /debs/ /
+
+FROM ubuntu:${UBUNTU} AS deb-host
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus sudo curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

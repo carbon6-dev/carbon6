@@ -1,0 +1,14 @@
+Package: c6w
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: @SHLIBS@, ca-certificates, git
+Recommends: openssh-client, procps, python3
+Section: net
+Priority: optional
+Homepage: https://github.com/carbon6-dev/carbon6
+Description: carbon6 worker
+ Runs carbon6 agent sessions on this machine for a carbon6 head. Runs as a
+ user: from boot with the c6w@<user> systemd service, or in that user's
+ systemd session with `systemctl --user enable --now c6w`.

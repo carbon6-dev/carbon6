@@ -1,0 +1,13 @@
+Package: c6h
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: @SHLIBS@, adduser, ca-certificates
+Section: net
+Priority: optional
+Homepage: https://github.com/carbon6-dev/carbon6
+Description: carbon6 head
+ Manages carbon6 workers and serves the web UI. Runs as the c6h systemd
+ service (user c6h), with its configuration in /etc/c6h/c6h.toml and its
+ state in /var/lib/c6h.

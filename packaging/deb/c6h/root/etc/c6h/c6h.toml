@@ -1,0 +1,21 @@
+# carbon6 head, run by systemd as c6h.service (user c6h). Every setting is
+# optional; see README → Configuration and crates/c6-head/src/config.rs.
+# Restart after a change: sudo systemctl restart c6h
+#
+# Admin commands run as the c6h user with this file, for example:
+#   sudo -u c6h c6h --config /etc/c6h/c6h.toml login-link
+#   sudo -u c6h c6h --config /etc/c6h/c6h.toml enroll-token
+
+# Database, master.key and CAs. Back up c6h.db and master.key together.
+data_dir = "/var/lib/c6h"
+
+# With no bind list the head binds every private, tailnet and loopback
+# address. For all interfaces (sign-in still protects the UI):
+# bind = ["0.0.0.0"]
+# allow_public_bind = true
+
+# Names the UI is reached by (the Tailscale MagicDNS name is added on its own).
+# extra_names = ["head.example.internal"]
+
+# HTTPS from the head's own private CA, so passkeys work beyond localhost.
+# ui_tls_head_ca = true

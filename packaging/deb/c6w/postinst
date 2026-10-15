@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        [ -z "$2" ] || systemctl try-restart 'c6w@*.service'
+    fi
+
+    if [ -z "$2" ]; then
+        cat <<'MSG'
+c6w: enroll as the user the worker should run as, with a token from the Workers page:
+       c6w enroll <token>
+     then run it from boot:            sudo systemctl enable --now c6w@$USER
+     or in your user session:          systemctl --user enable --now c6w
+MSG
+    else
+        echo "c6w: restarted c6w@<user> services; restart user-session workers with: systemctl --user restart c6w"
+    fi
+fi

@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    if ! getent passwd c6h >/dev/null; then
+        adduser --quiet --system --group --home /var/lib/c6h --no-create-home c6h
+    fi
+    install -d -o c6h -g c6h -m 0700 /var/lib/c6h
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if [ -z "$2" ]; then
+            systemctl enable --now c6h.service
+        else
+            systemctl try-restart c6h.service
+        fi
+    fi
+
+    if [ -z "$2" ]; then
+        cat <<'MSG'
+c6h: the head runs as the c6h service (sudo journalctl -u c6h for its web UI address).
+     Sign in the first time with a one-time link:
+       sudo -u c6h c6h --config /etc/c6h/c6h.toml login-link
+MSG
+    fi
+fi

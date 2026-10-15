@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = purge ]; then
+    echo "c6m: kept /var/lib/c6m (the memex's identity and store) and the c6m user; remove them yourself when no longer needed"
+fi

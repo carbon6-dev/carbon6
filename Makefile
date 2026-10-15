@@ -14,8 +14,16 @@ TAG          ?= dev
 ARCH         := $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 UI_PORT      ?= 7700
 WORKER_PORT  ?= 7701
+# Ubuntu release the packages are built on and for (it sets the minimum glibc).
+UBUNTU       ?= 24.04
+DEB_DIR       = dist/deb/ubuntu-$(UBUNTU)
+# <crate version>+git<commit time>.<commit>, so every commit sorts newer.
+DEB_VERSION  ?= $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)+git$(shell git log -1 --format=%cd.%h --date=format:%Y%m%d%H%M%S)
+DEB_MAINTAINER ?= $(shell git config user.name) <$(shell git config user.email)>
+DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSION) --build-arg "MAINTAINER=$(DEB_MAINTAINER)"
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
+        docker-deb docker-deb-all docker-deb-test \
         ui build test dev-head dev-token dev-login-link dev-worker dev-memex clean
 
 help: ## Show this help
@@ -59,6 +67,20 @@ docker-token: ## Print a worker enrollment token from the running head container
 
 docker-login-link: ## Print a one-time web UI login link from the running head container
 	@$(DOCKER) exec c6h c6h --config /etc/c6h/c6h.toml login-link
+
+##@ Ubuntu packages (Docker only)
+
+docker-deb: ## Build c6h, c6w and c6m .deb packages (systemd units included) for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=24.04)
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
+	@ls -l $(DEB_DIR)
+
+docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubuntu-<UBUNTU>/ (the other arch is emulated: slow)
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
+	@ls -l $(DEB_DIR)
+
+docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, upgrade, remove
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU) .
+	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU) $(DEB_DIR)
 
 ##@ Local toolchain
 

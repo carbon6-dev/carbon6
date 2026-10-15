@@ -1,0 +1,23 @@
+# A worker that runs as the user named after the @, from boot:
+#   c6w enroll <token>                      (as that user)
+#   sudo systemctl enable --now c6w@$USER
+[Unit]
+Description=carbon6 worker for %i
+Documentation=https://github.com/carbon6-dev/carbon6
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+User=%i
+# A login shell, so sessions get the user's PATH (~/.local/bin, ~/.cargo/bin, ...).
+ExecStart=/bin/bash -lc 'exec /usr/bin/c6w run'
+Environment=NO_COLOR=1
+# c6w shuts down cleanly on SIGINT; its sessions' processes are killed after it exits.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

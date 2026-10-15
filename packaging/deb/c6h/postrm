@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = purge ]; then
+    echo "c6h: kept /var/lib/c6h (the head's database and keys) and the c6h user; remove them yourself when no longer needed"
+fi

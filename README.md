@@ -39,6 +39,13 @@ make docker-token      # an enrollment token from that head
 - `make docker-images` builds the `carbon6/c6h` and `carbon6/c6w` runtime images.
 - Docker produces Linux binaries only. A worker on a Mac needs a native `c6w`, built with the local toolchain below.
 
+**Ubuntu packages.** `make docker-deb` builds `c6h`, `c6w` and `c6m` `.deb` packages with their systemd units into `dist/deb/ubuntu-24.04/` (`UBUNTU=22.04` for an older release; `make docker-deb-all` for amd64 and arm64). `make docker-deb-test` installs them in an Ubuntu container under systemd and checks the services. After `sudo apt install ./c6h_*.deb` (and so on):
+
+- **`c6h`** runs as the `c6h` service (user `c6h`) and starts on install. Its config is `/etc/c6h/c6h.toml`, its state `/var/lib/c6h`. Run admin commands as that user: `sudo -u c6h c6h --config /etc/c6h/c6h.toml login-link` (or `enroll-token`, `api-token`).
+- **`c6w`** runs as a user, since sessions work on that user's files. Enroll as that user (`c6w enroll <token>`), then either `sudo systemctl enable --now c6w@$USER` (from boot) or `systemctl --user enable --now c6w` (in your user session). It starts through a login shell, so sessions get your `PATH`.
+- **`c6m`** runs as the `c6m` service (user `c6m`, state in `/var/lib/c6m`) once enrolled: `sudo -u c6m c6m --state-dir /var/lib/c6m enroll <token>`, then `sudo systemctl enable --now c6m`.
+- Logs: `journalctl -u c6h` (or `c6w@<user>`, `c6m`). Upgrading a package restarts its services; removing one keeps its data.
+
 **With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
 
 ```bash
