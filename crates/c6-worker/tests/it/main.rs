@@ -46,3 +46,19 @@ mod usage;
 mod views;
 mod websearch;
 mod workflows;
+
+/// Opens the worker in `state`. A worker just stopped there may still be
+/// letting go of the state directory's lock (its tasks drop their handles as
+/// they end), so that error is retried for a while; any other fails at once.
+pub async fn open_worker(state: &std::path::Path) -> std::sync::Arc<c6_worker::Worker> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match c6_worker::Worker::open(state, c6_worker::Identity::load(state).unwrap()).await {
+            Ok(w) => return w,
+            Err(e) if format!("{e}").contains("already running") && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(e) => panic!("opening the worker: {e:#}"),
+        }
+    }
+}

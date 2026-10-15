@@ -9,7 +9,7 @@ use std::time::Duration;
 use c6_api::{Event, EventKind, Session, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply};
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use c6_worker::{ConnState, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -83,7 +83,7 @@ impl Env {
 }
 
 async fn run_worker(state: &Path) -> (Arc<Worker>, CancellationToken) {
-    let w = Worker::open(state, Identity::load(state).unwrap()).await.unwrap();
+    let w = crate::open_worker(state).await;
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(w.clone(), tx, stop.clone()));

@@ -192,8 +192,12 @@ async fn workflows_chain_conditions_and_approvals() {
     assert_eq!(steps(&w), "check=ok tell=skipped ok=waiting fix=pending");
     // The step is a decision too: answered there, the run stops.
     let source = format!("workflow:{}", r2.id);
-    let decisions: Vec<c6_api::Decision> = http.get(format!("{api}/decisions")).send().await.unwrap().json().await.unwrap();
-    let d = decisions.into_iter().find(|d| d.source == source).expect("the step's decision");
+    // Made just after the step starts waiting.
+    let d = eventually("the step's decision", async || {
+        let decisions: Vec<c6_api::Decision> = http.get(format!("{api}/decisions")).send().await.ok()?.json().await.ok()?;
+        decisions.into_iter().find(|d| d.source == source)
+    })
+    .await;
     assert!(d.waiting && d.title == "Clean up?" && d.options.len() == 2, "{d:?}");
     let r = http.post(format!("{api}/decisions/{}/answer", d.id)).json(&json!({"option": "Stop"})).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
