@@ -53,8 +53,11 @@ fn Shell(
     children: Children,
 ) -> impl IntoView {
     let site = expect_context::<Site>();
-    let full_title =
-        if title.is_empty() { "carbon6 — run AI coding agents on all your machines".to_string() } else { format!("{title} · carbon6") };
+    let full_title = if title.is_empty() {
+        "carbon6 — your attention on what matters, agents on everything else".to_string()
+    } else {
+        format!("{title} · carbon6")
+    };
     let canonical = format!("{}{}", site.base_url, if path == "/404.html" { "/" } else { &path });
     let current = |prefix: &'static str| path.starts_with(prefix).then_some("page");
     let nav = [("/docs/", "Docs"), ("/guide/", "Guide"), ("/install/", "Install"), ("/changelog/", "Changelog")];
@@ -164,8 +167,55 @@ const ARCHITECTURE: &str = r##"<svg viewBox="0 0 720 300" role="img" aria-labell
 <g class="d-box"><rect x="530" y="24" width="170" height="48" rx="10"/><text x="546" y="45" class="d-title">c6w</text><text x="546" y="62" class="d-sub">your laptop · macOS</text></g>
 <g class="d-box"><rect x="530" y="90" width="170" height="48" rx="10"/><text x="546" y="111" class="d-title">c6w</text><text x="546" y="128" class="d-sub">a dev box · Linux</text></g>
 <g class="d-box"><rect x="530" y="156" width="170" height="48" rx="10"/><text x="546" y="177" class="d-title">c6w</text><text x="546" y="194" class="d-sub">a build server</text></g>
-<g class="d-box d-optional"><rect x="530" y="228" width="170" height="48" rx="10"/><text x="546" y="249" class="d-title">c6m</text><text x="546" y="266" class="d-sub">the memex (optional)</text></g>
+<g class="d-box d-optional"><rect x="530" y="228" width="170" height="48" rx="10"/><text x="546" y="249" class="d-title">c6m</text><text x="546" y="266" class="d-sub">memex · knowledge graph</text></g>
 </svg>"##;
+
+/// A reason carbon6 multiplies what you get done: what it removes, and the
+/// features that remove it.
+struct Lever {
+    title: &'static str,
+    text: &'static str,
+    how: &'static [&'static str],
+}
+
+const LEVERS: &[Lever] = &[
+    Lever {
+        title: "Every machine, without friction",
+        text: "Your laptop, dev boxes and build servers are one click away, from a browser or your phone. No SSH sessions to juggle, no terminal tabs to babysit.",
+        how: &[
+            "Start a session on any machine and watch it work live",
+            "Run the same task across a fleet of machines at once",
+            "Sessions keep going when the network doesn't",
+        ],
+    },
+    Lever {
+        title: "Knowledge that captures itself",
+        text: "Every session leaves behind what it learned. The memex turns sessions, documents and mail into a graph of people, projects, hosts and topics, and every new session starts from it. You never explain the same thing twice.",
+        how: &[
+            "Each session's digest lands in the knowledge graph on its own",
+            "New sessions start with a brief of what's already known",
+            "Agents search everything by keyword and by meaning",
+        ],
+    },
+    Lever {
+        title: "All your context, one platform",
+        text: "Mail, calendar, contacts, documents and papers live beside your agents, not scattered across a dozen single-purpose tools. An agent drafting a reply knows the thread, the project and the person.",
+        how: &[
+            "Gmail, Calendar and Contacts, synced both ways",
+            "Documents and papers, with the citations between them",
+            "Apps for your own workflows, built from configuration, not code",
+        ],
+    },
+    Lever {
+        title: "Agents that don't wait on you",
+        text: "Agents keep working and queue what needs you. You look when you choose to, decide in a tap, and get back to the work only you can do.",
+        how: &[
+            "Questions become action items, not interruptions",
+            "Risky steps wait for your approval, from your phone",
+            "Schedules, webhooks and new mail start work without you",
+        ],
+    },
+];
 
 struct Feature {
     title: &'static str,
@@ -173,10 +223,6 @@ struct Feature {
 }
 
 const FEATURES: &[Feature] = &[
-    Feature {
-        title: "Every machine, one UI",
-        text: "Start a session on any worker and watch it stream live: text, reasoning, tool calls and shell output. Send a message mid-turn, stop a turn, or work in a fresh git worktree.",
-    },
     Feature {
         title: "The model you want",
         text: "Anthropic, OpenAI with a key or your ChatGPT plan, any OpenAI-compatible server such as Ollama or vLLM, or each worker's own signed-in Claude Code.",
@@ -186,24 +232,16 @@ const FEATURES: &[Feature] = &[
         text: "Claude Code-style tools for Claude, Codex-style for GPT, a generic set for the rest. MCP servers, skills, subagents, plans and web search with any model.",
     },
     Feature {
-        title: "Keeps going offline",
-        text: "Workers journal every event before they send it. Sessions keep running while the head is unreachable and sync back, exactly, when it returns.",
-    },
-    Feature {
         title: "An IDE in the browser",
-        text: "Browse a worker's files, review its git changes and open terminals on it, from any browser. The UI works on a phone, with web push for approvals.",
-    },
-    Feature {
-        title: "Fleets and automations",
-        text: "Templates, runs across many workers at once, schedules and webhooks, workflows, approvals, notifications, usage and budgets.",
+        text: "Browse a worker's files, review its git changes and open terminals on it, from any browser, phone included.",
     },
     Feature {
         title: "An OS for agents",
         text: "Realms keep apps apart. Apps are built from collections, decisions, triggers, series and views, by configuration alone, and installed as packages.",
     },
     Feature {
-        title: "A memex",
-        text: "An optional knowledge store for your sessions, documents, mail, calendar and photos, which your agents can search.",
+        title: "Usage and budgets",
+        text: "What every session, model and project costs, with budgets that stop the spending where you set them.",
     },
     Feature {
         title: "Observable",
@@ -218,7 +256,7 @@ fn Home() -> impl IntoView {
     view! {
         <Shell
             title=""
-            description="carbon6 is a self-hosted harness for AI coding agents: one head with a web UI, and workers that run agent sessions on each of your machines."
+            description="carbon6 is a self-hosted platform for AI agents that takes the friction out of your work: every machine, your mail and calendar, and a knowledge graph that builds itself, in one place. Your attention goes to what matters; agents do the rest."
             path="/"
             wide=true
         >
@@ -228,9 +266,9 @@ fn Home() -> impl IntoView {
                         <a href="/changelog/">"carbon6 " {v.clone()}</a>
                         " · open source · self-hosted"
                     </p>
-                    <h1>"Run AI coding agents on every machine you have, from one place."</h1>
+                    <h1>"Your attention on what matters. Agents on everything else."</h1>
                     <p class="lede">
-                        "carbon6 is a harness for coding agents. A head keeps your settings, credentials and sessions and serves the web UI; a worker on each dev machine runs the agents there, on that machine's files and tools."
+                        "Attention is the one resource you can't add more of. carbon6 clears away the friction around it: every machine you work on, your mail and calendar, and everything your agents learn, in one place. You choose what matters; agents carry the rest. That's how one person does the work of ten."
                     </p>
                     <div class="actions">
                         <a class="button primary" href="/install/">"Install"</a>
@@ -241,6 +279,29 @@ fn Home() -> impl IntoView {
                         </a>
                     </div>
                 </div>
+            </section>
+
+            <section class="band">
+                <h2>"Where the 10x comes from"</h2>
+                <p class="section-lede">"Agents are fast. What slows you down is everything around them: reaching the right machine, re-explaining context, switching between tools, answering every question as it comes up. carbon6 removes each of those."</p>
+                <div class="levers">
+                    {LEVERS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| view! {
+                            <div class="lever">
+                                <span class="lever-n">{format!("0{}", i + 1)}</span>
+                                <h3>{l.title}</h3>
+                                <p>{l.text}</p>
+                                <ul class="checks">{l.how.iter().map(|h| view! { <li>{*h}</li> }).collect_view()}</ul>
+                            </div>
+                        })
+                        .collect_view()}
+                </div>
+            </section>
+
+            <section class="band">
+                <h2>"How it fits together"</h2>
                 <figure class="diagram">
                     <div class="diagram-scroll" inner_html=ARCHITECTURE></div>
                     <figcaption>
@@ -249,10 +310,6 @@ fn Home() -> impl IntoView {
                         " command line."
                     </figcaption>
                 </figure>
-            </section>
-
-            <section class="band">
-                <h2>"Four programs"</h2>
                 <div class="parts">
                     <div class="part">
                         <h3><code>"c6h"</code>" the head"</h3>
@@ -264,7 +321,7 @@ fn Home() -> impl IntoView {
                     </div>
                     <div class="part">
                         <h3><code>"c6m"</code>" the memex"</h3>
-                        <p>"Optional. A knowledge store for sessions, documents, mail and photos, attached like a worker."</p>
+                        <p>"The knowledge graph: sessions, documents, mail and photos, attached like a worker."</p>
                     </div>
                     <div class="part">
                         <h3><code>"c6"</code>" the CLI"</h3>
@@ -274,7 +331,7 @@ fn Home() -> impl IntoView {
             </section>
 
             <section class="band">
-                <h2>"What it does"</h2>
+                <h2>"Under the hood"</h2>
                 <div class="features">
                     {FEATURES
                         .iter()
@@ -291,13 +348,13 @@ fn Home() -> impl IntoView {
             <section class="band split">
                 <div>
                     <h2>"Private by default"</h2>
-                    <p class="muted">"Agents run shell commands as you, so the head is as sensitive as a shell on every worker. carbon6 is built for that."</p>
+                    <p class="muted">"Your mail, your code and your machines in one place have to be safe there. Agents run shell commands as you, so the head is as sensitive as a shell on every worker. carbon6 is built for that."</p>
                     <ul class="checks">
+                        <li>"Self-hosted: your data stays on machines you own."</li>
                         <li>"The head binds only loopback, private and tailnet addresses unless you say otherwise, and answers only to its own names."</li>
                         <li>"Sign-in with passkeys and one-time login links made on the head; realm-scoped API tokens for scripts."</li>
                         <li>"Workers enroll with a one-time token that pins the head's CA, then connect with mutual TLS."</li>
                         <li>"API keys, OAuth tokens and your secrets are encrypted in the head's database."</li>
-                        <li>"What agents produce is served sandboxed, so it can't act as you in the UI."</li>
                     </ul>
                 </div>
                 <div>
