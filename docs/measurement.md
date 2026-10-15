@@ -10,96 +10,157 @@ carbon6 exists to make one person 10x to 100x more productive. Today nothing say
 2. **What did it cost me?** My attention: time spent steering, reviewing and answering. Model spend comes second.
 3. **Where did my attention go?** Which kinds of work need me most, and why, so the next improvement goes there.
 
-**The headline number is leverage:** how many hours of finished work you get per hour of your attention. Throughput alone can be gamed, so it's always shown beside acceptance: how much of the work you kept without redoing it.
+**The headline number is leverage:** hours of finished work you keep per hour of your attention. Throughput alone can be gamed, so it's always shown beside retention: how much of the work survived into what you actually used.
+
+**Measurement asks nothing of you.**
+- Outcomes are rated from what happened to the work afterwards (4).
+- The value of the work is estimated from your own unassisted work (5).
+- You can override either, but you never have to.
 
 **Not goals:**
 - **Measuring anyone else.** carbon6 has one user, and these numbers are for you.
 - **Keystroke or screen recording.** Attention is measured by presence (7), never by content.
-- **New kernel code for an app.** Measurement is built from series, collections, triggers, decisions and views (docs/os.md §4). The only additions are signals carbon6 alone can see, such as when a turn ran or when you were looking (2).
+- **New kernel code for an app.** Measurement is built from series, collections, triggers, decisions and views (docs/os.md §4). The only additions are signals carbon6 alone can see: turn timing, steering, waits, presence, and what git says about the work (6).
 
 ## 2. What carbon6 can see, and what it can't
 
-| Signal | Where it comes from | Seen? |
+| Signal | Where it comes from | History? |
 |---|---|---|
-| Agent working time | each turn's start and end in the session log | yes, also for past sessions |
-| Your messages that steer a session | user messages after the first, interrupts, rewinds | yes, also for past sessions |
-| Your answers | decisions: approvals, questions, choices, with when they opened and when you answered | yes, also for past decisions |
-| A session waiting on you | an open approval or question, or a finished turn with no reply from you yet | yes, also for past sessions |
+| Agent working time | each turn's start and end in the session log | yes |
+| Your messages that steer a session | user messages after the first, interrupts, rewinds | yes |
+| Your answers | decisions: approvals, questions, choices, when they opened and when you answered | yes |
+| A session waiting on you | an open approval or question, or a finished turn with no reply from you yet | yes |
 | Model spend | the usage series (`model_spend`) | yes |
-| Your time in carbon6 | presence in the UI (7) | from now on only |
-| Your time outside carbon6 | reviewing in an editor, on GitHub, in a meeting | **no**: entered by hand on an outcome, if you want (4) |
-| Whether the work was any good | your rating of the outcome (4) | only when you rate |
-| What it would have taken you by hand | your estimate (5) | only when you estimate |
-
-Everything carbon6 can see in past logs is backfilled (9), so the first dashboard already has history. Attention starts the day presence tracking is turned on.
+| What happened to the work | git (survival, reverts, follow-up fixes), drafts against sent mail, records' later edits, outputs opened (4) | yes, wherever the artifact still exists |
+| Your own speed | your commits made without carbon6, your hand-written replies, your presence and editor time (5) | git history: yes; presence: from now on |
+| Your time in carbon6 | presence in the UI (7) | from now on |
+| Your time outside carbon6 | the IDE integration's editor activity, where it's installed (5); otherwise unseen | from now on |
 
 ## 3. Measures
 
-Each measure is a series (docs/os.md §4.4) with the dimensions `realm`, `label` (the session's labels, one point per label) and `root` (the root session, so side chats and subagents roll up into the session they serve).
+Each measure is a series (os §4.4) with the dimensions `realm`, `label` (one point per session label) and `root` (the root session, so side chats and subagents roll up into the session they serve).
 
 | Series | Unit | Recorded when | Meaning |
 |---|---|---|---|
-| `agent_ms` | ms | a turn ends | how long the agent worked: turn start to end, summed across subagents |
-| `steer` | count | you send a message after the first, interrupt, or rewind | each time you corrected or redirected a session (dimension `how`: message, interrupt, rewind) |
-| `answer` | count | a decision is answered | each time carbon6 needed you (dimension `kind`: approve, question, choose, …; `via`: ui, link, session) |
-| `wait_on_you_ms` | ms | a decision is answered, or you reply to a finished turn | how long work waited for you (dimension `for`: approval, question, reply) |
-| `attention_ms` | ms | every heartbeat (7) | your time in carbon6, attributed to what you were looking at (dimension `on`: session, decision, view, memex, other) |
-| `outside_ms` | ms | you enter it on an outcome | your time outside carbon6 for that outcome |
-| `outcome` | count | an outcome is rated (4) | finished work (dimension `rating`: accepted, reworked, dropped; `kind`) |
-| `outcome_value_ms` | ms | an outcome is estimated (5) | what the work would have taken you by hand |
+| `agent_ms` | ms | a turn ends | how long the agent worked, summed across subagents |
+| `steer` | count | you send a message after the first, interrupt, or rewind | each time you corrected or redirected a session (`how`: message, interrupt, rewind) |
+| `answer` | count | a decision is answered | each time carbon6 needed you (`kind`; `via`: ui, link, session) |
+| `wait_on_you_ms` | ms | a decision is answered, or you reply to a finished turn | how long work waited for you (`for`: approval, question, reply) |
+| `attention_ms` | ms | every heartbeat (7) | your time in carbon6 (`on`: session, decision, view, memex, other) |
+| `outside_ms` | ms | editor activity reported by the IDE integration | your time outside carbon6 that carbon6 can see |
+| `outcome` | count | an outcome settles (4) | finished work (`kind`; `rated_by`: signals, judge, you) |
+| `outcome_retained` | 0–1 | an outcome settles | how much of the work survived |
+| `outcome_value_ms` | ms | an outcome is valued (5) | what the work would have taken you by hand (the median estimate) |
 
-**What's derived from them** (computed in queries and views, never stored):
+**Derived** (computed in queries and views, never stored):
 
 | Derived | Formula | What it says |
 |---|---|---|
-| **Leverage** | `outcome_value_ms` (accepted) ÷ (`attention_ms` + `outside_ms`) | hours of finished work per hour of you: the 10x–100x number |
-| **Acceptance** | accepted ÷ rated outcomes | whether the work is any good; shown beside leverage, always |
+| **Leverage** | Σ(`value` × `retained`) over settled outcomes ÷ (`attention_ms` + `outside_ms`) | hours of kept work per hour of you: the 10x–100x number |
+| **Retention** | Σ(`value` × `retained`) ÷ Σ`value` | whether the work is any good; always shown beside leverage |
 | **Steering per outcome** | `steer` ÷ outcomes | how much hand-holding work needs; it should fall week over week |
 | **Interruptions per outcome** | `answer` ÷ outcomes | how often carbon6 needed you |
 | **Wait on you** | `wait_on_you_ms`, median and 90th percentile | how much you are the bottleneck |
 | **Parallelism** | `agent_ms` ÷ wall-clock time, per day | how many agents ran for you at once, on average |
-| **Cost per outcome** | `model_spend` ÷ accepted outcomes | what finished work costs in models |
+| **Cost per kept hour** | `model_spend` ÷ Σ(`value` × `retained`) | what kept work costs in models |
 
-## 4. Outcomes
+Weighting value by retention means a large change that was mostly redone counts for little, and an unused report counts for nothing.
+
+## 4. Outcomes, rated from what happened to the work
 
 An **outcome** is a unit of finished work: a record in an `outcomes` collection in each realm.
 
 ```
-outcome(id, title, kind /* configurable: change, reply, report, decision, research, ops … */,
-        sessions /* the sessions labelled record:<id>, see os §4.5 */,
-        rating /* accepted | reworked | dropped | unrated */, rated_at,
-        value_ms? /* estimate, 5 */, value_by /* you | agent */, outside_ms?,
-        note?, created_at)
+outcome(id, title, kind, sessions /* labelled record:<id>, os §4.5 */,
+        artifacts /* commits, branch, draft, records, outputs: what the work produced */,
+        retained /* 0–1 */, rated_by /* signals | judge | you */, evidence /* Markdown */, confidence,
+        state /* open | provisional | settled */, settles_at,
+        value_ms, value_low, value_high, estimates /* each estimator's value, 5 */, estimator_version,
+        created_at)
 ```
 
-- **One per root session, by default.** When a session's turn ends with nothing more queued, carbon6 creates the outcome (unrated) and labels the session `record:<outcome>`. Side chats and subagents belong to their root's outcome. Linking another session to an existing outcome is relabeling it, so several sessions can serve one outcome.
-- **Rating takes one click,** where you already are when work finishes:
-  - in the session header, the Inbox and Mission cards: ✓ Accepted, ↺ Reworked (I had to fix or redo part of it), ✗ Dropped (not useful);
-  - optionally with an estimate (5) and time spent outside carbon6, as chips (15m, 1h, 4h, 1d) or a number.
-- **Unrated is allowed.** Measures count unrated outcomes separately and never guess a rating. A view lists unrated outcomes for a weekly sweep.
-- **Agents can propose, not decide.** An agent's `outcome_report` tool fills in the title, kind and a value estimate at the end of its work. The rating is always yours.
-- **Kinds are configuration:** a list in the realm's settings, with a description each, so agents can choose one.
+- **One per root session, by default.** When a turn ends with nothing more queued, carbon6 creates the outcome and labels the session `record:<outcome>`. Side chats and subagents belong to their root's outcome. Linking another session to an outcome is relabeling it.
+- **Artifacts are recorded as the work happens:**
+  - commits made in the session's folder (from the worker's checkpoints and git);
+  - mail drafts the session wrote;
+  - records it created or changed;
+  - outputs it published.
+- **The kind** comes from the artifacts (code, reply, records, report), or else from the agent's `outcome_report`. Kinds are configuration.
 
-## 5. The baseline: what would it have taken by hand?
+### 4.1 Retained fraction, per artifact
 
-Leverage needs a baseline: how long the work would have taken you without carbon6. There is no way to measure that, so it's estimated, and always labelled as an estimate.
+| Artifact | Retained | Signals of rework | Signals of a drop |
+|---|---|---|---|
+| **Code** | lines the session added or changed that still exist on the target branch at settling (git blame, following renames) ÷ lines it added or changed | your commits, or another session's, changing those lines within the window (follow-up fixes) | its commits reverted; its branch or worktree never merged; its changes discarded |
+| **Mail** | 1 − normalized edit distance between the agent's draft and what you sent | heavy edits before sending | draft deleted, never sent |
+| **Records** | fields still unchanged at settling ÷ fields it set | edits soon after | record deleted |
+| **Outputs** | 1 if opened, downloaded, linked or cited by a later session; 0.5 if superseded by a newer version after you steered | a newer version after steering | never opened |
+| **A recommended decision** | 1 if you chose the recommended option | another option chosen | — |
 
-- **The agent proposes** a value in `outcome_report`: what a competent engineer, or you, would need by hand, with one line of reasoning ("about 2h: three files, a migration and tests").
-- **You confirm or correct it** when rating, with a chip or a number. A corrected value is marked `value_by: you`, and views show what share of the value comes from your own estimates.
-- **The estimating prompt is configuration** (a prompt record), so you can calibrate it, for example "estimate my time, not a junior's".
-- **Calibration over time:** once a few dozen outcomes have your corrections, the weekly review (8) reports the agent's typical over- or under-estimate, and you can adjust the prompt.
+- **Several artifacts:** an outcome with several artifacts is weighted by each artifact's estimated value (5).
+- **Session behaviour adjusts confidence, not the score:**
+  - heavy steering, or a retry (a new session on the same task within a day, found by the memex's similarity search), lowers confidence;
+  - a session that ends with no artifact and no use of what it said becomes a candidate drop.
+
+### 4.2 The judge, only where artifacts can't speak
+
+For outcomes without artifacts (research, answers, advice), and to break ties when signals disagree, an **LLM judge** decides:
+- It reads the transcript, what you did next (your next messages, sessions started, decisions answered), and the artifacts' fate.
+- It returns a retained fraction with its evidence.
+- Its prompt is a prompt record, and its model is a task setting, so it can be cheap.
+- Its ratings are labelled `rated_by: judge` and shown separately in views, so they never pass for measured ones.
+
+### 4.3 Settling
+
+- **Provisional, then settled:** a rating is provisional until `settles_at`, then fixed. The window is configurable per kind: 7 days for code, 1 day for mail, 3 days for records and outputs. Code that looks fine on day one can be reverted on day three.
+- **Re-checked once:** at settling, the signals are read again. A settled outcome doesn't change afterwards, except by your override.
+- **Overrides are optional:** you can override any rating with a value and a note (`rated_by: you`). Nothing ever asks you to.
+
+## 5. Value: what would it have taken you by hand?
+
+The counterfactual can't be observed, so it's estimated by independent methods, calibrated against your own unassisted work, and shown with a range.
+
+### 5.1 The estimators
+
+1. **Your speed, from git history.**
+   - Take commits you made without an agent: before carbon6, and any you write by hand now. They're recognized by author and by having no carbon6 session.
+   - Group them into work stretches: consecutive commits with gaps under two hours (configurable).
+   - Fit a model of stretch time against the change's features: lines added and changed, files, test files, languages, new code against edits, and how familiar the files were to you (prior commits).
+   - Apply it to the session's changes: how long **you** would take.
+2. **Replaying the agent's steps at human speed.**
+   - Each step the agent took is priced at what it costs a person: reading a file (by lines), a search and reading the results, a build or test run (its own wall time), writing text or code (by size), browsing a page.
+   - The rates are configuration, with defaults, and are calibrated from what carbon6 sees of you: presence on pages, editor activity, how long your own builds take.
+3. **The agent's estimate.** `outcome_report` includes the agent's own estimate with a one-line reason. It's a third, weaker vote, and its prompt is a prompt record.
+
+**Mail and records** use estimators 2 and 3, plus your writing speed: from your hand-written replies (thread opened to reply sent, when presence saw it) and their length.
+
+### 5.2 Combining them
+
+- **The median** of the available estimates is `value_ms`; the lowest and highest are `value_low` and `value_high`.
+- **Wide disagreement** (the highest more than three times the lowest) lowers the outcome's confidence and flags it in the views, instead of being averaged away.
+
+### 5.3 Calibration, continuously and without you
+
+- **Every unassisted task is a calibration point.** When you do something yourself (a commit you wrote, a reply you typed), carbon6 sees both what the estimators would have predicted and what it actually took (presence plus editor time, or the work stretch).
+- **Corrections from the points:** the weekly job refits estimator 1 and the step rates of estimator 2. It also reports how far off the agent's estimates tend to be, as a ratio, which is then applied to estimator 3.
+- **A versioned estimator:** each refit is a new `estimator_version`. Changing the estimator recomputes every outcome's value with it, so history stays comparable. The absolute level may be off, but week-over-week trends are real, and trends are what you steer by.
 
 ## 6. Where measures come from
 
 | Measure | Source | How |
 |---|---|---|
 | `agent_ms`, `steer` | the head, from session events it already receives | a point at turn end, at each of your messages after the first, at interrupt and rewind |
-| `answer`, `wait_on_you_ms` (approvals, questions) | the head, when a decision is answered | `answered_at − created_at`, by kind and how it was answered |
-| `wait_on_you_ms` (reply) | the head | from a turn ending with nothing queued to your next message in that session |
+| `answer`, `wait_on_you_ms` | the head, when a decision is answered, or you reply to a finished turn | `answered_at − created_at`; turn end to your next message |
 | `attention_ms` | the UI's heartbeat (7) | `POST /api/v1/presence` |
-| `outcome`, `outcome_value_ms`, `outside_ms` | a trigger on the `outcomes` collection | record updated with a rating → "record a value" actions (os §4.3); no code |
+| `outside_ms` | the IDE integration | editor activity, by the same rules as presence |
+| Artifact fate (code) | **a git job on workers** | the head asks the worker that holds the repository: blame for the session's lines, reverts, follow-ups, merges. It runs at provisional time and at settling. |
+| Artifact fate (mail, records, outputs) | the memex and the head | drafts against sent, record history, output downloads and citations |
+| Your speed model | the git job, weekly | your commits' work stretches and features, sent to the head to fit |
+| `outcome`, `outcome_retained`, `outcome_value_ms` | a trigger on the `outcomes` collection | record settles → "record a value" actions (os §4.3) |
 
-Only the first three rows are carbon6 code. They are the signals only carbon6 can see, so they belong in the kernel, as `model_spend` already does. Everything about outcomes is configuration: a collection, triggers, a prompt and views, shipped as a root package that can be edited like any app (os §5).
+**Where the line is drawn:**
+- **Code in carbon6:** the signals, the git job and the estimators. Only carbon6 can see turns, presence, workers' repositories and the logs.
+- **Configuration:** the collection, triggers, prompts (judge, `outcome_report`), windows, rates and views. They ship as a root package you can edit like any app (os §5).
 
 ## 7. Attention: presence, not surveillance
 
@@ -107,52 +168,66 @@ Only the first three rows are carbon6 code. They are the signals only carbon6 ca
 - **Phones count too:** the same heartbeat from the phone layout.
 - **Answering by link:** a decision answered from a notification's link adds a fixed amount (30 seconds by default, configurable), since that page has no heartbeat.
 - **What is never sent:** what you typed, what was on screen, or where the mouse was. Only "present, looking at X, for 15 seconds".
-- **Off switch:** Settings → Measurement turns presence off. The other measures don't depend on it, but leverage is then computed against `outside_ms` only, and says so.
-- **Several tabs or tiles:** only the focused tile's focused column counts, and two tabs never double-count: the head keeps the latest heartbeat per 15-second slot.
+- **Off switch:** Settings → Measurement turns presence off. Leverage is then computed against `outside_ms` only, and the views say so.
+- **No double counting:** only the focused tile's focused column counts, and the head keeps one heartbeat per 15-second slot across tabs and devices.
 
 ## 8. Seeing it
 
-All of these are views (os §4.5) in a **Measurement** page, shipped as configuration.
+All of these are views (os §4.5) on a **Measurement** page, shipped as configuration.
 
-- **This week:** leverage, acceptance, outcomes by rating, steering and interruptions per outcome, wait on you (median and 90th percentile), parallelism, cost per outcome. Each is shown beside last week and the four-week average.
-- **Where attention went:** attention by what you were looking at, by label and by kind of outcome. This shows which kinds of work cost you most per outcome.
-- **Bottlenecks:** the longest waits on you this week, and what they waited for. These are candidates for a policy that removes the question.
-- **Worst sessions:** the outcomes with the most steering or that were reworked, with links. These feed the improvement loop (the next design), which mines them for skills, prompts and policies to propose.
-- **Unrated:** outcomes to rate, as a feed with the rating buttons.
+- **This week:** leverage, retention, kept hours, steering and interruptions per outcome, wait on you (median and 90th percentile), parallelism, cost per kept hour. Each is shown beside last week and the four-week average, with the share of outcomes still provisional.
+- **Where attention went:** attention by what you were looking at, by label and by kind of outcome, so you can see which kinds of work cost you most per kept hour.
+- **Bottlenecks:** the longest waits on you, and what they waited for. These are candidates for a policy that removes the question.
+- **Least retained:** settled outcomes with the lowest retention or the most steering, with their evidence. These feed the improvement loop (the next design).
+- **Low confidence:** outcomes where estimators disagree widely or the judge decided, so you can see what the numbers rest on. No action is needed.
+- **Calibration:** each estimator's error against your unassisted tasks, over time.
 
 **The weekly review** is a schedule trigger that starts a template on Monday morning:
 - an agent reads the week's series and outcomes;
-- it writes a short report as an output: the numbers, what changed, the three biggest attention costs, and one proposal for each;
+- it writes a short report as an output: the numbers, what changed, the three biggest costs to your attention, and one proposal for each;
 - the report links to the views;
-- the prompt is a prompt record you can edit.
+- the prompt is a prompt record.
 
-**Thresholds** (series events, os §4.4) can notify you when acceptance drops below a level, or the wait on you climbs. They're off by default.
+**Thresholds** (series events, os §4.4) can notify you when retention drops or the wait on you climbs. They're off by default.
 
 ## 9. Backfill
 
-On first install, a one-time job reads every session's log and every decision, and records the historical points for `agent_ms`, `steer`, `answer` and `wait_on_you_ms` with their original times.
-- Past sessions get unrated outcomes, so the Unrated view can be swept in one sitting, or ignored.
-- Attention has no history, so leverage starts on the day presence is turned on. Until then, views show the measures that have history and say which ones are missing.
+On first install, a one-time job:
+- records the historical points for `agent_ms`, `steer`, `answer` and `wait_on_you_ms` from every session log and decision;
+- creates outcomes for past sessions and rates them from what happened since. Old changes are already settled: git shows whether they survived;
+- fits your speed model from your repositories' history, and values past outcomes with it.
+
+Attention has no history, so leverage starts on the day presence is on. Until then, views show kept hours and the other measures, and say which ones are missing.
 
 ## 10. Guarantees
 
-- **Never guessed:** unrated means unrated, and estimates are labelled with who made them.
-- **Quality beside quantity:** leverage is never shown without acceptance.
-- **Presence only:** no content, screen or keystrokes ever leave the browser.
-- **Your data:** everything stays in the head's database, inside its realm, like any series or collection. Deleting the outcomes collection and the series removes it all.
-- **No new paths:** measures are ordinary series and outcomes are ordinary records, so the API, `carbon6_api`, views, triggers and agents work with them without special cases.
+- **Nothing asked of you:** every outcome is rated and valued automatically. Overrides are optional.
+- **Labelled by source:** each rating says whether it came from signals, the judge or you, and carries its evidence. Each value carries its range and estimator version. Judged ratings and wide ranges are shown as such.
+- **Quality beside quantity:** leverage is never shown without retention, and value only counts in proportion to what was kept.
+- **Comparable history:** a new estimator version revalues everything, so trends never mix versions.
+- **Presence only:** no content, screen or keystrokes leave the browser or the editor.
+- **Your data:** everything stays in the head's database, inside its realm, as ordinary series and records. The git job reads repositories on your workers and sends back only counts and features, never code.
 
 ## 11. Build order
 
 Each step is usable on its own.
 
-1. **Session measures and backfill:** `agent_ms`, `steer`, `answer`, `wait_on_you_ms` recorded by the head, with history backfilled. A first chart view.
-2. **Presence:** the heartbeat, `POST /api/v1/presence`, `attention_ms`, and the off switch.
-3. **Outcomes:** the collection, creation at turn end, the rating buttons and chips, `outcome_report`, the triggers that record `outcome`, `outcome_value_ms` and `outside_ms`.
-4. **The Measurement page and the weekly review:** the views, the review template and its trigger, optional thresholds.
+1. **Session measures and backfill:** `agent_ms`, `steer`, `answer` and `wait_on_you_ms` recorded by the head, with history. A first chart view.
+2. **Outcomes and artifacts:** the collection, creation at turn end, artifacts recorded from sessions, `outcome_report`.
+3. **The git job and retention:** survival, reverts and follow-ups on workers; mail, records and outputs from the memex and the head; provisional and settled ratings; the judge; backfill of past outcomes.
+4. **Value:** the speed model from git, the step replay, the agent's estimate, the ensemble, versioning.
+5. **Presence:** the UI heartbeat, the IDE integration's editor time, `POST /api/v1/presence`, the off switch.
+6. **The Measurement page and the weekly review:** the views, calibration, the review template and its trigger, optional thresholds.
+
+## 11a. Decisions
+
+| Question | Decision |
+|---|---|
+| Rating | Automatic: a retained fraction from what happened to the work, provisional until settled; the judge only where there are no artifacts or signals disagree; your override optional |
+| Baseline | Automatic: the median of your git speed model, a replay of the agent's steps at human speed, and the agent's estimate; calibrated from your unassisted work; versioned |
 
 ## 12. Open questions
 
-- **Rating friction:** whether one click per finished session is acceptable, or whether rating should be sampled (for example every third outcome) once the numbers settle.
-- **What counts as one outcome:** one per root session is simple. Long sessions that deliver several things may need splitting: a "new outcome from here" action, or the agent reporting several.
-- **Time outside carbon6:** whether to estimate it from signals instead of entering it, for example editor activity through the IDE integration.
+- **Settling windows:** whether 7 days for code is long enough to catch reverts and follow-up fixes in how you work.
+- **Your history:** which repositories, authors and time range count as your unassisted work (for example your email addresses in git, and the date you started using agents).
+- **Several outcomes in one session:** a long session that delivers several things may need splitting, by its artifacts (one per branch, draft or output) or by the agent reporting several.
