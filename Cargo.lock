@@ -462,7 +462,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "c6"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "c6-api",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "c6-agent"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "c6-api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "schemars",
  "serde",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "c6-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "c6-eval"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "c6-head"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "c6-llm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "c6-mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "c6-memex"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "c6-proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "c6-testkit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "futures",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "c6-tools"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "c6-ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "c6-api",
  "console_error_panic_hook",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "c6-worker"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "c6h"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "c6-core",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "c6m"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "c6-core",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "c6w"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "c6-core",

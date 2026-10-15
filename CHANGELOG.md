@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 (2026-10-15)
+
+- The policies test waits for the denial to reach the head's log
+- The assistant listens for an approval or an answer before asking, so one given the moment it shows is not lost
+- make check runs clippy on every target and the wasm UI too, so CI fails on clippy warnings
+- Worker tests that restart a worker wait for the old one to let go of its state directory, and the workflow test waits for the step's decision
+- No build warnings anywhere: tract is optimized in dev builds (the memex test binaries outgrew macOS's compact unwind tables), and make check, run by CI on Linux and macOS, fails on any warning
+
 ## 0.2.1 (2026-10-15)
 
 - Release workflow: the bottle jobs get 120 minutes (the Intel runner takes about 50)
