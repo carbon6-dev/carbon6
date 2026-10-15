@@ -17,8 +17,7 @@ ExecStart=/usr/bin/c6m --state-dir /var/lib/c6m run
 StateDirectory=c6m
 StateDirectoryMode=0700
 Environment=NO_COLOR=1
-# c6m shuts down cleanly on SIGINT; anything it started is killed after it exits.
-KillSignal=SIGINT
+# c6m stops cleanly on SIGTERM; anything it started is killed after it exits.
 KillMode=mixed
 TimeoutStopSec=30
 Restart=on-failure

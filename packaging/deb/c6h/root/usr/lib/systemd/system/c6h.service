@@ -13,8 +13,7 @@ ExecStart=/usr/bin/c6h --config /etc/c6h/c6h.toml serve
 StateDirectory=c6h
 StateDirectoryMode=0700
 Environment=NO_COLOR=1
-# c6h shuts down cleanly on SIGINT; anything it started is killed after it exits.
-KillSignal=SIGINT
+# c6h stops cleanly on SIGTERM; anything it started is killed after it exits.
 KillMode=mixed
 TimeoutStopSec=30
 Restart=on-failure

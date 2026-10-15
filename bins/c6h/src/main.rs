@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use c6_head::HeadConfig;
 use clap::{Parser, Subcommand};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
 /// carbon6 head: manages workers and serves the web UI.
@@ -70,8 +71,13 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("sign in with a passkey, or run `c6h login-link` for a one-time link");
             }
             let token = head.shutdown_token();
+            // Ctrl-C, or SIGTERM from systemd, launchd or `docker stop`.
+            let mut term = signal(SignalKind::terminate())?;
             tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
                 token.cancel();
             });
             head.wait().await

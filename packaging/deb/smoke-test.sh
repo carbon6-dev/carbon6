@@ -58,7 +58,7 @@ run "sudo -iu alice c6 login http://127.0.0.1:7700 --token $api_token"
 until_ok 'sudo -iu alice c6 workers | grep -qE "online +alice"' "c6 workers does not list alice online"
 run 'sudo -iu alice c6 workers'
 
-step "Clean stop (SIGINT) and restart"
+step "Clean stop (SIGTERM) and restart"
 run 'systemctl restart c6h c6w@alice c6m'
 until_ok 'journalctl -u c6w@alice | grep -c "attached to head" | grep -qv "^1$"' "c6w@alice did not reattach after a restart"
 run '! journalctl -u c6h -u c6w@alice -u c6m | grep -E "SIGKILL|Killing process|timed out"' || fail "a service had to be killed"

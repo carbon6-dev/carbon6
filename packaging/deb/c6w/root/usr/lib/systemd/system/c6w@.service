@@ -12,8 +12,7 @@ User=%i
 # A login shell, so sessions get the user's PATH (~/.local/bin, ~/.cargo/bin, ...).
 ExecStart=/bin/bash -lc 'exec /usr/bin/c6w run'
 Environment=NO_COLOR=1
-# c6w shuts down cleanly on SIGINT; its sessions' processes are killed after it exits.
-KillSignal=SIGINT
+# c6w stops cleanly on SIGTERM; its sessions' processes are killed after it exits.
 KillMode=mixed
 TimeoutStopSec=30
 Restart=on-failure

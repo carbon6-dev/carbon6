@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use c6_worker::{ConnState, Identity, conn, enroll, identity};
 use clap::{Parser, Subcommand};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -55,8 +56,13 @@ async fn main() -> anyhow::Result<()> {
             let (state_tx, _state_rx) = watch::channel(ConnState::Connecting);
             let stop = CancellationToken::new();
             let token = stop.clone();
+            // Ctrl-C, or SIGTERM from systemd, launchd or `docker stop`.
+            let mut term = signal(SignalKind::terminate())?;
             tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
                 token.cancel();
             });
             conn::run(worker, state_tx, stop).await
