@@ -175,6 +175,8 @@ impl Terminals {
         let pump = tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    // Output first: the shell's last words come before its exit.
+                    biased;
                     chunk = live.recv() => match chunk {
                         Ok(b) => if out_tx.send(frame(pty_frame::Frame::Data(b.to_vec()))).await.is_err() { return },
                         Err(broadcast::error::RecvError::Lagged(n)) => warn!(skipped = n, "terminal viewer fell behind"),
@@ -183,6 +185,15 @@ impl Terminals {
                     r = exited.changed() => {
                         let code = *exited.borrow();
                         if r.is_err() || code.is_some() {
+                            // The reader queued all output before marking the
+                            // exit: pass on what's still queued, then the exit.
+                            loop {
+                                match live.try_recv() {
+                                    Ok(b) => if out_tx.send(frame(pty_frame::Frame::Data(b.to_vec()))).await.is_err() { return },
+                                    Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                                    Err(_) => break,
+                                }
+                            }
                             let code = code.unwrap_or(-1);
                             let _ = out_tx.send(frame(pty_frame::Frame::Exit(PtyExit { code }))).await;
                             return;
