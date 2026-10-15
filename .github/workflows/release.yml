@@ -62,7 +62,8 @@ jobs:
       matrix:
         runner: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # The Intel runner is slow: about 50 minutes, most of it the release build.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
         with:
