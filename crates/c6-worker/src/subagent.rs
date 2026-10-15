@@ -256,7 +256,9 @@ impl Runner {
     ) -> Result<String, String> {
         let p = &self.parent;
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        child.send(crate::session::ActorMsg::Delegate(Box::new(input), Some(tx))).map_err(|_| "the subagent stopped before it started".to_owned())?;
+        child
+            .send(crate::session::ActorMsg::Delegate(Box::new(input), Some(tx)))
+            .map_err(|_| "the subagent stopped before it started".to_owned())?;
         // Stopping the parent's turn (or this background task) stops the
         // subagent's turn; its log keeps what it did. The delegation's
         // outcome follows once that turn closes.
@@ -357,7 +359,8 @@ pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: 
         _ => "0s".into(),
     };
     let by = if by.is_empty() { String::new() } else { format!(" by=\"{by}\"") };
-    let mut out = format!("<subagent id=\"{child_id}\" status=\"{status}\"{by} turns=\"{turns}\" tool_calls=\"{calls}\" elapsed=\"{elapsed}\">\n");
+    let mut out =
+        format!("<subagent id=\"{child_id}\" status=\"{status}\"{by} turns=\"{turns}\" tool_calls=\"{calls}\" elapsed=\"{elapsed}\">\n");
     if !last_text.is_empty() {
         out.push_str(&format!("Last message: {}\n", clip(&last_text, 800)));
     }

@@ -11,7 +11,7 @@ async-trait = "0.1.92"
 base64 = "0.23"
 c6-api.workspace = true
 c6-core = { workspace = true, features = ["upgrade"] }
-c6-llm = { version = "0.1.0", path = "../c6-llm" }
+c6-llm.workspace = true
 c6-worker.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"

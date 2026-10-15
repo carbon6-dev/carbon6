@@ -1,122 +1,117 @@
-# Releases — Design
+# Releases and CI
 
-Status: design only (2026-10-15). Nothing here is built yet.
+Status: built (2026-10-15); the workflows have not yet run on GitHub.
 
 ## 1. Goals
 
-- **One command cuts a release:** `make release BUMP=minor` checks, versions, writes the changelog, builds every artifact, tests them, commits and tags.
-- **Built here, not in CI.** Everything runs on the release Mac: Docker builds the Linux packages (as `make docker-deb-all` does today), the local toolchain builds the macOS bottles. No GitHub Actions.
-- **Cutting is local; publishing is a separate step.** `make release` touches only this checkout and `dist/`. `make release-publish` is the one step that pushes and uploads, run when you choose to.
-- **Nothing half-done.** A release that fails a check leaves no commit, no tag and no artifacts behind.
+- **One command cuts a release:** `make release BUMP=minor`. GitHub Actions does the rest: tests, every package, smoke tests, the GitHub release and the Homebrew tap.
+- **CI runs what you run.** Each workflow step is a make target or a script under `packaging/`, so any CI failure can be reproduced with the same command on your machine.
+- **Every change is tested** on Linux and macOS, on every push to `main` and every pull request.
+- **Nothing half-done.** A release that fails before its tag leaves nothing behind. One that fails in CI publishes nothing, and the fix is a new patch release.
 
 **Not goals (for now):** an apt repository (so `apt upgrade` would find new versions), signed packages, Docker images on a registry, Windows.
 
-## 2. Versions
+## 2. Workflows
 
-- **Semver, from the last tag.** `BUMP=patch|minor|major` (default `patch`), or `VERSION=x.y.z` to set it. The first release is `0.2.0`: `0.1.0` has been the unreleased development version.
-- **One version for the workspace.** Every crate takes `version.workspace = true` (today several set `0.1.0` themselves), so the release sets `[workspace.package] version` alone, and `Cargo.lock` follows. `c6_core::VERSION` (sent by workers to the head, recorded with database upgrades) is that version.
-- **Tags:** annotated, `v0.2.0`.
+| Workflow | Runs on | Does |
+|---|---|---|
+| **Test** (`.github/workflows/test.yml`) | push to `main`, pull requests, and from Release | `cargo test --locked` on Ubuntu 24.04 and macOS 15; the web UI compiles for wasm32 |
+| **Release** (`.github/workflows/release.yml`) | a `v*` tag; or by hand, as a dry run | §4 |
+
+**Toolchain:** the Rust and Trunk versions come from `docker/Dockerfile` (`RUST_VERSION`, `TRUNK_VERSION`), through `.github/actions/rust`. The Docker builds use the same versions, so local and CI builds match.
+
+## 3. Versions
+
+- **Semver.** `make release BUMP=patch|minor|major` (default `patch`), or `VERSION=x.y.z`. The first release is `0.2.0` (`make release BUMP=minor`): `0.1.0` has been the unreleased development version.
+- **One version for the workspace.** Every crate has `version.workspace = true`, so a release sets `[workspace.package] version` alone. `c6_core::VERSION`, which workers send to the head and which database upgrades record, is that version.
+- **Tags:** annotated, `v0.2.0`. The Release workflow refuses a tag that doesn't match the workspace version.
 - **Package versions:**
-  - a release: `0.2.0` (deb and brew alike);
-  - a build between releases, as today: `0.2.0+git<commit time>.<commit>` (deb) and `0.2.0.<commit time>` (brew).
+  - at a release tag: `0.2.0` (deb and brew alike);
+  - between releases: `0.2.0+git<commit time>.<commit>` (deb) and `0.2.0.<commit time>` (brew).
 
-  Both sort after `0.2.0` and before `0.2.1`, so upgrades go the right way whichever you install.
-- **Telling builds apart:** between releases a build still reports `0.2.0` from `--version`. Adding the commit to the version string (`0.2.0+git…`, from a build script) is a small follow-up (§8).
+  Both sort after `0.2.0` and before `0.2.1`, so upgrades go the right way. The Makefile picks the right one by itself: `RELEASE_TAG` is set when `HEAD` carries `v<crate version>`.
 
-## 3. `make release`
+## 4. Cutting a release
 
-`make release [BUMP=patch|minor|major | VERSION=x.y.z]`, in order:
+`make release [BUMP=… | VERSION=…]` runs `packaging/release/release.sh` on your machine:
 
 1. **Checks:**
-   - on `main`, with a clean tree;
-   - the new version is greater than the last tag, and its tag doesn't exist;
-   - Docker, the local toolchain and Homebrew are there.
-2. **Tests:** `make docker-test` (the full suite, on Linux) and `cargo test` (macOS).
-3. **The release commit:**
-   - sets the version (§2);
-   - adds the changelog section (§5);
-   - commits `Release 0.2.0`, without tagging yet.
-4. **Artifacts**, built from that commit into `dist/release/0.2.0/` (§4).
-5. **Smoke tests:**
-   - the deb smoke test on amd64 and arm64 (`make docker-deb-test`, both architectures);
-   - the bottles installed from a scratch tap and run with scratch state, as `make brew-install` was checked.
-6. **The tag:** `v0.2.0`, on the release commit. `SHA256SUMS` is written last.
+   - on `main`, with a clean tree, at `origin/main`;
+   - the version is newer than the current one;
+   - its tag doesn't exist.
+2. **The release commit:**
+   - sets the version, and refreshes `Cargo.lock` offline;
+   - puts a new section at the top of `CHANGELOG.md` (§5);
+   - commits `Release 0.2.0` and tags `v0.2.0`.
 
-If a step before the tag fails, the target resets the release commit and removes `dist/release/0.2.0/`. **`make release-undo`** does the same after a successful run, until the release is published: it deletes the tag, resets the commit and removes the artifacts.
+   A failure along the way puts everything back.
+3. **Push:** asks first (`YES=1` skips the question), then `git push --atomic origin main v0.2.0`. Not pushed, the commit and tag stay local; `git tag -d v0.2.0 && git reset --hard HEAD~1` undoes them.
 
-## 4. Artifacts
+The tag starts the **Release workflow**:
 
-In `dist/release/<version>/`:
-
-| File | What it is | Built by |
+| Job | Runner | Does |
 |---|---|---|
-| `c6h_<v>_amd64.deb` and `_arm64.deb` (and `c6w`, `c6m`, `c6`) | Ubuntu packages, built on 22.04, installable on 22.04 and later | Docker (`docker-deb-all`) |
-| `c6h-<v>.arm64_big_sur.bottle.tar.gz` (and the others) | Homebrew bottles for Apple Silicon, macOS 11 and later | local toolchain (`brew`) |
-| `c6h-<v>.big_sur.bottle.tar.gz` (and the others) | Homebrew bottles for Intel Macs, cross-built with the `x86_64-apple-darwin` target | local toolchain |
-| `carbon6-<v>-linux-amd64.tar.gz` and `-linux-arm64.tar.gz` | the four binaries, for Linux without packages | Docker (`docker-build-all`) |
-| `carbon6-<v>-darwin-arm64.tar.gz` and `-darwin-amd64.tar.gz` | the four binaries, for macOS without Homebrew | local toolchain |
-| `Formula/*.rb` | the formulas, pointing at the release's download URLs | `packaging/brew/build.sh` |
-| `SHA256SUMS` | checksums of everything above | `make release` |
+| check | ubuntu-24.04 | the tag matches the workspace version |
+| test | Test workflow | Linux and macOS suites |
+| linux | ubuntu-24.04, ubuntu-24.04-arm | `make docker-deb-test`: the .debs and `carbon6-<v>-linux-<arch>.tar.gz`, built on Ubuntu 22.04 natively per architecture, then installed under systemd, run, upgraded and removed |
+| macos | macos-15 (Apple Silicon), macos-15-intel | `make brew-test`: bottles and binary tarballs, then installed from a scratch tap, the head started with `brew services`, a worker and the memex attached, stopped with SIGTERM |
+| publish | ubuntu-24.04, after all the others | `packaging/release/publish.sh` (§6) |
 
-**One build per platform.** The deb and the Linux tarball hold the same binaries, and so do the bottle and the macOS tarball.
+**Dry run:** started by hand (Actions → Release → Run workflow, or `gh workflow run release.yml`), the workflow builds and tests everything and keeps the artifacts on the run. `publish` is skipped. Do this once before the first release.
 
 ## 5. Changelog
 
 - **`CHANGELOG.md`, newest first.** Each release adds a section: `## 0.2.0 (2026-10-15)`, then one bullet per commit since the previous tag, its one-line message as written.
 - **Release commits are left out** of the list.
-- **The first release** lists everything since the start of the repository (166 commits today), under a one-line summary that you write.
-- **The same section is the GitHub release's notes** (§6).
-- **Editing:** to change the wording, edit `CHANGELOG.md` after `make release`, then `git commit --amend` and move the tag (`make release-undo` and run it again also works). Publishing reads the file, so your edit carries through.
+- **The first release lists every commit** since the start of the repository.
+- **The same section is the GitHub release's notes.**
+- **Preview:** `make release-notes` prints the next section without changing anything.
 
-## 6. `make release-publish`
+## 6. Publishing
 
-Run after `make release`, when you're ready:
+`publish.sh <version> <dir>` runs in the Release workflow, on the artifacts of the other jobs:
 
-1. **Checks:**
-   - `gh` is installed and signed in (`brew install gh`, `gh auth login`, once);
-   - the tag is on `HEAD`;
-   - `origin/main` fast-forwards to `HEAD`;
-   - the release doesn't exist on GitHub yet.
-2. **Pushes** `main` and the tag.
-3. **The GitHub release:** `gh release create v0.2.0 --notes-file <the changelog section>`, uploading every file in `dist/release/0.2.0/` except the formulas.
-4. **The tap:** the formulas go to a separate repository, `carbon6-dev/homebrew-carbon6`, created once by you.
-   - Each formula's `url` and bottle `root_url` point at `https://github.com/carbon6-dev/carbon6/releases/download/v0.2.0/`. Homebrew asks for `<name>-<version>.<tag>.bottle.tar.gz` there, the names §4 uses.
-   - The target clones the tap into a scratch directory, replaces `Formula/`, commits `c6h, c6w, c6m, c6 0.2.0` and pushes.
-   - Anyone can then run `brew install carbon6-dev/carbon6/c6h`, and `brew upgrade` finds new releases.
-5. **Prints** the release URL and the install commands.
+1. **The formulas,** written by `packaging/brew/formulas.sh`:
+   - one per binary, covering both architectures (`on_arm` / `on_intel`);
+   - with a bottle for each;
+   - downloading from `https://github.com/carbon6-dev/carbon6/releases/download/v<version>/`.
+2. **`SHA256SUMS`** of every file, and **the notes:** the version's section of `CHANGELOG.md`.
+3. **The GitHub release** `v<version>`, with the files below. If the release already exists (a re-run), missing files are uploaded.
+4. **The tap:** the formulas are committed to `carbon6-dev/homebrew-carbon6`, so `brew install carbon6-dev/carbon6/c6h` works and `brew upgrade` finds new releases.
+   - This needs the repository secret `TAP_TOKEN`: a fine-grained token with *Contents: read and write* on the tap repository only.
+   - Without the secret, the formulas are only attached to the release, and the run says so.
 
-**Requirement: public downloads.** Release assets of a private repository need a token to download, which neither `apt install ./…deb` instructions nor Homebrew's bottle downloads handle. Today `carbon6-dev/carbon6` is private (github.com answers 404 without sign-in), so this must be settled before §6 is built (§9).
+The files on a release:
 
-**Partial failure:** a re-run picks up where it stopped. A pushed tag is skipped, an existing release gets the missing uploads, and the tap commit is skipped if it's unchanged. Nothing published is deleted automatically.
+| File | What it is |
+|---|---|
+| `c6h_<v>_amd64.deb`, `_arm64.deb` (and `c6w`, `c6m`, `c6`) | Ubuntu packages with systemd units, for 22.04 and later |
+| `carbon6-<v>-linux-amd64.tar.gz`, `-arm64` | the four binaries, for Linux without packages |
+| `c6h-<v>.arm64_big_sur.bottle.tar.gz`, `.big_sur.` (and the others) | Homebrew bottles, Apple Silicon and Intel, for macOS 11 and later |
+| `c6h-<v>-darwin-arm64.tar.gz`, `-x86_64` (and the others) | each binary for macOS without Homebrew; also the formulas' source |
+| `c6h.rb` and the other formulas | the formulas, as pushed to the tap |
+| `SHA256SUMS` | checksums of all of the above |
 
 ## 7. Make targets
 
 | Target | Does |
 |---|---|
-| `make release [BUMP=… \| VERSION=…]` | §3: checks, tests, release commit, artifacts, smoke tests, tag |
-| `make release-undo` | removes an unpublished release: tag, commit, artifacts |
-| `make release-publish` | §6: push, GitHub release, tap |
-| `make release-notes` | prints the changelog section the next release would add, without changing anything |
+| `make release [BUMP=… \| VERSION=…]` | §4: checks, release commit, tag, push |
+| `make release-notes` | prints the next changelog section |
+| `make docker-deb-test [ARCH=…]` | the Linux job: builds and tries the .debs under systemd |
+| `make brew-test` | the macOS job: builds and tries the bottles. It installs into this Mac's Homebrew, so it refuses where c6h etc. are installed or :7700 is in use, and removes all it installed |
+| `make brew-dist` | bottles and formulas (with `file://` URLs) into `dist/brew/`, without a tap |
 
-The work is done by `packaging/release/*.sh` scripts, which reuse the existing targets. `docker-deb-all`, `docker-deb-test` and `brew` gain a `PKG_VERSION` override so a release builds with the plain version.
+## 8. Setting it up (once)
 
-## 8. Build order
-
-1. **One workspace version:** every crate gets `version.workspace = true`, and `make release-notes` is added.
-2. **`make release` and `make release-undo`**, with the artifacts this Mac already builds (debs, Apple Silicon bottles, Linux tarballs).
-3. **Intel Mac bottles and the macOS tarballs:** add the `x86_64-apple-darwin` rustup target, build with `--target`, bottle tag `big_sur`.
-4. **`make release-publish`:** `gh`, the tap repository.
-5. **Follow-ups:**
-   - the commit in `--version` between releases;
-   - an upgrade check from the previous release's databases (§9).
+1. **Dry run:** run the Release workflow by hand on `main` (§4) and check that every job passes.
+2. **Tap repository:** create a public, empty `carbon6-dev/homebrew-carbon6`.
+3. **Token:** make a fine-grained token for it with *Contents: read and write*, and add it to `carbon6-dev/carbon6` as the Actions secret `TAP_TOKEN`.
+4. **Release:** `make release BUMP=minor` cuts `0.2.0`.
 
 ## 9. Open questions
 
-- **Upgrade check across releases.** `make release` could keep a small `c6h.db` and `memex.db` from each release (`packaging/release/fixtures/<version>/`) and run `c6h upgrade --check` / `c6m upgrade --check` from the previous one. That catches a migration that breaks upgrades before it ships. It's worth having once there are real installs to protect.
-- **Private repository (blocks §6).** `carbon6-dev/carbon6` is private today, so §6's public downloads don't work. The choices:
-  - make the repository public;
-  - a public repository for releases only (`carbon6-dev/releases`: assets and the tap, no source);
-  - a private tap with a token (`HOMEBREW_GITHUB_API_TOKEN` and a download strategy for private assets): fine for your own machines, unusable for anyone else;
-  - your own server.
-- **An apt repository.** Today a new release has to be installed by hand (`apt install ./c6h_….deb`). A signed apt repository (on GitHub Pages, or a server you run) would let `apt upgrade` pick releases up. It needs a signing key.
-- **Docker images.** `carbon6/c6h` and `carbon6/c6w` could be pushed to `ghcr.io` with the same tag.
+- **Upgrade check across releases.** A release could keep a small `c6h.db` and `memex.db` (`packaging/release/fixtures/<version>/`), and the Release workflow could run `c6h upgrade --check` and `c6m upgrade --check` from the previous release's copies. That catches a migration that breaks upgrades before it ships.
+- **The commit in `--version` between releases.** Today a build after `0.2.0` reports `0.2.0`. A build script could add `+git<commit>`.
+- **An apt repository.** A signed one, on GitHub Pages, would let `apt upgrade` pick up releases. It needs a signing key in the repository's secrets.
+- **Docker images.** `carbon6/c6h` and `carbon6/c6w` could be pushed to `ghcr.io` by the Release workflow.

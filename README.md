@@ -74,6 +74,9 @@ make docker-token      # an enrollment token from that head
 - **`c6w`:** `c6w enroll <token>`, then `brew services start c6w`. It starts through a login shell, so sessions get your `PATH`.
 - **`c6m`:** `c6m enroll <token>`, then `brew services start c6m`.
 - Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`, `c6m.log`). The worker and memex keep the standard state folders (`~/Library/Application Support/c6w`, `c6m`), the same ones `make dev-worker` and `make dev-memex` use.
+- `make brew-test` installs the bottles from a scratch tap and runs them, as the Release workflow does, then removes them.
+
+**CI and releases.** GitHub Actions runs the tests on Linux and macOS for every push to `main` and every pull request. `make release BUMP=patch|minor|major` bumps the version, adds the commits since the last release to `CHANGELOG.md`, commits, tags and pushes. The tag's Release workflow tests, builds the .debs (amd64, arm64) and bottles (Apple Silicon, Intel), smoke-tests them, and publishes the GitHub release and the Homebrew tap. See [docs/releases.md](docs/releases.md).
 
 **With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
 

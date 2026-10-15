@@ -1,17 +1,16 @@
 class C6h < Formula
   desc "carbon6 head: manages workers and serves the web UI"
   homepage "https://github.com/carbon6-dev/carbon6"
-  url "@URL@"
   version "@VERSION@"
-  sha256 "@SHA256@"
   license any_of: ["MIT", "Apache-2.0"]
+@SOURCES@
 
   bottle do
     root_url "@ROOT_URL@"
-    sha256 cellar: :any_skip_relocation, @BOTTLE_TAG@: "@BOTTLE_SHA256@"
+@BOTTLES@
   end
 
-  depends_on arch: :@ARCH@
+@DEPENDS_ON_ARCH@
   depends_on :macos
 
   def install

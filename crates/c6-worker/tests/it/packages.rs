@@ -36,14 +36,10 @@ async fn packages_require_install_and_remove() {
         v
     };
     let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
-    let add = |manifest: Value, files: Value| {
-        async move { send(M::POST, "packages", json!({"manifest": manifest, "files": files})).await }
-    };
-    let decide = |id: i64, option: &'static str| {
-        async move {
-            let r = send(M::POST, &format!("decisions/{id}/answer"), json!({"option": option})).await;
-            assert!(r.status().is_success(), "{}", r.text().await.unwrap());
-        }
+    let add = |manifest: Value, files: Value| async move { send(M::POST, "packages", json!({"manifest": manifest, "files": files})).await };
+    let decide = |id: i64, option: &'static str| async move {
+        let r = send(M::POST, &format!("decisions/{id}/answer"), json!({"option": option})).await;
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     };
 
     // A kit, built from another kit.
@@ -212,7 +208,8 @@ async fn kits_build_and_run_sandboxed() {
         eprintln!("no container runtime; skipped");
         return;
     };
-    let has_base = tokio::process::Command::new(&rt).args(["image", "inspect", "debian:bookworm-slim"]).output().await.unwrap().status.success();
+    let has_base =
+        tokio::process::Command::new(&rt).args(["image", "inspect", "debian:bookworm-slim"]).output().await.unwrap().status.success();
     if !has_base {
         eprintln!("debian:bookworm-slim is not pulled; skipped");
         return;
@@ -241,26 +238,47 @@ async fn kits_build_and_run_sandboxed() {
     let nonce = format!("{:x}", c6_core::now_ms());
     let base = format!("c6test-base-{nonce}");
     let probe = format!("c6test-probe-{nonce}");
-    ok(send(M::POST, "packages", json!({"manifest": {"package": base, "version": "1.0.0", "kit": {"tools": []}},
-        "files": {"Dockerfile": b64("FROM debian:bookworm-slim\nRUN echo base > /opt/base.txt\n")}})).await).await;
+    ok(send(
+        M::POST,
+        "packages",
+        json!({"manifest": {"package": base, "version": "1.0.0", "kit": {"tools": []}},
+        "files": {"Dockerfile": b64("FROM debian:bookworm-slim\nRUN echo base > /opt/base.txt\n")}}),
+    )
+    .await)
+    .await;
     let script = "echo \"routes: $(tail -n +2 /proc/net/route | wc -l)\"; echo \"uid: $(id -u)\"; cat /opt/base.txt; \
                   touch /etc/x 2>/dev/null && echo root-writable || echo root-read-only; echo made > \"$1\"; echo \"tmp: $(touch /tmp/t && echo ok)\"\n";
     ok(send(M::POST, "packages", json!({"manifest": {"package": probe, "version": "1.0.0", "requires": {&base: "^1"},
         "kit": {"build": {"files": ["probe.sh"]}, "tools": [{"name": "probe", "description": "Looks around.", "command": ["sh", "/opt/probe.sh", "{out}"], "args": {"out": "path"}}]}},
         "files": {"Dockerfile": b64(&format!("FROM kit:{base}\nCOPY probe.sh /opt/probe.sh\n")), "probe.sh": b64(script)}})).await).await;
-    ok(send(M::POST, "packages", json!({"manifest": {"package": "probe-lib", "version": "1.0.0", "requires": {&probe: "*"},
-        "contents": {"skills": [{"name": "probing", "body": "Use kit_run."}]}}, "files": {}})).await).await;
-    let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "probe-lib", "realm": "home"})).await).await).unwrap();
+    ok(send(
+        M::POST,
+        "packages",
+        json!({"manifest": {"package": "probe-lib", "version": "1.0.0", "requires": {&probe: "*"},
+        "contents": {"skills": [{"name": "probing", "body": "Use kit_run."}]}}, "files": {}}),
+    )
+    .await)
+    .await;
+    let i: Install =
+        serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "probe-lib", "realm": "home"})).await).await).unwrap();
     let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
 
     mock.push(Reply::ToolCalls(vec![("kit_run".into(), json!({}).to_string())]));
-    mock.push(Reply::ToolCalls(vec![("kit_run".into(), json!({"kit": probe, "tool": "probe", "args": {"out": "out/made.txt"}}).to_string())]));
-    mock.push(Reply::ToolCalls(vec![("kit_run".into(), json!({"kit": probe, "tool": "probe", "args": {"out": "../escape.txt"}}).to_string())]));
+    mock.push(Reply::ToolCalls(vec![(
+        "kit_run".into(),
+        json!({"kit": probe, "tool": "probe", "args": {"out": "out/made.txt"}}).to_string(),
+    )]));
+    mock.push(Reply::ToolCalls(vec![(
+        "kit_run".into(),
+        json!({"kit": probe, "tool": "probe", "args": {"out": "../escape.txt"}}).to_string(),
+    )]));
     mock.push(Reply::ToolCalls(vec![("kit_shell".into(), json!({"kit": probe, "command": "id"}).to_string())]));
     mock.push(Reply::Text("Done.".into()));
     std::fs::create_dir(work.path().join("out")).unwrap();
-    ok(send(M::POST, "sessions", json!({"worker_id": wid, "cwd": work.path(), "connection_id": conn.id, "model": "m", "prompt": "probe"})).await).await;
+    ok(send(M::POST, "sessions", json!({"worker_id": wid, "cwd": work.path(), "connection_id": conn.id, "model": "m", "prompt": "probe"}))
+        .await)
+    .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     let seen = loop {
         let reqs = mock.requests();
@@ -271,7 +289,16 @@ async fn kits_build_and_run_sandboxed() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     assert!(!seen.contains(&format!("\\\"kit\\\": \\\"{base}")), "build-only kits are not listed: {seen}");
-    for want in ["Looks around.", "routes: 0", "uid: ", "base", "root-read-only", "tmp: ok", "outside the session's folder", "does not allow a shell"] {
+    for want in [
+        "Looks around.",
+        "routes: 0",
+        "uid: ",
+        "base",
+        "root-read-only",
+        "tmp: ok",
+        "outside the session's folder",
+        "does not allow a shell",
+    ] {
         assert!(seen.contains(want), "{want} in {seen}");
     }
     assert!(!seen.contains("uid: 0\\"), "not root: {seen}");
@@ -324,7 +351,10 @@ async fn with_worker() -> WithWorker {
     let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
     let stop = tokio_util::sync::CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(std::time::Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. })))
+        .await
+        .unwrap()
+        .unwrap();
     let conn: c6_api::Connection = reqwest::Client::new()
         .post(format!("{api}/connections"))
         .json(&json!({"name": "m", "base_url": mock.base_url()}))
@@ -357,21 +387,42 @@ async fn template_start_through_an_export() {
         v
     };
     let templates = json!([{"name": "make", "prompt": "Make: {{input}}"}, {"name": "secret", "prompt": "Secret: {{input}}"}]);
-    ok(send(M::POST, "packages", json!({"manifest": {"package": "maker", "version": "1.0.0", "realm": "maker",
-        "contents": {"templates": templates}, "exports": {"templates": ["make"]}}, "files": {}})).await).await;
-    ok(send(M::POST, "packages", json!({"manifest": {"package": "user", "version": "1.0.0", "realm": "user", "requires": {"maker": "^1"},
-        "contents": {"skills": [{"name": "s", "body": "b"}]}}, "files": {}})).await).await;
+    ok(send(
+        M::POST,
+        "packages",
+        json!({"manifest": {"package": "maker", "version": "1.0.0", "realm": "maker",
+        "contents": {"templates": templates}, "exports": {"templates": ["make"]}}, "files": {}}),
+    )
+    .await)
+    .await;
+    ok(send(
+        M::POST,
+        "packages",
+        json!({"manifest": {"package": "user", "version": "1.0.0", "realm": "user", "requires": {"maker": "^1"},
+        "contents": {"skills": [{"name": "s", "body": "b"}]}}, "files": {}}),
+    )
+    .await)
+    .await;
     let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "user"})).await).await).unwrap();
     let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
 
-    w.mock.push(Reply::ToolCalls(vec![("template_start".into(), json!({"realm": "maker", "template": "secret", "input": "x"}).to_string())]));
-    w.mock.push(Reply::ToolCalls(vec![("template_start".into(), json!({"realm": "maker", "template": "make", "input": "a chair"}).to_string())]));
+    w.mock
+        .push(Reply::ToolCalls(vec![("template_start".into(), json!({"realm": "maker", "template": "secret", "input": "x"}).to_string())]));
+    w.mock.push(Reply::ToolCalls(vec![(
+        "template_start".into(),
+        json!({"realm": "maker", "template": "make", "input": "a chair"}).to_string(),
+    )]));
     w.mock.push(Reply::Text("Started.".into()));
     w.mock.push(Reply::Text("Made.".into()));
     let s: c6_api::Session = serde_json::from_value(
-        ok(send(M::POST, "sessions", json!({"worker_id": w.wid, "cwd": "", "connection_id": w.conn.id, "model": "m", "prompt": "go", "realm": "user"})).await)
-            .await,
+        ok(send(
+            M::POST,
+            "sessions",
+            json!({"worker_id": w.wid, "cwd": "", "connection_id": w.conn.id, "model": "m", "prompt": "go", "realm": "user"}),
+        )
+        .await)
+        .await,
     )
     .unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -419,11 +470,14 @@ async fn decks_render_kit_renders_a_deck() {
     let kit: Value = serde_json::from_str(include_str!("../../../../examples/packages/decks-render.json")).unwrap();
     let decks: Value = serde_json::from_str(include_str!("../../../../examples/apps/decks.json")).unwrap();
     ok(http.post(format!("{api}/packages")).json(&kit).send().await.unwrap()).await;
-    let i: c6_api::AppInstall = serde_json::from_value(ok(http.post(format!("{api}/apps")).json(&decks).send().await.unwrap()).await).unwrap();
-    ok(http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap()).await;
+    let i: c6_api::AppInstall =
+        serde_json::from_value(ok(http.post(format!("{api}/apps")).json(&decks).send().await.unwrap()).await).unwrap();
+    ok(http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap())
+        .await;
 
     // A deck made the way deck-html says: its base CSS and a theme.
-    let skill = decks["contents"]["skills"].as_array().unwrap().iter().find(|s| s["name"] == "deck-html").unwrap()["body"].as_str().unwrap();
+    let skill =
+        decks["contents"]["skills"].as_array().unwrap().iter().find(|s| s["name"] == "deck-html").unwrap()["body"].as_str().unwrap();
     let base = skill.split("```css\n").nth(1).unwrap().split("```").next().unwrap();
     let work = tempfile::tempdir().unwrap();
     std::fs::write(

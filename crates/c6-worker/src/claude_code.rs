@@ -178,7 +178,9 @@ async fn run_process(
         return Ok(Outcome::Ended(TurnEndReason::Interrupted));
     }
     // Subagents whose call never got a result ended with the process.
-    mapper.close_children(if mapper.result == Some(TurnEndReason::Completed) { TurnEndReason::Completed } else { TurnEndReason::Error }).await?;
+    mapper
+        .close_children(if mapper.result == Some(TurnEndReason::Completed) { TurnEndReason::Completed } else { TurnEndReason::Error })
+        .await?;
     let status = child.wait().await?;
     let stderr = stderr_task.await.unwrap_or_default();
     if let Some(r) = mapper.result {
@@ -330,7 +332,8 @@ impl Mapper<'_> {
                     _ => String::new(),
                 };
                 if !text.trim().is_empty() {
-                    log.append(session_event::Kind::User(UserMessage { text, delegated_by: call.to_owned(), ..Default::default() })).await?;
+                    log.append(session_event::Kind::User(UserMessage { text, delegated_by: call.to_owned(), ..Default::default() }))
+                        .await?;
                 }
                 for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     let r = tool_result(b);
@@ -430,7 +433,11 @@ fn tool_result(b: &Value) -> ToolResult {
         .filter_map(|p| {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.decode(p["source"]["data"].as_str()?).ok()?;
-            Some(c6_proto::Attachment { name: "image".into(), mime: p["source"]["media_type"].as_str().unwrap_or("image/png").into(), data })
+            Some(c6_proto::Attachment {
+                name: "image".into(),
+                mime: p["source"]["media_type"].as_str().unwrap_or("image/png").into(),
+                data,
+            })
         })
         .collect();
     ToolResult {
@@ -612,10 +619,22 @@ JSON
         };
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
-        let reason =
-            run_process(&bin, 1, "0199-main", dir.path(), "opus", None, None, "go", false, &sink, Some(&observer), &CancellationToken::new())
-                .await
-                .unwrap();
+        let reason = run_process(
+            &bin,
+            1,
+            "0199-main",
+            dir.path(),
+            "opus",
+            None,
+            None,
+            "go",
+            false,
+            &sink,
+            Some(&observer),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(reason, Outcome::Ended(TurnEndReason::Completed)));
         let main = vec_sink.0.lock().unwrap().clone();
         assert_eq!(main.iter().map(kind).collect::<Vec<_>>(), ["assistant", "subagent_spawned", "tool_result", "assistant", "usage"]);

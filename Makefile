@@ -20,19 +20,25 @@ UBUNTU       ?= 22.04
 DEB_DIR       = dist/deb/ubuntu-$(UBUNTU)
 CRATE_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 COMMIT_TIME   = $(shell git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)
-# <crate version>+git<commit time>.<commit>, so every commit sorts newer.
-DEB_VERSION  ?= $(CRATE_VERSION)+git$(COMMIT_TIME).$(shell git rev-parse --short HEAD)
-DEB_MAINTAINER ?= $(shell git config user.name) <$(shell git config user.email)>
+# Set when HEAD is the release v<crate version>: its packages get the plain
+# version. Between releases they get one that sorts after the last release
+# and every earlier commit.
+RELEASE_TAG   = $(shell git tag --points-at HEAD --list 'v$(CRATE_VERSION)')
+# <crate version>+git<commit time>.<commit> between releases.
+DEB_VERSION  ?= $(if $(RELEASE_TAG),$(CRATE_VERSION),$(CRATE_VERSION)+git$(COMMIT_TIME).$(shell git rev-parse --short HEAD))
+# The author of the commit the packages are built from.
+DEB_MAINTAINER ?= $(shell git log -1 --format='%an <%ae>')
 BREW         ?= brew
 BREW_TAP     ?= carbon6/local
 BREW_DIR      = dist/brew
-# <crate version>.<commit time>: Homebrew puts it in file:// URLs, so digits and dots only.
-BREW_VERSION ?= $(CRATE_VERSION).$(COMMIT_TIME)
+# <crate version>.<commit time> between releases: Homebrew puts it in file://
+# URLs, so digits and dots only.
+BREW_VERSION ?= $(if $(RELEASE_TAG),$(CRATE_VERSION),$(CRATE_VERSION).$(COMMIT_TIME))
 BREW_ENV      = HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSION) --build-arg "MAINTAINER=$(DEB_MAINTAINER)"
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
-        docker-deb docker-deb-all docker-deb-test brew brew-install \
+        docker-deb docker-deb-all docker-deb-test brew-dist brew brew-install brew-test release release-notes \
         ui build test dev-head dev-token dev-login-link dev-worker dev-memex clean
 
 help: ## Show this help
@@ -80,7 +86,7 @@ docker-login-link: ## Print a one-time web UI login link from the running head c
 ##@ Ubuntu packages (Docker only)
 
 docker-deb: ## Build .deb packages of c6h, c6w and c6m (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=22.04; they install on later releases too)
-	rm -f $(DEB_DIR)/*_$(ARCH).deb
+	rm -f $(DEB_DIR)/*_$(ARCH).deb $(DEB_DIR)/*-linux-$(ARCH).tar.gz
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
 	@ls -l $(DEB_DIR)
 
@@ -95,9 +101,12 @@ docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under
 
 ##@ Homebrew (macOS, local toolchain)
 
-brew: build ## Build bottles and formulas of c6h, c6w, c6m (as brew services) and c6 into dist/brew/, and add them to the local tap carbon6/local (BREW_TAP)
+brew-dist: build ## Build bottles and formulas of c6h, c6w, c6m (as brew services) and c6 for this Mac's architecture into dist/brew/
 	rm -rf $(BREW_DIR)
 	packaging/brew/build.sh target/release $(BREW_VERSION) $(BREW_DIR)
+	packaging/brew/formulas.sh $(BREW_VERSION) $(BREW_DIR) file://$(abspath $(BREW_DIR)) $(BREW_DIR)/Formula
+
+brew: brew-dist ## brew-dist, then add the formulas to the local tap carbon6/local (BREW_TAP)
 	@tap="$$($(BREW) --repo $(BREW_TAP))"; \
 	test -d "$$tap" || $(BREW_ENV) $(BREW) tap-new --no-git $(BREW_TAP); \
 	mkdir -p "$$tap/Formula" && cp $(BREW_DIR)/Formula/*.rb "$$tap/Formula/" && echo "Formulas in $$tap/Formula"
@@ -110,6 +119,17 @@ brew-install: brew ## Install or upgrade c6h, c6w, c6m and c6 from the local tap
 	@for f in $$($(BREW) services list | awk '$$1 ~ /^c6[hwm]$$/ && $$2 == "started" { print $$1 }'); do \
 		$(BREW) services restart $$f; \
 	done
+
+brew-test: brew-dist ## Install the formulas from a scratch tap and run them: head as a brew service, worker and memex attach, c6 sees them, SIGTERM stops them (refuses if c6h etc. are installed)
+	packaging/brew/smoke-test.sh $(BREW_DIR)/Formula
+
+##@ Releases
+
+release: ## Cut a release (BUMP=patch|minor|major, or VERSION=x.y.z): check, bump the version, add to CHANGELOG.md, commit, tag v<version> and push, which starts the Release workflow
+	packaging/release/release.sh $(if $(filter command line,$(origin VERSION)),$(VERSION),$(or $(BUMP),patch))
+
+release-notes: ## Print the CHANGELOG.md section the next release would add
+	@packaging/release/notes.sh
 
 ##@ Local toolchain
 

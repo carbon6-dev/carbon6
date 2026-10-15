@@ -1,0 +1,36 @@
+# The test suite on Linux and macOS, for every push to main and every pull
+# request. The Release workflow runs it too.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      - name: A git identity, for tests that commit
+        run: git config --global user.email test@c6 && git config --global user.name test
+      - run: cargo test --locked
+      - name: The web UI compiles
+        if: runner.os == 'Linux'
+        run: cargo check --locked -p c6-ui --target wasm32-unknown-unknown

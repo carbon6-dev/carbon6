@@ -663,7 +663,9 @@ impl SessionManager {
             let child = events
                 .iter()
                 .find_map(|e| match &e.kind {
-                    Some(session_event::Kind::SubagentSpawned(sp)) if sp.background_task_id == t.task_id => Some(sp.child_session_id.clone()),
+                    Some(session_event::Kind::SubagentSpawned(sp)) if sp.background_task_id == t.task_id => {
+                        Some(sp.child_session_id.clone())
+                    }
                     _ => None,
                 })
                 .unwrap_or_default();

@@ -1,0 +1,25 @@
+name: Rust toolchain
+description: The Rust version docker/Dockerfile pins (RUST_VERSION), with the wasm32 target, and optionally Trunk (TRUNK_VERSION) for the web UI.
+inputs:
+  trunk:
+    description: Also install Trunk, to build the web UI.
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Rust
+      shell: bash
+      run: |
+        rust=$(sed -n 's/^ARG RUST_VERSION=//p' docker/Dockerfile)
+        rustup toolchain install "$rust" --profile minimal --target wasm32-unknown-unknown
+        rustup default "$rust"
+        rustc --version
+    - name: Trunk
+      if: inputs.trunk == 'true'
+      shell: bash
+      run: |
+        trunk=$(sed -n 's/^ARG TRUNK_VERSION=//p' docker/Dockerfile)
+        arch=$(uname -m | sed 's/^arm64$/aarch64/')
+        case $RUNNER_OS in macOS) os=apple-darwin ;; *) os=unknown-linux-gnu ;; esac
+        curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v$trunk/trunk-$arch-$os.tar.gz" | tar -xz -C "$HOME/.cargo/bin" trunk
+        trunk --version
