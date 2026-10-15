@@ -1,0 +1,175 @@
+# Changelog
+
+## 0.2.0 (2026-10-15)
+
+- Photo events are rebuilt in one transaction, so a reader never sees a trip with only some of its photos
+- GitHub Actions: tests on Linux and macOS for every push and pull request; make release bumps the one workspace version, writes CHANGELOG.md, tags and pushes, and the tag's workflow builds, smoke-tests and publishes .debs, bottles and the Homebrew tap
+- Memex things are created race-free when ingests run at once (a folder scan beside an upload could lose a paper's links), and three racy tests wait for what they check
+- Open-source pre-flight: MIT OR Apache-2.0 (license files, every crate, brew formulas, a Debian copyright file), README status, security and license sections, os.md and memex.md marked built; markdown and outside links refuse javascript:/data: URLs, attachments are served sandboxed, state directories are 0700, and the head warns when it serves plain HTTP on a LAN address
+- Release design: make release cuts locally (checks, version, CHANGELOG.md from commits, debs and bottles, smoke tests, tag); make release-publish pushes to GitHub Releases and a Homebrew tap; no CI
+- c6h, c6w and c6m shut down cleanly on SIGTERM (systemd, launchd, docker stop), so the systemd units drop KillSignal=SIGINT
+- Homebrew bottles and formulas for c6h, c6w, c6m (as brew services) and c6 in a local tap (make brew, make brew-install), poured without Xcode or the CLT
+- Ubuntu packages build on 22.04 by default (they install on 24.04 and 26.04 too), docker-deb-test takes ARCH=amd64|arm64, and Docker build caches are per architecture so docker-deb-all and docker-build-all work
+- A c6 (CLI) .deb next to c6h, c6w and c6m; docker-deb clears its output directory first, and the smoke test checks c6 lists the worker online
+- Ubuntu packages for c6h, c6w and c6m with systemd units, built in Docker (make docker-deb, docker-deb-all; UBUNTU=24.04) and tried under systemd in a container (make docker-deb-test)
+- Measurement design: deferred
+- Measurement design: decisions on settling windows, unassisted history and splitting outcomes by artifact
+- Measurement design: automatic ratings from what happened to the work, and value estimated from your own unassisted work
+- Measurement design: leverage (finished work per hour of your attention) from series, outcomes, presence and a weekly review
+- Run any realm's templates (GET /templates with realms; run finds the template's realm, so an app's templates show on the Sessions page and work with c6 run -t), and a file picker for packages: this device, the head (GET /head/fs/list|read, its data directory refused) or a worker, with folder navigation
+- Subagents, step 6: Claude Code's own subagents mirrored from its stream into read-only child sessions (nested ones too), sessions.observed (0041), messages and resume refused for them, read-only threads
+- Subagents, step 5: threads under their calls (live peek while running, the whole conversation with Stop, Resume and a reply box that can wake the parent), the ◆ list of a session's subagents, a subagent's lineage and reply box on its page, side chats on subagents, find and search through subagent threads, Session.subagents_running and root_id
+- Subagents, step 4: nesting (Task and SendMessage below the depth limit, a running limit per tree, the subagent-limits setting in Settings → Agents), tree-wide cost and archiving, children?tree=1
+- Subagents, step 3: continuing them (SendMessage to an idle or running subagent, bash_output digests, your messages with wake, POST /resume with the session.subagent_resume prompt), reports of turns no call waited on go to the parent, side chats on and restores of subagents
+- Subagents, step 2: partial results (a digest of the subagent's log and the editable session.subagent_partial prompt for every outcome but a report), lost foreground calls answered at recovery, lost background subagents reported with their work, sessions.agent, end_reason and root_id (0040)
+- Subagents, step 1: subagents are sessions with their own actor (Delegation in the journaled spec, ActorMsg::Delegate, outcome from the log), SubagentSpawned in the parent's log, interrupts sent to the child, the parent's live hooks and sinks, secrets by the root
+- Subagents design: actor-backed child sessions, partial results, SendMessage, nesting, inline threads; docs/subagents.md
+- decks-render built and checked: the Paper theme names P052, quotes centred, quiet page rendering; an opt-in end-to-end test (C6_TEST_DECKS_RENDER=1)
+- Packages, step 4: the decks-render kit (Chromium, poppler, python-pptx, open fonts; pdf, slides, slide, pptx); decks 1.1 requires it and renders with kit_run; packages may carry text files
+- Packages: wait for the started template session's request in the test
+- Packages, step 3: template_start, in the session's realm or another whose app exports the template to it (checked against the install's grant)
+- Packages, step 2: kits on workers (docker or podman): images built from kits in order, kit_run and kit_shell in a sandbox from the approved permissions (no network, read-only root, not root, the session's folder at /work, limits, timeout)
+- Packages, step 1: a local registry of package versions by digest (apps, kits, libraries), installs with requires resolved, locked and shared, one approval per install, cycles and conflicts refused; apps moved over (0039); Settings → Packages
+- docs: kits built from kits (dependencies, roots, approvals)
+- docs: kits design (local registry, build from definitions, permissions approved at install, sandboxed runs)
+- Decks: browser prints pages to PDF; the decks app (outline you approve, theme you choose, HTML slides checked by eye, HTML and PDF delivered) with three themes; docs/decks.md
+- Tools can show images to the model: read on an image file, browser screenshots (element, full page, window size; saved to Outputs only when asked); kept in history (the latest 12), shown in the transcript
+- Explorer: realm-wide search (records, knowledge, facts, sessions and what was said, decisions, triggers, series, settings) and two-hop neighborhood graphs
+- Explorer UI: the realms map, each realm's inventory, overview, wiring, sections and objects with what is connected (lists or a graph); realm signal outlives pages; trigger form follows the realm
+- Explorer, head side: realm summary, activity, section lists, objects with what is connected, the map; memex inventory and lists; triggers and decisions created with ?realm=
+- docs: realm explorer design
+- OS step 10: the worked examples as installable packages (service factory, personal CRM), with the gaps they found fixed: realm templates and workflows, realm budgets, memex events through grants
+- OS step 9: apps — JSON packages of configuration installed into realms of their own after your decision, with grants asked and secrets listed; export of any realm (optionally with records); three-way upgrades that keep your edits; removal of a realm and everything in it
+- OS step 8: the assistant works in the realm you open it in — its operations admitted as that realm's token, administration only from root, instructions per realm naming where it is
+- docs: join the decision log table
+- OS step 7: views — a realm's configured screens (table, board, record, chart, feed, page) as a system list, rendered by the UI with actions that set fields or start templates about a record, and each realm's Views menu
+- OS step 6: series — points with dimensions per realm, summaries over windows by dimension and hour or day, model usage as computed series, host check history, thresholds and silence as trigger events, record-a-value action, series tools for agents
+- OS step 5: triggers — automations become triggers in place (ids, webhook URLs, history kept); record, decision and session events; JSONPath filters and mapping; write, ask and notify actions; loop protection by chain depth and runs an hour; digests of open decisions
+- OS step 4d: commons — a realm every realm reads (unless turned off), published into only with an append grant and your review of each record or fact, shared in searches and briefs
+- OS step 4c: grants — realms read, add to or copy each other's collections (or some records), read each other's knowledge and call each other's operations only through grants you make; every use logged; agents request them as decisions
+- OS step 4b: each realm's memex knowledge in a database of its own (opened by home's memex), home-only mail/calendar/contacts/photos/folders, realm-scoped disputes and events, knowledge dropped with the realm
+- OS step 4a: realms you create (with their own system collections), workers and connections available per realm, per-realm settings, realm switcher and Realms panel
+- OS step 3: decisions — action items become decisions (ids kept); held tool calls, workflow approve steps and assistant questions open them and settle both ways; decision_request asks without stopping (answer arrives as a message); deadlines, links, Decisions page
+- OS step 2c: carbon6's prompts are editable records (sessions, compaction, subagents, assistant, action items, memex) with defaults that follow the code until edited; Settings → Prompts
+- OS step 2b: settings lists and memory notes become system collections with per-entry history; realms inherit root's lists (override, root-first, realm-first); upgrades check each migration as it runs
+- OS step 2a: collections — strict schemas, records with versions and history, JSON filter queries, agent records tools, memex mirror, Collections page with schema-made forms
+- OS step 1: realms (root and home) on every object, realm-scoped API tokens checked by the head, sessions/secrets/notes/action items kept to their realm, memex realm gate; data migrated with checks
+- OS step 0: safe upgrades of the head and memex databases (backup, restore on failure, row and data checks, reports, c6h/c6m upgrade --check) with test databases in today's shape
+- OS design: build order starts with the upgrade machinery and realm plumbing; collections before decisions before creatable realms
+- OS design: revisit what's built (kernel, duplicates, services) and upgrade existing data on every step
+- carbon6 as an OS: design for realms, grants, collections, decisions, triggers, series, views and config-only apps
+- Memex: one ingest API typed by MIME type (memex.ingest, memex.types) with mail and document handlers; imported mail threads by headers and upgrades to synced
+- API reference for agents: carbon6_api tool and /api/v1/openapi.json, generated from the operation catalog
+- Memex design: no Thunderbird importer
+- Memex design: one ingest API typed by MIME type with registered handlers (4.5); Thunderbird importer as its first client
+- Compaction: ask again without tools when the model gives no summary, say what it did, and fall back to a digest so sessions are not stuck
+- Session transcript shows published images inline
+- Remove follow-through, self-configuration and playbooks; keep environment knowledge and action items
+- Playbooks: agents' setup, investigation, repair and action-item prompts are editable settings, not code
+- Tests: one integration test binary per crate, dependencies without debug info
+- Self-configuration: sessions write kits through the catalog within limits; setup playbook once per repo; repairs
+- Environment knowledge in the memex and action items: facts with status, scope, volatility and evidence; disputes; to-do list with sessions
+- Follow-through: project kits with reactions, next steps and trackers; investigations on failure
+- Follow-through: investigations propose fixes; observations kept forever
+- Follow-through and environment knowledge design
+- ChatGPT: several accounts and workspaces, each with its own client id; verified ID tokens; sign in again
+- Model lists: accept a ChatGPT plan's models[].slug as well as data[].id
+- ChatGPT sign-in: send ext_agent_host_id and agent_name_hint, redirect to /callback
+- Settings in sections: a menu, one section at a time, linkable at /settings/<section>
+- Assistant: discovery ranks operations first and says where task models live
+- The assistant: an agent in the head that does what the UI does
+- Assistant design: an agent in the head that does what the UI does
+- Tokens: tell the two kinds apart
+- Revert "Enrollment tokens: find the token in whatever was pasted"
+- Enrollment tokens: find the token in whatever was pasted
+- make dev-memex: enroll (with TOKEN) and run the dev memex
+- Memex: a ChatGPT plan cannot embed or transcribe
+- Memex: room for thinking models' answers; say so when there is none
+- Memex photos and videos: EXIF, places, events, vision, faces, transcripts
+- Memex understanding: summaries, topics, commitments, claims; review, graph, timelines
+- Memex: documents, papers and trails; Gmail, Calendar and Contacts
+- Memex @-mentions: things in the composer, cards attached on send
+- Memex: a knowledge service on the fabric, with two-way context
+- Memex design: Thunderbird backfill; decisions settled
+- Memex design: Google accounts, calendar and contacts
+- Memex design draft
+- Web push and a phone-friendly head
+- Workflows: chained steps, conditions, approval gates
+- Browser tool: a headless Chromium per session
+- Fixes from the phase 4 live check
+- Automation run history and health
+- Cron: no hang across the end of daylight saving time
+- Host inventory: hosts with labels, fleet runs by label, checks
+- Usage, cost and budgets
+- Notifications: channels, approval links, notify tool
+- Model routing by label
+- Policies and approvals
+- Memory: notes across sessions, scoped by label
+- Export: label hook context as what was sent, not an empty command
+- Connector presets; secrets in MCP configs
+- Automations: run templates on a schedule or from a webhook
+- Session templates and fleet runs
+- Outputs: deliverables the agent publishes, previewed and versioned
+- Web search for any model: Brave, Tavily or SearXNG
+- SSH targets: sessions on another machine through a worker
+- Sessions without a folder get a scratch workspace
+- Secret store: environment variables the agent can use but never see
+- Search results follow the label filter
+- Browser notifications follow the label filter
+- Inbox badge follows the label filter
+- Filter the activity dock by labels too
+- Label filter in the inbox and mission control
+- Fix workers rejected as revoked when their serial starts with zero
+- Background tasks that tell the agent when they end
+- Session labels, and settings that apply by label
+- Slash commands, agents and skills live in the head's settings
+- Hooks live in the head's settings, with an editor in Settings
+- Headless CLI (c6) and API tokens
+- Hooks in Claude Code's settings.json format
+- Named agents from .claude/agents as Task subagent types
+- Slash commands: .claude/commands, /compact, /init, /review, /clear, /export
+- Attachments and @-mentions
+- Tests: account for checkpoint events
+- Rewind and edit-and-resend, with file checkpoints
+- Workspace: sessions opened from a list open side by side
+- Workspace UI: tiles of sliding columns, activity dock, inbox, mission control
+- Find in session: highlight every match on the page
+- Find in session: step through every match, side chats included
+- Search: say which words were ignored as too short
+- Search: side chat hits open inside their top-level session
+- Session search (SQLite FTS5) with deep links to the matching block
+- Dev head and worker keep state in the standard directories
+- Rename passkeys
+- Settings: explain that a synced passkey is listed once
+- Clearer message when a device already has a synced passkey
+- Docs: restart the browser after trusting the head's CA
+- One-time codes for signing in another device
+- Android: serve the web UI CA as /ca.crt
+- Settings: CA download links bypass the client-side router
+- Mac instructions for trusting the head's web UI CA
+- Web UI HTTPS from the head's own name-constrained CA, not Tailscale
+- Sign-in: passkeys and one-time login links; HTTPS for the web UI
+- Head answers to its Tailscale MagicDNS name
+- Dev head listens on all interfaces; wildcard binds work
+- Side chat header shows the effort
+- Hide effort for connections that do not pass it on
+- Effort in the model picker
+- Model switching in the main session composer
+- Side chat header shows the current model
+- Model switching in side chats; Ask button at the end of each message
+- Side chats: threaded, persistent, nestable conversations off any message
+- Session page: per-turn and session token stats, context gauge
+- Worker journal: stop trimming live sessions; one worker per state dir
+- Changes tab: explain folders that are not git repositories
+- make dev-worker: enroll only when TOKEN is given
+- Folder picker for new sessions; test connection with model discovery
+- Docker-based build: make help, docker-build/test/images/head
+- M5: hardening, restore, chaos tests, evals, UX polish
+- M4: web tools, background shells, subagents, MCP, skills, OTLP
+- M3: remote files, git changes, worktrees, terminals
+- Claude Code backend: run the worker's own claude CLI for sessions
+- M2: Anthropic and Responses clients, ChatGPT sign-in, tool profiles, compaction
+- M1: sessions, agent loop, tools, journal sync, session UI
+- M0: workspace, enrollment, mTLS worker attach, fleet UI
+- Add Carbon6 architecture doc
+- Add Carbon6 requirements doc
