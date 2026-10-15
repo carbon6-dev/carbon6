@@ -498,11 +498,15 @@ pub async fn events(m: &Memex) -> anyhow::Result<usize> {
             _ => groups.push(vec![r]),
         }
     }
-    let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("DELETE FROM evidence WHERE link_id IN (SELECT id FROM links WHERE made_by = ?)").bind(MADE_BY).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM links WHERE made_by = ?").bind(MADE_BY).execute(&mut *tx).await?;
-    tx.commit().await?;
-    let mut made = 0;
+    // Each event's name, place and photos first; then all of them made again
+    // in one transaction, so a reader never sees an event half-linked.
+    struct Made {
+        key: String,
+        name: String,
+        place: Option<String>,
+        items: Vec<String>,
+    }
+    let mut made = Vec::new();
     for g in groups.iter().filter(|g| g.len() >= 10) {
         let first: String = g[0].get("item_id");
         let (start, end): (i64, i64) = (g[0].get("taken_at"), g[g.len() - 1].get("taken_at"));
@@ -532,28 +536,76 @@ pub async fn events(m: &Memex) -> anyhow::Result<usize> {
             (false, Some(p)) => format!("{p}, {span}"),
             (false, None) => format!("Photos, {span}"),
         };
-        let event = m.store.ensure_thing(&format!("event:photos:{first}"), "event", &name).await?;
-        sqlx::query("UPDATE things SET name = ? WHERE id = ?").bind(&name).bind(&event).execute(&m.store.pool).await?;
-        for r in g {
-            m.store.link_inferred(&r.get::<String, _>("item_id"), "part_of", &event, 0.8, MADE_BY, None).await?;
+        made.push(Made { key: format!("event:photos:{first}"), name, place, items: g.iter().map(|r| r.get("item_id")).collect() });
+    }
+
+    let now = c6_core::now_ms();
+    let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("DELETE FROM evidence WHERE link_id IN (SELECT id FROM links WHERE made_by = ?)").bind(MADE_BY).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM links WHERE made_by = ?").bind(MADE_BY).execute(&mut *tx).await?;
+    for e in &made {
+        // The event's thing (one merged into another keeps its key there).
+        let merged: Option<String> =
+            sqlx::query_scalar("SELECT thing_id FROM thing_keys WHERE key = ?").bind(&e.key).fetch_optional(&mut *tx).await?;
+        let event = match merged {
+            Some(id) => id,
+            None => {
+                sqlx::query(
+                    "INSERT INTO things (id, kind, name, key, created_at) VALUES (?, 'event', ?, ?, ?) ON CONFLICT (key) DO NOTHING",
+                )
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(&e.name)
+                .bind(&e.key)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query_scalar("SELECT id FROM things WHERE key = ?").bind(&e.key).fetch_one(&mut *tx).await?
+            }
+        };
+        sqlx::query("UPDATE things SET name = ? WHERE id = ?").bind(&e.name).bind(&event).execute(&mut *tx).await?;
+        for item in &e.items {
+            let link: i64 = sqlx::query_scalar(
+                "INSERT INTO links (src_item, rel, dst_thing, basis, confidence, made_by, created_at) \
+                 VALUES (?, 'part_of', ?, 'inferred', 0.8, ?, ?) RETURNING id",
+            )
+            .bind(item)
+            .bind(&event)
+            .bind(MADE_BY)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO evidence (link_id, item_id, quote) VALUES (?, ?, NULL)")
+                .bind(link)
+                .bind(item)
+                .execute(&mut *tx)
+                .await?;
         }
-        if let Some(p) = &place {
-            m.store.link_things(&event, "at", p, "inferred", MADE_BY).await?;
+        if let Some(p) = &e.place {
+            sqlx::query(
+                "INSERT INTO links (src_thing, rel, dst_thing, basis, made_by, created_at) SELECT ?1, 'at', ?2, 'inferred', ?3, ?4 \
+                 WHERE NOT EXISTS (SELECT 1 FROM links WHERE src_thing = ?1 AND rel = 'at' AND dst_thing = ?2)",
+            )
+            .bind(&event)
+            .bind(p)
+            .bind(MADE_BY)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         }
-        made += 1;
     }
     // Events no longer made (their photos moved apart, or went).
     sqlx::query(
         "DELETE FROM things WHERE key LIKE 'event:photos:%' AND NOT EXISTS (SELECT 1 FROM links l WHERE l.dst_thing = things.id) \
          AND NOT EXISTS (SELECT 1 FROM trail_steps s WHERE s.target = things.id)",
     )
-    .execute(&m.store.pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM links WHERE made_by = ? AND src_thing IS NOT NULL AND src_thing NOT IN (SELECT id FROM things)")
         .bind(MADE_BY)
-        .execute(&m.store.pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(made)
+    tx.commit().await?;
+    Ok(made.len())
 }
 
 /// The default photo prompt (`memex.look`).
