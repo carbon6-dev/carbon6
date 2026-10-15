@@ -511,16 +511,17 @@ impl Store {
             }
             return Ok(id);
         }
-        let id = uuid::Uuid::now_v7().to_string();
-        sqlx::query("INSERT INTO things (id, kind, name, key, created_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(&id)
+        // Another ingest (a folder scan beside an upload) may add the same
+        // key between the lookup and here: its thing is kept, and returned.
+        sqlx::query("INSERT INTO things (id, kind, name, key, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (key) DO NOTHING")
+            .bind(uuid::Uuid::now_v7().to_string())
             .bind(kind)
             .bind(if name.is_empty() { key } else { name })
             .bind(key)
             .bind(c6_core::now_ms())
             .execute(&self.pool)
             .await?;
-        Ok(id)
+        Ok(sqlx::query_scalar("SELECT id FROM things WHERE key = ?").bind(key).fetch_one(&self.pool).await?)
     }
 
     /// Links an item to a thing, with what supports it (a quote).
@@ -795,16 +796,16 @@ async fn thing_for_label(tx: &mut sqlx::SqliteConnection, label: &str, now: i64)
     if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM things WHERE key = ?").bind(label).fetch_optional(&mut *tx).await? {
         return Ok(Some(id));
     }
-    let id = uuid::Uuid::now_v7().to_string();
-    sqlx::query("INSERT INTO things (id, kind, name, key, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(&id)
+    // As in ensure_thing: one added since the lookup is kept.
+    sqlx::query("INSERT INTO things (id, kind, name, key, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (key) DO NOTHING")
+        .bind(uuid::Uuid::now_v7().to_string())
         .bind(kind)
         .bind(name)
         .bind(label)
         .bind(now)
         .execute(&mut *tx)
         .await?;
-    Ok(Some(id))
+    Ok(Some(sqlx::query_scalar("SELECT id FROM things WHERE key = ?").bind(label).fetch_one(&mut *tx).await?))
 }
 
 fn thing_ref(r: &sqlx::sqlite::SqliteRow) -> api::MemexThingRef {
@@ -889,6 +890,29 @@ mod tests {
         assert_eq!(parts.len(), 2, "two paragraphs fit in one passage, the third does not");
         assert!(chunk(&"x ".repeat(2000)).iter().all(|c| c.len() <= PART_CHARS));
         assert!(chunk("  \n\n ").is_empty());
+    }
+
+    /// Ingests running at once (a folder scan and an upload) that name the
+    /// same thing get the same one, and neither fails.
+    #[tokio::test]
+    async fn concurrent_ensure_thing_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(&dir.path().join("memex.db")).await.unwrap());
+        for round in 0..20 {
+            let key = format!("paper:arxiv:1607.0645{round}");
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let (store, key) = (store.clone(), key.clone());
+                    tokio::spawn(async move { store.ensure_thing(&key, "paper", "Layer normalization").await })
+                })
+                .collect();
+            let mut ids = Vec::new();
+            for t in tasks {
+                ids.push(t.await.unwrap().expect("ensure_thing"));
+            }
+            ids.dedup();
+            assert_eq!(ids.len(), 1, "one thing for {key}: {ids:?}");
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use c6_api::{Connection, Decision, Session};
+use c6_api::{Connection, Decision, Session, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
@@ -220,6 +220,13 @@ async fn grants_let_data_cross_realms() {
     assert!(d.document.contains("to find upsells") && d.source == format!("session:{}", s.id), "{d:?}");
     let pending: Value = send(M::GET, "grants?realm=factory", json!({})).await.json().await.unwrap();
     assert!(pending.as_array().unwrap().iter().any(|g| g["state"] == "requested"), "{pending}");
+    // The answer starts a turn of its own once the asking turn has ended;
+    // answered sooner, it would reach the model inside that turn instead.
+    eventually("the asking turn's end", async || {
+        let d: SessionDetail = http.get(format!("{api}/sessions/{}", s.id)).send().await.ok()?.json().await.ok()?;
+        (d.session.status == SessionStatus::Idle && mock.requests().len() >= 2).then_some(())
+    })
+    .await;
     let r = send(M::POST, &format!("decisions/{}/answer", d.id), json!({"option": "Allow"})).await;
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     let seen = eventually("the agent read through the grant", async || {

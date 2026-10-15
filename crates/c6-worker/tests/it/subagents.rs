@@ -38,8 +38,15 @@ impl Env {
         let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
         let http = reqwest::Client::new();
         let mock = MockLlm::start().await;
-        let conn: Value =
-            http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap().json().await.unwrap();
+        let conn: Value = http
+            .post(format!("{api}/connections"))
+            .json(&json!({"name": "m", "base_url": mock.base_url()}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         Self { head, api, http, mock, conn_id: conn["id"].as_str().unwrap().to_owned(), _head_dir: head_dir }
     }
 
@@ -102,6 +109,15 @@ fn turn_end(events: &[Event]) -> Option<TurnEndReason> {
     })
 }
 
+/// How the last turn ended, if it ended after `seq`: other events after
+/// `seq` (a subagent's progress) don't make an earlier turn's end count.
+fn turn_end_after(events: &[Event], seq: u64) -> Option<TurnEndReason> {
+    events.iter().rev().take_while(|e| e.seq > seq).find_map(|e| match &e.kind {
+        EventKind::TurnEnded { reason, .. } => Some(*reason),
+        _ => None,
+    })
+}
+
 /// The parent's log names the child, the child's first message is the
 /// task (the subagent note goes to the model only), and stopping the parent
 /// stops the child, whose finished tool calls stay in its log.
@@ -129,7 +145,11 @@ async fn a_subagent_is_a_session_and_stops_with_its_parent() {
     assert_eq!(child.2, "dig");
     let child_id = child.1;
     until("the subagent's command ran", 15, async || {
-        env.events(&child_id).await.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("found-half"))).then_some(())
+        env.events(&child_id)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("found-half")))
+            .then_some(())
     })
     .await;
     let children = env.children(&id).await;
@@ -403,7 +423,13 @@ async fn your_message_to_a_subagent_reports_back() {
 
     // Without wake: the parent stays idle.
     env.mock.push(Reply::Text("Half the haystack is searched.".into()));
-    let r = env.http.post(format!("{}/sessions/{child_id}/messages", env.api)).json(&json!({"text": "How far did you get?"})).send().await.unwrap();
+    let r = env
+        .http
+        .post(format!("{}/sessions/{child_id}/messages", env.api))
+        .json(&json!({"text": "How far did you get?"}))
+        .send()
+        .await
+        .unwrap();
     assert!(r.status().is_success(), "{}", r.status());
     until("subagent answered", 15, async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -415,7 +441,7 @@ async fn your_message_to_a_subagent_reports_back() {
     env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "status?"})).send().await.unwrap();
     until("parent answered", 15, async || {
         let ev = env.events(&id).await;
-        (ev.last().unwrap().seq > parent_seq && turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(())
+        (turn_end_after(&ev, parent_seq) == Some(TurnEndReason::Completed)).then_some(())
     })
     .await;
     let req = request_text(&env.mock.requests()[before]);
@@ -433,7 +459,7 @@ async fn your_message_to_a_subagent_reports_back() {
         .unwrap();
     let ev = until("parent woken", 15, async || {
         let ev = env.events(&id).await;
-        (ev.last().unwrap().seq > seq && turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
+        (turn_end_after(&ev, seq) == Some(TurnEndReason::Completed)).then_some(ev)
     })
     .await;
     let notice = user_messages(&ev).into_iter().rev().find(|(_, c, _)| c == "task-notification").unwrap();
@@ -567,7 +593,8 @@ async fn a_lost_subagent_is_restored_from_the_head() {
     .await;
     let req = &env.mock.requests()[before];
     assert!(request_text(req).contains("found-half"), "history restored");
-    let offered: Vec<String> = req["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect();
+    let offered: Vec<String> =
+        req["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect();
     let mut a = offered.clone();
     a.sort();
     let mut b = tools.clone();
@@ -621,12 +648,14 @@ async fn subagents_nest() {
     assert_eq!(calls, 5);
     // Search opens the leaf in the top session, through the threads; find
     // in the top session reaches it, after the call that started it.
-    let found: c6_api::SearchResponse = env.http.get(format!("{}/search?q=leaf%3A%20dug", env.api)).send().await.unwrap().json().await.unwrap();
+    let found: c6_api::SearchResponse =
+        env.http.get(format!("{}/search?q=leaf%3A%20dug", env.api)).send().await.unwrap().json().await.unwrap();
     let hit = found.results.iter().find(|r| r.session.id == leaf[0].id).expect("the leaf's match");
     let open_in = hit.open_in.as_ref().expect("opened in the top session");
     assert_eq!(open_in.session_id, id);
     assert_eq!(open_in.side_chats, vec![middle[0].id.clone(), leaf[0].id.clone()]);
-    let m: c6_api::SessionMatches = env.http.get(format!("{}/sessions/{id}/matches?q=dug", env.api)).send().await.unwrap().json().await.unwrap();
+    let m: c6_api::SessionMatches =
+        env.http.get(format!("{}/sessions/{id}/matches?q=dug", env.api)).send().await.unwrap().json().await.unwrap();
     let opens: Vec<Vec<String>> = m.matches.iter().map(|x| x.open.clone()).collect();
     assert!(opens.contains(&vec![middle[0].id.clone(), leaf[0].id.clone()]), "{opens:?}");
     assert_eq!(opens.last().unwrap(), &Vec::<String>::new(), "the parent's own report comes last: {:?}", m.matches);
@@ -638,7 +667,8 @@ async fn subagents_nest() {
     env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "again"})).send().await.unwrap();
     let ids = until("three levels working", 15, async || {
         let tree: Vec<Session> = env.http.get(format!("{}/sessions/{id}/children?tree=1", env.api)).send().await.ok()?.json().await.ok()?;
-        (tree.len() == 4 && tree.iter().all(|s| s.status == SessionStatus::Running || s.end_reason.is_some())
+        (tree.len() == 4
+            && tree.iter().all(|s| s.status == SessionStatus::Running || s.end_reason.is_some())
             && tree[3].status == SessionStatus::Running)
             .then(|| tree.iter().skip(2).map(|s| s.id.clone()).collect::<Vec<_>>())
     })
@@ -659,9 +689,21 @@ async fn subagent_limits_apply() {
     env.enroll(state.path()).await;
     let (worker, stop) = run_worker(state.path()).await;
     let project = tempfile::tempdir().unwrap();
-    let r = env.http.put(format!("{}/settings/subagent-limits", env.api)).json(&json!({"max_depth": 0, "max_running": 1})).send().await.unwrap();
+    let r = env
+        .http
+        .put(format!("{}/settings/subagent-limits", env.api))
+        .json(&json!({"max_depth": 0, "max_running": 1}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 400);
-    let r = env.http.put(format!("{}/settings/subagent-limits", env.api)).json(&json!({"max_depth": 1, "max_running": 1})).send().await.unwrap();
+    let r = env
+        .http
+        .put(format!("{}/settings/subagent-limits", env.api))
+        .json(&json!({"max_depth": 1, "max_running": 1}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 204);
 
     env.mock.push(Reply::ToolCalls(vec![

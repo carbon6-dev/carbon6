@@ -213,9 +213,13 @@ async fn documents_papers_and_trails() {
     assert!(item["item"]["text"].as_str().unwrap().contains("based solely on attention"), "{item}");
     // The citation graph: layer normalization is cited by both papers; the
     // transformer paper (a thing) is the uploaded one and cited by Reformer.
-    let ln = get("paper:arxiv:1607.06450").await;
+    // The folder's paper is counted before its links are written.
+    let ln = eventually("both papers citing layer normalization", async || {
+        let ln = get("paper:arxiv:1607.06450").await;
+        (ln["thing"]["items"].as_array().map_or(0, Vec::len) == 2).then_some(ln)
+    })
+    .await;
     assert_eq!(ln["thing"]["thing"]["name"], "Layer normalization");
-    assert_eq!(ln["thing"]["items"].as_array().unwrap().len(), 2, "{ln}");
     let attention = get("paper:arxiv:1706.03762").await;
     let titles: Vec<&str> = attention["thing"]["items"].as_array().unwrap().iter().map(|h| h["title"].as_str().unwrap()).collect();
     assert!(titles.contains(&"Attention Is All You Need") && titles.contains(&"Reformer: The Efficient Transformer"), "{titles:?}");
