@@ -13,7 +13,7 @@
 
 ARG RUST_VERSION=1.97
 ARG TRUNK_VERSION=0.21.14
-ARG UBUNTU=24.04
+ARG UBUNTU=22.04
 
 FROM rust:${RUST_VERSION}-bookworm AS toolchain
 ARG TRUNK_VERSION
@@ -24,12 +24,14 @@ RUN rustup target add wasm32-unknown-unknown \
 WORKDIR /src
 
 FROM toolchain AS build
+ARG TARGETARCH
 COPY . .
 # Caches survive between builds; the binaries are copied out of the cached target dir.
+# Build outputs and Trunk's downloaded tools are per architecture.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/target \
-    --mount=type=cache,target=/root/.cache/trunk \
+    --mount=type=cache,id=c6-target-${TARGETARCH},target=/src/target \
+    --mount=type=cache,id=c6-trunk-${TARGETARCH},target=/root/.cache/trunk \
     cd crates/c6-ui && trunk build --release && cd /src \
  && cargo build --release --locked -p c6h -p c6w -p c6 -p c6-eval \
  && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6 target/release/c6-eval /out/
@@ -61,8 +63,8 @@ VOLUME /state
 ENTRYPOINT ["c6w", "--state-dir", "/state"]
 CMD ["run"]
 
-# Ubuntu packages. Built on the target release, so the binaries need no newer
-# glibc than it has.
+# Ubuntu packages. Built on the oldest release they target, so the binaries
+# need no newer glibc than it has (and install on every later release).
 FROM ubuntu:${UBUNTU} AS deb-toolchain
 ARG RUST_VERSION
 ARG TRUNK_VERSION
@@ -83,7 +85,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,id=c6-deb-target-${UBUNTU}-${TARGETARCH},target=/src/target \
-    --mount=type=cache,target=/root/.cache/trunk \
+    --mount=type=cache,id=c6-trunk-${TARGETARCH},target=/root/.cache/trunk \
     cd crates/c6-ui && trunk build --release && cd /src \
  && cargo build --release --locked -p c6h -p c6w -p c6m -p c6 \
  && mkdir -p /out && cp target/release/c6h target/release/c6w target/release/c6m target/release/c6 /out/

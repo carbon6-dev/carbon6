@@ -14,8 +14,9 @@ TAG          ?= dev
 ARCH         := $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 UI_PORT      ?= 7700
 WORKER_PORT  ?= 7701
-# Ubuntu release the packages are built on and for (it sets the minimum glibc).
-UBUNTU       ?= 24.04
+# Ubuntu release the packages are built on. It sets the minimum glibc, so they
+# also install on every later release (22.04: 22.04, 24.04, 26.04, ...).
+UBUNTU       ?= 22.04
 DEB_DIR       = dist/deb/ubuntu-$(UBUNTU)
 # <crate version>+git<commit time>.<commit>, so every commit sorts newer.
 DEB_VERSION  ?= $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)+git$(shell git log -1 --format=%cd.%h --date=format:%Y%m%d%H%M%S)
@@ -70,8 +71,8 @@ docker-login-link: ## Print a one-time web UI login link from the running head c
 
 ##@ Ubuntu packages (Docker only)
 
-docker-deb: ## Build .deb packages of c6h, c6w and c6m (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=24.04)
-	rm -rf $(DEB_DIR)
+docker-deb: ## Build .deb packages of c6h, c6w and c6m (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=22.04; they install on later releases too)
+	rm -f $(DEB_DIR)/*_$(ARCH).deb
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
 	@ls -l $(DEB_DIR)
 
@@ -80,9 +81,9 @@ docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubu
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
 	@ls -l $(DEB_DIR)
 
-docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, c6 sees the worker, upgrade, remove
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU) .
-	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU) $(DEB_DIR)
+docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, c6 sees the worker, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) .
+	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) $(DEB_DIR) $(ARCH)
 
 ##@ Local toolchain
 
