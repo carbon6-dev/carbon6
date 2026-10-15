@@ -27,3 +27,34 @@ c6-testkit = { path = "crates/c6-testkit" }
 # own crates keep full debug info.
 [profile.dev.package."*"]
 debug = false
+
+# tract (the memex's ONNX models) optimized even in dev builds: unoptimized,
+# its generic code makes the memex's test binaries' unwind tables too big
+# for macOS's linker to encode compactly (a linker warning), and the models
+# run far slower.
+[profile.dev.package.tract-core]
+opt-level = 1
+
+[profile.dev.package.tract-data]
+opt-level = 1
+
+[profile.dev.package.tract-extra]
+opt-level = 1
+
+[profile.dev.package.tract-hir]
+opt-level = 1
+
+[profile.dev.package.tract-linalg]
+opt-level = 1
+
+[profile.dev.package.tract-nnef]
+opt-level = 1
+
+[profile.dev.package.tract-onnx]
+opt-level = 1
+
+[profile.dev.package.tract-onnx-opl]
+opt-level = 1
+
+[profile.dev.package.tract-transformers]
+opt-level = 1

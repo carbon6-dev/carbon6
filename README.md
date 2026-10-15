@@ -83,6 +83,7 @@ make docker-token      # an enrollment token from that head
 ```bash
 make build             # web UI, then release c6h and c6w into target/release
 make test
+make check             # every target, and the web UI for wasm, must build without warnings (CI runs it too)
 ```
 
 ## Run

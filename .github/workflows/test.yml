@@ -28,9 +28,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
+      - name: Every target builds without warnings (and the web UI for wasm)
+        run: make check
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
       - run: cargo test --locked
-      - name: The web UI compiles
-        if: runner.os == 'Linux'
-        run: cargo check --locked -p c6-ui --target wasm32-unknown-unknown
