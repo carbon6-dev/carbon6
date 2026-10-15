@@ -41,7 +41,7 @@ Pages: `/` (home), `/install/`, `/guide/`, `/docs/` and `/docs/<doc>/`, `/change
 
 `make site-publish` pushes with your own SSH key, or with `SITE_TOKEN` over HTTPS when it is set. An unchanged site pushes nothing.
 
-The **Site workflow** (`.github/workflows/site.yml`) runs `make site-check` and `make site` for pull requests that touch the site's sources, and also `make site-publish` for pushes to `main`, after each successful Release workflow (so the install page names a version only once its packages are up), and by hand. Without the `SITE_TOKEN` secret it builds and warns instead of publishing.
+The **Site workflow** (`.github/workflows/site.yml`) runs `make site-check` and `make site` for pull requests that touch the site's sources, and also `make site-publish` for pushes to `main`, after each successful Release workflow, and by hand. The push of a release commit (`Release x.y.z`) only builds: the install page would link to packages the Release workflow hasn't uploaded yet. So a version reaches the site only once its packages are up, and a failed release never reaches it. Without the `SITE_TOKEN` secret it builds and warns instead of publishing.
 
 ## 4. Setting it up
 

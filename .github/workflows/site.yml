@@ -2,6 +2,10 @@
 # repository (docs/site.md): on every push to main that changes what it is
 # built from, and after every release, so the install page names the new
 # version once its packages are up. Pull requests only build it.
+#
+# The push of a release commit ("Release x.y.z") builds but doesn't publish:
+# its packages aren't up yet, so the install page's links would be dead. The
+# run after the Release workflow succeeds publishes it.
 name: Site
 
 on:
@@ -49,7 +53,9 @@ jobs:
       - run: make site-check
       - run: make site
       - name: Publish
-        if: github.event_name != 'pull_request'
+        if: >-
+          github.event_name != 'pull_request' &&
+          !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'Release '))
         env:
           SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
         run: make site-publish
