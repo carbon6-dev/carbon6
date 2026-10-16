@@ -53,8 +53,8 @@ pub const GROUPS: &[Group] = &[
             Doc {
                 slug: "apps",
                 file: "docs/apps.md",
-                label: "Apps: tools and daemons",
-                summary: "Proposed: an app's code apart from the data made with it, tools that run in your realm, and code that changes only by upgrade.",
+                label: "Apps and data",
+                summary: "Proposed: apps as instances in realms you choose, data open to read and written only by its owner, and code that changes only by upgrade.",
             },
             Doc {
                 slug: "explorer",

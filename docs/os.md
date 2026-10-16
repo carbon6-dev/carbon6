@@ -491,7 +491,7 @@ The memex tools (`memex_search`, `knowledge_record` and the others) stay, scoped
 
 ## 5. Apps
 
-> **Proposed change:** [apps.md](apps.md) separates an app's code from the data made with it. Tools run in the realm that uses them, and every app's code becomes immutable except through upgrades.
+> **Proposed change:** [apps.md](apps.md) makes realms trust domains you draw, and apps instances installed in them. Reading is open within a realm, writing belongs to the data's owner, and app code changes only by upgrade.
 
 ### 5.1 The package
 
