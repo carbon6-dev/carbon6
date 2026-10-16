@@ -593,6 +593,27 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             if !c.keys.is_empty() {
                 o.fields.push(("unique".into(), c.keys.join(", ")));
             }
+            // Its data card (docs/apps.md §8).
+            o.fields.push((
+                "owner".into(),
+                if c.owner.is_empty() {
+                    "the realm".into()
+                } else {
+                    format!("the app {}{}", c.owner, if c.card.version.is_empty() { String::new() } else { format!(" {}", c.card.version) })
+                },
+            ));
+            o.fields.push(("stability".into(), if c.card.internal() { "internal".into() } else { "published".into() }));
+            for (k, v) in [("sources", c.card.sources.clone()), ("freshness", c.card.freshness.clone())] {
+                if !v.is_empty() {
+                    o.fields.push((k.into(), v));
+                }
+            }
+            if !c.card.invariants.is_empty() {
+                o.fields.push(("invariants".into(), c.card.invariants.join("; ")));
+            }
+            if !c.card.operations.is_empty() {
+                o.fields.push(("operations".into(), c.card.operations.join(", ")));
+            }
             o.open = Some(format!("/collections/{}", c.name));
             let recs = list(st, realm, &format!("collection:{id}"), "").await?;
             groups.push(group("Records", recs));

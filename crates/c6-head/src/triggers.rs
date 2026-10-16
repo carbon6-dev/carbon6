@@ -648,7 +648,12 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
                     let cur = crate::collections::record(st, &realm, collection, id).await?;
                     let mut merged = cur.fields.as_object().cloned().unwrap_or_default();
                     merged.extend(fields);
-                    let rec = api::RecordIn { fields: Value::Object(merged), links: None, labels: None, version: Some(cur.version) };
+                    let rec = api::RecordIn {
+                        fields: Value::Object(merged),
+                        version: Some(cur.version),
+                        derived_from: serde_json::from_value(p["derived_from"].clone()).ok(),
+                        ..Default::default()
+                    };
                     crate::collections::put(st, &realm, collection, Some(id), &rec, &by).await?;
                 }
                 None => {
@@ -657,6 +662,7 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
                         links: serde_json::from_value(p["links"].clone()).ok(),
                         labels: serde_json::from_value(p["labels"].clone()).ok(),
                         version: None,
+                        derived_from: serde_json::from_value(p["derived_from"].clone()).ok(),
                     };
                     crate::collections::put(st, &realm, collection, None, &rec, &by).await?;
                 }

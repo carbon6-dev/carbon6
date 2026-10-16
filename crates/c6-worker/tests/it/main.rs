@@ -5,6 +5,7 @@
 mod agents;
 mod api_reference;
 mod apps;
+mod cards;
 mod assistant;
 mod attach;
 mod attachments;

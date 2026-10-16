@@ -179,6 +179,7 @@ fn NewCollection(done: Callback<()>) -> impl IntoView {
             description: Some(description.get_untracked()),
             schema: Some(schema),
             keys: Some(keys.get_untracked().split(',').map(|k| k.trim().to_owned()).filter(|k| !k.is_empty()).collect()),
+            card: None,
         };
         spawn_local(async move {
             match api::create_collection(c).await {
@@ -274,6 +275,7 @@ fn CollectionView(name: String) -> impl IntoView {
                             })}
                         </div>
                         {move || gone.get().map(|e| view! { <ErrorBox message=e /> })}
+                        {(!c.with_value(|c| c.system)).then(|| view! { <Card collection=c.get_value() /> })}
                         {move || editing.get().map(|r| view! { <RecordForm collection=c.get_value() record=r done=refresh /> })}
                         {c.with_value(|c| !c.owner.is_empty()).then(|| view! { <Operations collection=c.get_value() picked calling refresh /> })}
                         {move || page.get().map(|p| match p {
@@ -315,6 +317,84 @@ fn CollectionView(name: String) -> impl IntoView {
                 }
             })}
         </main>
+    }
+}
+
+/// What a collection says about itself (docs/apps.md §8): who owns it,
+/// whether it is published or internal, where its records come from, what
+/// stays true, how fresh it is. The realm's own are yours to describe.
+#[component]
+fn Card(collection: Collection) -> impl IntoView {
+    let card = RwSignal::new(collection.card.clone());
+    let editing = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let mine = collection.owner.is_empty();
+    let name = StoredValue::new(collection.name.clone());
+    let owner = collection.owner.clone();
+    let (stability, sources, invariants, freshness) =
+        (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let open = move |_| {
+        let c = card.get_untracked();
+        stability.set(if c.internal() { "internal".into() } else { "published".into() });
+        sources.set(c.sources.clone());
+        invariants.set(c.invariants.join("\n"));
+        freshness.set(c.freshness.clone());
+        editing.set(true);
+    };
+    let save = move |_| {
+        let c = c6_api::DataCard {
+            stability: stability.get_untracked(),
+            sources: sources.get_untracked().trim().to_owned(),
+            invariants: invariants.get_untracked().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect(),
+            freshness: freshness.get_untracked().trim().to_owned(),
+            ..Default::default()
+        };
+        spawn_local(async move {
+            match api::set_card(name.get_value(), c).await {
+                Ok(col) => {
+                    card.set(col.card);
+                    editing.set(false);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <div class="space-y-1 rounded-md bg-zinc-50 px-3 py-2 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">
+            {move || {
+                let c = card.get();
+                let who = if owner.is_empty() { "The realm's".to_owned() } else { format!("The app {}{}'s", owner, if c.version.is_empty() { String::new() } else { format!(" {}", c.version) }) };
+                view! {
+                    <div class="flex flex-wrap gap-x-3">
+                        <span>{who}</span>
+                        <span class=if c.internal() { "text-amber-700 dark:text-amber-400" } else { "" }>{if c.internal() { "internal: may change without notice" } else { "published" }}</span>
+                        {(!c.freshness.is_empty()).then(|| view! { <span>{format!("updated {}", c.freshness)}</span> })}
+                        {(!c.operations.is_empty()).then(|| view! { <span>{format!("changed by {}", c.operations.join(", "))}</span> })}
+                        <span class="flex-1"></span>
+                        {mine.then(|| view! { <button class="underline" on:click=open>"Describe…"</button> })}
+                    </div>
+                    {(!c.sources.is_empty()).then(|| view! { <div>{format!("Comes from: {}", c.sources)}</div> })}
+                    {(!c.invariants.is_empty()).then(|| view! { <div>{format!("Stays true: {}", c.invariants.join("; "))}</div> })}
+                }
+            }}
+            {move || editing.get().then(|| view! {
+                <div class="space-y-2 pt-2">
+                    <select class=INPUT prop:value=move || stability.get() on:change=move |ev| stability.set(event_target_value(&ev))>
+                        <option value="published">"published: others may build on it"</option>
+                        <option value="internal">"internal: may change without notice"</option>
+                    </select>
+                    <input class=INPUT placeholder="Where its records come from" prop:value=move || sources.get() on:input=move |ev| sources.set(event_target_value(&ev)) />
+                    <textarea class=format!("{INPUT} h-16") placeholder="What stays true, one per line" prop:value=move || invariants.get() on:input=move |ev| invariants.set(event_target_value(&ev))></textarea>
+                    <input class=INPUT placeholder="How and how often it is updated" prop:value=move || freshness.get() on:input=move |ev| freshness.set(event_target_value(&ev)) />
+                    {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                    <div class="flex gap-2">
+                        <button class=BUTTON on:click=save>"Save"</button>
+                        <button class=BUTTON_QUIET on:click=move |_| editing.set(false)>"Cancel"</button>
+                    </div>
+                </div>
+            })}
+        </div>
     }
 }
 
@@ -558,7 +638,7 @@ fn RecordForm(collection: Collection, record: Option<Record>, done: Callback<()>
                 Err(msg) => return error.set(Some(format!("{k}: {msg}"))),
             }
         }
-        let r = RecordIn { fields: Value::Object(out), links: links.clone(), labels: labels.clone(), version };
+        let r = RecordIn { fields: Value::Object(out), links: links.clone(), labels: labels.clone(), version, derived_from: None };
         spawn_local(async move {
             match api::save_record(name.get_value(), id.get_value(), r).await {
                 Ok(_) => done.run(()),

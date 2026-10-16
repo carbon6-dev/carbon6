@@ -134,7 +134,7 @@ pub(crate) async fn apply_instance(st: &HeadState, realm: &str, name: &str, p: &
     }
     for (col, recs) in &c.records {
         for fields in recs {
-            let rec = api::RecordIn { fields: fields.clone(), links: None, labels: None, version: None };
+            let rec = api::RecordIn { fields: fields.clone(), ..Default::default() };
             crate::collections::put(st, realm, col, None, &rec, &by).await?;
         }
     }
@@ -235,7 +235,8 @@ pub(crate) async fn apply_instance_upgrade(
             Ok(cur) if cur.owner == name => {
                 let changed = col.schema.as_ref().is_some_and(|s| *s != cur.schema)
                     || col.description.as_ref().is_some_and(|d| *d != cur.description)
-                    || col.keys.as_ref().is_some_and(|k| *k != cur.keys);
+                    || col.keys.as_ref().is_some_and(|k| *k != cur.keys)
+                    || col.card.is_some();
                 if changed {
                     crate::collections::update(st, realm, &col.name, col).await?;
                 }
@@ -524,6 +525,7 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
             description: Some(c.description),
             schema: Some(c.schema),
             keys: Some(c.keys),
+            card: (!c.card.is_empty()).then_some(c.card),
         });
     }
     for s in crate::series::list(st, realm).await?.into_iter().filter(|s| !s.system && s.owner.is_empty()) {
@@ -662,4 +664,127 @@ fn items(p: &api::AppPackage) -> BTreeMap<(String, String), Value> {
 
 fn name_of(kind: &str, id: &str) -> String {
     format!("{} {}", kind.trim_start_matches("list:"), id.split('\u{1f}').next().unwrap_or(id).trim_matches('"'))
+}
+
+/// Whether a new schema could reject what an old one accepted: a field
+/// gone, a new required field, a type or the choices of an enum narrowed.
+/// (Additive changes are fine: a new optional field, a new enum value.)
+fn breaks(old: &Value, new: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let (op, np) = (old["properties"].as_object(), new["properties"].as_object());
+    let empty = serde_json::Map::new();
+    let (op, np) = (op.unwrap_or(&empty), np.unwrap_or(&empty));
+    for (k, o) in op {
+        match np.get(k) {
+            None => out.push(format!("field {k} is gone")),
+            Some(n) => {
+                if o.get("type") != n.get("type") && n.get("type").is_some() {
+                    out.push(format!("field {k} changes type"));
+                }
+                if let (Some(oe), Some(ne)) = (o["enum"].as_array(), n["enum"].as_array())
+                    && oe.iter().any(|v| !ne.contains(v))
+                {
+                    out.push(format!("field {k} drops choices"));
+                }
+                if o["enum"].is_null() && n["enum"].is_array() {
+                    out.push(format!("field {k} becomes a choice"));
+                }
+            }
+        }
+    }
+    let req = |s: &Value| -> Vec<String> {
+        s["required"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect()
+    };
+    for r in req(new) {
+        if !req(old).contains(&r) {
+            out.push(format!("field {r} becomes required"));
+        }
+    }
+    out
+}
+
+/// A breaking change to what an app publishes needs a new major version
+/// (docs/apps.md §12): a published collection's schema narrowed, a
+/// published operation's input narrowed, or either removed.
+pub(crate) fn contract_problems(old: &api::AppPackage, new: &api::AppPackage) -> Vec<String> {
+    let major = |v: &str| semver::Version::parse(v).map(|v| if v.major == 0 { (0, v.minor) } else { (v.major, 0) }).unwrap_or((0, 0));
+    let (a, b) = (major(&old.version), major(&new.version));
+    if old.app != new.app || b != a {
+        return Vec::new();
+    }
+    let mut changes = Vec::new();
+    for c in &old.contents.collections {
+        let published = c.card.as_ref().is_none_or(|k| !k.internal());
+        if !published {
+            continue;
+        }
+        match new.contents.collections.iter().find(|x| x.name == c.name) {
+            None => changes.push(format!("collection {} is no longer shipped", c.name)),
+            Some(n) => {
+                if let (Some(os), Some(ns)) = (&c.schema, &n.schema) {
+                    changes.extend(breaks(os, ns).into_iter().map(|b| format!("collection {}: {b}", c.name)));
+                }
+            }
+        }
+    }
+    for o in old.operations.iter().filter(|o| o.stability != "internal") {
+        match new.operations.iter().find(|x| x.name == o.name) {
+            None => changes.push(format!("operation {} is gone", o.name)),
+            Some(n) => changes.extend(breaks(&o.input, &n.input).into_iter().map(|b| format!("operation {}: {b}", o.name))),
+        }
+    }
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} {} changes what it publishes ({}): a breaking change needs a new major version",
+        new.app,
+        new.version,
+        changes.join("; ")
+    )]
+}
+
+/// What in a realm depends on an app's published collections and
+/// operations: views, triggers, other apps' reads, grants (for an upgrade's
+/// decision).
+pub(crate) async fn dependents(st: &HeadState, realm: &str, name: &str, p: &api::AppPackage) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let cols: Vec<&str> = p.contents.collections.iter().map(|c| c.name.as_str()).collect();
+    for (v, layer) in crate::lists::effective_tagged(&st.store.pool, "views", realm, None).await? {
+        if layer == crate::lists::Layer::Instance(name.to_owned()) {
+            continue;
+        }
+        if v["source"]["collection"].as_str().is_some_and(|c| cols.contains(&c)) {
+            out.push(format!("view {}", v["name"].as_str().unwrap_or("?")));
+        }
+    }
+    for t in crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await? {
+        if t.owner == name {
+            continue;
+        }
+        let on = t.event_params["collection"].as_str().is_some_and(|c| cols.contains(&c));
+        let calls = t.action == "operation" && t.action_params["instance"] == name;
+        if on || calls {
+            out.push(format!("trigger {}", t.name));
+        }
+    }
+    for i in crate::instances::list(&st.store.pool, Some(realm)).await? {
+        if i.name == name {
+            continue;
+        }
+        let reads = crate::instances::approved_reads(&st.store.pool, i.id).await?;
+        if reads.collections.iter().any(|r| cols.contains(&r.as_str()) || *r == format!("{name}.*")) {
+            out.push(format!("the app {}", i.name));
+        }
+    }
+    for g in crate::grants::list(st, Some(realm)).await? {
+        let scoped = g.scope["collection"].as_str().is_some_and(|c| cols.contains(&c))
+            || g.scope["methods"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|x| x.as_str().is_some_and(|s| s.starts_with(&format!("op:{name}.")))));
+        if g.from_realm == realm && matches!(g.state.as_str(), "active" | "requested") && scoped {
+            out.push(format!("the grant to {}", g.to_realm));
+        }
+    }
+    Ok(out)
 }

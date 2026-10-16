@@ -216,7 +216,7 @@ fn BoardView(view: ViewDef) -> impl IntoView {
         spawn_local(async move {
             let mut fields = rec.fields.as_object().cloned().unwrap_or_default();
             fields.insert(field, Value::String(to));
-            let r = c6_api::RecordIn { fields: Value::Object(fields), links: None, labels: None, version: Some(rec.version) };
+            let r = c6_api::RecordIn { fields: Value::Object(fields), version: Some(rec.version), ..Default::default() };
             match api::save_record(collection, Some(rec.id.clone()), r).await {
                 Ok(_) => {
                     error.set(None);

@@ -351,3 +351,15 @@ Settled since the first version: mail, calendar and contacts are in the realm wh
   - triggers: the `operation` action, `{instance, operation, input}` with the event mapped in;
   - views: an action with `operation` (`<instance>.<name>`, or the name alone for the collection's owner) and `input` mapped from the record (`"$.id"`, `"$.fields.x"`);
   - the UI: an app's collection shows its operations as buttons, each a form made from its input's schema and filled from the record you pick.
+
+### 18.3 Data cards, provenance and contracts (step 5)
+
+- **Migration `0043`:** `collections.card`, `records.derived_from` and `records.provenance`.
+- **The data card** (`card` on a collection: `stability`, `sources`, `invariants`, `freshness`) comes with an app's collections in its package, and you describe the realm's own (`PATCH /api/v1/collections/{name}` with `card`, or Describe… on its page). The head fills in the owner's package version and the operations that change it. Field meanings stay in the schema's descriptions.
+- **Where it shows:**
+  - an agent's first `records_query` or `records_get` of a collection carries `about`, the card in words (once per session);
+  - an internal collection's records carry a `note` for every reader but its app, in tool results and in the API's record pages;
+  - records mirrored for search include the card;
+  - the API, the collection's page and the realm explorer show it.
+- **Provenance:** every write records who wrote the current version (`by`, and the app, its package and version, the session or operation, `forced`). `derived_from` (`item:<id>`, `record:<collection>/<id>`, a URL) is given by agents' `records_put`, mapped by write operations and triggers' write actions, and set by grant snapshots (`record:<realm>/<collection>/<id>`).
+- **Contracts:** an upgrade within a major version (a minor version below 1.0) can't narrow what the app publishes. That means a published collection losing a field, changing a field's type, dropping enum choices or requiring a new field, and a published operation's input the same way or the operation removed. Internal collections and operations may change. The decision names what in the realm uses what the app publishes: views, triggers, other apps' reads and grants.

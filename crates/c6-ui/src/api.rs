@@ -924,6 +924,12 @@ pub async fn collection(name: String) -> Result<c6_api::Collection, String> {
     json(Request::get(&format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))).send().await).await
 }
 
+/// A collection's data card (docs/apps.md §8).
+pub async fn set_card(name: String, card: c6_api::DataCard) -> Result<c6_api::Collection, String> {
+    let c = c6_api::CollectionIn { card: Some(card), ..Default::default() };
+    send_json(Request::patch(&format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))), &c).await
+}
+
 pub async fn create_collection(c: c6_api::CollectionIn) -> Result<c6_api::Collection, String> {
     send_json(Request::post(&format!("/api/v1/collections{}", in_realm('?'))), &c).await
 }

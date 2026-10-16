@@ -93,6 +93,7 @@ pub async fn answer(st: &HeadState, d: &api::Decision, publish: bool) -> anyhow:
                 links: serde_json::from_value(c["links"].clone()).ok(),
                 labels: Some(labels),
                 version: None,
+                derived_from: serde_json::from_value(c["derived_from"].clone()).ok(),
             };
             crate::collections::put(st, COMMONS, c["collection"].as_str().unwrap_or_default(), None, &rec, &by).await?;
         }
@@ -126,6 +127,7 @@ pub async fn from_session(st: &HeadState, session_id: &str, realm: &str, p: &Val
             links: serde_json::from_value(p["links"].clone()).ok(),
             labels: serde_json::from_value(p["labels"].clone()).ok(),
             version: None,
+            derived_from: serde_json::from_value(p["derived_from"].clone()).ok(),
         };
         propose_record(st, realm, &by, name, &rec).await?
     };

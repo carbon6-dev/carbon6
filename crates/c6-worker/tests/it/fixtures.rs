@@ -383,7 +383,7 @@ async fn head_fixtures_upgrade_and_serve() {
         // Views (from version 37 on).
         if name.as_str() >= "c6h-v0037.db" {
             let v = get("views").await;
-            assert_eq!(v[0]["name"], "candidates", "{name}: {v}");
+            assert!(v.as_array().unwrap().iter().any(|x| x["name"] == "candidates"), "{name}: {v}");
         }
         // Apps (from version 38 on), as instances (version 42): the app owns
         // its collection, and its code is read from its package, so the
@@ -392,17 +392,17 @@ async fn head_fixtures_upgrade_and_serve() {
         if name.as_str() >= "c6h-v0038.db" {
             let a = get("apps").await;
             assert!(a.as_array().unwrap().iter().any(|x| x["app"] == "notes" && x["state"] == "installed"), "{name}: {a}");
-            let cols = get("collections?realm=notes").await;
+            // Before instances an app got a realm of its own; since, it goes in home.
+            let realm = if name.as_str() >= "c6h-v0042.db" { "home" } else { "notes" };
+            let cols = get(&format!("collections?realm={realm}")).await;
             assert!(cols.as_array().unwrap().iter().any(|c| c["name"] == "notes" && c["owner"] == "notes"), "{name}: {cols}");
-            assert_eq!(get("settings/views?realm=notes").await, json!([]), "{name}");
-            let views = get("realms/notes/effective/views").await;
-            assert_eq!(
-                (views[0]["entry"]["name"].as_str(), views[0]["from"].as_str()),
-                (Some("notes"), Some("app:notes")),
-                "{name}: {views}"
-            );
+            if realm == "notes" {
+                assert_eq!(get("settings/views?realm=notes").await, json!([]), "{name}");
+            }
+            let views = get(&format!("realms/{realm}/effective/views")).await;
+            assert!(views.as_array().unwrap().iter().any(|v| v["entry"]["name"] == "notes" && v["from"] == "app:notes"), "{name}: {views}");
             let installs = get("installs").await;
-            assert!(installs.as_array().unwrap().iter().any(|i| i["name"] == "notes" && i["realm"] == "notes"), "{name}: {installs}");
+            assert!(installs.as_array().unwrap().iter().any(|i| i["name"] == "notes" && i["realm"] == realm), "{name}: {installs}");
         }
         // Grants (from version 33 on).
         if name.as_str() >= "c6h-v0033.db" {

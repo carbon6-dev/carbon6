@@ -309,6 +309,7 @@ async fn snapshot(st: &HeadState, g: &api::Grant) -> anyhow::Result<()> {
             description: Some(format!("{} (a copy from realm {})", source.description, g.from_realm)),
             schema: Some(source.schema.clone()),
             keys: Some(Vec::new()),
+            card: Some(source.card.clone()),
         };
         crate::collections::create(st, &g.to_realm, &c, &format!("grant:{}", g.id), false).await?;
     }
@@ -320,7 +321,13 @@ async fn snapshot(st: &HeadState, g: &api::Grant) -> anyhow::Result<()> {
         links.push(format!("record:{}/{}", g.from_realm, r.id));
         let mut labels = r.labels.clone();
         labels.extend([format!("from:{}", g.from_realm), format!("grant:{}", g.id)]);
-        let copy = api::RecordIn { fields: r.fields.clone(), links: Some(links), labels: Some(labels), version: None };
+        let copy = api::RecordIn {
+            fields: r.fields.clone(),
+            links: Some(links),
+            labels: Some(labels),
+            version: None,
+            derived_from: Some(vec![format!("record:{}/{name}/{}", g.from_realm, r.id)]),
+        };
         crate::collections::put(st, &g.to_realm, name, None, &copy, &format!("grant:{}", g.id)).await?;
     }
     record_use(st, &g.id, "you", &format!("snapshot of {} records of {name}", page.records.len())).await;

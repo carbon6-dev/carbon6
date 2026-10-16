@@ -91,7 +91,9 @@ records_tool!(
     Concurrency::Exclusive,
     "Adds a record to a collection (no id) or replaces one (its id, and the version you read). fields is the whole record and \
      must match the collection's schema exactly: no fields it does not name, every required one, the right types. links names \
-     things and items it is about (e.g. client:acme); labels are labels.",
+     things and items it is about (e.g. client:acme); labels are labels; derived_from names the evidence it came from \
+     (item:<id> for a memex item, record:<collection>/<id> for a record), so others can check it. An app's collection is \
+     written only by the app: use app_call for its operations.",
     json!({"type": "object", "properties": {
         "collection": {"type": "string"},
         "realm": {"type": "string", "description": "Another realm's collection, through a grant it gave yours"},
@@ -99,7 +101,8 @@ records_tool!(
         "fields": {"type": "object"},
         "version": {"type": "integer"},
         "links": {"type": "array", "items": {"type": "string"}},
-        "labels": {"type": "array", "items": {"type": "string"}}
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "derived_from": {"type": "array", "items": {"type": "string"}}
     }, "required": ["collection", "fields"], "additionalProperties": false}),
     |ctx, input| { call(ctx, "session.records_put", input).await }
 );

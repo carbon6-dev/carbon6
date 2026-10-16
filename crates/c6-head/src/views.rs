@@ -111,7 +111,7 @@ pub async fn act(st: &HeadState, realm: &str, name: &str, a: &api::ViewAct, by: 
     if !action.set.is_empty() {
         let mut fields = rec.fields.as_object().cloned().unwrap_or_default();
         fields.extend(action.set.clone());
-        let r = api::RecordIn { fields: Value::Object(fields), links: None, labels: None, version: Some(rec.version) };
+        let r = api::RecordIn { fields: Value::Object(fields), version: Some(rec.version), ..Default::default() };
         rec = crate::collections::put(st, realm, collection, Some(&rec.id), &r, by).await?;
     }
     let mut out = json!({"record": rec});

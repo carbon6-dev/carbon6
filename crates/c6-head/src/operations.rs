@@ -120,7 +120,7 @@ async fn write(st: &HeadState, realm: &str, w: &api::OperationWrite, input: &Val
         if w.delete {
             return Err(bad_request("a deletion names the record"));
         }
-        let rec = api::RecordIn { fields, links: None, labels: None, version: None };
+        let rec = api::RecordIn { fields, derived_from: derived(w, input), ..Default::default() };
         return Ok(json!({"record": crate::collections::put(st, realm, &w.collection, None, &rec, by).await?}));
     };
     let cur = crate::collections::record(st, realm, &w.collection, &id).await?;
@@ -139,8 +139,17 @@ async fn write(st: &HeadState, realm: &str, w: &api::OperationWrite, input: &Val
     }
     let mut merged = cur.fields.as_object().cloned().unwrap_or_default();
     merged.extend(fields.as_object().cloned().unwrap_or_default());
-    let rec = api::RecordIn { fields: Value::Object(merged), links: None, labels: None, version: Some(cur.version) };
+    let rec =
+        api::RecordIn { fields: Value::Object(merged), version: Some(cur.version), derived_from: derived(w, input), ..Default::default() };
     Ok(json!({"record": crate::collections::put(st, realm, &w.collection, Some(&id), &rec, by).await?}))
+}
+
+/// What a write's record was derived from, mapped from the input.
+fn derived(w: &api::OperationWrite, input: &Value) -> Option<Vec<String>> {
+    if w.derived_from.is_null() {
+        return None;
+    }
+    serde_json::from_value(crate::triggers::render(&w.derived_from, input)).ok()
 }
 
 /// An agent's `app_call`: an operation of an instance in its session's

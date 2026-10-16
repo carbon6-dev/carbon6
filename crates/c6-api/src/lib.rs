@@ -230,6 +230,48 @@ pub struct Collection {
     /// empty: the realm's, written by anything in it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner: String,
+    /// What it says about itself, so any agent can use it (docs/apps.md §8).
+    #[serde(default)]
+    pub card: DataCard,
+}
+
+/// A collection's data card (docs/apps.md §8). With its schema's field
+/// descriptions, what an agent that has never seen the app needs to use
+/// its data, and to know what it may rely on.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DataCard {
+    /// `published` (a contract: changing its schema incompatibly is a
+    /// breaking change) or `internal` (readable, but may change without
+    /// notice). Default: published.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stability: String,
+    /// Where its records come from: inputs, and how they are derived.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sources: String,
+    /// What stays true, in words ("a relationship's last contact is the
+    /// date of its newest touchpoint").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invariants: Vec<String>,
+    /// How and how often it is updated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub freshness: String,
+    /// Filled in by the head: the owner's package version, and the
+    /// operations that change it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
+}
+
+impl DataCard {
+    pub fn is_empty(&self) -> bool {
+        self.stability.is_empty() && self.sources.is_empty() && self.invariants.is_empty() && self.freshness.is_empty()
+    }
+
+    pub fn internal(&self) -> bool {
+        self.stability == "internal"
+    }
 }
 
 /// `POST /api/v1/collections` and `PATCH /api/v1/collections/{name}`.
@@ -247,6 +289,9 @@ pub struct CollectionIn {
     pub schema: Option<serde_json::Value>,
     #[serde(default)]
     pub keys: Option<Vec<String>>,
+    /// Its data card (docs/apps.md §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<DataCard>,
 }
 
 /// A record in a collection.
@@ -266,6 +311,15 @@ pub struct Record {
     pub updated_by: String,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
+    /// What it was derived from: items (`item:<id>`) and records
+    /// (`record:<collection>/<id>`), so any agent can check the evidence
+    /// (docs/apps.md §8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<String>,
+    /// Who wrote its current version: the app and package version, the
+    /// session or operation (docs/apps.md §8).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub provenance: serde_json::Value,
 }
 
 /// `POST /api/v1/collections/{name}/records` and `PUT …/records/{id}`.
@@ -282,6 +336,10 @@ pub struct RecordIn {
     /// changed it since, and the write is refused.
     #[serde(default)]
     pub version: Option<i64>,
+    /// What it was derived from (`item:<id>`, `record:<collection>/<id>`);
+    /// updating without it keeps what it had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<Vec<String>>,
 }
 
 /// `POST /api/v1/collections/{name}/query`: which records, in what order.
@@ -570,6 +628,10 @@ pub struct OperationWrite {
     /// Deletes the record instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delete: bool,
+    /// What the record is derived from, mapped from the input: a list like
+    /// `["item:{{$.email}}"]` (docs/apps.md §8).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub derived_from: serde_json::Value,
 }
 
 /// A kit operation's tool and its arguments, mapped from the input.
@@ -1053,6 +1115,10 @@ pub struct RecordPage {
     /// With group_by: (value, count), most first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<(serde_json::Value, i64)>,
+    /// An internal collection of an app: readable, but it may change
+    /// without notice (docs/apps.md §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A version of a record.

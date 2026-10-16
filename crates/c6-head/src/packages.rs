@@ -1113,6 +1113,11 @@ pub async fn upgrade_to(st: &HeadState, id: i64, package: &str, version: &str) -
             lines.extend(changes);
         }
         problems.extend(crate::apps::migration_problems(st, &cur.realm, &cur.name, &new).await?);
+        problems.extend(crate::apps::contract_problems(&old, &new));
+        let deps = crate::apps::dependents(st, &cur.realm, &cur.name, &old).await?;
+        if !deps.is_empty() {
+            lines.push(format!("\nWhat in {} uses what it publishes: {}.", cur.realm, deps.join(", ")));
+        }
     }
     let grew = grown(&old, &new);
     if !grew.is_empty() {
