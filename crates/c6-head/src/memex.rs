@@ -23,6 +23,7 @@ pub const FOLDERS: &str = "memex_folders";
 const MEMORIES_SENT: &str = "memex_memories_sent";
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const WAITING_TIMEOUT: Duration = Duration::from_secs(120);
 /// A session's brief must not hold up its start for long.
 const BRIEF_TIMEOUT: Duration = Duration::from_secs(4);
 /// Session digests keep the latest turns within this many characters.
@@ -65,7 +66,9 @@ pub async fn call_in(st: &HeadState, realm: &str, method: &str, params: Value) -
 
 /// Calls the knowledge store (in the head, docs/knowledge.md).
 pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
-    call_within(st, method, params, CALL_TIMEOUT).await
+    // Ingest and uploads wait a while for what a worker reads (extract.rs).
+    let limit = if matches!(method, "memex.ingest" | "memex.upload") { WAITING_TIMEOUT } else { CALL_TIMEOUT };
+    call_within(st, method, params, limit).await
 }
 
 async fn call_within(st: &HeadState, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
@@ -279,8 +282,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
     Ok(json!({
         "embedding": embedding,
         "folders": folders,
-        "google": crate::google::for_memex(st).await,
-        "google_people": crate::google::endpoints().people,
+        "accounts": crate::providers::feeding(st, crate::realms::HOME).await.unwrap_or_default(),
         "contacts_auto": s.contacts_auto.unwrap_or(false),
         "understanding": task(&s.understanding),
         "prompts": crate::prompts::for_memex(st).await,

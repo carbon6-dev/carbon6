@@ -110,7 +110,19 @@ pub async fn call(st: &HeadState, realm: &str, instance: &str, name: &str, input
     }
     if let Some(k) = &op.kit {
         let args = crate::triggers::render(&Value::Object(k.args.clone()), &input).as_object().cloned().unwrap_or_default();
-        return crate::kitjobs::for_instance(st, realm, instance, &k.kit, &k.tool, args, Default::default(), &acting).await;
+        return crate::kitjobs::for_instance(
+            st,
+            realm,
+            instance,
+            &k.kit,
+            &k.tool,
+            args,
+            Default::default(),
+            &acting,
+            &k.state,
+            Some(&input),
+        )
+        .await;
     }
     Err(bad_request(format!("{instance}.{name} does nothing")))
 }

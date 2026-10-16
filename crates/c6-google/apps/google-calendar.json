@@ -1,0 +1,213 @@
+{
+  "package": "google-calendar",
+  "version": "1.0.0",
+  "description": "Your Google calendars in carbon6: every calendar of your accounts, events (recurring ones too) kept and searchable; creating, changing and deleting events, and answering invitations.",
+  "requires": {
+    "google": "^1"
+  },
+  "feeds": [
+    "calendar"
+  ],
+  "permissions": {
+    "secrets": [
+      "GOOGLE_CLIENT_ID",
+      "GOOGLE_CLIENT_SECRET"
+    ]
+  },
+  "providers": [
+    {
+      "name": "google",
+      "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "scopes": [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/calendar"
+      ],
+      "userinfo_url": "https://www.googleapis.com/oauth2/v3/userinfo",
+      "account_field": "email",
+      "params": {
+        "access_type": "offline",
+        "prompt": "consent"
+      },
+      "client_id_secret": "GOOGLE_CLIENT_ID",
+      "client_secret_secret": "GOOGLE_CLIENT_SECRET"
+    }
+  ],
+  "contents": {
+    "collections": [
+      {
+        "name": "calendar_sync",
+        "description": "Where each account's calendar sync is: its cursor, its import's place, its last trouble.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "what syncs: mail:<account>, cal:<account>:<calendar>, contacts:<account>"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "page_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "queue": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "type": "string",
+              "enum": [
+                "import",
+                "live"
+              ]
+            },
+            "done": {
+              "type": "integer"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": "integer"
+            }
+          }
+        },
+        "keys": [
+          "key"
+        ],
+        "card": {
+          "stability": "internal",
+          "sources": "The google kit's syncs.",
+          "freshness": "Every run."
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "name": "calendar sync",
+        "trigger": "schedule",
+        "cron": "*/3 * * * *",
+        "action": "kit",
+        "action_params": {
+          "kit": "google",
+          "tool": "calendar-sync",
+          "state": [
+            "calendar_sync"
+          ]
+        },
+        "per_hour": 60
+      }
+    ]
+  },
+  "operations": [
+    {
+      "name": "create",
+      "description": "Creates an event (invitations go out to its attendees).",
+      "input": {
+        "type": "object",
+        "required": [
+          "edit"
+        ],
+        "properties": {
+          "edit": {
+            "type": "object",
+            "description": "The event: account, calendar_id, event_id, instance_start, scope (this, following, all), summary, description, location, start, end, all_day, attendees, recurrence; for an answer, response"
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "calendar-write",
+        "args": {
+          "action": "create"
+        }
+      }
+    },
+    {
+      "name": "update",
+      "description": "Changes an event: this one, this and following, or all.",
+      "input": {
+        "type": "object",
+        "required": [
+          "edit"
+        ],
+        "properties": {
+          "edit": {
+            "type": "object",
+            "description": "The event: account, calendar_id, event_id, instance_start, scope (this, following, all), summary, description, location, start, end, all_day, attendees, recurrence; for an answer, response"
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "calendar-write",
+        "args": {
+          "action": "update"
+        }
+      }
+    },
+    {
+      "name": "delete",
+      "description": "Deletes an event: this one, this and following, or all.",
+      "input": {
+        "type": "object",
+        "required": [
+          "edit"
+        ],
+        "properties": {
+          "edit": {
+            "type": "object",
+            "description": "The event: account, calendar_id, event_id, instance_start, scope (this, following, all), summary, description, location, start, end, all_day, attendees, recurrence; for an answer, response"
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "calendar-write",
+        "args": {
+          "action": "delete"
+        }
+      }
+    },
+    {
+      "name": "rsvp",
+      "description": "Answers an invitation: accepted, declined or tentative.",
+      "input": {
+        "type": "object",
+        "required": [
+          "edit"
+        ],
+        "properties": {
+          "edit": {
+            "type": "object",
+            "description": "The event: account, calendar_id, event_id, instance_start, scope (this, following, all), summary, description, location, start, end, all_day, attendees, recurrence; for an answer, response"
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "calendar-write",
+        "args": {
+          "action": "rsvp"
+        }
+      }
+    }
+  ]
+}

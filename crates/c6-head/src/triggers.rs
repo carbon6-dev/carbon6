@@ -334,6 +334,9 @@ pub fn passes(filter: &Value, event: &Value) -> bool {
 /// Parameters with the event's values in: a string that is a JSONPath
 /// (`$.body.amount`) becomes that value; `{{$.path}}` inside text becomes
 /// it as text.
+/// Apps' kit tools running from triggers now: realm/app/kit.tool.
+static KIT_RUNS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
 pub fn render(template: &Value, event: &Value) -> Value {
     match template {
         Value::String(s) if s.starts_with("$.") && !s.contains(char::is_whitespace) => at(event, s).cloned().unwrap_or(Value::Null),
@@ -711,18 +714,28 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
         }
         "kit" => {
             let inst = if a.owner.is_empty() { p["instance"].as_str().unwrap_or_default() } else { a.owner.as_str() };
+            let (kit, tool) = (p["kit"].as_str().unwrap_or_default(), p["tool"].as_str().unwrap_or_default());
             let args = p["args"].as_object().cloned().unwrap_or_default();
-            crate::kitjobs::for_instance(
-                st,
-                &realm,
-                inst,
-                p["kit"].as_str().unwrap_or_default(),
-                p["tool"].as_str().unwrap_or_default(),
-                args,
-                Default::default(),
-                &by,
-            )
-            .await?;
+            let state: Vec<String> = serde_json::from_value(p["state"].clone()).unwrap_or_default();
+            // One run of an app's tool at a time; one that asks to go again
+            // (an import under way) does, soon.
+            let key = format!("{realm}/{inst}/{kit}.{tool}");
+            if !KIT_RUNS.lock().unwrap().insert(key.clone()) {
+                return Ok(());
+            }
+            let result = async {
+                for _ in 0..500 {
+                    let v = crate::kitjobs::for_instance(st, &realm, inst, kit, tool, args.clone(), Default::default(), &by, &state, None).await?;
+                    if v["again"] != true {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            KIT_RUNS.lock().unwrap().remove(&key);
+            result?;
         }
         "notify" => {
             st.notifier.send(crate::notify::Note {

@@ -582,6 +582,11 @@ pub async fn google_connect() -> Result<String, String> {
     Ok(v["authorize_url"].as_str().unwrap_or_default().to_owned())
 }
 
+/// Asks to install the Gmail, Calendar and Contacts apps.
+pub async fn google_install() -> Result<Vec<c6_api::Install>, String> {
+    json(Request::post("/api/v1/google/install").send().await).await
+}
+
 pub async fn google_accounts() -> Result<Vec<c6_api::GoogleAccount>, String> {
     json(Request::get("/api/v1/google/accounts").send().await).await
 }

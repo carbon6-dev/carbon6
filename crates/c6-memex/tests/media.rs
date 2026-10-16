@@ -191,7 +191,7 @@ async fn photos_and_videos() {
     // Someone you write to.
 
     let (m, _dir) = memex_node(&head, &stop).await;
-    c6_memex::google::person(&m.store, "jane@acme.com", "Jane Doe").await.unwrap();
+    c6_memex::people::person(&m.store, "jane@acme.com", "Jane Doe").await.unwrap();
     // Face models (what the kit gets; the fake above stands in for them).
     for f in ["detector.onnx", "embedder.onnx"] {
         std::fs::write(files.path().join(f), b"onnx").unwrap();

@@ -1,16 +1,17 @@
-//! Google Calendar: every calendar of every account, synced both ways
-//! with sync tokens; recurring events expanded for the views here (with
-//! their exceptions); creating, changing ("this one", "this and
-//! following", "all") and deleting events; RSVPs; free/busy.
+//! The calendar store: every calendar of the calendar apps' accounts, as
+//! they sync them (Google's shapes: events with their recurrence rules and
+//! changed or cancelled instances); recurring events expanded for the
+//! views here; free/busy. Creating, changing ("this one", "this and
+//! following", "all"), deleting and RSVPs go through the app that owns
+//! the account (docs/knowledge.md §6).
 
 use c6_api as api;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde_json::{Value, json};
 use sqlx::Row;
-use tracing::warn;
 
 use crate::Memex;
-use crate::google::{self, Account, status_of};
+use crate::people;
 use crate::store::clip;
 
 /// RFC 3339 (or a date, for all-day events) to ms.
@@ -22,90 +23,34 @@ fn parse_time(v: &Value) -> Option<(i64, bool)> {
     Some((Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?).timestamp_millis(), true))
 }
 
-fn time_json(ms: i64, all_day: bool, tz: &str) -> Value {
-    let t = Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now);
-    if all_day {
-        json!({"date": t.format("%Y-%m-%d").to_string()})
-    } else {
-        let mut v = json!({"dateTime": t.to_rfc3339()});
-        if !tz.is_empty() {
-            v["timeZone"] = json!(tz);
-        }
-        v
-    }
-}
-
-/// Syncs an account's calendars and their events.
-pub async fn sync(m: &Memex, acct: &Account) -> anyhow::Result<()> {
-    let list = m.google.get(&acct.id, "/calendar/v3/users/me/calendarList", &[]).await?;
-    for c in list["items"].as_array().into_iter().flatten() {
-        sqlx::query(
-            "INSERT INTO calendars (account, id, summary, color, is_primary, access, selected, time_zone) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(account, id) DO UPDATE SET summary = excluded.summary, color = excluded.color, is_primary = excluded.is_primary, \
-             access = excluded.access, time_zone = excluded.time_zone",
-        )
-        .bind(&acct.id)
-        .bind(c["id"].as_str().unwrap_or_default())
-        .bind(c["summaryOverride"].as_str().or(c["summary"].as_str()).unwrap_or_default())
-        .bind(c["backgroundColor"].as_str().unwrap_or(""))
-        .bind(c["primary"].as_bool().unwrap_or(false) as i64)
-        .bind(c["accessRole"].as_str().unwrap_or(""))
-        .bind(c["selected"].as_bool().unwrap_or(true) as i64)
-        .bind(c["timeZone"].as_str().unwrap_or("UTC"))
-        .execute(&m.store.pool)
-        .await?;
-        let id = c["id"].as_str().unwrap_or_default().to_owned();
-        if let Err(e) = sync_calendar(m, acct, &id).await {
-            warn!(account = %acct.email, calendar = %id, "calendar sync: {e:#}");
-            google::set_error(&m.store, &acct.id, &format!("cal:{id}"), Some(&format!("{e:#}"))).await?;
-        }
-    }
+/// Keeps a calendar an app syncs (whether it is shown stays yours).
+pub async fn store_calendar(m: &Memex, account: &str, c: &Value) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO calendars (account, id, summary, color, is_primary, access, selected, time_zone) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(account, id) DO UPDATE SET summary = excluded.summary, color = excluded.color, is_primary = excluded.is_primary, \
+         access = excluded.access, time_zone = excluded.time_zone",
+    )
+    .bind(account)
+    .bind(c["id"].as_str().unwrap_or_default())
+    .bind(c["summaryOverride"].as_str().or(c["summary"].as_str()).unwrap_or_default())
+    .bind(c["backgroundColor"].as_str().unwrap_or(""))
+    .bind(c["primary"].as_bool().unwrap_or(false) as i64)
+    .bind(c["accessRole"].as_str().unwrap_or(""))
+    .bind(c["selected"].as_bool().unwrap_or(true) as i64)
+    .bind(c["timeZone"].as_str().unwrap_or("UTC"))
+    .execute(&m.store.pool)
+    .await?;
     Ok(())
 }
 
-async fn sync_calendar(m: &Memex, acct: &Account, cal: &str) -> anyhow::Result<()> {
-    let kind = format!("cal:{cal}");
-    let mut st = google::state(&m.store, &acct.id, &kind).await?;
-    let path = format!("/calendar/v3/calendars/{}/events", urlenc(cal));
-    let mut page: Option<String> = None;
-    loop {
-        let mut q = vec![("showDeleted", "true".to_owned()), ("maxResults", "250".to_owned())];
-        if let Some(t) = &st.cursor {
-            q.push(("syncToken", t.clone()));
-        }
-        if let Some(p) = &page {
-            q.push(("pageToken", p.clone()));
-        }
-        let v = match m.google.get(&acct.id, &path, &q).await {
-            Ok(v) => v,
-            Err(e) if status_of(&e) == Some(410) => {
-                st = google::SyncState { phase: "import".into(), ..Default::default() };
-                google::save_state(&m.store, &acct.id, &kind, &st, None).await?;
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        for e in v["items"].as_array().into_iter().flatten() {
-            store_event(m, acct, cal, e).await?;
-            st.done += 1;
-        }
-        page = v["nextPageToken"].as_str().map(str::to_owned);
-        if page.is_none() {
-            st.cursor = v["nextSyncToken"].as_str().map(str::to_owned).or(st.cursor);
-            st.phase = "live".into();
-            break;
-        }
-    }
-    google::save_state(&m.store, &acct.id, &kind, &st, None).await
-}
-
-/// Stores (or removes) an event, and its item: what, when, who.
-pub async fn store_event(m: &Memex, acct: &Account, cal: &str, e: &Value) -> anyhow::Result<()> {
+/// Stores (or removes) an event an app synced, and its item: what, when,
+/// who. `source` is the app's (`app:<name>`).
+pub async fn store_event(m: &Memex, source: &str, account: &str, email: &str, cal: &str, e: &Value) -> anyhow::Result<()> {
     let id = e["id"].as_str().unwrap_or_default();
     let status = e["status"].as_str().unwrap_or("confirmed");
     let existing: Option<Option<String>> =
         sqlx::query_scalar("SELECT item_id FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
-            .bind(&acct.id)
+            .bind(account)
             .bind(cal)
             .bind(id)
             .fetch_optional(&m.store.pool)
@@ -117,7 +62,7 @@ pub async fn store_event(m: &Memex, acct: &Account, cal: &str, e: &Value) -> any
             m.store.delete(item).await?;
         }
         sqlx::query("DELETE FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
-            .bind(&acct.id)
+            .bind(account)
             .bind(cal)
             .bind(id)
             .execute(&m.store.pool)
@@ -141,8 +86,8 @@ pub async fn store_event(m: &Memex, acct: &Account, cal: &str, e: &Value) -> any
             .collect();
         let it = api::MemexItemIn {
             kind: "event".into(),
-            source: format!("calendar:{}", acct.id),
-            external_id: format!("{cal}/{id}"),
+            source: source.to_owned(),
+            external_id: format!("{account}:{cal}:{id}"),
             title: summary.clone(),
             text: format!(
                 "{}\n{}{}\n{}",
@@ -152,14 +97,15 @@ pub async fn store_event(m: &Memex, acct: &Account, cal: &str, e: &Value) -> any
                 clip(e["description"].as_str().unwrap_or(""), 20_000)
             ),
             created_at: Some(start),
-            meta: json!({"account": acct.email, "calendar": cal, "event_id": id, "end": end, "all_day": all_day}),
+            meta: json!({"account": email, "calendar": cal, "event_id": id, "end": end, "all_day": all_day,
+                         "location": e["location"].as_str().unwrap_or_default()}),
             ..Default::default()
         };
         let item = m.store.put(&it, &it.source).await?;
         m.store.clear_links(&item, "calendar").await?;
         for a in &attendees {
             if let Some(addr) = a["email"].as_str() {
-                let p = google::person(&m.store, addr, a["displayName"].as_str().unwrap_or("")).await?;
+                let p = people::person(&m.store, addr, a["displayName"].as_str().unwrap_or("")).await?;
                 m.store.link(&item, "attendee", &p, "observed", "calendar", None).await?;
             }
         }
@@ -175,7 +121,7 @@ pub async fn store_event(m: &Memex, acct: &Account, cal: &str, e: &Value) -> any
          organizer = excluded.organizer, my_status = excluded.my_status, transparent = excluded.transparent, html_link = excluded.html_link, \
          conference = excluded.conference, updated = excluded.updated, item_id = excluded.item_id",
     )
-    .bind(&acct.id)
+    .bind(account)
     .bind(cal)
     .bind(id)
     .bind(status)
@@ -200,16 +146,6 @@ pub async fn store_event(m: &Memex, acct: &Account, cal: &str, e: &Value) -> any
     .execute(&m.store.pool)
     .await?;
     Ok(())
-}
-
-fn urlenc(s: &str) -> String {
-    url_escape(s)
-}
-
-fn url_escape(s: &str) -> String {
-    s.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect()
 }
 
 fn row_event(r: &sqlx::sqlite::SqliteRow, start: i64, end: i64, instance: bool) -> api::CalendarEvent {
@@ -340,59 +276,34 @@ pub async fn select(m: &Memex, account: &str, id: &str, on: bool) -> anyhow::Res
     Ok(())
 }
 
-fn event_body(e: &api::EventEdit, tz: &str) -> Value {
-    let mut v = json!({});
-    if let Some(s) = &e.summary {
-        v["summary"] = json!(s);
+/// Creates, changes, deletes or answers an event through the calendar
+/// app that owns the account; what changed is kept as it syncs back. A
+/// new event comes back.
+pub async fn write(m: &Memex, action: &str, params: Value, by: &str) -> anyhow::Result<Value> {
+    let mut e: api::EventEdit = if action == "rsvp" {
+        api::EventEdit {
+            account: params["account"].as_str().unwrap_or_default().to_owned(),
+            calendar_id: params["calendar_id"].as_str().map(str::to_owned),
+            event_id: params["event_id"].as_str().map(str::to_owned),
+            instance_start: params["instance_start"].as_i64(),
+            ..Default::default()
+        }
+    } else {
+        serde_json::from_value(params.clone())?
+    };
+    let a = m.account("calendar", &e.account)?;
+    e.account = a.id.clone();
+    let mut edit = json!(e);
+    if action == "rsvp" {
+        edit["response"] = params["response"].clone();
     }
-    if let Some(s) = &e.description {
-        v["description"] = json!(s);
+    let v = m.app_call(&a, action, json!({"edit": edit}), by).await?;
+    if action == "create" {
+        let r = &v["result"];
+        let e = one(m, &a.id, r["calendar_id"].as_str().unwrap_or("primary"), r["event_id"].as_str().unwrap_or_default()).await?;
+        return Ok(json!(e));
     }
-    if let Some(s) = &e.location {
-        v["location"] = json!(s);
-    }
-    if let (Some(s), Some(en)) = (e.start, e.end) {
-        v["start"] = time_json(s, e.all_day, tz);
-        v["end"] = time_json(en, e.all_day, tz);
-    }
-    if let Some(a) = &e.attendees {
-        v["attendees"] = json!(a.iter().map(|x| json!({"email": x})).collect::<Vec<_>>());
-    }
-    if let Some(r) = &e.recurrence {
-        v["recurrence"] = json!(r);
-    }
-    v
-}
-
-async fn cal_tz(m: &Memex, account: &str, cal: &str) -> String {
-    sqlx::query_scalar("SELECT time_zone FROM calendars WHERE account = ? AND id = ?")
-        .bind(account)
-        .bind(cal)
-        .fetch_optional(&m.store.pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "UTC".into())
-}
-
-/// Creates an event (invitations go out to attendees); it is stored.
-pub async fn create(m: &Memex, e: &api::EventEdit) -> anyhow::Result<api::CalendarEvent> {
-    let acct = m.account(&e.account)?;
-    let cal = e.calendar_id.clone().unwrap_or_else(|| "primary".into());
-    anyhow::ensure!(e.start.is_some() && e.end.is_some() && e.summary.is_some(), "an event needs a title, a start and an end");
-    let tz = cal_tz(m, &acct.id, &cal).await;
-    let v = m
-        .google
-        .call(
-            &acct.id,
-            reqwest::Method::POST,
-            &format!("/calendar/v3/calendars/{}/events", urlenc(&cal)),
-            &[("sendUpdates", "all".into())],
-            Some(&event_body(e, &tz)),
-        )
-        .await?;
-    store_event(m, &acct, &cal, &v).await?;
-    one(m, &acct.id, &cal, v["id"].as_str().unwrap_or_default()).await
+    Ok(json!({}))
 }
 
 async fn one(m: &Memex, account: &str, cal: &str, id: &str) -> anyhow::Result<api::CalendarEvent> {
@@ -403,172 +314,6 @@ async fn one(m: &Memex, account: &str, cal: &str, id: &str) -> anyhow::Result<ap
         .fetch_one(&m.store.pool)
         .await?;
     Ok(row_event(&r, r.get("start"), r.get("end"), false))
-}
-
-/// Google's id for an instance of a recurring event.
-fn instance_id(id: &str, start: i64, all_day: bool) -> String {
-    let t = Utc.timestamp_millis_opt(start).single().unwrap_or_else(Utc::now);
-    if all_day { format!("{id}_{}", t.format("%Y%m%d")) } else { format!("{id}_{}", t.format("%Y%m%dT%H%M%SZ")) }
-}
-
-/// Changes an event: one instance ("this"), the series from an instance
-/// on ("following"), or the whole series ("all", or a single event).
-pub async fn update(m: &Memex, e: &api::EventEdit) -> anyhow::Result<()> {
-    let acct = m.account(&e.account)?;
-    let cal = e.calendar_id.clone().unwrap_or_else(|| "primary".into());
-    let id = e.event_id.clone().ok_or_else(|| anyhow::anyhow!("which event?"))?;
-    let tz = cal_tz(m, &acct.id, &cal).await;
-    let base = format!("/calendar/v3/calendars/{}/events", urlenc(&cal));
-    let send = [("sendUpdates", "all".to_owned())];
-    match (e.scope.as_deref().unwrap_or("all"), e.instance_start) {
-        ("this", Some(at)) => {
-            let master = one(m, &acct.id, &cal, &id).await?;
-            let iid = instance_id(&id, at, master.all_day);
-            let v = m
-                .google
-                .call(&acct.id, reqwest::Method::PATCH, &format!("{base}/{}", urlenc(&iid)), &send, Some(&event_body(e, &tz)))
-                .await?;
-            store_event(m, &acct, &cal, &v).await?;
-        }
-        ("following", Some(at)) => {
-            // End the series before this instance; start a new one here.
-            let r = sqlx::query("SELECT * FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
-                .bind(&acct.id)
-                .bind(&cal)
-                .bind(&id)
-                .fetch_one(&m.store.pool)
-                .await?;
-            let lines: Vec<String> = serde_json::from_str(&r.get::<String, _>("recurrence")).unwrap_or_default();
-            let until = Utc.timestamp_millis_opt(at - 1000).single().unwrap_or_else(Utc::now).format("%Y%m%dT%H%M%SZ").to_string();
-            let ended: Vec<String> =
-                lines.iter().map(|l| if l.starts_with("RRULE:") { with_until(l, &until) } else { l.clone() }).collect();
-            let v = m
-                .google
-                .call(&acct.id, reqwest::Method::PATCH, &format!("{base}/{}", urlenc(&id)), &send, Some(&json!({"recurrence": ended})))
-                .await?;
-            store_event(m, &acct, &cal, &v).await?;
-            let (start, end): (i64, i64) = (r.get("start"), r.get("end"));
-            let mut next = e.clone();
-            next.start = Some(e.start.unwrap_or(at));
-            next.end = Some(e.end.unwrap_or(at + (end - start)));
-            next.summary = next.summary.or(Some(r.get("summary")));
-            next.recurrence =
-                Some(lines.iter().map(|l| if l.starts_with("RRULE:") { without_count_until(l) } else { l.clone() }).collect());
-            next.all_day = r.get::<i64, _>("all_day") != 0;
-            let v = m.google.call(&acct.id, reqwest::Method::POST, &base, &send, Some(&event_body(&next, &tz))).await?;
-            store_event(m, &acct, &cal, &v).await?;
-        }
-        _ => {
-            let v = m
-                .google
-                .call(&acct.id, reqwest::Method::PATCH, &format!("{base}/{}", urlenc(&id)), &send, Some(&event_body(e, &tz)))
-                .await?;
-            store_event(m, &acct, &cal, &v).await?;
-        }
-    }
-    Ok(())
-}
-
-fn with_until(rule: &str, until: &str) -> String {
-    let parts: Vec<&str> =
-        rule.trim_start_matches("RRULE:").split(';').filter(|p| !p.starts_with("UNTIL=") && !p.starts_with("COUNT=")).collect();
-    format!("RRULE:{};UNTIL={until}", parts.join(";"))
-}
-
-fn without_count_until(rule: &str) -> String {
-    let parts: Vec<&str> =
-        rule.trim_start_matches("RRULE:").split(';').filter(|p| !p.starts_with("UNTIL=") && !p.starts_with("COUNT=")).collect();
-    format!("RRULE:{}", parts.join(";"))
-}
-
-/// Deletes an event, an instance ("this"), or the series from one on.
-pub async fn delete(m: &Memex, e: &api::EventEdit) -> anyhow::Result<()> {
-    let acct = m.account(&e.account)?;
-    let cal = e.calendar_id.clone().unwrap_or_else(|| "primary".into());
-    let id = e.event_id.clone().ok_or_else(|| anyhow::anyhow!("which event?"))?;
-    let base = format!("/calendar/v3/calendars/{}/events", urlenc(&cal));
-    match (e.scope.as_deref().unwrap_or("all"), e.instance_start) {
-        ("this", Some(at)) => {
-            let master = one(m, &acct.id, &cal, &id).await?;
-            let iid = instance_id(&id, at, master.all_day);
-            m.google
-                .call(&acct.id, reqwest::Method::DELETE, &format!("{base}/{}", urlenc(&iid)), &[("sendUpdates", "all".into())], None)
-                .await?;
-            sqlx::query(
-                "INSERT OR REPLACE INTO events (account, calendar_id, event_id, status, start, end, recurring_event_id, original_start) VALUES (?, ?, ?, 'cancelled', ?, ?, ?, ?)",
-            )
-            .bind(&acct.id)
-            .bind(&cal)
-            .bind(&iid)
-            .bind(at)
-            .bind(at)
-            .bind(&id)
-            .bind(at)
-            .execute(&m.store.pool)
-            .await?;
-        }
-        ("following", Some(at)) => {
-            let r = sqlx::query("SELECT recurrence FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
-                .bind(&acct.id)
-                .bind(&cal)
-                .bind(&id)
-                .fetch_one(&m.store.pool)
-                .await?;
-            let lines: Vec<String> = serde_json::from_str(&r.get::<String, _>("recurrence")).unwrap_or_default();
-            let until = Utc.timestamp_millis_opt(at - 1000).single().unwrap_or_else(Utc::now).format("%Y%m%dT%H%M%SZ").to_string();
-            let ended: Vec<String> =
-                lines.iter().map(|l| if l.starts_with("RRULE:") { with_until(l, &until) } else { l.clone() }).collect();
-            let v = m
-                .google
-                .call(&acct.id, reqwest::Method::PATCH, &format!("{base}/{}", urlenc(&id)), &[], Some(&json!({"recurrence": ended})))
-                .await?;
-            store_event(m, &acct, &cal, &v).await?;
-        }
-        _ => {
-            m.google
-                .call(&acct.id, reqwest::Method::DELETE, &format!("{base}/{}", urlenc(&id)), &[("sendUpdates", "all".into())], None)
-                .await?;
-            store_event(m, &acct, &cal, &json!({"id": id, "status": "cancelled"})).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Answers an invitation: accepted, declined or tentative.
-pub async fn rsvp(m: &Memex, account: &str, cal: &str, id: &str, instance_start: Option<i64>, response: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(matches!(response, "accepted" | "declined" | "tentative"), "the answer is accepted, declined or tentative");
-    let acct = m.account(account)?;
-    let r = sqlx::query("SELECT attendees, all_day FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
-        .bind(&acct.id)
-        .bind(cal)
-        .bind(id)
-        .fetch_one(&m.store.pool)
-        .await?;
-    let mut attendees: Vec<Value> = serde_json::from_str(&r.get::<String, _>("attendees")).unwrap_or_default();
-    let mine = acct.email.to_lowercase();
-    let mut found = false;
-    for a in attendees.iter_mut() {
-        if a["self"].as_bool() == Some(true) || a["email"].as_str().map(str::to_lowercase).as_deref() == Some(mine.as_str()) {
-            a["responseStatus"] = json!(response);
-            found = true;
-        }
-    }
-    anyhow::ensure!(found, "you are not invited to this event");
-    let target = match instance_start {
-        Some(at) => instance_id(id, at, r.get::<i64, _>("all_day") != 0),
-        None => id.to_owned(),
-    };
-    let v = m
-        .google
-        .call(
-            &acct.id,
-            reqwest::Method::PATCH,
-            &format!("/calendar/v3/calendars/{}/events/{}", urlenc(cal), urlenc(&target)),
-            &[("sendUpdates", "all".into())],
-            Some(&json!({"attendees": attendees})),
-        )
-        .await?;
-    store_event(m, &acct, cal, &v).await
 }
 
 #[cfg(test)]
@@ -587,10 +332,5 @@ mod tests {
         let ny = Utc.with_ymd_and_hms(2026, 10, 26, 13, 0, 0).unwrap().timestamp_millis(); // 09:00 EDT
         let got = expand(ny, "America/New_York", &["RRULE:FREQ=WEEKLY;COUNT=2".to_owned()], ny, ny + 30 * day).unwrap();
         assert_eq!(got[1] - got[0], 7 * day + 3_600_000, "09:00 EST is an hour later in UTC");
-        assert_eq!(
-            with_until("RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=MO", "20261101T000000Z"),
-            "RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261101T000000Z"
-        );
-        assert_eq!(instance_id("abc", start, false), "abc_20261012T090000Z");
     }
 }

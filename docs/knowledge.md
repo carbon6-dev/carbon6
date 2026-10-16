@@ -245,3 +245,47 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - Each has paging back in time.
   - The Mail, Calendar and Photos pages stay as they are until step 6 moves mail, calendar and contacts into apps.
 
+### 13.6 Gmail, Calendar and Contacts as apps (step 6)
+
+- **Packages** (`crates/c6-google`, part of carbon6, offered for install with your approval):
+  - the kit **google**: a Rust binary built in its image, as c6-extract is. Its network is `hosts`: www.googleapis.com, gmail.googleapis.com and people.googleapis.com.
+  - the apps **gmail**, **google-calendar** and **google-contacts**, which require it. Each has:
+    - the OAuth provider `google` (the client in home's secrets `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`);
+    - `feeds` (`mail`, `calendar`, `contacts`: a new manifest field naming the knowledge store's stores its accounts feed);
+    - an internal collection where its syncs are (`gmail_sync`, `calendar_sync`, `contacts_sync`);
+    - a schedule trigger that runs its sync tool with no agent (every 2, 3 and 10 minutes);
+    - kit operations: gmail's `modify`, `send` and `draft`; the calendar's `create`, `update`, `delete` and `rsvp`; the contacts' `create`.
+  - A unit test ties the packages' versions to a digest of their source (`kit.digest`).
+- **The kit** talks to Google and keeps nothing:
+  - It reads where each sync is (`state/<collection>.json`) and an operation's input (`input.json`).
+  - It writes what changed as typed items in `out/ingest.json`: messages as `message/rfc822` with Gmail's ids and labels as attributes (a label change is the item without its bytes); label names, calendars, events and contacts in Google's own JSON (`application/vnd.c6.*+json`); deletions; the syncs' new records; and `again` while an import is under way.
+  - A run brings up to 24 MB of messages. The rest of an import page waits in the sync's `queue`, and the trigger runs again at once.
+  - An operation's answer goes in `out/result.json`.
+- **New kit primitives:**
+  - Operations' and triggers' `state` (the app's collections, given to the run).
+  - `input.json` (the input with the kit operation's arguments).
+  - Typed items, `deleted`, `again` and `result` in a run's output.
+  - `id` in `C6_ACCOUNTS`.
+  - `kitjobs::run_locally` (a kit's code in-process, for tests).
+  - `providers::connect_many` (one sign-in for several apps; the Google apps use the redirect address registered before, `/auth/google/callback`).
+  - The knowledge store's `app.call` link, so it can call an app's operation.
+- **The knowledge store keeps its mail, calendar and contacts stores**, fed by whichever app owns an account:
+  - Typed ingest written as an app (`as: app:<name>`, which only the head can set).
+  - Mirrored mail, with the mailbox's labels.
+  - Calendars, events (with recurrence expansion as before) and contacts.
+  - The mail client, calendar and contacts act through the owning app's operations (`modify`, `send` after the undo window, `draft`, `create` and the rest). The app changes the provider, and what changed comes back through its output.
+  - Accounts reach the knowledge store from the head's config, with their app and what they feed.
+- **Removed:** the memex's Google client and syncs (`google.rs`), the head's Google token broker (`google:` credentials), and the head's own Google sign-in. Settings → Mail & calendar now installs the apps, sets the client and connects accounts for all three.
+- **Moving in** (`google::move_in`, once at start):
+  - The three apps are installed in home, approved, since you had approved the memex's sync.
+  - The old OAuth client becomes home's secrets.
+  - Each account becomes each app's. The gmail app keeps the account's id, since the mail is filed by it; the calendar's and contacts' get theirs.
+  - Mail and event items become the apps' (`app:gmail`, `app:google-calendar`), with the same ids.
+  - Each sync's cursor moves into the apps' collections, so nothing is fetched again.
+  - A follow-up says so.
+- **Tested:**
+  - With the kit's code in-process against a stand-in Google: install, the sign-in's address with all three apps' scopes, import in pages, history, archiving, sending with undo, drafts, contacts written back, events with a recurring one and an exception, RSVP, an agent's mail held for approval, automations on new mail.
+  - The move in.
+  - The image builds, and reaches Google over TLS.
+- **Not done:** understanding (summaries, links, facts, the review queue) still runs in the knowledge store. Making it system packages that write claims, with the review queue as decisions, is the rest of step 6.
+

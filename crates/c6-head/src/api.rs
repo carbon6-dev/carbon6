@@ -29,10 +29,12 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
         .route("/callback", get(chatgpt_callback))
-        .route("/auth/google/callback", get(crate::google::callback))
+        // Google's apps sign in through the address registered before they were apps.
+        .route("/auth/google/callback", get(crate::providers::callback))
         .route("/auth/oauth/callback", get(crate::providers::callback))
         .route("/api/v1/google/client", get(get_google_client).put(put_google_client))
         .route("/api/v1/google/connect", post(google_connect))
+        .route("/api/v1/google/install", post(google_install))
         .route("/api/v1/google/accounts", get(google_accounts))
         .route("/api/v1/google/accounts/{id}", delete(google_remove))
         .route("/ca.pem", get(ui_ca_pem))
@@ -1470,6 +1472,11 @@ async fn google_connect(State(st): State<Arc<HeadState>>, headers: HeaderMap) ->
     Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, origin.as_deref()).await?})))
 }
 
+/// Asks you to install the Gmail, Calendar and Contacts apps.
+async fn google_install(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Install>>> {
+    Ok(Json(crate::google::install(&st).await?))
+}
+
 async fn google_accounts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::GoogleAccount>>> {
     Ok(Json(crate::google::accounts(&st).await?))
 }
@@ -1525,8 +1532,21 @@ async fn memex_rpc(
             crate::sessions::check_labels(&item.labels)?;
         }
     }
+    // The mail client's accounts and syncs are the Google apps'.
+    match r.method.as_str() {
+        "memex.google" => return Ok(Json(crate::google::status(&st).await?)),
+        "memex.google_sync" => {
+            crate::google::sync_now(&st).await?;
+            return Ok(Json(serde_json::json!({})));
+        }
+        _ => {}
+    }
     let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
     params["made_by"] = serde_json::json!("you");
+    // Only the head writes as an app (its kits' output).
+    if let Some(o) = params.as_object_mut() {
+        o.remove("as");
+    }
     // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
     if r.method == "memex.graph" {
         params["policies"] = serde_json::json!(crate::claims::policies(&st, caller.memex_realm()).await);

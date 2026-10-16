@@ -1,170 +1,34 @@
-//! Gmail: history import (newest first, resumable), then incremental sync
-//! from the history id; the mail store behind the mail client (threads,
-//! views, labels); changes back to Gmail; drafts; and sending, held a few
+//! The mail store behind the mail client (threads, views, labels): kept
+//! from what mail apps sync (their accounts' messages, with the mailbox's
+//! labels) and what is imported; changes, drafts and sending go through
+//! the app that owns the account (docs/knowledge.md §6), sending held a few
 //! seconds so it can be undone (or until a time you choose).
 
-use base64::Engine;
 use c6_api as api;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tracing::{info, warn};
 
 use crate::Memex;
-use crate::google::{self, Account, status_of};
+use crate::people;
 use crate::store::clip;
 
-const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-/// Messages fetched per import round.
-const IMPORT_PAGE: u32 = 100;
 /// How long a sent message waits, so it can be undone.
 pub const UNDO_MS: i64 = 10_000;
 
-fn b64url_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    // Gmail uses URL-safe base64, sometimes padded.
-    Ok(B64URL.decode(s.trim_end_matches('=').as_bytes())?)
-}
-
-/// One round of a mail account's sync: what changed since the last one,
-/// then (while importing) another page of history.
-pub async fn sync(m: &Memex, acct: &Account) -> anyhow::Result<()> {
-    let g = &m.google;
-    let mut st = google::state(&m.store, &acct.id, "mail").await?;
-    if st.cursor.is_none() {
-        let profile = g.get(&acct.id, "/gmail/v1/users/me/profile", &[]).await?;
-        st.cursor = profile["historyId"].as_str().map(str::to_owned).or_else(|| profile["historyId"].as_u64().map(|n| n.to_string()));
-        st.phase = "import".into();
-        google::save_state(&m.store, &acct.id, "mail", &st, None).await?;
-        labels(m, acct).await?;
-    }
-    // Changes since the cursor.
-    let mut page: Option<String> = None;
-    loop {
-        let mut q = vec![("startHistoryId", st.cursor.clone().unwrap_or_default())];
-        for t in ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"] {
-            q.push(("historyTypes", t.into()));
-        }
-        if let Some(p) = &page {
-            q.push(("pageToken", p.clone()));
-        }
-        let h = match g.get(&acct.id, "/gmail/v1/users/me/history", &q).await {
-            Ok(h) => h,
-            Err(e) if status_of(&e) == Some(404) => {
-                // Too old: import again (what is here already is kept).
-                warn!(account = %acct.email, "Gmail history expired; importing again");
-                st = google::SyncState { phase: "import".into(), ..Default::default() };
-                google::save_state(&m.store, &acct.id, "mail", &st, None).await?;
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        for rec in h["history"].as_array().into_iter().flatten() {
-            for a in rec["messagesAdded"].as_array().into_iter().flatten() {
-                let msg = &a["message"];
-                let id = msg["id"].as_str().unwrap_or_default();
-                if m.mail_item(&acct.id, id).await?.is_none() {
-                    // A new message in the inbox is told about once it's read.
-                    let tell = st.phase == "live" && labels_of(msg).iter().any(|l| l == "INBOX");
-                    fetch(m, acct, id, tell).await?;
-                }
-            }
-            for d in rec["messagesDeleted"].as_array().into_iter().flatten() {
-                if let Some(item) = m.mail_item(&acct.id, d["message"]["id"].as_str().unwrap_or_default()).await? {
-                    m.store.delete(&item).await?;
-                    sqlx::query("DELETE FROM mail WHERE item_id = ?").bind(&item).execute(&m.store.pool).await?;
-                    sqlx::query("DELETE FROM mail_labels WHERE item_id = ?").bind(&item).execute(&m.store.pool).await?;
-                }
-            }
-            for key in ["labelsAdded", "labelsRemoved"] {
-                for c in rec[key].as_array().into_iter().flatten() {
-                    let msg = &c["message"];
-                    if let Some(item) = m.mail_item(&acct.id, msg["id"].as_str().unwrap_or_default()).await? {
-                        set_labels(m, &item, &labels_of(msg)).await?;
-                    }
-                }
-            }
-        }
-        if let Some(id) = h["historyId"].as_str().map(str::to_owned).or_else(|| h["historyId"].as_u64().map(|n| n.to_string())) {
-            st.cursor = Some(id);
-        }
-        page = h["nextPageToken"].as_str().map(str::to_owned);
-        if page.is_none() {
-            break;
-        }
-    }
-    // History import: a page at a time, newest first.
-    if st.phase == "import" {
-        let mut q = vec![("maxResults", IMPORT_PAGE.to_string()), ("includeSpamTrash", "true".into())];
-        if let Some(p) = &st.page_token {
-            q.push(("pageToken", p.clone()));
-        }
-        let list = g.get(&acct.id, "/gmail/v1/users/me/messages", &q).await?;
-        for msg in list["messages"].as_array().into_iter().flatten() {
-            let id = msg["id"].as_str().unwrap_or_default();
-            if m.mail_item(&acct.id, id).await?.is_none() {
-                match fetch(m, acct, id, false).await {
-                    Ok(_) => st.done += 1,
-                    Err(e) => warn!(account = %acct.email, message = %id, "not imported: {e:#}"),
-                }
-            }
-        }
-        st.page_token = list["nextPageToken"].as_str().map(str::to_owned);
-        if st.page_token.is_none() {
-            st.phase = "live".into();
-            info!(account = %acct.email, messages = st.done, "Gmail import finished");
-        }
-    }
-    google::save_state(&m.store, &acct.id, "mail", &st, None).await
-}
-
-fn labels_of(msg: &Value) -> Vec<String> {
-    msg["labelIds"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect()).unwrap_or_default()
-}
-
-/// Gmail's labels for an account (names for the user's own).
-pub async fn labels(m: &Memex, acct: &Account) -> anyhow::Result<()> {
-    let v = m.google.get(&acct.id, "/gmail/v1/users/me/labels", &[]).await?;
-    for l in v["labels"].as_array().into_iter().flatten() {
-        sqlx::query("INSERT OR REPLACE INTO label_names (account, id, name, type) VALUES (?, ?, ?, ?)")
-            .bind(&acct.id)
-            .bind(l["id"].as_str().unwrap_or_default())
-            .bind(l["name"].as_str().unwrap_or_default())
-            .bind(l["type"].as_str().unwrap_or("user"))
-            .execute(&m.store.pool)
-            .await?;
-    }
-    Ok(())
-}
-
-/// Fetches a message in full and asks for it to be read and stored.
-async fn fetch(m: &Memex, acct: &Account, id: &str, tell: bool) -> anyhow::Result<()> {
-    let key = format!("gmail:{}:{id}", acct.id);
-    if crate::extract::queued(m, &key).await? {
-        return Ok(());
-    }
-    let v = match m.google.get(&acct.id, &format!("/gmail/v1/users/me/messages/{id}"), &[("format", "raw".into())]).await {
-        Ok(v) => v,
-        Err(e) if status_of(&e) == Some(404) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let raw = b64url_decode(v["raw"].as_str().unwrap_or_default())?;
-    let date = v["internalDate"].as_str().and_then(|d| d.parse().ok()).unwrap_or_else(c6_core::now_ms);
-    let blob = m.put_blob(&raw).await?;
-    let params = json!({"kind": "gmail", "account": acct.id, "gmail_id": id, "thread_id": v["threadId"].as_str().unwrap_or(id),
-        "labels": labels_of(&v), "date": date, "tell": tell});
-    crate::extract::queue(m, &key, "mail", &format!("head:{blob}"), "", params).await
-}
-
-/// A synced message, read: the item (its text searchable), the mail row,
-/// its labels, and links to the people it is from and to; told about if
-/// it came to the inbox while live.
+/// A mirrored message, read (an app's sync gave it): the item (its text
+/// searchable), the mail row, its labels, and links to the people it is
+/// from and to; told about if it came to the inbox while live.
 pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &Parsed) -> anyhow::Result<String> {
     let p = job.params;
-    let s = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
-    let (account, gmail_id, thread_id) = (s("account"), s("gmail_id"), s("thread_id"));
-    let acct = m.account(&account)?;
-    let labels: Vec<String> = serde_json::from_value(p["labels"].clone()).unwrap_or_default();
-    let date = p["date"].as_i64().unwrap_or_else(c6_core::now_ms);
-    let source = format!("gmail:{}", acct.id);
+    let a = &p["attributes"];
+    let s = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    let (source, external_id) = (s(&p["source"]), s(&p["external_id"]));
+    let (account, message) = (s(&a["account"]), s(&a["message"]));
+    let thread = a["thread"].as_str().filter(|t| !t.is_empty()).map(str::to_owned).unwrap_or_else(|| message.clone());
+    let labels: Vec<String> = serde_json::from_value(a["labels"].clone()).unwrap_or_default();
+    let date = a["received"].as_i64().unwrap_or_else(c6_core::now_ms);
+    let owner = m.accounts().into_iter().find(|x| x.id == account).map(|x| x.email).unwrap_or_else(|| account.clone());
     let rfc_id = parsed.message_id.clone();
     // Imported earlier and now synced: the item becomes the synced one and
     // keeps its id, so links and notes made meanwhile stay.
@@ -177,14 +41,14 @@ pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &P
             let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
             sqlx::query("UPDATE items SET source = ?, external_id = ? WHERE id = ?")
                 .bind(&source)
-                .bind(&gmail_id)
+                .bind(&external_id)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE mail SET account = ?, gmail_id = ?, thread_id = ? WHERE item_id = ?")
-                .bind(&acct.id)
-                .bind(&gmail_id)
-                .bind(&thread_id)
+                .bind(&account)
+                .bind(&message)
+                .bind(&thread)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
@@ -192,24 +56,25 @@ pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &P
         }
     }
     let to = Stored {
-        account: &acct.id,
-        external_id: &gmail_id,
-        thread_id: &thread_id,
+        account: &account,
+        external_id: &external_id,
+        thread_id: &thread,
         source: &source,
         rfc_id: &rfc_id,
         origin: "mirrored",
-        owner: &acct.email,
+        owner: &owner,
+        message: &message,
     };
     let blob = job.input.strip_prefix("head:").unwrap_or_default();
     let item = store(m, parsed, blob, &to, &labels, date).await?;
-    if p["tell"].as_bool() == Some(true) {
+    if a["tell"].as_bool() == Some(true) {
         let r = sqlx::query("SELECT from_addr, from_name, to_json, subject, snippet, thread_id FROM mail WHERE item_id = ?")
             .bind(&item)
             .fetch_one(&m.store.pool)
             .await?;
         let to: Vec<(String, String)> = serde_json::from_str(&r.get::<String, _>("to_json")).unwrap_or_default();
         let data = json!({
-            "account": acct.email, "item_id": item, "thread_id": r.get::<String, _>("thread_id"),
+            "account": owner, "item_id": item, "thread_id": r.get::<String, _>("thread_id"),
             "from": format!("{} <{}>", r.get::<String, _>("from_name"), r.get::<String, _>("from_addr")),
             "to": to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "),
             "subject": r.get::<String, _>("subject"), "snippet": r.get::<String, _>("snippet"),
@@ -289,7 +154,7 @@ async fn parts_of(m: &Memex, parsed: &Parsed) -> anyhow::Result<(String, Option<
     Ok((text, html))
 }
 
-/// Where a message is kept: its mail account (a Gmail account's id, or
+/// Where a message is kept: its mail account (an app's account id, or
 /// `import:…` for imported mail) and thread.
 pub struct Stored<'a> {
     pub account: &'a str,
@@ -302,6 +167,8 @@ pub struct Stored<'a> {
     pub origin: &'a str,
     /// The account's address, or the source for imported mail.
     pub owner: &'a str,
+    /// The mailbox's id for it (empty for imported mail).
+    pub message: &'a str,
 }
 
 /// Stores a read message: the item (searchable text, the people as
@@ -346,7 +213,7 @@ pub async fn store(m: &Memex, msg: &Parsed, blob: &str, at: &Stored<'_>, labels:
     )
     .bind(&item_id)
     .bind(at.account)
-    .bind(at.external_id)
+    .bind(if at.message.is_empty() { at.external_id } else { at.message })
     .bind(at.thread_id)
     .bind(at.rfc_id)
     .bind(date)
@@ -376,19 +243,19 @@ pub async fn store(m: &Memex, msg: &Parsed, blob: &str, at: &Stored<'_>, labels:
     // The people, as observed links.
     m.store.clear_links(&item_id, "mail").await?;
     if !from.0.is_empty() {
-        let p = google::person(&m.store, &from.0, &from.1).await?;
+        let p = people::person(&m.store, &from.0, &from.1).await?;
         m.store.link(&item_id, "from", &p, "observed", "mail", None).await?;
     }
     for (rel, list) in [("to", &to), ("cc", &cc)] {
         for (a, n) in list.iter() {
-            let p = google::person(&m.store, a, n).await?;
+            let p = people::person(&m.store, a, n).await?;
             m.store.link(&item_id, rel, &p, "observed", "mail", None).await?;
         }
     }
     Ok(item_id)
 }
 
-async fn set_labels(m: &Memex, item: &str, labels: &[String]) -> anyhow::Result<()> {
+pub async fn set_labels(m: &Memex, item: &str, labels: &[String]) -> anyhow::Result<()> {
     let has = |l: &str| labels.iter().any(|x| x == l) as i64;
     sqlx::query(
         "UPDATE mail SET labels = ?, unread = ?, starred = ?, inbox = ?, spam = ?, trash = ?, sent = ?, draft = ? WHERE item_id = ?",
@@ -600,14 +467,15 @@ pub async fn attachment(m: &Memex, item_id: &str, index: usize) -> anyhow::Resul
     Ok((v["name"].as_str().unwrap_or("attachment").to_owned(), v["mime"].as_str().unwrap_or("application/octet-stream").to_owned(), data))
 }
 
-/// Adds and removes labels on a thread (in Gmail, then here; imported
-/// mail only here): read and
-/// unread (UNREAD), archive (−INBOX), star (STARRED), trash (TRASH).
-pub async fn modify(m: &Memex, account: &str, thread_id: &str, add: &[String], remove: &[String]) -> anyhow::Result<()> {
-    // Imported mail has no Gmail to tell: its changes stay here.
+/// Adds and removes labels on a thread: through the mail app that owns
+/// the account (which tells the mailbox, and keeps the new labels), or
+/// here only for imported mail: read and unread (UNREAD), archive
+/// (−INBOX), star (STARRED), trash (TRASH).
+pub async fn modify(m: &Memex, account: &str, thread_id: &str, add: &[String], remove: &[String], by: &str) -> anyhow::Result<()> {
     if !account.starts_with("import:") {
-        let body = json!({"addLabelIds": add, "removeLabelIds": remove});
-        m.google.call(account, reqwest::Method::POST, &format!("/gmail/v1/users/me/threads/{thread_id}/modify"), &[], Some(&body)).await?;
+        let a = m.account("mail", account)?;
+        m.app_call(&a, "modify", json!({"account": a.id, "thread": thread_id, "add": add, "remove": remove}), by).await?;
+        return Ok(());
     }
     let rows = sqlx::query("SELECT item_id, labels FROM mail WHERE account = ? AND thread_id = ?")
         .bind(account)
@@ -630,7 +498,7 @@ pub async fn modify(m: &Memex, account: &str, thread_id: &str, add: &[String], r
 /// A message to send (or keep as a draft), as RFC 822 in base64url, and
 /// the thread it continues.
 async fn compose(m: &Memex, d: &api::MailDraft) -> anyhow::Result<(String, Option<String>)> {
-    let acct = m.account(&d.account)?;
+    let acct = m.account("mail", &d.account)?;
     let mut b = mail_builder::MessageBuilder::new()
         .from((acct.name.clone(), acct.email.clone()))
         .to(d.to.iter().map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect::<Vec<_>>())
@@ -659,7 +527,8 @@ async fn compose(m: &Memex, d: &api::MailDraft) -> anyhow::Result<(String, Optio
         b = b.attachment(if a.mime.is_empty() { "application/octet-stream".to_owned() } else { a.mime.clone() }, a.name.clone(), data);
     }
     let raw = b.write_to_vec()?;
-    Ok((B64URL.encode(raw), thread))
+    use base64::Engine;
+    Ok((base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw), thread))
 }
 
 fn markdown_html(md: &str) -> String {
@@ -669,29 +538,18 @@ fn markdown_html(md: &str) -> String {
 }
 
 /// Saves a draft in Gmail (new, or replacing `draft_id`); its id.
-pub async fn draft(m: &Memex, d: &api::MailDraft) -> anyhow::Result<String> {
+pub async fn draft(m: &Memex, d: &api::MailDraft, by: &str) -> anyhow::Result<String> {
     let (raw, thread) = compose(m, d).await?;
-    let acct = m.account_id(&d.account)?;
-    let mut message = json!({"raw": raw});
-    if let Some(t) = thread {
-        message["threadId"] = json!(t);
-    }
-    let v = match &d.draft_id {
-        Some(id) => {
-            m.google
-                .call(&acct, reqwest::Method::PUT, &format!("/gmail/v1/users/me/drafts/{id}"), &[], Some(&json!({"message": message})))
-                .await?
-        }
-        None => m.google.call(&acct, reqwest::Method::POST, "/gmail/v1/users/me/drafts", &[], Some(&json!({"message": message}))).await?,
-    };
-    Ok(v["id"].as_str().unwrap_or_default().to_owned())
+    let a = m.account("mail", &d.account)?;
+    let v = m.app_call(&a, "draft", json!({"account": a.id, "raw": raw, "thread": thread, "draft_id": d.draft_id}), by).await?;
+    Ok(v["result"]["draft_id"].as_str().unwrap_or_default().to_owned())
 }
 
 /// Queues a message: sent after the undo window, or at `send_at`.
 pub async fn queue(m: &Memex, d: &api::MailDraft, made_by: &str) -> anyhow::Result<api::Outgoing> {
     anyhow::ensure!(!d.to.is_empty(), "a message needs a recipient");
     let (raw, thread) = compose(m, d).await?;
-    let acct = m.account_id(&d.account)?;
+    let acct = m.account("mail", &d.account)?.id;
     let now = c6_core::now_ms();
     let send_at = d.send_at.filter(|t| *t > now).unwrap_or(now + UNDO_MS);
     let id = uuid::Uuid::now_v7().simple().to_string();
@@ -756,12 +614,12 @@ pub async fn send_due(m: &Memex) -> anyhow::Result<()> {
         {
             continue;
         }
-        let mut body = json!({"raw": r.get::<String, _>("raw")});
-        if let Some(t) = r.get::<Option<String>, _>("thread_id") {
-            body["threadId"] = json!(t);
-        }
         let account: String = r.get("account");
-        let result = m.google.call(&account, reqwest::Method::POST, "/gmail/v1/users/me/messages/send", &[], Some(&body)).await;
+        let input = json!({"account": account, "raw": r.get::<String, _>("raw"), "thread": r.get::<Option<String>, _>("thread_id")});
+        let result = match m.account("mail", &account) {
+            Ok(a) => m.app_call(&a, "send", input, &r.get::<String, _>("made_by")).await,
+            Err(e) => Err(e),
+        };
         let (status, error) = match &result {
             Ok(_) => ("sent", None),
             Err(e) => ("failed", Some(format!("{e:#}"))),

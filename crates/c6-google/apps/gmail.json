@@ -1,0 +1,221 @@
+{
+  "package": "gmail",
+  "version": "1.0.0",
+  "description": "Your Gmail in carbon6: every message kept and searchable, synced both ways (labels, read, archive, trash), drafts and sending. Mail is untrusted input: agents get it as quoted data.",
+  "requires": {
+    "google": "^1"
+  },
+  "feeds": [
+    "mail"
+  ],
+  "permissions": {
+    "secrets": [
+      "GOOGLE_CLIENT_ID",
+      "GOOGLE_CLIENT_SECRET"
+    ]
+  },
+  "providers": [
+    {
+      "name": "google",
+      "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "scopes": [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.send"
+      ],
+      "userinfo_url": "https://www.googleapis.com/oauth2/v3/userinfo",
+      "account_field": "email",
+      "params": {
+        "access_type": "offline",
+        "prompt": "consent"
+      },
+      "client_id_secret": "GOOGLE_CLIENT_ID",
+      "client_secret_secret": "GOOGLE_CLIENT_SECRET"
+    }
+  ],
+  "contents": {
+    "collections": [
+      {
+        "name": "gmail_sync",
+        "description": "Where each account's mail sync is: its cursor, its import's place, its last trouble.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "what syncs: mail:<account>, cal:<account>:<calendar>, contacts:<account>"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "page_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "queue": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "type": "string",
+              "enum": [
+                "import",
+                "live"
+              ]
+            },
+            "done": {
+              "type": "integer"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": "integer"
+            }
+          }
+        },
+        "keys": [
+          "key"
+        ],
+        "card": {
+          "stability": "internal",
+          "sources": "The google kit's syncs.",
+          "freshness": "Every run."
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "name": "gmail sync",
+        "trigger": "schedule",
+        "cron": "*/2 * * * *",
+        "action": "kit",
+        "action_params": {
+          "kit": "google",
+          "tool": "mail-sync",
+          "state": [
+            "gmail_sync"
+          ]
+        },
+        "per_hour": 60
+      }
+    ]
+  },
+  "operations": [
+    {
+      "name": "modify",
+      "description": "Adds and removes labels on a thread: read (UNREAD), archive (INBOX), star (STARRED), trash (TRASH), or yours.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "thread"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "thread": {
+            "type": "string"
+          },
+          "add": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "mail-modify"
+      }
+    },
+    {
+      "name": "send",
+      "description": "Sends a message (RFC 822, base64url), in a thread if it continues one.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "raw"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "raw": {
+            "type": "string"
+          },
+          "thread": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "mail-send"
+      }
+    },
+    {
+      "name": "draft",
+      "description": "Saves a draft (new, or replacing draft_id).",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "raw"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "raw": {
+            "type": "string"
+          },
+          "thread": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "draft_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "mail-draft"
+      }
+    }
+  ]
+}

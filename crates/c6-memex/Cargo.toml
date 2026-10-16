@@ -35,6 +35,7 @@ in-process-extract = ["dep:c6-extract"]
 [dev-dependencies]
 c6-memex = { path = ".", features = ["in-process-extract"] }
 c6-extract = { path = "../c6-extract" }
+c6-google = { path = "../c6-google" }
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 kamadak-exif = "0.6.1"
 tempfile = "3.27.0"

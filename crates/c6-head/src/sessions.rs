@@ -1278,20 +1278,13 @@ async fn secret_credential(
 }
 
 pub async fn credential(st: &HeadState, worker_id: WorkerId, req: CredentialRequest) -> CredentialGrant {
-    let role = st.registry.get(worker_id).map(|l| l.role).unwrap_or_default();
     let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
-    credential_for(st, &role, Some(worker_id), &worker_name, req).await
+    credential_for(st, Some(worker_id), &worker_name, req).await
 }
 
-/// Credentials for a node of `role` (`worker_id`: a fabric node; none: the
-/// head's own knowledge store, docs/knowledge.md).
-pub async fn credential_for(
-    st: &HeadState,
-    role: &str,
-    worker_id: Option<WorkerId>,
-    worker_name: &str,
-    req: CredentialRequest,
-) -> CredentialGrant {
+/// Credentials for a node (`worker_id`: a fabric node; none: the head's
+/// own knowledge store, docs/knowledge.md).
+pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_name: &str, req: CredentialRequest) -> CredentialGrant {
     let mut grant = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id.clone(), ..Default::default() };
     if let Some(name) = req.connection_id.strip_prefix("secret:") {
         let Some(worker_id) = worker_id else {
@@ -1299,24 +1292,6 @@ pub async fn credential_for(
             return grant;
         };
         return secret_credential(st, worker_id, worker_name, name, grant).await;
-    }
-    // Google accounts: for the memex only (it syncs mail, calendars and
-    // contacts); workers reach them through the memex.
-    if let Some(account) = req.connection_id.strip_prefix("google:") {
-        if role != "memex" {
-            grant.error = "Google accounts are for the memex".into();
-            return grant;
-        }
-        match crate::google::access_token(st, account).await {
-            Ok((token, expires)) => {
-                grant.kind = "google".into();
-                grant.base_url = crate::google::endpoints().api;
-                grant.bearer = token;
-                grant.expires_at_ms = expires;
-            }
-            Err(e) => grant.error = format!("Google sign-in needs attention: {e:#}"),
-        }
-        return grant;
     }
     let conn = match st.store.connection(&req.connection_id).await {
         Ok(Some(c)) => c,

@@ -83,8 +83,33 @@ fn command(spec: &Value, tool: &str, args: &serde_json::Map<String, Value>) -> a
         .collect())
 }
 
+/// A kit run in this process instead of a container (tests: the kit's own
+/// code, against stand-ins for what it talks to).
+pub struct LocalRun {
+    pub tool: String,
+    pub command: Vec<String>,
+    /// The job's folder's files before the run.
+    pub inputs: BTreeMap<String, Vec<u8>>,
+    pub env: Vec<(String, String)>,
+}
+
+pub type LocalKit = std::sync::Arc<dyn Fn(LocalRun) -> futures::future::BoxFuture<'static, anyhow::Result<Output>> + Send + Sync>;
+
+static LOCAL: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, LocalKit>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Runs this kit's jobs in this process, for every head here (tests).
+pub fn run_locally(kit: &str, f: LocalKit) {
+    LOCAL.lock().unwrap().insert(kit.to_owned(), f);
+}
+
 /// Runs a job on a worker that can, and returns what it made.
 pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
+    let local = LOCAL.lock().unwrap().get(job.spec["name"].as_str().unwrap_or_default()).cloned();
+    if let Some(f) = local {
+        let command = command(&job.spec, &job.tool, &job.args)?;
+        return f(LocalRun { tool: job.tool, command, inputs: job.inputs, env: job.env }).await;
+    }
     let workers = st.registry.with_capability("kits");
     let worker = match job.worker {
         Some(w) if workers.contains(&w) => w,
@@ -116,6 +141,18 @@ pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
 /// (docs/knowledge.md §6.2, #4): records of its collections, knowledge
 /// items, things and claims. Each is checked like any write of that owner.
 pub async fn ingest(st: &HeadState, realm: &str, instance: &str, by: &str, batch: &Value) -> anyhow::Result<Value> {
+    ingest_with(st, realm, instance, by, batch, &BTreeMap::new()).await
+}
+
+/// `ingest`, with the files the run made (typed items' bytes).
+pub async fn ingest_with(
+    st: &HeadState,
+    realm: &str,
+    instance: &str,
+    by: &str,
+    batch: &Value,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<Value> {
     let acting = format!("app:{instance} {by}");
     let mut done = json!({"records": 0, "items": 0, "things": 0, "claims": 0, "errors": []});
     let mut errors: Vec<String> = Vec::new();
@@ -158,7 +195,48 @@ pub async fn ingest(st: &HeadState, realm: &str, instance: &str, by: &str, batch
             Err(e) => errors.push(format!("thing: {e:#}")),
         }
     }
-    for it in batch["items"].as_array().into_iter().flatten() {
+    // Typed items (a message, an event, a contact) go to the knowledge
+    // store's handlers, written as the app; their bytes are files it made.
+    let mut typed = Vec::new();
+    for it in batch["items"].as_array().into_iter().flatten().filter(|i| i["type"].is_string()) {
+        let mut item = it.clone();
+        if let Some(f) = it["file"].as_str() {
+            match files.get(f) {
+                Some(b) => item["data"] = json!(base64::engine::general_purpose::STANDARD.encode(b)),
+                None => {
+                    errors.push(format!("item {}: no file {f}", it["external_id"]));
+                    continue;
+                }
+            }
+        }
+        if let Some(o) = item.as_object_mut() {
+            o.remove("file");
+            o.insert("source".into(), json!({"kind": "app"}));
+        }
+        typed.push(item);
+    }
+    for chunk in typed.chunks(200) {
+        let params = json!({"items": chunk, "as": format!("app:{instance}"), "wait": false});
+        match crate::memex::call_in(st, realm, "memex.ingest", params).await {
+            Ok(v) => {
+                for r in v["results"].as_array().into_iter().flatten() {
+                    match r["status"].as_str() {
+                        Some("rejected") => errors.push(format!("item: {}", r["error"].as_str().unwrap_or_default())),
+                        _ => done["items"] = json!(done["items"].as_i64().unwrap_or(0) + 1),
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("items: {e:#}")),
+        }
+    }
+    for d in batch["deleted"].as_array().into_iter().flatten() {
+        let params = json!({"source": format!("app:{instance}"), "external_id": d["external_id"]});
+        if let Err(e) = crate::memex::call_in(st, realm, "memex.delete", params).await {
+            errors.push(format!("deleting {}: {e:#}", d["external_id"]));
+        }
+    }
+    errors.extend(batch["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_owned)));
+    for it in batch["items"].as_array().into_iter().flatten().filter(|i| !i["type"].is_string()) {
         // An item of a shared kind has its kind's shape (docs/knowledge.md §6.2, #6).
         if let Some(schema) = crate::claims::kind_schema(st, it["kind"].as_str().unwrap_or_default()).await {
             let meta = if it["meta"].is_null() { json!({}) } else { it["meta"].clone() };
@@ -188,6 +266,11 @@ pub async fn ingest(st: &HeadState, realm: &str, instance: &str, by: &str, batch
 /// the kit must be one its package requires; the job gets the kit's
 /// approved secrets of the realm, and the app's access tokens; an
 /// `out/ingest.json` is kept as the app's.
+///
+/// The run also gets the app's collections it asks for, as
+/// `state/<collection>.json` (where a sync is, say), and an operation's
+/// input with its arguments as `input.json`. What it says in `result.json`
+/// is the answer; `again` in its batch asks for another run soon.
 #[allow(clippy::too_many_arguments)]
 pub async fn for_instance(
     st: &HeadState,
@@ -196,9 +279,27 @@ pub async fn for_instance(
     kit: &str,
     tool: &str,
     args: serde_json::Map<String, Value>,
-    inputs: BTreeMap<String, Vec<u8>>,
+    mut inputs: BTreeMap<String, Vec<u8>>,
     by: &str,
+    state: &[String],
+    input: Option<&Value>,
 ) -> anyhow::Result<Value> {
+    for c in state {
+        let col = crate::collections::get(st, realm, c).await?;
+        if col.owner != instance {
+            return Err(bad_request(format!("{instance} does not own the collection {c}")));
+        }
+        let page = crate::collections::query(st, realm, c, &api::RecordQuery { limit: Some(10_000), ..Default::default() }).await?;
+        let records: Vec<Value> = page.records.iter().map(|r| json!({"id": r.id, "fields": r.fields})).collect();
+        inputs.insert(format!("state/{c}.json"), serde_json::to_vec(&records)?);
+    }
+    if let Some(i) = input {
+        let mut merged = if i.is_object() { i.clone() } else { json!({}) };
+        for (k, v) in &args {
+            merged[k] = v.clone();
+        }
+        inputs.insert("input.json".into(), serde_json::to_vec(&merged)?);
+    }
     let i = crate::instances::get(&st.store.pool, realm, instance)
         .await?
         .ok_or_else(|| bad_request(format!("no app {instance} in realm {realm}")))?;
@@ -222,7 +323,11 @@ pub async fn for_instance(
         "files": out.files.keys().cloned().collect::<Vec<_>>()});
     if let Some(batch) = out.files.get("ingest.json") {
         let batch: Value = serde_json::from_slice(batch).map_err(|e| bad_request(format!("{tool}: out/ingest.json is not JSON: {e}")))?;
-        result["ingested"] = ingest(st, realm, instance, &format!("kit:{kit}.{tool} {by}"), &batch).await?;
+        result["ingested"] = ingest_with(st, realm, instance, &format!("kit:{kit}.{tool} {by}"), &batch, &out.files).await?;
+        result["again"] = json!(batch["again"].as_bool() == Some(true));
+    }
+    if let Some(r) = out.files.get("result.json") {
+        result["result"] = serde_json::from_slice(r).unwrap_or(Value::Null);
     }
     if !out.ok() {
         return Err(bad_request(format!("{kit}.{tool} exited {:?}: {}", out.exit, out.stderr.trim())));

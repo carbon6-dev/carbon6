@@ -1,15 +1,17 @@
-//! Google in the memex, against a stand-in Google: OAuth sign-in on the
-//! head; Gmail import, people and organizations, the mail views, archiving,
-//! sending with undo; contacts (one person by two addresses), candidates
-//! written back; calendars with a recurring event and an exception, RSVP;
-//! an agent sending mail only after your approval; automations on new mail.
+//! Gmail, Google Calendar and Google Contacts as apps (docs/knowledge.md
+//! §6), against a stand-in Google, their kit's code run in this process:
+//! installing them, one sign-in for the three; Gmail import, people and
+//! organizations, the mail views, archiving, sending with undo; contacts
+//! (one person by two addresses), candidates written back; calendars with
+//! a recurring event and an exception, RSVP; an agent sending mail only
+//! after your approval; automations on new mail.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use base64::Engine;
 use c6_api::{Connection, Event, EventKind, Session};
@@ -111,14 +113,27 @@ async fn google(g: Mock) -> String {
             Json(json!({"history": added, "historyId": g.history_id.to_string()}))
         }))
         .route("/gmail/v1/users/me/threads/{id}/modify", post(|State(g): State<Mock>, Path(id): Path<String>, Json(b): Json<Value>| async move {
-            g.lock().unwrap().modified.push((id, b));
-            Json(json!({}))
+            let mut g = g.lock().unwrap();
+            g.modified.push((id.clone(), b.clone()));
+            let list = |k: &str| -> Vec<String> { serde_json::from_value(b[k].clone()).unwrap_or_default() };
+            let (add, remove) = (list("addLabelIds"), list("removeLabelIds"));
+            let mut out = Vec::new();
+            for (mid, m) in g.messages.iter_mut().filter(|(_, m)| m.0 == id) {
+                m.1.retain(|l| !remove.contains(l));
+                m.1.extend(add.iter().filter(|l| !m.1.contains(l)).cloned().collect::<Vec<_>>());
+                out.push(json!({"id": mid, "labelIds": m.1}));
+            }
+            Json(json!({"id": id, "messages": out}))
         }))
         .route("/gmail/v1/users/me/drafts", post(|| async { Json(json!({"id": "draft-1"})) }))
         .route("/gmail/v1/users/me/messages/send", post(|State(g): State<Mock>, Json(b): Json<Value>| async move {
             let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b["raw"].as_str().unwrap().trim_end_matches('=')).unwrap();
-            g.lock().unwrap().sent.push(String::from_utf8_lossy(&raw).into_owned());
-            Json(json!({"id": "sent-1"}))
+            let mut g = g.lock().unwrap();
+            g.sent.push(String::from_utf8_lossy(&raw).into_owned());
+            let id = format!("sent-{}", g.sent.len());
+            let thread = b["threadId"].as_str().unwrap_or(&id).to_owned();
+            g.messages.insert(id.clone(), (thread.clone(), vec!["SENT".into()], c6_core::now_ms(), b["raw"].as_str().unwrap().to_owned()));
+            Json(json!({"id": id, "threadId": thread, "labelIds": ["SENT"]}))
         }))
         .route("/calendar/v3/users/me/calendarList", get(|| async {
             Json(json!({"items": [{"id": "me@example.com", "summary": "Me", "primary": true, "accessRole": "owner", "timeZone": "UTC", "backgroundColor": "#9fe1e7"}]}))
@@ -139,7 +154,10 @@ async fn google(g: Mock) -> String {
             b["status"] = json!("confirmed");
             Json(b)
         }))
-        .route("/calendar/v3/calendars/{cal}/events/{id}", patch(|State(g): State<Mock>, Path((_cal, id)): Path<(String, String)>, Json(b): Json<Value>| async move {
+        .route("/calendar/v3/calendars/{cal}/events/{id}", get(|Path((_cal, id)): Path<(String, String)>| async move {
+            Json(json!({"id": id, "status": "confirmed", "summary": "Acme review", "start": {"dateTime": "2026-11-03T15:00:00Z"}, "end": {"dateTime": "2026-11-03T16:00:00Z"},
+                        "attendees": [{"email": "me@example.com", "self": true, "responseStatus": "needsAction"}, {"email": "alice@acme.com", "displayName": "Alice Smith"}]}))
+        }).patch(|State(g): State<Mock>, Path((_cal, id)): Path<(String, String)>, Json(b): Json<Value>| async move {
             g.lock().unwrap().patched.push(json!({"id": id, "body": b.clone()}));
             Json(json!({"id": id, "status": "confirmed", "summary": "Acme review", "start": {"dateTime": "2026-11-03T15:00:00Z"}, "end": {"dateTime": "2026-11-03T16:00:00Z"}, "attendees": b["attendees"]}))
         }))
@@ -210,13 +228,42 @@ async fn google_mail_calendar_contacts() {
         add(&mut s, "m5", "t4", &["SENT"], now - 3 * DAY, raw("Me <me@example.com>", "bob@other.org", "Follow-up", "Any thoughts?", ""));
     }
     let base = google(g.clone()).await;
-    // SAFETY: the only test in this binary, before anything reads them.
-    unsafe {
-        std::env::set_var("C6_GOOGLE_AUTH_URL", format!("{base}/auth"));
-        std::env::set_var("C6_GOOGLE_TOKEN_URL", format!("{base}/token"));
-        std::env::set_var("C6_GOOGLE_API_URL", &base);
-        std::env::set_var("C6_GOOGLE_PEOPLE_URL", &base);
-    }
+    // The google kit's code, in this process, against the stand-in.
+    let api_base = base.clone();
+    c6_head::kitjobs::run_locally(
+        "google",
+        Arc::new(move |run: c6_head::kitjobs::LocalRun| {
+            let base = api_base.clone();
+            Box::pin(async move {
+                let dir = tempfile::tempdir()?;
+                for (path, data) in &run.inputs {
+                    let p = dir.path().join(path);
+                    std::fs::create_dir_all(p.parent().unwrap())?;
+                    std::fs::write(p, data)?;
+                }
+                let accounts = run.env.iter().find(|(k, _)| k == "C6_ACCOUNTS").map(|(_, v)| v.clone()).unwrap_or_else(|| "[]".into());
+                let env = c6_google::Env { accounts, api: base.clone(), people: base };
+                let done = c6_google::run(&run.tool, dir.path(), &env).await;
+                let mut files = std::collections::BTreeMap::new();
+                let out = dir.path().join("out");
+                let mut stack = vec![out.clone()];
+                while let Some(d) = stack.pop() {
+                    for e in std::fs::read_dir(&d)?.flatten() {
+                        if e.file_type()?.is_dir() {
+                            stack.push(e.path());
+                        } else {
+                            files.insert(e.path().strip_prefix(&out)?.to_string_lossy().into_owned(), std::fs::read(e.path())?);
+                        }
+                    }
+                }
+                let (exit, stderr) = match done {
+                    Ok(()) => (0, String::new()),
+                    Err(e) => (1, format!("{e:#}")),
+                };
+                Ok(c6_head::kitjobs::Output { exit: Some(exit), stdout: String::new(), stderr, files })
+            })
+        }),
+    );
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
@@ -233,7 +280,16 @@ async fn google_mail_calendar_contacts() {
     let http = reqwest::Client::new();
     let stop = CancellationToken::new();
 
-    // Sign-in.
+    // The apps: offered for you to approve, each.
+    assert_eq!(http.post(format!("{api}/google/connect")).send().await.unwrap().status(), reqwest::StatusCode::BAD_REQUEST, "no apps yet");
+    let installs: Vec<c6_api::Install> = http.post(format!("{api}/google/install")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(installs.iter().map(|i| i.package.as_str()).collect::<Vec<_>>(), ["gmail", "google-calendar", "google-contacts"]);
+    for i in &installs {
+        let r =
+            http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    }
+    // One sign-in for the three, through your OAuth client.
     assert_eq!(
         http.post(format!("{api}/google/connect")).send().await.unwrap().status(),
         reqwest::StatusCode::BAD_REQUEST,
@@ -254,14 +310,26 @@ async fn google_mail_calendar_contacts() {
     let url = url::Url::parse(go["authorize_url"].as_str().unwrap()).unwrap();
     let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
     assert_eq!((q["client_id"].as_str(), q["access_type"].as_str()), ("cid", "offline"));
-    assert!(q["scope"].contains("gmail.modify") && q["scope"].contains("calendar") && q["scope"].contains("contacts"));
-    let ui = api.trim_end_matches("/api/v1");
-    let back = http.get(format!("{ui}/auth/google/callback?code=the-code&state={}", q["state"])).send().await.unwrap();
-    assert!(back.url().as_str().contains("google=connected"), "{}", back.url());
-    let replay = http.get(format!("{ui}/auth/google/callback?code=the-code&state={}", q["state"])).send().await.unwrap();
-    assert!(replay.url().as_str().contains("expired"), "a state works once");
+    assert!(q["scope"].contains("gmail.modify") && q["scope"].contains("calendar") && q["scope"].contains("contacts"), "{q:?}");
+    assert!(q["redirect_uri"].ends_with("/auth/google/callback"), "{q:?}");
+    // (The sign-in itself is the providers test's; here, the account it keeps.)
+    for (p, _) in c6_head::google::APPS {
+        let a = c6_head::providers::Kept {
+            realm: "home",
+            instance: p,
+            provider: "google",
+            account: "me@example.com",
+            name: "Me Myself",
+            refresh: "rt-1",
+            access: "at-1",
+            expires: c6_core::now_ms() + 3_600_000,
+            scopes: "all",
+        };
+        c6_head::providers::keep(&head.state, &a, None).await.unwrap();
+    }
+    c6_head::memex::reload(&head.state).await;
     let accounts: Vec<c6_api::GoogleAccount> = http.get(format!("{api}/google/accounts")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(accounts[0].email, "me@example.com");
+    assert_eq!(accounts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), ["me@example.com"], "once, for the three apps");
 
     let put = |path: &str, v: Value| {
         let (http, url) = (http.clone(), format!("{api}/settings/{path}"));
@@ -289,7 +357,9 @@ async fn google_mail_calendar_contacts() {
         }
     };
 
-    // Imported (both pages), contacts synced, calendars read.
+    // The apps' syncs (every few minutes; now): imported (both pages),
+    // contacts synced, calendars read.
+    rpc("memex.google_sync", json!({})).await;
     eventually("the import", async || {
         let v = rpc("memex.google", json!({})).await;
         let phase = |k: &str| v["sync"].as_array()?.iter().find(|s| s["kind"] == k).map(|s| s["phase"].as_str().unwrap_or("").to_owned());
@@ -525,11 +595,9 @@ async fn google_mail_calendar_contacts() {
     assert!(asked.contains("Triage: New email from Alice Smith <alice@acme.com>") && asked.contains("Contract draft"), "{asked}");
     // Gmail now has the message imported earlier: the same item, now synced.
     let upgraded: Value = http.get(format!("{api}/memex/get?id={imported}")).send().await.unwrap().json().await.unwrap();
-    assert!(upgraded["item"]["source"].as_str().unwrap_or("").starts_with("gmail:"), "{upgraded}");
+    assert_eq!(upgraded["item"]["source"], "app:gmail", "{upgraded}");
     let t6 = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
     assert!(t6.as_array().unwrap().iter().any(|t| t["thread_id"] == "t6" && t["account"] != "import:mbox:archive"), "{t6}");
-
-    assert!(g.lock().unwrap().tokens.contains(&"authorization_code".to_owned()));
 
     stop.cancel();
     head.shutdown().await.unwrap();

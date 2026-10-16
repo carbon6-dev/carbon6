@@ -380,7 +380,8 @@ fn build() -> Vec<Op> {
         // Google accounts.
         op!("google.client.get", "mail", "GET" "/api/v1/google/client", Read, Input::None, "The Google OAuth client carbon6 uses (its id; the secret is never shown)."),
         op!("google.client.put", "mail", "PUT" "/api/v1/google/client", Write, Input::Body(schema::<api::GoogleClientIn>), "Sets the Google OAuth client (from your Google Cloud project). Ask for the secret with c6_ask (secret field)."),
-        op!("google.connect", "mail", "POST" "/api/v1/google/connect", Write, Input::None, "Starts adding a Google account: returns the address for you to open and sign in."),
+        op!("google.connect", "mail", "POST" "/api/v1/google/connect", Write, Input::None, "Starts adding a Google account to the Gmail, Calendar and Contacts apps: returns the address for you to open and sign in."),
+        op!("google.install", "mail", "POST" "/api/v1/google/install", Write, Input::None, "Asks to install the Gmail, Calendar and Contacts apps in home (a decision each; they run on a worker with Docker or Podman)."),
         op!("google.accounts", "mail", "GET" "/api/v1/google/accounts", Read, Input::None, "Google accounts the memex syncs."),
         op!("google.accounts.remove", "mail", "DELETE" "/api/v1/google/accounts/{id}", Destructive, Input::None, "Removes a Google account (its mail, events and contacts stay in the memex).", choices = &[("id", "google.accounts")]),
 

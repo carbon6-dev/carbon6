@@ -258,17 +258,18 @@ The memex is your knowledge store, part of the head: items, a graph of things wi
 
 ### Mail, calendar and contacts
 
-carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**).
+carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**). Three apps do the syncing, installed in home: **gmail**, **google-calendar** and **google-contacts**. They run on the **google** kit on a worker with Docker or Podman, which reaches only Google. Their packages are part of carbon6, and an IMAP or CalDAV app would be written the same way. Design: [docs/knowledge.md](docs/knowledge.md) §6.
 
 - **Setup** (**Settings → Mail & calendar**):
+  - **Install the apps** (you approve each under Decisions).
   - Create an OAuth client in your Google Cloud project (Web application, with the redirect URI shown).
   - Enable the Gmail, Calendar and People APIs.
   - Set the app to "In production", or "Internal" for Workspace.
-  - Paste the client ID and secret, then **Add Google account**.
+  - Paste the client ID and secret (they become home's secrets `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`), then **Add Google account**: one sign-in for the three apps.
 
-  The head keeps the sign-in encrypted; the sync gets short-lived access only.
+  The head keeps the sign-in encrypted; the apps' syncs get short-lived access tokens only. A head that synced Google itself before moves your accounts, client and everything synced into the apps when it starts, so nothing is fetched again.
 - **Mail:**
-  - **Import:** your whole mailbox is imported, newest first and resumable, then kept in sync every minute. Labels, read state, archive and drafts sync both ways.
+  - **Import:** your whole mailbox is imported, newest first and resumable, then kept in sync every two minutes. Labels, read state, archive and drafts sync both ways.
   - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
   - **Reading:** conversations, with HTML sandboxed and remote images off until you allow them.
   - **Writing:** Markdown compose, reply and reply all, attachments, drafts, **send later**, and **undo** (messages wait 10 seconds).

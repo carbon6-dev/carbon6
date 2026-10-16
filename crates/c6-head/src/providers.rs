@@ -18,8 +18,9 @@ use tracing::{info, warn};
 
 use crate::{HeadState, bad_request, not_found};
 
-/// Sign-ins in progress: state → (realm, instance, provider, redirect URI, when).
-type Pending = (String, String, String, String, i64);
+/// Sign-ins in progress: state → (realm, instances, provider, redirect URI,
+/// where to go back to, when).
+type Pending = (String, Vec<String>, String, String, String, i64);
 static PENDING: LazyLock<Mutex<HashMap<String, Pending>>> = LazyLock::new(Default::default);
 
 /// What is wrong with a package's providers.
@@ -72,15 +73,41 @@ pub async fn redirect_uri(st: &HeadState, origin: Option<&str>) -> String {
 
 /// Starts a sign-in to an app's provider: the address to send you to.
 pub async fn connect(st: &HeadState, realm: &str, instance: &str, name: &str, origin: Option<&str>) -> anyhow::Result<String> {
-    let p = provider(st, realm, instance, name).await?;
-    let (client_id, _) = client(st, realm, &p).await?;
     let redirect = redirect_uri(st, origin).await;
+    connect_many(st, realm, &[instance.to_owned()], name, &redirect, "/settings/system").await
+}
+
+/// One sign-in for several apps of a realm with the same provider (mail,
+/// calendar and contacts of one account): every app's scopes, and the
+/// account kept for each.
+/// `redirect`: where the provider sends you back (the head's
+/// `/auth/oauth/callback`, or an address registered before); `back`: the
+/// page you return to.
+pub async fn connect_many(
+    st: &HeadState,
+    realm: &str,
+    instances: &[String],
+    name: &str,
+    redirect: &str,
+    back: &str,
+) -> anyhow::Result<String> {
+    let first = instances.first().ok_or_else(|| bad_request("which apps?"))?;
+    let mut p = provider(st, realm, first, name).await?;
+    for i in &instances[1..] {
+        for scope in provider(st, realm, i, name).await?.scopes {
+            if !p.scopes.contains(&scope) {
+                p.scopes.push(scope);
+            }
+        }
+    }
+    let (client_id, _) = client(st, realm, &p).await?;
+    let redirect = redirect.to_owned();
     let state = hex::encode(rand::random::<[u8; 16]>());
     let now = c6_core::now_ms();
     {
         let mut pending = PENDING.lock().unwrap();
-        pending.retain(|_, x| now - x.4 < 15 * 60_000);
-        pending.insert(state.clone(), (realm.to_owned(), instance.to_owned(), name.to_owned(), redirect.clone(), now));
+        pending.retain(|_, x| now - x.5 < 15 * 60_000);
+        pending.insert(state.clone(), (realm.to_owned(), instances.to_vec(), name.to_owned(), redirect.clone(), back.to_owned(), now));
     }
     let mut u = url::Url::parse(&p.authorize_url)?;
     {
@@ -110,20 +137,23 @@ pub struct Callback {
 /// `GET /auth/oauth/callback`: trades the code for tokens, keeps the
 /// account, and goes back to Settings.
 pub async fn callback(State(st): State<std::sync::Arc<HeadState>>, Query(q): Query<Callback>) -> Response {
-    let back = |note: &str| Redirect::to(&format!("/settings/system?oauth={}", urlencode(note))).into_response();
+    let pending = PENDING.lock().unwrap().remove(&q.state);
+    let page = pending.as_ref().map(|p| p.4.clone()).unwrap_or_else(|| "/settings/system".into());
+    let back = |note: &str| Redirect::to(&format!("{page}?oauth={}", urlencode(note))).into_response();
     if !q.error.is_empty() {
         return back(&q.error);
     }
-    let Some((realm, instance, name, redirect, _)) = PENDING.lock().unwrap().remove(&q.state) else {
+    let Some((realm, instances, name, redirect, _, _)) = pending else {
         return back("that sign-in expired; try again");
     };
-    match finish(&st, &realm, &instance, &name, &q.code, &redirect).await {
+    match finish(&st, &realm, &instances, &name, &q.code, &redirect).await {
         Ok(account) => {
-            info!(%account, %instance, provider = %name, "account connected");
+            info!(%account, apps = %instances.join(", "), provider = %name, "account connected");
+            crate::memex::reload(&st).await;
             back("connected")
         }
         Err(e) => {
-            warn!(%instance, provider = %name, "sign-in: {e:#}");
+            warn!(apps = %instances.join(", "), provider = %name, "sign-in: {e:#}");
             back(&format!("{e:#}"))
         }
     }
@@ -133,8 +163,8 @@ fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-async fn finish(st: &HeadState, realm: &str, instance: &str, name: &str, code: &str, redirect: &str) -> anyhow::Result<String> {
-    let p = provider(st, realm, instance, name).await?;
+async fn finish(st: &HeadState, realm: &str, instances: &[String], name: &str, code: &str, redirect: &str) -> anyhow::Result<String> {
+    let p = provider(st, realm, instances.first().map(String::as_str).unwrap_or_default(), name).await?;
     let (client_id, secret) = client(st, realm, &p).await?;
     let tokens: Value = st
         .http
@@ -163,26 +193,67 @@ async fn finish(st: &HeadState, realm: &str, instance: &str, name: &str, code: &
         (account, who["name"].as_str().unwrap_or("").to_owned())
     };
     let expires = c6_core::now_ms() + tokens["expires_in"].as_i64().unwrap_or(3600) * 1000;
+    let asked = p.scopes.join(" ");
+    let scopes = tokens["scope"].as_str().unwrap_or(&asked);
+    for instance in instances {
+        let a = Kept { realm, instance, provider: name, account: &account, name: &display, refresh, access, expires, scopes };
+        keep(st, &a, None).await?;
+    }
+    Ok(account)
+}
+
+/// An account to keep for an app.
+pub struct Kept<'a> {
+    pub realm: &'a str,
+    pub instance: &'a str,
+    pub provider: &'a str,
+    pub account: &'a str,
+    pub name: &'a str,
+    pub refresh: &'a str,
+    pub access: &'a str,
+    pub expires: i64,
+    pub scopes: &'a str,
+}
+
+/// Keeps (or renews) an app's account; `id` as given (accounts moved in
+/// keep theirs), else new.
+pub async fn keep(st: &HeadState, a: &Kept<'_>, id: Option<&str>) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO oauth_accounts (id, realm, instance, provider, account, name, refresh_token, access_token, access_expires, scopes, added_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (realm, instance, provider, account) DO UPDATE SET name = excluded.name, \
          refresh_token = excluded.refresh_token, access_token = excluded.access_token, access_expires = excluded.access_expires, \
          scopes = excluded.scopes",
     )
-    .bind(uuid::Uuid::now_v7().simple().to_string()[20..].to_owned())
-    .bind(realm)
-    .bind(instance)
-    .bind(name)
-    .bind(&account)
-    .bind(&display)
-    .bind(st.secrets.encrypt(refresh)?)
-    .bind(st.secrets.encrypt(access)?)
-    .bind(expires)
-    .bind(tokens["scope"].as_str().unwrap_or(&p.scopes.join(" ")))
+    .bind(id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::now_v7().simple().to_string()[20..].to_owned()))
+    .bind(a.realm)
+    .bind(a.instance)
+    .bind(a.provider)
+    .bind(a.account)
+    .bind(a.name)
+    .bind(st.secrets.encrypt(a.refresh)?)
+    .bind(st.secrets.encrypt(a.access)?)
+    .bind(a.expires)
+    .bind(a.scopes)
     .bind(c6_core::now_ms())
     .execute(&st.store.pool)
     .await?;
-    Ok(account)
+    Ok(())
+}
+
+/// The accounts apps of a realm connected that feed carbon6's stores
+/// (mail, calendar, contacts), for the knowledge store: {id, email, name,
+/// app, feeds}.
+pub async fn feeding(st: &HeadState, realm: &str) -> anyhow::Result<Value> {
+    let mut out = Vec::new();
+    for i in crate::instances::list(&st.store.pool, Some(realm)).await? {
+        if i.package.feeds.is_empty() {
+            continue;
+        }
+        for a in accounts(st, realm, &i.name).await? {
+            out.push(json!({"id": a.id, "email": a.account, "name": a.name, "app": i.name, "feeds": i.package.feeds}));
+        }
+    }
+    Ok(Value::Array(out))
 }
 
 /// The accounts connected for an app.
@@ -256,7 +327,7 @@ async fn access_token(st: &HeadState, r: &sqlx::sqlite::SqliteRow) -> anyhow::Re
 }
 
 /// The access tokens an app's kit jobs get: `C6_ACCOUNTS`, a JSON list of
-/// {provider, account, access_token, expires_at}. An account whose sign-in
+/// {id, provider, account, access_token, expires_at}. An account whose sign-in
 /// needs attention is left out, and noted.
 pub async fn tokens_for(st: &HeadState, realm: &str, instance: &str) -> anyhow::Result<Vec<(String, String)>> {
     let rows = sqlx::query("SELECT * FROM oauth_accounts WHERE realm = ? AND instance = ?")
@@ -270,8 +341,8 @@ pub async fn tokens_for(st: &HeadState, realm: &str, instance: &str) -> anyhow::
     let mut list = Vec::new();
     for r in &rows {
         match access_token(st, r).await {
-            Ok((token, expires)) => list.push(json!({"provider": r.get::<String, _>("provider"), "account": r.get::<String, _>("account"),
-                "access_token": token, "expires_at": expires})),
+            Ok((token, expires)) => list.push(json!({"id": r.get::<String, _>("id"), "provider": r.get::<String, _>("provider"),
+                "account": r.get::<String, _>("account"), "access_token": token, "expires_at": expires})),
             Err(e) => warn!(%instance, account = %r.get::<String, _>("account"), "access token: {e:#}"),
         }
     }

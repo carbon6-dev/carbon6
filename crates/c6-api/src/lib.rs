@@ -520,6 +520,11 @@ pub struct AppPackage {
     /// The OAuth providers its kit jobs sign in with (docs/knowledge.md §6.2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<OAuthProvider>,
+    /// Which of carbon6's stores its accounts feed (`mail`, `calendar`,
+    /// `contacts`): the mail client, the calendar and the contacts show
+    /// them, and act through its operations (docs/knowledge.md §6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feeds: Vec<String>,
     /// The labels its claims use, what each means, and the shared label
     /// it maps to (docs/apps.md §9.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -695,8 +700,13 @@ pub struct OperationWrite {
 pub struct OperationKit {
     pub kit: String,
     pub tool: String,
+    /// The tool's arguments, mapped from the input (they also go, with the
+    /// input, to the run as `input.json`).
     #[serde(default)]
     pub args: serde_json::Map<String, serde_json::Value>,
+    /// The app's collections the run reads, as `state/<name>.json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<String>,
 }
 
 /// `POST /api/v1/apps/{realm}/{instance}/operations/{name}`.
@@ -3744,6 +3754,12 @@ pub struct GoogleClient {
     /// The redirect URI to register with Google for this head.
     #[serde(default)]
     pub redirect_uri: String,
+    /// The Google apps installed in home (gmail, google-calendar,
+    /// google-contacts), and those waiting for your approval.
+    #[serde(default)]
+    pub apps: Vec<String>,
+    #[serde(default)]
+    pub waiting: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

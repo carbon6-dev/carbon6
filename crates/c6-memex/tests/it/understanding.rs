@@ -111,7 +111,7 @@ async fn understanding_review_graph() {
         .await
         .unwrap();
     // Someone you write to, with the same name as the paper's author.
-    c6_memex::google::person(&m.store, "jane@acme.com", "Jane Doe").await.unwrap();
+    c6_memex::people::person(&m.store, "jane@acme.com", "Jane Doe").await.unwrap();
 
     // The model's answers, newest item first: the paper, then the session.
     mock.push(Reply::Text(

@@ -419,8 +419,28 @@ pub fn GoogleSettings() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Mail & calendar"</h2>
-                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the memex. Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
+                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts (in home; they run on a worker with Docker or Podman, reaching only Google). Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
             </div>
+            {move || client.get().and_then(Result::ok).filter(|c| c.apps.len() < 3).map(|c| {
+                let waiting = !c.waiting.is_empty();
+                view! {
+                    <div class="flex flex-wrap items-center gap-2 rounded-md bg-amber-50 p-2 text-sm dark:bg-amber-950">
+                        <span class="flex-1">{if waiting {
+                            "The Google apps wait for your approval (Decisions).".to_owned()
+                        } else if c.apps.is_empty() {
+                            "Install the Gmail, Calendar and Contacts apps to connect accounts.".to_owned()
+                        } else {
+                            format!("Installed: {}. Install the others too?", c.apps.join(", "))
+                        }}</span>
+                        {(!waiting).then(|| view! {
+                            <button class=BUTTON on:click=move |_| spawn_local(async move {
+                                note.set(Some(api::google_install().await.map(|_| "Approve each app under Decisions.".to_owned())));
+                                client.refetch();
+                            })>"Install the apps"</button>
+                        })}
+                    </div>
+                }
+            })}
             {move || client.get().and_then(Result::ok).map(|c| view! {
                 <p class="text-xs text-zinc-500">"Redirect URI: " <code class="select-all font-mono">{c.redirect_uri.clone()}</code></p>
             })}
@@ -444,7 +464,7 @@ pub fn GoogleSettings() -> impl IntoView {
                     <div class="divide-y divide-zinc-100 text-sm dark:divide-zinc-800">
                         {list.into_iter().map(|a| {
                             let id = a.id.clone();
-                            let mine: Vec<String> = states.iter().filter(|s| s["account"] == a.id.as_str()).map(|s| {
+                            let mine: Vec<String> = states.iter().filter(|s| s["email"] == a.email.as_str()).map(|s| {
                                 let kind = s["kind"].as_str().unwrap_or("").trim_start_matches("cal:").to_owned();
                                 let err = s["error"].as_str().map(|e| format!(" ({e})")).unwrap_or_default();
                                 format!("{kind}: {} {}{err}", s["phase"].as_str().unwrap_or(""), if s["done"].as_i64().unwrap_or(0) > 0 { format!("· {}", s["done"]) } else { String::new() })
@@ -454,7 +474,7 @@ pub fn GoogleSettings() -> impl IntoView {
                                     <span class="font-medium">{a.email.clone()}</span>
                                     <span class="min-w-0 flex-1 truncate text-xs text-zinc-500" title=mine.join("\n")>{mine.join(" · ")}</span>
                                     <button class="text-xs text-red-600 hover:underline" on:click=move |_| {
-                                        if !window().confirm_with_message("Disconnect this account? (What is in the memex stays.)").unwrap_or(false) { return; }
+                                        if !window().confirm_with_message("Disconnect this account from the Google apps? (What is in the memex stays.)").unwrap_or(false) { return; }
                                         let id = id.clone();
                                         spawn_local(async move { let _ = api::google_remove(id).await; accounts.refetch(); });
                                     }>"Disconnect"</button>

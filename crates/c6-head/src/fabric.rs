@@ -58,6 +58,14 @@ pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::
             }
             Ok(json!({}))
         }
+        // An app's operation, for the knowledge store's mail, calendar and
+        // contacts: what the account's app does (docs/knowledge.md §6).
+        "app.call" => {
+            let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
+            let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
+            let by = params["by"].as_str().filter(|b| !b.is_empty()).unwrap_or("you");
+            crate::operations::call(st, &realm, &s("app"), &s("operation"), &params["input"], by).await
+        }
         // A disputed fact, for you to settle.
         "todo.add" => {
             // From the memex, about one realm's knowledge.

@@ -1,0 +1,105 @@
+{
+  "package": "google",
+  "version": "1.0.0",
+  "description": "Gmail, Google Calendar and Google Contacts over their APIs, for the gmail, google-calendar and google-contacts apps: it reaches only Google, with the access tokens each run gets.",
+  "permissions": {
+    "files": "session",
+    "network": "hosts",
+    "hosts": [
+      "gmail.googleapis.com",
+      "www.googleapis.com",
+      "people.googleapis.com"
+    ],
+    "cpus": 1,
+    "memory_mb": 512,
+    "timeout_s": 600
+  },
+  "kit": {
+    "build": {
+      "dockerfile": "Dockerfile",
+      "files": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/mail.rs",
+        "src/calendar.rs",
+        "src/contacts.rs"
+      ]
+    },
+    "tools": [
+      {
+        "name": "mail-sync",
+        "description": "What changed in each account's Gmail since the last run (an import, a page at a time, then its history).",
+        "command": [
+          "c6-google",
+          "mail-sync"
+        ],
+        "args": {}
+      },
+      {
+        "name": "mail-modify",
+        "description": "Adds and removes labels on a thread (input: account, thread, add, remove).",
+        "command": [
+          "c6-google",
+          "mail-modify"
+        ],
+        "args": {}
+      },
+      {
+        "name": "mail-send",
+        "description": "Sends a message (input: account, raw, thread).",
+        "command": [
+          "c6-google",
+          "mail-send"
+        ],
+        "args": {}
+      },
+      {
+        "name": "mail-draft",
+        "description": "Saves a draft (input: account, raw, thread, draft_id).",
+        "command": [
+          "c6-google",
+          "mail-draft"
+        ],
+        "args": {}
+      },
+      {
+        "name": "calendar-sync",
+        "description": "What changed in each account's calendars.",
+        "command": [
+          "c6-google",
+          "calendar-sync"
+        ],
+        "args": {}
+      },
+      {
+        "name": "calendar-write",
+        "description": "Creates, changes, deletes or answers an event (input: action, edit).",
+        "command": [
+          "c6-google",
+          "calendar-write"
+        ],
+        "args": {}
+      },
+      {
+        "name": "contacts-sync",
+        "description": "What changed in each account's contacts.",
+        "command": [
+          "c6-google",
+          "contacts-sync"
+        ],
+        "args": {}
+      },
+      {
+        "name": "contacts-write",
+        "description": "Adds a contact in the carbon6 group (input: account, name, email).",
+        "command": [
+          "c6-google",
+          "contacts-write"
+        ],
+        "args": {}
+      }
+    ]
+  }
+}

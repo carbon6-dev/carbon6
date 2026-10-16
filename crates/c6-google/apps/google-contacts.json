@@ -1,0 +1,147 @@
+{
+  "package": "google-contacts",
+  "version": "1.0.0",
+  "description": "Your Google contacts in carbon6: each contact a person in your knowledge, with all of their addresses; people you add are written back, in a group named carbon6.",
+  "requires": {
+    "google": "^1"
+  },
+  "feeds": [
+    "contacts"
+  ],
+  "permissions": {
+    "secrets": [
+      "GOOGLE_CLIENT_ID",
+      "GOOGLE_CLIENT_SECRET"
+    ]
+  },
+  "providers": [
+    {
+      "name": "google",
+      "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "scopes": [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/contacts"
+      ],
+      "userinfo_url": "https://www.googleapis.com/oauth2/v3/userinfo",
+      "account_field": "email",
+      "params": {
+        "access_type": "offline",
+        "prompt": "consent"
+      },
+      "client_id_secret": "GOOGLE_CLIENT_ID",
+      "client_secret_secret": "GOOGLE_CLIENT_SECRET"
+    }
+  ],
+  "contents": {
+    "collections": [
+      {
+        "name": "contacts_sync",
+        "description": "Where each account's contacts sync is: its cursor, its import's place, its last trouble.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "what syncs: mail:<account>, cal:<account>:<calendar>, contacts:<account>"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "page_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "queue": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "type": "string",
+              "enum": [
+                "import",
+                "live"
+              ]
+            },
+            "done": {
+              "type": "integer"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": "integer"
+            }
+          }
+        },
+        "keys": [
+          "key"
+        ],
+        "card": {
+          "stability": "internal",
+          "sources": "The google kit's syncs.",
+          "freshness": "Every run."
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "name": "contacts sync",
+        "trigger": "schedule",
+        "cron": "*/10 * * * *",
+        "action": "kit",
+        "action_params": {
+          "kit": "google",
+          "tool": "contacts-sync",
+          "state": [
+            "contacts_sync"
+          ]
+        },
+        "per_hour": 60
+      }
+    ]
+  },
+  "operations": [
+    {
+      "name": "create",
+      "description": "Adds a contact, in the carbon6 group.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "email"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          }
+        }
+      },
+      "kit": {
+        "kit": "google",
+        "tool": "contacts-write"
+      }
+    }
+  ]
+}

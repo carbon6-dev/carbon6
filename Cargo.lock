@@ -565,6 +565,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "c6-google"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "chrono",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "c6-head"
 version = "0.2.2"
 dependencies = [
@@ -670,6 +683,7 @@ dependencies = [
  "c6-api",
  "c6-core",
  "c6-extract",
+ "c6-google",
  "c6-head",
  "c6-llm",
  "c6-memex",

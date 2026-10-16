@@ -10,12 +10,12 @@ pub mod embed;
 mod explore;
 pub mod extract;
 pub mod faces;
-pub mod google;
 pub mod ingest;
 pub mod knowledge;
 pub mod llm;
 pub mod mail;
 pub mod media;
+pub mod people;
 pub mod review;
 pub mod store;
 
@@ -58,13 +58,12 @@ pub struct Memex {
     prompts: Mutex<std::collections::HashMap<String, String>>,
     /// Wakes the folder scanner (settings changed).
     rescan: tokio::sync::Notify,
-    pub google: google::Google,
-    /// Google accounts to sync, from the head's settings.
-    accounts: Mutex<Vec<google::Account>>,
-    /// Write people you correspond with back to Google Contacts.
+    /// The accounts apps connected for mail, calendars and contacts, from
+    /// the head's config.
+    accounts: Mutex<Vec<people::Account>>,
+    /// Add people you correspond with to your contacts (through the
+    /// contacts app).
     contacts_auto: std::sync::atomic::AtomicBool,
-    /// Wakes the Google sync.
-    resync: tokio::sync::Notify,
     /// The models for understanding, vision and transcription, and model
     /// calls a day.
     tasks: Mutex<Tasks>,
@@ -128,7 +127,6 @@ impl Memex {
             realms: Default::default(),
             store,
             embed: embed::Embedder::new(link.clone()),
-            google: google::Google::new(link.clone()),
             link,
             last_error: Mutex::new(None),
             dir: dir.to_owned(),
@@ -137,7 +135,6 @@ impl Memex {
             accounts: Mutex::default(),
             contacts_auto: Default::default(),
             prompts: Default::default(),
-            resync: tokio::sync::Notify::new(),
             tasks: Mutex::default(),
             wake: tokio::sync::Notify::new(),
             reload: tokio::sync::Notify::new(),
@@ -159,7 +156,7 @@ impl Memex {
         // Mail, calendars, contacts, folders and photos are home's.
         if self.is_home() {
             self.spawn_scanner();
-            self.spawn_google();
+            self.spawn_mail();
             media::spawn(self.clone());
         }
         understand::spawn(self.clone());
@@ -176,13 +173,9 @@ impl Memex {
                                 model: c["embedding"]["model"].as_str().unwrap_or_default().to_owned(),
                             }));
                             let home = m.is_home();
-                            let accounts: Vec<google::Account> =
-                                if home { serde_json::from_value(c["google"].clone()).unwrap_or_default() } else { Vec::new() };
-                            let new_accounts = *m.accounts.lock().unwrap() != accounts;
+                            let accounts: Vec<people::Account> =
+                                if home { serde_json::from_value(c["accounts"].clone()).unwrap_or_default() } else { Vec::new() };
                             *m.accounts.lock().unwrap() = accounts;
-                            if let Some(p) = c["google_people"].as_str() {
-                                *m.google.people.lock().unwrap() = p.to_owned();
-                            }
                             let tasks = Tasks {
                                 understanding: task_of(&c["understanding"]),
                                 vision: task_of(&c["vision"]),
@@ -207,9 +200,6 @@ impl Memex {
                                 m.wake.notify_waiters();
                             }
                             m.contacts_auto.store(c["contacts_auto"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
-                            if new_accounts {
-                                m.resync.notify_one();
-                            }
                             *m.prompts.lock().unwrap() = serde_json::from_value(c["prompts"].clone()).unwrap_or_default();
                             let folders: Vec<api::MemexFolder> =
                                 if home { serde_json::from_value(c["folders"].clone()).unwrap_or_default() } else { Vec::new() };
@@ -240,58 +230,38 @@ impl Memex {
         });
     }
 
-    /// Syncs Google accounts: mail every minute (and while importing, as
-    /// fast as it goes), calendars every 3 minutes, contacts every 10; and
-    /// sends mail when it is due.
-    pub fn spawn_google(self: &Arc<Self>) {
+    /// Sends mail when it is due, and (when you asked) adds people you
+    /// write to to your contacts, through the apps that own the accounts.
+    pub fn spawn_mail(self: &Arc<Self>) {
         let m = self.clone();
         tokio::spawn(async move {
             let mut round: u64 = 0;
             loop {
-                let accounts = m.accounts();
-                let mut importing = false;
                 if m.link.is_connected() {
-                    for a in &accounts {
-                        let r = mail::sync(&m, a).await;
-                        let st = google::state(&m.store, &a.id, "mail").await.ok();
-                        importing |= st.as_ref().is_some_and(|s| s.phase == "import");
-                        if let Err(e) = r {
-                            warn!(account = %a.email, "mail sync: {e:#}");
-                            let _ = google::set_error(&m.store, &a.id, "mail", Some(&format!("{e:#}"))).await;
-                        }
-                        if round.is_multiple_of(3)
-                            && let Err(e) = calendar::sync(&m, a).await
-                        {
-                            warn!(account = %a.email, "calendar sync: {e:#}");
-                            let _ = google::set_error(&m.store, &a.id, "calendars", Some(&format!("{e:#}"))).await;
-                        }
-                        if round.is_multiple_of(10)
-                            && let Err(e) = contacts::sync(&m, a).await
-                        {
-                            warn!(account = %a.email, "contacts sync: {e:#}");
-                            let _ = google::set_error(&m.store, &a.id, "contacts", Some(&format!("{e:#}"))).await;
-                        }
+                    if let Err(e) = mail::send_due(&m).await {
+                        warn!("sending mail: {e:#}");
+                    }
+                    // Every ten minutes.
+                    if m.contacts_auto()
+                        && round.is_multiple_of(300)
+                        && let Err(e) = contacts::write_back(&m).await
+                    {
+                        warn!("adding contacts: {e:#}");
                     }
                 }
                 round += 1;
-                let wait = if importing { Duration::from_millis(200) } else { Duration::from_secs(60) };
-                tokio::select! {
-                    _ = m.resync.notified() => round = 0,
-                    _ = tokio::time::sleep(wait) => {}
-                }
-            }
-        });
-        let m = self.clone();
-        tokio::spawn(async move {
-            loop {
-                if m.link.is_connected()
-                    && let Err(e) = mail::send_due(&m).await
-                {
-                    warn!("sending mail: {e:#}");
-                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
+    }
+
+    /// Calls an operation of the app an account belongs to (it talks to
+    /// the provider, and what changed comes back through its ingest).
+    pub async fn app_call(&self, account: &people::Account, operation: &str, input: Value, by: &str) -> anyhow::Result<Value> {
+        anyhow::ensure!(!account.app.is_empty(), "no app owns the account {}", account.email);
+        self.link
+            .call("app.call", json!({"realm": self.realm, "app": account.app, "operation": operation, "input": input, "by": by}))
+            .await
     }
 
     pub fn tasks(&self) -> Tasks {
@@ -371,28 +341,25 @@ impl Memex {
         t.understanding.map(|u| (u, t.per_day))
     }
 
-    pub fn accounts(&self) -> Vec<google::Account> {
+    pub fn accounts(&self) -> Vec<people::Account> {
         self.accounts.lock().unwrap().clone()
     }
 
-    /// An account by id or address.
-    pub fn account(&self, id_or_email: &str) -> anyhow::Result<google::Account> {
-        let accounts = self.accounts();
+    /// An account that feeds a store (mail, calendar, contacts), by id or
+    /// address.
+    pub fn account(&self, feeds: &str, id_or_email: &str) -> anyhow::Result<people::Account> {
+        let accounts: Vec<people::Account> = self.accounts().into_iter().filter(|a| a.feeds.iter().any(|f| f == feeds)).collect();
         match accounts.iter().find(|a| a.id == id_or_email || a.email.eq_ignore_ascii_case(id_or_email)) {
             Some(a) => Ok(a.clone()),
             None if id_or_email.is_empty() && accounts.len() == 1 => Ok(accounts[0].clone()),
-            None => anyhow::bail!("no Google account {id_or_email:?}"),
+            None => anyhow::bail!("no {feeds} account {id_or_email:?} (connect one in Settings → Mail & calendar)"),
         }
     }
 
-    pub fn account_id(&self, id_or_email: &str) -> anyhow::Result<String> {
-        Ok(self.account(id_or_email)?.id)
-    }
-
-    /// A mail account to read or label: a Google account, or an import
-    /// source (`import:…`).
+    /// A mail account to read or label: an app's, or an import source
+    /// (`import:…`).
     pub fn mail_account(&self, id_or_email: &str) -> anyhow::Result<String> {
-        if id_or_email.starts_with("import:") { Ok(id_or_email.to_owned()) } else { self.account_id(id_or_email) }
+        if id_or_email.starts_with("import:") { Ok(id_or_email.to_owned()) } else { Ok(self.account("mail", id_or_email)?.id) }
     }
 
     pub fn contacts_auto(&self) -> bool {
@@ -643,7 +610,7 @@ impl Memex {
         let realm = params["realm"].as_str().unwrap_or(&self.realm).to_owned();
         if realm != self.realm {
             const HOME_ONLY: [&str; 7] =
-                ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.media.", "memex.google", "memex.scan", "memex.upgrades"];
+                ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.media.", "memex.legacy_sync", "memex.scan", "memex.upgrades"];
             if HOME_ONLY.iter().any(|p| method.starts_with(p)) {
                 anyhow::bail!("{method} is home's (mail, calendars, contacts, photos and folders belong to home)");
             }
@@ -670,7 +637,12 @@ impl Memex {
                     None => self.store.id_of(params["source"].as_str().unwrap_or(""), params["external_id"].as_str().unwrap_or("")).await?,
                 };
                 let deleted = match id {
-                    Some(id) => self.store.delete(&id).await?,
+                    Some(id) => {
+                        // A message gone from its mailbox leaves the mail store too.
+                        sqlx::query("DELETE FROM mail WHERE item_id = ?").bind(&id).execute(&self.store.pool).await?;
+                        sqlx::query("DELETE FROM mail_labels WHERE item_id = ?").bind(&id).execute(&self.store.pool).await?;
+                        self.store.delete(&id).await?
+                    }
                     None => false,
                 };
                 Ok(json!({"deleted": deleted}))
@@ -866,14 +838,12 @@ impl Memex {
                 }
                 Ok(json!({"read": n}))
             }
-            m if m.starts_with("memex.mail.")
-                || m.starts_with("memex.calendar.")
-                || m.starts_with("memex.contacts.")
-                || m == "memex.google"
-                || m == "memex.google_sync" =>
-            {
+            m if m.starts_with("memex.mail.") || m.starts_with("memex.calendar.") || m.starts_with("memex.contacts.") => {
                 self.google_method(m, params, &allowed).await
             }
+            // Where the memex's own Google sync was, for moving it to apps.
+            "memex.legacy_sync" => Ok(json!(people::legacy_states(&self.store).await?)),
+            "memex.move_google" => people::move_to_apps(self, &params["accounts"]).await.map(|n| json!({"moved": n})),
             "memex.commitments" => Ok(json!(understand::commitments(self, params["status"].as_str().unwrap_or("open")).await?)),
             "memex.commitment" => {
                 understand::set_commitment(self, params["id"].as_i64().unwrap_or(0), params["status"].as_str().unwrap_or("")).await?;
@@ -999,13 +969,6 @@ impl Memex {
         let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
         let made_by = params["made_by"].as_str().unwrap_or("you").to_owned();
         Ok(match method {
-            "memex.google" => {
-                json!({"accounts": self.accounts().iter().map(|a| json!({"id": a.id, "email": a.email})).collect::<Vec<_>>(), "sync": google::states(&self.store).await?})
-            }
-            "memex.google_sync" => {
-                self.resync.notify_one();
-                json!({})
-            }
             "memex.mail.threads" => {
                 let account = params["account"].as_str().filter(|a| !a.is_empty()).map(|a| self.mail_account(a)).transpose()?;
                 let view = params["view"].as_str().unwrap_or("inbox");
@@ -1025,7 +988,7 @@ impl Memex {
                 let list = |k: &str| -> Vec<String> {
                     params[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default()
                 };
-                mail::modify(self, &self.mail_account(&s("account"))?, &s("thread_id"), &list("add"), &list("remove")).await?;
+                mail::modify(self, &self.mail_account(&s("account"))?, &s("thread_id"), &list("add"), &list("remove"), &made_by).await?;
                 json!({})
             }
             "memex.mail.attachment" => {
@@ -1034,7 +997,7 @@ impl Memex {
             }
             "memex.mail.draft" => {
                 let d: api::MailDraft = serde_json::from_value(params)?;
-                json!({"draft_id": mail::draft(self, &d).await?})
+                json!({"draft_id": mail::draft(self, &d, &made_by).await?})
             }
             "memex.mail.send" => {
                 let d: api::MailDraft = serde_json::from_value(params)?;
@@ -1045,7 +1008,7 @@ impl Memex {
             "memex.mail.labels" => json!(mail::label_list(self).await?),
             "memex.calendar.calendars" => json!(calendar::calendars(self).await?),
             "memex.calendar.select" => {
-                calendar::select(self, &self.account_id(&s("account"))?, &s("id"), params["on"].as_bool().unwrap_or(true)).await?;
+                calendar::select(self, &self.account("calendar", &s("account"))?.id, &s("id"), params["on"].as_bool().unwrap_or(true)).await?;
                 json!({})
             }
             "memex.calendar.events" => {
@@ -1054,23 +1017,22 @@ impl Memex {
             "memex.calendar.busy" => {
                 json!(calendar::busy(self, params["from"].as_i64().unwrap_or(0), params["to"].as_i64().unwrap_or(0)).await?)
             }
-            "memex.calendar.create" => json!(calendar::create(self, &serde_json::from_value(params)?).await?),
+            "memex.calendar.create" => json!(calendar::write(self, "create", params, &made_by).await?),
             "memex.calendar.update" => {
-                calendar::update(self, &serde_json::from_value(params)?).await?;
+                calendar::write(self, "update", params, &made_by).await?;
                 json!({})
             }
             "memex.calendar.delete" => {
-                calendar::delete(self, &serde_json::from_value(params)?).await?;
+                calendar::write(self, "delete", params, &made_by).await?;
                 json!({})
             }
             "memex.calendar.rsvp" => {
-                calendar::rsvp(self, &s("account"), &s("calendar_id"), &s("event_id"), params["instance_start"].as_i64(), &s("response"))
-                    .await?;
+                calendar::write(self, "rsvp", params, &made_by).await?;
                 json!({})
             }
             "memex.contacts.list" => json!(contacts::list(self, &s("q")).await?),
             "memex.contacts.candidates" => json!(contacts::candidates(self).await?),
-            "memex.contacts.create" => json!(contacts::create(self, &s("account"), &s("name"), &s("email")).await?),
+            "memex.contacts.create" => json!(contacts::create(self, &s("account"), &s("name"), &s("email"), &made_by).await?),
             other => anyhow::bail!("the memex has no method {other}"),
         })
     }
