@@ -98,6 +98,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     };
 
     let (tx, rx) = mpsc::channel::<WorkerMsg>(64);
+    let kits = c6_tools::kits::runtime().await.is_some();
     let hello = Hello {
         protocol_version: c6_core::PROTOCOL_VERSION,
         version: c6_core::VERSION.into(),
@@ -107,7 +108,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         capabilities: {
             let mut c: Vec<String> = crate::claude_code::find_claude().map(|_| "claude_code".to_owned()).into_iter().collect();
             // It runs kit jobs for the head (docs/knowledge.md §6.2).
-            if c6_tools::kits::runtime().await.is_some() {
+            if kits {
                 c.push("kits".into());
             }
             if let Some(ext) = worker.extension() {
@@ -178,6 +179,9 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     }
 
     let mut pings = tokio::time::interval(PING_INTERVAL);
+    // Docker or Podman started after we attached: attach again, saying so.
+    let mut look_for_kits = tokio::time::interval(Duration::from_secs(60));
+    look_for_kits.tick().await;
     let mut nonce = 0u64;
     let mut in_flight: HashMap<u64, Instant> = HashMap::new();
     let mut last_rtt_us = 0u32;
@@ -187,6 +191,11 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         tokio::select! {
             _ = shutdown.cancelled() => return Ended::Shutdown,
             _ = tokio::time::sleep_until(deadline.into()) => return Ended::Retry(anyhow::anyhow!("head unresponsive")),
+            _ = look_for_kits.tick(), if !kits => {
+                if c6_tools::kits::runtime().await.is_some() {
+                    return Ended::Retry(anyhow::anyhow!("a container runtime is here now: attaching again to say so"));
+                }
+            }
             _ = pings.tick() => {
                 nonce += 1;
                 in_flight.insert(nonce, Instant::now());

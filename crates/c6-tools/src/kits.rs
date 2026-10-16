@@ -22,32 +22,82 @@ const MAX_OUTPUT: usize = 30_000;
 /// A build that takes longer than this is stopped.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Where container runtimes and their helpers (credential helpers, say)
+/// are, beyond PATH: a service's PATH (launchd, systemd) is short.
+const DIRS: [&str; 7] = [
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/Applications/Docker.app/Contents/Resources/bin",
+    "~/.docker/bin",
+    "~/.rd/bin",
+    "/opt/podman/bin",
+    "/usr/bin",
+];
+
+/// PATH, and the places runtimes live.
+fn search_path() -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    for d in DIRS {
+        let d = match d.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(d),
+        };
+        if d.is_dir() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
+/// A command of the runtime, finding its helpers wherever they are.
+pub fn runtime_command(rt: &str) -> Command {
+    let mut c = Command::new(rt);
+    c.env("PATH", search_path());
+    c
+}
+
 /// The container runtime here: `docker` or `podman` (or what
-/// C6_CONTAINER_RUNTIME names), if it answers.
+/// C6_CONTAINER_RUNTIME names), if it answers. Found once; not found, it is
+/// looked for again a minute later (Docker Desktop may still be starting).
 pub async fn runtime() -> Option<String> {
-    static FOUND: OnceLock<Option<String>> = OnceLock::new();
+    static FOUND: OnceLock<String> = OnceLock::new();
+    static LOOKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     if let Some(r) = FOUND.get() {
-        return r.clone();
+        return Some(r.clone());
     }
-    let mut candidates: Vec<String> = Vec::new();
+    if LOOKED.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+        return None;
+    }
+    *LOOKED.lock().unwrap() = Some(std::time::Instant::now());
+    let mut names: Vec<String> = Vec::new();
     if let Ok(r) = std::env::var("C6_CONTAINER_RUNTIME") {
-        candidates.push(r);
+        names.push(r);
     }
-    candidates.extend(["docker".into(), "podman".into()]);
-    let mut found = None;
-    for c in candidates {
-        let ok = tokio::time::timeout(Duration::from_secs(15), Command::new(&c).args(["version", "--format", "{{.Server.Version}}"]).output())
+    names.extend(["docker".into(), "podman".into()]);
+    let path = search_path();
+    for name in names {
+        // By its full path, so a short PATH doesn't hide it.
+        let full = if name.contains('/') {
+            PathBuf::from(&name)
+        } else {
+            match std::env::split_paths(&path).map(|d| d.join(&name)).find(|p| p.is_file()) {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        let full = full.display().to_string();
+        let ok = tokio::time::timeout(Duration::from_secs(15), runtime_command(&full).args(["version", "--format", "{{.Server.Version}}"]).output())
             .await
             .ok()
             .and_then(Result::ok)
             .is_some_and(|o| o.status.success());
         if ok {
-            found = Some(c);
-            break;
+            let _ = FOUND.set(full.clone());
+            return Some(full);
         }
     }
-    let _ = FOUND.set(found.clone());
-    found
+    None
 }
 
 async fn head_call(ctx: &ToolCtx, method: &str, params: Value) -> Result<Value, String> {
@@ -71,7 +121,7 @@ fn clip(s: &str) -> String {
 async fn ensure_images(rt: &str, spec: &Value) -> Result<(), String> {
     for b in spec["builds"].as_array().into_iter().flatten() {
         let tag = b["tag"].as_str().unwrap_or_default();
-        let have = Command::new(rt).args(["image", "inspect", tag]).output().await.map(|o| o.status.success()).unwrap_or(false);
+        let have = runtime_command(rt).args(["image", "inspect", tag]).output().await.map(|o| o.status.success()).unwrap_or(false);
         if have {
             continue;
         }
@@ -90,7 +140,7 @@ async fn ensure_images(rt: &str, spec: &Value) -> Result<(), String> {
             }
             tokio::fs::write(&full, data).await.map_err(|e| e.to_string())?;
         }
-        let build = Command::new(rt).args(["build", "-t", tag, "-f"]).arg(dir.join("Dockerfile.c6kit")).arg(&dir).kill_on_drop(true).output();
+        let build = runtime_command(rt).args(["build", "-t", tag, "-f"]).arg(dir.join("Dockerfile.c6kit")).arg(&dir).kill_on_drop(true).output();
         let out = tokio::time::timeout(BUILD_TIMEOUT, build).await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let out = out.map_err(|_| format!("building {} took too long", b["name"].as_str().unwrap_or("the kit")))?.map_err(|e| e.to_string())?;
@@ -186,8 +236,8 @@ impl Egress {
                 Err(x) => Err(format!("{what}: {x}")),
             }
         };
-        ok(Command::new(rt).args(["network", "create", "--internal", &e.net]).output().await, "making the run's network")?;
-        let r = Command::new(rt)
+        ok(runtime_command(rt).args(["network", "create", "--internal", &e.net]).output().await, "making the run's network")?;
+        let r = runtime_command(rt)
             .args(["run", "-d", "--rm", "--name", &e.proxy, "--network", &e.net, "--user", "65534:65534", "--cap-drop", "ALL"])
             .args(["--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp", "-v"])
             .arg(format!("{}:/etc/c6:ro", e.dir.display()))
@@ -198,13 +248,13 @@ impl Egress {
             e.stop().await;
             return Err(x);
         }
-        if let Err(x) = ok(Command::new(rt).args(["network", "connect", "bridge", &e.proxy]).output().await, "connecting the egress proxy") {
+        if let Err(x) = ok(runtime_command(rt).args(["network", "connect", "bridge", &e.proxy]).output().await, "connecting the egress proxy") {
             e.stop().await;
             return Err(x);
         }
         // Until it listens.
         for _ in 0..50 {
-            let up = Command::new(rt).args(["exec", &e.proxy, "nc", "-z", "127.0.0.1", "8888"]).output().await.is_ok_and(|o| o.status.success());
+            let up = runtime_command(rt).args(["exec", &e.proxy, "nc", "-z", "127.0.0.1", "8888"]).output().await.is_ok_and(|o| o.status.success());
             if up {
                 return Ok(e);
             }
@@ -220,8 +270,8 @@ impl Egress {
     }
 
     async fn stop(&self) {
-        let _ = Command::new(&self.rt).args(["rm", "-f", &self.proxy]).output().await;
-        let _ = Command::new(&self.rt).args(["network", "rm", &self.net]).output().await;
+        let _ = runtime_command(&self.rt).args(["rm", "-f", &self.proxy]).output().await;
+        let _ = runtime_command(&self.rt).args(["network", "rm", &self.net]).output().await;
         let _ = tokio::fs::remove_dir_all(&self.dir).await;
     }
 }
@@ -282,13 +332,13 @@ pub async fn sandboxed(
     args.push(spec["image"].as_str().unwrap_or_default().to_owned());
     args.extend(command);
     let timeout = Duration::from_secs(p["timeout_s"].as_u64().unwrap_or(120));
-    let child = Command::new(rt).args(&args).kill_on_drop(true).output();
+    let child = runtime_command(rt).args(&args).kill_on_drop(true).output();
     let never = tokio_util::sync::CancellationToken::new();
     let cancelled = cancel.unwrap_or(&never);
     let out = tokio::select! {
         r = tokio::time::timeout(timeout, child) => r,
         _ = cancelled.cancelled() => {
-            let _ = Command::new(rt).args(["kill", &name]).output().await;
+            let _ = runtime_command(rt).args(["kill", &name]).output().await;
             if let Some(e) = &egress { e.stop().await; }
             return Err("interrupted".into());
         }
@@ -298,7 +348,7 @@ pub async fn sandboxed(
     }
     match out {
         Err(_) => {
-            let _ = Command::new(rt).args(["kill", &name]).output().await;
+            let _ = runtime_command(rt).args(["kill", &name]).output().await;
             Err(format!("stopped after {} seconds (the kit's limit)", timeout.as_secs()))
         }
         Ok(Err(e)) => Err(format!("running the kit: {e}")),
