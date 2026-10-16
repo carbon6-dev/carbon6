@@ -124,58 +124,23 @@ fn inside(root: &Path, given: &str) -> Result<String, String> {
 }
 
 /// Runs a command in the kit's image, in the sandbox its permissions
-/// describe.
+/// describe, with the session's folder at /work.
 async fn run(ctx: &ToolCtx, rt: &str, spec: &Value, command: Vec<String>) -> ToolOutput {
     if let Err(e) = ensure_images(rt, spec).await {
         return ToolOutput::err(e);
     }
-    let p = &spec["permissions"];
     let root = ctx.session.cwd();
-    let ro = p["files"] == "session-ro";
-    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
-    let name = format!("c6kit-run-{}", uuid_like());
-    args.extend(["--name".into(), name.clone()]);
-    args.extend(["--network".into(), if p["network"] == "any" { "bridge".into() } else { "none".into() }]);
-    args.extend(["--read-only".into(), "--tmpfs".into(), "/tmp:rw,size=512m".into()]);
-    args.extend(["--cap-drop".into(), "ALL".into(), "--security-opt".into(), "no-new-privileges".into()]);
-    args.extend(["--pids-limit".into(), "512".into()]);
-    args.extend(["--cpus".into(), format!("{}", p["cpus"].as_f64().unwrap_or(1.0))]);
-    args.extend(["--memory".into(), format!("{}m", p["memory_mb"].as_u64().unwrap_or(1024))]);
-    // As the owner of the session's folder, never root.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(m) = std::fs::metadata(&root) {
-            let (uid, gid) = if m.uid() == 0 { (65534, 65534) } else { (m.uid(), m.gid()) };
-            args.extend(["--user".into(), format!("{uid}:{gid}")]);
-        }
-    }
-    args.extend(["-e".into(), "HOME=/tmp".into()]);
-    args.extend(["-v".into(), format!("{}:/work{}", root.display(), if ro { ":ro" } else { "" }), "-w".into(), "/work".into()]);
     // The secrets it was approved for, for this run only.
-    for s in p["secrets"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        if let Some(v) = ctx.session.secrets().get(s) {
-            args.extend(["-e".into(), format!("{s}={v}")]);
-        }
-    }
-    args.push(spec["image"].as_str().unwrap_or_default().to_owned());
-    args.extend(command);
-    let timeout = Duration::from_secs(p["timeout_s"].as_u64().unwrap_or(120));
-    let child = Command::new(rt).args(&args).kill_on_drop(true).output();
-    let out = tokio::select! {
-        r = tokio::time::timeout(timeout, child) => r,
-        _ = ctx.cancel.cancelled() => {
-            let _ = Command::new(rt).args(["kill", &name]).output().await;
-            return ToolOutput::err("interrupted");
-        }
-    };
-    let out = match out {
-        Err(_) => {
-            let _ = Command::new(rt).args(["kill", &name]).output().await;
-            return ToolOutput::err(format!("stopped after {} seconds (the kit's limit)", timeout.as_secs()));
-        }
-        Ok(Err(e)) => return ToolOutput::err(format!("running the kit: {e}")),
-        Ok(Ok(o)) => o,
+    let env: Vec<(String, String)> = spec["permissions"]["secrets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|s| ctx.session.secrets().get(s).map(|v| (s.to_owned(), v)))
+        .collect();
+    let out = match sandboxed(rt, spec, &root, command, &env, Some(&ctx.cancel)).await {
+        Ok(o) => o,
+        Err(e) => return ToolOutput::err(e),
     };
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let text = ctx.session.secrets().redact(&clip(&text));
@@ -183,6 +148,162 @@ async fn run(ctx: &ToolCtx, rt: &str, spec: &Value, command: Vec<String>) -> Too
         Some(0) => ToolOutput::limited(if text.trim().is_empty() { "(done, no output)".into() } else { text }, false),
         code => ToolOutput::limited(format!("exit status {}\n{text}", code.map(|c| c.to_string()).unwrap_or_else(|| "(killed)".into())), true),
     }
+}
+
+/// The egress proxy's image: tinyproxy, denying every host but the
+/// filter's (docs/knowledge.md §6.2).
+const EGRESS_DOCKERFILE: &str = "FROM alpine:3.20\nRUN apk add --no-cache tinyproxy\n";
+
+fn egress_spec() -> Value {
+    json!({"builds": [{"name": "c6-egress", "version": "1", "tag": "c6kit/egress:tinyproxy-1", "dockerfile": EGRESS_DOCKERFILE, "files": {}}]})
+}
+
+/// A network a run reaches only the given hosts through: an internal
+/// network (no route out) with a proxy on it that also sits on the default
+/// bridge and lets through only those hosts.
+struct Egress {
+    rt: String,
+    net: String,
+    proxy: String,
+    dir: PathBuf,
+}
+
+impl Egress {
+    async fn start(rt: &str, hosts: &[String]) -> Result<Self, String> {
+        ensure_images(rt, &egress_spec()).await?;
+        let id = uuid_like();
+        let e = Egress { rt: rt.to_owned(), net: format!("c6net-{id}"), proxy: format!("c6egress-{id}"), dir: std::env::temp_dir().join(format!("c6egress-{id}")) };
+        tokio::fs::create_dir_all(&e.dir).await.map_err(|x| x.to_string())?;
+        let filter: String = hosts.iter().map(|h| format!("^{}$\n", h.replace('.', "\\."))).collect();
+        tokio::fs::write(e.dir.join("filter"), filter).await.map_err(|x| x.to_string())?;
+        let conf = "Port 8888\nListen 0.0.0.0\nTimeout 600\nMaxClients 64\nFilterDefaultDeny Yes\nFilter \"/etc/c6/filter\"\n\
+                    ConnectPort 443\nConnectPort 80\nLogLevel Warning\n";
+        tokio::fs::write(e.dir.join("tinyproxy.conf"), conf).await.map_err(|x| x.to_string())?;
+        let ok = |o: std::io::Result<std::process::Output>, what: &str| -> Result<(), String> {
+            match o {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => Err(format!("{what}: {}", String::from_utf8_lossy(&o.stderr).trim())),
+                Err(x) => Err(format!("{what}: {x}")),
+            }
+        };
+        ok(Command::new(rt).args(["network", "create", "--internal", &e.net]).output().await, "making the run's network")?;
+        let r = Command::new(rt)
+            .args(["run", "-d", "--rm", "--name", &e.proxy, "--network", &e.net, "--user", "65534:65534", "--cap-drop", "ALL"])
+            .args(["--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp", "-v"])
+            .arg(format!("{}:/etc/c6:ro", e.dir.display()))
+            .args(["c6kit/egress:tinyproxy-1", "tinyproxy", "-d", "-c", "/etc/c6/tinyproxy.conf"])
+            .output()
+            .await;
+        if let Err(x) = ok(r, "starting the egress proxy") {
+            e.stop().await;
+            return Err(x);
+        }
+        if let Err(x) = ok(Command::new(rt).args(["network", "connect", "bridge", &e.proxy]).output().await, "connecting the egress proxy") {
+            e.stop().await;
+            return Err(x);
+        }
+        // Until it listens.
+        for _ in 0..50 {
+            let up = Command::new(rt).args(["exec", &e.proxy, "nc", "-z", "127.0.0.1", "8888"]).output().await.is_ok_and(|o| o.status.success());
+            if up {
+                return Ok(e);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        e.stop().await;
+        Err("the egress proxy did not start".into())
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        let url = format!("http://{}:8888", self.proxy);
+        ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"].iter().map(|k| ((*k).to_owned(), url.clone())).collect()
+    }
+
+    async fn stop(&self) {
+        let _ = Command::new(&self.rt).args(["rm", "-f", &self.proxy]).output().await;
+        let _ = Command::new(&self.rt).args(["network", "rm", &self.net]).output().await;
+        let _ = tokio::fs::remove_dir_all(&self.dir).await;
+    }
+}
+
+/// Runs `command` in the kit's image (built already), in the sandbox its
+/// permissions describe: `folder` at /work and nothing else of this
+/// machine, no privileges, bounded processes, CPU, memory and time, and the
+/// network the kit may use: none, any, or only its hosts (through an
+/// egress proxy). `env` is set for this run only.
+pub async fn sandboxed(
+    rt: &str,
+    spec: &Value,
+    folder: &Path,
+    command: Vec<String>,
+    env: &[(String, String)],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<std::process::Output, String> {
+    let p = &spec["permissions"];
+    let ro = p["files"] == "session-ro";
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    let name = format!("c6kit-run-{}", uuid_like());
+    args.extend(["--name".into(), name.clone()]);
+    let hosts: Vec<String> = p["hosts"].as_array().into_iter().flatten().filter_map(|h| h.as_str().map(str::to_owned)).collect();
+    let egress = match p["network"].as_str() {
+        Some("hosts") if !hosts.is_empty() => Some(Egress::start(rt, &hosts).await?),
+        _ => None,
+    };
+    let network = match (&egress, p["network"].as_str()) {
+        (Some(e), _) => e.net.clone(),
+        (None, Some("any")) => "bridge".into(),
+        _ => "none".into(),
+    };
+    args.extend(["--network".into(), network]);
+    args.extend(["--read-only".into(), "--tmpfs".into(), "/tmp:rw,size=512m".into()]);
+    args.extend(["--cap-drop".into(), "ALL".into(), "--security-opt".into(), "no-new-privileges".into()]);
+    args.extend(["--pids-limit".into(), "512".into()]);
+    args.extend(["--cpus".into(), format!("{}", p["cpus"].as_f64().unwrap_or(1.0))]);
+    args.extend(["--memory".into(), format!("{}m", p["memory_mb"].as_u64().unwrap_or(1024))]);
+    // As the owner of the folder, never root.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(m) = std::fs::metadata(folder) {
+            let (uid, gid) = if m.uid() == 0 { (65534, 65534) } else { (m.uid(), m.gid()) };
+            args.extend(["--user".into(), format!("{uid}:{gid}")]);
+        }
+    }
+    args.extend(["-e".into(), "HOME=/tmp".into()]);
+    for (k, v) in env.iter().chain(egress.as_ref().map(|e| e.env()).unwrap_or_default().iter()) {
+        args.extend(["-e".into(), format!("{k}={v}")]);
+    }
+    args.extend(["-v".into(), format!("{}:/work{}", folder.display(), if ro { ":ro" } else { "" }), "-w".into(), "/work".into()]);
+    args.push(spec["image"].as_str().unwrap_or_default().to_owned());
+    args.extend(command);
+    let timeout = Duration::from_secs(p["timeout_s"].as_u64().unwrap_or(120));
+    let child = Command::new(rt).args(&args).kill_on_drop(true).output();
+    let never = tokio_util::sync::CancellationToken::new();
+    let cancelled = cancel.unwrap_or(&never);
+    let out = tokio::select! {
+        r = tokio::time::timeout(timeout, child) => r,
+        _ = cancelled.cancelled() => {
+            let _ = Command::new(rt).args(["kill", &name]).output().await;
+            if let Some(e) = &egress { e.stop().await; }
+            return Err("interrupted".into());
+        }
+    };
+    if let Some(e) = &egress {
+        e.stop().await;
+    }
+    match out {
+        Err(_) => {
+            let _ = Command::new(rt).args(["kill", &name]).output().await;
+            Err(format!("stopped after {} seconds (the kit's limit)", timeout.as_secs()))
+        }
+        Ok(Err(e)) => Err(format!("running the kit: {e}")),
+        Ok(Ok(o)) => Ok(o),
+    }
+}
+
+/// Builds a kit's images if they are missing (for runs the head asks for).
+pub async fn build(rt: &str, spec: &Value) -> Result<(), String> {
+    ensure_images(rt, spec).await
 }
 
 fn uuid_like() -> String {

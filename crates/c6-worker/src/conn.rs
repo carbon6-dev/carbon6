@@ -106,6 +106,10 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         arch: c6_core::host_arch().into(),
         capabilities: {
             let mut c: Vec<String> = crate::claude_code::find_claude().map(|_| "claude_code".to_owned()).into_iter().collect();
+            // It runs kit jobs for the head (docs/knowledge.md §6.2).
+            if c6_tools::kits::runtime().await.is_some() {
+                c.push("kits".into());
+            }
             if let Some(ext) = worker.extension() {
                 c.extend(ext.capabilities());
             }

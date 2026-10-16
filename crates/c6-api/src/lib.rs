@@ -517,6 +517,9 @@ pub struct AppPackage {
     /// How anyone but the app changes what it owns (docs/apps.md §7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<Operation>,
+    /// The OAuth providers its kit jobs sign in with (docs/knowledge.md §6.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<OAuthProvider>,
     /// The labels its claims use, what each means, and the shared label
     /// it maps to (docs/apps.md §9.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -543,7 +546,7 @@ pub struct Permissions {
     /// "session-ro".
     #[serde(default = "files_default")]
     pub files: String,
-    /// Kit runs: "none" (default) or "any".
+    /// Kit runs: "none" (default), "any", or "hosts" (only `hosts`).
     #[serde(default = "network_default")]
     pub network: String,
     #[serde(default = "cpus_default")]
@@ -555,6 +558,10 @@ pub struct Permissions {
     /// Whether agents may run any command in the kit.
     #[serde(default)]
     pub shell: bool,
+    /// With network `hosts`: the only hosts its runs may reach (through an
+    /// egress proxy; docs/knowledge.md §6.2), e.g. gmail.googleapis.com.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
 }
 
 fn files_default() -> String {
@@ -585,6 +592,7 @@ impl Default for Permissions {
             memory_mb: memory_default(),
             timeout_s: timeout_default(),
             shell: false,
+            hosts: Vec::new(),
         }
     }
 }
@@ -617,6 +625,44 @@ pub struct Operation {
     /// breaking change) or `internal`. Default: published.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stability: String,
+}
+
+/// An OAuth provider a package declares (docs/knowledge.md §6.2, #2): the
+/// head runs the sign-in and keeps the refresh token; the app's kit jobs
+/// get access tokens (`C6_ACCOUNTS`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct OAuthProvider {
+    /// Letters, digits and -.
+    pub name: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Where to learn which account was connected (with the access token).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub userinfo_url: String,
+    /// Its field naming the account (default: email).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account_field: String,
+    /// The realm secrets holding your OAuth client's id and secret.
+    pub client_id_secret: String,
+    pub client_secret_secret: String,
+    /// More authorization parameters (e.g. access_type: offline).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
+/// An account connected for an app instance.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct OAuthAccount {
+    pub id: String,
+    pub provider: String,
+    pub account: String,
+    #[serde(default)]
+    pub name: String,
+    pub added_at: UnixMs,
 }
 
 /// A write operation: `"$.path"` strings take the input's values, and
@@ -822,6 +868,9 @@ pub struct Install {
     /// Where its code no longer matches the package it installed (§5.5).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+    /// The OAuth providers its package declares, to connect accounts with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
     /// What it requires, locked: name → digest.
     #[serde(default)]
     pub locks: std::collections::BTreeMap<String, String>,

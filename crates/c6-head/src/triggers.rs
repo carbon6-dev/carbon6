@@ -34,7 +34,7 @@ pub const MAX_WEBHOOK_BODY: usize = 1024 * 1024;
 pub const MAX_DEPTH: usize = 5;
 
 pub const EVENTS: [&str; 7] = ["schedule", "webhook", "memex", "record", "decision", "session", "series"];
-pub const ACTIONS: [&str; 6] = ["start", "write", "ask", "notify", "record", "operation"];
+pub const ACTIONS: [&str; 7] = ["start", "write", "ask", "notify", "record", "operation", "kit"];
 const OPS: [(&str, &[&str]); 4] = [
     ("series", &["crossed", "cleared"]),
     ("record", &["created", "updated", "deleted"]),
@@ -192,6 +192,18 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
             return Err(bad_request("a notify gives a title or a message"));
         }
         "ask" | "notify" => {}
+        // A kit tool of an app, with no agent (docs/knowledge.md §6.2): the
+        // trigger's own app, or the one it names.
+        "kit" => {
+            let inst = if a.owner.is_empty() { p["instance"].as_str().unwrap_or_default() } else { a.owner.as_str() };
+            let i = crate::instances::get(&st.store.pool, realm, inst)
+                .await?
+                .ok_or_else(|| bad_request(format!("a kit action names an app in realm {realm}: {{\"instance\", \"kit\", \"tool\", \"args\"}}")))?;
+            let kit = p["kit"].as_str().unwrap_or_default();
+            if !i.package.requires.contains_key(kit) {
+                return Err(bad_request(format!("the app {inst} does not require the kit {kit:?}")));
+            }
+        }
         "operation" => {
             let (inst, op) = (p["instance"].as_str().unwrap_or_default(), p["operation"].as_str().unwrap_or_default());
             let ops = crate::operations::list(st, realm, inst).await.map_err(|_| {
@@ -696,6 +708,21 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
         "operation" => {
             let (inst, op) = (p["instance"].as_str().unwrap_or_default(), p["operation"].as_str().unwrap_or_default());
             crate::operations::call(st, &realm, inst, op, &p["input"], &by).await?;
+        }
+        "kit" => {
+            let inst = if a.owner.is_empty() { p["instance"].as_str().unwrap_or_default() } else { a.owner.as_str() };
+            let args = p["args"].as_object().cloned().unwrap_or_default();
+            crate::kitjobs::for_instance(
+                st,
+                &realm,
+                inst,
+                p["kit"].as_str().unwrap_or_default(),
+                p["tool"].as_str().unwrap_or_default(),
+                args,
+                Default::default(),
+                &by,
+            )
+            .await?;
         }
         "notify" => {
             st.notifier.send(crate::notify::Note {

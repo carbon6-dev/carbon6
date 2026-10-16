@@ -473,6 +473,7 @@ fn Apps() -> impl IntoView {
                     let has_settings = i.settings.as_object().is_some_and(|o| !o.is_empty());
                     let by: Vec<String> = i.required_by.iter().filter_map(|b| names.get(b).cloned()).collect();
                     let title = if i.name.is_empty() || i.name == i.package { i.package.clone() } else { format!("{} ({})", i.name, i.package) };
+                    let (prealm, pinst, providers) = (i.realm.clone(), i.name.clone(), i.providers.clone());
                     view! {
                         <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                             <span class="font-medium">{title}</span>
@@ -495,6 +496,7 @@ fn Apps() -> impl IntoView {
                             <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| spawn_local(async move {
                                 done(crate::api::remove_install(id2).await.map(|i| format!("Removing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
                             })>"Remove…"</button>
+                            {(!providers.is_empty()).then(|| view! { <Accounts realm=prealm.clone() instance=pinst.clone() providers=providers.clone() /> })}
                             {move || editing.get().filter(|(e, _)| *e == id3).map(|(_, t)| view! {
                                 <div class="w-full space-y-2 pt-1">
                                     <textarea class=format!("{INPUT} min-h-24 font-mono text-xs") prop:value=t on:input=move |ev| editing.set(Some((id3, event_target_value(&ev))))></textarea>
@@ -550,6 +552,59 @@ fn Apps() -> impl IntoView {
                 <button class=BUTTON on:click=move |_| add(true)>"Add and install…"</button>
             </div>
         </section>
+    }
+}
+
+/// An app's connected accounts (docs/knowledge.md §6.2): connect one per
+/// provider it declares (you sign in there), or disconnect.
+#[component]
+fn Accounts(realm: String, instance: String, providers: Vec<String>) -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let error = RwSignal::new(None::<String>);
+    let (r1, i1) = (realm.clone(), instance.clone());
+    let list = LocalResource::new(move || {
+        tick.track();
+        let (r, i) = (r1.clone(), i1.clone());
+        async move { crate::api::app_accounts(&r, &i).await }
+    });
+    let (r2, i2) = (StoredValue::new(realm), StoredValue::new(instance));
+    view! {
+        <div class="w-full space-y-1 pt-1 text-xs">
+            {move || list.get().and_then(Result::ok).map(|accts| accts.into_iter().map(|a| {
+                let id = a.id.clone();
+                view! {
+                    <div class="flex items-center gap-2">
+                        <span>{format!("{} · {}", a.provider, a.account)}</span>
+                        <button class="underline" on:click=move |_| {
+                            let id = id.clone();
+                            spawn_local(async move {
+                                match crate::api::remove_account(&r2.get_value(), &i2.get_value(), &id).await {
+                                    Ok(()) => tick.update(|t| *t += 1),
+                                    Err(e) => error.set(Some(e)),
+                                }
+                            });
+                        }>"Disconnect"</button>
+                    </div>
+                }
+            }).collect_view())}
+            <div class="flex flex-wrap gap-2">
+                {providers.into_iter().map(|p| {
+                    let label = format!("Connect a {p} account");
+                    view! {
+                        <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                            let p = p.clone();
+                            spawn_local(async move {
+                                match crate::api::connect_account(&r2.get_value(), &i2.get_value(), &p).await {
+                                    Ok(url) => { let _ = window().location().set_href(&url); }
+                                    Err(e) => error.set(Some(e)),
+                                }
+                            });
+                        }>{label}</button>
+                    }
+                }).collect_view()}
+            </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+        </div>
     }
 }
 

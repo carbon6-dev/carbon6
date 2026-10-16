@@ -177,6 +177,15 @@ impl Registry {
         self.conns.lock().unwrap().get(&worker_id).cloned()
     }
 
+    /// Connected workers with a capability (e.g. `kits`), longest connected first.
+    pub fn with_capability(&self, capability: &str) -> Vec<WorkerId> {
+        let conns = self.conns.lock().unwrap();
+        let mut v: Vec<(i64, WorkerId)> =
+            conns.iter().filter(|(_, c)| c.capabilities.iter().any(|x| x == capability)).map(|(id, c)| (c.connected_since, *id)).collect();
+        v.sort();
+        v.into_iter().map(|(_, id)| id).collect()
+    }
+
     /// The connected memex, if any.
     pub fn memex(&self) -> Option<WorkerId> {
         self.conns.lock().unwrap().iter().find(|(_, c)| c.role == "memex").map(|(id, _)| *id)

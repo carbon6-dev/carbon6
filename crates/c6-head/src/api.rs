@@ -30,6 +30,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
         .route("/callback", get(chatgpt_callback))
         .route("/auth/google/callback", get(crate::google::callback))
+        .route("/auth/oauth/callback", get(crate::providers::callback))
         .route("/api/v1/google/client", get(get_google_client).put(put_google_client))
         .route("/api/v1/google/connect", post(google_connect))
         .route("/api/v1/google/accounts", get(google_accounts))
@@ -169,6 +170,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/installs/{id}/settings", get(install_settings).put(put_install_settings))
         .route("/api/v1/realms/{id}/effective/{key}", get(effective_list))
         .route("/api/v1/apps/{realm}/{instance}/operations", get(list_operations))
+        .route("/api/v1/apps/{realm}/{instance}/accounts", get(list_accounts))
+        .route("/api/v1/apps/{realm}/{instance}/accounts/{id}", axum::routing::delete(remove_account))
+        .route("/api/v1/apps/{realm}/{instance}/providers/{provider}/connect", post(connect_account))
         .route("/api/v1/apps/{realm}/{instance}/operations/{name}", post(call_operation))
         .route("/api/v1/installs/{id}", axum::routing::delete(remove_install))
         .route("/api/v1/apps", get(list_apps).post(install_app))
@@ -2721,6 +2725,44 @@ async fn list_operations(
         return Err(crate::not_found("no such realm").into());
     }
     Ok(Json(crate::operations::list(&st, &realm, &instance).await?))
+}
+
+/// The accounts connected for an app's OAuth providers (docs/knowledge.md §6.2).
+async fn list_accounts(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((realm, instance)): Path<(String, String)>,
+) -> ApiResult<Json<Vec<api::OAuthAccount>>> {
+    if caller.realm.is_some() {
+        return Err(crate::forbidden("connecting accounts is yours").into());
+    }
+    Ok(Json(crate::providers::accounts(&st, &realm, &instance).await?))
+}
+
+/// Starts a sign-in to one of an app's providers: where to send you.
+async fn connect_account(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+    Path((realm, instance, provider)): Path<(String, String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if caller.realm.is_some() {
+        return Err(crate::forbidden("connecting accounts is yours").into());
+    }
+    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
+    Ok(Json(serde_json::json!({"authorize_url": crate::providers::connect(&st, &realm, &instance, &provider, origin.as_deref()).await?})))
+}
+
+async fn remove_account(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((realm, instance, id)): Path<(String, String, String)>,
+) -> ApiResult<StatusCode> {
+    if caller.realm.is_some() {
+        return Err(crate::forbidden("connecting accounts is yours").into());
+    }
+    crate::providers::remove(&st, &realm, &instance, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Calls an operation: the app does the work, and who asked is kept with it.

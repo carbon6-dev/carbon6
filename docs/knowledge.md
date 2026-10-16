@@ -177,3 +177,26 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
 - **Elsewhere:** `c6h import-knowledge <memex folder> [--copy]`, with the head stopped, for a memex on another machine (copy its folder over first) or another disk.
 - **Removed:** the `c6m` binary and crate entry, its Homebrew formula, its .deb and systemd unit, `make dev-memex`, and the memex enrollment in Settings. The memex library (`c6-memex`) stays, now linked into `c6h`.
 - **Not yet:** Gmail, Calendar and Contacts still sync from the memex code inside the head; they become apps with step 6.
+
+### 13.3 Kit jobs, allow-lists and OAuth providers (steps 3 and 4)
+
+- **Kit jobs** (`kitjobs.rs`): the head runs a kit tool on a worker with no session and no model. Workers with a container runtime say so (capability `kits`) and answer `kit.job`.
+  - The job runs in a folder of its own under the worker's state, with its inputs written there first, in the sandbox the kit's permissions describe.
+  - What it leaves in `out/` comes back, up to 64 MB.
+  - A first run may build the kit's image; the head allows 35 minutes on top of the run's own limit for that.
+- **Kit output that becomes owned data:** an `out/ingest.json` is kept as the app that ran the job (`app:<name> kit:<kit>.<tool>`), each part checked like any write of that owner:
+  - `records` (by `id`, or by a `key` field's value, else new);
+  - `things`;
+  - knowledge `items`;
+  - `claims`.
+- **Triggers:** the `kit` action, `{instance, kit, tool, args}` (an app's own trigger runs its own app's kit), with the event mapped into `args`.
+- **Operations:** kind `kit` (`{kit, tool, args}`, mapped from the input). The kit must be one the package requires.
+- **Network allow-lists:** a kit's `network` can be `hosts`, with `hosts: [...]`.
+  - Its runs go on an internal container network with no route out. A tinyproxy container sits on that network and on the default bridge, and denies every host but the listed ones (`HTTPS_PROXY` in the run).
+  - The proxy image (`c6kit/egress`, from Alpine) is built on first use.
+  - Tested on Docker Desktop: the listed host is reached and others are refused.
+- **OAuth providers** (`providers.rs`, migration `0044`): a package declares `providers` with `authorize_url`, `token_url`, `scopes`, an optional `userinfo_url` and `account_field`, extra `params`, and the realm secrets that hold your OAuth client (`client_id_secret`, `client_secret_secret`, which must be among the secrets it asks for).
+  - You connect accounts from its entry under Settings → System → Packages.
+  - The head runs the sign-in at `/auth/oauth/callback` and keeps each account's refresh token encrypted (`oauth_accounts`).
+  - Kit jobs get `C6_ACCOUNTS`: a JSON list of `{provider, account, access_token, expires_at}`, refreshed when near expiry, never with the refresh token.
+  - Removing the app forgets its accounts.

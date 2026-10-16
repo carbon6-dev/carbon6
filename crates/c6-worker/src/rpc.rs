@@ -11,6 +11,61 @@ use tokio::process::Command;
 
 use crate::Worker;
 
+/// What a kit job returns, at most (its files, together).
+const MAX_JOB_OUTPUT: u64 = 64 * 1024 * 1024;
+
+/// A kit tool run the head asks for, with no session (docs/knowledge.md
+/// §6.2): in a folder of its own under the worker's state, with `inputs`
+/// written there first; what the run leaves in `out/` comes back.
+async fn kit_job(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let rt = c6_tools::kits::runtime().await.ok_or_else(|| anyhow!("this worker has no container runtime (Docker or Podman)"))?;
+    let spec = &p["spec"];
+    c6_tools::kits::build(&rt, spec).await.map_err(|e| anyhow!(e))?;
+    let dir = worker.state_dir.join("kitjobs").join(uuid::Uuid::now_v7().to_string());
+    tokio::fs::create_dir_all(dir.join("out")).await?;
+    let result = async {
+        for (path, data) in p["inputs"].as_object().into_iter().flatten() {
+            if path.starts_with('/') || path.split('/').any(|s| s == "..") {
+                bail!("{path}: not a path inside the job");
+            }
+            let full = dir.join(path);
+            if let Some(parent) = full.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&full, b64.decode(data.as_str().unwrap_or_default())?).await?;
+        }
+        let command: Vec<String> = serde_json::from_value(p["command"].clone())?;
+        let env: Vec<(String, String)> = serde_json::from_value(p["env"].clone()).unwrap_or_default();
+        let out = c6_tools::kits::sandboxed(&rt, spec, &dir, command, &env, None).await.map_err(|e| anyhow!(e))?;
+        let mut files = serde_json::Map::new();
+        let mut total = 0u64;
+        let mut stack = vec![dir.join("out")];
+        while let Some(d) = stack.pop() {
+            let mut rd = tokio::fs::read_dir(&d).await?;
+            while let Some(e) = rd.next_entry().await? {
+                let path = e.path();
+                if e.file_type().await?.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                total += e.metadata().await?.len();
+                if total > MAX_JOB_OUTPUT {
+                    bail!("the job left more than {} MB in out/", MAX_JOB_OUTPUT / 1024 / 1024);
+                }
+                let rel = path.strip_prefix(dir.join("out"))?.to_string_lossy().into_owned();
+                files.insert(rel, json!(b64.encode(tokio::fs::read(&path).await?)));
+            }
+        }
+        let text = |b: &[u8]| String::from_utf8_lossy(b).chars().rev().take(30_000).collect::<String>().chars().rev().collect::<String>();
+        Ok(json!({"exit": out.status.code(), "stdout": text(&out.stdout), "stderr": text(&out.stderr), "files": files}))
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    result
+}
+
 /// Largest file `fs.read` returns.
 const MAX_READ: u64 = 2 * 1024 * 1024;
 const MAX_LIST: usize = 5000;
@@ -36,6 +91,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
             }
         }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
+        "kit.job" => kit_job(worker, &params).await,
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),

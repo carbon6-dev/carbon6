@@ -340,6 +340,8 @@ pub(crate) async fn remove_instance(st: &HeadState, realm: &str, name: &str) -> 
             crate::series::delete(st, realm, &s.name).await?;
         }
     }
+    // The accounts you connected for it go (their tokens with them).
+    sqlx::query("DELETE FROM oauth_accounts WHERE realm = ? AND instance = ?").bind(realm).bind(name).execute(&st.store.pool).await?;
     // Its claims leave the graph (into history) too (docs/apps.md §9.2).
     if let Err(e) = crate::memex::call_in(st, realm, "memex.claims.retract_owner", json!({"owner": format!("app:{name}")})).await {
         warn!(app = %name, "retracting its claims: {e:#}");

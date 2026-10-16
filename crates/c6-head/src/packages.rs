@@ -63,7 +63,8 @@ pub fn roles(p: &api::AppPackage) -> Vec<String> {
     let mut r = Vec::new();
     let c = &p.contents;
     let owns =
-        !c.collections.is_empty() || !c.series.is_empty() || !c.triggers.is_empty() || !p.settings.is_null() || !p.operations.is_empty();
+        !c.collections.is_empty() || !c.series.is_empty() || !c.triggers.is_empty() || !p.settings.is_null() || !p.operations.is_empty()
+        || !p.providers.is_empty();
     if owns || !p.realm.is_empty() {
         r.push("app".to_owned());
     }
@@ -128,8 +129,14 @@ fn check_manifest(p: &api::AppPackage, files: &BTreeMap<String, Vec<u8>>) -> Vec
     if !matches!(perm.files.as_str(), "session" | "session-ro") {
         problems.push("files is session or session-ro".into());
     }
-    if !matches!(perm.network.as_str(), "none" | "any") {
-        problems.push("network is none or any (allow-lists by host come later)".into());
+    if !matches!(perm.network.as_str(), "none" | "any" | "hosts") {
+        problems.push("network is none, any, or hosts (with the hosts it may reach)".into());
+    }
+    if perm.network == "hosts"
+        && (perm.hosts.is_empty()
+            || perm.hosts.iter().any(|h| h.is_empty() || !h.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')))
+    {
+        problems.push("network hosts lists the host names its runs may reach (like gmail.googleapis.com)".into());
     }
     if !matches!(perm.workers.as_str(), "" | "any" | "dedicated") {
         problems.push("workers is any or dedicated".into());
@@ -166,6 +173,7 @@ fn check_manifest(p: &api::AppPackage, files: &BTreeMap<String, Vec<u8>>) -> Vec
         }
     }
     problems.extend(crate::operations::check(p));
+    problems.extend(crate::providers::check(p));
     if roles(p).is_empty() {
         problems.push("a package has contents (an app or a library), settings, or a kit".into());
     }
@@ -409,6 +417,7 @@ fn install_of(r: &sqlx::sqlite::SqliteRow, packages: &BTreeMap<String, (Vec<Stri
         settings: crate::instances::with_defaults(&manifest.settings, &values),
         reads: serde_json::from_value(approved["reads"].clone()).unwrap_or_default(),
         problems: Vec::new(),
+        providers: manifest.providers.iter().map(|p| p.name.clone()).collect(),
         locks: serde_json::from_str(&r.get::<String, _>("locks")).unwrap_or_default(),
         required_by: serde_json::from_str(&r.get::<String, _>("required_by")).unwrap_or_default(),
         decision: r.get("decision"),
@@ -645,7 +654,12 @@ pub fn permission_lines(p: &api::AppPackage) -> Vec<String> {
     if p.kit.is_some() {
         let files =
             if perm.files == "session-ro" { "Read files in the session's folder" } else { "Read and write files in the session's folder" };
-        let net = if perm.network == "any" { "Reach the network" } else { "No network" };
+        let hosts = format!("Reach only {}", perm.hosts.join(", "));
+        let net = match perm.network.as_str() {
+            "any" => "Reach the network",
+            "hosts" => hosts.as_str(),
+            _ => "No network",
+        };
         let mem =
             if perm.memory_mb >= 1024 { format!("{:.1} GB", perm.memory_mb as f64 / 1024.0) } else { format!("{} MB", perm.memory_mb) };
         let time = if perm.timeout_s >= 60 { format!("{} minutes", perm.timeout_s / 60) } else { format!("{} seconds", perm.timeout_s) };
@@ -697,6 +711,10 @@ fn grown(old: &api::AppPackage, new: &api::AppPackage) -> Vec<String> {
     let mut out = Vec::new();
     if o.network != n.network && n.network == "any" {
         out.push("network access".to_owned());
+    }
+    let more_hosts: Vec<&String> = n.hosts.iter().filter(|h| o.network != "any" && !o.hosts.contains(h)).collect();
+    if n.network == "hosts" && !more_hosts.is_empty() {
+        out.push(format!("reaching {}", more_hosts.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ")));
     }
     if o.files == "session-ro" && n.files == "session" {
         out.push("writing files".to_owned());
@@ -1411,6 +1429,11 @@ pub async fn kit_spec(st: &HeadState, realm: &str, name: &str) -> anyhow::Result
             format!("no kit {name} here (this realm has: {})", names.join(", "))
         }));
     };
+    kit_spec_of(st, kit).await
+}
+
+/// What a worker needs to build and run an installed kit.
+pub async fn kit_spec_of(st: &HeadState, kit: &api::Install) -> anyhow::Result<Value> {
     let all = installs(st).await?;
     let mut builds: Vec<Value> = Vec::new();
     let mut tags: BTreeMap<String, String> = BTreeMap::new();

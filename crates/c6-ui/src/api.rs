@@ -217,6 +217,23 @@ pub fn export_url(realm: &str, instance: &str, fork: &str, data: bool) -> String
     )
 }
 
+/// The accounts connected for an app's OAuth providers.
+pub async fn app_accounts(realm: &str, instance: &str) -> Result<Vec<c6_api::OAuthAccount>, String> {
+    json(Request::get(&format!("/api/v1/apps/{}/{}/accounts", enc(realm), enc(instance))).send().await).await
+}
+
+/// Starts connecting an account: where to send you.
+pub async fn connect_account(realm: &str, instance: &str, provider: &str) -> Result<String, String> {
+    let v: serde_json::Value =
+        send_json(Request::post(&format!("/api/v1/apps/{}/{}/providers/{}/connect", enc(realm), enc(instance), enc(provider))), &serde_json::json!({}))
+            .await?;
+    Ok(v["authorize_url"].as_str().unwrap_or_default().to_owned())
+}
+
+pub async fn remove_account(realm: &str, instance: &str, id: &str) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/apps/{}/{}/accounts/{}", enc(realm), enc(instance), enc(id))).send().await).await
+}
+
 /// An app instance's operations (docs/apps.md §7).
 pub async fn operations(realm: &str, instance: &str) -> Result<Vec<c6_api::Operation>, String> {
     json(Request::get(&format!("/api/v1/apps/{}/{}/operations", enc(realm), enc(instance))).send().await).await

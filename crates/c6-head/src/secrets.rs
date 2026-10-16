@@ -53,6 +53,14 @@ fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A secret's value, if `realm` has it (for a kit job's environment).
+pub async fn value_in(st: &crate::HeadState, realm: &str, name: &str) -> anyhow::Result<Option<String>> {
+    match st.store.secret(name).await? {
+        Some((blob, _, r)) if r == realm => Ok(Some(st.secrets.decrypt(&blob)?)),
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

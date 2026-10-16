@@ -51,8 +51,10 @@ pub fn check(p: &api::AppPackage) -> Vec<String> {
         if !op.template.is_empty() && !templates.contains(&op.template.as_str()) {
             out.push(format!("operation {n} starts {}, which is not among the package's templates", op.template));
         }
-        if op.kit.is_some() {
-            out.push(format!("operation {n}: kit operations are not built yet"));
+        if let Some(k) = &op.kit
+            && !p.requires.contains_key(&k.kit)
+        {
+            out.push(format!("operation {n} runs the kit {}, which the package does not require", k.kit));
         }
         if !matches!(op.stability.as_str(), "" | "published" | "internal") {
             out.push(format!("operation {n}: stability is published or internal"));
@@ -106,7 +108,11 @@ pub async fn call(st: &HeadState, realm: &str, instance: &str, name: &str, input
         let run = crate::templates::run_as(st, &op.template, &text, &[format!("op:{instance}.{name}")], realm, Some(instance)).await?;
         return Ok(json!({"run": run}));
     }
-    Err(bad_request(format!("{instance}.{name}: kit operations are not built yet")))
+    if let Some(k) = &op.kit {
+        let args = crate::triggers::render(&Value::Object(k.args.clone()), &input).as_object().cloned().unwrap_or_default();
+        return crate::kitjobs::for_instance(st, realm, instance, &k.kit, &k.tool, args, Default::default(), &acting).await;
+    }
+    Err(bad_request(format!("{instance}.{name} does nothing")))
 }
 
 async fn write(st: &HeadState, realm: &str, w: &api::OperationWrite, input: &Value, by: &str) -> anyhow::Result<Value> {
