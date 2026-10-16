@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes the Homebrew formulas for c6h, c6w, c6m and c6 from <name>.rb, for
+# Writes the Homebrew formulas for c6h, c6w and c6 from <name>.rb, for
 # the architectures whose files build.sh left in <dir>, downloading from
 # <url base>: file://<dir> for a local tap, the GitHub release for a release.
 #
@@ -16,7 +16,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$formulas"
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
-for pkg in c6h c6w c6m c6; do
+for pkg in c6h c6w c6; do
     sources='' bottles='' arches=()
     for arch in arm64 x86_64; do
         tarball=$dir/$pkg-$version-darwin-$arch.tar.gz

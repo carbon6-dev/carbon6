@@ -85,7 +85,7 @@ The files on a release:
 
 | File | What it is |
 |---|---|
-| `c6h_<v>_amd64.deb`, `_arm64.deb` (and `c6w`, `c6m`, `c6`) | Ubuntu packages with systemd units, for 22.04 and later |
+| `c6h_<v>_amd64.deb`, `_arm64.deb` (and `c6w`, `c6`; `c6m` until 0.2.2, since the memex is part of the head) | Ubuntu packages with systemd units, for 22.04 and later |
 | `carbon6-<v>-linux-amd64.tar.gz`, `-arm64` | the four binaries, for Linux without packages |
 | `c6h-<v>.arm64_big_sur.bottle.tar.gz`, `.big_sur.` (and the others) | Homebrew bottles, Apple Silicon and Intel, for macOS 11 and later |
 | `c6h-<v>-darwin-arm64.tar.gz`, `-x86_64` (and the others) | each binary for macOS without Homebrew; also the formulas' source |
@@ -111,7 +111,7 @@ The files on a release:
 
 ## 9. Open questions
 
-- **Upgrade check across releases.** A release could keep a small `c6h.db` and `memex.db` (`packaging/release/fixtures/<version>/`), and the Release workflow could run `c6h upgrade --check` and `c6m upgrade --check` from the previous release's copies. That catches a migration that breaks upgrades before it ships.
+- **Upgrade check across releases.** A release could keep a small `c6h.db` and `memex.db` (`packaging/release/fixtures/<version>/`), and the Release workflow could run `c6h upgrade --check` from the previous release's copies (and of its knowledge store). That catches a migration that breaks upgrades before it ships.
 - **The commit in `--version` between releases.** Today a build after `0.2.0` reports `0.2.0`. A build script could add `+git<commit>`.
 - **An apt repository.** A signed one, on GitHub Pages, would let `apt upgrade` pick up releases. It needs a signing key in the repository's secrets.
 - **Docker images.** `carbon6/c6h` and `carbon6/c6w` could be pushed to `ghcr.io` by the Release workflow.

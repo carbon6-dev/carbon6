@@ -199,7 +199,7 @@ fn build() -> Vec<Op> {
     let mut v = vec![
         // Fleet.
         op!("workers.list", "fleet", "GET" "/api/v1/workers", Read, Input::None, "Workers and the memex node: name, host, whether connected, sessions running, capabilities."),
-        op!("workers.enrollments.create", "fleet", "POST" "/api/v1/workers/enrollments", Secret, Input::Body(schema::<api::CreateEnrollment>), "Creates a one-time enrollment token for a new worker (c6w enroll <token>) or the memex (c6m enroll <token>); valid for an hour.", secret = &["token"]),
+        op!("workers.enrollments.create", "fleet", "POST" "/api/v1/workers/enrollments", Secret, Input::Body(schema::<api::CreateEnrollment>), "Creates a one-time enrollment token for a new worker (c6w enroll <token>); valid for an hour.", secret = &["token"]),
         op!("workers.revoke", "fleet", "POST" "/api/v1/workers/{id}/revoke", Destructive, Input::None, "Revokes a worker: it is disconnected and can no longer attach; its sessions stop.", choices = &[("id", "workers.list")]),
         op!("workers.delete", "fleet", "DELETE" "/api/v1/workers/{id}", Destructive, Input::None, "Deletes a revoked worker and its records.", choices = &[("id", "workers.list")]),
         op!("workers.fs.list", "fleet", "GET" "/api/v1/workers/{id}/fs/list", Read, Input::Query(any_object), "Lists a folder on a worker: query path (absolute), hidden (bool).", choices = &[("id", "workers.list")]),

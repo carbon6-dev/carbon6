@@ -292,6 +292,11 @@ pub struct CollectionIn {
     /// Its data card (docs/apps.md §8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<DataCard>,
+    /// In a package: made as the realm's, not the app's, for what the app
+    /// hands off (docs/apps.md §10): it stays, and anything in the realm
+    /// writes it, when the app is gone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handoff: bool,
 }
 
 /// A record in a collection.

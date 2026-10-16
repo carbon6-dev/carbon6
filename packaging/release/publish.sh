@@ -44,7 +44,7 @@ if git -C "$work/tap" diff --cached --quiet; then
     echo "$tap already has $version"
 else
     git -C "$work/tap" -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-        commit -q -m "c6h, c6w, c6m and c6 $version"
+        commit -q -m "c6h, c6w and c6 $version"
     git -C "$work/tap" push -q origin HEAD
     echo "Pushed the formulas to $tap"
 fi

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds the c6h, c6w and c6m .deb packages with their systemd units, c6
+# Builds the c6h and c6w .deb packages with their systemd units, c6
 # (the CLI), and carbon6-<version>-linux-<arch>.tar.gz with the four
 # binaries. Runs on Debian/Ubuntu with dpkg-dev and binutils (the docker-deb
 # build stage).
 #
-#   build.sh <dir with c6h, c6w, c6m and c6> <version> <output dir>
+#   build.sh <dir with c6h, c6w and c6> <version> <output dir>
 #
 # Each package is its binary, <pkg>/root (other files as installed, if any)
 # and <pkg>/control, whose
@@ -20,7 +20,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$out"
 
-for pkg in c6h c6w c6m c6; do
+for pkg in c6h c6w c6; do
     src=$here/$pkg
     root=$work/$pkg
     mkdir -p "$root/DEBIAN"
@@ -50,5 +50,5 @@ for pkg in c6h c6w c6m c6; do
 done
 
 # The same four binaries, for Linux without packages.
-tar -czf "$out/carbon6-$version-linux-$arch.tar.gz" -C "$work/plain" c6h c6w c6m c6
+tar -czf "$out/carbon6-$version-linux-$arch.tar.gz" -C "$work/plain" c6h c6w c6
 ls -l "$out"

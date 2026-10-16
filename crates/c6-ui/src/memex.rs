@@ -508,16 +508,7 @@ pub fn MemexSettings() -> impl IntoView {
             }
         }
     });
-    let token = RwSignal::new(None::<String>);
     let note = RwSignal::new(None::<Result<String, String>>);
-    let make_token = move |_| {
-        spawn_local(async move {
-            match api::create_enrollment(Some("memex".into())).await {
-                Ok(e) => token.set(Some(e.token)),
-                Err(e) => note.set(Some(Err(e))),
-            }
-        });
-    };
     let save = move |_| {
         let embedding = (!conn.get_untracked().is_empty())
             .then(|| serde_json::json!({"connection": conn.get_untracked(), "model": model.get_untracked().trim()}));
@@ -556,20 +547,12 @@ pub fn MemexSettings() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Memex"</h2>
-                <p class="text-sm text-zinc-500">"Your knowledge store, a separate service (c6m) on the fabric that can run on any machine. carbon6 sends it what your sessions do (digests, outputs, pages read, memory notes); sessions start with a brief from it about their labels, and agents can search it and save notes. What a session may see is set by scope rules below."</p>
+                <p class="text-sm text-zinc-500">"Your knowledge store, part of the head: items, the graph of things and the claims about them, and search. carbon6 keeps in it what your sessions do (digests, outputs, pages read, memory notes); sessions start with a brief from it about their labels, and agents can search it, save notes and make claims. What a session may see is set by scope rules below."</p>
             </div>
             {move || status.get().and_then(Result::ok).map(|s| if s.connected {
-                view! { <p class="text-sm text-emerald-700 dark:text-emerald-400">{format!("Connected: {} · {} items", s.node.clone().unwrap_or_default(), s.items.values().sum::<u64>())}</p> }.into_any()
+                view! { <p class="text-sm text-emerald-700 dark:text-emerald-400">{format!("{} items", s.items.values().sum::<u64>())}</p> }.into_any()
             } else {
-                view! {
-                    <div class="space-y-2 text-sm">
-                        <p>"Not connected. On the machine that should hold it (this one is fine), with c6m installed:"</p>
-                        <button class=BUTTON_QUIET on:click=make_token>"Create an enrollment token"</button>
-                        {move || token.get().map(|t| view! {
-                            <pre class="select-all overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{format!("c6m enroll {t}\nc6m run")}</pre>
-                        })}
-                    </div>
-                }.into_any()
+                view! { <p class="text-sm text-zinc-500">{s.last_error.clone().unwrap_or_else(|| "Starting.".into())}</p> }.into_any()
             })}
             <div class="grid gap-2 sm:grid-cols-3">
                 <label class="space-y-0.5">

@@ -51,6 +51,16 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Take in a memex's knowledge (the `memex` folder in c6m's state
+    /// folder): the memex is part of the head now. Stop the head first. The
+    /// head does this by itself when c6m ran on this machine.
+    ImportKnowledge {
+        /// The memex folder, e.g. ~/Library/Application Support/c6m/memex.
+        from: PathBuf,
+        /// Copy it rather than move it (another disk).
+        #[arg(long)]
+        copy: bool,
+    },
 }
 
 #[tokio::main]
@@ -108,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(r) => print!("{}", r.text()),
                 None => println!("{}: up to date", path.display()),
             }
+            Ok(())
+        }
+        Command::ImportKnowledge { from, copy } => {
+            println!("{}", c6_head::knowledge::import(&cfg, &from, copy).await?);
             Ok(())
         }
         Command::EnrollToken { name } => {

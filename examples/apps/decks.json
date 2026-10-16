@@ -1,9 +1,11 @@
 {
-  "app": "decks",
-  "version": "1.1.0",
-  "realm": "decks",
-  "description": "Presentation decks from a brief: an outline you approve, a theme you choose, then slides built as HTML, checked by eye and delivered as HTML and PDF.",
-  "needs": {
+  "package": "decks",
+  "version": "1.2.0",
+  "description": "Presentation decks from a brief: an outline you approve, a theme you choose, then slides built as HTML, checked by eye, and handed to you as HTML and PDF. Install it in the realm whose decks they are (home, a business).",
+  "requires": {
+    "decks-render": "^1"
+  },
+  "permissions": {
     "secrets": [],
     "workers": "any",
     "grants": []
@@ -11,8 +13,8 @@
   "contents": {
     "collections": [
       {
-        "name": "decks",
-        "description": "Decks: the brief, the outline, the theme, where it is, and the files.",
+        "name": "jobs",
+        "description": "Decks being made: the brief, the outline, the theme, where the work is, and how far along.",
         "schema": {
           "type": "object",
           "required": [
@@ -61,6 +63,56 @@
               }
             }
           }
+        },
+        "card": {
+          "stability": "internal",
+          "sources": "The decks app, from your brief and your answers to its questions.",
+          "freshness": "as each deck is made"
+        }
+      },
+      {
+        "name": "decks",
+        "description": "Finished decks: what they are about, and their files. Handed to you by the decks app; yours to keep and change.",
+        "handoff": true,
+        "schema": {
+          "type": "object",
+          "required": [
+            "title",
+            "files"
+          ],
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "brief": {
+              "type": "string"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "theme": {
+              "type": "string"
+            },
+            "folder": {
+              "type": "string",
+              "description": "Where its files are made, on the worker"
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "The published files: HTML, PDF, and PowerPoint when asked"
+            },
+            "made_by": {
+              "type": "string",
+              "description": "What made it, e.g. decks 1.2.0"
+            }
+          }
+        },
+        "card": {
+          "sources": "Handed off by the decks app when a deck is delivered.",
+          "freshness": "once per deck"
         }
       },
       {
@@ -86,7 +138,14 @@
         },
         "keys": [
           "name"
-        ]
+        ],
+        "card": {
+          "sources": "Shipped with the decks app; add your own with its add_theme operation.",
+          "invariants": [
+            "each theme's name is unique",
+            "css sets the CSS variables the base CSS uses"
+          ]
+        }
       }
     ],
     "records": {
@@ -138,28 +197,42 @@
     "templates": [
       {
         "name": "deck",
-        "description": "A deck from a brief: outline → theme → build → review → HTML and PDF.",
-        "prompt": "Make a presentation deck from this brief:\n\n{{input}}\n\nUse the skills deck-storyline, deck-design, deck-html, deck-visuals and deck-review. Work in a folder decks/<short-name>/ under the working directory.\n\n1. Add a record to the decks collection (title, brief, audience, stage outlining, folder).\n2. Write the outline (deck-storyline). Ask the user to approve it with decision_request: the outline in the document, options \"Looks good\" and \"Change it\" (they say what in the note), group decks. Then end your turn and wait: the answer comes back as a message. Revise and ask again until they approve. Save the outline in the record.\n3. Read the themes collection. Ask which theme with decision_request (one option per theme, its mood as what it does). Wait for the answer. Set the record's stage to building and its theme.\n4. Build deck.html (deck-html, deck-visuals, deck-design).\n5. Review: render every slide with kit_run (kit decks-render, tool slides, into <folder>/slides) and read each image. Fix what deck-review finds and look again, until every slide passes. Set the stage to reviewing while you do.\n6. Print deck.pdf with kit_run (tool pdf); if the brief asks for PowerPoint, make deck.pptx too (tool pptx). Publish deck.html, deck.pdf (and deck.pptx) with publish_file.\n7. Update the record: stage delivered, the files. Tell the user what you made in two lines."
+        "description": "A deck from a brief: outline → theme → build → review → HTML and PDF, handed to you.",
+        "prompt": "Make a presentation deck from this brief:\n\n{{input}}\n\nUse the skills deck-storyline, deck-design, deck-html, deck-visuals and deck-review. Work in a folder decks/<short-name>/ under the working directory.\n\n1. Add a record to the jobs collection (title, brief, audience, stage outlining, folder).\n2. Write the outline (deck-storyline). Ask the user to approve it with decision_request: the outline in the document, options \"Looks good\" and \"Change it\" (they say what in the note), group decks. Then end your turn and wait: the answer comes back as a message. Revise and ask again until they approve. Save the outline in the record.\n3. Read the themes collection. Ask which theme with decision_request (one option per theme, its mood as what it does). Wait for the answer. Set the record's stage to building and its theme.\n4. Build deck.html (deck-html, deck-visuals, deck-design).\n5. Review: render every slide with kit_run (kit decks-render, tool slides, into <folder>/slides) and read each image. Fix what deck-review finds and look again, until every slide passes. Set the stage to reviewing while you do.\n6. Print deck.pdf with kit_run (tool pdf); if the brief asks for PowerPoint, make deck.pptx too (tool pptx). Publish deck.html, deck.pdf (and deck.pptx) with publish_file.\n7. Update the job: stage delivered, the files. Hand the deck to the user: add a record to the decks collection (title, brief, audience, theme, folder, files, made_by \"decks 1.2.0\"). Tell the user what you made in two lines."
       },
       {
         "name": "deck-revise",
-        "description": "Changes to a delivered deck from notes.",
-        "prompt": "Revise a delivered deck. Its record and the user's notes:\n\n{{input}}\n\nUse the deck skills. Open the deck's folder, change deck.html as the notes ask, review the changed slides (kit_run decks-render, tool slide, then read it; deck-review), print the PDF again (tool pdf), publish both files again (a new version), and update the record."
+        "description": "Changes to a deck from notes: any deck, whether the decks app made it or not.",
+        "prompt": "Revise a deck: one the decks app made, or any deck.html you point at. What to change, and which deck:\n\n{{input}}\n\nUse the deck skills. Open the deck's folder (from its record in the decks collection, or the path given), change deck.html as the notes ask, review the changed slides (kit_run decks-render, tool slide, then read it; deck-review), print the PDF again (tool pdf), publish both files again (a new version), and update its record in the decks collection with the files (add one if it has none)."
       }
     ],
     "views": [
       {
-        "name": "decks",
-        "title": "Decks",
+        "name": "deck-jobs",
+        "title": "Decks being made",
         "kind": "board",
         "group_by": "stage",
         "source": {
-          "collection": "decks"
+          "collection": "jobs"
         },
         "fields": [
           "title",
           "audience",
           "theme"
+        ]
+      },
+      {
+        "name": "decks",
+        "title": "Decks",
+        "kind": "table",
+        "source": {
+          "collection": "decks",
+          "sort": "-updated_at"
+        },
+        "fields": [
+          "title",
+          "audience",
+          "files"
         ],
         "actions": [
           {
@@ -185,11 +258,78 @@
     "memory": [
       {
         "scope": "",
-        "text": "This realm makes presentation decks. Every deck is HTML first (deck.html), checked slide by slide as images from the decks-render kit, and delivered as HTML and PDF (and PowerPoint when asked)."
+        "text": "The decks app makes presentation decks. Every deck is HTML first (deck.html), checked slide by slide as images from the decks-render kit, and delivered as HTML and PDF (and PowerPoint when asked); a finished deck is handed to the user as a record of the decks collection."
       }
     ]
   },
-  "requires": {
-    "decks-render": "^1"
-  }
+  "operations": [
+    {
+      "name": "make",
+      "description": "Make a deck from a brief (it asks you to approve the outline and choose a theme as it goes)",
+      "input": {
+        "type": "object",
+        "required": [
+          "brief"
+        ],
+        "properties": {
+          "brief": {
+            "type": "string",
+            "description": "What the deck is for, who it is for, how long, and anything it must say"
+          }
+        }
+      },
+      "template": "deck"
+    },
+    {
+      "name": "revise",
+      "description": "Change a deck from notes: a deck in the decks collection, or any deck.html",
+      "input": {
+        "type": "object",
+        "required": [
+          "notes"
+        ],
+        "properties": {
+          "deck": {
+            "type": "string",
+            "description": "A record of the decks collection, or a path to a deck.html"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      },
+      "template": "deck-revise"
+    },
+    {
+      "name": "add_theme",
+      "description": "Add a look for decks",
+      "input": {
+        "type": "object",
+        "required": [
+          "name",
+          "css"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "mood": {
+            "type": "string"
+          },
+          "css": {
+            "type": "string",
+            "description": "CSS custom properties over the base CSS"
+          }
+        }
+      },
+      "write": {
+        "collection": "themes",
+        "fields": {
+          "name": "$.name",
+          "mood": "$.mood",
+          "css": "$.css"
+        }
+      }
+    }
+  ]
 }

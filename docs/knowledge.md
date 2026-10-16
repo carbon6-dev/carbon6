@@ -166,3 +166,14 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
 - **Not yet:** parsing and models still run where the memex ran, which is now the head's process. Steps 2 and 6 move them out to kits and system packages.
 - **Deviation: collections stay in `c6h.db`** rather than moving into each realm's knowledge file (§3). Every settings list, the memory notes and the prompts are records of system collections, so moving collections would split the head's own configuration across per-realm files. The record mirror to search is in-process now, so it is synchronous rather than a fabric hop. One store for both is left as a follow-up.
 - **Briefs and memory notes:** with a knowledge store always present, every session gets a brief. Memory notes now always come in the session's Memory section (filtered by their scope), and briefs leave them out instead of repeating them. Before, a scoped note could show in an unrelated session's brief.
+
+### 13.2 Moving an existing memex in, and removing c6m (step 7)
+
+- **On start:** the head looks where `c6m` kept its state on this machine: c6m's usual folder, and `/var/lib/c6m`. A head run from its config file looks; a test head (no file) never does.
+  - If the head's knowledge is still empty and that folder's `memex/` holds knowledge, the folder is moved in as `<data_dir>/knowledge`. It's a rename, so nothing is copied on one disk.
+  - Whatever the head had there is kept aside as `knowledge.before-<time>`.
+  - Memex worker rows are retired, and a follow-up says how to remove `c6m` (`brew services stop c6m && brew uninstall c6m`, or `apt remove c6m`).
+- **While `c6m` runs** (it holds its lock), nothing moves. A follow-up asks you to stop it, and the move happens on the next start.
+- **Elsewhere:** `c6h import-knowledge <memex folder> [--copy]`, with the head stopped, for a memex on another machine (copy its folder over first) or another disk.
+- **Removed:** the `c6m` binary and crate entry, its Homebrew formula, its .deb and systemd unit, `make dev-memex`, and the memex enrollment in Settings. The memex library (`c6-memex`) stays, now linked into `c6h`.
+- **Not yet:** Gmail, Calendar and Contacts still sync from the memex code inside the head; they become apps with step 6.

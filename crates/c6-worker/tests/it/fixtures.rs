@@ -403,6 +403,30 @@ async fn head_fixtures_upgrade_and_serve() {
             assert!(views.as_array().unwrap().iter().any(|v| v["entry"]["name"] == "notes" && v["from"] == "app:notes"), "{name}: {views}");
             let installs = get("installs").await;
             assert!(installs.as_array().unwrap().iter().any(|i| i["name"] == "notes" && i["realm"] == realm), "{name}: {installs}");
+            // An app in the realm it was given is offered a move; moved to
+            // home, its records come along, with their history.
+            if realm == "notes" {
+                let ds = get("decisions?state=open").await;
+                let d = ds
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["title"] == "Move notes out of its own realm?")
+                    .unwrap_or_else(|| panic!("{name}: {ds}"));
+                let r = reqwest::Client::new()
+                    .post(format!("{api}/decisions/{}/answer", d["id"]))
+                    .json(&json!({"option": "Move it", "values": {"realm": "home"}}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(r.status().is_success(), "{name}: {}", r.text().await.unwrap());
+                let recs = get("collections/notes/records?realm=home").await;
+                assert_eq!(recs["records"][0]["fields"]["text"], "first", "{name}: {recs}");
+                assert!(recs["records"][0]["derived_from"].to_string().contains("record:notes/notes/"), "{name}: {recs}");
+                let installs = get("installs").await;
+                assert!(installs.as_array().unwrap().iter().any(|i| i["name"] == "notes" && i["realm"] == "home"), "{name}: {installs}");
+                assert!(!installs.as_array().unwrap().iter().any(|i| i["realm"] == "notes"), "{name}: {installs}");
+            }
         }
         // Grants (from version 33 on).
         if name.as_str() >= "c6h-v0033.db" {

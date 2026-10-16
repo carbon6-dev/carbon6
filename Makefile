@@ -40,7 +40,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test brew-dist brew brew-install brew-test release release-notes \
-        ui build test check dev-head dev-token dev-login-link dev-worker dev-memex clean \
+        ui build test check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
 help: ## Show this help
@@ -87,7 +87,7 @@ docker-login-link: ## Print a one-time web UI login link from the running head c
 
 ##@ Ubuntu packages (Docker only)
 
-docker-deb: ## Build .deb packages of c6h, c6w and c6m (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=22.04; they install on later releases too)
+docker-deb: ## Build .deb packages of c6h and c6w (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=22.04; they install on later releases too)
 	rm -f $(DEB_DIR)/*_$(ARCH).deb $(DEB_DIR)/*-linux-$(ARCH).tar.gz
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
 	@ls -l $(DEB_DIR)
@@ -97,13 +97,13 @@ docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubu
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
 	@ls -l $(DEB_DIR)
 
-docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, worker and memex attach, c6 sees the worker, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
+docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, the worker attaches, c6 sees it, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) .
 	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) $(DEB_DIR) $(ARCH)
 
 ##@ Homebrew (macOS, local toolchain)
 
-brew-dist: build ## Build bottles and formulas of c6h, c6w, c6m (as brew services) and c6 for this Mac's architecture into dist/brew/
+brew-dist: build ## Build bottles and formulas of c6h, c6w (as brew services) and c6 for this Mac's architecture into dist/brew/
 	rm -rf $(BREW_DIR)
 	packaging/brew/build.sh target/release $(BREW_VERSION) $(BREW_DIR)
 	packaging/brew/formulas.sh $(BREW_VERSION) $(BREW_DIR) file://$(abspath $(BREW_DIR)) $(BREW_DIR)/Formula
@@ -113,8 +113,8 @@ brew: brew-dist ## brew-dist, then add the formulas to the local tap carbon6/loc
 	test -d "$$tap" || $(BREW_ENV) $(BREW) tap-new --no-git $(BREW_TAP); \
 	mkdir -p "$$tap/Formula" && cp $(BREW_DIR)/Formula/*.rb "$$tap/Formula/" && echo "Formulas in $$tap/Formula"
 
-brew-install: brew ## Install or upgrade c6h, c6w, c6m and c6 from the local tap, and restart those of their services that are running
-	@for f in c6h c6w c6m c6; do \
+brew-install: brew ## Install or upgrade c6h, c6w and c6 from the local tap, and restart those of their services that are running
+	@for f in c6h c6w c6; do \
 		if $(BREW) list --versions $$f >/dev/null; then $(BREW_ENV) $(BREW) reinstall $(BREW_TAP)/$$f; \
 		else $(BREW_ENV) $(BREW) install $(BREW_TAP)/$$f; fi || exit 1; \
 	done
@@ -122,7 +122,7 @@ brew-install: brew ## Install or upgrade c6h, c6w, c6m and c6 from the local tap
 		$(BREW) services restart $$f; \
 	done
 
-brew-test: brew-dist ## Install the formulas from a scratch tap and run them: head as a brew service, worker and memex attach, c6 sees them, SIGTERM stops them (refuses if c6h etc. are installed)
+brew-test: brew-dist ## Install the formulas from a scratch tap and run them: head as a brew service, the worker attaches, c6 sees it, SIGTERM stops it (refuses if c6h etc. are installed)
 	packaging/brew/smoke-test.sh $(BREW_DIR)/Formula
 
 ##@ Releases
@@ -163,10 +163,6 @@ dev-login-link: ## Print a one-time web UI login link for the dev head
 dev-worker: ## Run the dev worker (pass TOKEN=... to enroll it first)
 	@if [ -n "$(TOKEN)" ]; then cargo run -p c6w -- enroll --force "$(TOKEN)"; fi
 	cargo run -p c6w -- run
-
-dev-memex: ## Run the dev memex (pass TOKEN=... from Settings → Memex to enroll it first)
-	@if [ -n "$(TOKEN)" ]; then cargo run -p c6m -- enroll --force "$(TOKEN)"; fi
-	cargo run -p c6m -- run
 
 clean: ## Remove build outputs (target/, site/target/, dist/, crates/c6-ui/dist)
 	cargo clean

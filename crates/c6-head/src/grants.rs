@@ -310,6 +310,7 @@ async fn snapshot(st: &HeadState, g: &api::Grant) -> anyhow::Result<()> {
             schema: Some(source.schema.clone()),
             keys: Some(Vec::new()),
             card: Some(source.card.clone()),
+            handoff: false,
         };
         crate::collections::create(st, &g.to_realm, &c, &format!("grant:{}", g.id), false).await?;
     }

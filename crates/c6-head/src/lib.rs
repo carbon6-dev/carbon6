@@ -231,12 +231,16 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     let mut tasks = JoinSet::new();
 
     // The knowledge graph is the head's (docs/knowledge.md).
-    knowledge::open(&state).await?;
+    knowledge::open(&state, cfg.memex_dirs.as_deref().unwrap_or_default()).await?;
 
     // Apps installed before instances read their code from their package
     // from now on (docs/apps.md §14).
     if let Err(e) = apps::adopt(&state).await {
         tracing::warn!("adopting apps installed before instances: {e:#}");
+    }
+    // And each is offered a move out of the realm it was given.
+    if let Err(e) = apps::offer_moves(&state).await {
+        tracing::warn!("offering to move apps out of their own realms: {e:#}");
     }
 
     // Scheduled automations.

@@ -4,7 +4,7 @@ An AI coding-agent harness for running agents on many machines from one place.
 
 - **`c6h`** (head) runs centrally. It owns all configuration, credentials and session data, and serves the web UI.
 - **`c6w`** (worker) runs headless on each dev machine (macOS or Linux). It attaches to the head and runs agent sessions there.
-- **`c6m`** (memex), optional, is a knowledge store for your sessions, documents, mail and photos, attached to the head like a worker.
+- The **memex**, your knowledge store for sessions, documents, mail and photos, is part of the head ([docs/knowledge.md](docs/knowledge.md)). A `c6m` you ran beside it before moves its knowledge in when the head first starts with `c6m` stopped (or with `c6h import-knowledge <folder>`).
 - **`c6`** is the command line, for scripts and terminals.
 
 See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs/architecture.md).
@@ -60,20 +60,18 @@ make docker-token      # an enrollment token from that head
 - `make docker-images` builds the `carbon6/c6h` and `carbon6/c6w` runtime images.
 - Docker produces Linux binaries only. A worker on a Mac needs a native `c6w`, built with the local toolchain below.
 
-**Ubuntu packages.** `make docker-deb` builds `c6h`, `c6w` and `c6m` `.deb` packages with their systemd units, and `c6` (the CLI), into `dist/deb/ubuntu-22.04/`. Built on 22.04, they install on 22.04 and every later release (24.04, 26.04, ...); set `UBUNTU=` to build on another. `make docker-deb-all` builds amd64 and arm64. `make docker-deb-test` installs them in an Ubuntu container under systemd and checks the services (`ARCH=amd64` on an arm64 machine tests the emulated one). After `sudo apt install ./c6h_*.deb` (and so on):
+**Ubuntu packages.** `make docker-deb` builds `c6h` and `c6w` `.deb` packages with their systemd units, and `c6` (the CLI), into `dist/deb/ubuntu-22.04/`. Built on 22.04, they install on 22.04 and every later release (24.04, 26.04, ...); set `UBUNTU=` to build on another. `make docker-deb-all` builds amd64 and arm64. `make docker-deb-test` installs them in an Ubuntu container under systemd and checks the services (`ARCH=amd64` on an arm64 machine tests the emulated one). After `sudo apt install ./c6h_*.deb` (and so on):
 
 - **`c6h`** runs as the `c6h` service (user `c6h`) and starts on install. Its config is `/etc/c6h/c6h.toml`, its state `/var/lib/c6h`. Run admin commands as that user: `sudo -u c6h c6h --config /etc/c6h/c6h.toml login-link` (or `enroll-token`, `api-token`).
 - **`c6w`** runs as a user, since sessions work on that user's files. Enroll as that user (`c6w enroll <token>`), then either `sudo systemctl enable --now c6w@$USER` (from boot) or `systemctl --user enable --now c6w` (in your user session). It starts through a login shell, so sessions get your `PATH`.
-- **`c6m`** runs as the `c6m` service (user `c6m`, state in `/var/lib/c6m`) once enrolled: `sudo -u c6m c6m --state-dir /var/lib/c6m enroll <token>`, then `sudo systemctl enable --now c6m`.
 - **`c6`** is the command line, for any machine that reaches the head: `c6 login <url> --token <token>` with a token from `c6h api-token`.
-- Logs: `journalctl -u c6h` (or `c6w@<user>`, `c6m`). Upgrading a package restarts its services; removing one keeps its data.
+- Logs: `journalctl -u c6h` (or `c6w@<user>`). Upgrading a package restarts its services; removing one keeps its data.
 
-**Homebrew (macOS).** `make brew` builds bottles and formulas of `c6h`, `c6w`, `c6m` and `c6` for this Mac's architecture into `dist/brew/` (with the local toolchain) and adds them to a local tap, `carbon6/local`. `make brew-install` installs or upgrades them from it and restarts their running services. Bottles need neither Xcode nor the Command Line Tools to install, and work on macOS 11 and later. The services run as you, under launchd:
+**Homebrew (macOS).** `make brew` builds bottles and formulas of `c6h`, `c6w` and `c6` for this Mac's architecture into `dist/brew/` (with the local toolchain) and adds them to a local tap, `carbon6/local`. `make brew-install` installs or upgrades them from it and restarts their running services. Bottles need neither Xcode nor the Command Line Tools to install, and work on macOS 11 and later. The services run as you, under launchd:
 
 - **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h --config $(brew --prefix)/etc/c6h/c6h.toml login-link`.
 - **`c6w`:** `c6w enroll <token>`, then `brew services start c6w`. It starts through a login shell, so sessions get your `PATH`.
-- **`c6m`:** `c6m enroll <token>`, then `brew services start c6m`.
-- Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`, `c6m.log`). The worker and memex keep the standard state folders (`~/Library/Application Support/c6w`, `c6m`), the same ones `make dev-worker` and `make dev-memex` use.
+- Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`). The worker keeps the standard state folder (`~/Library/Application Support/c6w`), the same one `make dev-worker` uses.
 - `make brew-test` installs the bottles from a scratch tap and runs them, as the Release workflow does, then removes them.
 
 **CI and releases.** GitHub Actions runs the tests on Linux and macOS for every push to `main` and every pull request. `make release BUMP=patch|minor|major` bumps the version, adds the commits since the last release to `CHANGELOG.md`, commits, tags and pushes. The tag's Release workflow tests, builds the .debs (amd64, arm64) and bottles (Apple Silicon, Intel), smoke-tests them, and publishes the GitHub release and the Homebrew tap. See [docs/releases.md](docs/releases.md).
@@ -184,12 +182,12 @@ Collections are typed tables of records in a realm, for anything apps and agents
 
 ### Upgrades
 
-A new version of carbon6 upgrades its databases when it starts: the head's (`c6h.db`) and the memex's (`memex.db`). Workers' journals need no upgrading.
+A new version of carbon6 upgrades its databases when it starts: the head's (`c6h.db`) and its knowledge's (`knowledge/memex.db`, one per realm). Workers' journals need no upgrading.
 
 - **A backup first:** the database is copied to `backups/` next to it, named with the versions and the time, before anything changes. Backups are kept until you delete them.
 - **All or nothing:** if a step fails, or a check finds data missing afterwards, the backup is put back and carbon6 refuses to start, saying why. The database is as it was, so the previous version still runs on it.
 - **Nothing lost silently:** every table must keep its rows, unless the upgrade says it moves or removes them.
-- **Try it first:** `c6h upgrade --check` (and `c6m upgrade --check`) upgrades a copy and prints what would change, leaving your database untouched. `c6h upgrade` upgrades without starting the head.
+- **Try it first:** `c6h upgrade --check` upgrades a copy and prints what would change, leaving your database untouched. `c6h upgrade` upgrades without starting the head.
 - **History:** **Settings → System** lists each upgrade with what changed and where its backup is.
 - **Going back:** stop carbon6 and put the backup in place of the database.
 
@@ -234,21 +232,21 @@ Policies (**Settings → Policies**) are rules for the agent's tool calls in ses
 
 ### Memex
 
-The memex is your knowledge store: a separate service, `c6m`, on the same fabric as the workers. It can run on any machine (this one is fine). Its design, and what comes next (documents and papers, Gmail, calendar and contacts, photos and videos), is in [docs/memex.md](docs/memex.md).
+The memex is your knowledge store, part of the head: items, a graph of things with the claims made about them, and search, one database per realm under the head's `knowledge/` folder. Its design, and what comes next (documents and papers, Gmail, calendar and contacts, photos and videos), is in [docs/memex.md](docs/memex.md).
 
-- **Connecting one:** **Settings → Memex → Create an enrollment token**, then on the machine that should hold it, `c6m enroll <token>` and `c6m run`. It keeps its store under its state folder.
+- **Claims:** every link in the graph is a claim with an owner (you, an app, the realm's agents, or a program such as the mail sync). Anyone may add their own and only the owner retracts it; each realm's reader policies (**Settings → claim_policies**) say whose to believe, yours first by default. See [docs/apps.md](docs/apps.md) §9.
 - **carbon6 → memex:**
   - every session's digest (what was asked, what tools did, what it concluded);
   - published outputs;
   - pages your agents read with the browser or web fetch;
   - your memory notes.
 
-  Each comes with the session's labels, which become things in the memex's graph (`client:acme`, `host:web1`, `repo:…`). Updates queue on the head while no memex is connected.
+  Each comes with the session's labels, which become things in the memex's graph (`client:acme`, `host:web1`, `repo:…`). Updates queue on the head until the knowledge store takes them.
 - **memex → carbon6:**
-  - **Briefs:** a new session starts with a brief from the memex about its labels and its first message (notes, recent sessions about the same things, what else matches), in place of the memory section.
+  - **Briefs:** a new session starts with a brief from the memex about its labels and its first message (recent sessions about the same things, facts, what else matches), after its memory notes.
   - **Tools:** agents get `memex_search` (keywords and meaning), `memex_get` (an item in full, or a thing with its notes, items and related things) and `memex_note`.
 - **@-mentions:** typing `@` in a message also offers things from the memex (people, clients, hosts, topics); `@memex:client:acme` attaches what the memex knows about it to the message.
-- **Documents and papers:** add files on the Memex page (**Add files**) or keep folders in sync (**Settings → Memex folders**, on the memex's machine).
+- **Documents and papers:** add files on the Memex page (**Add files**) or keep folders in sync (**Settings → Memex folders**, on the head's machine).
 - **Bringing in data from other tools:** `memex.ingest` (on `POST /api/v1/memex/rpc`, with an API token) takes batches of items typed by MIME type: mail as `message/rfc822` (an old archive, for example), and documents as PDF, Word, Markdown, text or HTML. Each item comes back created, updated, duplicate or rejected with the reason. `memex.types` lists what each type accepts. Imported mail is threaded and searchable like synced mail, is never written back to Gmail, and becomes the synced copy if Gmail later has the same message. Design: [docs/memex.md](docs/memex.md) §4.5.
   - **Formats:** PDF, Word (.docx), Markdown, HTML and text are read.
   - **Papers** are recognized, with their title, authors, DOI or arXiv id, and the papers they cite. Cited papers become things too, so the memex holds a citation graph. For example, a paper's page lists the papers in your memex that cite it.
@@ -259,7 +257,7 @@ The memex is your knowledge store: a separate service, `c6m`, on the same fabric
 
 ### Mail, calendar and contacts
 
-With a memex connected, carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**).
+carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**).
 
 - **Setup** (**Settings → Mail & calendar**):
   - Create an OAuth client in your Google Cloud project (Web application, with the redirect URI shown).
@@ -267,7 +265,7 @@ With a memex connected, carbon6 is a client for your Gmail and Google Workspace 
   - Set the app to "In production", or "Internal" for Workspace.
   - Paste the client ID and secret, then **Add Google account**.
 
-  The head keeps the sign-in encrypted; the memex gets short-lived access only.
+  The head keeps the sign-in encrypted; the sync gets short-lived access only.
 - **Mail:**
   - **Import:** your whole mailbox is imported, newest first and resumable, then kept in sync every minute. Labels, read state, archive and drafts sync both ways.
   - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
@@ -539,7 +537,6 @@ The search box in the header (⌘K) searches every message, tool call, tool outp
 make dev-head                     # head on all interfaces using dev/c6h.toml; state in the standard data directory
 make dev-token                    # prints a token
 make dev-worker TOKEN=c6e1.…      # enrolls and runs a worker against it (later: just make dev-worker)
-make dev-memex TOKEN=c6e1.…       # enrolls and runs the memex (token from Settings → Memex; later: just make dev-memex)
 make dev-login-link               # a one-time link to sign in to the dev UI
 ```
 

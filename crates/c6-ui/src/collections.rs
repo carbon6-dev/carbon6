@@ -180,6 +180,7 @@ fn NewCollection(done: Callback<()>) -> impl IntoView {
             schema: Some(schema),
             keys: Some(keys.get_untracked().split(',').map(|k| k.trim().to_owned()).filter(|k| !k.is_empty()).collect()),
             card: None,
+            handoff: false,
         };
         spawn_local(async move {
             match api::create_collection(c).await {

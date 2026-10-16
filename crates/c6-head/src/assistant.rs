@@ -729,9 +729,7 @@ fn secret_title(op: &Op, field: &str) -> String {
 
 fn secret_note(op: &Op) -> &'static str {
     match op.name {
-        "workers.enrollments.create" => {
-            "On the new machine: c6w enroll <token> then c6w run (a worker), or c6m enroll <token> then c6m run (the memex). One use, valid for an hour."
-        }
+        "workers.enrollments.create" => "On the new machine: c6w enroll <token> then c6w run. One use, valid for an hour.",
         "auth.tokens.create" => "For the c6 CLI or a script (Authorization: Bearer <token>). Copy it now: it is not shown again.",
         "auth.codes.create" => "Enter it on the other device's sign-in page. Valid for a few minutes.",
         "triggers.rotate" => "The old URL no longer works.",

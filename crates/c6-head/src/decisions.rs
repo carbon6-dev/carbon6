@@ -328,7 +328,7 @@ async fn act(
             crate::collections::answer_force(st, d, option).await?;
         }
         (Some("app" | "package"), Some(_), Some(_)) => {
-            crate::packages::answer(st, reference, option).await?;
+            crate::packages::answer(st, reference, option, values).await?;
         }
         (Some("publish"), _, _) => {
             crate::commons::answer(st, d, option == Some("Publish")).await?;

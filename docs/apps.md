@@ -382,3 +382,17 @@ Settled since the first version: mail, calendar and contacts are in the realm wh
 - **Removing an app** retracts its claims.
 - **The explorer** shows a thing's claims with their owners, and whether the realm believes each.
 - **Not yet:** policies with conditions (a confidence threshold), briefs applying policies, and edges into other realms through grants.
+
+### 18.5 Moving what's installed (step 7)
+
+- **Apps in a realm made for them** (before instances) are each offered a move, once: "Move it", with the realm to move into, or "Keep it where it is".
+  - Moving installs it in the chosen realm and copies what it owns: records get new ids and keep their fields, their history and `derived_from` (`record:<old realm>/<collection>/<id>`), and series keep their points.
+  - It is then removed from where it was; that realm keeps its sessions and is yours to delete.
+  - Its webhook triggers get new URLs.
+- **Hand-off collections:** a package's collection with `handoff: true` is made as the realm's, not the app's. It stays, and anything in the realm writes it, after the app is gone.
+- **decks 1.2.0** (`examples/apps/decks.json`): no realm of its own, so it installs in home by default. It has:
+  - `jobs`: internal, the decks being made;
+  - `decks`: handed off, finished decks with their files;
+  - `themes`: published, with an `add_theme` write operation;
+  - `make` and `revise` template operations. `revise` takes any deck file.
+- **Libraries** have been instances with no collections since step 1.

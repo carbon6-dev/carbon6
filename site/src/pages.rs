@@ -150,7 +150,7 @@ fn Code(#[prop(into)] lines: Vec<String>, #[prop(optional, into)] label: Option<
 
 const ARCHITECTURE: &str = r##"<svg viewBox="0 0 720 300" role="img" aria-labelledby="arch-title arch-desc">
 <title id="arch-title">How carbon6 fits together</title>
-<desc id="arch-desc">A browser or the c6 command line reaches the head, c6h. Workers (c6w) on a laptop, a dev box and a build server, and the memex (c6m), connect out to the head.</desc>
+<desc id="arch-desc">A browser or the c6 command line reaches the head, c6h. Workers (c6w) on a laptop, a dev box and a build server connect out to the head, which also keeps the knowledge graph.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="d-arrow"/></marker></defs>
 <g class="d-lines">
 <path d="M190 100 L272 124" marker-end="url(#arrow)"/>
@@ -158,16 +158,14 @@ const ARCHITECTURE: &str = r##"<svg viewBox="0 0 720 300" role="img" aria-labell
 <path d="M530 48 L448 104" marker-end="url(#arrow)"/>
 <path d="M530 114 L448 134" marker-end="url(#arrow)"/>
 <path d="M530 180 L448 164" marker-end="url(#arrow)"/>
-<path d="M530 252 L448 196" marker-end="url(#arrow)" class="d-dashed"/>
 </g>
 <g class="d-box"><rect x="20" y="70" width="170" height="60" rx="10"/><text x="38" y="96" class="d-title d-plain">browser, phone</text><text x="38" y="116" class="d-sub">the web UI, passkeys</text></g>
 <g class="d-box"><rect x="20" y="170" width="170" height="60" rx="10"/><text x="38" y="196" class="d-title">c6</text><text x="38" y="216" class="d-sub">CLI, scripts, API tokens</text></g>
-<g class="d-head"><rect x="275" y="50" width="170" height="200" rx="14"/><text x="295" y="84" class="d-title d-big">c6h</text><text x="295" y="106" class="d-sub">the head</text><line x1="295" y1="122" x2="425" y2="122"/>
-<text x="295" y="150" class="d-sub">web UI and API</text><text x="295" y="174" class="d-sub">settings, secrets</text><text x="295" y="198" class="d-sub">every session's log</text><text x="295" y="222" class="d-sub">automations, approvals</text></g>
+<g class="d-head"><rect x="275" y="40" width="170" height="230" rx="14"/><text x="295" y="84" class="d-title d-big">c6h</text><text x="295" y="106" class="d-sub">the head</text><line x1="295" y1="122" x2="425" y2="122"/>
+<text x="295" y="150" class="d-sub">web UI and API</text><text x="295" y="174" class="d-sub">settings, secrets</text><text x="295" y="198" class="d-sub">every session's log</text><text x="295" y="222" class="d-sub">automations, approvals</text><text x="295" y="246" class="d-sub">the knowledge graph</text></g>
 <g class="d-box"><rect x="530" y="24" width="170" height="48" rx="10"/><text x="546" y="45" class="d-title">c6w</text><text x="546" y="62" class="d-sub">your laptop · macOS</text></g>
 <g class="d-box"><rect x="530" y="90" width="170" height="48" rx="10"/><text x="546" y="111" class="d-title">c6w</text><text x="546" y="128" class="d-sub">a dev box · Linux</text></g>
 <g class="d-box"><rect x="530" y="156" width="170" height="48" rx="10"/><text x="546" y="177" class="d-title">c6w</text><text x="546" y="194" class="d-sub">a build server</text></g>
-<g class="d-box d-optional"><rect x="530" y="228" width="170" height="48" rx="10"/><text x="546" y="249" class="d-title">c6m</text><text x="546" y="266" class="d-sub">memex · knowledge graph</text></g>
 </svg>"##;
 
 /// A reason carbon6 multiplies what you get done: what it removes, and the
@@ -313,15 +311,11 @@ fn Home() -> impl IntoView {
                 <div class="parts">
                     <div class="part">
                         <h3><code>"c6h"</code>" the head"</h3>
-                        <p>"Runs in one place. It owns all configuration, credentials and session data, and serves the web UI."</p>
+                        <p>"Runs in one place. It owns all configuration, credentials and session data, keeps the knowledge graph (sessions, documents, mail and photos), and serves the web UI."</p>
                     </div>
                     <div class="part">
                         <h3><code>"c6w"</code>" a worker"</h3>
                         <p>"Runs headless on each dev machine, macOS or Linux, and runs agent sessions there."</p>
-                    </div>
-                    <div class="part">
-                        <h3><code>"c6m"</code>" the memex"</h3>
-                        <p>"The knowledge graph: sessions, documents, mail and photos, attached like a worker."</p>
                     </div>
                     <div class="part">
                         <h3><code>"c6"</code>" the CLI"</h3>
@@ -421,7 +415,6 @@ fn Install() -> impl IntoView {
                     <li>"The head's config is " <code>"$(brew --prefix)/etc/c6h/c6h.toml"</code> " (kept across upgrades), its data " <code>"$(brew --prefix)/var/c6h"</code> "."</li>
                     <li>"Sign in with " <code>"c6h --config $(brew --prefix)/etc/c6h/c6h.toml login-link"</code> "."</li>
                     <li>"A worker: " <code>"c6w enroll <token>"</code> ", then " <code>"brew services start c6w"</code> ". It starts through a login shell, so sessions get your " <code>"PATH"</code> "."</li>
-                    <li>"The memex: " <code>"brew install c6m"</code> ", " <code>"c6m enroll <token>"</code> ", then " <code>"brew services start c6m"</code> "."</li>
                     <li>"Logs are in " <code>"$(brew --prefix)/var/log/"</code> ". " <code>"brew upgrade"</code> " upgrades them."</li>
                 </ul>
 
@@ -444,11 +437,6 @@ fn Install() -> impl IntoView {
                         " (" <code>{format!("c6w_{v}_$arch.deb")}</code> ") runs as you, since sessions work on your files: "
                         <code>"c6w enroll <token>"</code> ", then " <code>"sudo systemctl enable --now c6w@$USER"</code>
                         " to start at boot, or " <code>"systemctl --user enable --now c6w"</code> " for your session."
-                    </li>
-                    <li>
-                        <strong>"c6m"</strong>
-                        " (" <code>{format!("c6m_{v}_$arch.deb")}</code> "): " <code>"sudo -u c6m c6m --state-dir /var/lib/c6m enroll <token>"</code>
-                        ", then " <code>"sudo systemctl enable --now c6m"</code> "."
                     </li>
                     <li><strong>"c6"</strong> " (" <code>{format!("c6_{v}_$arch.deb")}</code> "), the command line, on any machine that reaches the head."</li>
                     <li>"Logs: " <code>"journalctl -u c6h"</code> ". Installing a newer package restarts its services; removing one keeps its data."</li>

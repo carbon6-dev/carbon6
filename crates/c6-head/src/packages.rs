@@ -903,7 +903,7 @@ async fn ask(st: &HeadState, id: i64, what: &str, title: &str, document: &str, o
 
 /// Your answer to an install, upgrade or removal (decision `package:<what>:<id>`,
 /// or `app:<what>:<realm>` from before packages).
-pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>) -> anyhow::Result<()> {
+pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>, values: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
     let mut parts = reference.splitn(3, ':');
     let (kind, what, key) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let id = match kind {
@@ -913,6 +913,9 @@ pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>) -> an
     };
     if what == "adopt" {
         return crate::apps::answer_adopt(st, id, option).await;
+    }
+    if what == "move" {
+        return crate::apps::answer_move(st, id, option, values).await;
     }
     let r = row(st, id).await?;
     let pending: Value = r.get::<Option<String>, _>("pending").and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);

@@ -105,11 +105,20 @@ pub(crate) fn contents_lines(p: &api::AppPackage) -> Vec<String> {
 /// as the instance. Its other code (skills, templates, views, …) is read
 /// from its package wherever it applies, so nothing of it is copied.
 pub(crate) async fn apply_instance(st: &HeadState, realm: &str, name: &str, p: &api::AppPackage) -> anyhow::Result<()> {
+    apply_instance_seeded(st, realm, name, p, true).await
+}
+
+async fn apply_instance_seeded(st: &HeadState, realm: &str, name: &str, p: &api::AppPackage, seed: bool) -> anyhow::Result<()> {
     let c = &p.contents;
     let by = format!("app:{name}");
     for col in &c.collections {
         match crate::collections::get(st, realm, &col.name).await {
             Ok(existing) if existing.owner == name => {}
+            // What it hands off is the realm's: one already there is used.
+            Ok(existing) if col.handoff && existing.owner.is_empty() => {}
+            Err(_) if col.handoff => {
+                crate::collections::create_owned(st, realm, col, &by, false, "").await?;
+            }
             Ok(existing) => {
                 return Err(bad_request(format!(
                     "realm {realm} already has a collection {} ({})",
@@ -132,7 +141,7 @@ pub(crate) async fn apply_instance(st: &HeadState, realm: &str, name: &str, p: &
             serde_json::from_value(crate::instances::fill_settings(&json!(t), &crate::instances::with_defaults(&p.settings, &json!({}))))?;
         crate::triggers::create_owned(st, filled, realm, name).await?;
     }
-    for (col, recs) in &c.records {
+    for (col, recs) in c.records.iter().filter(|_| seed) {
         for fields in recs {
             let rec = api::RecordIn { fields: fields.clone(), ..Default::default() };
             crate::collections::put(st, realm, col, None, &rec, &by).await?;
@@ -150,6 +159,7 @@ pub(crate) async fn clashes(st: &HeadState, realm: &str, name: &str, p: &api::Ap
     for col in &p.contents.collections {
         if let Ok(c) = crate::collections::get(st, realm, &col.name).await
             && c.owner != name
+            && !(col.handoff && c.owner.is_empty())
         {
             out.push(format!(
                 "realm {realm} already has a collection {} ({}): install it in another realm",
@@ -190,7 +200,7 @@ pub(crate) fn code_changes(old: &api::AppPackage, new: &api::AppPackage) -> Vec<
 /// there: those need a migration, so the upgrade can't go ahead as it is.
 pub(crate) async fn migration_problems(st: &HeadState, realm: &str, name: &str, new: &api::AppPackage) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
-    for col in &new.contents.collections {
+    for col in new.contents.collections.iter().filter(|c| !c.handoff) {
         let Ok(cur) = crate::collections::get(st, realm, &col.name).await else { continue };
         if cur.owner != name {
             out.push(format!("realm {realm} has a collection {} that is not {name}'s", col.name));
@@ -232,6 +242,11 @@ pub(crate) async fn apply_instance_upgrade(
     let by = format!("app:{name}");
     for col in &new.contents.collections {
         match crate::collections::get(st, realm, &col.name).await {
+            // The realm's (handed off): the app no longer changes it.
+            Ok(cur) if col.handoff && cur.owner.is_empty() => {}
+            Err(_) if col.handoff => {
+                crate::collections::create_owned(st, realm, col, &by, false, "").await?;
+            }
             Ok(cur) if cur.owner == name => {
                 let changed = col.schema.as_ref().is_some_and(|s| *s != cur.schema)
                     || col.description.as_ref().is_some_and(|d| *d != cur.description)
@@ -530,6 +545,7 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
             schema: Some(c.schema),
             keys: Some(c.keys),
             card: (!c.card.is_empty()).then_some(c.card),
+            handoff: false,
         });
     }
     for s in crate::series::list(st, realm).await?.into_iter().filter(|s| !s.system && s.owner.is_empty()) {
@@ -717,7 +733,7 @@ pub(crate) fn contract_problems(old: &api::AppPackage, new: &api::AppPackage) ->
         return Vec::new();
     }
     let mut changes = Vec::new();
-    for c in &old.contents.collections {
+    for c in old.contents.collections.iter().filter(|c| !c.handoff) {
         let published = c.card.as_ref().is_none_or(|k| !k.internal());
         if !published {
             continue;
@@ -791,4 +807,161 @@ pub(crate) async fn dependents(st: &HeadState, realm: &str, name: &str, p: &api:
         }
     }
     Ok(out)
+}
+
+/// Apps installed before instances each got a realm of their own. Each is
+/// offered a move into a realm you choose (docs/apps.md §14), once.
+pub async fn offer_moves(st: &HeadState) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT i.id, i.name, i.package, i.realm FROM installs i JOIN realms r ON r.id = i.realm \
+         WHERE r.app = i.package AND i.realm NOT IN ('home', 'root', 'commons') AND i.state = 'installed'",
+    )
+    .fetch_all(&st.store.pool)
+    .await?;
+    let realms: Vec<String> = crate::realms::list(st, &crate::realms::Caller::root())
+        .await?
+        .into_iter()
+        .map(|r| r.id)
+        .filter(|r| r != ROOT && r != COMMONS)
+        .collect();
+    for r in rows {
+        let (id, name, realm): (i64, String, String) = (r.get("id"), r.get("name"), r.get("realm"));
+        let key = format!("app_move_offered:{id}");
+        if st.store.setting(&key).await?.is_some() {
+            continue;
+        }
+        let d = api::DecisionIn {
+            kind: "approve".into(),
+            title: format!("Move {name} out of its own realm?"),
+            document: format!(
+                "Apps no longer get a realm each: an app is installed in a realm you choose, and what it makes is that realm's \
+                 (docs/apps.md). **{name}** is still in **{realm}**, the realm it was given.\n\n\
+                 Moving it installs it in the realm you pick and copies what it owns there (its records, with their history and \
+                 where they came from, and its series). Its sessions stay in **{realm}**, readable; the realm is then yours to \
+                 delete. Its webhook triggers get new URLs.\n\nOr keep it where it is: an app in a realm of its own is fine."
+            ),
+            options: ["Move it", "Keep it where it is"]
+                .iter()
+                .map(|o| api::DecisionOption { label: (*o).to_owned(), does: String::new() })
+                .collect(),
+            form: vec![api::FormField {
+                name: "realm".into(),
+                label: "Move it into".into(),
+                kind: "choice".into(),
+                choices: realms.iter().filter(|r| **r != realm).cloned().collect(),
+                required: false,
+            }],
+            source: "packages".into(),
+            context: json!({"install": id}),
+            ..Default::default()
+        };
+        crate::decisions::open(st, &d, ROOT, &format!("package:move:{id}")).await?;
+        st.store.set_setting(&key, "1").await?;
+    }
+    Ok(())
+}
+
+/// Your answer to moving an app out of its own realm.
+pub(crate) async fn answer_move(
+    st: &HeadState,
+    id: i64,
+    option: Option<&str>,
+    values: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
+    if option != Some("Move it") {
+        return Ok(());
+    }
+    let to = values.get("realm").and_then(Value::as_str).filter(|r| !r.is_empty()).unwrap_or(crate::realms::HOME).to_owned();
+    move_instance(st, id, &to).await
+}
+
+/// Moves an instance to another realm: installed there, what it owns
+/// copied (records with their history and where they came from, series
+/// points), then removed from where it was.
+pub async fn move_instance(st: &HeadState, id: i64, to: &str) -> anyhow::Result<()> {
+    let i = crate::packages::install_by_id(st, id).await?;
+    let from = i.realm.clone();
+    anyhow::ensure!(from != to, "it is in {to} already");
+    if !crate::realms::exists(st, to).await? || to == ROOT || to == COMMONS {
+        return Err(bad_request(format!("no realm {to:?} to move it into")));
+    }
+    if crate::instances::get(&st.store.pool, to, &i.name).await?.is_some() {
+        return Err(bad_request(format!("realm {to} already has an app named {}", i.name)));
+    }
+    let (p, _) = crate::packages::by_digest(st, &i.digest).await?.ok_or_else(|| anyhow::anyhow!("its package is gone"))?;
+    let clashes = clashes(st, to, &i.name, &p).await?;
+    if !clashes.is_empty() {
+        return Err(bad_request(clashes.join("; ")));
+    }
+    // The new instance, installed as the old one was.
+    let row = sqlx::query("SELECT * FROM installs WHERE id = ?").bind(id).fetch_one(&st.store.pool).await?;
+    let now = c6_core::now_ms();
+    let new_id: i64 = sqlx::query_scalar(
+        "INSERT INTO installs (package, version, digest, realm, name, state, approved, locks, required_by, installed, settings, adopted, \
+         created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'installed', ?, ?, '[]', ?, ?, 1, ?, ?) RETURNING id",
+    )
+    .bind(&i.package)
+    .bind(&i.version)
+    .bind(&i.digest)
+    .bind(to)
+    .bind(&i.name)
+    .bind(row.get::<String, _>("approved"))
+    .bind(row.get::<String, _>("locks"))
+    .bind(row.get::<String, _>("installed"))
+    .bind(row.get::<String, _>("settings"))
+    .bind(now)
+    .bind(now)
+    .fetch_one(&st.store.pool)
+    .await?;
+    if let Err(e) = apply_instance_seeded(st, to, &i.name, &p, false).await {
+        let _ = remove_instance(st, to, &i.name).await;
+        sqlx::query("DELETE FROM installs WHERE id = ?").bind(new_id).execute(&st.store.pool).await?;
+        return Err(e);
+    }
+    // What it owns: records (new ids, their history, where they came from).
+    let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    for c in crate::collections::list(st, &from).await?.into_iter().filter(|c| c.owner == i.name) {
+        let recs =
+            sqlx::query("SELECT * FROM records WHERE realm = ? AND collection = ?").bind(&from).bind(&c.name).fetch_all(&mut *tx).await?;
+        for r in recs {
+            let old: String = r.get("id");
+            let new = uuid::Uuid::now_v7().to_string();
+            let mut derived: Vec<String> = serde_json::from_str(&r.get::<String, _>("derived_from")).unwrap_or_default();
+            derived.push(format!("record:{from}/{}/{old}", c.name));
+            sqlx::query(
+                "INSERT INTO records (id, realm, collection, fields, links, labels, version, created_by, updated_by, created_at, updated_at, \
+                 derived_from, provenance) SELECT ?, ?, collection, fields, links, labels, version, created_by, updated_by, created_at, \
+                 updated_at, ?, provenance FROM records WHERE id = ?",
+            )
+            .bind(&new)
+            .bind(to)
+            .bind(serde_json::to_string(&derived)?)
+            .bind(&old)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO record_history (record_id, version, op, fields, changed_by, changed_at) \
+                 SELECT ?, version, op, fields, changed_by, changed_at FROM record_history WHERE record_id = ?",
+            )
+            .bind(&new)
+            .bind(&old)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    for s in crate::series::list(st, &from).await?.into_iter().filter(|s| s.owner == i.name) {
+        sqlx::query("INSERT INTO points (realm, series, ts, value, dims, source) SELECT ?, series, ts, value, dims, source FROM points WHERE realm = ? AND series = ?")
+            .bind(to)
+            .bind(&from)
+            .bind(&s.name)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    // Then it leaves where it was.
+    remove_instance(st, &from, &i.name).await?;
+    sqlx::query("DELETE FROM installs WHERE id = ?").bind(id).execute(&st.store.pool).await?;
+    sqlx::query("UPDATE realms SET app = NULL WHERE id = ? AND app = ?").bind(&from).bind(&i.package).execute(&st.store.pool).await?;
+    st.registry.bump();
+    Ok(())
 }

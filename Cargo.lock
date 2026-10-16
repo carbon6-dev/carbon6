@@ -816,20 +816,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "c6m"
-version = "0.2.2"
-dependencies = [
- "anyhow",
- "c6-core",
- "c6-memex",
- "c6-worker",
- "clap",
- "tokio",
- "tokio-util",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "c6w"
 version = "0.2.2"
 dependencies = [

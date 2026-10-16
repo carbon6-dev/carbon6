@@ -761,7 +761,7 @@ fn Upgrades() -> impl IntoView {
     view! {
         <section class="space-y-2">
             <h2 class="font-medium">"Upgrades"</h2>
-            <p class="text-sm text-zinc-500">"Each new version of carbon6 upgrades its databases when it starts (or with c6h upgrade and c6m upgrade). The database is copied to backups/ next to it first; a failed upgrade puts the copy back, so nothing changes. To go back to an earlier version, stop carbon6 and put the backup in place of the database. To see what an upgrade would do first: c6h upgrade --check (or c6m upgrade --check)."</p>
+            <p class="text-sm text-zinc-500">"Each new version of carbon6 upgrades its databases when it starts (or with c6h upgrade). The database is copied to backups/ next to it first; a failed upgrade puts the copy back, so nothing changes. To go back to an earlier version, stop carbon6 and put the backup in place of the database. To see what an upgrade would do first: c6h upgrade --check."</p>
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
                 Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"No upgrades yet."</p> }.into_any(),

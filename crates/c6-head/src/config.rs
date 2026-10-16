@@ -40,6 +40,10 @@ pub struct HeadConfig {
     /// name-constrained CA (trust `/ca.pem` once per device). Keeps the
     /// head's names out of public Certificate Transparency logs.
     pub ui_tls_head_ca: bool,
+    /// Where a memex that ran beside the head (`c6m`) kept its state on this
+    /// machine, to move its knowledge in (docs/knowledge.md §8). Loading a
+    /// config file fills in c6m's usual folders; none: don't look.
+    pub memex_dirs: Option<Vec<PathBuf>>,
 }
 
 impl Default for HeadConfig {
@@ -58,6 +62,7 @@ impl Default for HeadConfig {
             ui_tls_cert: None,
             ui_tls_key: None,
             ui_tls_head_ca: false,
+            memex_dirs: None,
         }
     }
 }
@@ -80,6 +85,15 @@ impl HeadConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        // A head run from its config looks where c6m kept its state.
+        if cfg.memex_dirs.is_none() {
+            let mut dirs = Vec::new();
+            if let Some(d) = dirs::data_local_dir() {
+                dirs.push(d.join("c6m"));
+            }
+            dirs.push(PathBuf::from("/var/lib/c6m"));
+            cfg.memex_dirs = Some(dirs);
+        }
         if let Some(h) = std::env::var("C6H_ADVERTISE_HOST").ok().filter(|h| !h.is_empty()) {
             cfg.advertise_host = Some(h);
         }

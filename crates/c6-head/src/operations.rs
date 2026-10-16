@@ -110,7 +110,11 @@ pub async fn call(st: &HeadState, realm: &str, instance: &str, name: &str, input
 }
 
 async fn write(st: &HeadState, realm: &str, w: &api::OperationWrite, input: &Value, by: &str) -> anyhow::Result<Value> {
-    let fields = crate::triggers::render(&Value::Object(w.fields.clone()), input);
+    // Fields the input leaves out are left out (not set to null).
+    let mut fields = crate::triggers::render(&Value::Object(w.fields.clone()), input);
+    if let Some(o) = fields.as_object_mut() {
+        o.retain(|_, v| !v.is_null());
+    }
     let id = match crate::triggers::render(&w.id, input) {
         Value::String(s) if !s.is_empty() => Some(s),
         Value::Null => None,
