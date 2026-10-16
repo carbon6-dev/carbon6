@@ -20,8 +20,18 @@ const EXPIRY_MARGIN_MS: i64 = 60_000;
 /// messages per frame instead of one per token.
 const COALESCE: Duration = Duration::from_millis(25);
 
+/// The head, in the same process (docs/knowledge.md §3): the memex is part
+/// of the head, so its link calls it directly instead of over the fabric.
+#[async_trait::async_trait]
+pub trait LocalHead: Send + Sync {
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn credential(&self, connection_id: &str) -> CredentialGrant;
+}
+
 #[derive(Default)]
 pub struct HeadLink {
+    /// Set when the head is in this process.
+    local: std::sync::OnceLock<Arc<dyn LocalHead>>,
     outbound: Mutex<Option<mpsc::Sender<WorkerMsg>>>,
     /// Deltas waiting for the next flush; `Some` while a flush is scheduled.
     ephemeral_buf: Arc<Mutex<Option<Vec<EphemeralEvent>>>>,
@@ -33,6 +43,13 @@ pub struct HeadLink {
 }
 
 impl HeadLink {
+    /// A link to the head in this process.
+    pub fn local(head: Arc<dyn LocalHead>) -> Self {
+        let link = Self::default();
+        let _ = link.local.set(head);
+        link
+    }
+
     pub(crate) fn connected(&self, tx: mpsc::Sender<WorkerMsg>) {
         *self.outbound.lock().unwrap() = Some(tx);
     }
@@ -46,6 +63,9 @@ impl HeadLink {
     /// Calls the head: `method` with JSON `params`. What a node may call
     /// depends on its role (see the head's `fabric`).
     pub async fn call(&self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        if let Some(local) = self.local.get() {
+            return local.call(method, params).await.map_err(|e| anyhow!(e));
+        }
         let tx = self.outbound.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the head"))?;
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
@@ -74,7 +94,7 @@ impl HeadLink {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.outbound.lock().unwrap().is_some()
+        self.local.get().is_some() || self.outbound.lock().unwrap().is_some()
     }
 
     /// Best effort: dropped when disconnected or backed up. Consecutive
@@ -107,6 +127,14 @@ impl HeadLink {
             return Ok(g.clone());
         }
 
+        if let Some(local) = self.local.get() {
+            let grant = local.credential(connection_id).await;
+            if !grant.error.is_empty() {
+                bail!("head refused credentials: {}", grant.error);
+            }
+            self.cache.lock().unwrap().insert(connection_id.to_owned(), grant.clone());
+            return Ok(grant);
+        }
         let tx = self.outbound.lock().unwrap().clone();
         let Some(tx) = tx else {
             // An expiring-but-valid token is better than nothing offline.

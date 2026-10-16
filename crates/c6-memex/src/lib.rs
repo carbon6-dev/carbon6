@@ -4,6 +4,7 @@
 //! head's `memex.*` calls. See docs/memex.md.
 
 pub mod calendar;
+pub mod claims;
 pub mod contacts;
 pub mod docs;
 pub mod embed;
@@ -638,6 +639,12 @@ impl Memex {
         let allowed = Self::allowed(&params);
         match method {
             "memex.ingest" => ingest::ingest(self, params).await,
+            // Claims (docs/apps.md §9): the head stamps the owner.
+            "memex.claims.add" => claims::add(self, &params).await,
+            "memex.claims.retract" => claims::retract(self, &params).await,
+            "memex.claims.retract_owner" => claims::retract_owner(self, params["owner"].as_str().unwrap_or_default()).await,
+            "memex.claims.list" => claims::list(self, &params).await,
+            "memex.things.create" => claims::create_thing(self, &params).await,
             "memex.types" => Ok(json!(ingest::types())),
             "memex.upgrades" => Ok(json!(self.store.upgrades().await?)),
             "memex.delete" => {
@@ -827,13 +834,21 @@ impl Memex {
             "memex.summarize" => Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default()).await?})),
             "memex.graph" => {
                 let limit = params["limit"].as_u64().unwrap_or(40).min(150) as u32;
-                Ok(json!(review::graph(&self.store, params["id"].as_str().unwrap_or_default(), &allowed, limit).await?))
+                let policies: Vec<api::ClaimPolicy> = serde_json::from_value(params["policies"].clone()).unwrap_or_default();
+                Ok(json!(review::graph(&self.store, params["id"].as_str().unwrap_or_default(), &allowed, limit, &policies).await?))
             }
             "memex.explore.inventory" => explore::inventory(self, &allowed).await,
             "memex.explore.list" => explore::list(self, &params, &allowed).await,
             "memex.explore.thing" => explore::about_thing(self, params["id"].as_str().unwrap_or_default(), &allowed).await,
             "memex.months" => Ok(review::histogram(&self.store, params["id"].as_str().unwrap_or_default(), &allowed).await?),
-            "memex.knowledge.record" => knowledge::record(self, &params).await,
+            "memex.knowledge.record" => {
+                let v = knowledge::record(self, &params).await?;
+                // Whose claim it is, as the head says (docs/apps.md §9).
+                if let (Some(owner), Some(id)) = (params["owner"].as_str().filter(|o| !o.is_empty()), v["id"].as_str()) {
+                    sqlx::query("UPDATE facts SET owner = ? WHERE id = ?").bind(owner).bind(id).execute(&self.store.pool).await?;
+                }
+                Ok(v)
+            }
             "memex.knowledge.verify" => knowledge::verify(self, &params).await,
             "memex.knowledge.set" => knowledge::set(self, &params).await,
             "memex.knowledge.list" => knowledge::list(self, &params).await,
@@ -1086,7 +1101,8 @@ impl Memex {
             }
         }
         let mut seen = std::collections::HashSet::new();
-        notes.retain(|n| seen.insert(n.id.clone()));
+        // carbon6's memory notes reach sessions on their own, by their scope.
+        notes.retain(|n| n.source != "memory" && seen.insert(n.id.clone()));
         notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
         if !notes.is_empty() {
             let lines: Vec<String> = notes
@@ -1114,7 +1130,7 @@ impl Memex {
         if !text.trim().is_empty() {
             let q = api::MemexQuery { query: text.chars().take(500).collect(), limit: Some(5), ..Default::default() };
             let hits: Vec<api::MemexHit> =
-                self.search(&q, allowed).await.unwrap_or_default().into_iter().filter(|h| seen.insert(h.id.clone())).collect();
+                self.search(&q, allowed).await.unwrap_or_default().into_iter().filter(|h| h.source != "memory" && seen.insert(h.id.clone())).collect();
             if !hits.is_empty() {
                 let lines: Vec<String> = hits
                     .iter()

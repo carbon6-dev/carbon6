@@ -25,16 +25,11 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
     }
 }
 
-async fn node(head: &c6_head::Head, memex: bool, stop: &CancellationToken) -> (std::sync::Arc<Worker>, tempfile::TempDir) {
+async fn node(head: &c6_head::Head, _memex: bool, stop: &CancellationToken) -> (std::sync::Arc<Worker>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
     let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    if memex {
-        let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-        m.spawn_jobs();
-        w.set_extension(m);
-    }
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
     tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
@@ -142,7 +137,6 @@ async fn documents_papers_and_trails() {
     assert!(put("memex_folders", json!([{"path": folder.path().display().to_string(), "labels": ["research"]}])).await.is_success());
 
     let (worker, _wd) = node(&head, false, &stop).await;
-    let (_memex, _md) = node(&head, true, &stop).await;
     let status = || {
         let (http, url) = (http.clone(), format!("{api}/memex/status"));
         async move { http.get(url).send().await.unwrap().json::<c6_api::MemexStatus>().await.unwrap() }

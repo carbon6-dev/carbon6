@@ -516,11 +516,10 @@ impl SessionManager {
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
             }
-            // With a memex, its brief (which holds your notes) replaces the
-            // memory section.
-            if spec.memex_brief.trim().is_empty() {
-                prompt.push_str(&memory_section(&spec, &labels));
-            } else {
+            // Your notes, by their scope; then what the knowledge store
+            // knows about this session's things (it leaves the notes out).
+            prompt.push_str(&memory_section(&spec, &labels));
+            if !spec.memex_brief.trim().is_empty() {
                 prompt.push_str("\n\n# Memex\n\n");
                 prompt.push_str(spec.memex_brief.trim());
             }
@@ -1757,6 +1756,10 @@ pub(crate) async fn build_tools(
         tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexNote::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexTrail::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::Claims::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::ClaimAdd::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::ClaimRetract::new(profile == ToolProfile::Claude)));
+        tools.push(Arc::new(c6_tools::memex::ThingCreate::new(profile == ToolProfile::Claude)));
         // Environment knowledge.
         tools.push(Arc::new(c6_tools::knowledge::KnowledgeRecord::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::knowledge::KnowledgeVerify::new(profile == ToolProfile::Claude)));

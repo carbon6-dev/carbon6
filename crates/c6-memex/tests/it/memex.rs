@@ -1,4 +1,4 @@
-//! The memex on the fabric: it attaches like a worker with the role memex;
+//! The memex, part of the head (docs/knowledge.md); a separate c6m is turned away;
 //! carbon6's sessions and memory notes flow into it; search finds them by
 //! keyword and meaning; new sessions start with a brief; agents search and
 //! write notes through the head, within their scope.
@@ -25,16 +25,11 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
 }
 
 /// Enrolls a node and keeps it attached; `memex`: with the memex on top.
-async fn node(head: &c6_head::Head, memex: bool, stop: &CancellationToken) -> (std::sync::Arc<Worker>, tempfile::TempDir) {
+async fn node(head: &c6_head::Head, _memex: bool, stop: &CancellationToken) -> (std::sync::Arc<Worker>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
     let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    if memex {
-        let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-        m.spawn_jobs();
-        w.set_extension(m);
-    }
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
     tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
@@ -84,17 +79,25 @@ async fn memex_round_trip() {
     assert!(early.status().is_success(), "{}", early.text().await.unwrap());
 
     let (worker, _wd) = node(&head, false, &stop).await;
-    let (memex, _md) = node(&head, true, &stop).await;
+    // The memex is part of the head (docs/knowledge.md): a separate c6m is
+    // turned away.
+    let dir = tempfile::tempdir().unwrap();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
+    let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
+    let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
+    w.set_extension(m);
+    let (tx, rx) = watch::channel(ConnState::Connecting);
+    let refused = CancellationToken::new();
+    tokio::spawn(conn::run(w.clone(), tx, refused.clone()));
+    eventually("c6m turned away", async || {
+        let s = rx.borrow().clone();
+        (!matches!(s, ConnState::Attached { .. } | ConnState::Connecting)).then_some(())
+    })
+    .await;
+    refused.cancel();
     let workers: Vec<ApiWorker> = http.get(format!("{api}/workers")).send().await.unwrap().json().await.unwrap();
-    let role = |id: uuid::Uuid| workers.iter().find(|w| w.id == id).unwrap().role.clone();
-    assert_eq!((role(worker.identity.meta.worker_id.0).as_str(), role(memex.identity.meta.worker_id.0).as_str()), ("worker", "memex"));
-    let on_memex = http
-        .post(format!("{api}/sessions"))
-        .json(&json!({"worker_id": memex.identity.meta.worker_id.0, "cwd": "", "connection_id": conn.id, "model": "m", "prompt": "hi"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(on_memex.status(), reqwest::StatusCode::BAD_REQUEST, "the memex runs no sessions");
+    assert!(workers.iter().all(|w| w.role != "memex" || w.status != c6_api::WorkerStatus::Online), "{workers:?}");
 
     let wid = worker.identity.meta.worker_id.0;
     let create = |labels: Value, prompt: &str| {
@@ -162,8 +165,11 @@ async fn memex_round_trip() {
     idle(s2.id.clone()).await;
     let reqs = mock.requests();
     let system = reqs[requests_before]["messages"][0]["content"].to_string();
-    assert!(system.contains("# Memex") && system.contains("staging gate") && system.contains("Invoices are due"), "{system}");
-    assert!(!system.contains("# Memory"), "the brief replaces the memory section");
+    // Memory notes come by their scope in their own section; the brief adds
+    // what the knowledge store knows (without repeating them).
+    assert!(system.contains("# Memex") && system.contains("# Memory"), "{system}");
+    assert!(system.contains("staging gate") && system.contains("Invoices are due"), "{system}");
+    assert_eq!(system.matches("Invoices are due").count(), 1, "not twice: {system}");
     let found = reqs[requests_before + 1]["messages"].to_string();
     assert!(found.contains("ops runbook") && found.contains(&s1.id), "the agent found session 1: {found}");
     let saved = reqs[requests_before + 2]["messages"].to_string();

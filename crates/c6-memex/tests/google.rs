@@ -31,16 +31,11 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
     }
 }
 
-async fn node(head: &c6_head::Head, memex: bool, stop: &CancellationToken) -> (Arc<Worker>, tempfile::TempDir) {
+async fn node(head: &c6_head::Head, _memex: bool, stop: &CancellationToken) -> (Arc<Worker>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
     let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    if memex {
-        let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-        m.spawn_jobs();
-        w.set_extension(m);
-    }
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
     tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
@@ -283,7 +278,6 @@ async fn google_mail_calendar_contacts() {
         .await
         .unwrap();
     let (worker, _wd) = node(&head, false, &stop).await;
-    let (_memex, _md) = node(&head, true, &stop).await;
     let rpc = |method: &str, params: Value| {
         let (http, url, body) = (http.clone(), format!("{api}/memex/rpc"), json!({"method": method, "params": params}));
         async move {

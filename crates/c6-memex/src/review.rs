@@ -169,7 +169,13 @@ pub async fn merge(store: &Store, from: &str, into: &str) -> anyhow::Result<()> 
 
 /// The things around a thing: those it shares items with (of `kinds`) and
 /// those it links to directly, with the links among them.
-pub async fn graph(store: &Store, key: &str, kinds: &[String], limit: u32) -> anyhow::Result<api::MemexGraph> {
+pub async fn graph(
+    store: &Store,
+    key: &str,
+    kinds: &[String],
+    limit: u32,
+    policies: &[api::ClaimPolicy],
+) -> anyhow::Result<api::MemexGraph> {
     let center = store.thing(key).await?.ok_or_else(|| anyhow::anyhow!("no thing {key:?}"))?;
     let kinds_json = serde_json::to_string(kinds)?;
     let shared = sqlx::query(
@@ -198,13 +204,27 @@ pub async fn graph(store: &Store, key: &str, kinds: &[String], limit: u32) -> an
         })
         .collect();
     let direct = sqlx::query(
-        "SELECT t.*, l.rel, l.src_thing = ?1 AS outgoing FROM links l JOIN things t ON t.id = CASE WHEN l.src_thing = ?1 THEN l.dst_thing ELSE l.src_thing END \
+        "SELECT t.*, l.rel, l.owner, l.src_thing AS from_id, l.src_thing = ?1 AS outgoing FROM links l \
+         JOIN things t ON t.id = CASE WHEN l.src_thing = ?1 THEN l.dst_thing ELSE l.src_thing END \
          WHERE (l.src_thing = ?1 AND l.dst_thing IS NOT NULL) OR l.dst_thing = ?1 AND l.src_thing IS NOT NULL LIMIT 200",
     )
     .bind(&center.id)
     .fetch_all(&store.pool)
     .await?;
-    for r in &direct {
+    // Only what the reader's policies believe (docs/apps.md §9.3).
+    let mut claims: Vec<api::Claim> = direct
+        .iter()
+        .enumerate()
+        .map(|(i, r)| api::Claim {
+            id: i as i64,
+            from: r.get::<Option<String>, _>("from_id").unwrap_or_default(),
+            label: r.get("rel"),
+            owner: r.get("owner"),
+            ..Default::default()
+        })
+        .collect();
+    crate::claims::apply(&mut claims, policies);
+    for (r, _) in direct.iter().zip(&claims).filter(|(_, c)| c.believed) {
         let id: String = r.get("id");
         let rel: String = r.get("rel");
         let rel = if r.get::<bool, _>("outgoing") { rel } else { format!("{rel} ←") };

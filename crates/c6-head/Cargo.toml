@@ -14,7 +14,9 @@ c6-api = { workspace = true, features = ["schema"] }
 c6-core = { workspace = true, features = ["upgrade"] }
 c6-llm.workspace = true
 c6-mcp.workspace = true
+c6-memex.workspace = true
 c6-proto.workspace = true
+c6-worker.workspace = true
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"

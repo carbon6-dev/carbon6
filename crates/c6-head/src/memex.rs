@@ -63,22 +63,29 @@ pub async fn call_in(st: &HeadState, realm: &str, method: &str, params: Value) -
     call(st, method, in_realm(params, realm)).await
 }
 
-/// Calls the memex now. Err if none is connected.
+/// Calls the knowledge store (in the head, docs/knowledge.md).
 pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
-    let id = st.registry.memex().ok_or_else(|| bad_request("no memex is connected (Settings → Memex)"))?;
-    st.registry.call(id, method, params, CALL_TIMEOUT).await.map_err(|e| {
-        // What the memex refuses is about the request; losing it is not.
-        if e.contains("not connected") || e.contains("disconnected") || e.contains("in time") {
-            anyhow::anyhow!("memex: {e}")
-        } else {
-            bad_request(format!("memex: {e}"))
-        }
-    })
+    call_within(st, method, params, CALL_TIMEOUT).await
 }
 
-/// Tells the memex its settings changed (if one is connected).
+async fn call_within(st: &HeadState, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
+    let m = crate::knowledge::get(st).ok_or_else(|| anyhow::anyhow!("the knowledge store is starting"))?;
+    match tokio::time::timeout(timeout, m.handle_method(method, params)).await {
+        Ok(Ok(v)) => Ok(v),
+        // What it refuses is about the request.
+        Ok(Err(e)) => Err(bad_request(format!("memex: {e:#}"))),
+        Err(_) => Err(anyhow::anyhow!("memex: {method} took longer than {}s", timeout.as_secs())),
+    }
+}
+
+/// Whether the knowledge store is open.
+pub fn ready(st: &HeadState) -> bool {
+    crate::knowledge::get(st).is_some()
+}
+
+/// Tells the knowledge store its settings changed.
 pub async fn reload(st: &HeadState) {
-    if st.registry.memex().is_some() {
+    if ready(st) {
         let _ = call(st, "memex.reload", serde_json::json!({})).await;
     }
 }
@@ -108,7 +115,7 @@ pub fn spawn(st: Arc<HeadState>) {
                 _ = st.memex_feed.wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
-            if st.registry.memex().is_none() {
+            if !ready(&st) {
                 continue;
             }
             if let Err(e) = send_memories(&st).await {
@@ -309,8 +316,7 @@ fn item_labels(session: &SessionRow) -> Vec<String> {
 /// A brief for a new session about `labels`, or "" (no memex, nothing
 /// known, or it took too long).
 pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -> String {
-    let Some(id) = st.registry.memex() else { return String::new() };
-    if !has_memex(realm) {
+    if !ready(st) || !has_memex(realm) {
         return String::new();
     }
     let chars = settings(st).await.ok().and_then(|s| s.brief_chars).unwrap_or(4000);
@@ -320,7 +326,7 @@ pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -
     let scope = scope_for(st, labels).await;
     let one = async |realm: &str| {
         let params = json!({"labels": labels, "text": text, "chars": chars, "scope": scope, "realm": realm});
-        match st.registry.call(id, "memex.brief", params, BRIEF_TIMEOUT).await {
+        match call_within(st, "memex.brief", params, BRIEF_TIMEOUT).await {
             Ok(v) => serde_json::from_value::<api::MemexBrief>(v).map(|b| b.text).unwrap_or_default(),
             Err(e) => {
                 debug!("memex brief: {e}");
@@ -342,19 +348,13 @@ pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -
 
 pub async fn status(st: &HeadState) -> anyhow::Result<api::MemexStatus> {
     let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memex_outbox").fetch_one(&st.store.pool).await?;
-    let node = st.registry.memex();
-    let mut s = match node {
-        Some(_) => match call(st, "memex.status", json!({})).await {
-            Ok(v) => serde_json::from_value(v).unwrap_or_default(),
-            Err(e) => api::MemexStatus { last_error: Some(format!("{e:#}")), ..Default::default() },
-        },
-        None => api::MemexStatus::default(),
+    let mut s = match call(st, "memex.status", json!({})).await {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => api::MemexStatus { last_error: Some(format!("{e:#}")), ..Default::default() },
     };
-    s.connected = node.is_some();
-    s.node = match node {
-        Some(id) => st.store.worker(id).await?.map(|w| w.name),
-        None => None,
-    };
+    // Part of the head (docs/knowledge.md).
+    s.connected = ready(st);
+    s.node = Some("head".into());
     s.outbox = outbox as u64;
     Ok(s)
 }

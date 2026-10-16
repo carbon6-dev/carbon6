@@ -107,6 +107,20 @@ pub const LISTS: &[List] = &[
         merge: Merge::Override,
     },
     List {
+        key: "claim_policies",
+        description: "Reader policies: per label, whose claims a realm's readers believe, in order (docs/apps.md §9.3).",
+        realm: HOME,
+        key_fields: &["label"],
+        merge: Merge::Override,
+    },
+    List {
+        key: "vocabulary",
+        description: "The shared vocabulary: labels and item kinds, and what each means (docs/apps.md §9.4).",
+        realm: ROOT,
+        key_fields: &["name", "kind"],
+        merge: Merge::Override,
+    },
+    List {
         key: "prompts",
         description: "What carbon6 tells models: sessions, the assistant, the memex.",
         realm: ROOT,

@@ -281,6 +281,10 @@ fn build() -> Vec<Op> {
         op!("realms.effective", "apps", "GET" "/api/v1/realms/{id}/effective/{key}", Read, Input::Query(schema::<crate::api::EffectiveQuery>), "A settings list (skills, templates, views, …) as a realm's sessions use it, or (instance) as an app instance's sessions do: each entry with where it comes from (root, the realm, or app:<name>).", choices = &[("id", "realms.list")]),
         op!("apps.operations", "apps", "GET" "/api/v1/apps/{realm}/{instance}/operations", Read, Input::None, "An app instance's operations: how anything but the app changes what it owns, each with its input's JSON Schema.", choices = &[("realm", "realms.list")]),
         op!("apps.operations.call", "apps", "POST" "/api/v1/apps/{realm}/{instance}/operations/{name}", Write, Input::Body(schema::<api::OperationCall>), "Calls an app's operation with its input: a write runs at once, a template starts the app's session, as the app.", choices = &[("realm", "realms.list")]),
+        op!("claims.list", "knowledge", "GET" "/api/v1/memex/claims", Read, Input::Query(schema::<crate::api::ClaimsQuery>), "Claims about a thing (about: thing:<key>) or an item (item:<id>): who claims what, with what evidence, and whether the realm's reader policies believe it (policy=all shows every claim). same_as=true follows the things taken to be the same."),
+        op!("claims.add", "knowledge", "POST" "/api/v1/memex/claims", Write, Input::Body(schema::<api::ClaimIn>), "Adds a claim of yours (a correction outranks an app's under the default policies): from, label, to, confidence, evidence (item ids)."),
+        op!("claims.retract", "knowledge", "DELETE" "/api/v1/memex/claims/{id}", Destructive, Input::None, "Retracts a claim of yours (only its owner can; others' claims you answer with your own)."),
+        op!("things.create", "knowledge", "POST" "/api/v1/memex/things", Write, Input::Body(any_object), "Makes a thing (a person, a place, a topic) anyone may make claims about: {kind, name, key?}."),
         op!("apps.list", "apps", "GET" "/api/v1/apps", Read, Input::None, "Installed apps: each an instance of a package in a realm, with its version and state."),
         op!("apps.plan", "apps", "POST" "/api/v1/apps/plan", Read, Input::Body(schema::<api::AppPackage>), "What installing a package would create, what it needs, and why it could not go ahead."),
         op!("apps.install", "apps", "POST" "/api/v1/apps", Write, Input::Body(schema::<api::AppPackage>), "Asks to install a package (JSON: package, version, description, reads {items {kinds}, collections}, settings (a JSON Schema), permissions {secrets, workers, grants}, contents {collections, series, triggers, memory, records, and settings lists by key: views, skills, agents, commands, hooks, mcp_servers, templates, workflows, policies, routes, prices, budgets}) in ?realm= (default: the realm it suggests if it exists, else home). The user decides; then what it owns is created there."),
@@ -291,6 +295,8 @@ fn build() -> Vec<Op> {
     v.extend(list_setting!("settings.views.get", "settings.views.put", "views", "/api/v1/settings/views", api::View, "A realm's views (?realm=), its configured screens: name, title, kind (table, board, record, chart, feed, page), source ({collection, where?, sort?, limit?} for table, board and record; {series, agg?, minutes?, bucket?, group_by?} for chart; {decisions: \"open\"} or {sessions: {labels}} for feed), fields, group_by (a board's column field), columns, body (a page's Markdown; {{view:name}} embeds another view), actions ({label, start: template, set: {field: value}}), menu."));
     v.extend(list_setting!("settings.hosts.get", "settings.hosts.put", "hosts", "/api/v1/settings/hosts", api::Host, "The SSH host inventory: name, target, worker to reach it through, labels."));
     v.extend(list_setting!("settings.workflows.get", "settings.workflows.put", "automation", "/api/v1/settings/workflows", api::Workflow, "Workflows: steps of sessions, approvals and conditions."));
+    v.extend(list_setting!("settings.claim_policies.get", "settings.claim_policies.put", "knowledge", "/api/v1/settings/claim_policies", api::ClaimPolicy, "Reader policies: per label, whose claims the realm's readers (search, the graph, agents) believe, in order: you, app:<name>, realm, a program, app:*, or * for everyone else. Without one: yours first, then everyone's."));
+    v.extend(list_setting!("settings.vocabulary.get", "settings.vocabulary.put", "knowledge", "/api/v1/settings/vocabulary", api::VocabularyEntry, "The shared vocabulary (in root, for every realm): labels and item kinds, and what each means."));
     v.extend(list_setting!("settings.memex_scopes.get", "settings.memex_scopes.put", "knowledge", "/api/v1/settings/memex_scopes", api::MemexScope, "Memex scope rules: which kinds of items (email, photo…) sessions with given labels may see."));
     v.extend(list_setting!("settings.memex_folders.get", "settings.memex_folders.put", "knowledge", "/api/v1/settings/memex_folders", api::MemexFolder, "Folders on the memex's machine it reads (documents, papers, photos, videos)."));
     v.extend([
@@ -489,6 +495,8 @@ pub fn list_schema(key: &str) -> Option<Value> {
         "memex_folders" => schema::<api::MemexFolder>(),
         "memex_scopes" => schema::<api::MemexScope>(),
         "views" => schema::<api::View>(),
+        "claim_policies" => schema::<api::ClaimPolicy>(),
+        "vocabulary" => schema::<api::VocabularyEntry>(),
         "prompts" => json!({"type": "object", "required": ["name", "body"], "properties": {
             "name": {"type": "string"}, "description": {"type": "string"}, "body": {"type": "string"}
         }}),

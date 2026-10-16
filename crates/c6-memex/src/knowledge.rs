@@ -356,6 +356,13 @@ pub async fn set(m: &Memex, params: &Value) -> anyhow::Result<Value> {
     let id = params["id"].as_str().unwrap_or_default();
     let status = params["status"].as_str().unwrap_or("");
     let Some(mut f) = get(m, id).await? else { anyhow::bail!("no fact {id}") };
+    // A fact is a claim (docs/apps.md §9): only its owner (or you) retires or
+    // replaces it; anyone else records a fact of their own.
+    let caller = params["owner"].as_str().filter(|o| !o.is_empty()).unwrap_or("you");
+    let owner: String = sqlx::query_scalar("SELECT owner FROM facts WHERE id = ?").bind(&f.id).fetch_one(&m.store.pool).await?;
+    if caller != "you" && caller != owner && (status == "retired" || params["claim"].as_str().is_some_and(|c| !c.trim().is_empty())) {
+        anyhow::bail!("fact {} is {owner}'s: record a fact of your own instead (it may dispute this one)", f.id);
+    }
     let now = c6_core::now_ms();
     let by = params["made_by"].as_str().unwrap_or("you").to_owned();
     if let Some(correct) = params["claim"].as_str().filter(|c| !c.trim().is_empty()) {

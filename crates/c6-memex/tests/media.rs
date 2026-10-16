@@ -12,9 +12,7 @@ use std::time::Duration;
 use c6_api::{MemexReview, MemexStatus};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply};
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
@@ -28,18 +26,9 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
     }
 }
 
-async fn memex_node(head: &c6_head::Head, stop: &CancellationToken) -> (Arc<c6_memex::Memex>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
-    enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
-    let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-    m.spawn_jobs();
-    w.set_extension(m.clone());
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
-    (m, dir)
+/// The head's own knowledge store (docs/knowledge.md), and a folder for the test's files.
+async fn memex_node(head: &c6_head::Head, _stop: &CancellationToken) -> (Arc<c6_memex::Memex>, tempfile::TempDir) {
+    (c6_head::knowledge::get(&head.state).expect("the head's knowledge store"), tempfile::tempdir().unwrap())
 }
 
 /// A JPEG: a background, and a square in the middle (a "face" when red or

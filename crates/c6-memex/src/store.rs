@@ -31,6 +31,18 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
     checks: &[
         c6_core::upgrade::Check {
+            version: 8,
+            name: "every link is a claim with an owner",
+            before: "SELECT count(*) FROM before.links",
+            after: "SELECT count(*) FROM links WHERE owner != ''",
+        },
+        c6_core::upgrade::Check {
+            version: 8,
+            name: "every fact has an owner",
+            before: "SELECT count(*) FROM before.facts",
+            after: "SELECT count(*) FROM facts WHERE owner != ''",
+        },
+        c6_core::upgrade::Check {
             version: 7,
             name: "items, things and links are in home",
             before: "SELECT (SELECT count(*) FROM before.items) + (SELECT count(*) FROM before.things) + (SELECT count(*) FROM before.links)",

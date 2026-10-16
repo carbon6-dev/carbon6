@@ -352,7 +352,7 @@ async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
 }
 
 async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Vec<SessionEvent>) -> anyhow::Result<CreateSession> {
-    let memex = st.registry.memex().is_some();
+    let memex = crate::memex::ready(st);
     let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
     let limits = subagent_limits(st).await?;
@@ -1278,15 +1278,32 @@ async fn secret_credential(
 }
 
 pub async fn credential(st: &HeadState, worker_id: WorkerId, req: CredentialRequest) -> CredentialGrant {
+    let role = st.registry.get(worker_id).map(|l| l.role).unwrap_or_default();
+    let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
+    credential_for(st, &role, Some(worker_id), &worker_name, req).await
+}
+
+/// Credentials for a node of `role` (`worker_id`: a fabric node; none: the
+/// head's own knowledge store, docs/knowledge.md).
+pub async fn credential_for(
+    st: &HeadState,
+    role: &str,
+    worker_id: Option<WorkerId>,
+    worker_name: &str,
+    req: CredentialRequest,
+) -> CredentialGrant {
     let mut grant = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id.clone(), ..Default::default() };
     if let Some(name) = req.connection_id.strip_prefix("secret:") {
-        let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
-        return secret_credential(st, worker_id, &worker_name, name, grant).await;
+        let Some(worker_id) = worker_id else {
+            grant.error = "secrets are for workers' sessions".into();
+            return grant;
+        };
+        return secret_credential(st, worker_id, worker_name, name, grant).await;
     }
     // Google accounts: for the memex only (it syncs mail, calendars and
     // contacts); workers reach them through the memex.
     if let Some(account) = req.connection_id.strip_prefix("google:") {
-        if st.registry.get(worker_id).map(|l| l.role).as_deref() != Some("memex") {
+        if role != "memex" {
             grant.error = "Google accounts are for the memex".into();
             return grant;
         }

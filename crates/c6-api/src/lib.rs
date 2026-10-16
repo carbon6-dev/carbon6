@@ -512,6 +512,10 @@ pub struct AppPackage {
     /// How anyone but the app changes what it owns (docs/apps.md §7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<Operation>,
+    /// The labels its claims use, what each means, and the shared label
+    /// it maps to (docs/apps.md §9.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vocabulary: Vec<VocabularyEntry>,
     /// A kit's environment and tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<KitPart>,
@@ -3178,6 +3182,83 @@ pub struct MemexThingRef {
     /// The carbon6 label it stands for, if any.
     #[serde(default)]
     pub label: String,
+}
+
+/// A claim (docs/apps.md §9): an edge between things and items, with its
+/// owner and where it comes from. Anyone may add their own; only the
+/// owner retracts it; readers choose whose to believe.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Claim {
+    pub id: i64,
+    /// `thing:<key>` or `item:<id>`.
+    pub from: String,
+    #[serde(default)]
+    pub from_name: String,
+    pub label: String,
+    pub to: String,
+    #[serde(default)]
+    pub to_name: String,
+    /// you, app:<name>, realm, or the program that made it.
+    pub owner: String,
+    /// Exactly who: a session, an operation, a pipeline and its version.
+    #[serde(default)]
+    pub made_by: String,
+    /// observed or inferred.
+    #[serde(default)]
+    pub basis: String,
+    #[serde(default)]
+    pub confidence: f64,
+    /// Items that support it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    pub created_at: UnixMs,
+    /// What the label means (the shared vocabulary, or its owner's words).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub means: String,
+    /// Whether the reader's policy believes it.
+    #[serde(default)]
+    pub believed: bool,
+}
+
+/// `POST /api/v1/memex/claims`: a claim of yours.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ClaimIn {
+    /// `thing:<key>` (or a thing's key or id) or `item:<id>`.
+    pub from: String,
+    pub label: String,
+    pub to: String,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// Items that support it.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+/// A reader policy (docs/apps.md §9.3): for a label, whose claims to
+/// believe, in order (`you`, `app:<name>`, `realm`, a program, `app:*`, or
+/// `*` for everyone else); the first owner with claims about something wins.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ClaimPolicy {
+    pub label: String,
+    pub believe: Vec<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// The shared vocabulary (docs/apps.md §9.4): a label or an item kind, what
+/// it means, and (for an owner's own label) the shared one it maps to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct VocabularyEntry {
+    pub name: String,
+    /// label or kind.
+    pub kind: String,
+    pub means: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub maps_to: String,
 }
 
 /// An item, in full (`memex.get` of an item id).

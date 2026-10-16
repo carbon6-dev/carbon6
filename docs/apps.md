@@ -363,3 +363,22 @@ Settled since the first version: mail, calendar and contacts are in the realm wh
   - the API, the collection's page and the realm explorer show it.
 - **Provenance:** every write records who wrote the current version (`by`, and the app, its package and version, the session or operation, `forced`). `derived_from` (`item:<id>`, `record:<collection>/<id>`, a URL) is given by agents' `records_put`, mapped by write operations and triggers' write actions, and set by grant snapshots (`record:<realm>/<collection>/<id>`).
 - **Contracts:** an upgrade within a major version (a minor version below 1.0) can't narrow what the app publishes. That means a published collection losing a field, changing a field's type, dropping enum choices or requiring a new field, and a published operation's input the same way or the operation removed. Internal collections and operations may change. The decision names what in the realm uses what the app publishes: views, triggers, other apps' reads and grants.
+
+### 18.4 Claims (step 6)
+
+- **In the knowledge store** (memex migration `0008`): every link is a claim with an `owner`.
+  - Existing links and facts get one from their `made_by`: `session:` becomes `realm`, `app:<name>` stays an app, and anything else (`you`, `gmail`, a pipeline) is its own owner. A trigger does the same for writers that don't name an owner.
+  - Retracted claims move to `retracted_links`, out of the graph.
+- **Calls:** `memex.claims.add` / `retract` / `retract_owner` / `list` and `memex.things.create`. The head stamps the owner and never takes it from the caller: you are `you`; an app's session is `app:<name>`; the realm's sessions and tokens are `realm`.
+  - Only the owner retracts its claims.
+  - Each owner may add at most 20,000 claims an hour.
+- **API:** `GET /api/v1/memex/claims` (`about` = `thing:<key>` or `item:<id>`, `label`, `owner`, `policy=all`, `same_as`), `POST /api/v1/memex/claims`, `DELETE /api/v1/memex/claims/{id}` and `POST /api/v1/memex/things`. Agents get `claims`, `claim_add`, `claim_retract` and `thing_create`.
+- **Reader policies:** a realm settings list, `claim_policies`: `{label, believe: [owners in order]}`, where `app:*` matches every app and `*` everyone else. Without a policy, yours come first, then everyone's.
+  - The head applies them to `claims` lists, judging an owner's own label as the shared label it maps to.
+  - The graph view shows only believed relations.
+- **Identity:** `same_as` and `not_same_as` claims; `same_as=true` follows the believed ones, transitively.
+- **Vocabulary:** a root settings list, `vocabulary`, seeded once with the core labels and item kinds. Packages declare their own labels (`vocabulary`, with `maps_to`). A claims list gives each claim what its label `means`, and a label filter finds owners' labels mapped to it.
+- **Facts are claims:** they carry an owner; anyone but their owner (or you) is refused when retiring or replacing one.
+- **Removing an app** retracts its claims.
+- **The explorer** shows a thing's claims with their owners, and whether the realm believes each.
+- **Not yet:** policies with conditions (a confidence threshold), briefs applying policies, and edges into other realms through grants.

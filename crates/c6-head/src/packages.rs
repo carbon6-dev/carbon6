@@ -1261,7 +1261,8 @@ pub async fn remove(st: &HeadState, id: i64) -> anyhow::Result<api::Install> {
         let owned = crate::apps::owned_lines(st, &cur.realm, &cur.name).await?;
         (
             format!(
-                "Removing **{}** from realm **{}** deletes what it owns: {}. Its sessions stay in the realm's history, and the realm stays.\
+                "Removing **{}** from realm **{}** deletes what it owns: {}, and retracts its claims in the graph. Its sessions stay in the \
+                 realm's history, and the realm stays.\
                  \n\nExport its data first (Settings → System → Packages → Export) to keep a copy.",
                 cur.name,
                 cur.realm,

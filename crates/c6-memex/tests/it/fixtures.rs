@@ -12,10 +12,8 @@ use base64::Engine;
 use c6_api::Connection;
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply};
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use sqlx::Row;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
@@ -64,16 +62,8 @@ async fn make_memex_fixture() {
         .await
         .unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let e = c6_head::api::new_enrollment(&head.state, Some("memex")).await.unwrap();
-    enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
-    let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-    m.spawn_jobs();
-    w.set_extension(m);
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    // The knowledge store is the head's own (docs/knowledge.md).
+    let dir = c6_head::knowledge::dir(&head.state);
 
     let send = |path: &str, body: Value| {
         let (http, url) = (http.clone(), format!("{api}/{path}"));
@@ -139,7 +129,7 @@ async fn make_memex_fixture() {
     .await;
 
     stop.cancel();
-    let path = dir.path().join("memex").join("memex.db");
+    let path = dir.join("memex.db");
     let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
     let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
     let empty = fill_empty_tables(&pool).await;

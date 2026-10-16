@@ -84,7 +84,7 @@ async fn explorer_shows_a_realm_and_its_connections() {
     assert_eq!(e("decisions:open").unwrap().count, 1);
     assert_eq!(e("list:views").unwrap().count, 1);
     assert!(e("list:prompts").is_some_and(|p| p.count == 0 && p.inherited > 0), "root's prompts are inherited");
-    assert!(!s.knowledge, "no memex here");
+    assert!(s.knowledge, "the head keeps knowledge (docs/knowledge.md)");
 
     // Activity: the deal's changes, the trigger's run, its invoice, the decision.
     let act: Vec<ExRef> = send(M::GET, "realms/crm/activity", json!({})).await.json().await.unwrap();

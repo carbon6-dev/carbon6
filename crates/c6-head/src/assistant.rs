@@ -477,7 +477,7 @@ impl Env {
     fn tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
         let mut tools: Vec<Arc<dyn Tool>> =
             vec![Arc::new(Discover), Arc::new(Describe), Arc::new(Call { env: self.clone() }), Arc::new(Ask { env: self.clone() })];
-        if self.st.registry.memex().is_some() {
+        if crate::memex::ready(&self.st) {
             tools.push(Arc::new(c6_tools::memex::MemexSearch::new(false)));
             tools.push(Arc::new(c6_tools::memex::MemexGet::new(false)));
         }

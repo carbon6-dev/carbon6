@@ -606,3 +606,86 @@ tool!(
         }
     }
 );
+
+// --- Claims (docs/apps.md §9) ---
+
+tool!(
+    Claims,
+    "claims",
+    "Claims",
+    "Claims about a thing (about: thing:<key>, e.g. thing:person:jane@acme.com) or an item (item:<id>): who claims what (each \
+     claim has an owner: you (the user), app:<name>, realm, or a program like gmail), with its evidence. By default only what \
+     this realm's reader policies believe; policy \"all\" shows every claim, each saying whether it is believed. same_as: true \
+     includes the things taken to be the same.",
+    json!({"type": "object", "properties": {
+        "about": {"type": "string"},
+        "label": {"type": "string", "description": "Only this label (and owners' labels mapped to it)"},
+        "policy": {"type": "string", "description": "default or all"},
+        "same_as": {"type": "boolean"}
+    }, "required": ["about"], "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| {
+        match call(ctx, "memex.claims.list", input).await {
+            Ok(v) => ToolOutput::limited(serde_json::to_string_pretty(&v).unwrap_or_default(), false),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);
+
+tool!(
+    ClaimAdd,
+    "claim_add",
+    "ClaimAdd",
+    "Adds a claim to the graph: from (thing:<key> or item:<id>) label to, with the items that support it as evidence. It is \
+     yours (your app's, or the realm's): others may disagree with claims of their own, and readers choose whose to believe. Use \
+     the shared labels (sent_by, about, mentions, works_at, same_as, …) where one fits. Make a thing first with thing_create.",
+    json!({"type": "object", "properties": {
+        "from": {"type": "string"},
+        "label": {"type": "string"},
+        "to": {"type": "string"},
+        "confidence": {"type": "number", "description": "0 to 1; below 1 means inferred"},
+        "evidence": {"type": "array", "items": {"type": "string"}, "description": "Item ids that support it"}
+    }, "required": ["from", "label", "to"], "additionalProperties": false}),
+    Concurrency::Exclusive,
+    |ctx, input| {
+        match call(ctx, "memex.claims.add", input).await {
+            Ok(v) => ToolOutput::ok(serde_json::to_string_pretty(&v).unwrap_or_default()),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);
+
+tool!(
+    ClaimRetract,
+    "claim_retract",
+    "ClaimRetract",
+    "Retracts a claim you (your app, or the realm) made, by its id. Others' claims can't be retracted: add your own instead.",
+    json!({"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"], "additionalProperties": false}),
+    Concurrency::Exclusive,
+    |ctx, input| {
+        match call(ctx, "memex.claims.retract", input).await {
+            Ok(v) => ToolOutput::ok(v.to_string()),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);
+
+tool!(
+    ThingCreate,
+    "thing_create",
+    "ThingCreate",
+    "Makes a thing in the graph (a person, an organization, a place, a topic) that claims can be about: kind, name, and a key \
+     (default <kind>:<name>). If the key exists, that thing is returned.",
+    json!({"type": "object", "properties": {
+        "kind": {"type": "string"},
+        "name": {"type": "string"},
+        "key": {"type": "string"}
+    }, "required": ["kind", "name"], "additionalProperties": false}),
+    Concurrency::Exclusive,
+    |ctx, input| {
+        match call(ctx, "memex.things.create", input).await {
+            Ok(v) => ToolOutput::ok(serde_json::to_string_pretty(&v).unwrap_or_default()),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);

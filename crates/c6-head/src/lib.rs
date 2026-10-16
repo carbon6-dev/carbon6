@@ -5,6 +5,7 @@ pub mod apps;
 pub mod assistant;
 pub mod auth;
 pub mod catalog;
+pub mod claims;
 pub mod collections;
 pub mod commons;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod guard;
 pub mod hosts;
 pub mod hub;
 pub mod instances;
+pub mod knowledge;
 pub mod lists;
 pub mod memex;
 pub mod memory;
@@ -128,6 +130,8 @@ pub struct HeadState {
     pub shutdown: CancellationToken,
     /// Its database, PKI and keys (never offered by `files`).
     pub data_dir: std::path::PathBuf,
+    /// The knowledge graph and its store (docs/knowledge.md), in this process.
+    pub memex: std::sync::OnceLock<Arc<c6_memex::Memex>>,
 }
 
 /// A running head.
@@ -221,9 +225,13 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         assistant: Default::default(),
         shutdown: shutdown.clone(),
         data_dir: cfg.data_dir.clone(),
+        memex: Default::default(),
     });
 
     let mut tasks = JoinSet::new();
+
+    // The knowledge graph is the head's (docs/knowledge.md).
+    knowledge::open(&state).await?;
 
     // Apps installed before instances read their code from their package
     // from now on (docs/apps.md §14).

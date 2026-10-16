@@ -137,10 +137,11 @@ impl WorkerHub for HubSvc {
         } else {
             row.role.clone()
         };
-        if role == "memex"
-            && let Some(other) = st.registry.memex().filter(|o| *o != worker_id)
-        {
-            return Err(Status::failed_precondition(format!("another memex ({other}) is connected; one memex per head")));
+        // The knowledge graph is the head's own now (docs/knowledge.md).
+        if role == "memex" {
+            return Err(Status::failed_precondition(
+                "the memex is part of the head now: stop c6m (the head moves its data in when it upgrades)",
+            ));
         }
         st.store.worker_attached(worker_id, hostname, os, arch, version, now_ms()).await.map_err(internal)?;
 

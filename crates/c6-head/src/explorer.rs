@@ -777,6 +777,30 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             o.sub = format!("{} · {}", t["kind"].as_str().unwrap_or(""), t["label"].as_str().unwrap_or(""));
             o.open = Some("/memex".into());
             o.data = v.clone();
+            // Who claims what about it, and whether the realm believes it (docs/apps.md §9).
+            let about = format!("thing:{}", t["label"].as_str().filter(|l| !l.is_empty()).or(t["id"].as_str()).unwrap_or(id));
+            let claims: Vec<api::Claim> =
+                crate::claims::call(st, realm, "memex.claims.list", json!({"about": about, "policy": "all"}), "you", "you")
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+            groups.push(group(
+                "Claims",
+                claims
+                    .iter()
+                    .map(|c| {
+                        let other = if c.from == about { (&c.to, &c.to_name) } else { (&c.from, &c.from_name) };
+                        r(
+                            "claim",
+                            c.id.to_string(),
+                            format!("{} {}", c.label, if other.1.is_empty() { other.0 } else { other.1 }),
+                            format!("by {}{}", c.owner, if c.believed { "" } else { " · not believed" }),
+                            Some(c.created_at),
+                        )
+                    })
+                    .collect(),
+            ));
             groups.push(group(
                 "Facts about it",
                 v["facts"]

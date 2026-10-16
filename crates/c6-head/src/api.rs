@@ -87,6 +87,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/workflows", get(get_workflows).put(put_workflows))
         .route("/api/v1/settings/memex", get(get_memex_settings).put(put_memex_settings))
         .route("/api/v1/settings/memex_scopes", get(get_memex_scopes).put(put_memex_scopes))
+        .route("/api/v1/settings/claim_policies", get(get_claim_policies).put(put_claim_policies))
+        .route("/api/v1/settings/vocabulary", get(get_vocabulary).put(put_vocabulary))
+        .route("/api/v1/memex/claims", get(list_claims).post(add_claim))
+        .route("/api/v1/memex/claims/{id}", axum::routing::delete(retract_claim))
+        .route("/api/v1/memex/things", post(create_thing))
         .route("/api/v1/memex/status", get(memex_status))
         .route("/api/v1/memex/search", get(memex_search))
         .route("/api/v1/memex/get", get(memex_get))
@@ -1263,6 +1268,99 @@ async fn put_memex_scopes(State(st): State<Arc<HeadState>>, Json(s): Json<Vec<ap
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_claim_policies(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::ClaimPolicy>>> {
+    Ok(Json(st.store.setting(crate::claims::POLICIES).await?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()))
+}
+
+async fn put_claim_policies(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::ClaimPolicy>>) -> ApiResult<StatusCode> {
+    crate::claims::check_policies(&p)?;
+    st.store.set_setting(crate::claims::POLICIES, &serde_json::to_string(&p).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_vocabulary(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::VocabularyEntry>>> {
+    Ok(Json(st.store.setting(crate::claims::VOCABULARY).await?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()))
+}
+
+async fn put_vocabulary(State(st): State<Arc<HeadState>>, Json(v): Json<Vec<api::VocabularyEntry>>) -> ApiResult<StatusCode> {
+    crate::claims::check_vocabulary(&v)?;
+    st.store.set_setting(crate::claims::VOCABULARY, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Claims about a thing or an item (docs/apps.md §9): `about`
+/// (`thing:<key>` or `item:<id>`), `label`, `owner`, `policy` (`all`: every
+/// claim, each saying whether the realm's policies believe it), `same_as`.
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct ClaimsQuery {
+    about: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    policy: String,
+    #[serde(default)]
+    same_as: bool,
+    #[serde(default)]
+    realm: Option<String>,
+}
+
+/// Who asserts what you or a token add: you, or the token's realm.
+fn claim_owner(caller: &Caller) -> (&'static str, String) {
+    match &caller.realm {
+        Some(r) => ("realm", format!("token:{r}")),
+        None => ("you", "you".into()),
+    }
+}
+
+async fn list_claims(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<ClaimsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &api::InRealm { realm: q.realm.clone() }).await?;
+    let (owner, by) = claim_owner(&caller);
+    let params = serde_json::json!({"about": q.about, "label": q.label, "filter_owner": q.owner, "policy": q.policy, "same_as": q.same_as});
+    Ok(Json(crate::claims::call(&st, &realm, "memex.claims.list", params, owner, &by).await?))
+}
+
+async fn add_claim(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(c): Json<api::ClaimIn>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    let (owner, by) = claim_owner(&caller);
+    let params = serde_json::to_value(&c).map_err(anyhow::Error::from)?;
+    Ok(Json(crate::claims::call(&st, &realm, "memex.claims.add", params, owner, &by).await?))
+}
+
+/// Retracts a claim of yours (only the owner retracts).
+async fn retract_claim(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<i64>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    let (owner, by) = claim_owner(&caller);
+    Ok(Json(crate::claims::call(&st, &realm, "memex.claims.retract", serde_json::json!({"id": id}), owner, &by).await?))
+}
+
+/// A thing anyone may make (`{kind, name, key?}`).
+async fn create_thing(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(t): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    let (owner, by) = claim_owner(&caller);
+    Ok(Json(crate::claims::call(&st, &realm, "memex.things.create", t, owner, &by).await?))
+}
+
 async fn memex_status(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::MemexStatus>> {
     Ok(Json(crate::memex::status(&st).await?))
 }
@@ -1423,6 +1521,10 @@ async fn memex_rpc(
     }
     let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
     params["made_by"] = serde_json::json!("you");
+    // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
+    if r.method == "memex.graph" {
+        params["policies"] = serde_json::json!(crate::claims::policies(&st, caller.memex_realm()).await);
+    }
     Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), &r.method, params).await?))
 }
 

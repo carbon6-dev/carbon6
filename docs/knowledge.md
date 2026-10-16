@@ -1,6 +1,6 @@
 # Knowledge in the head — Design
 
-Status: proposed (2026-10-16). Nothing here is built. It goes with docs/apps.md: that doc says who owns and changes data, this one says where knowledge is kept and what becomes of the memex. It replaces docs/memex.md §2 (architecture), §4.4 (storage) and §6.1–6.5 (Google accounts and sync) as §11 lists; the rest of memex.md (what knowledge is, the pipelines' work, the mail client's behaviour) still holds.
+Status: being built (2026-10-16); §13 records what is built and where it differs. It goes with docs/apps.md: that doc says who owns and changes data, this one says where knowledge is kept and what becomes of the memex. It replaces docs/memex.md §2 (architecture), §4.4 (storage) and §6.1–6.5 (Google accounts and sync) as §11 lists; the rest of memex.md (what knowledge is, the pipelines' work, the mail client's behaviour) still holds.
 
 ## 1. The idea
 
@@ -153,3 +153,16 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
 - **Long-running kits.** Polling every 30 seconds starts a container each time. Is that fine at personal scale, or do mirror apps need a kit that stays running between runs?
 - **A head with no worker.** Should a head ship a minimal extraction kit it can run itself, sandboxed, so uploads of plain text and Markdown work with no worker at all?
 - **Vectors at scale.** Millions of vectors per realm fit in memory on one machine; whether the index should live on disk (an on-disk ANN index) before that becomes a problem.
+
+## 13. As built
+
+### 13.1 Knowledge in the head (step 1)
+
+- **The memex is a library of the head.** `c6h` opens it at start (`knowledge.rs`) and keeps it in `HeadState`.
+  - Its link to the head is in-process: `HeadLink::local` sends its calls (settings, events, decisions, notices) to `fabric::memex_call`, and its credential requests to the same broker workers use.
+  - The head's memex calls (the outbox, briefs, status, the API, workers' relayed calls) go straight to it, each with a time limit.
+- **Where knowledge lives:** `<data_dir>/knowledge/`, in the memex's own layout: home's `memex.db` and blobs at its root, each other realm's under `realms/<id>/`. This differs from §3's `realms/<realm>/knowledge.db` names, but the separation is the same.
+- **A separate `c6m` is turned away** when it attaches ("the memex is part of the head now"). Moving an existing memex in, and removing `c6m`, is step 7.
+- **Not yet:** parsing and models still run where the memex ran, which is now the head's process. Steps 2 and 6 move them out to kits and system packages.
+- **Deviation: collections stay in `c6h.db`** rather than moving into each realm's knowledge file (§3). Every settings list, the memory notes and the prompts are records of system collections, so moving collections would split the head's own configuration across per-realm files. The record mirror to search is in-process now, so it is synchronous rather than a fabric hop. One store for both is left as a follow-up.
+- **Briefs and memory notes:** with a knowledge store always present, every session gets a brief. Memory notes now always come in the session's Memory section (filtered by their scope), and briefs leave them out instead of repeating them. Before, a scoped note could show in an unrelated session's brief.

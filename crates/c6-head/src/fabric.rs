@@ -8,8 +8,13 @@ use serde_json::{Value, json};
 use crate::{HeadState, bad_request};
 
 /// What a session's tools may ask the memex.
-const SESSION_METHODS: [&str; 20] = [
+const SESSION_METHODS: [&str; 24] = [
     "memex.search",
+    // Claims (docs/apps.md §9): owned by the session's app, or the realm.
+    "memex.claims.add",
+    "memex.claims.retract",
+    "memex.claims.list",
+    "memex.things.create",
     // Environment knowledge.
     "memex.knowledge.record",
     "memex.knowledge.verify",
@@ -33,47 +38,53 @@ const SESSION_METHODS: [&str; 20] = [
     "memex.calendar.rsvp",
 ];
 
+/// What the memex asks of the head (docs/memex.md §2.4): its settings,
+/// events for triggers, decisions, notifications.
+pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
+    match method {
+        "config.get" => crate::memex::config(st).await,
+        "event" => {
+            let kind = params["type"].as_str().unwrap_or_default().to_owned();
+            let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
+            crate::triggers::on_memex_event(st, &realm, &kind, &params["data"]).await;
+            // Realms granted reads of that knowledge hear it too.
+            let item_kind = match kind.as_str() {
+                "mail.received" => "email",
+                other => other.split('.').next().unwrap_or(other),
+            };
+            for (grant, to) in crate::grants::memex_readers(st, &realm, item_kind).await {
+                crate::grants::log_memex_read(st, &grant, "memex event", &kind).await;
+                crate::triggers::on_memex_event(st, &to, &kind, &params["data"]).await;
+            }
+            Ok(json!({}))
+        }
+        // A disputed fact, for you to settle.
+        "todo.add" => {
+            // From the memex, about one realm's knowledge.
+            let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
+            let d: c6_api::DecisionIn = serde_json::from_value(params).map_err(|e| bad_request(format!("{e}")))?;
+            Ok(json!({"id": crate::decisions::open(st, &d, &realm, "").await?.id}))
+        }
+        "notify" => {
+            let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
+            st.notifier.send(crate::notify::Note {
+                event: "notice",
+                title: s("title"),
+                message: s("message"),
+                priority: if s("priority") == "high" { "high" } else { "normal" },
+                labels: vec!["memex".into()],
+                ..Default::default()
+            });
+            Ok(json!({}))
+        }
+        other => Err(bad_request(format!("the memex may not call {other}"))),
+    }
+}
+
 pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Value) -> anyhow::Result<Value> {
     let role = st.registry.get(from).map(|l| l.role).unwrap_or_default();
     if role == "memex" {
-        return match method {
-            "config.get" => crate::memex::config(st).await,
-            "event" => {
-                let kind = params["type"].as_str().unwrap_or_default().to_owned();
-                let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
-                crate::triggers::on_memex_event(st, &realm, &kind, &params["data"]).await;
-                // Realms granted reads of that knowledge hear it too.
-                let item_kind = match kind.as_str() {
-                    "mail.received" => "email",
-                    other => other.split('.').next().unwrap_or(other),
-                };
-                for (grant, to) in crate::grants::memex_readers(st, &realm, item_kind).await {
-                    crate::grants::log_memex_read(st, &grant, "memex event", &kind).await;
-                    crate::triggers::on_memex_event(st, &to, &kind, &params["data"]).await;
-                }
-                Ok(json!({}))
-            }
-            // A disputed fact, for you to settle.
-            "todo.add" => {
-                // From the memex, about one realm's knowledge.
-                let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
-                let d: c6_api::DecisionIn = serde_json::from_value(params).map_err(|e| bad_request(format!("{e}")))?;
-                Ok(json!({"id": crate::decisions::open(st, &d, &realm, "").await?.id}))
-            }
-            "notify" => {
-                let s = |k: &str| params[k].as_str().unwrap_or_default().to_owned();
-                st.notifier.send(crate::notify::Note {
-                    event: "notice",
-                    title: s("title"),
-                    message: s("message"),
-                    priority: if s("priority") == "high" { "high" } else { "normal" },
-                    labels: vec!["memex".into()],
-                    ..Default::default()
-                });
-                Ok(json!({}))
-            }
-            other => Err(bad_request(format!("the memex may not call {other}"))),
-        };
+        return memex_call(st, method, params).await;
     }
     // Action items and the API reference, for one of this worker's sessions.
     if let Some(what) = method.strip_prefix("session.") {
@@ -111,9 +122,17 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 if realm != own && !crate::grants::may_start(st, &realm, &own, template, &format!("session:{target}")).await {
                     return Err(bad_request(format!("realm {own} may not start {realm}'s template {template:?}; no grant allows it")));
                 }
-                let run = crate::templates::run(st, template, params["input"].as_str().unwrap_or_default(), &[format!("started-by:{target}")], &realm)
-                    .await?;
-                Ok(json!({"run_id": run.run_id, "realm": realm, "sessions": run.sessions.iter().map(|s| &s.id).collect::<Vec<_>>(), "errors": run.errors}))
+                let run = crate::templates::run(
+                    st,
+                    template,
+                    params["input"].as_str().unwrap_or_default(),
+                    &[format!("started-by:{target}")],
+                    &realm,
+                )
+                .await?;
+                Ok(
+                    json!({"run_id": run.run_id, "realm": realm, "sessions": run.sessions.iter().map(|s| &s.id).collect::<Vec<_>>(), "errors": run.errors}),
+                )
             }
             // An app's operation (docs/apps.md §7).
             "app_call" => crate::operations::for_session(st, &target, &params).await,
@@ -152,7 +171,16 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     }
     let labels = session.all_labels();
     params["scope"] = json!(crate::memex::scope_for(st, &labels).await);
+    // An app's session sees the item kinds its install approved (docs/apps.md §5.2).
+    if let Some(i) = crate::instances::of_session(&st.store.pool, &session_id).await? {
+        params["scope"] = json!(crate::instances::approved_reads(&st.store.pool, i.id).await?.items.kinds);
+    }
     params["made_by"] = json!(format!("session:{session_id}"));
+    let owner = crate::claims::owner_of_session(st, &session_id).await;
+    if method.starts_with("memex.claims.") || method == "memex.things.create" {
+        return crate::claims::call(st, &session.realm, method, params, &owner, &format!("session:{session_id}")).await;
+    }
+    params["owner"] = json!(owner);
     if method == "memex.note" && params["labels"].as_array().is_none_or(|a| a.is_empty()) {
         params["labels"] = json!(labels.into_iter().filter(|l| !l.starts_with("model:")).collect::<Vec<_>>());
     }

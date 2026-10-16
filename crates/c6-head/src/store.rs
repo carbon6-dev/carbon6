@@ -228,6 +228,7 @@ impl Store {
         let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
         crate::lists::ensure(&pool).await?;
         crate::prompts::seed(&pool).await?;
+        crate::claims::seed(&pool).await?;
         crate::packages::fix_legacy(&pool).await?;
         Ok((Self { pool }, report))
     }

@@ -4,9 +4,7 @@
 use std::time::Duration;
 
 use c6_head::HeadConfig;
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
@@ -36,16 +34,7 @@ async fn records_are_searchable() {
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     let http = reqwest::Client::new();
     let stop = CancellationToken::new();
-    let dir = tempfile::tempdir().unwrap();
-    let e = c6_head::api::new_enrollment(&head.state, Some("memex")).await.unwrap();
-    enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
-    let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-    m.spawn_jobs();
-    w.set_extension(m);
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    // The knowledge store is the head's own (docs/knowledge.md).
 
     let r = http
         .post(format!("{api}/collections"))
@@ -98,16 +87,7 @@ async fn edited_prompts_reach_the_memex() {
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     let http = reqwest::Client::new();
     let stop = CancellationToken::new();
-    let dir = tempfile::tempdir().unwrap();
-    let e = c6_head::api::new_enrollment(&head.state, Some("memex")).await.unwrap();
-    enroll::enroll(&e.token).await.unwrap().save(dir.path()).unwrap();
-    let w = Worker::open(dir.path(), Identity::load(dir.path()).unwrap()).await.unwrap();
-    let m = c6_memex::Memex::open(&dir.path().join("memex"), w.link.clone()).await.unwrap();
-    m.spawn_jobs();
-    w.set_extension(m);
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    // The knowledge store is the head's own (docs/knowledge.md).
 
     let r = http
         .post(format!("{api}/memex/rpc"))
