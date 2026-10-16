@@ -2,6 +2,8 @@
 
 Status: v0.2 (2026-10-11). The whole build order (section 10) is built; the "As built" sections record where it differs. The Google flows and face recognition are tested only against fakes. v0.2 added Google accounts, calendar and contacts, and records the decisions in section 11.
 
+> **Proposed change:** [knowledge.md](knowledge.md) moves the knowledge graph into the head and removes `c6m`. It replaces §2 (architecture, including §2.1, §2.3 and §2.4), §4.4 (storage) and §6.1–6.5 (Google accounts and sync, which become apps). The rest of this doc still describes what the memex's knowledge is and what its pipelines and mail client do.
+
 > "A memex is a device in which an individual stores all his books, records, and communications, and which is mechanized so that it may be consulted with exceeding speed and flexibility." (Vannevar Bush, *As We May Think*, 1945)
 
 ## 1. Goals
@@ -30,6 +32,8 @@ The memex is your personal knowledge store, and it holds the context carbon6 wor
 - encryption at rest: that's left to the disks (FileVault, LUKS, an encrypted NAS volume).
 
 ## 2. Architecture
+
+> Replaced, if [knowledge.md](knowledge.md) is built: the head keeps the graph (§2–§3 there).
 
 ```
                          c6 fabric (mTLS, private network / tailnet)
@@ -199,6 +203,8 @@ trail(id, name, description) ; trail_step(trail_id, ordinal, target, comment)
 
 ### 4.4 Storage
 
+> Replaced, if [knowledge.md](knowledge.md) is built: per-realm knowledge files in the head, and blobs where you choose (§3, §5 there).
+
 - **SQLite (WAL)** for items, parts, the graph, mail state and jobs. Full-text search uses FTS5 with trigram and word tokenizers, as the head already does.
 - **A vector index per embedding space:** an in-process approximate index (HNSW) in Rust, with the vectors also in SQLite so the index can be rebuilt. Sized for millions of vectors on one machine.
 - **Blobs** in a content-addressed directory (`blobs/ab/cdef…`).
@@ -363,6 +369,8 @@ Jobs live in a durable queue in the memex database, each with a priority, a budg
   - Both are on every thing's page, under the Memex page's Review and Commitments tabs.
 
 ## 6. Mail, calendar and contacts
+
+> §6.1–6.5 become the `gmail`, `google-calendar` and `google-contacts` apps if [knowledge.md](knowledge.md) is built (§6 there). What they do stays as written here.
 
 carbon6 replaces the mail client, the calendar and the address book, starting with Google: any number of Gmail and Google Workspace accounts. The provider layer is an interface, so IMAP/SMTP, JMAP, CalDAV and CardDAV can be added later without changing the rest.
 

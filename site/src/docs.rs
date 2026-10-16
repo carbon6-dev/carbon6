@@ -57,6 +57,12 @@ pub const GROUPS: &[Group] = &[
                 summary: "Proposed: apps as instances in realms you choose, data open to read and written only by its owner, and code that changes only by upgrade.",
             },
             Doc {
+                slug: "knowledge",
+                file: "docs/knowledge.md",
+                label: "Knowledge in the head",
+                summary: "Proposed: the head keeps the knowledge graph, parsing runs in sandboxed kits, and Gmail, Calendar and Contacts become apps.",
+            },
+            Doc {
                 slug: "explorer",
                 file: "docs/explorer.md",
                 label: "Realm explorer",

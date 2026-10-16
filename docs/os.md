@@ -255,7 +255,7 @@ record_history(record_id, version, fields JSON, changed_by, changed_at)
 - **Search and briefs.** Records are mirrored into the memex as items of kind `record`, the way facts are, so search finds them and briefs can mention them.
 - **Queries:** a small JSON filter language with equality, ranges, `in`, text match on string fields, sorting, grouping with counts, and paging. There's deliberately no SQL, so queries stay safe and portable.
 - **Effects:** deleting a record or dropping a collection is destructive, and asks first (4.2).
-- **Where they live:** in the head's database. The head is the always-on core, next to the triggers that react to changes. The memex is optional and may run on another machine, so it only holds the search mirror.
+- **Where they live:** in the head's database. The head is the always-on core, next to the triggers that react to changes. The memex is optional and may run on another machine, so it only holds the search mirror. ([knowledge.md](knowledge.md) proposes moving them into each realm's knowledge file in the head, with the graph.)
 
 #### As built (step 2a)
 
