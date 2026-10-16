@@ -5,7 +5,6 @@
 
 use base64::Engine;
 use c6_api as api;
-use mail_parser::MimeHeaders;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tracing::{info, warn};
@@ -62,26 +61,10 @@ pub async fn sync(m: &Memex, acct: &Account) -> anyhow::Result<()> {
             for a in rec["messagesAdded"].as_array().into_iter().flatten() {
                 let msg = &a["message"];
                 let id = msg["id"].as_str().unwrap_or_default();
-                if m.mail_item(&acct.id, id).await?.is_none()
-                    && let Some(item) = fetch(m, acct, id).await?
-                    && st.phase == "live"
-                    && labels_of(msg).iter().any(|l| l == "INBOX")
-                {
-                    {
-                        let r =
-                            sqlx::query("SELECT from_addr, from_name, to_json, subject, snippet, thread_id FROM mail WHERE item_id = ?")
-                                .bind(&item)
-                                .fetch_one(&m.store.pool)
-                                .await?;
-                        let to: Vec<(String, String)> = serde_json::from_str(&r.get::<String, _>("to_json")).unwrap_or_default();
-                        let data = json!({
-                            "account": acct.email, "item_id": item, "thread_id": r.get::<String, _>("thread_id"),
-                            "from": format!("{} <{}>", r.get::<String, _>("from_name"), r.get::<String, _>("from_addr")),
-                            "to": to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "),
-                            "subject": r.get::<String, _>("subject"), "snippet": r.get::<String, _>("snippet"),
-                        });
-                        m.emit("mail.received", data).await;
-                    }
+                if m.mail_item(&acct.id, id).await?.is_none() {
+                    // A new message in the inbox is told about once it's read.
+                    let tell = st.phase == "live" && labels_of(msg).iter().any(|l| l == "INBOX");
+                    fetch(m, acct, id, tell).await?;
                 }
             }
             for d in rec["messagesDeleted"].as_array().into_iter().flatten() {
@@ -118,7 +101,7 @@ pub async fn sync(m: &Memex, acct: &Account) -> anyhow::Result<()> {
         for msg in list["messages"].as_array().into_iter().flatten() {
             let id = msg["id"].as_str().unwrap_or_default();
             if m.mail_item(&acct.id, id).await?.is_none() {
-                match fetch(m, acct, id).await {
+                match fetch(m, acct, id, false).await {
                     Ok(_) => st.done += 1,
                     Err(e) => warn!(account = %acct.email, message = %id, "not imported: {e:#}"),
                 }
@@ -152,32 +135,37 @@ pub async fn labels(m: &Memex, acct: &Account) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fetches a message in full and stores it; its item id.
-async fn fetch(m: &Memex, acct: &Account, id: &str) -> anyhow::Result<Option<String>> {
+/// Fetches a message in full and asks for it to be read and stored.
+async fn fetch(m: &Memex, acct: &Account, id: &str, tell: bool) -> anyhow::Result<()> {
+    let key = format!("gmail:{}:{id}", acct.id);
+    if crate::extract::queued(m, &key).await? {
+        return Ok(());
+    }
     let v = match m.google.get(&acct.id, &format!("/gmail/v1/users/me/messages/{id}"), &[("format", "raw".into())]).await {
         Ok(v) => v,
-        Err(e) if status_of(&e) == Some(404) => return Ok(None),
+        Err(e) if status_of(&e) == Some(404) => return Ok(()),
         Err(e) => return Err(e),
     };
     let raw = b64url_decode(v["raw"].as_str().unwrap_or_default())?;
     let date = v["internalDate"].as_str().and_then(|d| d.parse().ok()).unwrap_or_else(c6_core::now_ms);
-    Ok(Some(store_message(m, acct, id, v["threadId"].as_str().unwrap_or(id), &labels_of(&v), date, &raw).await?))
+    let blob = m.put_blob(&raw).await?;
+    let params = json!({"kind": "gmail", "account": acct.id, "gmail_id": id, "thread_id": v["threadId"].as_str().unwrap_or(id),
+        "labels": labels_of(&v), "date": date, "tell": tell});
+    crate::extract::queue(m, &key, "mail", &format!("head:{blob}"), "", params).await
 }
 
-/// Stores a message: the item (its text searchable), the mail row, its
-/// labels, and links to the people it is from and to.
-pub async fn store_message(
-    m: &Memex,
-    acct: &Account,
-    gmail_id: &str,
-    thread_id: &str,
-    labels: &[String],
-    date: i64,
-    raw: &[u8],
-) -> anyhow::Result<String> {
-    let msg = mail_parser::MessageParser::default().parse(raw).ok_or_else(|| anyhow::anyhow!("not a mail message"))?;
+/// A synced message, read: the item (its text searchable), the mail row,
+/// its labels, and links to the people it is from and to; told about if
+/// it came to the inbox while live.
+pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &Parsed) -> anyhow::Result<String> {
+    let p = job.params;
+    let s = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
+    let (account, gmail_id, thread_id) = (s("account"), s("gmail_id"), s("thread_id"));
+    let acct = m.account(&account)?;
+    let labels: Vec<String> = serde_json::from_value(p["labels"].clone()).unwrap_or_default();
+    let date = p["date"].as_i64().unwrap_or_else(c6_core::now_ms);
     let source = format!("gmail:{}", acct.id);
-    let rfc_id = msg.message_id().unwrap_or("").to_owned();
+    let rfc_id = parsed.message_id.clone();
     // Imported earlier and now synced: the item becomes the synced one and
     // keeps its id, so links and notes made meanwhile stay.
     if !rfc_id.is_empty() {
@@ -189,14 +177,14 @@ pub async fn store_message(
             let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
             sqlx::query("UPDATE items SET source = ?, external_id = ? WHERE id = ?")
                 .bind(&source)
-                .bind(gmail_id)
+                .bind(&gmail_id)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE mail SET account = ?, gmail_id = ?, thread_id = ? WHERE item_id = ?")
                 .bind(&acct.id)
-                .bind(gmail_id)
-                .bind(thread_id)
+                .bind(&gmail_id)
+                .bind(&thread_id)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
@@ -205,14 +193,100 @@ pub async fn store_message(
     }
     let to = Stored {
         account: &acct.id,
-        external_id: gmail_id,
-        thread_id,
+        external_id: &gmail_id,
+        thread_id: &thread_id,
         source: &source,
         rfc_id: &rfc_id,
         origin: "mirrored",
         owner: &acct.email,
     };
-    store(m, &msg, raw, &to, labels, date).await
+    let blob = job.input.strip_prefix("head:").unwrap_or_default();
+    let item = store(m, parsed, blob, &to, &labels, date).await?;
+    if p["tell"].as_bool() == Some(true) {
+        let r = sqlx::query("SELECT from_addr, from_name, to_json, subject, snippet, thread_id FROM mail WHERE item_id = ?")
+            .bind(&item)
+            .fetch_one(&m.store.pool)
+            .await?;
+        let to: Vec<(String, String)> = serde_json::from_str(&r.get::<String, _>("to_json")).unwrap_or_default();
+        let data = json!({
+            "account": acct.email, "item_id": item, "thread_id": r.get::<String, _>("thread_id"),
+            "from": format!("{} <{}>", r.get::<String, _>("from_name"), r.get::<String, _>("from_addr")),
+            "to": to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "),
+            "subject": r.get::<String, _>("subject"), "snippet": r.get::<String, _>("snippet"),
+        });
+        m.emit("mail.received", data).await;
+    }
+    Ok(item)
+}
+
+/// A message as c6-extract read it.
+#[derive(Default)]
+pub struct Parsed {
+    pub message_id: String,
+    pub from: (String, String),
+    pub to: Vec<(String, String)>,
+    pub cc: Vec<(String, String)>,
+    pub subject: String,
+    pub text: String,
+    pub html: Option<Vec<u8>>,
+    pub list: bool,
+    pub attachments: Vec<Value>,
+}
+
+impl Parsed {
+    pub fn of(v: &Value, files: &std::collections::BTreeMap<String, Vec<u8>>) -> Self {
+        let pairs = |k: &str| -> Vec<(String, String)> { serde_json::from_value(v[k].clone()).unwrap_or_default() };
+        Self {
+            message_id: v["message_id"].as_str().unwrap_or_default().to_owned(),
+            from: serde_json::from_value(v["from"].clone()).unwrap_or_default(),
+            to: pairs("to"),
+            cc: pairs("cc"),
+            subject: v["subject"].as_str().unwrap_or_default().trim().to_owned(),
+            text: v["text"].as_str().unwrap_or_default().to_owned(),
+            html: files.get("html").cloned(),
+            list: v["list"].as_bool().unwrap_or(false),
+            attachments: v["attachments"].as_array().cloned().unwrap_or_default(),
+        }
+    }
+}
+
+/// Mail kept before messages were read once (its text, HTML and
+/// attachments' names): read again, a few at a time.
+pub async fn backfill(m: &Memex) -> anyhow::Result<usize> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_id, blob FROM mail WHERE parsed = 0 AND ('reparse:' || item_id) NOT IN (SELECT key FROM extractions) LIMIT 100",
+    )
+    .fetch_all(&m.store.pool)
+    .await?;
+    for (item, blob) in &rows {
+        crate::extract::queue(m, &format!("reparse:{item}"), "mail", &format!("head:{blob}"), "", json!({"kind": "reparse", "item": item}))
+            .await?;
+    }
+    Ok(rows.len())
+}
+
+/// Keeps what reading an older message again found.
+pub async fn reparsed(m: &Memex, job: &crate::extract::Done<'_>, parsed: &Parsed) -> anyhow::Result<String> {
+    let item = job.params["item"].as_str().unwrap_or_default().to_owned();
+    let (text_blob, html_blob) = parts_of(m, parsed).await?;
+    sqlx::query("UPDATE mail SET text_blob = ?, html_blob = ?, parts = ?, attachments = ?, parsed = 1 WHERE item_id = ?")
+        .bind(&text_blob)
+        .bind(&html_blob)
+        .bind(json!(parsed.attachments).to_string())
+        .bind(parsed.attachments.len() as i64)
+        .bind(&item)
+        .execute(&m.store.pool)
+        .await?;
+    Ok(item)
+}
+
+async fn parts_of(m: &Memex, parsed: &Parsed) -> anyhow::Result<(String, Option<String>)> {
+    let text = m.put_blob(parsed.text.as_bytes()).await?;
+    let html = match &parsed.html {
+        Some(h) => Some(m.put_blob(h).await?),
+        None => None,
+    };
+    Ok((text, html))
 }
 
 /// Where a message is kept: its mail account (a Gmail account's id, or
@@ -230,40 +304,16 @@ pub struct Stored<'a> {
     pub owner: &'a str,
 }
 
-/// Stores a parsed message: the item (searchable text, the people as
-/// links) and its row in the mail store.
-pub async fn store(
-    m: &Memex,
-    msg: &mail_parser::Message<'_>,
-    raw: &[u8],
-    at: &Stored<'_>,
-    labels: &[String],
-    date: i64,
-) -> anyhow::Result<String> {
-    let addrs = |a: Option<&mail_parser::Address>| -> Vec<(String, String)> {
-        a.map(|a| a.iter().filter_map(|x| Some((x.address()?.to_lowercase(), x.name().unwrap_or("").to_owned()))).collect())
-            .unwrap_or_default()
-    };
-    let from = addrs(msg.from()).into_iter().next().unwrap_or_default();
-    let (to, cc) = (addrs(msg.to()), addrs(msg.cc()));
-    let subject = msg.subject().unwrap_or("").trim().to_owned();
-    let body = match msg.body_text(0) {
-        Some(t) if !t.trim().is_empty() => t.into_owned(),
-        _ => msg.body_html(0).map(|h| htmd::convert(&h).unwrap_or_default()).unwrap_or_default(),
-    };
-    let attachments: Vec<Value> = msg
-        .attachments()
-        .enumerate()
-        .map(|(i, a)| {
-            json!({"index": i, "name": a.attachment_name().unwrap_or("attachment"), "size": a.contents().len(),
-                              "mime": a.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or(""))).unwrap_or_default()})
-        })
-        .collect();
-    let list = msg.header_raw("List-Unsubscribe").is_some()
-        || msg.header_raw("List-Id").is_some()
-        || from.0.contains("noreply")
-        || from.0.contains("no-reply");
-    let blob = m.put_blob(raw).await?;
+/// Stores a read message: the item (searchable text, the people as
+/// links) and its row in the mail store. `blob`: the raw message's.
+pub async fn store(m: &Memex, msg: &Parsed, blob: &str, at: &Stored<'_>, labels: &[String], date: i64) -> anyhow::Result<String> {
+    let from = msg.from.clone();
+    let (to, cc) = (msg.to.clone(), msg.cc.clone());
+    let subject = msg.subject.clone();
+    let body = msg.text.clone();
+    let attachments = &msg.attachments;
+    let list = msg.list || from.0.contains("noreply") || from.0.contains("no-reply");
+    let (text_blob, html_blob) = parts_of(m, msg).await?;
     let spam = labels.iter().any(|l| l == "SPAM");
     let who = |v: &[(String, String)]| {
         v.iter().map(|(a, n)| if n.is_empty() { a.clone() } else { format!("{n} <{a}>") }).collect::<Vec<_>>().join(", ")
@@ -288,9 +338,11 @@ pub async fn store(
     let has = |l: &str| labels.iter().any(|x| x == l) as i64;
     sqlx::query(
         "INSERT INTO mail (item_id, account, gmail_id, thread_id, rfc_id, date, from_addr, from_name, to_json, cc_json, subject, snippet, labels, \
-         unread, starred, inbox, spam, trash, sent, draft, list, attachments, blob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         unread, starred, inbox, spam, trash, sent, draft, list, attachments, blob, text_blob, html_blob, parts, parsed) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) \
          ON CONFLICT(item_id) DO UPDATE SET labels = excluded.labels, unread = excluded.unread, starred = excluded.starred, inbox = excluded.inbox, \
-         spam = excluded.spam, trash = excluded.trash, sent = excluded.sent, draft = excluded.draft",
+         spam = excluded.spam, trash = excluded.trash, sent = excluded.sent, draft = excluded.draft, text_blob = excluded.text_blob, \
+         html_blob = excluded.html_blob, parts = excluded.parts, parsed = 1",
     )
     .bind(&item_id)
     .bind(at.account)
@@ -314,7 +366,10 @@ pub async fn store(
     .bind(has("DRAFT"))
     .bind(list as i64)
     .bind(attachments.len() as i64)
-    .bind(&blob)
+    .bind(blob)
+    .bind(&text_blob)
+    .bind(&html_blob)
+    .bind(json!(attachments).to_string())
     .execute(&m.store.pool)
     .await?;
     set_labels(m, &item_id, labels).await?;
@@ -475,26 +530,46 @@ pub async fn thread(m: &Memex, account: &str, thread_id: &str) -> anyhow::Result
         .await?;
     let mut out = Vec::new();
     for r in rows {
-        let raw = tokio::fs::read(m.blob_path(&r.get::<String, _>("blob"))).await.unwrap_or_default();
-        let msg = mail_parser::MessageParser::default().parse(&raw);
-        let (text, html, attachments) = match &msg {
-            Some(p) => (
-                p.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
-                p.body_html(0).map(|t| t.into_owned()),
-                p.attachments()
-                    .enumerate()
-                    .map(|(i, a)| api::MailAttachment {
-                        index: i as u32,
-                        name: a.attachment_name().unwrap_or("attachment").to_owned(),
-                        mime: a.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or(""))).unwrap_or_default(),
-                        size: a.contents().len() as u64,
-                    })
-                    .collect(),
-            ),
-            None => (String::new(), None, Vec::new()),
+        let read = |hash: Option<String>| async move {
+            match hash {
+                Some(h) => tokio::fs::read(m.blob_path(&h)).await.ok().map(|b| String::from_utf8_lossy(&b).into_owned()),
+                None => None,
+            }
         };
+        let item_id: String = r.get("item_id");
+        let (text, html) = if r.get::<i64, _>("parsed") == 1 {
+            (read(r.get("text_blob")).await.unwrap_or_default(), read(r.get("html_blob")).await)
+        } else {
+            // Kept before messages were read once: its searchable text for
+            // now, and read again soon.
+            crate::extract::queue(
+                m,
+                &format!("reparse:{item_id}"),
+                "mail",
+                &format!("head:{}", r.get::<String, _>("blob")),
+                "",
+                json!({"kind": "reparse", "item": item_id}),
+            )
+            .await?;
+            let body: String = sqlx::query_scalar("SELECT body FROM items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_optional(&m.store.pool)
+                .await?
+                .unwrap_or_default();
+            (body.splitn(4, '\n').nth(3).unwrap_or(&body).to_owned(), None)
+        };
+        let attachments = serde_json::from_str::<Vec<Value>>(&r.get::<String, _>("parts"))
+            .unwrap_or_default()
+            .iter()
+            .map(|a| api::MailAttachment {
+                index: a["index"].as_u64().unwrap_or(0) as u32,
+                name: a["name"].as_str().unwrap_or("attachment").to_owned(),
+                mime: a["mime"].as_str().unwrap_or_default().to_owned(),
+                size: a["size"].as_u64().unwrap_or(0),
+            })
+            .collect();
         out.push(api::MailMessage {
-            item_id: r.get("item_id"),
+            item_id,
             gmail_id: r.get("gmail_id"),
             from: r.get("from_addr"),
             from_name: r.get("from_name"),
@@ -512,23 +587,17 @@ pub async fn thread(m: &Memex, account: &str, thread_id: &str) -> anyhow::Result
     Ok(out)
 }
 
-/// A message's attachment: (name, mime, bytes).
+/// A message's attachment: (name, mime, bytes), read from the message
+/// when asked for.
 pub async fn attachment(m: &Memex, item_id: &str, index: usize) -> anyhow::Result<(String, String, Vec<u8>)> {
     let blob: String = sqlx::query_scalar("SELECT blob FROM mail WHERE item_id = ?")
         .bind(item_id)
         .fetch_optional(&m.store.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no such message"))?;
-    let raw = tokio::fs::read(m.blob_path(&blob)).await?;
-    let msg = mail_parser::MessageParser::default().parse(&raw).ok_or_else(|| anyhow::anyhow!("unreadable message"))?;
-    let a = msg.attachments().nth(index).ok_or_else(|| anyhow::anyhow!("no attachment {index}"))?;
-    Ok((
-        a.attachment_name().unwrap_or("attachment").to_owned(),
-        a.content_type()
-            .map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("")))
-            .unwrap_or_else(|| "application/octet-stream".into()),
-        a.contents().to_vec(),
-    ))
+    let (v, mut files) = crate::extract::now(m, "attachment", &format!("head:{blob}"), "", Some(index as u64)).await?;
+    let data = files.remove("data").ok_or_else(|| anyhow::anyhow!("no attachment {index}"))?;
+    Ok((v["name"].as_str().unwrap_or("attachment").to_owned(), v["mime"].as_str().unwrap_or("application/octet-stream").to_owned(), data))
 }
 
 /// Adds and removes labels on a thread (in Gmail, then here; imported

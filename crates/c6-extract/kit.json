@@ -1,0 +1,26 @@
+{
+  "package": "c6-extract",
+  "version": "1.0.0",
+  "description": "Reads what carbon6's knowledge store keeps but never parses itself: mail, PDF, Word and HTML documents, photos (EXIF, thumbnails, faces) and videos (keyframes, sound).",
+  "permissions": {
+    "files": "session",
+    "network": "none",
+    "cpus": 2,
+    "memory_mb": 2048,
+    "timeout_s": 600
+  },
+  "kit": {
+    "build": {
+      "dockerfile": "Dockerfile",
+      "files": ["Cargo.toml", "Cargo.lock", "src/lib.rs", "src/main.rs", "src/docs.rs", "src/mail.rs", "src/media.rs", "src/faces.rs"]
+    },
+    "tools": [
+      {
+        "name": "extract",
+        "description": "Runs jobs.json's jobs (see c6-extract's README in the source): results in out/result.json.",
+        "command": ["c6-extract", "/work/jobs.json"],
+        "args": {}
+      }
+    ]
+  }
+}

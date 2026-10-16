@@ -165,7 +165,7 @@ fn AddFiles() -> impl IntoView {
     };
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-            <p class="text-sm text-zinc-500">"PDF, Word (.docx), Markdown, HTML or text, up to 50 MB each. Research papers are recognized: their title, authors, identifiers and the papers they cite join the graph. To keep a folder in sync instead, add it under Settings → Memex folders."</p>
+            <p class="text-sm text-zinc-500">"PDF, Word (.docx), Markdown, HTML or text, up to 40 MB each (all but text are read by the c6-extract kit on a worker). Research papers are recognized: their title, authors, identifiers and the papers they cite join the graph. To keep a folder in sync instead, add it under Settings → Memex folders."</p>
             <input class=format!("{INPUT} font-mono text-xs") placeholder="labels for these files, e.g. research, client:acme" prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
             <input type="file" multiple accept=".pdf,.docx,.md,.markdown,.txt,.html,.htm,.rst" class="text-sm" on:change=pick />
             <ul class="space-y-1 text-sm">
@@ -488,7 +488,7 @@ pub fn MemexSettings() -> impl IntoView {
     let tasks: [(&'static str, RwSignal<String>, RwSignal<String>); 3] =
         ["understanding", "vision", "transcription"].map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new())));
     let per_day = RwSignal::new(String::new());
-    // Files on the memex's machine: places, face models.
+    // Files on the head's machine: places, face models.
     let files: [(&'static str, RwSignal<String>); 3] =
         ["places_file", "face_detector", "face_embedder"].map(|k| (k, RwSignal::new(String::new())));
     Effect::new(move || {
@@ -610,7 +610,7 @@ pub fn MemexSettings() -> impl IntoView {
                         </label>
                     }
                 }).collect_view()}
-                <p class="text-xs text-zinc-500 sm:col-span-3">"Photos and videos in memex folders are read in place. Files above are paths on the memex's machine; nothing is downloaded for you. Places: a GeoNames cities file names where photos were taken. Faces: an UltraFace-style detector and an ArcFace- or MobileFaceNet-style embedder; faces are grouped and you name them in Review. Videos get keyframes and transcripts when ffmpeg is installed there."</p>
+                <p class="text-xs text-zinc-500 sm:col-span-3">"Photos and videos in memex folders are read in place, by the c6-extract kit on their worker. Files above are paths on the head's machine; nothing is downloaded for you. Places: a GeoNames cities file names where photos were taken. Faces: an UltraFace-style detector and an ArcFace- or MobileFaceNet-style embedder (sent to the kit); faces are grouped and you name them in Review. Videos get keyframes, and transcripts with a transcription model."</p>
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Model calls a day"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />

@@ -44,6 +44,7 @@ uuid = { version = "1.28.0", features = ["v7"] }
 [dev-dependencies]
 async-trait = "0.1.92"
 base64 = "0.23"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 axum = "0.8"
 c6-api.workspace = true
 c6-core.workspace = true

@@ -87,6 +87,7 @@ const PAPER: [&str; 16] = [
 
 #[tokio::test]
 async fn documents_papers_and_trails() {
+    crate::extract_here();
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {

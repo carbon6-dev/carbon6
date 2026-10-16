@@ -22,6 +22,7 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
 
 #[tokio::test]
 async fn realms_have_their_own_knowledge() {
+    crate::extract_here();
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),

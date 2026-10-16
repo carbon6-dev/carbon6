@@ -3397,6 +3397,9 @@ pub struct MemexStatus {
     /// Suggestions waiting for you.
     #[serde(default)]
     pub review: u64,
+    /// Files waiting to be read by the c6-extract kit on a worker.
+    #[serde(default)]
+    pub extracting: u64,
 }
 
 /// Who owes what, by when (`/api/v1/memex/commitments`), read from mail and
@@ -3502,12 +3505,13 @@ pub struct MemexSettings {
     /// Transcribes videos' speech (an OpenAI-style /audio/transcriptions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcription: Option<MemexModel>,
-    /// A GeoNames cities file on the memex's machine (e.g. cities1000.txt),
+    /// A GeoNames cities file on the head's machine (e.g. cities1000.txt),
     /// for naming where photos were taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub places_file: Option<String>,
-    /// Face models (ONNX files on the memex's machine): a detector
-    /// (UltraFace-style) and an embedder (ArcFace or MobileFaceNet-style).
+    /// Face models (ONNX files on the head's machine, sent to the
+    /// c6-extract kit): a detector (UltraFace-style) and an embedder
+    /// (ArcFace or MobileFaceNet-style).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_detector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3661,12 +3665,16 @@ pub struct IngestType {
     pub produces: Vec<String>,
 }
 
-/// A folder the memex watches (`/api/v1/settings/memex_folders`), on the
-/// machine the memex runs on.
+/// A folder the knowledge store watches (`/api/v1/settings/memex_folders`),
+/// on a worker: its files stay there and are read there.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MemexFolder {
     pub path: String,
+    /// The worker it is on (its name); empty: the worker on the head's
+    /// machine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker: String,
     /// Labels for what is found there (e.g. research, client:acme).
     #[serde(default)]
     pub labels: Vec<String>,

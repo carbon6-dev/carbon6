@@ -38,6 +38,7 @@ async fn node(head: &c6_head::Head, _memex: bool, stop: &CancellationToken) -> (
 
 #[tokio::test]
 async fn memex_round_trip() {
+    crate::extract_here();
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {

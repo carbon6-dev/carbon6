@@ -31,6 +31,10 @@ pub struct Job {
     pub inputs: BTreeMap<String, Vec<u8>>,
     /// Environment for this run only (access tokens, approved secrets).
     pub env: Vec<(String, String)>,
+    /// The worker to run on (default: any that can).
+    pub worker: Option<c6_core::WorkerId>,
+    /// The worker's own files the run reads: (its path, where under /mnt).
+    pub mounts: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -82,14 +86,19 @@ fn command(spec: &Value, tool: &str, args: &serde_json::Map<String, Value>) -> a
 /// Runs a job on a worker that can, and returns what it made.
 pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
     let workers = st.registry.with_capability("kits");
-    let worker = *workers
-        .first()
-        .ok_or_else(|| bad_request("no worker with a container runtime (Docker or Podman) is connected: kit jobs run on one"))?;
+    let worker = match job.worker {
+        Some(w) if workers.contains(&w) => w,
+        Some(_) => return Err(bad_request("that worker is not connected, or has no container runtime (Docker or Podman)")),
+        None => *workers
+            .first()
+            .ok_or_else(|| bad_request("no worker with a container runtime (Docker or Podman) is connected: kit jobs run on one"))?,
+    };
     let cmd = command(&job.spec, &job.tool, &job.args)?;
     let b64 = base64::engine::general_purpose::STANDARD;
     let inputs: serde_json::Map<String, Value> = job.inputs.iter().map(|(k, v)| (k.clone(), json!(b64.encode(v)))).collect();
     let limit = Duration::from_secs(job.spec["permissions"]["timeout_s"].as_u64().unwrap_or(120)) + BUILD_ALLOWANCE;
-    let params = json!({"spec": job.spec, "command": cmd, "inputs": inputs, "env": job.env});
+    let mounts: Vec<Value> = job.mounts.iter().map(|(path, at)| json!({"path": path, "at": at})).collect();
+    let params = json!({"spec": job.spec, "command": cmd, "inputs": inputs, "env": job.env, "mounts": mounts});
     let v = st.registry.call(worker, "kit.job", params, limit).await.map_err(|e| anyhow::anyhow!("kit job: {e}"))?;
     let mut files = BTreeMap::new();
     for (k, data) in v["files"].as_object().into_iter().flatten() {
@@ -200,7 +209,7 @@ pub async fn for_instance(
         }
     }
     env.extend(crate::providers::tokens_for(st, realm, instance).await?);
-    let out = run(st, Job { spec, tool: tool.to_owned(), args, inputs, env }).await?;
+    let out = run(st, Job { spec, tool: tool.to_owned(), args, inputs, env, ..Default::default() }).await?;
     let mut result = json!({"exit": out.exit, "stdout": out.stdout, "stderr": out.stderr,
         "files": out.files.keys().cloned().collect::<Vec<_>>()});
     if let Some(batch) = out.files.get("ingest.json") {

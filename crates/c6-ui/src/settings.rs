@@ -219,7 +219,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="memex_folders"
                         title="Memex folders"
                         noun="folder"
-                        help="Folders on the memex's machine that it keeps in sync: documents and papers (PDF, Word, Markdown, HTML, text) in them and their subfolders are read, changes are picked up every few minutes, and removed files leave the memex. Hidden files are skipped."
+                        help="Folders on a worker that the memex keeps in sync: documents and papers (PDF, Word, Markdown, HTML, text), photos and videos in them and their subfolders are read where they are, by the c6-extract kit on that worker (it needs Docker or Podman); changes are picked up every few minutes, and removed files leave the memex. Hidden files are skipped."
                         fields=FOLDER_FIELDS
                         examples=folder_examples
                     />
@@ -1775,7 +1775,8 @@ fn budget_examples() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 const FOLDER_FIELDS: &[Field] = &[
-    Field { key: "path", label: "Folder", placeholder: "e.g. ~/Documents/Papers (on the memex's machine)", kind: FieldKind::Mono },
+    Field { key: "path", label: "Folder", placeholder: "e.g. ~/Documents/Papers (on its worker)", kind: FieldKind::Mono },
+    Field { key: "worker", label: "Worker", placeholder: "its name; empty: the worker on the head's machine", kind: FieldKind::Mono },
     Field { key: "labels", label: "Labels", placeholder: "e.g. research", kind: FieldKind::Labels },
 ];
 

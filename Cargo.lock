@@ -549,6 +549,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "c6-extract"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "htmd",
+ "image",
+ "kamadak-exif",
+ "mail-parser",
+ "pdf-extract",
+ "regex",
+ "serde_json",
+ "tract-onnx",
+ "zip",
+]
+
+[[package]]
 name = "c6-head"
 version = "0.2.2"
 dependencies = [
@@ -653,21 +669,19 @@ dependencies = [
  "base64 0.23.1",
  "c6-api",
  "c6-core",
+ "c6-extract",
  "c6-head",
  "c6-llm",
+ "c6-memex",
  "c6-testkit",
  "c6-worker",
  "chrono",
  "chrono-tz",
  "futures-util",
- "htmd",
  "image",
  "kamadak-exif",
  "mail-builder",
- "mail-parser",
- "pdf-extract",
  "pulldown-cmark",
- "regex",
  "reqwest",
  "rrule",
  "serde",
@@ -677,10 +691,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tract-onnx",
  "url",
  "uuid",
- "zip",
 ]
 
 [[package]]
@@ -775,6 +787,7 @@ dependencies = [
  "futures",
  "gethostname",
  "ignore",
+ "image",
  "nix 0.31.3",
  "opentelemetry-proto",
  "pem",

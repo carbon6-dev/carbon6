@@ -13,6 +13,7 @@ mod convert;
 mod cron;
 pub mod decisions;
 pub mod explorer;
+pub mod extract;
 mod export;
 pub mod fabric;
 pub mod files;

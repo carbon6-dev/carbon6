@@ -44,6 +44,7 @@ fn item(kind: &str, id: &str, title: &str, text: &str, at: i64, labels: &[&str])
 
 #[tokio::test]
 async fn understanding_review_graph() {
+    crate::extract_here();
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {

@@ -1,6 +1,7 @@
 //! One way in (docs/memex.md §4.5): `memex.ingest` takes items typed by
-//! their MIME type, and each type's handler keeps its own parsing,
-//! identity and storage. Everything that comes in this way is imported:
+//! their MIME type, and each type's handler keeps its own identity and
+//! storage. What needs reading (mail, PDF, Word, HTML) is kept as a blob
+//! and read by the c6-extract kit (extract.rs): its result says `queued`. Everything that comes in this way is imported:
 //! only connectors (Gmail sync) create mirrored items, whose changes are
 //! written back, and ingested sources can't reach theirs.
 
@@ -12,6 +13,8 @@ use crate::Memex;
 
 /// Items per call.
 const MAX_ITEMS: usize = 500;
+/// How long a call waits for what the kit reads.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The largest message.
 const MAIL_LIMIT: u64 = 25 * 1024 * 1024;
 
@@ -44,7 +47,7 @@ pub fn types() -> Vec<api::IngestType> {
             types: DOC_TYPES.iter().map(|(t, _)| t.to_string()).collect(),
             attributes: doc_schema(),
             identity: "the content's hash, across all documents".into(),
-            limit: crate::MAX_FILE,
+            limit: crate::MAX_HELD,
             produces: vec!["document".into(), "paper".into()],
         },
     ]
@@ -133,10 +136,26 @@ pub async fn ingest(m: &Memex, params: Value) -> anyhow::Result<Value> {
     for item in &batch.items {
         out.push(match one(m, item).await {
             Ok(r) => r,
-            Err(e) => api::IngestResult { status: "rejected".into(), error: Some(format!("{e:#}")), ..Default::default() },
+            Err(e) => (api::IngestResult { status: "rejected".into(), error: Some(format!("{e:#}")), ..Default::default() }, None),
         });
     }
-    Ok(json!({"results": out}))
+    // What the kit reads: waited for a while, else still `queued`.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    for (r, key) in out.iter_mut() {
+        let Some(key) = key else { continue };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match crate::extract::outcome(m, key, left).await? {
+            Some(Ok(k)) => {
+                r.kind = sqlx::query_scalar("SELECT kind FROM items WHERE id = ?").bind(&k.id).fetch_optional(&m.store.pool).await?;
+                // A document from this source and id before is updated.
+                let status = if r.id.is_some() && k.status == "created" { "updated" } else { k.status };
+                (r.status, r.id) = (status.into(), Some(k.id));
+            }
+            Some(Err(e)) => (r.status, r.error) = ("rejected".into(), Some(e)),
+            None => {}
+        }
+    }
+    Ok(json!({"results": out.into_iter().map(|(r, _)| r).collect::<Vec<_>>()}))
 }
 
 /// An ingested item's source: always under `import:`, so it can never name
@@ -152,7 +171,8 @@ fn source_of(s: &api::IngestSource) -> anyhow::Result<String> {
     Ok(if id.is_empty() { format!("import:{kind}") } else { format!("import:{kind}:{id}") })
 }
 
-async fn one(m: &Memex, item: &api::IngestItem) -> anyhow::Result<api::IngestResult> {
+/// An item in, and the extraction job it waits for (if any).
+async fn one(m: &Memex, item: &api::IngestItem) -> anyhow::Result<(api::IngestResult, Option<String>)> {
     let mime = item.mime.split(';').next().unwrap_or("").trim().to_lowercase();
     let handler = types().into_iter().find(|h| h.types.contains(&mime));
     let Some(handler) = handler else {
@@ -172,14 +192,17 @@ async fn one(m: &Memex, item: &api::IngestItem) -> anyhow::Result<api::IngestRes
         (None, None) => anyhow::bail!("data (base64) or text is required"),
     };
     anyhow::ensure!(data.len() as u64 <= handler.limit, "larger than {} MB", handler.limit >> 20);
-    match handler.name.as_str() {
-        "mail" => mail(m, &source, external_id, &data, &item.attributes).await,
+    let (r, key) = match handler.name.as_str() {
+        "mail" => (mail(m, &source, external_id, &data, &item.attributes).await?, format!("mail:{source}:{external_id}")),
         _ => {
             let ext = DOC_TYPES.iter().find(|(t, _)| *t == mime).map(|(_, e)| *e).unwrap_or("txt");
             let name = item.attributes["name"].as_str().unwrap_or(external_id);
-            document(m, &source, external_id, name, ext, &data, &item.labels, item.attributes["created"].as_i64()).await
+            let r = document(m, &source, external_id, name, ext, &data, &item.labels, item.attributes["created"].as_i64()).await?;
+            (r, format!("doc:{source}:{external_id}"))
         }
-    }
+    };
+    let waits = r.status == "queued";
+    Ok((r, waits.then_some(key)))
 }
 
 /// An existing item from this source with this id.
@@ -195,8 +218,12 @@ fn duplicate(id: String, kind: Option<String>) -> api::IngestResult {
     api::IngestResult { status: "duplicate".into(), id: Some(id), kind, error: None }
 }
 
+/// Text the store keeps as it is (no reading needed).
+pub const PLAIN: [&str; 5] = ["md", "markdown", "txt", "text", "rst"];
+
 /// A document: its text (and, for a paper, its identity and citations),
-/// recognized by the content's hash.
+/// recognized by the content's hash. Plain text is kept now; the rest is
+/// read by the kit (status `queued`).
 #[allow(clippy::too_many_arguments)]
 pub async fn document(
     m: &Memex,
@@ -218,37 +245,66 @@ pub async fn document(
     if let Some((id, kind)) = same {
         return Ok(duplicate(id, Some(kind)));
     }
-    // The extension tells the extractor what it is.
+    // The extension tells the reader what it is.
     let file = if name.to_lowercase().ends_with(&format!(".{ext}")) { name.to_owned() } else { format!("{name}.{ext}") };
-    let (id, kind, _) = m.add_document(&file, data, source, external_id, labels, created).await?;
-    Ok(api::IngestResult {
-        status: if before.is_some() { "updated" } else { "created" }.into(),
-        id: Some(id),
-        kind: Some(kind),
-        error: None,
-    })
+    m.put_blob(data).await?;
+    let input = format!("head:{hash}");
+    let params = json!({"source": source, "external_id": external_id, "labels": labels, "created": created, "size": data.len()});
+    let key = format!("doc:{source}:{external_id}");
+    if PLAIN.contains(&ext) {
+        let files = Default::default();
+        let job = crate::extract::Done { key: &key, input: &input, name: &file, params: &params, files: &files };
+        let id = m.document_from(&job, &json!({"text": String::from_utf8_lossy(data)})).await?;
+        let kind: String = sqlx::query_scalar("SELECT kind FROM items WHERE id = ?").bind(&id).fetch_one(&m.store.pool).await?;
+        return Ok(api::IngestResult {
+            status: if before.is_some() { "updated" } else { "created" }.into(),
+            id: Some(id),
+            kind: Some(kind),
+            error: None,
+        });
+    }
+    crate::extract::queue(m, &key, "document", &input, &file, params).await?;
+    Ok(api::IngestResult { status: "queued".into(), id: before, kind: None, error: None })
 }
 
-/// A message: stored with the mail, threaded by its References and
-/// In-Reply-To, recognized by its Message-ID.
+/// A message: kept as a blob, read by the kit, then stored with the mail
+/// (mail_from).
 async fn mail(m: &Memex, source: &str, external_id: &str, raw: &[u8], attrs: &Value) -> anyhow::Result<api::IngestResult> {
     if let Some(id) = existing(m, source, external_id).await? {
         return Ok(duplicate(id, None));
     }
-    let msg = mail_parser::MessageParser::default().parse(raw).ok_or_else(|| anyhow::anyhow!("not an RFC 822 message"))?;
-    anyhow::ensure!(
-        msg.from().is_some() || msg.message_id().is_some() || msg.subject().is_some() || msg.date().is_some(),
-        "not an RFC 822 message: no headers"
-    );
-    let rfc_id = match msg.message_id() {
+    let blob = m.put_blob(raw).await?;
+    let params = json!({"kind": "import", "source": source, "external_id": external_id, "attributes": attrs});
+    crate::extract::queue(m, &format!("mail:{source}:{external_id}"), "mail", &format!("head:{blob}"), "", params).await?;
+    Ok(api::IngestResult { status: "queued".into(), id: None, kind: None, error: None })
+}
+
+/// A message the kit read: stored as its job says (imported, synced from
+/// Gmail, or kept before and read again).
+pub async fn mail_from(m: &Memex, job: &crate::extract::Done<'_>, v: &Value) -> anyhow::Result<crate::extract::Kept> {
+    use crate::extract::Kept;
+    let parsed = crate::mail::Parsed::of(v, job.files);
+    match job.params["kind"].as_str().unwrap_or_default() {
+        "gmail" => return crate::mail::store_message(m, job, &parsed).await.map(Kept::from),
+        "reparse" => return crate::mail::reparsed(m, job, &parsed).await.map(Kept::from),
+        _ => {}
+    }
+    let p = job.params;
+    let (source, external_id, attrs) =
+        (p["source"].as_str().unwrap_or_default(), p["external_id"].as_str().unwrap_or_default(), &p["attributes"]);
+    if let Some(id) = existing(m, source, external_id).await? {
+        return Ok(Kept { id, status: "duplicate" });
+    }
+    let rfc_id = match v["message_id"].as_str() {
         Some(id) if !id.trim().is_empty() => id.trim().to_owned(),
         _ => {
+            // As it always was: From, Date, Subject and the text part.
             let key = format!(
                 "{:?}|{:?}|{}|{}",
-                msg.from().and_then(|a| a.first()).and_then(|a| a.address()),
-                msg.date().map(|d| d.to_timestamp()),
-                msg.subject().unwrap_or(""),
-                msg.body_text(0).unwrap_or_default()
+                v["from_raw"].as_str(),
+                v["date"].as_i64(),
+                v["subject"].as_str().unwrap_or(""),
+                v["plain"].as_str().unwrap_or("")
             );
             format!("{}@c6.import", &c6_core::sha256_hex(key.as_bytes())[..32])
         }
@@ -256,18 +312,14 @@ async fn mail(m: &Memex, source: &str, external_id: &str, raw: &[u8], attrs: &Va
     let same: Option<String> =
         sqlx::query_scalar("SELECT item_id FROM mail WHERE rfc_id = ? LIMIT 1").bind(&rfc_id).fetch_optional(&m.store.pool).await?;
     if let Some(id) = same {
-        return Ok(duplicate(id, Some("email".into())));
+        return Ok(Kept { id, status: "duplicate" });
     }
     // The thread's root: the first reference, else what it answers, else
     // itself; the same in any order the messages arrive.
-    let root = msg
-        .references()
-        .as_text_list()
-        .and_then(|l| l.first().map(|r| r.to_string()))
-        .or_else(|| msg.in_reply_to().as_text_list().and_then(|l| l.first().map(|r| r.to_string())))
-        .unwrap_or_else(|| rfc_id.clone());
+    let first = |k: &str| v[k].as_array().and_then(|l| l.first()).and_then(|r| r.as_str()).map(str::to_owned);
+    let root = first("references").or_else(|| first("in_reply_to")).unwrap_or_else(|| rfc_id.clone());
     let thread_id = format!("i{}", &c6_core::sha256_hex(root.trim().as_bytes())[..16]);
-    let date = msg.date().map(|d| d.to_timestamp() * 1000).or_else(|| attrs["received"].as_i64()).unwrap_or_else(c6_core::now_ms);
+    let date = v["date"].as_i64().map(|d| d * 1000).or_else(|| attrs["received"].as_i64()).unwrap_or_else(c6_core::now_ms);
 
     let mut labels: Vec<String> =
         attrs["folder"].as_str().filter(|f| !f.trim().is_empty()).map(|f| f.trim().to_owned()).into_iter().collect();
@@ -286,8 +338,7 @@ async fn mail(m: &Memex, source: &str, external_id: &str, raw: &[u8], attrs: &Va
         labels.push("STARRED".into());
     }
     let me: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
-    let from = msg.from().and_then(|a| a.first()).and_then(|a| a.address()).map(str::to_lowercase).unwrap_or_default();
-    if me.contains(&from) {
+    if me.contains(&parsed.from.0) {
         labels.push("SENT".into());
     }
     for l in &user_labels {
@@ -307,9 +358,8 @@ async fn mail(m: &Memex, source: &str, external_id: &str, raw: &[u8], attrs: &Va
         origin: "imported",
         owner: source,
     };
-    let id = crate::mail::store(m, &msg, raw, &at, &labels, date).await?;
-    let kind = if labels.iter().any(|l| l == "SPAM") { "spam" } else { "email" };
-    Ok(api::IngestResult { status: "created".into(), id: Some(id), kind: Some(kind.into()), error: None })
+    let blob = job.input.strip_prefix("head:").unwrap_or_default();
+    crate::mail::store(m, &parsed, blob, &at, &labels, date).await.map(Kept::from)
 }
 
 #[cfg(test)]

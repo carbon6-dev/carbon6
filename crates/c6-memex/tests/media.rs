@@ -100,25 +100,28 @@ fn video(seconds: u32, created_unix: i64, lat: f64, lon: f64) -> Vec<u8> {
 /// colour.
 struct FakeFaces;
 
-impl c6_memex::faces::FaceModel for FakeFaces {
+impl c6_extract::faces::FaceModel for FakeFaces {
     fn version(&self) -> String {
         "faces-v1:fake".into()
     }
 
-    fn detect(&self, img: &image::RgbImage) -> anyhow::Result<Vec<c6_memex::faces::Found>> {
+    fn detect(&self, img: &image::RgbImage) -> anyhow::Result<Vec<c6_extract::faces::Found>> {
         let p = img.get_pixel(img.width() / 2, img.height() / 2);
         let face = (p[0] > 150 && p[2] < 100) || (p[2] > 150 && p[0] < 100);
-        Ok(if face { vec![c6_memex::faces::Found { x: 0.375, y: 0.333, w: 0.25, h: 0.333, score: 0.99 }] } else { vec![] })
+        Ok(if face { vec![c6_extract::faces::Found { x: 0.375, y: 0.333, w: 0.25, h: 0.333, score: 0.99 }] } else { vec![] })
     }
 
     fn embed(&self, face: &image::RgbImage) -> anyhow::Result<Vec<f32>> {
         let p = face.get_pixel(face.width() / 2, face.height() / 2);
-        Ok(c6_memex::faces::unit(vec![p[0] as f32, p[1] as f32, p[2] as f32]))
+        Ok(c6_extract::faces::unit(vec![p[0] as f32, p[1] as f32, p[2] as f32]))
     }
 }
 
 #[tokio::test]
 async fn photos_and_videos() {
+    // The c6-extract kit's code, in this process, with face models that
+    // find the coloured squares.
+    c6_memex::extract::set_override(Arc::new(c6_memex::extract::InProcess { faces: Some(Arc::new(FakeFaces)) }));
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
@@ -189,8 +192,17 @@ async fn photos_and_videos() {
 
     let (m, _dir) = memex_node(&head, &stop).await;
     c6_memex::google::person(&m.store, "jane@acme.com", "Jane Doe").await.unwrap();
-    m.set_face_model(Some(Arc::new(FakeFaces)));
-    let put = http.put(format!("{api}/settings/memex")).json(&json!({"places_file": places.display().to_string()})).send().await.unwrap();
+    // Face models (what the kit gets; the fake above stands in for them).
+    for f in ["detector.onnx", "embedder.onnx"] {
+        std::fs::write(files.path().join(f), b"onnx").unwrap();
+    }
+    let put = http
+        .put(format!("{api}/settings/memex"))
+        .json(&json!({"places_file": places.display().to_string(), "face_detector": files.path().join("detector.onnx"),
+            "face_embedder": files.path().join("embedder.onnx")}))
+        .send()
+        .await
+        .unwrap();
     assert!(put.status().is_success());
     m.set_places(Some(places.display().to_string())).await;
     let put = http

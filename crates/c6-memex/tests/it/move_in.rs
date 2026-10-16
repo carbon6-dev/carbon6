@@ -36,6 +36,7 @@ async fn head(data: &std::path::Path, c6m: &std::path::Path) -> c6_head::Head {
 
 #[tokio::test]
 async fn a_memex_moves_into_the_head() {
+    crate::extract_here();
     c6_llm::install_crypto_provider();
     let (data, c6m) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     c6m_folder(c6m.path()).await;

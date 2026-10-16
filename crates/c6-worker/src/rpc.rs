@@ -11,8 +11,9 @@ use tokio::process::Command;
 
 use crate::Worker;
 
-/// What a kit job returns, at most (its files, together).
-const MAX_JOB_OUTPUT: u64 = 64 * 1024 * 1024;
+/// What a kit job returns, at most (its files, together, sent back as
+/// base64 in one message).
+const MAX_JOB_OUTPUT: u64 = 44 * 1024 * 1024;
 
 /// A kit tool run the head asks for, with no session (docs/knowledge.md
 /// §6.2): in a folder of its own under the worker's state, with `inputs`
@@ -38,7 +39,18 @@ async fn kit_job(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
         }
         let command: Vec<String> = serde_json::from_value(p["command"].clone())?;
         let env: Vec<(String, String)> = serde_json::from_value(p["env"].clone()).unwrap_or_default();
-        let out = c6_tools::kits::sandboxed(&rt, spec, &dir, command, &env, None).await.map_err(|e| anyhow!(e))?;
+        // This machine's files the job reads where they are (a watched
+        // folder's photos, say), mounted read-only under /mnt.
+        let mut mounts = Vec::new();
+        for m in p["mounts"].as_array().into_iter().flatten() {
+            let (from, at) = (crate::expand_home(m["path"].as_str().unwrap_or_default()), m["at"].as_str().unwrap_or_default());
+            if !at.starts_with("/mnt/") || at.split('/').any(|s| s == "..") || !from.is_absolute() {
+                bail!("{at}: mounts go under /mnt");
+            }
+            tokio::fs::metadata(&from).await.with_context(|| format!("{} not found", from.display()))?;
+            mounts.push((from, at.to_owned()));
+        }
+        let out = c6_tools::kits::sandboxed(&rt, spec, &dir, &mounts, command, &env, None).await.map_err(|e| anyhow!(e))?;
         let mut files = serde_json::Map::new();
         let mut total = 0u64;
         let mut stack = vec![dir.join("out")];
@@ -66,8 +78,11 @@ async fn kit_job(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
     result
 }
 
-/// Largest file `fs.read` returns.
+/// Largest file `fs.read` returns, and `fs.read_file`.
 const MAX_READ: u64 = 2 * 1024 * 1024;
+const MAX_FILE: u64 = 40 * 1024 * 1024;
+/// Files `fs.walk` lists at most.
+const MAX_WALK: usize = 500_000;
 const MAX_LIST: usize = 5000;
 const MAX_DIFF: usize = 4 * 1024 * 1024;
 
@@ -75,6 +90,8 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
     match method {
         "fs.list" => fs_list(serde_json::from_value(params)?).await,
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
+        "fs.read_file" => fs_read_file(&params).await,
+        "fs.walk" => fs_walk(&params).await,
         "fs.mkdir" => fs_mkdir(&path_param(&params)?).await,
         "fs.find" => fs_find(serde_json::from_value(params)?).await,
         // Outside a repository, git methods answer `{"repo": false}` rather
@@ -265,6 +282,61 @@ async fn fs_read(p: ReadParams) -> anyhow::Result<Value> {
     Ok(
         json!({"path": path.display().to_string(), "size": meta.len(), "truncated": meta.len() > MAX_READ, "binary": binary, "content": content}),
     )
+}
+
+/// A file whole (base64), up to `max` bytes (a watched folder's document).
+async fn fs_read_file(p: &Value) -> anyhow::Result<Value> {
+    use base64::Engine;
+    let path = crate::expand_home(p["path"].as_str().unwrap_or_default());
+    let max = p["max"].as_u64().unwrap_or(MAX_READ).min(MAX_FILE);
+    let meta = tokio::fs::metadata(&path).await.with_context(|| format!("{} not found", path.display()))?;
+    if meta.is_dir() || meta.len() > max {
+        bail!("{} is a folder, or larger than {} MB", path.display(), max >> 20);
+    }
+    Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(tokio::fs::read(&path).await?)}))
+}
+
+/// Every file under a folder (hidden ones left out): its full path, size
+/// and when it changed, for the knowledge store's watched folders.
+async fn fs_walk(p: &Value) -> anyhow::Result<Value> {
+    let root = crate::expand_home(p["path"].as_str().unwrap_or_default());
+    if !root.is_dir() {
+        bail!("{} is not a folder on {}", root.display(), hostname());
+    }
+    let root2 = root.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let mut stack = vec![root2];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(e.path());
+                    continue;
+                }
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                out.push(json!([e.path().display().to_string(), meta.len(), mtime]));
+                if out.len() >= MAX_WALK {
+                    return out;
+                }
+            }
+        }
+        out
+    })
+    .await?;
+    Ok(json!({"root": root.display().to_string(), "files": files}))
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "this worker".into())
 }
 
 async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {

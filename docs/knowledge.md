@@ -200,3 +200,31 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - The head runs the sign-in at `/auth/oauth/callback` and keeps each account's refresh token encrypted (`oauth_accounts`).
   - Kit jobs get `C6_ACCOUNTS`: a JSON list of `{provider, account, access_token, expires_at}`, refreshed when near expiry, never with the refresh token.
   - Removing the app forgets its accounts.
+
+### 13.4 Never parse (step 2)
+
+- **c6-extract:** the parsers the memex had in-process now live in a crate of their own, `crates/c6-extract`: mail (mail-parser, HTML to text), PDF, Word and HTML documents with paper recognition, EXIF and thumbnails, HEIC (libheif), video containers, keyframes and sound (ffmpeg), and faces (tract with your ONNX models).
+  - It is a **system kit**. Its source, `Dockerfile` and its own `Cargo.lock` are embedded in `c6h`, and the worker builds the image: Rust in a build stage, ffmpeg and libheif in the image. On Docker Desktop that takes about 2 minutes, once.
+  - It runs with no network, 2 CPUs, 2 GB and 10 minutes a run.
+  - It has one tool, `extract`, which runs `jobs.json`: a tool name (`document`, `mail`, `attachment`, `media`, `faces`, `video`) and jobs. Results go to `out/result.json`, and files to `out/<job>/`. A job that panics is reported as that job's error.
+- **Approval, then upgrades:** the first time something needs reading, the head adds the package and asks you to install it (Decisions). Answering Install retries what waits.
+  - A newer kit in a later carbon6 is offered as an upgrade.
+  - A unit test ties the kit's version to a digest of its source (`kit.digest`), since the registry refuses changed content under the same version.
+- **The queue** (`extractions` in each realm's knowledge database, migration 0009): one job per key, such as `doc:<source>:<id>`, `mail:<source>:<id>`, `gmail:<account>:<id>`, `folder:<location>`, `faces:<item>`, `video:<item>`, `reparse:<item>`.
+  - A runner sends batches of one tool and one place: up to 24 jobs, and up to 24 MB of the store's own files.
+  - What comes back is kept as before: items, the mail store, papers' citation graph, media rows, faces grouped into people, keyframes and transcripts.
+  - When no worker can run it, or you haven't approved it yet, jobs back off from a minute, doubling, to an hour. The status shows how many wait (`extracting`) and why.
+- **Where files are** (§5): a job's input is `head:<blob>` (uploads, ingested and synced mail), or `worker:<name>:<path>`.
+  - A watched folder names its worker (`worker` on Memex folders; empty means the worker on the head's machine, matched by hostname). The worker lists it (`fs.walk`), and its files are mounted read-only into the kit's run at `/mnt/N`. Nothing is copied.
+  - Originals open through the worker (`fs.read_file`, up to 40 MB).
+  - Bare paths in folders kept before this mean the head's machine, so nothing is read again.
+- **Ingest and uploads wait** up to a minute for the kit (90 seconds for an upload), then answer as before: created, updated, duplicate or rejected. Past that, an item is `queued`.
+  - Plain text and Markdown are kept without the kit, so a head with no worker can still take them (§12's question, answered for text).
+  - Files the store holds itself are capped at 40 MB, since they travel to the worker inside one message.
+- **Mail is read once:** its text and HTML are kept as blobs, and its attachments' names in the mail row. A thread shows them without parsing. An attachment's bytes are read from the message by the kit when you open it.
+  - Mail kept before this is read again in the background, 100 at a time. Until then a thread shows its searchable text.
+- **Removed from c6-memex:** htmd, image, kamadak-exif, mail-parser, pdf-extract, tract-onnx, zip and regex; and running ffmpeg and sips on the head.
+  - Tests use the same code in-process (`c6_memex::extract::InProcess`, behind the `in-process-extract` feature that only tests enable).
+  - `C6_TEST_KITS=1` runs the real kit end to end: an approval, a Docker build, a folder on a worker read in place, and mail with an attachment.
+- **Not done:** embeddings still go to a model connection from the head (§4 allows it); OCR of scans is not in the kit yet; object storage for blobs (§5) is later.
+

@@ -168,6 +168,8 @@ async fn google(g: Mock) -> String {
 
 #[tokio::test]
 async fn google_mail_calendar_contacts() {
+    // The c6-extract kit's code, in this process (what workers run).
+    c6_memex::extract::set_override(Arc::new(c6_memex::extract::InProcess::default()));
     let now = c6_core::now_ms();
     let g: Mock = Arc::default();
     {
@@ -294,7 +296,12 @@ async fn google_mail_calendar_contacts() {
         (phase("mail")? == "live" && phase("contacts")? == "live" && phase("cal:me@example.com")? == "live").then_some(())
     })
     .await;
-    let inbox = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
+    // Each message is read by the kit once fetched.
+    let inbox = eventually("the messages read", async || {
+        let v = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
+        (v.as_array()?.len() == 3).then_some(v)
+    })
+    .await;
     assert_eq!(inbox.as_array().unwrap().len(), 3, "{inbox}");
     let needs = rpc("memex.mail.threads", json!({"view": "needs_reply"})).await;
     let subjects: Vec<&str> = needs.as_array().unwrap().iter().map(|t| t["subject"].as_str().unwrap()).collect();

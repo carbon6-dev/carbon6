@@ -37,6 +37,7 @@ fn mail(id: &str, reply_to: Option<&str>, subject: &str, body: &str) -> String {
 #[tokio::test]
 #[ignore = "writes the memex upgrade test database; run it when the memex's schema is about to change"]
 async fn make_memex_fixture() {
+    crate::extract_here();
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
@@ -89,6 +90,12 @@ async fn make_memex_fixture() {
     )
     .await;
     assert!(r.to_string().contains("created"), "{r}");
+    // Mail is read by the kit (here, in this process).
+    eventually("the mail read", async || {
+        let s: Value = http.get(format!("{api}/memex/status")).send().await.ok()?.json().await.ok()?;
+        (s["items"]["email"].as_u64() == Some(2)).then_some(())
+    })
+    .await;
     // A document by upload, a note, a trail.
     send("memex/upload", json!({"name": "plan.md", "data": b64("# Plan\n\nShip the release on Friday."), "labels": ["client:acme"]})).await;
     send("memex/notes", json!({"text": "Ada prefers Thursday meetings.", "about": ["person:ada"]})).await;
@@ -208,6 +215,7 @@ async fn fill_empty_tables(pool: &sqlx::SqlitePool) -> Vec<String> {
 /// back.
 #[tokio::test]
 async fn memex_fixtures_upgrade_and_serve() {
+    crate::extract_here();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
     let mut fixtures: Vec<_> =
         std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "db")).collect();

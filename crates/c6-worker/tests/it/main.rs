@@ -17,6 +17,7 @@ mod commands;
 mod decisions;
 mod examples;
 mod explorer;
+mod extract;
 mod fixtures;
 mod grants;
 mod hooks;

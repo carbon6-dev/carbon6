@@ -1031,6 +1031,9 @@ async fn apply_install(st: &HeadState, pending: &Value) -> anyhow::Result<()> {
         if in_realm(&roles) {
             crate::apps::next_steps(st, &realm, &name, &p).await;
         }
+        if p.app == crate::extract::KIT {
+            crate::extract::approved(st).await;
+        }
     }
     // Then who requires what, and what an app requiring an app in another
     // realm may start.

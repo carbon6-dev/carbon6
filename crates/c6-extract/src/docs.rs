@@ -5,9 +5,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-
-/// Files the memex reads, by extension.
-pub const EXTENSIONS: [&str; 9] = ["pdf", "docx", "md", "markdown", "txt", "text", "html", "htm", "rst"];
+use serde_json::{Value, json};
 
 static DOI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+[A-Za-z0-9])").unwrap());
 static ARXIV: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:arxiv:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5})").unwrap());
@@ -265,6 +263,22 @@ fn names_list(s: &str) -> bool {
     let words: Vec<&str> = s.split_whitespace().collect();
     let capital = words.iter().filter(|w| w.chars().next().is_some_and(char::is_uppercase) || **w == "and").count();
     (s.contains(',') || s.contains(" and ")) && capital * 10 >= words.len() * 8
+}
+
+/// What the knowledge store keeps of a document: its text, its metadata
+/// title, and if it is a paper, what it says about itself and cites.
+pub fn document(name: &str, data: &[u8]) -> anyhow::Result<Value> {
+    let (text, meta_title) = extract(name, data)?;
+    let paper = if name.to_lowercase().ends_with(".pdf") { analyze(&text, meta_title.as_deref()) } else { None };
+    Ok(json!({
+        "text": text,
+        "title": meta_title,
+        "paper": paper.map(|p| json!({
+            "key": paper_key(p.doi.as_deref(), p.arxiv.as_deref(), &p.title),
+            "title": p.title, "authors": p.authors, "doi": p.doi, "arxiv": p.arxiv, "year": p.year,
+            "references": p.references.iter().map(|r| json!({"key": r.key(), "title": r.title, "text": r.text})).collect::<Vec<_>>(),
+        })),
+    }))
 }
 
 #[cfg(test)]

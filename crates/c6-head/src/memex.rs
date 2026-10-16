@@ -241,7 +241,7 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
 pub fn check_folders(folders: &[api::MemexFolder]) -> anyhow::Result<()> {
     for f in folders {
         if !f.path.starts_with('/') && !f.path.starts_with('~') {
-            return Err(bad_request(format!("{:?}: a folder is a full path on the memex's machine", f.path)));
+            return Err(bad_request(format!("{:?}: a folder is a full path on its worker", f.path)));
         }
         crate::sessions::check_labels(&f.labels)?;
     }

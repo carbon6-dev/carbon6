@@ -6,9 +6,9 @@
 pub mod calendar;
 pub mod claims;
 pub mod contacts;
-pub mod docs;
 pub mod embed;
 mod explore;
+pub mod extract;
 pub mod faces;
 pub mod google;
 pub mod ingest;
@@ -74,14 +74,20 @@ pub struct Memex {
     reload: tokio::sync::Notify,
     /// Cities, for naming where photos were taken.
     pub places: Mutex<Option<media::Places>>,
-    /// Face models (and the paths they came from), and each person's faces.
-    face_model: Mutex<Option<Arc<dyn faces::FaceModel>>>,
+    /// The face models' files (detector, embedder), and each person's faces.
     face_paths: Mutex<Option<(String, String)>>,
     pub(crate) face_index: Mutex<Option<faces::Index>>,
     /// Photos or videos came or went: make events again.
     pub media_changed: std::sync::atomic::AtomicBool,
     /// A folder scan is under way (events wait for it).
     pub scanning: std::sync::atomic::AtomicBool,
+    /// What reads files (extract.rs): the head's kit jobs.
+    extractor: std::sync::OnceLock<Arc<dyn extract::Extractor>>,
+    /// Wakes the extraction queue; tells waiters jobs finished.
+    extract_wake: tokio::sync::Notify,
+    extracted: tokio::sync::Notify,
+    /// Finished jobs' outcomes (an item, or why not), for waiters.
+    outcomes: Mutex<HashMap<String, Result<extract::Kept, String>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -96,8 +102,12 @@ fn task_of(v: &Value) -> Option<llm::Task> {
     Some(llm::Task { connection_id: v["connection_id"].as_str()?.to_owned(), model: v["model"].as_str().unwrap_or_default().to_owned() })
 }
 
-/// Files larger than this are not read.
+/// Folder files larger than this are not read.
 pub(crate) const MAX_FILE: u64 = 50 * 1024 * 1024;
+/// The largest file the store holds itself (it goes to a worker whole).
+pub(crate) const MAX_HELD: u64 = 40 * 1024 * 1024;
+/// Documents in folders, by extension.
+pub const DOC_EXTENSIONS: [&str; 9] = ["pdf", "docx", "md", "markdown", "txt", "text", "html", "htm", "rst"];
 
 impl Memex {
     /// One of the memex's prompts, as edited, else its default.
@@ -132,11 +142,14 @@ impl Memex {
             wake: tokio::sync::Notify::new(),
             reload: tokio::sync::Notify::new(),
             places: Mutex::default(),
-            face_model: Mutex::default(),
             face_paths: Mutex::default(),
             face_index: Mutex::default(),
             media_changed: Default::default(),
             scanning: Default::default(),
+            extractor: Default::default(),
+            extract_wake: tokio::sync::Notify::new(),
+            extracted: tokio::sync::Notify::new(),
+            outcomes: Default::default(),
         }))
     }
 
@@ -150,6 +163,7 @@ impl Memex {
             media::spawn(self.clone());
         }
         understand::spawn(self.clone());
+        extract::spawn(self.clone());
         let m = self.clone();
         tokio::spawn(async move {
             let mut refreshed: Option<std::time::Instant> = None;
@@ -290,11 +304,36 @@ impl Memex {
         self.wake.notify_waiters();
     }
 
-    /// Uses these face models (tests; normally from the settings).
-    pub fn set_face_model(&self, model: Option<Arc<dyn faces::FaceModel>>) {
-        *self.face_model.lock().unwrap() = model;
-        *self.face_index.lock().unwrap() = None;
-        self.wake.notify_waiters();
+    /// Reads files with this (the head's kit jobs).
+    pub fn set_extractor(&self, e: Arc<dyn extract::Extractor>) {
+        let _ = self.extractor.set(e);
+        self.extract_wake.notify_one();
+    }
+
+    /// Tries waiting extraction now (here and in other realms): what reads
+    /// files is ready.
+    pub async fn extract_now(&self) {
+        let _ = sqlx::query("UPDATE extractions SET next_at = 0").execute(&self.store.pool).await;
+        self.extract_wake.notify_one();
+        for m in self.realms.lock().await.values() {
+            let _ = sqlx::query("UPDATE extractions SET next_at = 0").execute(&m.store.pool).await;
+            m.extract_wake.notify_one();
+        }
+    }
+
+    /// What reads files, if anything does yet.
+    pub fn extractor(&self) -> Option<Arc<dyn extract::Extractor>> {
+        extract::overridden().or_else(|| self.extractor.get().cloned())
+    }
+
+    /// The face models' files, if there are models.
+    pub async fn face_models(&self) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some((d, e)) = self.face_paths.lock().unwrap().clone() else { return Ok(None) };
+        let read = |p: String| async move {
+            let path = c6_worker::expand_home(&p);
+            tokio::fs::read(&path).await.map_err(|err| anyhow::anyhow!("{}: {err}", path.display()))
+        };
+        Ok(Some((read(d).await?, read(e).await?)))
     }
 
     /// Loads a GeoNames file (None: no places), and places what is here.
@@ -406,61 +445,32 @@ impl Memex {
     }
 
     async fn scan_inner(&self, f: &api::MemexFolder) -> anyhow::Result<usize> {
-        let root = c6_worker::expand_home(&f.path);
-        anyhow::ensure!(root.is_dir(), "{} is not a folder on this machine", f.path);
-        let root_str = root.display().to_string();
+        let ex = self.extractor().ok_or_else(|| anyhow::anyhow!("nothing reads folders yet"))?;
+        let (root, files) = ex.walk(&f.worker, &f.path).await?;
         let started = c6_core::now_ms();
-        let mut stack = vec![root.clone()];
         let mut n = 0;
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for e in entries.flatten() {
-                let path = e.path();
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let Ok(meta) = e.metadata() else { continue };
-                if meta.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-                let media_kind = media::kind_of(&ext);
-                if media_kind.is_none() && (!docs::EXTENSIONS.contains(&ext.as_str()) || meta.len() > MAX_FILE) {
-                    continue;
-                }
-                let p = path.display().to_string();
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                if self.store.file_state(&p).await? == Some((mtime, meta.len() as i64)) {
-                    self.store.touch_file(&p).await?;
-                    continue;
-                }
-                let result = match media_kind {
-                    Some(kind) => media::add(self, &path, kind, mtime, meta.len(), &f.labels).await,
-                    None => match tokio::fs::read(&path).await {
-                        Ok(data) => self.add_document(&name, &data, "folder", &p, &f.labels, Some(mtime)).await.map(|r| r.0),
-                        Err(e) => Err(e.into()),
-                    },
-                };
-                match result {
-                    Ok(id) => {
-                        self.store.set_file(&p, mtime, meta.len() as i64, Some(&id), None).await?;
-                        n += 1;
-                    }
-                    Err(e) => {
-                        info!(file = %p, "not read: {e:#}");
-                        self.store.set_file(&p, mtime, meta.len() as i64, None, Some(&format!("{e:#}"))).await?;
-                    }
-                }
+        for (path, size, mtime) in files {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            let media_kind = media::kind_of(&ext);
+            if media_kind.is_none() && (!DOC_EXTENSIONS.contains(&ext.as_str()) || size > MAX_FILE) {
+                continue;
             }
+            let at = extract::location(&f.worker, &path);
+            if self.store.file_state(&at).await? == Some((mtime, size as i64)) {
+                self.store.touch_file(&at).await?;
+                continue;
+            }
+            self.store.touch_file(&at).await?;
+            let key = format!("folder:{at}");
+            if extract::queued(self, &key).await? {
+                continue;
+            }
+            let params = json!({"folder": true, "worker": f.worker, "mtime": mtime, "size": size, "labels": f.labels, "kind": media_kind});
+            extract::queue(self, &key, if media_kind.is_some() { "media" } else { "document" }, &at, &name, params).await?;
+            n += 1;
         }
-        for (path, item) in self.store.files_gone(&root_str, started).await? {
+        for (path, item) in self.store.files_gone(&extract::location(&f.worker, &root), started).await? {
             if let Some(id) = item {
                 self.store.delete(&id).await?;
                 self.media_changed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -468,7 +478,7 @@ impl Memex {
             self.store.forget_file(&path).await?;
         }
         if n > 0 {
-            info!(folder = %f.path, files = n, "folder read");
+            info!(folder = %f.path, files = n, "folder files to read");
         }
         Ok(n)
     }
@@ -490,68 +500,72 @@ impl Memex {
         self.dir.join("blobs").join(&hash[..2]).join(&hash[2..])
     }
 
-    /// Adds a document (or paper) from a file: its text, and for a paper
-    /// its identity, authors and citations as links. (id, kind, title).
-    pub async fn add_document(
-        &self,
-        name: &str,
-        data: &[u8],
-        source: &str,
-        external_id: &str,
-        labels: &[String],
-        created_at: Option<i64>,
-    ) -> anyhow::Result<(String, String, String)> {
-        let (text, meta_title) = docs::extract(name, data)?;
+    /// Keeps a document (or paper) the kit read: its text, and for a paper
+    /// its identity, authors and citations as links. Its id.
+    pub async fn document_from(&self, job: &extract::Done<'_>, v: &Value) -> anyhow::Result<String> {
+        let p = job.params;
+        let name = job.name;
+        let text = v["text"].as_str().unwrap_or_default().to_owned();
         anyhow::ensure!(!text.trim().is_empty(), "no text in {name} (a scan? images are read in a later step)");
-        let blob = if source == "folder" { None } else { Some(self.put_blob(data).await?) };
-        let is_pdf = name.to_lowercase().ends_with(".pdf");
-        let paper = if is_pdf { docs::analyze(&text, meta_title.as_deref()) } else { None };
+        let folder = p["folder"].as_bool() == Some(true);
+        let (source, external_id) =
+            if folder { ("folder", job.input) } else { (p["source"].as_str().unwrap_or("upload"), p["external_id"].as_str().unwrap_or_default()) };
+        let paper = v["paper"].as_object().filter(|_| v["paper"]["key"].is_string());
         let title = paper
-            .as_ref()
-            .map(|p| p.title.clone())
+            .and_then(|p| p["title"].as_str())
             .filter(|t| !t.is_empty())
-            .or(meta_title)
+            .or(v["title"].as_str().filter(|t| !t.is_empty()))
+            .map(str::to_owned)
             .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_owned());
         let kind = if paper.is_some() { "paper" } else { "document" };
-        let mut meta = json!({"name": name, "size": data.len(), "mime": mime_of(name)});
-        if let Some(b) = &blob {
+        let mut meta = json!({"name": name, "size": p["size"], "mime": mime_of(name)});
+        if let Some(b) = job.input.strip_prefix("head:") {
             meta["blob"] = json!(b);
         }
-        if source == "folder" {
-            meta["path"] = json!(external_id);
+        if folder {
+            meta["path"] = json!(extract::path_of(job.input));
+            if let Some(w) = p["worker"].as_str().filter(|w| !w.is_empty()) {
+                meta["worker"] = json!(w);
+            }
         }
-        if let Some(p) = &paper {
-            meta["paper"] = json!({"doi": p.doi, "arxiv": p.arxiv, "authors": p.authors, "year": p.year, "references": p.references.len()});
+        if let Some(p) = paper {
+            meta["paper"] = json!({"doi": p["doi"], "arxiv": p["arxiv"], "authors": p["authors"], "year": p["year"],
+                "references": p["references"].as_array().map_or(0, Vec::len)});
         }
+        let labels: Vec<String> = serde_json::from_value(p["labels"].clone()).unwrap_or_default();
         let item = api::MemexItemIn {
             kind: kind.into(),
             source: source.into(),
             external_id: external_id.into(),
             title: title.clone(),
             text,
-            created_at,
-            labels: labels.to_vec(),
+            created_at: p["created"].as_i64().or(p["mtime"].as_i64().filter(|_| folder)),
+            labels,
             meta,
             ..Default::default()
         };
         let id = self.store.put(&item, source).await?;
         self.store.clear_links(&id, "docs").await?;
         if let Some(p) = paper {
-            let me = self.store.ensure_thing(&docs::paper_key(p.doi.as_deref(), p.arxiv.as_deref(), &p.title), "paper", &p.title).await?;
+            let s = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+            let me = self.store.ensure_thing(&s(&p["key"]), "paper", &s(&p["title"])).await?;
             self.store.link(&id, "is", &me, "observed", "docs", None).await?;
-            for a in &p.authors {
+            for a in p["authors"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 let key = format!("person:name:{}", a.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-"));
                 let person = self.store.ensure_thing(&key, "person", a).await?;
                 self.store.link(&id, "authored_by", &person, "observed", "docs", None).await?;
             }
-            for r in &p.references {
-                let cited = self.store.ensure_thing(&r.key(), "paper", &r.title).await?;
+            for r in p["references"].as_array().into_iter().flatten() {
+                let cited = self.store.ensure_thing(&s(&r["key"]), "paper", &s(&r["title"])).await?;
                 if cited != me {
-                    self.store.link(&id, "cites", &cited, "observed", "docs", Some(&r.text)).await?;
+                    self.store.link(&id, "cites", &cited, "observed", "docs", Some(&s(&r["text"]))).await?;
                 }
             }
         }
-        Ok((id, kind.into(), title))
+        if folder {
+            self.store.set_file(job.input, p["mtime"].as_i64().unwrap_or(0), p["size"].as_i64().unwrap_or(0), Some(&id), None).await?;
+        }
+        Ok(id)
     }
 
     /// Embeds a batch of passages; how many.
@@ -613,6 +627,9 @@ impl Memex {
             return Ok(m.clone());
         }
         let m = Self::open_in(&self.dir.join("realms").join(realm), self.link.clone(), realm).await?;
+        if let Some(e) = self.extractor.get() {
+            m.set_extractor(e.clone());
+        }
         m.spawn_jobs();
         info!(%realm, "a realm's memex opened");
         realms.insert(realm.to_owned(), m.clone());
@@ -716,18 +733,29 @@ impl Memex {
                 use base64::Engine;
                 let u: api::MemexUpload = serde_json::from_value(params)?;
                 let data = base64::engine::general_purpose::STANDARD.decode(u.data.as_bytes())?;
-                anyhow::ensure!(data.len() as u64 <= MAX_FILE, "files up to 50 MB");
+                anyhow::ensure!(data.len() as u64 <= MAX_HELD, "files up to {} MB", MAX_HELD >> 20);
                 let hash = c6_core::sha256_hex(&data);
                 // Through the document handler: a file already here is that item.
                 let ext = u.name.rsplit('.').next().unwrap_or("").to_lowercase();
-                let r = ingest::document(self, "upload", &hash, &u.name, &ext, &data, &u.labels, None).await?;
+                let mut r = ingest::document(self, "upload", &hash, &u.name, &ext, &data, &u.labels, None).await?;
+                if r.status == "queued" {
+                    // Read by the kit: wait a while for it.
+                    match extract::outcome(self, &format!("doc:upload:{hash}"), std::time::Duration::from_secs(90)).await? {
+                        Some(Ok(k)) => {
+                            r.id = Some(k.id);
+                            r.status = k.status.into();
+                        }
+                        Some(Err(e)) => anyhow::bail!("{e}"),
+                        None => return Ok(json!({"status": "queued", "title": u.name})),
+                    }
+                }
                 let id = r.id.unwrap_or_default();
-                let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
+                let (kind, title): (String, String) = sqlx::query_as("SELECT kind, title FROM items WHERE id = ?")
                     .bind(&id)
                     .fetch_optional(&self.store.pool)
                     .await?
                     .unwrap_or_default();
-                Ok(json!({"id": id, "kind": r.kind, "title": title, "status": r.status}))
+                Ok(json!({"id": id, "kind": kind, "title": title, "status": r.status}))
             }
             "memex.content" => {
                 use base64::Engine;
@@ -735,7 +763,11 @@ impl Memex {
                 let item = self.store.item(id, &allowed).await?.ok_or_else(|| anyhow::anyhow!("no item {id:?}"))?;
                 let data = match (item.meta["blob"].as_str(), item.meta["path"].as_str()) {
                     (Some(b), _) => tokio::fs::read(self.blob_path(b)).await?,
-                    (None, Some(p)) => tokio::fs::read(p).await?,
+                    // In a folder on its worker: read there.
+                    (None, Some(p)) => {
+                        let ex = self.extractor().ok_or_else(|| anyhow::anyhow!("nothing reads folders yet"))?;
+                        ex.read(item.meta["worker"].as_str().unwrap_or_default(), p, MAX_HELD).await?
+                    }
                     _ => item.text.into_bytes(),
                 };
                 Ok(json!({
@@ -875,6 +907,11 @@ impl Memex {
                 s.last_error = self.last_error.lock().unwrap().clone();
                 understand::status(self, &mut s).await?;
                 media::status(self, &mut s).await?;
+                let (waiting, trouble) = extract::status(self).await?;
+                s.extracting = waiting as u64;
+                if s.last_error.is_none() {
+                    s.last_error = trouble.map(|t| format!("reading files: {t}"));
+                }
                 Ok(json!(s))
             }
             other => anyhow::bail!("the memex has no method {other}"),

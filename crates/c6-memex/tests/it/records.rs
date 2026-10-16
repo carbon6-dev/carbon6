@@ -20,6 +20,7 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
 
 #[tokio::test]
 async fn records_are_searchable() {
+    crate::extract_here();
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),
@@ -73,6 +74,7 @@ async fn records_are_searchable() {
 /// reaches the memex, here the guidance briefs give before facts.
 #[tokio::test]
 async fn edited_prompts_reach_the_memex() {
+    crate::extract_here();
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),

@@ -138,7 +138,7 @@ async fn run(ctx: &ToolCtx, rt: &str, spec: &Value, command: Vec<String>) -> Too
         .filter_map(Value::as_str)
         .filter_map(|s| ctx.session.secrets().get(s).map(|v| (s.to_owned(), v)))
         .collect();
-    let out = match sandboxed(rt, spec, &root, command, &env, Some(&ctx.cancel)).await {
+    let out = match sandboxed(rt, spec, &root, &[], command, &env, Some(&ctx.cancel)).await {
         Ok(o) => o,
         Err(e) => return ToolOutput::err(e),
     };
@@ -235,6 +235,7 @@ pub async fn sandboxed(
     rt: &str,
     spec: &Value,
     folder: &Path,
+    mounts: &[(PathBuf, String)],
     command: Vec<String>,
     env: &[(String, String)],
     cancel: Option<&tokio_util::sync::CancellationToken>,
@@ -274,6 +275,10 @@ pub async fn sandboxed(
         args.extend(["-e".into(), format!("{k}={v}")]);
     }
     args.extend(["-v".into(), format!("{}:/work{}", folder.display(), if ro { ":ro" } else { "" }), "-w".into(), "/work".into()]);
+    // Files of the worker's the run reads, never writes.
+    for (from, at) in mounts {
+        args.extend(["-v".into(), format!("{}:{at}:ro", from.display())]);
+    }
     args.push(spec["image"].as_str().unwrap_or_default().to_owned());
     args.extend(command);
     let timeout = Duration::from_secs(p["timeout_s"].as_u64().unwrap_or(120));

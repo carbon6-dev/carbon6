@@ -1,0 +1,24 @@
+# Built on its own in the c6-extract kit's image (docs/knowledge.md §4), so
+# nothing here comes from the workspace; its Cargo.lock is that build's.
+# The head offers the kit as kit.json's version: when the source changes,
+# bump it (and kit.digest; c6-head's tests say what to write).
+[package]
+name = "c6-extract"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/carbon6-dev/carbon6"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+htmd = "0.5.5"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff"] }
+kamadak-exif = "0.6.1"
+mail-parser = "0.11.9"
+pdf-extract = "0.12.1"
+regex = "1.13.1"
+serde_json = "1.0.151"
+tract-onnx = "0.23.8"
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
+

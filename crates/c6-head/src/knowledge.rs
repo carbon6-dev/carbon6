@@ -170,6 +170,7 @@ pub async fn open(st: &Arc<HeadState>, memex_dirs: &[std::path::PathBuf]) -> any
     }
     let link = Arc::new(c6_worker::link::HeadLink::local(Arc::new(Local { st: Arc::downgrade(st) })));
     let m = c6_memex::Memex::open(&dir(st), link).await?;
+    m.set_extractor(Arc::new(crate::extract::KitExtractor { st: Arc::downgrade(st) }));
     m.spawn_jobs();
     let _ = st.memex.set(m);
     Ok(())

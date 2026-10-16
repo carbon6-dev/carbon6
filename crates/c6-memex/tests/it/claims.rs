@@ -28,6 +28,7 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
 
 #[tokio::test]
 async fn claims_are_owned_and_readers_choose() {
+    crate::extract_here();
     let mock = MockLlm::start().await;
     let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let head = c6_head::start(HeadConfig {
