@@ -212,7 +212,10 @@ async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some(first) =
         sqlx::query("SELECT * FROM extractions WHERE next_at <= ? ORDER BY id LIMIT 1").bind(now).fetch_optional(&m.store.pool).await?
     else {
-        return Ok(false);
+        // Nothing waits at all: mail kept before messages were read once
+        // is read again, a hundred at a time.
+        let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM extractions").fetch_one(&m.store.pool).await?;
+        return Ok(waiting == 0 && crate::mail::backfill(m).await? > 0);
     };
     let tool: String = first.get("tool");
     let place = worker_of(&first.get::<String, _>("input"));
@@ -355,6 +358,13 @@ async fn failed(m: &Memex, tool: &str, job: &Done<'_>, why: &str) -> anyhow::Res
         "document" | "media" if job.params["folder"].as_bool() == Some(true) => {
             let (mtime, size) = (job.params["mtime"].as_i64().unwrap_or(0), job.params["size"].as_i64().unwrap_or(0));
             m.store.set_file(job.input, mtime, size, None, Some(why)).await?;
+        }
+        // A message that can't be read again isn't tried forever.
+        "mail" if job.params["kind"] == "reparse" => {
+            sqlx::query("UPDATE mail SET parsed = 2 WHERE item_id = ?")
+                .bind(job.params["item"].as_str().unwrap_or_default())
+                .execute(&m.store.pool)
+                .await?;
         }
         "faces" | "video" => {
             let sql = if tool == "faces" {

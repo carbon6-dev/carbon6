@@ -91,11 +91,14 @@ pub async fn worker(st: &HeadState, name: &str) -> anyhow::Result<WorkerId> {
     let rows = st.store.workers().await?;
     let host = gethostname::gethostname().into_string().unwrap_or_default().to_lowercase();
     let short = |h: &str| h.trim_end_matches(".local").to_lowercase();
-    let row = if name.is_empty() {
-        rows.iter().filter(|r| r.revoked_at.is_none() && r.role != "memex").find(|r| short(&r.hostname) == short(&host))
+    let candidates: Vec<&crate::store::WorkerRow> = if name.is_empty() {
+        rows.iter().filter(|r| r.revoked_at.is_none() && r.role != "memex" && short(&r.hostname) == short(&host)).collect()
     } else {
-        rows.iter().filter(|r| r.revoked_at.is_none()).find(|r| r.name == name || r.id == name)
+        rows.iter().filter(|r| r.revoked_at.is_none() && (r.name == name || r.id == name)).collect()
     };
+    // One that is connected, if any is (a machine can have several).
+    let connected = |r: &&&crate::store::WorkerRow| r.id.parse().is_ok_and(|id| st.registry.get(WorkerId(id)).is_some());
+    let row = candidates.iter().find(connected).or(candidates.first()).copied();
     let row = row.ok_or_else(|| {
         anyhow::anyhow!(if name.is_empty() {
             "no worker runs on the head's machine (name the folder's worker in Settings → Knowledge)".to_owned()
