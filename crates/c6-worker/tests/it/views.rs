@@ -142,3 +142,93 @@ async fn views_per_realm_and_their_actions() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+/// Items of a shared kind (docs/knowledge.md §6.2, #6 and #7): root's
+/// vocabulary gives each kind its shape, an app's items are checked against
+/// it, and a messages view an app brings shows its items, its buttons
+/// calling the app's operations.
+#[tokio::test]
+async fn item_views_and_shared_kinds() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    use reqwest::Method as M;
+    let send = |method: M, path: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.request(method, &url).json(&body).send().await.unwrap() }
+    };
+    let ok = async |r: reqwest::Response| -> Value {
+        let s = r.status();
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+
+    // The shared kinds, with their shapes and cards.
+    let vocab = ok(send(M::GET, "settings/vocabulary", json!({})).await).await;
+    let email = vocab.as_array().unwrap().iter().find(|e| e["name"] == "email" && e["kind"] == "kind").unwrap().clone();
+    assert_eq!(email["schema"]["required"], json!(["thread_id"]), "{email}");
+    assert!(email["card"]["invariants"].to_string().contains("thread_id"), "{email}");
+    // An items view shows a kind its kind is for.
+    let bad = json!([{"name": "x", "kind": "messages", "source": {"items": "photo"}}]);
+    assert_eq!(send(M::PUT, "settings/views", bad).await.status(), StatusCode::BAD_REQUEST);
+
+    // A mail app: its messages view, and an operation its Archive button calls.
+    let pkg = json!({"package": "mailbox", "version": "1.0.0",
+        "contents": {
+            "collections": [{"name": "archived", "schema": {"type": "object", "properties": {"item": {"type": "string"}}}}],
+            "views": [{"name": "inbox", "kind": "messages", "source": {"items": "email"},
+                       "actions": [{"label": "Archive", "operation": "archive", "input": {"item": "$.id"}}]}]},
+        "operations": [{"name": "archive", "input": {"type": "object", "properties": {"item": {"type": "string"}}},
+                        "write": {"collection": "archived", "fields": {"item": "$.item"}}}]});
+    ok(send(M::POST, "packages", json!({"manifest": pkg})).await).await;
+    let i: c6_api::Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "mailbox"})).await).await).unwrap();
+    ok(send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await).await;
+
+    // Its items (as its kit's out/ingest.json would give them); one without
+    // a thread is not an email.
+    let mail = |id: &str, thread: Option<&str>, at: i64, subject: &str| {
+        let mut meta = json!({"from": "ada@example.com"});
+        if let Some(t) = thread {
+            meta["thread_id"] = json!(t);
+        }
+        json!({"kind": "email", "external_id": id, "title": subject, "text": format!("From: ada@example.com\n{subject}"), "created_at": at, "meta": meta})
+    };
+    let done = c6_head::kitjobs::ingest(
+        &head.state,
+        "home",
+        "mailbox",
+        "kit:test.sync",
+        &json!({"items": [mail("m1", Some("t1"), 1_000, "Engines"), mail("m2", Some("t1"), 2_000, "Re: Engines"), mail("m3", None, 3_000, "Nope")]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(done["items"], 2, "{done}");
+    assert!(done["errors"].to_string().contains("thread_id"), "{done}");
+
+    let items: Vec<c6_api::ViewItem> = serde_json::from_value(ok(send(M::GET, "views/inbox/items", json!({})).await).await).unwrap();
+    assert_eq!(items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), ["Re: Engines", "Engines"]);
+    assert!(items.iter().all(|i| i.source == "app:mailbox" && i.meta["thread_id"] == "t1"));
+    let older: Vec<c6_api::ViewItem> =
+        serde_json::from_value(ok(send(M::GET, "views/inbox/items?before=2000", json!({})).await).await).unwrap();
+    assert_eq!(older.len(), 1);
+
+    // Archive calls the app's operation with the item.
+    let out = ok(send(M::POST, "views/inbox/act", json!({"action": "Archive", "item": items[0].id})).await).await;
+    assert_eq!(out["item"], items[0].id.as_str(), "{out}");
+    let archived = ok(send(M::POST, "collections/archived/query", json!({})).await).await;
+    assert_eq!(archived["records"][0]["fields"]["item"], items[0].id.as_str(), "{archived}");
+    assert!(archived["records"][0]["created_by"].as_str().unwrap().starts_with("app:mailbox"), "{archived}");
+
+    head.shutdown().await.unwrap();
+}

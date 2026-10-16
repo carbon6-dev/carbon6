@@ -183,6 +183,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/views", get(get_views_setting).put(put_views))
         .route("/api/v1/views", get(list_views))
         .route("/api/v1/views/{name}/act", post(view_act))
+        .route("/api/v1/views/{name}/items", get(view_items))
+        .route("/api/v1/views/{name}/items/{id}/thumb", get(view_item_thumb))
         .route("/api/v1/series", get(list_series).post(create_series))
         .route("/api/v1/series/{name}", get(get_series).patch(update_series).delete(delete_series))
         .route("/api/v1/series/{name}/points", post(record_point))
@@ -2838,6 +2840,29 @@ async fn list_views(
 ) -> ApiResult<Json<Vec<api::View>>> {
     let realm = realm_for(&st, &caller, &r).await?;
     Ok(Json(crate::views::effective(&st, &realm).await?))
+}
+
+async fn view_items(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(q): Query<api::ViewItemsQuery>,
+) -> ApiResult<Json<Vec<api::ViewItem>>> {
+    let realm = realm_for(&st, &caller, &api::InRealm { realm: q.realm.clone() }).await?;
+    Ok(Json(crate::views::items(&st, &realm, &name, &q).await?))
+}
+
+async fn view_item_thumb(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((name, id)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let realm = realm_for(&st, &caller, &r).await?;
+    let data = crate::views::thumb(&st, &realm, &name, &id).await?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg"), (axum::http::header::CACHE_CONTROL, "private, max-age=3600")], data)
+        .into_response())
 }
 
 async fn view_act(

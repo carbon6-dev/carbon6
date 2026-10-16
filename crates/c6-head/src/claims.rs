@@ -36,29 +36,192 @@ const DEFAULT_VOCABULARY: &[(&str, &str, &str)] = &[
     ("contradicts", "label", "The item contradicts the claim or fact."),
     ("same_as", "label", "The two things are the same (a person under two names or addresses)."),
     ("not_same_as", "label", "The two things are not the same, though they may look it."),
-    ("email", "kind", "An email message."),
-    ("event", "kind", "A calendar event."),
-    ("contact", "kind", "An entry in an address book."),
-    ("document", "kind", "A document: PDF, Word, Markdown, text, HTML."),
-    ("photo", "kind", "A photo."),
-    ("video", "kind", "A video."),
-    ("note", "kind", "A note written by you or an agent."),
-    ("session", "kind", "A carbon6 session's digest."),
-    ("record", "kind", "A record of a collection, mirrored for search."),
 ];
 
-/// Puts the default vocabulary in root once (your edits are kept).
+/// The shared item kinds (docs/knowledge.md §6.2, #6): what each means,
+/// the shape of its items' `meta` (every app's items of the kind are
+/// checked against it), and its data card. Gmail, IMAP and an import all
+/// make the same `email`.
+fn default_kinds() -> Vec<Value> {
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let n = |d: &str| json!({"type": "integer", "description": d});
+    let list = |d: &str| json!({"type": "array", "items": {"type": "string"}, "description": d});
+    let file = || {
+        json!({
+            "name": s("Its file name"), "mime": s("Its MIME type"), "size": n("Bytes"),
+            "blob": s("The content's blob (its SHA-256), when the store holds it"),
+            "path": s("Where it is, in a folder on a worker"), "worker": s("That worker (empty: the head's machine)"),
+        })
+    };
+    let card = |sources: &str, invariants: &[&str], freshness: &str| json!({"stability": "published", "sources": sources, "invariants": invariants, "freshness": freshness});
+    let mut photo = file();
+    photo.as_object_mut().unwrap().extend(
+        json!({
+            "width": n("Pixels"), "height": n("Pixels"), "thumb": s("A JPEG thumbnail's blob, if not the store's own"),
+            "camera": s("The camera"), "lat": {"type": "number"}, "lon": {"type": "number"},
+        })
+        .as_object()
+        .cloned()
+        .unwrap(),
+    );
+    let mut video = photo.clone();
+    video["duration"] = json!({"type": "number", "description": "Seconds"});
+    let mut paper = file();
+    paper["paper"] = json!({"type": "object", "description": "Its identity: doi, arxiv, authors, year, references (a count)"});
+    let kind = |name: &str, means: &str, schema: Value, card: Value| {
+        let mut e = json!({"name": name, "kind": "kind", "means": means, "card": card});
+        if !schema.is_null() {
+            e["schema"] = schema;
+        }
+        e
+    };
+    let obj = |props: Value, required: &[&str]| {
+        let mut o = json!({"type": "object", "properties": props});
+        if !required.is_empty() {
+            o["required"] = json!(required);
+        }
+        o
+    };
+    vec![
+        kind(
+            "email",
+            "An email message. Its created_at is when it was sent; its text starts with From and To lines.",
+            obj(
+                json!({
+                    "thread_id": s("The conversation it belongs to: the same for every message of a thread"),
+                    "from": s("The sender's address"), "to": list("Addresses it was sent to"), "cc": list("Addresses copied"),
+                    "account": s("The mailbox it is in"), "attachments": n("How many attachments it has"),
+                    "html": s("Its HTML's blob, if it has HTML"),
+                }),
+                &["thread_id"],
+            ),
+            card(
+                "Mail apps (Gmail, IMAP, an import): one item per message, sent_by, sent_to and cc claims to people.",
+                &["Messages of one conversation share thread_id.", "Spam is the kind spam, not email, and is not shown to agents."],
+                "As often as its app syncs (Gmail: minutes).",
+            ),
+        ),
+        kind(
+            "attachment",
+            "A file attached to an email.",
+            obj(
+                json!({"message": s("The email item it came with"), "index": n("Its place among the message's attachments")}),
+                &["message"],
+            )
+            .as_object()
+            .cloned()
+            .map(|mut o| {
+                o["properties"].as_object_mut().unwrap().extend(file().as_object().cloned().unwrap());
+                Value::Object(o)
+            })
+            .unwrap(),
+            card("Mail apps, from the messages they keep.", &["An attachment's message is an email item."], "With its message."),
+        ),
+        kind(
+            "event",
+            "A calendar event. Its created_at is when it starts.",
+            obj(
+                json!({
+                    "end": n("When it ends (ms since the epoch)"), "all_day": {"type": "boolean"},
+                    "location": s("Where"), "calendar": s("The calendar it is in"), "account": s("The account"),
+                    "attendees": list("Attendees' addresses"), "status": s("confirmed, tentative or cancelled"),
+                }),
+                &[],
+            ),
+            card(
+                "Calendar apps (Google Calendar, CalDAV): one item per event or occurrence, attended and invited claims.",
+                &["end is at or after the start (created_at)."],
+                "As often as its app syncs.",
+            ),
+        ),
+        kind(
+            "contact",
+            "An entry in an address book.",
+            obj(json!({"emails": list("Its addresses"), "phones": list("Its numbers"), "organization": s("Where they work")}), &[]),
+            card("Contacts apps (Google Contacts, CardDAV).", &[], "As often as its app syncs."),
+        ),
+        kind(
+            "document",
+            "A document: PDF, Word, Markdown, text, HTML.",
+            obj(file(), &[]),
+            card(
+                "Uploads, watched folders and imports; its text as the c6-extract kit read it.",
+                &[],
+                "When added, and when its file changes.",
+            ),
+        ),
+        kind(
+            "paper",
+            "A research paper: a document that says what it is and what it cites.",
+            obj(paper, &[]),
+            card(
+                "Documents recognized as papers.",
+                &["It is linked to its paper thing (is), its authors and the papers it cites."],
+                "When added.",
+            ),
+        ),
+        kind(
+            "photo",
+            "A photo. Its created_at is when it was taken.",
+            obj(photo, &[]),
+            card(
+                "Watched folders and photo apps; EXIF and a thumbnail as the c6-extract kit read them.",
+                &[],
+                "When its folder is scanned.",
+            ),
+        ),
+        kind(
+            "video",
+            "A video. Its created_at is when it was recorded.",
+            obj(video, &[]),
+            card("Watched folders and photo apps.", &[], "When its folder is scanned."),
+        ),
+        kind("note", "A note written by you or an agent.", Value::Null, json!({})),
+        kind("session", "A carbon6 session's digest.", Value::Null, json!({})),
+        kind("record", "A record of a collection, mirrored for search.", Value::Null, json!({})),
+    ]
+}
+
+/// Puts the default vocabulary in root (your edits are kept): once, and
+/// then the item kinds' schemas and cards, and kinds that came later.
 pub async fn seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let seeded: Option<String> =
         sqlx::query_scalar("SELECT value FROM settings WHERE key = 'vocabulary_seeded'").fetch_optional(pool).await?;
-    if seeded.is_some() {
+    if seeded.as_deref() == Some("2") {
         return Ok(());
     }
-    let entries: Vec<Value> =
-        DEFAULT_VOCABULARY.iter().map(|(name, kind, means)| json!({"name": name, "kind": kind, "means": means})).collect();
+    let mut entries: Vec<Value> = match seeded {
+        None => DEFAULT_VOCABULARY.iter().map(|(name, kind, means)| json!({"name": name, "kind": kind, "means": means})).collect(),
+        Some(_) => crate::lists::read(pool, VOCABULARY, ROOT).await?,
+    };
+    for k in default_kinds() {
+        match entries.iter_mut().find(|e| e["name"] == k["name"] && e["kind"] == "kind") {
+            Some(e) => {
+                for f in ["schema", "card"] {
+                    if e.get(f).is_none_or(Value::is_null) && !k[f].is_null() {
+                        e[f] = k[f].clone();
+                    }
+                }
+            }
+            None => entries.push(k),
+        }
+    }
     crate::lists::write(pool, VOCABULARY, ROOT, &entries, "system").await?;
-    sqlx::query("INSERT INTO settings (key, value) VALUES ('vocabulary_seeded', '1')").execute(pool).await?;
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('vocabulary_seeded', '2') ON CONFLICT(key) DO UPDATE SET value = '2'")
+        .execute(pool)
+        .await?;
     Ok(())
+}
+
+/// An item kind's schema in the shared vocabulary, if it has one.
+pub async fn kind_schema(st: &HeadState, kind: &str) -> Option<Value> {
+    crate::lists::read(&st.store.pool, VOCABULARY, ROOT)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|e| e["kind"] == "kind" && e["name"] == kind)
+        .map(|e| e["schema"].clone())
+        .filter(|s| !s.is_null())
 }
 
 pub fn check_policies(p: &[api::ClaimPolicy]) -> anyhow::Result<()> {
@@ -78,6 +241,12 @@ pub fn check_vocabulary(v: &[api::VocabularyEntry]) -> anyhow::Result<()> {
     for e in v {
         if e.name.trim().is_empty() || !matches!(e.kind.as_str(), "label" | "kind") || e.means.trim().is_empty() {
             return Err(bad_request("a vocabulary entry is a name, its kind (label or kind) and what it means"));
+        }
+        if !e.schema.is_null() {
+            if e.kind != "kind" {
+                return Err(bad_request(format!("{}: only item kinds have a schema", e.name)));
+            }
+            crate::schema::check_schema(&e.schema).map_err(|m| bad_request(format!("{}: {m}", e.name)))?;
         }
     }
     Ok(())

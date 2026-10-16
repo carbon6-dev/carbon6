@@ -1,7 +1,8 @@
 //! Views (docs/os.md §4.5): a realm's configured screens, rendered from
 //! their configuration (Settings → Views): a table or board of records, a
 //! record, a chart of a series, a feed of decisions or sessions, or a page
-//! embedding others. Each realm's views are in the header's menu.
+//! embedding others; and messages, a calendar or a gallery of items of a
+//! shared kind (itemviews.rs). Each realm's views are in the header's menu.
 
 use c6_api::{Record, RecordQuery, View as ViewDef, ViewAct};
 use leptos::prelude::*;
@@ -82,6 +83,9 @@ pub(crate) fn ViewBody(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
         "chart" => view! { <ChartView view=view /> }.into_any(),
         "feed" => view! { <FeedView view=view /> }.into_any(),
         "page" => view! { <PageView view=view all=all /> }.into_any(),
+        "messages" => view! { <crate::itemviews::MessagesView view=view /> }.into_any(),
+        "calendar" => view! { <crate::itemviews::CalendarView view=view /> }.into_any(),
+        "gallery" => view! { <crate::itemviews::GalleryView view=view /> }.into_any(),
         "record" => match view.source["id"].as_str() {
             Some(id) => view! { <RecordBody id=id.to_owned() view=view.clone() /> }.into_any(),
             None => view! { <TableView view=view /> }.into_any(),
@@ -149,7 +153,7 @@ fn Actions(view: ViewDef, record: String, tick: RwSignal<u32>, error: RwSignal<O
             view! {
                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |ev| {
                     ev.stop_propagation();
-                    let act = ViewAct { action: label.clone(), record: record.clone() };
+                    let act = ViewAct { action: label.clone(), record: record.clone(), ..Default::default() };
                     let name = name.clone();
                     spawn_local(async move {
                         match api::view_act(name, act).await {

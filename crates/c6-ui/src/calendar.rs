@@ -10,14 +10,14 @@ use serde_json::json;
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
-const DAY: f64 = 86_400_000.0;
+pub(crate) const DAY: f64 = 86_400_000.0;
 
-fn date_of(ms: f64) -> js_sys::Date {
+pub(crate) fn date_of(ms: f64) -> js_sys::Date {
     js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms))
 }
 
 /// Local midnight of the day containing `ms`.
-fn midnight(ms: f64) -> f64 {
+pub(crate) fn midnight(ms: f64) -> f64 {
     let d = date_of(ms);
     d.set_hours(0);
     d.set_minutes(0);
@@ -26,12 +26,12 @@ fn midnight(ms: f64) -> f64 {
     d.get_time()
 }
 
-fn hm(ms: i64) -> String {
+pub(crate) fn hm(ms: i64) -> String {
     let d = date_of(ms as f64);
     format!("{:02}:{:02}", d.get_hours(), d.get_minutes())
 }
 
-fn day_label(ms: f64) -> String {
+pub(crate) fn day_label(ms: f64) -> String {
     String::from(date_of(ms).to_locale_date_string(
         "default",
         &js_sys::Object::from(js_sys::JSON::parse(r#"{"weekday":"short","month":"short","day":"numeric"}"#).unwrap()),

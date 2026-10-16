@@ -228,3 +228,20 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - `C6_TEST_KITS=1` runs the real kit end to end: an approval, a Docker build, a folder on a worker read in place, and mail with an attachment.
 - **Not done:** embeddings still go to a model connection from the head (§4 allows it); OCR of scans is not in the kit yet; object storage for blobs (§5) is later.
 
+### 13.5 Shared item kinds and their views (step 5)
+
+- **Item kinds in root's vocabulary:** `email`, `attachment`, `event`, `contact`, `document`, `paper`, `photo`, `video` (and `note`, `session`, `record`). Each has a `schema`, the JSON Schema of its items' `meta` (for example, an email has a `thread_id`; an event has `end` and `all_day`), and a data `card` (sources, invariants, freshness).
+  - Vocabularies seeded before this get the schemas, cards and new kinds added. Entries you changed keep your changes.
+  - A schema is checked when you save the vocabulary.
+- **Apps' items are checked:** an item in a kit's `out/ingest.json` of a kind with a schema must fit it, or it is refused, with the reason among the run's errors. Items carbon6 makes itself (the Gmail sync until step 6, extraction) already fit.
+- **View kinds** `messages` (email), `calendar` (event) and `gallery` (photo and video). Their source is `{"items": kind, "owner"?: app}`.
+  - The owner defaults to the app that brings the view. A view of your own with no owner shows anyone's items.
+  - `GET /api/v1/views/{name}/items` lists them: newest first with `before`, or from a time on, oldest first, with `from` and `to`. `…/items/{id}/thumb` gives a picture: a photo's thumbnail, or the blob an item's `meta.thumb` names.
+- **Actions on items:** `POST /api/v1/views/{name}/act` with `item` calls an operation of the owning app (`op`, or `app.op`), its input mapped from the item (`$.id`, `$.title`, `$.meta.thread_id`), as that app. It can also start a template with the item as input (sessions labelled `item:<id>`).
+- **In the UI** (`itemviews.rs`):
+  - **messages:** threads (by `thread_id`) beside the chosen thread's messages, with the actions acting on its newest message;
+  - **calendar:** a week by day, with times or "all day";
+  - **gallery:** a grid of thumbnails, with photos and videos side by side, and one opened larger with its actions.
+  - Each has paging back in time.
+  - The Mail, Calendar and Photos pages stay as they are until step 6 moves mail, calendar and contacts into apps.
+

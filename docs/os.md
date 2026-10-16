@@ -428,6 +428,7 @@ view(realm, name, kind /* table | board | record | chart | feed | page */,
   - **chart:** bars per hour or day of a series, with totals per dimension value.
   - **feed:** open decisions with their options as buttons, or sessions with given labels, newest first.
   - **page:** Markdown with `{{view:name}}` embedding any view but a page.
+  - **messages, calendar, gallery:** items of a shared kind (email; events; photos and videos), from whichever app owns them. docs/knowledge.md §13.5 has the details.
 - **Actions** are buttons on each record. They set fields and/or start a template with the record as `{{input}}`, its sessions labelled `record:<id>`. Answering decisions and opening a record's sessions are built into feeds and records.
 - **The menu:** "Views ▾" in the header lists the realm's views. Below the `xl` width, it and the less-used links go into the ☰ menu, which now shows at every width up to `xl` (the header no longer overlaps at 1024px).
 

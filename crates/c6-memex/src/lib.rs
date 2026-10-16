@@ -776,6 +776,53 @@ impl Memex {
                     "data": base64::engine::general_purpose::STANDARD.encode(data),
                 }))
             }
+            // Items of a kind, for views (docs/knowledge.md §6.2, #7).
+            "memex.items.list" => {
+                let kind = params["kind"].as_str().unwrap_or_default();
+                anyhow::ensure!(allowed.iter().any(|k| k == kind), "{kind} is outside what this caller may see");
+                let asc = params["order"] == "asc";
+                let sql = if asc {
+                    "SELECT id, kind, title, substr(body, 1, 4000) AS text, created_at, source, meta FROM items WHERE kind = ? \
+                     AND (? = '' OR source = ?) AND created_at >= ? AND created_at < ? ORDER BY created_at ASC LIMIT ?"
+                } else {
+                    "SELECT id, kind, title, substr(body, 1, 4000) AS text, created_at, source, meta FROM items WHERE kind = ? \
+                     AND (? = '' OR source = ?) AND created_at >= ? AND created_at < ? ORDER BY created_at DESC LIMIT ?"
+                };
+                let rows = sqlx::query(sql)
+                .bind(kind)
+                .bind(params["source"].as_str().unwrap_or_default())
+                .bind(params["source"].as_str().unwrap_or_default())
+                .bind(params["from"].as_i64().unwrap_or(i64::MIN))
+                .bind(params["to"].as_i64().unwrap_or(i64::MAX))
+                .bind(params["limit"].as_u64().unwrap_or(100).min(500) as i64)
+                .fetch_all(&self.store.pool)
+                .await?;
+                use sqlx::Row;
+                Ok(json!(rows.iter().map(|r| api::ViewItem {
+                    id: r.get("id"),
+                    kind: r.get("kind"),
+                    title: r.get("title"),
+                    text: r.get("text"),
+                    created_at: r.get("created_at"),
+                    source: r.get("source"),
+                    meta: serde_json::from_str(&r.get::<String, _>("meta")).unwrap_or_default(),
+                }).collect::<Vec<_>>()))
+            }
+            // An item's picture: a photo's thumbnail, else the blob its
+            // meta names (`thumb`).
+            "memex.items.thumb" => {
+                use base64::Engine;
+                let id = params["id"].as_str().unwrap_or_default();
+                let item = self.store.item(id, &allowed).await?.ok_or_else(|| anyhow::anyhow!("no item {id:?}"))?;
+                let data = match media::thumb(self, id, None).await {
+                    Ok(d) => d,
+                    Err(_) => {
+                        let hash = item.meta["thumb"].as_str().filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+                        tokio::fs::read(self.blob_path(hash.ok_or_else(|| anyhow::anyhow!("no picture for {id}"))?)).await?
+                    }
+                };
+                Ok(json!({"mime": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(data)}))
+            }
             "memex.trails" => Ok(json!(self.store.trails().await?)),
             "memex.trail" => {
                 let id = params["id"].as_str().unwrap_or_default();

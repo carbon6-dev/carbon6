@@ -11,6 +11,7 @@ mod decisions;
 mod explorer;
 mod files;
 mod fleet;
+mod itemviews;
 mod labels;
 mod mail;
 mod markdown;

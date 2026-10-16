@@ -22,7 +22,7 @@ const VIEWS: [(&str, &str); 9] = [
     ("trash", "Trash"),
 ];
 
-fn when(ms: i64) -> String {
+pub(crate) fn when(ms: i64) -> String {
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
     let today = js_sys::Date::new_0();
     if d.to_date_string() == today.to_date_string() {

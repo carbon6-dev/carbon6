@@ -921,6 +921,18 @@ pub async fn view_act(name: String, a: c6_api::ViewAct) -> Result<serde_json::Va
     send_json(Request::post(&format!("/api/v1/views/{}/act{}", enc(&name), in_realm('?'))), &a).await
 }
 
+/// The items a messages, calendar or gallery view shows; `q` is more of
+/// the query (`before=…`, `from=…&to=…`, `kind=video`).
+pub async fn view_items(name: String, q: String) -> Result<Vec<c6_api::ViewItem>, String> {
+    let realm = in_realm('&');
+    json(Request::get(&format!("/api/v1/views/{}/items?{q}{realm}", enc(&name))).send().await).await
+}
+
+/// An item's picture in a view.
+pub fn view_thumb(name: &str, id: &str) -> String {
+    format!("/api/v1/views/{}/items/{}/thumb{}", enc(name), enc(id), in_realm('?'))
+}
+
 pub async fn series() -> Result<Vec<c6_api::Series>, String> {
     json(Request::get(&format!("/api/v1/series{}", in_realm('?'))).send().await).await
 }

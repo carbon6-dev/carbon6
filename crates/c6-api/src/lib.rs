@@ -1005,11 +1005,15 @@ pub struct View {
     pub name: String,
     #[serde(default)]
     pub title: String,
-    /// table, board, record, chart, feed or page.
+    /// table, board, record, chart, feed or page; or, for items of a
+    /// shared kind, messages, calendar or gallery.
     pub kind: String,
     /// What it shows: {collection, where?, sort?, limit?} (table, board,
     /// record); {series, agg?, minutes?, bucket?, group_by?} (chart);
-    /// {decisions: "open"} or {sessions: {labels}} (feed). A page has none.
+    /// {decisions: "open"} or {sessions: {labels}} (feed); {items: kind,
+    /// owner?} (messages, calendar, gallery: items of that kind, from the
+    /// owner app, by default the app that brings the view, else any). A
+    /// page has none.
     #[serde(default)]
     pub source: serde_json::Value,
     /// The fields shown (default: the schema's).
@@ -1043,8 +1047,9 @@ pub struct ViewAction {
     pub start: String,
     #[serde(default)]
     pub set: serde_json::Map<String, serde_json::Value>,
-    /// An operation of the app that owns the view's collection (docs/apps.md
-    /// §7), with `input` mapped from the record (`"$.id"`, `"$.fields.x"`).
+    /// An operation of the app that owns the view's collection or item
+    /// (docs/apps.md §7), with `input` mapped from the record (`"$.id"`,
+    /// `"$.fields.x"`) or item (`"$.id"`, `"$.meta.thread_id"`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub operation: String,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -1057,7 +1062,47 @@ pub struct ViewAction {
 pub struct ViewAct {
     /// The action's label.
     pub action: String,
+    #[serde(default)]
     pub record: String,
+    /// In an items view: the item.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub item: String,
+}
+
+/// `GET /api/v1/views/{name}/items`: newest first (before a time), or
+/// from a time on, oldest first (a calendar's weeks).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ViewItemsQuery {
+    #[serde(default)]
+    pub realm: Option<String>,
+    #[serde(default)]
+    pub before: Option<UnixMs>,
+    #[serde(default)]
+    pub from: Option<UnixMs>,
+    #[serde(default)]
+    pub to: Option<UnixMs>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// A gallery's other kind (video), when not its own.
+    #[serde(default)]
+    pub kind: String,
+}
+
+/// An item in an items view (`GET /api/v1/views/{name}/items`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ViewItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    /// Its text (the first few thousand characters).
+    pub text: String,
+    pub created_at: UnixMs,
+    /// Who wrote it: `app:<instance>`, or a program of carbon6's.
+    pub source: String,
+    #[serde(default)]
+    pub meta: serde_json::Value,
 }
 
 /// A series (docs/os.md §4.4): numbers over time in a realm.
@@ -3313,6 +3358,14 @@ pub struct VocabularyEntry {
     pub means: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub maps_to: String,
+    /// An item kind's shape: the JSON Schema of its items' `meta`, which
+    /// every app's items of the kind are checked against (docs/knowledge.md
+    /// §6.2, #6).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub schema: serde_json::Value,
+    /// An item kind's data card: what readers may rely on, from any owner.
+    #[serde(default, skip_serializing_if = "DataCard::is_empty")]
+    pub card: DataCard,
 }
 
 /// An item, in full (`memex.get` of an item id).

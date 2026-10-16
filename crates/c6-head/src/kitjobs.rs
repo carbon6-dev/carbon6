@@ -159,6 +159,14 @@ pub async fn ingest(st: &HeadState, realm: &str, instance: &str, by: &str, batch
         }
     }
     for it in batch["items"].as_array().into_iter().flatten() {
+        // An item of a shared kind has its kind's shape (docs/knowledge.md §6.2, #6).
+        if let Some(schema) = crate::claims::kind_schema(st, it["kind"].as_str().unwrap_or_default()).await {
+            let meta = if it["meta"].is_null() { json!({}) } else { it["meta"].clone() };
+            if let Err(why) = crate::schema::validate(&schema, &meta) {
+                errors.push(format!("item {:?} ({}): {}", it["title"].as_str().unwrap_or_default(), it["kind"], why.join("; ")));
+                continue;
+            }
+        }
         let mut item = it.clone();
         item["source"] = json!(format!("app:{instance}"));
         match crate::memex::call_in(st, realm, "memex.ingest", item).await {
