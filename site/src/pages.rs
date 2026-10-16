@@ -303,7 +303,7 @@ fn Home() -> impl IntoView {
                 <figure class="diagram">
                     <div class="diagram-scroll" inner_html=ARCHITECTURE></div>
                     <figcaption>
-                        "Workers and the memex dial out to the head over mutual TLS, so they listen on no port. You reach the head from a browser, a phone or the "
+                        "Workers dial out to the head over mutual TLS, so they listen on no port. The memex is part of the head. You reach the head from a browser, a phone or the "
                         <code>"c6"</code>
                         " command line."
                     </figcaption>
@@ -391,7 +391,7 @@ fn Install() -> impl IntoView {
     view! {
         <Shell
             title="Install"
-            description="Install the carbon6 head, workers, memex and CLI on macOS with Homebrew, on Ubuntu with .deb packages, or from source."
+            description="Install the carbon6 head, workers and CLI on macOS with Homebrew, on Ubuntu with .deb packages, or from source."
             path="/install/"
         >
             <article class="prose">
@@ -402,6 +402,13 @@ fn Install() -> impl IntoView {
                     " is the latest; "
                     <a href="/changelog/">"see what changed"</a>
                     "."
+                </p>
+                <p>
+                    "Reading mail, documents and photos, and syncing Gmail, Calendar and Contacts, run in sandboxed kits on a worker with Docker or Podman, so give at least one worker either. "
+                    "Upgrading from 0.2: stop and remove "
+                    <code>"c6m"</code>
+                    " first (" <code>"brew services stop c6m && brew uninstall c6m"</code>
+                    "); the head takes its knowledge in when it starts."
                 </p>
 
                 <h2 id="macos">"macOS, with Homebrew"</h2>
