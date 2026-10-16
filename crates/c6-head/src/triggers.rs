@@ -34,7 +34,7 @@ pub const MAX_WEBHOOK_BODY: usize = 1024 * 1024;
 pub const MAX_DEPTH: usize = 5;
 
 pub const EVENTS: [&str; 7] = ["schedule", "webhook", "memex", "record", "decision", "session", "series"];
-pub const ACTIONS: [&str; 5] = ["start", "write", "ask", "notify", "record"];
+pub const ACTIONS: [&str; 6] = ["start", "write", "ask", "notify", "record", "operation"];
 const OPS: [(&str, &[&str]); 4] = [
     ("series", &["crossed", "cleared"]),
     ("record", &["created", "updated", "deleted"]),
@@ -192,6 +192,17 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
             return Err(bad_request("a notify gives a title or a message"));
         }
         "ask" | "notify" => {}
+        "operation" => {
+            let (inst, op) = (p["instance"].as_str().unwrap_or_default(), p["operation"].as_str().unwrap_or_default());
+            let ops = crate::operations::list(st, realm, inst).await.map_err(|_| {
+                bad_request(format!(
+                    "an operation action names an app in realm {realm}: {{\"instance\": …, \"operation\": …, \"input\": …}}"
+                ))
+            })?;
+            if !ops.iter().any(|o| o.name == op) {
+                return Err(bad_request(format!("the app {inst} has no operation {op:?}")));
+            }
+        }
         "record" => {
             let name = p["series"].as_str().unwrap_or_default();
             let s = crate::series::get(st, realm, name).await.map_err(|_| bad_request(format!("no series {name:?} in realm {realm}")))?;
@@ -675,6 +686,10 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
             .ok_or_else(|| anyhow::anyhow!("the value is not a number: {}", p["value"]))?;
             let point = api::Point { ts: p["ts"].as_i64().unwrap_or(0), value, dims: p["dims"].as_object().cloned().unwrap_or_default() };
             crate::series::record(st, &realm, p["series"].as_str().unwrap_or_default(), &point, &by).await?;
+        }
+        "operation" => {
+            let (inst, op) = (p["instance"].as_str().unwrap_or_default(), p["operation"].as_str().unwrap_or_default());
+            crate::operations::call(st, &realm, inst, op, &p["input"], &by).await?;
         }
         "notify" => {
             st.notifier.send(crate::notify::Note {

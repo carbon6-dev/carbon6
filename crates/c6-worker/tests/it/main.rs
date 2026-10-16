@@ -25,6 +25,7 @@ mod labels;
 mod m4;
 mod memory;
 mod notify;
+mod operations;
 mod outputs;
 mod packages;
 mod policies;

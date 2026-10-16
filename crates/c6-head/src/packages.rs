@@ -62,7 +62,8 @@ pub fn normalize_manifest(mut v: Value) -> anyhow::Result<api::AppPackage> {
 pub fn roles(p: &api::AppPackage) -> Vec<String> {
     let mut r = Vec::new();
     let c = &p.contents;
-    let owns = !c.collections.is_empty() || !c.series.is_empty() || !c.triggers.is_empty() || !p.settings.is_null();
+    let owns =
+        !c.collections.is_empty() || !c.series.is_empty() || !c.triggers.is_empty() || !p.settings.is_null() || !p.operations.is_empty();
     if owns || !p.realm.is_empty() {
         r.push("app".to_owned());
     }
@@ -164,6 +165,7 @@ fn check_manifest(p: &api::AppPackage, files: &BTreeMap<String, Vec<u8>>) -> Vec
             }
         }
     }
+    problems.extend(crate::operations::check(p));
     if roles(p).is_empty() {
         problems.push("a package has contents (an app or a library), settings, or a kit".into());
     }

@@ -1742,6 +1742,7 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::kits::KitRun::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::kits::KitShell::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::templates::TemplateStart::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::apps::AppCall::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::records::SeriesRecord::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::records::SeriesQuery::new(profile == ToolProfile::Claude)));
     // Collections: typed tables in the session's realm.

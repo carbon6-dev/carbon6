@@ -163,6 +163,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/installs/{id}/upgrade", post(upgrade_install))
         .route("/api/v1/installs/{id}/settings", get(install_settings).put(put_install_settings))
         .route("/api/v1/realms/{id}/effective/{key}", get(effective_list))
+        .route("/api/v1/apps/{realm}/{instance}/operations", get(list_operations))
+        .route("/api/v1/apps/{realm}/{instance}/operations/{name}", post(call_operation))
         .route("/api/v1/installs/{id}", axum::routing::delete(remove_install))
         .route("/api/v1/apps", get(list_apps).post(install_app))
         .route("/api/v1/apps/plan", post(plan_app))
@@ -2605,6 +2607,31 @@ async fn effective_list(
         })
         .collect();
     Ok(Json(out))
+}
+
+/// An app instance's operations (docs/apps.md §7).
+async fn list_operations(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((realm, instance)): Path<(String, String)>,
+) -> ApiResult<Json<Vec<api::Operation>>> {
+    if !caller.sees(&realm) {
+        return Err(crate::not_found("no such realm").into());
+    }
+    Ok(Json(crate::operations::list(&st, &realm, &instance).await?))
+}
+
+/// Calls an operation: the app does the work, and who asked is kept with it.
+async fn call_operation(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((realm, instance, name)): Path<(String, String, String)>,
+    Json(c): Json<api::OperationCall>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !caller.sees(&realm) {
+        return Err(crate::not_found("no such realm").into());
+    }
+    Ok(Json(crate::operations::call(&st, &realm, &instance, &name, &c.input, &writer(&caller)).await?))
 }
 
 /// The values of an instance's settings (docs/apps.md §5.4).

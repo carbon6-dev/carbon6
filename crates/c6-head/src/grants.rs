@@ -274,7 +274,14 @@ pub async fn caller_of(st: &HeadState, to: &str, method: &str, by: &str) -> Opti
 /// Whether realm `to` may start realm `from`'s template (granted when an
 /// app requiring `from`'s app was installed, docs/packages.md §3).
 pub async fn may_start(st: &HeadState, from: &str, to: &str, template: &str, by: &str) -> bool {
-    let method = format!("template:{template}");
+    may_call(st, from, to, &format!("template:{template}"), by).await
+}
+
+/// Whether realm `to` may call `method` of realm `from` (an operations
+/// grant naming it), logged on the grant when it may: `template:<name>`,
+/// `op:<instance>.<name>` (docs/apps.md §7).
+pub async fn may_call(st: &HeadState, from: &str, to: &str, method: &str, by: &str) -> bool {
+    let method = method.to_owned();
     let Some(g) = in_force(st, Some(from), to, "operations", "call")
         .await
         .into_iter()

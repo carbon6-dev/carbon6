@@ -54,8 +54,13 @@ pub fn check_views(views: &[api::View]) -> anyhow::Result<()> {
         if v.kind == "board" && v.group_by.is_empty() {
             return Err(bad_request(format!("{n}: a board names the field its columns are (group_by)")));
         }
-        if let Some(a) = v.actions.iter().find(|a| a.label.trim().is_empty() || (a.start.is_empty() && a.set.is_empty())) {
-            return Err(bad_request(format!("{n}: an action has a label, and starts a template or sets fields ({:?})", a.label)));
+        if let Some(a) =
+            v.actions.iter().find(|a| a.label.trim().is_empty() || (a.start.is_empty() && a.set.is_empty() && a.operation.is_empty()))
+        {
+            return Err(bad_request(format!(
+                "{n}: an action has a label, and starts a template, sets fields or calls an operation ({:?})",
+                a.label
+            )));
         }
     }
     Ok(())
@@ -84,6 +89,25 @@ pub async fn act(st: &HeadState, realm: &str, name: &str, a: &api::ViewAct, by: 
         view.actions.iter().find(|x| x.label == a.action).ok_or_else(|| bad_request(format!("{name} has no action {:?}", a.action)))?;
     let collection = view.source["collection"].as_str().ok_or_else(|| bad_request("actions are on records"))?;
     let mut rec = crate::collections::record(st, realm, collection, &a.record).await?;
+    // An operation of the app that owns the collection (docs/apps.md §7):
+    // `<app>.<operation>`, or the operation's name alone.
+    if !action.operation.is_empty() {
+        let owner = crate::collections::get(st, realm, collection).await?.owner;
+        let (inst, op) = match action.operation.split_once('.') {
+            Some((i, o)) => (i.to_owned(), o.to_owned()),
+            None => (owner.clone(), action.operation.clone()),
+        };
+        let input = crate::triggers::render(&Value::Object(action.input.clone()), &json!({"id": rec.id, "fields": rec.fields}));
+        let out = crate::operations::call(st, realm, &inst, &op, &input, by).await?;
+        if let Ok(r) = crate::collections::record(st, realm, collection, &rec.id).await {
+            rec = r;
+        }
+        let mut v = json!({"record": rec, "operation": out});
+        if let Some(run) = out_run(&v) {
+            v["run"] = run;
+        }
+        return Ok(v);
+    }
     if !action.set.is_empty() {
         let mut fields = rec.fields.as_object().cloned().unwrap_or_default();
         fields.extend(action.set.clone());
@@ -98,4 +122,8 @@ pub async fn act(st: &HeadState, realm: &str, name: &str, a: &api::ViewAct, by: 
         out["run"] = json!(run);
     }
     Ok(out)
+}
+
+fn out_run(v: &Value) -> Option<Value> {
+    v["operation"].get("run").cloned()
 }

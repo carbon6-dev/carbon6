@@ -146,6 +146,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["templates", _, "run"] if method == Method::POST => Ok(()),
         // Its own realm in the explorer.
         ["realms", id, "summary" | "activity" | "list" | "object" | "search" | "neighborhood" | "effective", ..] if *id == realm => Ok(()),
+        // Its apps' operations.
+        ["apps", r, _, "operations", ..] if *r == realm => Ok(()),
         // Series and views: always within the caller's realm.
         ["series", ..] | ["views", ..] => Ok(()),
         // Collections: within the caller's realm, or another's through a

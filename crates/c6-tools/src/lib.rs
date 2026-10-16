@@ -1,6 +1,7 @@
 //! Built-in agent tools and the `Tool` trait.
 
 pub mod agents;
+pub mod apps;
 pub mod api_reference;
 mod background;
 mod bash;

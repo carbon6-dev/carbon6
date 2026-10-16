@@ -115,6 +115,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                     .await?;
                 Ok(json!({"run_id": run.run_id, "realm": realm, "sessions": run.sessions.iter().map(|s| &s.id).collect::<Vec<_>>(), "errors": run.errors}))
             }
+            // An app's operation (docs/apps.md §7).
+            "app_call" => crate::operations::for_session(st, &target, &params).await,
             // Series, in the session's realm (docs/os.md §4.4).
             "series_record" | "series_query" => {
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());

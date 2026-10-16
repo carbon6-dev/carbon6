@@ -217,6 +217,19 @@ pub fn export_url(realm: &str, instance: &str, fork: &str, data: bool) -> String
     )
 }
 
+/// An app instance's operations (docs/apps.md §7).
+pub async fn operations(realm: &str, instance: &str) -> Result<Vec<c6_api::Operation>, String> {
+    json(Request::get(&format!("/api/v1/apps/{}/{}/operations", enc(realm), enc(instance))).send().await).await
+}
+
+pub async fn call_operation(realm: &str, instance: &str, name: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
+    send_json(
+        Request::post(&format!("/api/v1/apps/{}/{}/operations/{}", enc(realm), enc(instance), enc(name))),
+        &serde_json::json!({"input": input}),
+    )
+    .await
+}
+
 pub async fn set_install_settings(id: i64, values: serde_json::Value) -> Result<c6_api::Install, String> {
     send_json(Request::put(&format!("/api/v1/installs/{id}/settings")), &values).await
 }

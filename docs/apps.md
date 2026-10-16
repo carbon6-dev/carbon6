@@ -334,3 +334,20 @@ Settled since the first version: mail, calendar and contacts are in the realm wh
 - **Removing** an instance deletes what it owns (collections and their records, series, triggers), after the decision; its sessions and the realm stay.
 - **Apps installed before:** at start, the copies of their code they wrote into their realm's lists are removed where they are still as installed; entries you had edited stay as the realm's own, and a decision asks whether to keep them or use the app's.
 - **Not yet:** app realms are not moved into home (step 7), and `exports` still only matters across realms, through a grant.
+
+### 18.2 Operations (step 4)
+
+- **In the manifest:** `operations`, each with a `name`, a `description`, an `input` (a JSON Schema of an object) and one of:
+  - `write` {`collection` (one the package owns), `id` (`"$.record"`; none: a new record), `fields` (mapped from the input), `when` (a query filter the record must match first), `delete`};
+  - `template` (one of the package's templates).
+  - `kit` operations are declared in the type but refused until kits run from the head (docs/knowledge.md, step 3).
+  - Checked when the package is added: what it writes is its own, what it starts is its template.
+- **Calling** (`operations.rs`): the input is checked against its schema; the work is done as the app, and who asked is kept with it (`app:<instance> op:<name> <caller>` in the record's history).
+  - A write touches only the fields it names; a `when` that the record doesn't match is refused, saying so.
+  - A template operation starts the app's session (labelled `op:<instance>.<name>`) with the input as `{{input}}`.
+- **Callers:**
+  - the API: `GET /api/v1/apps/{realm}/{instance}/operations` and `POST …/operations/{name}` with `{input}` (a realm's token, in its realm);
+  - agents: the `app_call` tool, which with no arguments lists what there is to call in its realm, and reaches another realm only through a `call` grant on `op:<instance>.<name>`;
+  - triggers: the `operation` action, `{instance, operation, input}` with the event mapped in;
+  - views: an action with `operation` (`<instance>.<name>`, or the name alone for the collection's owner) and `input` mapped from the record (`"$.id"`, `"$.fields.x"`);
+  - the UI: an app's collection shows its operations as buttons, each a form made from its input's schema and filled from the record you pick.

@@ -225,6 +225,9 @@ fn CollectionView(name: String) -> impl IntoView {
     });
     // None: no form; Some(None): a new record; Some(Some(r)): editing r.
     let editing = RwSignal::new(None::<Option<Record>>);
+    // An app's collection: the record picked, and the operation whose form is open.
+    let picked = RwSignal::new(None::<Record>);
+    let calling = RwSignal::new(None::<c6_api::Operation>);
     let gone = RwSignal::new(None::<String>);
     let column = crate::workspace::use_column();
     let refresh = Callback::new(move |()| {
@@ -272,6 +275,7 @@ fn CollectionView(name: String) -> impl IntoView {
                         </div>
                         {move || gone.get().map(|e| view! { <ErrorBox message=e /> })}
                         {move || editing.get().map(|r| view! { <RecordForm collection=c.get_value() record=r done=refresh /> })}
+                        {c.with_value(|c| !c.owner.is_empty()).then(|| view! { <Operations collection=c.get_value() picked calling refresh /> })}
                         {move || page.get().map(|p| match p {
                             Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                             Ok(p) if p.records.is_empty() => view! { <p class="text-sm text-zinc-500">"No records."</p> }.into_any(),
@@ -289,7 +293,13 @@ fn CollectionView(name: String) -> impl IntoView {
                                                 let row = r.clone();
                                                 view! {
                                                     <tr class="cursor-pointer border-t border-zinc-200 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
-                                                        on:click=move |_| if !c.with_value(|c| c.system) { editing.set(Some(Some(row.clone()))) }>
+                                                        on:click=move |_| {
+                                                            if c.with_value(|c| !c.owner.is_empty()) {
+                                                                picked.set(Some(row.clone()));
+                                                            } else if !c.with_value(|c| c.system) {
+                                                                editing.set(Some(Some(row.clone())));
+                                                            }
+                                                        }>
                                                         {columns.get_value().into_iter().map(|col| view! { <td class="max-w-xs truncate px-3 py-1.5">{cell(r.fields.get(&col))}</td> }).collect_view()}
                                                         <td class="whitespace-nowrap px-3 py-1.5 text-xs text-zinc-500">{format!("{} · {}", ago(now_ms() - r.updated_at), r.updated_by)}</td>
                                                     </tr>
@@ -305,6 +315,129 @@ fn CollectionView(name: String) -> impl IntoView {
                 }
             })}
         </main>
+    }
+}
+
+/// An app's collection is changed through the app's operations (docs/apps.md
+/// §7): one button each, and a form made from its input's schema, filled
+/// from the record picked.
+#[component]
+fn Operations(
+    collection: Collection,
+    picked: RwSignal<Option<Record>>,
+    calling: RwSignal<Option<c6_api::Operation>>,
+    refresh: Callback<()>,
+) -> impl IntoView {
+    let c = StoredValue::new(collection);
+    let ops = LocalResource::new(move || {
+        let (realm, owner) = c.with_value(|c| (c.realm.clone(), c.owner.clone()));
+        async move { api::operations(&realm, &owner).await }
+    });
+    let done = Callback::new(move |()| {
+        calling.set(None);
+        refresh.run(());
+    });
+    view! {
+        <div class="flex flex-wrap items-center gap-2 text-sm">
+            <span class="text-xs text-zinc-500">{move || match picked.get() {
+                Some(r) => format!("Record {} · ", &r.id[r.id.len().saturating_sub(6)..]),
+                None => "Pick a record, or ".to_owned(),
+            }}</span>
+            {move || ops.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(list) => list
+                    .into_iter()
+                    .filter(|o| o.write.as_ref().is_none_or(|w| c.with_value(|c| w.collection == c.name)))
+                    .map(|o| {
+                        let title = o.description.clone();
+                        let label = o.name.clone();
+                        view! { <button class=format!("{BUTTON_QUIET} text-xs") title=title on:click=move |_| calling.set(Some(o.clone()))>{label}</button> }
+                    })
+                    .collect_view()
+                    .into_any(),
+            })}
+        </div>
+        {move || calling.get().map(|op| view! { <OperationForm collection=c.get_value() op record=picked.get_untracked() done /> })}
+    }
+}
+
+#[component]
+fn OperationForm(collection: Collection, op: c6_api::Operation, record: Option<Record>, done: Callback<()>) -> impl IntoView {
+    let props = ordered_fields(&op.input);
+    let required: Vec<String> =
+        op.input["required"].as_array().map(|r| r.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+    // A field naming the record gets its id; one named like a field of it, its value.
+    let fields: Vec<(String, Editor, String, RwSignal<String>)> = props
+        .iter()
+        .map(|(k, s)| {
+            let e = editor_for(k, s);
+            let start = match &record {
+                Some(r) if ["record", "id", "record_id"].contains(&k.as_str()) => r.id.clone(),
+                Some(r) => as_text(&e, r.fields.get(k)),
+                None => String::new(),
+            };
+            (k.clone(), e, s["description"].as_str().unwrap_or("").to_owned(), RwSignal::new(start))
+        })
+        .collect();
+    let fields = StoredValue::new(fields);
+    let error = RwSignal::new(None::<String>);
+    let result = RwSignal::new(None::<String>);
+    let (realm, owner, name) = (collection.realm.clone(), collection.owner.clone(), op.name.clone());
+    let run = move |_| {
+        let mut input = Map::new();
+        for (k, e, _, v) in fields.get_value() {
+            match from_text(&e, &v.get_untracked()) {
+                Ok(Some(x)) => {
+                    input.insert(k, x);
+                }
+                Ok(None) => {}
+                Err(msg) => return error.set(Some(format!("{k}: {msg}"))),
+            }
+        }
+        let (realm, owner, name) = (realm.clone(), owner.clone(), name.clone());
+        spawn_local(async move {
+            match api::call_operation(&realm, &owner, &name, Value::Object(input)).await {
+                Ok(v) if v.get("run").is_some() => result.set(Some("Started: the app's session does the work.".into())),
+                Ok(_) => done.run(()),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+            <div class="text-sm font-medium">{format!("{}.{}", collection.owner, op.name)}</div>
+            {(!op.description.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">{op.description.clone()}</p> })}
+            {fields.get_value().into_iter().map(|(k, e, help, v)| {
+                let label = format!("{k}{}", if required.contains(&k) { " *" } else { "" });
+                let input = match e {
+                    Editor::Choice(options) => view! {
+                        <select class=INPUT prop:value=move || v.get() on:change=move |ev| v.set(event_target_value(&ev))>
+                            <option value="">"—"</option>
+                            {options.into_iter().map(|o| view! { <option value=o.clone()>{o.clone()}</option> }).collect_view()}
+                        </select>
+                    }.into_any(),
+                    Editor::Flag => view! {
+                        <div><input type="checkbox" prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) /></div>
+                    }.into_any(),
+                    Editor::Text { long: true } | Editor::Json => view! {
+                        <textarea class=format!("{INPUT} h-20 font-mono text-xs") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev))></textarea>
+                    }.into_any(),
+                    _ => view! { <input class=INPUT prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev)) /> }.into_any(),
+                };
+                view! {
+                    <label class="block space-y-1">
+                        <span class="text-xs text-zinc-500">{label}{(!help.is_empty()).then(|| format!(" · {help}"))}</span>
+                        {input}
+                    </label>
+                }
+            }).collect_view()}
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || result.get().map(|r| view! { <p class="text-sm text-emerald-700 dark:text-emerald-400">{r}</p> })}
+            <div class="flex gap-2">
+                <button class=BUTTON on:click=run>"Run"</button>
+                <button class=BUTTON_QUIET on:click=move |_| done.run(())>"Close"</button>
+            </div>
+        </section>
     }
 }
 

@@ -451,6 +451,9 @@ pub struct AppPackage {
     /// The package this one is a fork of (docs/apps.md §5.6).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub forked_from: String,
+    /// How anyone but the app changes what it owns (docs/apps.md §7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<Operation>,
     /// A kit's environment and tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<KitPart>,
@@ -517,6 +520,74 @@ impl Default for Permissions {
             shell: false,
         }
     }
+}
+
+/// An operation an app publishes (docs/apps.md §7): the way anyone but the
+/// app changes what it owns. Exactly one of `write`, `template` and `kit`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Operation {
+    /// Letters, digits, - and _.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// A JSON Schema of its input (an object); the input is checked against it.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub input: serde_json::Value,
+    /// A record written in one of the app's collections, mapped from the
+    /// input; it runs at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<OperationWrite>,
+    /// One of the app's templates, started as the app with the input as
+    /// `{{input}}`, for changes that need judgment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub template: String,
+    /// A kit tool the app's package requires, run at once with arguments
+    /// mapped from the input (docs/knowledge.md §6.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit: Option<OperationKit>,
+    /// `published` (a contract: changing its input incompatibly is a
+    /// breaking change) or `internal`. Default: published.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stability: String,
+}
+
+/// A write operation: `"$.path"` strings take the input's values, and
+/// `{{$.path}}` inside text is replaced by them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct OperationWrite {
+    pub collection: String,
+    /// The record to change (`"$.record"`); none: a new record.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub id: serde_json::Value,
+    /// The fields it sets (only these change).
+    #[serde(default)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// What the record must hold first: a filter as in queries.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub when: serde_json::Map<String, serde_json::Value>,
+    /// Deletes the record instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete: bool,
+}
+
+/// A kit operation's tool and its arguments, mapped from the input.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct OperationKit {
+    pub kit: String,
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /api/v1/apps/{realm}/{instance}/operations/{name}`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct OperationCall {
+    #[serde(default)]
+    pub input: serde_json::Value,
 }
 
 /// What an app's instances read in their realm (docs/apps.md §5.2).
@@ -852,6 +923,12 @@ pub struct ViewAction {
     pub start: String,
     #[serde(default)]
     pub set: serde_json::Map<String, serde_json::Value>,
+    /// An operation of the app that owns the view's collection (docs/apps.md
+    /// §7), with `input` mapped from the record (`"$.id"`, `"$.fields.x"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub input: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `POST /api/v1/views/{name}/act`: one of a view's actions on a record.
