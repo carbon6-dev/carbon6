@@ -491,6 +491,8 @@ The memex tools (`memex_search`, `knowledge_record` and the others) stay, scoped
 
 ## 5. Apps
 
+> **Proposed change:** [apps.md](apps.md) separates an app's code from the data made with it. Tools run in the realm that uses them, and every app's code becomes immutable except through upgrades.
+
 ### 5.1 The package
 
 An app is a package of configuration, with **no code**:

@@ -2,6 +2,8 @@
 
 Everything you install in carbon6 is a **package**: an app with a realm of its own, a kit of software and tools that runs in a sandbox, or a library of configuration. Packages live in a registry, local first. They can require other packages, and installing one asks you once for everything it and its new dependencies need, the way Android asks for an app's permissions.
 
+> **Proposed change:** [apps.md](apps.md) splits apps into tools and daemons, makes app code immutable, and turns libraries into tools enabled by reference.
+
 ## 1. Words
 
 - **Package:** a manifest (name, version, what it requires, what it asks permission for) with optional parts. Its role comes from the parts it has:

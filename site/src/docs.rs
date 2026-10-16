@@ -51,6 +51,12 @@ pub const GROUPS: &[Group] = &[
                 summary: "Apps, kits and libraries, installed from a registry with the permissions they ask for.",
             },
             Doc {
+                slug: "apps",
+                file: "docs/apps.md",
+                label: "Apps: tools and daemons",
+                summary: "Proposed: an app's code apart from the data made with it, tools that run in your realm, and code that changes only by upgrade.",
+            },
+            Doc {
                 slug: "explorer",
                 file: "docs/explorer.md",
                 label: "Realm explorer",
