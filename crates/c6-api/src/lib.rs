@@ -173,6 +173,9 @@ pub struct Session {
     /// A subagent of Claude Code's, mirrored from its stream: read-only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observed: bool,
+    /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -223,6 +226,10 @@ pub struct Collection {
     pub records: i64,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
+    /// The app instance that owns it and alone writes it (docs/apps.md §6);
+    /// empty: the realm's, written by anything in it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 /// `POST /api/v1/collections` and `PATCH /api/v1/collections/{name}`.
@@ -433,6 +440,17 @@ pub struct AppPackage {
     /// What an app offers to apps that require it.
     #[serde(default, skip_serializing_if = "Exports::is_empty")]
     pub exports: Exports,
+    /// What its instances read in their realm, approved at install
+    /// (docs/apps.md §5.2).
+    #[serde(default, skip_serializing_if = "Reads::is_empty")]
+    pub reads: Reads,
+    /// The settings it lets you configure: a JSON Schema of an object
+    /// (docs/apps.md §5.4).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub settings: serde_json::Value,
+    /// The package this one is a fork of (docs/apps.md §5.6).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub forked_from: String,
     /// A kit's environment and tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<KitPart>,
@@ -501,7 +519,39 @@ impl Default for Permissions {
     }
 }
 
-/// What an app offers to the apps that require it.
+/// What an app's instances read in their realm (docs/apps.md §5.2).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Reads {
+    /// Knowledge it reads: item kinds and things in the graph.
+    #[serde(default, skip_serializing_if = "ReadItems::is_empty")]
+    pub items: ReadItems,
+    /// Collections it reads, by name, or `<instance>.*` for everything an
+    /// instance owns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ReadItems {
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+impl ReadItems {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+}
+
+impl Reads {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.collections.is_empty()
+    }
+}
+
+/// What an app offers to apps that require it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Exports {
@@ -613,10 +663,23 @@ pub struct Install {
     pub version: String,
     pub digest: String,
     pub roles: Vec<String>,
-    /// Its realm (app), the realm it was added to (library), or "" (kit).
+    /// The realm it is installed in (apps and libraries), or "" (kit).
     pub realm: String,
+    /// The instance's name in its realm (docs/apps.md §5): the package's,
+    /// unless given. Kits: their package's name.
+    #[serde(default)]
+    pub name: String,
     /// installing, installed, upgrading or removing.
     pub state: String,
+    /// The values of the settings its package declares (docs/apps.md §5.4).
+    #[serde(default)]
+    pub settings: serde_json::Value,
+    /// What its package may read in its realm, as approved (§5.2).
+    #[serde(default, skip_serializing_if = "Reads::is_empty")]
+    pub reads: Reads,
+    /// Where its code no longer matches the package it installed (§5.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
     /// What it requires, locked: name → digest.
     #[serde(default)]
     pub locks: std::collections::BTreeMap<String, String>,
@@ -637,9 +700,13 @@ pub struct InstallIn {
     /// A version range; default: the newest.
     #[serde(default)]
     pub version: String,
-    /// A library's realm (apps have their own; kits none).
+    /// The realm to install an app or library in (default: the one the
+    /// package suggests if it exists, else home); kits: none.
     #[serde(default)]
     pub realm: String,
+    /// The instance's name in that realm (default: the package's).
+    #[serde(default)]
+    pub name: String,
 }
 
 impl AppNeeds {
@@ -815,6 +882,9 @@ pub struct Series {
     pub computed: bool,
     pub created_by: String,
     pub created_at: UnixMs,
+    /// The app instance that owns it (docs/apps.md §6); empty: the realm's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
     /// How many points it has, and the latest.
     #[serde(default)]
     pub points: i64,
@@ -2127,6 +2197,10 @@ pub struct Automation {
     /// Schedules: the template's {{input}}.
     #[serde(default)]
     pub input: String,
+    /// The app instance it belongs to (docs/apps.md §5.5): changed only by
+    /// upgrading or removing it. Empty: the realm's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
     pub enabled: bool,
     pub created_at: UnixMs,
     #[serde(default)]

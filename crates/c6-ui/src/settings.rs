@@ -398,7 +398,10 @@ fn Apps() -> impl IntoView {
     });
     let text = RwSignal::new(String::new());
     let realm = RwSignal::new(String::new());
+    let inst_name = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
+    // The instance whose settings are open, and their text.
+    let editing = RwSignal::new(None::<(i64, String)>);
     let note = RwSignal::new(None::<String>);
     let done = move |r: Result<String, String>| match r {
         Ok(n) => {
@@ -429,7 +432,13 @@ fn Apps() -> impl IntoView {
                 if !then_install {
                     return Ok(format!("Added {} {} to the registry.", info.name, info.version));
                 }
-                let i = crate::api::install_package(c6_api::InstallIn { package: info.name, version: info.version, realm: realm.get_untracked() }).await?;
+                let i = crate::api::install_package(c6_api::InstallIn {
+                    package: info.name,
+                    version: info.version,
+                    realm: realm.get_untracked(),
+                    name: inst_name.get_untracked(),
+                })
+                .await?;
                 Ok(format!("Installing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default()))
             }
             .await;
@@ -447,7 +456,7 @@ fn Apps() -> impl IntoView {
     view! {
         <section class="space-y-3 pt-4">
             <h2 class="font-medium">"Packages"</h2>
-            <p class="text-sm text-zinc-500">"Everything you install is a package: an app (a realm of its own), a kit (software that workers build and run in a sandbox, with tools for agents), or a library (configuration added to a realm). Packages can require others; installing one asks you once for everything it and what it requires need. The registry below is local to this head."</p>
+            <p class="text-sm text-zinc-500">"Everything you install is a package: an app (it owns data: collections, triggers, settings), a library (configuration that owns nothing), or a kit (software that workers build and run in a sandbox, with tools for agents). An app or library is installed in a realm you choose, as an instance with a name; one package can be installed many times. Its code is its package's and changes only by upgrading (or switching to a fork); what it owns is written only by it. Installing asks you once for everything it and what it requires need. The registry below is local to this head."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || note.get().map(|n| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&n)></div> })}
             <h3 class="text-sm font-medium">"Installed"</h3>
@@ -457,18 +466,28 @@ fn Apps() -> impl IntoView {
                 }
                 let names: std::collections::HashMap<i64, String> = list.iter().map(|i| (i.id, i.package.clone())).collect();
                 list.into_iter().map(|i| {
-                    let (id1, id2) = (i.id, i.id);
-                    let is_app = i.roles.iter().any(|r| r == "app");
-                    let realm = i.realm.clone();
+                    let (id1, id2, id3) = (i.id, i.id, i.id);
+                    let in_realm = !i.realm.is_empty();
+                    let (realm, inst) = (i.realm.clone(), i.name.clone());
+                    let settings_text = serde_json::to_string_pretty(&i.settings).unwrap_or_default();
+                    let has_settings = i.settings.as_object().is_some_and(|o| !o.is_empty());
                     let by: Vec<String> = i.required_by.iter().filter_map(|b| names.get(b).cloned()).collect();
+                    let title = if i.name.is_empty() || i.name == i.package { i.package.clone() } else { format!("{} ({})", i.name, i.package) };
                     view! {
                         <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
-                            <span class="font-medium">{i.package.clone()}</span>
+                            <span class="font-medium">{title}</span>
                             <span class="text-xs text-zinc-500">{format!("{} · {}{} · {}", i.version, i.roles.join(" and "), if i.realm.is_empty() { " for workers".to_owned() } else { format!(" in {}", i.realm) }, i.state)}</span>
                             <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{(!by.is_empty()).then(|| format!("required by {}", by.join(", ")))}</span>
-                            {is_app.then(|| view! {
-                                <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&realm, false) download=format!("{realm}.json")>"Export"</a>
-                                <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&realm, true) download=format!("{realm}-with-data.json")>"Export with data"</a>
+                            {(!i.problems.is_empty()).then(|| view! { <span class="w-full text-xs text-red-600">{i.problems.join("; ")}</span> })}
+                            {has_settings.then(|| view! {
+                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                    if editing.get_untracked().is_some_and(|(e, _)| e == id3) { editing.set(None) } else { editing.set(Some((id3, settings_text.clone()))) }
+                                }>"Settings"</button>
+                            })}
+                            {in_realm.then(|| view! {
+                                <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&realm, &inst, "", false) download=format!("{inst}.json")>"Export"</a>
+                                <a class=format!("{BUTTON_QUIET} text-xs") href=crate::api::export_url(&realm, &inst, "", true) download=format!("{inst}-with-data.json")>"Export with data"</a>
+                                <a class=format!("{BUTTON_QUIET} text-xs") title="As a new package forked from it, to change and install" href=crate::api::export_url(&realm, &inst, &format!("{inst}-fork"), false) download=format!("{inst}-fork.json")>"Export as fork"</a>
                             })}
                             <button class=format!("{BUTTON_QUIET} text-xs") title="To the newest version in the registry" on:click=move |_| spawn_local(async move {
                                 done(crate::api::upgrade_install(id1).await.map(|i| format!("Upgrading waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
@@ -476,6 +495,21 @@ fn Apps() -> impl IntoView {
                             <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| spawn_local(async move {
                                 done(crate::api::remove_install(id2).await.map(|i| format!("Removing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
                             })>"Remove…"</button>
+                            {move || editing.get().filter(|(e, _)| *e == id3).map(|(_, t)| view! {
+                                <div class="w-full space-y-2 pt-1">
+                                    <textarea class=format!("{INPUT} min-h-24 font-mono text-xs") prop:value=t on:input=move |ev| editing.set(Some((id3, event_target_value(&ev))))></textarea>
+                                    <button class=format!("{BUTTON} text-xs") on:click=move |_| {
+                                        let text = editing.get_untracked().map(|(_, t)| t).unwrap_or_default();
+                                        spawn_local(async move {
+                                            let r = match serde_json::from_str::<serde_json::Value>(&text) {
+                                                Ok(v) => crate::api::set_install_settings(id3, v).await.map(|_| { editing.set(None); "Settings saved.".to_owned() }),
+                                                Err(e) => Err(format!("The settings are not JSON: {e}")),
+                                            };
+                                            done(r);
+                                        });
+                                    }>"Save settings"</button>
+                                </div>
+                            })}
                         </div>
                     }
                 }).collect_view().into_any()
@@ -494,7 +528,7 @@ fn Apps() -> impl IntoView {
                             <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                 let (name, version) = (name.clone(), version.clone());
                                 spawn_local(async move {
-                                    done(crate::api::install_package(c6_api::InstallIn { package: name, version, realm: realm.get_untracked() }).await
+                                    done(crate::api::install_package(c6_api::InstallIn { package: name, version, realm: realm.get_untracked(), name: inst_name.get_untracked() }).await
                                         .map(|i| format!("Installing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default())));
                                 });
                             }>"Install…"</button>
@@ -510,7 +544,8 @@ fn Apps() -> impl IntoView {
                     <crate::files::FilePicker title="Choose a package file" extensions=&[".json"] on_pick=picked on_cancel=Callback::new(move |()| picking.set(false)) />
                 })}
                 <span class="flex-1"></span>
-                <input class=format!("{INPUT} w-40 py-1 text-sm") placeholder="realm (libraries)" prop:value=move || realm.get() on:input=move |ev| realm.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} w-40 py-1 text-sm") title="The realm to install it in; it must exist" placeholder="realm (default: home)" prop:value=move || realm.get() on:input=move |ev| realm.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} w-40 py-1 text-sm") title="The instance's name in that realm" placeholder="name (default: the package's)" prop:value=move || inst_name.get() on:input=move |ev| inst_name.set(event_target_value(&ev)) />
                 <button class=BUTTON_QUIET on:click=move |_| add(false)>"Add to registry"</button>
                 <button class=BUTTON on:click=move |_| add(true)>"Add and install…"</button>
             </div>

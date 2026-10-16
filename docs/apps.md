@@ -1,6 +1,6 @@
 # Apps: instances, owned data and open reading — Design
 
-Status: proposed (2026-10-16). Nothing here is built. It changes what docs/os.md §5 and docs/packages.md describe; §13 lists what it replaces. Where knowledge is kept, and what becomes of the memex, is in docs/knowledge.md.
+Status: being built (2026-10-16); §18 records what is built and where it differs. It changes what docs/os.md §5 and docs/packages.md describe; §13 lists what it replaces. Where knowledge is kept, and what becomes of the memex, is in docs/knowledge.md.
 
 ## 1. The problem
 
@@ -306,3 +306,31 @@ A service makes something for whoever asked and keeps no hold on it.
 - **Policies that depend on content:** "believe the CRM's `works_at` only above confidence 0.8" needs conditions in a policy, not just an order of owners. Is an order enough to start?
 
 Settled since the first version: mail, calendar and contacts are in the realm whose accounts they are, owned by that realm's mirror apps, and stored by the head (docs/knowledge.md); and two apps tracking the same idea is no conflict, since things are shared and claims are owned (9).
+
+## 18. As built
+
+### 18.1 Instances, ownership and immutable code (steps 1–3)
+
+- **Migration `0042`:**
+  - `installs` is rebuilt with a `name` (the instance's, unique per realm), `settings` (the values) and `adopted`;
+  - `collections`, `series` and `triggers` get an `owner`, and `sessions` an `instance`;
+  - the collections, series and triggers an installed app's package names become that app's.
+  - Upgrade checks: every install keeps its id, package, version, realm and state, named after its package; the collections installed apps brought are theirs. Fixture `c6h-v0041.db` keeps the shape before.
+- **Instances** (`instances.rs`): an installed app or library in a realm, with its package's manifest read from the registry by digest.
+  - **Its code is never copied.** `lists::effective_tagged` layers it: for a realm's sessions, root's entries, then what its instances offer, then the realm's own; for an instance's sessions, root's, the realm's, then the instance's own. Each entry says where it came from (`GET /api/v1/realms/{id}/effective/{key}`; the explorer marks an app's entries).
+  - **Settings** (`settings` in the manifest, a JSON Schema of an object): values per instance (`GET`/`PUT /api/v1/installs/{id}/settings`), defaults filled in, and `{{settings.<name>}}` filled in its code wherever it applies.
+  - **Reads** (`reads` in the manifest) are approved with the install and checked when an instance's session reads another owner's collection (`records_query`, `records_get`). Item kinds are recorded; they are enforced once knowledge is in the head.
+- **Installing:**
+  - in the realm asked for, else the one the package suggests (`realm`) if it exists, else home; a realm that does not exist is a problem ("create it first"), and root and commons hold no apps;
+  - under the name asked for, else the package's; a package can be installed many times;
+  - what it requires goes beside it, in the same realm; a collection or series it brings that the realm already has is a problem.
+  - Roles: an **app** owns something (collections, series, triggers, settings) or names a realm as packages first did; a **library** owns nothing.
+- **Ownership:** a write to an app's collection or series comes from the app (`app:<name>`: its sessions, triggers, views and seed records) or is refused, pointing at the app's operations. You can force one (`?force=true` on a record write): it opens a decision ("Write it" / "Cancel"), and the write is recorded as `you forced`. Tokens and the assistant can't force.
+- **Immutable code:** an app's collection schemas, series and triggers change only with the app; you may switch its triggers off and on. Settings lists can't reach its code, since it isn't in them.
+- **Sessions as an instance:** templates an instance offers (from the realm, a view of its, or its trigger) start sessions that act as it: `instance` on the session, the automatic label `app:<name>`, its entries over the realm's, its memory notes, and its settings filled in. Subagents and side chats act as their parent does.
+- **Upgrades and downgrades** (`POST /api/v1/installs/{id}/upgrade` with `version`, and `package` for a fork): no merge. The decision lists what changes in its code; the options are Upgrade, Downgrade or Switch. A new schema that rejects records already there is a problem ("needs a migration"). Triggers follow the new version by name, keeping their webhook URLs and whether they're on; settings the new version drops lose their values.
+- **Forks:** `GET /api/v1/apps/export?realm=…&instance=…&fork=<name>` gives the package as a new one with `forked_from`; an instance switches to a fork of its package (or back).
+- **Digests** are checked once per head start for each installed package; a mismatch shows as a problem on the install.
+- **Removing** an instance deletes what it owns (collections and their records, series, triggers), after the decision; its sessions and the realm stay.
+- **Apps installed before:** at start, the copies of their code they wrote into their realm's lists are removed where they are still as installed; entries you had edited stay as the realm's own, and a decision asks whether to keep them or use the app's.
+- **Not yet:** app realms are not moved into home (step 7), and `exports` still only matters across realms, through a grant.

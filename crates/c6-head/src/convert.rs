@@ -195,6 +195,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         root_id: r.root_id.clone(),
         subagents_running: 0,
         observed: r.observed,
+        instance: r.instance.clone(),
     }
 }
 

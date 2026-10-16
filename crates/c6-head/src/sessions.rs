@@ -66,6 +66,13 @@ impl LiveHub {
 }
 
 pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<api::Session> {
+    create_as(st, req, "").await
+}
+
+/// A session acting as an app instance in its realm (docs/apps.md §5.3),
+/// or as the realm (`instance` empty). Only the head starts sessions as an
+/// instance: from its templates, triggers and operations.
+pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) -> anyhow::Result<api::Session> {
     let worker_id = WorkerId(req.worker_id);
     let worker = st.store.worker(worker_id).await?.ok_or_else(|| bad_request("no such worker"))?;
     if worker.revoked_at.is_some() {
@@ -102,6 +109,9 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     let labels = check_labels(&req_labels)?;
     let realm = req.realm.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| crate::realms::HOME.to_owned());
     crate::realms::check_for_sessions(st, &realm).await?;
+    if !instance.is_empty() && crate::instances::get(&st.store.pool, &realm, instance).await?.is_none() {
+        return Err(bad_request(format!("no app {instance:?} is installed in realm {realm}")));
+    }
     if !crate::realms::available(&worker.realms, &realm) {
         return Err(bad_request(format!("{} is not available to realm {realm}", worker.name)));
     }
@@ -160,6 +170,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
         end_reason: String::new(),
         root_id: None,
         observed: false,
+        instance: instance.to_owned(),
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     // Context from the memex, for what is known at creation.
@@ -231,6 +242,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         end_reason: String::new(),
         root_id: None,
         observed: false,
+        instance: String::new(),
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
@@ -299,6 +311,8 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         end_reason: String::new(),
         root_id: Some(parent.root_id.clone().unwrap_or_else(|| parent.id.clone())),
         observed: false,
+        // And acts as what its parent acts as.
+        instance: parent.instance.clone(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -357,17 +371,17 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         cwd: row.cwd.clone(),
         base_prompt,
         worktree,
-        mcp_servers_json: st.store.setting_for(MCP_SERVERS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
-        skills_json: st.store.setting_for(SKILLS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
-        hooks_json: st.store.setting_for(HOOKS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
-        agents_json: st.store.setting_for(AGENTS, &row.realm).await?.unwrap_or_else(|| "[]".into()),
+        mcp_servers_json: st.store.setting_in(MCP_SERVERS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
+        skills_json: st.store.setting_in(SKILLS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
+        hooks_json: st.store.setting_in(HOOKS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
+        agents_json: st.store.setting_in(AGENTS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         // Only its realm's secrets.
         secrets_json: serde_json::to_string(&st.store.secrets(Some(&row.realm)).await?)?,
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
-        memories_json: crate::memory::for_sessions(st, &row.realm).await?,
-        policies_json: with_builtin_policies(st, st.store.setting_for(POLICIES, &row.realm).await?.unwrap_or_default()).await,
+        memories_json: crate::memory::for_sessions_of(st, &row.realm, &row.instance).await?,
+        policies_json: with_builtin_policies(st, st.store.setting_in(POLICIES, &row.realm, &row.instance).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
         memex_brief: String::new(),
         memex_tools: memex,
@@ -707,7 +721,8 @@ pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) 
     let text = crate::prompts::get(st, "session.subagent_resume", &session.realm).await;
     let worker_id: WorkerId = session.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
-    let input = UserInput { text: text.clone(), command: "resume".into(), wake: req.wake, labels: session.head_labels(), ..Default::default() };
+    let input =
+        UserInput { text: text.clone(), command: "resume".into(), wake: req.wake, labels: session.head_labels(), ..Default::default() };
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&text) }).await?;
     publish_queue(st, session_id).await;

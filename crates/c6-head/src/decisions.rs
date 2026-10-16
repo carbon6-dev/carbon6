@@ -324,6 +324,9 @@ async fn act(
                 }
             }
         }
+        (Some("force"), Some(_), _) => {
+            crate::collections::answer_force(st, d, option).await?;
+        }
         (Some("app" | "package"), Some(_), Some(_)) => {
             crate::packages::answer(st, reference, option).await?;
         }

@@ -60,6 +60,22 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
     checks: &[
         c6_core::upgrade::Check {
+            version: 42,
+            name: "every install keeps its id, package, version, realm and state, named after its package",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || package || '@' || version || ' in ' || realm || ' ' || state, '|'), '') \
+                     FROM (SELECT * FROM before.installs ORDER BY id)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || package || '@' || version || ' in ' || realm || ' ' || state, '|'), '') \
+                    FROM (SELECT * FROM installs WHERE name = package ORDER BY id)",
+        },
+        c6_core::upgrade::Check {
+            version: 42,
+            name: "the collections installed apps brought are theirs",
+            before: "SELECT count(*) FROM before.collections c WHERE c.system = 0 AND EXISTS (SELECT 1 FROM before.installs i \
+                     WHERE i.realm = c.realm AND i.state = 'installed' AND EXISTS (SELECT 1 FROM json_each(json_extract(i.installed, '$.contents.collections')) x \
+                     WHERE json_extract(x.value, '$.name') = c.name))",
+            after: "SELECT count(*) FROM collections WHERE owner != ''",
+        },
+        c6_core::upgrade::Check {
             version: 28,
             name: "every session has a realm",
             before: "SELECT count(*) FROM before.sessions",
@@ -421,6 +437,8 @@ pub struct SessionRow {
     pub root_id: Option<String>,
     /// A subagent of Claude Code's, mirrored from its stream: read-only.
     pub observed: bool,
+    /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
+    pub instance: String,
 }
 
 impl SessionRow {
@@ -434,6 +452,9 @@ impl SessionRow {
             if self.folder.is_empty() && self.cwd.starts_with('/') && self.ssh_target.is_empty() { &self.cwd } else { &self.folder };
         let mut l = self.user_labels();
         l.extend(c6_api::labels::auto_labels(&self.worker_name, &self.repo, folder, &self.home, &self.model, &self.ssh_target));
+        if !self.instance.is_empty() {
+            l.push(format!("app:{}", self.instance));
+        }
         l
     }
 
@@ -474,7 +495,7 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model, realm, root_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -494,6 +515,7 @@ impl Store {
         .bind(&s.subagent_model)
         .bind(&s.realm)
         .bind(&s.root_id)
+        .bind(&s.instance)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -629,6 +651,18 @@ impl Store {
     pub async fn setting_for(&self, key: &str, realm: &str) -> anyhow::Result<Option<String>> {
         if crate::lists::list(key).is_some() {
             return Ok(Some(serde_json::to_string(&crate::lists::effective(&self.pool, key, realm).await?)?));
+        }
+        self.setting(key).await
+    }
+
+    /// A system list as an app instance's sessions use it (docs/apps.md
+    /// §5.3), or as the realm's do (`instance` empty), as a JSON array.
+    pub async fn setting_in(&self, key: &str, realm: &str, instance: &str) -> anyhow::Result<Option<String>> {
+        if crate::lists::list(key).is_some() {
+            let inst = Some(instance).filter(|i| !i.is_empty());
+            let v: Vec<serde_json::Value> =
+                crate::lists::effective_tagged(&self.pool, key, realm, inst).await?.into_iter().map(|(v, _)| v).collect();
+            return Ok(Some(serde_json::to_string(&v)?));
         }
         self.setting(key).await
     }
@@ -849,7 +883,7 @@ async fn create_subagent_session(
         return Ok(false);
     }
     let parent = sqlx::query(
-        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
+        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, instance, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
     )
     .bind(&s.parent_session_id)
     .bind(worker_id.to_string())
@@ -859,7 +893,7 @@ async fn create_subagent_session(
     let now = c6_core::now_ms();
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name, ssh_target, realm, agent, root_id, observed) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target, realm, agent, root_id, observed, instance) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -881,6 +915,8 @@ async fn create_subagent_session(
     .bind(parent.get::<String, _>("root"))
     // Claude Code's own subagents are mirrored, not run.
     .bind(s.tool_profile == "claude_code")
+    // And acts as the instance its parent acts as.
+    .bind(parent.get::<String, _>("instance"))
     .execute(&mut *tx)
     .await?;
     Ok(true)

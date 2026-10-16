@@ -47,6 +47,7 @@ fn series_of(r: &sqlx::sqlite::SqliteRow) -> api::Series {
         created_at: r.get("created_at"),
         points: r.try_get("n").unwrap_or(0),
         last: None,
+        owner: r.try_get("owner").unwrap_or_default(),
     }
 }
 
@@ -64,6 +65,7 @@ fn usage_series(realm: &str, (name, unit, description): (&str, &str, &str)) -> a
         created_at: 0,
         points: 0,
         last: None,
+        owner: String::new(),
     }
 }
 
@@ -121,6 +123,11 @@ fn check_dims(dims: &[String]) -> anyhow::Result<()> {
 }
 
 pub async fn create(st: &HeadState, realm: &str, s: &api::SeriesIn, by: &str) -> anyhow::Result<api::Series> {
+    create_owned(st, realm, s, by, "").await
+}
+
+/// A series an app instance owns (`owner`), or the realm (`""`): docs/apps.md §6.
+pub async fn create_owned(st: &HeadState, realm: &str, s: &api::SeriesIn, by: &str, owner: &str) -> anyhow::Result<api::Series> {
     let name = s.name.trim();
     if !valid_name(name) {
         return Err(bad_request("a series' name is lowercase letters, digits and _ (up to 64)"));
@@ -134,7 +141,8 @@ pub async fn create(st: &HeadState, realm: &str, s: &api::SeriesIn, by: &str) ->
     let dims = s.dimensions.clone().unwrap_or_default();
     check_dims(&dims)?;
     let done = sqlx::query(
-        "INSERT OR IGNORE INTO series (realm, name, unit, description, dimensions, retention_days, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO series (realm, name, unit, description, dimensions, retention_days, created_by, created_at, owner) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(realm)
     .bind(name)
@@ -144,6 +152,7 @@ pub async fn create(st: &HeadState, realm: &str, s: &api::SeriesIn, by: &str) ->
     .bind(s.retention_days.unwrap_or(0) as i64)
     .bind(by)
     .bind(now_ms())
+    .bind(owner)
     .execute(&st.store.pool)
     .await?;
     if done.rows_affected() == 0 {
@@ -190,6 +199,12 @@ pub async fn record(st: &HeadState, realm: &str, name: &str, p: &api::Point, sou
     let s = get(st, realm, name).await?;
     if s.computed {
         return Err(bad_request(format!("{name} is computed from model usage")));
+    }
+    if !s.owner.is_empty() {
+        let (instance, forced) = crate::collections::writer_of(st, source).await;
+        if !forced && instance.as_deref() != Some(s.owner.as_str()) {
+            return Err(bad_request(format!("{name} belongs to the app {}: its points come from the app", s.owner)));
+        }
     }
     if !p.value.is_finite() {
         return Err(bad_request("a point's value is a number"));

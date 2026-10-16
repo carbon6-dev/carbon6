@@ -385,10 +385,24 @@ async fn head_fixtures_upgrade_and_serve() {
             let v = get("views").await;
             assert_eq!(v[0]["name"], "candidates", "{name}: {v}");
         }
-        // Apps (from version 38 on).
+        // Apps (from version 38 on), as instances (version 42): the app owns
+        // its collection, and its code is read from its package, so the
+        // copies it once wrote into its realm's lists are gone while what
+        // the realm uses is unchanged.
         if name.as_str() >= "c6h-v0038.db" {
             let a = get("apps").await;
             assert!(a.as_array().unwrap().iter().any(|x| x["app"] == "notes" && x["state"] == "installed"), "{name}: {a}");
+            let cols = get("collections?realm=notes").await;
+            assert!(cols.as_array().unwrap().iter().any(|c| c["name"] == "notes" && c["owner"] == "notes"), "{name}: {cols}");
+            assert_eq!(get("settings/views?realm=notes").await, json!([]), "{name}");
+            let views = get("realms/notes/effective/views").await;
+            assert_eq!(
+                (views[0]["entry"]["name"].as_str(), views[0]["from"].as_str()),
+                (Some("notes"), Some("app:notes")),
+                "{name}: {views}"
+            );
+            let installs = get("installs").await;
+            assert!(installs.as_array().unwrap().iter().any(|i| i["name"] == "notes" && i["realm"] == "notes"), "{name}: {installs}");
         }
         // Grants (from version 33 on).
         if name.as_str() >= "c6h-v0033.db" {

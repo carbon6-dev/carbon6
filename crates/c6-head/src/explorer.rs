@@ -138,9 +138,12 @@ pub async fn summary(st: &HeadState, realm: &str) -> anyhow::Result<api::RealmSu
         let (n, last) = scalar(st, "SELECT count(*), max(last_run_at) FROM triggers WHERE realm = ?", realm).await;
         entries.push(entry("work", "triggers", "Triggers", n, last));
     }
-    // Configuration: the realm's own entries, and root's it inherits.
+    // Configuration: the realm's own entries and its apps' (docs/apps.md
+    // §5.3), and root's it inherits.
+    let apps = if realm == ROOT { Vec::new() } else { crate::instances::list(&st.store.pool, Some(realm)).await? };
     for (key, label) in LISTS {
-        let own = crate::lists::read(&st.store.pool, key, realm).await?.len() as i64;
+        let own = crate::lists::read(&st.store.pool, key, realm).await?.len() as i64
+            + apps.iter().map(|i| i.entries(key).len() as i64).sum::<i64>();
         let inherited = if realm == ROOT { 0 } else { crate::lists::read(&st.store.pool, key, ROOT).await?.len() as i64 };
         if own + inherited > 0 {
             entries.push(api::ExEntry { inherited, ..entry("config", format!("list:{key}"), label, own, None) });
@@ -417,12 +420,24 @@ pub async fn list(st: &HeadState, realm: &str, section: &str, q: &str) -> anyhow
         "list" => {
             let l = crate::lists::list(arg).ok_or_else(|| bad_request(format!("no list {arg}")))?;
             let mut out: Vec<api::ExRef> = Vec::new();
-            for (from, entries) in [(realm, crate::lists::read(pool, arg, realm).await?), (ROOT, if realm == ROOT { Vec::new() } else { crate::lists::read(pool, arg, ROOT).await? })] {
+            let mut sources: Vec<(String, Vec<Value>)> = vec![(realm.to_owned(), crate::lists::read(pool, arg, realm).await?)];
+            if realm != ROOT {
+                for i in crate::instances::list(pool, Some(realm)).await? {
+                    sources.push((format!("app:{}", i.name), i.entries(arg)));
+                }
+                sources.push((ROOT.to_owned(), crate::lists::read(pool, arg, ROOT).await?));
+            }
+            for (from, entries) in sources {
                 for e in entries {
                     let name = e["name"].as_str().or(e["path"].as_str()).unwrap_or("").to_owned();
                     let id = crate::lists::identity(l, &e);
                     let sub = e["description"].as_str().or(e["title"].as_str()).or(e["kind"].as_str()).unwrap_or("").to_owned();
-                    out.push(r("entry", format!("{arg}/{from}/{id}"), &name, if from == realm { sub } else { format!("from root · {sub}") }, None));
+                    let sub = match from.as_str() {
+                        f if f == realm => sub,
+                        f if f.starts_with("app:") => format!("from the app {} · {sub}", &f[4..]),
+                        _ => format!("from root · {sub}"),
+                    };
+                    out.push(r("entry", format!("{arg}/{from}/{id}"), &name, sub, None));
                 }
             }
             out.into_iter().filter(|x| x.title.contains(q)).collect()
@@ -1117,13 +1132,20 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             let mut parts = id.splitn(3, '/');
             let (key, from, ident) = (parts.next().unwrap_or(""), parts.next().unwrap_or(realm), parts.next().unwrap_or(""));
             let l = crate::lists::list(key).ok_or_else(|| bad_request(format!("no list {key}")))?;
-            let e = crate::lists::read(pool, key, from)
-                .await?
+            let entries = match from.strip_prefix("app:") {
+                Some(app) => crate::instances::get(pool, realm, app).await?.map(|i| i.entries(key)).unwrap_or_default(),
+                None => crate::lists::read(pool, key, from).await?,
+            };
+            let e = entries
                 .into_iter()
                 .find(|e| crate::lists::identity(l, e) == ident || e["name"].as_str() == Some(ident.trim_matches('"')))
                 .ok_or_else(|| not_found("no such entry"))?;
             o.title = e["name"].as_str().or(e["path"].as_str()).unwrap_or(key).to_owned();
-            o.sub = format!("{key}{}", if from != realm { " · from root" } else { "" });
+            o.sub = match from.strip_prefix("app:") {
+                Some(app) => format!("{key} · from the app {app} (changes only by upgrading it)"),
+                None if from != realm => format!("{key} · from root"),
+                None => key.to_owned(),
+            };
             o.body = e["body"].as_str().or(e["prompt"].as_str()).unwrap_or("").to_owned();
             o.fields = field_list(&e).into_iter().filter(|(k, _)| k != "body" && k != "prompt" && k != "name").collect();
             o.open = Some(match key {

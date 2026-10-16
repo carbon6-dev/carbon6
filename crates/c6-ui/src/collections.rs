@@ -245,9 +245,14 @@ fn CollectionView(name: String) -> impl IntoView {
                             <h1 class="text-lg font-semibold">{c.with_value(|c| c.name.clone())}</h1>
                             <span class="flex-1 text-sm text-zinc-500">{c.with_value(|c| c.description.clone())}</span>
                             <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Search" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
-                            {(!c.with_value(|c| c.system)).then(|| view! { <button class=BUTTON on:click=move |_| editing.set(Some(None))>"Add a record"</button> })}
+                            {c.with_value(|c| !c.system && c.owner.is_empty()).then(|| view! { <button class=BUTTON on:click=move |_| editing.set(Some(None))>"Add a record"</button> })}
                             {c.with_value(|c| c.system).then(|| view! { <span class="text-xs text-zinc-500">"carbon6's own: change it under Settings"</span> })}
-                            {(!c.with_value(|c| c.system)).then(|| view! {
+                            {c.with_value(|c| (!c.owner.is_empty()).then(|| c.owner.clone())).map(|o| view! {
+                                <span class="text-xs text-zinc-500" title="docs/apps.md §6: an app's data is read by anything in the realm and written only by the app">
+                                    {format!("The app {o}'s: written through its operations")}
+                                </span>
+                            })}
+                            {c.with_value(|c| !c.system && c.owner.is_empty()).then(|| view! {
                                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
                                     let n = name.get_value();
                                     if !window().confirm_with_message(&format!("Delete the collection {n} and all its records? Their history is kept.")).unwrap_or(false) {

@@ -12,14 +12,15 @@ mod convert;
 mod cron;
 pub mod decisions;
 pub mod explorer;
-pub mod files;
 mod export;
 pub mod fabric;
+pub mod files;
 pub mod google;
 pub mod grants;
 pub mod guard;
 pub mod hosts;
 pub mod hub;
+pub mod instances;
 pub mod lists;
 pub mod memex;
 pub mod memory;
@@ -222,6 +223,12 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     });
 
     let mut tasks = JoinSet::new();
+
+    // Apps installed before instances read their code from their package
+    // from now on (docs/apps.md §14).
+    if let Err(e) = apps::adopt(&state).await {
+        tracing::warn!("adopting apps installed before instances: {e:#}");
+    }
 
     // Scheduled automations.
     triggers::spawn_scheduler(state.clone());

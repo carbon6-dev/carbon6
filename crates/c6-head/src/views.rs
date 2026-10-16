@@ -65,7 +65,21 @@ pub fn check_views(views: &[api::View]) -> anyhow::Result<()> {
 /// the template with the record as {{input}}, its sessions labelled
 /// record:<id>.
 pub async fn act(st: &HeadState, realm: &str, name: &str, a: &api::ViewAct, by: &str) -> anyhow::Result<Value> {
-    let view = effective(st, realm).await?.into_iter().find(|v| v.name == name).ok_or_else(|| not_found(format!("no view {name}")))?;
+    // A view an app brings acts as the app (docs/apps.md §6).
+    let (view, layer) = crate::lists::effective_tagged(&st.store.pool, KEY, realm, None)
+        .await?
+        .into_iter()
+        .filter_map(|(v, l)| serde_json::from_value::<api::View>(v).ok().map(|v| (v, l)))
+        .find(|(v, _)| v.name == name)
+        .ok_or_else(|| not_found(format!("no view {name}")))?;
+    let app = match &layer {
+        crate::lists::Layer::Instance(n) => Some(n.clone()),
+        _ => None,
+    };
+    let by = &match &app {
+        Some(n) => format!("app:{n} {by}"),
+        None => by.to_owned(),
+    };
     let action =
         view.actions.iter().find(|x| x.label == a.action).ok_or_else(|| bad_request(format!("{name} has no action {:?}", a.action)))?;
     let collection = view.source["collection"].as_str().ok_or_else(|| bad_request("actions are on records"))?;
@@ -80,7 +94,7 @@ pub async fn act(st: &HeadState, realm: &str, name: &str, a: &api::ViewAct, by: 
     if !action.start.is_empty() {
         let input =
             serde_json::to_string_pretty(&json!({"collection": collection, "id": rec.id, "fields": rec.fields, "links": rec.links}))?;
-        let run = crate::templates::run(st, &action.start, &input, &[format!("record:{}", rec.id)], realm).await?;
+        let run = crate::templates::run_as(st, &action.start, &input, &[format!("record:{}", rec.id)], realm, app.as_deref()).await?;
         out["run"] = json!(run);
     }
     Ok(out)

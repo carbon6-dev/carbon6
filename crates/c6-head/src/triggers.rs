@@ -79,6 +79,7 @@ fn row_to_api(r: &sqlx::sqlite::SqliteRow) -> api::Automation {
         webhook_url: None,
         disable_after: r.get::<i64, _>("disable_after").max(0) as u32,
         recent: Vec::new(),
+        owner: r.try_get("owner").unwrap_or_default(),
     }
 }
 
@@ -620,7 +621,12 @@ async fn stopped(st: &HeadState, a: &api::Automation, why: &str, via: &str, chai
 async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow::Result<()> {
     let realm = realm_of(st, &a.id).await;
     let p = render(&a.action_params, event);
-    let by = format!("trigger:{}", label_safe(&a.name));
+    // An app's trigger acts as the app (docs/apps.md §6).
+    let by = if a.owner.is_empty() {
+        format!("trigger:{}", label_safe(&a.name))
+    } else {
+        format!("app:{} trigger:{}", a.owner, label_safe(&a.name))
+    };
     match a.action.as_str() {
         "write" => {
             let collection = p["collection"].as_str().unwrap_or_default();
@@ -756,6 +762,12 @@ fn obj(v: &Value) -> String {
 /// A new trigger in `realm` (its actions work there); a webhook's response
 /// carries its URL (once).
 pub async fn create(st: &HeadState, e: api::AutomationEdit, realm: &str) -> anyhow::Result<api::Automation> {
+    create_owned(st, e, realm, "").await
+}
+
+/// A trigger an app instance brings (`owner`): it acts as the instance,
+/// and changes only with it (docs/apps.md §5.5).
+pub async fn create_owned(st: &HeadState, e: api::AutomationEdit, realm: &str, owner: &str) -> anyhow::Result<api::Automation> {
     let blank = api::Automation {
         id: String::new(),
         name: String::new(),
@@ -777,6 +789,7 @@ pub async fn create(st: &HeadState, e: api::AutomationEdit, realm: &str) -> anyh
         webhook_url: None,
         disable_after: 0,
         recent: Vec::new(),
+        owner: owner.to_owned(),
     };
     let a = edit_into(e, blank);
     check(st, &a, realm).await?;
@@ -784,7 +797,7 @@ pub async fn create(st: &HeadState, e: api::AutomationEdit, realm: &str) -> anyh
     let token = (a.trigger == "webhook").then(new_token);
     sqlx::query(
         "INSERT INTO triggers (id, name, template, event, cron, input, token_hash, enabled, created_at, disable_after, realm, \
-         event_params, filter, action, action_params, per_hour) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         event_params, filter, action, action_params, per_hour, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&a.name)
@@ -802,6 +815,7 @@ pub async fn create(st: &HeadState, e: api::AutomationEdit, realm: &str) -> anyh
     .bind(&a.action)
     .bind(obj(&a.action_params))
     .bind(a.per_hour as i64)
+    .bind(owner)
     .execute(&st.store.pool)
     .await?;
     let mut a = get(st, &id).await?;
@@ -834,6 +848,28 @@ pub async fn update(st: &HeadState, id: &str, mut e: api::AutomationEdit) -> any
     .execute(&st.store.pool)
     .await?;
     get(st, id).await
+}
+
+/// What you may change of a trigger an app brought: only whether it is on
+/// (the rest is the app's code, docs/apps.md §5.5).
+pub async fn check_edit(st: &HeadState, id: &str, e: Option<&api::AutomationEdit>) -> anyhow::Result<()> {
+    let cur = get(st, id).await?;
+    if cur.owner.is_empty() {
+        return Ok(());
+    }
+    let only_enabled = e.is_some_and(|e| {
+        let mut rest = e.clone();
+        rest.enabled = None;
+        let blank = api::AutomationEdit::default();
+        serde_json::to_value(&rest).ok() == serde_json::to_value(&blank).ok()
+    });
+    if only_enabled {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "trigger {} belongs to the app {}: it changes when the app is upgraded (you can switch it off or on)",
+        cur.name, cur.owner
+    )))
 }
 
 /// A new webhook token (the old URL stops working); the response has the URL.
@@ -882,7 +918,8 @@ pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &st
     // and its outcome arrives when it finishes (`workflow_finished`).
     // Its sessions run in the trigger's realm, with the realm's templates.
     let realm = realm_of(st, &a.id).await;
-    let is_template = crate::templates::templates_for(st, &realm).await?.iter().any(|t| t.name == a.template);
+    let instance = Some(a.owner.as_str()).filter(|o| !o.is_empty());
+    let is_template = crate::templates::templates_in(st, &realm, instance).await?.iter().any(|(t, _)| t.name == a.template);
     let workflow = !is_template && crate::workflows::workflows_for(st, &realm).await?.iter().any(|w| w.name == a.template);
     let result = if workflow {
         crate::workflows::start(st, &a.template, input, trigger, &realm).await.map(|r| api::TemplateRun {
@@ -891,7 +928,7 @@ pub async fn fire(st: &HeadState, a: &api::Automation, input: &str, trigger: &st
             errors: Vec::new(),
         })
     } else {
-        crate::templates::run(st, &a.template, input, &[format!("automation:{}", label_safe(&a.name))], &realm).await
+        crate::templates::run_as(st, &a.template, input, &[format!("automation:{}", label_safe(&a.name))], &realm, instance).await
     };
     let (run_id, error) = match &result {
         Ok(r) => (Some(r.run_id.clone()), (!r.errors.is_empty()).then(|| r.errors.join("; "))),

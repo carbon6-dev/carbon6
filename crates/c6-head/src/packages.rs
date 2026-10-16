@@ -21,7 +21,7 @@ use c6_core::now_ms;
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::realms::ROOT;
+use crate::realms::{COMMONS, HOME, ROOT};
 use crate::{HeadState, bad_request, not_found};
 
 // --- Manifests -------------------------------------------------------------------
@@ -55,17 +55,21 @@ pub fn normalize_manifest(mut v: Value) -> anyhow::Result<api::AppPackage> {
     Ok(p)
 }
 
-/// What a package is: app (a realm), kit (an environment), library
-/// (configuration without a realm).
+/// What a package is: an app (it owns data: collections, series,
+/// triggers, settings, or it names a realm as packages first did), a kit
+/// (an environment), a library (configuration that owns nothing). Apps and
+/// libraries are installed as instances in a realm (docs/apps.md §5).
 pub fn roles(p: &api::AppPackage) -> Vec<String> {
     let mut r = Vec::new();
-    if !p.realm.is_empty() {
+    let c = &p.contents;
+    let owns = !c.collections.is_empty() || !c.series.is_empty() || !c.triggers.is_empty() || !p.settings.is_null();
+    if owns || !p.realm.is_empty() {
         r.push("app".to_owned());
     }
     if p.kit.is_some() {
         r.push("kit".to_owned());
     }
-    if p.realm.is_empty() && !p.contents.is_empty() {
+    if !owns && p.realm.is_empty() && !p.contents.is_empty() {
         r.push("library".to_owned());
     }
     r
@@ -160,8 +164,11 @@ fn check_manifest(p: &api::AppPackage, files: &BTreeMap<String, Vec<u8>>) -> Vec
             }
         }
     }
-    if p.realm.is_empty() && p.kit.is_none() && p.contents.is_empty() {
-        problems.push("a package has a realm (an app), a kit, or contents (a library)".into());
+    if roles(p).is_empty() {
+        problems.push("a package has contents (an app or a library), settings, or a kit".into());
+    }
+    if !p.settings.is_null() && (p.settings["type"] != "object" || crate::schema::check_schema(&p.settings).is_err()) {
+        problems.push("settings is a JSON Schema of an object".into());
     }
     problems
 }
@@ -340,16 +347,66 @@ pub async fn fix_legacy(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
 
 // --- Installs ----------------------------------------------------------------------
 
-fn install_of(r: &sqlx::sqlite::SqliteRow, roles_by_digest: &BTreeMap<String, Vec<String>>) -> api::Install {
+/// Packages by digest: their roles and manifests.
+async fn packages_by_digest(st: &HeadState) -> anyhow::Result<BTreeMap<String, (Vec<String>, api::AppPackage)>> {
+    Ok(sqlx::query("SELECT digest, roles, manifest FROM packages")
+        .fetch_all(&st.store.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("digest"),
+                (
+                    serde_json::from_str(&r.get::<String, _>("roles")).unwrap_or_default(),
+                    serde_json::from_str(&r.get::<String, _>("manifest")).unwrap_or_default(),
+                ),
+            )
+        })
+        .collect())
+}
+
+/// Digests checked against their content since the head started: a
+/// package's code can't change under its digest (docs/apps.md §5.5).
+static VERIFIED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+
+/// Whether a package's manifest and files still hash to its digest.
+async fn verified(st: &HeadState, digest: &str) -> bool {
+    if let Some(ok) = VERIFIED.lock().ok().and_then(|v| v.get(digest).copied()) {
+        return ok;
+    }
+    let ok = async {
+        let (p, info) = by_digest(st, digest).await.ok()??;
+        let mut files = BTreeMap::new();
+        for f in &info.files {
+            files.insert(f.clone(), file(st, digest, f).await.ok()?);
+        }
+        Some(digest_of(&p, &files) == digest)
+    }
+    .await
+    .unwrap_or(false);
+    if let Ok(mut v) = VERIFIED.lock() {
+        v.insert(digest.to_owned(), ok);
+    }
+    ok
+}
+
+fn install_of(r: &sqlx::sqlite::SqliteRow, packages: &BTreeMap<String, (Vec<String>, api::AppPackage)>) -> api::Install {
     let digest: String = r.get("digest");
+    let (roles, manifest) = packages.get(&digest).cloned().unwrap_or_default();
+    let approved: Value = serde_json::from_str(&r.get::<String, _>("approved")).unwrap_or(Value::Null);
+    let values: Value = serde_json::from_str(&r.get::<String, _>("settings")).unwrap_or(json!({}));
     api::Install {
         id: r.get("id"),
         package: r.get("package"),
         version: r.get("version"),
-        roles: roles_by_digest.get(&digest).cloned().unwrap_or_default(),
+        roles,
         digest,
         realm: r.get("realm"),
+        name: r.get("name"),
         state: r.get("state"),
+        settings: crate::instances::with_defaults(&manifest.settings, &values),
+        reads: serde_json::from_value(approved["reads"].clone()).unwrap_or_default(),
+        problems: Vec::new(),
         locks: serde_json::from_str(&r.get::<String, _>("locks")).unwrap_or_default(),
         required_by: serde_json::from_str(&r.get::<String, _>("required_by")).unwrap_or_default(),
         decision: r.get("decision"),
@@ -358,19 +415,16 @@ fn install_of(r: &sqlx::sqlite::SqliteRow, roles_by_digest: &BTreeMap<String, Ve
     }
 }
 
-async fn roles_by_digest(st: &HeadState) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
-    Ok(sqlx::query("SELECT digest, roles FROM packages")
-        .fetch_all(&st.store.pool)
-        .await?
-        .iter()
-        .map(|r| (r.get::<String, _>("digest"), serde_json::from_str(&r.get::<String, _>("roles")).unwrap_or_default()))
-        .collect())
-}
-
 pub async fn installs(st: &HeadState) -> anyhow::Result<Vec<api::Install>> {
-    let roles = roles_by_digest(st).await?;
-    let rows = sqlx::query("SELECT * FROM installs ORDER BY package, realm").fetch_all(&st.store.pool).await?;
-    Ok(rows.iter().map(|r| install_of(r, &roles)).collect())
+    let packages = packages_by_digest(st).await?;
+    let rows = sqlx::query("SELECT * FROM installs ORDER BY package, realm, name").fetch_all(&st.store.pool).await?;
+    let mut out: Vec<api::Install> = rows.iter().map(|r| install_of(r, &packages)).collect();
+    for i in &mut out {
+        if !verified(st, &i.digest).await {
+            i.problems.push("its code no longer matches the package it installed (the digest differs): reinstall it".into());
+        }
+    }
+    Ok(out)
 }
 
 pub async fn install_by_id(st: &HeadState, id: i64) -> anyhow::Result<api::Install> {
@@ -385,13 +439,14 @@ async fn row(st: &HeadState, id: i64) -> anyhow::Result<sqlx::sqlite::SqliteRow>
         .ok_or_else(|| not_found("no such install"))
 }
 
-/// The app installed in a realm, with its manifest as installed.
+/// An app installed in a realm (the one named after the realm, else the
+/// first), with its manifest.
 pub async fn app_in(st: &HeadState, realm: &str) -> anyhow::Result<Option<(api::Install, api::AppPackage)>> {
-    let Some(i) = installs(st).await?.into_iter().find(|i| i.realm == realm && i.roles.iter().any(|r| r == "app")) else {
-        return Ok(None);
-    };
-    let m: api::AppPackage = serde_json::from_str(&row(st, i.id).await?.get::<String, _>("installed")).unwrap_or_default();
-    let m = if m.app.is_empty() { by_digest(st, &i.digest).await?.map(|x| x.0).unwrap_or_default() } else { m };
+    let mut apps: Vec<api::Install> =
+        installs(st).await?.into_iter().filter(|i| i.realm == realm && i.roles.iter().any(|r| r == "app")).collect();
+    apps.sort_by_key(|i| (i.name != realm, i.id));
+    let Some(i) = apps.into_iter().next() else { return Ok(None) };
+    let m = by_digest(st, &i.digest).await?.map(|x| x.0).unwrap_or_default();
     Ok(Some((i, m)))
 }
 
@@ -401,14 +456,22 @@ struct Node {
     pkg: api::AppPackage,
     digest: String,
     roles: Vec<String>,
-    /// Its realm (app), the realm it joins (library), "" (kit).
+    /// The realm it is installed in (apps, libraries), or "" (kits).
     target: String,
+    /// Its instance's name there.
+    name: String,
     /// Already installed: that install.
     existing: Option<i64>,
     /// What it requires: name → digest.
     locks: BTreeMap<String, String>,
     /// The nodes that require it.
     parents: Vec<usize>,
+}
+
+/// Whether a package is installed as an instance in a realm (an app or a
+/// library) rather than for workers (a kit).
+fn in_realm(roles: &[String]) -> bool {
+    roles.iter().any(|r| r == "app" || r == "library")
 }
 
 /// The newest version in the registry a range allows.
@@ -425,13 +488,46 @@ async fn newest(st: &HeadState, name: &str, req: &str) -> anyhow::Result<Option<
     Ok(best.map(|(_, d, m)| (serde_json::from_str(&m).unwrap_or_default(), d)))
 }
 
+fn valid_instance_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 32 && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') && !n.starts_with('-')
+}
+
+/// The realm an app or library goes in: the one asked for, else the one
+/// the package suggests if it exists, else home. Installing never makes a
+/// realm (docs/apps.md §4).
+async fn target_realm(st: &HeadState, p: &api::AppPackage, asked: &str) -> anyhow::Result<String> {
+    if !in_realm(&roles(p)) {
+        return Ok(String::new());
+    }
+    let asked = asked.trim();
+    let suggested = p.realm.trim();
+    let realm = if !asked.is_empty() {
+        asked.to_owned()
+    } else if !suggested.is_empty() && crate::realms::exists(st, suggested).await? && ![ROOT, COMMONS].contains(&suggested) {
+        suggested.to_owned()
+    } else {
+        HOME.to_owned()
+    };
+    if realm == ROOT || realm == COMMONS {
+        return Err(bad_request(format!("apps are not installed in {realm}; pick a realm that holds data")));
+    }
+    if !crate::realms::exists(st, &realm).await? {
+        return Err(bad_request(format!(
+            "there is no realm {realm:?}: create it first (Settings → System → Realms), then install into it"
+        )));
+    }
+    Ok(realm)
+}
+
 /// Resolves a package and what it requires: nodes in install order
-/// (requirements first), and what stands in the way.
+/// (requirements first), and what stands in the way. Apps and libraries a
+/// package requires go in the same realm.
 async fn resolve(
     st: &HeadState,
     root: api::AppPackage,
     root_digest: String,
-    library_realm: &str,
+    realm: &str,
+    name: &str,
 ) -> anyhow::Result<(Vec<Node>, Vec<String>)> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut problems = Vec::new();
@@ -443,6 +539,7 @@ async fn resolve(
         pkg: api::AppPackage,
         digest: String,
         target: String,
+        name: String,
         path: &mut Vec<String>,
         nodes: &mut Vec<Node>,
         problems: &mut Vec<String>,
@@ -463,38 +560,33 @@ async fn resolve(
         path.push(pkg.app.clone());
         let mut locks = BTreeMap::new();
         let mut children = Vec::new();
-        for (name, req) in pkg.requires.clone() {
-            // An installed version that meets the range is used as it is.
-            let child_target_of = |child: &api::AppPackage| -> Option<String> {
-                let r = roles(child);
-                if r.iter().any(|x| x == "app") {
-                    Some(child.realm.clone())
-                } else if r.iter().any(|x| x == "library") {
-                    (!target.is_empty()).then(|| target.clone())
-                } else {
-                    Some(String::new())
+        for (req_name, req) in pkg.requires.clone() {
+            let Some((child, cdigest)) = newest(st, &req_name, &req).await? else {
+                problems.push(format!("{} requires {req_name} {req}, which is not in the registry", pkg.app));
+                continue;
+            };
+            let ctarget = if in_realm(&roles(&child)) {
+                if target.is_empty() {
+                    problems.push(format!("{} (a kit) cannot require {req_name}, which is installed in a realm", pkg.app));
+                    continue;
                 }
+                target.clone()
+            } else {
+                String::new()
             };
-            let Some((child, cdigest)) = newest(st, &name, &req).await? else {
-                problems.push(format!("{} requires {name} {req}, which is not in the registry", pkg.app));
-                continue;
-            };
-            let Some(ctarget) = child_target_of(&child) else {
-                problems.push(format!("{} (a kit) cannot require the library {name}", pkg.app));
-                continue;
-            };
-            if let Some(inst) = existing.iter().find(|i| i.package == name && i.realm == ctarget && i.state == "installed") {
+            // An installed version that meets the range is used as it is.
+            if let Some(inst) = existing.iter().find(|i| i.package == req_name && i.realm == ctarget && i.state == "installed") {
                 let ok = semver::Version::parse(&inst.version).ok().is_some_and(|v| range(&req).map(|r| r.matches(&v)).unwrap_or(false));
                 if !ok {
                     problems.push(format!(
-                        "{} requires {name} {req}, but {} is installed{}; upgrade it first",
+                        "{} requires {req_name} {req}, but {} is installed{}; upgrade it first",
                         pkg.app,
                         inst.version,
                         where_(&ctarget)
                     ));
                     continue;
                 }
-                locks.insert(name.clone(), inst.digest.clone());
+                locks.insert(req_name.clone(), inst.digest.clone());
                 let i = match nodes.iter().position(|n| n.existing == Some(inst.id)) {
                     Some(i) => i,
                     None => {
@@ -504,6 +596,7 @@ async fn resolve(
                             pkg: m,
                             digest: inst.digest.clone(),
                             target: ctarget,
+                            name: inst.name.clone(),
                             existing: Some(inst.id),
                             locks: inst.locks.clone(),
                             parents: Vec::new(),
@@ -514,33 +607,28 @@ async fn resolve(
                 children.push(i);
                 continue;
             }
-            locks.insert(name.clone(), cdigest.clone());
-            let i = Box::pin(visit(st, child, cdigest, ctarget, path, nodes, problems, existing)).await?;
+            locks.insert(req_name.clone(), cdigest.clone());
+            let cname = req_name.clone();
+            let i = Box::pin(visit(st, child, cdigest, ctarget, cname, path, nodes, problems, existing)).await?;
             if i != usize::MAX {
                 children.push(i);
             }
         }
         path.pop();
         let i = nodes.len();
-        let existing_here = existing.iter().find(|x| x.package == pkg.app && x.realm == target).map(|x| x.id);
-        nodes.push(Node { pkg, digest, roles: pkg_roles, target, existing: existing_here, locks, parents: Vec::new() });
+        let existing_here = existing.iter().find(|x| x.realm == target && x.name == name).map(|x| x.id);
+        nodes.push(Node { pkg, digest, roles: pkg_roles, target, name, existing: existing_here, locks, parents: Vec::new() });
         for c in children {
             nodes[c].parents.push(i);
         }
         Ok(i)
     }
-    let root_roles = roles(&root);
-    let target = if root_roles.iter().any(|r| r == "app") {
-        root.realm.clone()
-    } else if root_roles.iter().any(|r| r == "library") {
-        if library_realm.is_empty() {
-            problems.push(format!("{} is a library: say which realm it joins", root.app));
-        }
-        library_realm.to_owned()
-    } else {
-        String::new()
-    };
-    visit(st, root, root_digest, target, &mut Vec::new(), &mut nodes, &mut problems, &existing).await?;
+    let target = if in_realm(&roles(&root)) { realm.to_owned() } else { String::new() };
+    let name = if name.trim().is_empty() { root.app.clone() } else { name.trim().to_owned() };
+    if !valid_instance_name(&name) {
+        problems.push("an instance's name is lowercase letters, digits and - (up to 32)".into());
+    }
+    visit(st, root, root_digest, target, name, &mut Vec::new(), &mut nodes, &mut problems, &existing).await?;
     Ok((nodes, problems))
 }
 
@@ -576,6 +664,7 @@ pub fn permission_lines(p: &api::AppPackage) -> Vec<String> {
             out.push("Builds reach the network to fetch what they need.".into());
         }
     }
+    out.extend(read_lines(&p.reads));
     if !perm.secrets.is_empty() {
         out.push(format!("Needs secrets you set: {}.", perm.secrets.join(", ")));
     }
@@ -588,30 +677,58 @@ pub fn permission_lines(p: &api::AppPackage) -> Vec<String> {
     out
 }
 
-/// What grew from one version's permissions to another's.
-fn grown(old: &api::Permissions, new: &api::Permissions) -> Vec<String> {
+/// What an instance reads in its realm, in plain words (docs/apps.md §5.2).
+pub fn read_lines(r: &api::Reads) -> Vec<String> {
     let mut out = Vec::new();
-    if old.network != new.network && new.network == "any" {
+    if !r.items.kinds.is_empty() {
+        out.push(format!("Reads knowledge in its realm: {}.", r.items.kinds.join(", ")));
+    }
+    if !r.collections.is_empty() {
+        out.push(format!("Reads collections in its realm: {}.", r.collections.join(", ")));
+    }
+    out
+}
+
+/// What grew from one version's permissions to another's.
+fn grown(old: &api::AppPackage, new: &api::AppPackage) -> Vec<String> {
+    let (o, n) = (&old.permissions, &new.permissions);
+    let mut out = Vec::new();
+    if o.network != n.network && n.network == "any" {
         out.push("network access".to_owned());
     }
-    if old.files == "session-ro" && new.files == "session" {
+    if o.files == "session-ro" && n.files == "session" {
         out.push("writing files".to_owned());
     }
-    if new.cpus > old.cpus || new.memory_mb > old.memory_mb || new.timeout_s > old.timeout_s {
+    if n.cpus > o.cpus || n.memory_mb > o.memory_mb || n.timeout_s > o.timeout_s {
         out.push("more CPU, memory or time".to_owned());
     }
-    if new.shell && !old.shell {
+    if n.shell && !o.shell {
         out.push("a shell".to_owned());
     }
-    let more: Vec<&String> = new.secrets.iter().filter(|s| !old.secrets.contains(s)).collect();
+    let more: Vec<&String> = n.secrets.iter().filter(|s| !o.secrets.contains(s)).collect();
     if !more.is_empty() {
         out.push(format!("secrets {}", more.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
     }
-    if new.grants.len() > old.grants.len() {
+    if n.grants.len() > o.grants.len() {
         out.push("more grants".to_owned());
     }
-    if new.workers == "dedicated" && old.workers != "dedicated" {
+    if n.workers == "dedicated" && o.workers != "dedicated" {
         out.push("a worker of its own".to_owned());
+    }
+    let kinds: Vec<&String> = new.reads.items.kinds.iter().filter(|k| !old.reads.items.kinds.contains(k)).collect();
+    let cols: Vec<&String> = new.reads.collections.iter().filter(|c| !old.reads.collections.contains(c)).collect();
+    if !kinds.is_empty() || !cols.is_empty() {
+        out.push(format!("reading more ({})", kinds.iter().chain(cols.iter()).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    let triggers: Vec<String> = new
+        .contents
+        .triggers
+        .iter()
+        .filter_map(|t| t.name.clone())
+        .filter(|n| !old.contents.triggers.iter().any(|t| t.name.as_deref() == Some(n.as_str())))
+        .collect();
+    if !triggers.is_empty() {
+        out.push(format!("new triggers ({})", triggers.join(", ")));
     }
     out
 }
@@ -622,19 +739,23 @@ async fn plan_of(st: &HeadState, nodes: &[Node], mut problems: Vec<String>) -> a
     let root = nodes.last().ok_or_else(|| anyhow::anyhow!("nothing to install"))?;
     let new: Vec<&Node> = nodes.iter().filter(|n| n.existing.is_none()).collect();
     if root.existing.is_some() {
-        problems.push(format!("{} is already installed{}", root.pkg.app, where_(&root.target)));
+        problems.push(format!(
+            "{} is already installed{} as {}: upgrade it, or give this one another name",
+            root.pkg.app,
+            where_(&root.target),
+            root.name
+        ));
     }
     let mut lines = Vec::new();
     for n in &new {
-        if n.roles.iter().any(|r| r == "app") && crate::realms::exists(st, &n.target).await? {
-            problems
-                .push(format!("realm {} already exists (upgrade the app installed there, or give the package another realm)", n.target));
+        if in_realm(&n.roles) {
+            problems.extend(crate::apps::clashes(st, &n.target, &n.name, &n.pkg).await?);
         }
         let role = n.roles.join(" and ");
         let place = match n.target.as_str() {
             "" => "for workers to build".to_owned(),
-            t if n.roles.iter().any(|r| r == "app") => format!("into a new realm **{t}**"),
-            t => format!("into realm **{t}**"),
+            t if n.name == n.pkg.app => format!("in realm **{t}**"),
+            t => format!("in realm **{t}** as **{}**", n.name),
         };
         let first = if std::ptr::eq(*n, root) { "Install" } else { "With it, install" };
         lines.push(format!("{first} **{}** {} ({role}) {place}.", n.pkg.app, n.pkg.version));
@@ -649,11 +770,9 @@ async fn plan_of(st: &HeadState, nodes: &[Node], mut problems: Vec<String>) -> a
             lines.push(String::new());
             lines.extend(perms.into_iter().map(|p| format!("- {p}")));
         }
-        for name in n.pkg.requires.keys() {
-            if let Some(c) = nodes.iter().find(|c| &c.pkg.app == name && c.roles.iter().any(|r| r == "app"))
-                && !c.pkg.exports.templates.is_empty() {
-                    lines.push(format!("- May start {}'s templates: {}.", c.pkg.app, c.pkg.exports.templates.join(", ")));
-                }
+        let settings: Vec<&String> = n.pkg.settings["properties"].as_object().map(|o| o.keys().collect()).unwrap_or_default();
+        if !settings.is_empty() {
+            lines.push(format!("- Settings you can change later: {}.", settings.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
         }
         lines.push(String::new());
     }
@@ -668,17 +787,35 @@ pub async fn plan(st: &HeadState, req: &api::InstallIn) -> anyhow::Result<api::A
     let (pkg, digest) = newest(st, &req.package, &req.version)
         .await?
         .ok_or_else(|| not_found(format!("no package {} {} in the registry", req.package, req.version)))?;
-    let (nodes, problems) = resolve(st, pkg, digest, &req.realm).await?;
+    let realm = match target_realm(st, &pkg, &req.realm).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(api::AppPlan {
+                realm: req.realm.clone(),
+                plan: String::new(),
+                problems: vec![format!("{e:#}")],
+                conflicts: Vec::new(),
+            });
+        }
+    };
+    let (nodes, problems) = resolve(st, pkg, digest, &realm, &req.name).await?;
     plan_of(st, &nodes, problems).await
 }
 
 /// What installing a package not yet in the registry would do.
-pub async fn plan_manifest(st: &HeadState, manifest: Value) -> anyhow::Result<api::AppPlan> {
+pub async fn plan_manifest(st: &HeadState, manifest: Value, realm: &str) -> anyhow::Result<api::AppPlan> {
     let p = normalize_manifest(manifest)?;
     let mut problems = check_manifest(&p, &BTreeMap::new());
     problems.retain(|x| !x.contains("among the package's files"));
     let digest = digest_of(&p, &BTreeMap::new());
-    let (nodes, more) = resolve(st, p, digest, "").await?;
+    let realm = match target_realm(st, &p, realm).await {
+        Ok(r) => r,
+        Err(e) => {
+            problems.push(format!("{e:#}"));
+            return Ok(api::AppPlan { realm: realm.to_owned(), plan: String::new(), problems, conflicts: Vec::new() });
+        }
+    };
+    let (nodes, more) = resolve(st, p, digest, &realm, "").await?;
     problems.extend(more);
     plan_of(st, &nodes, problems).await
 }
@@ -688,7 +825,8 @@ pub async fn install(st: &HeadState, req: &api::InstallIn) -> anyhow::Result<api
     let (pkg, digest) = newest(st, &req.package, &req.version)
         .await?
         .ok_or_else(|| not_found(format!("no package {} {} in the registry", req.package, req.version)))?;
-    let (nodes, problems) = resolve(st, pkg, digest, &req.realm).await?;
+    let realm = target_realm(st, &pkg, &req.realm).await?;
+    let (nodes, problems) = resolve(st, pkg, digest, &realm, &req.name).await?;
     let plan = plan_of(st, &nodes, problems).await?;
     if !plan.problems.is_empty() {
         return Err(bad_request(plan.problems.join("; ")));
@@ -702,12 +840,14 @@ pub async fn install(st: &HeadState, req: &api::InstallIn) -> anyhow::Result<api
             continue;
         }
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO installs (package, version, digest, realm, state, locks, created_at, updated_at) VALUES (?, ?, ?, ?, 'installing', ?, ?, ?) RETURNING id",
+            "INSERT INTO installs (package, version, digest, realm, name, state, locks, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 'installing', ?, ?, ?) RETURNING id",
         )
         .bind(&n.pkg.app)
         .bind(&n.pkg.version)
         .bind(&n.digest)
         .bind(&n.target)
+        .bind(if n.target.is_empty() { &n.pkg.app } else { &n.name })
         .bind(serde_json::to_string(&n.locks)?)
         .bind(now)
         .bind(now)
@@ -729,9 +869,11 @@ pub async fn install(st: &HeadState, req: &api::InstallIn) -> anyhow::Result<api
         .execute(&st.store.pool)
         .await?;
     let title = if root.roles.iter().any(|r| r == "app") {
-        format!("Install the app {}?", root.pkg.app)
-    } else {
+        format!("Install the app {} in {}?", root.pkg.app, root.target)
+    } else if root.target.is_empty() {
         format!("Install the {} {}?", root.roles.join(" and "), root.pkg.app)
+    } else {
+        format!("Install the {} {} in {}?", root.roles.join(" and "), root.pkg.app, root.target)
     };
     ask(st, root_id, "install", &title, &plan.plan, &["Install", "Cancel"]).await
 }
@@ -767,9 +909,24 @@ pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>) -> an
         // An app's decision from before packages: by its realm.
         _ => app_in(st, key).await?.map(|(i, _)| i.id).ok_or_else(|| not_found(format!("no app in {key}")))?,
     };
+    if what == "adopt" {
+        return crate::apps::answer_adopt(st, id, option).await;
+    }
     let r = row(st, id).await?;
     let pending: Value = r.get::<Option<String>, _>("pending").and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);
-    let go = matches!(option, Some("Install" | "Upgrade, keeping my edits" | "Upgrade, taking the new version" | "Upgrade" | "Remove"));
+    let go = matches!(
+        option,
+        Some(
+            "Install"
+                | "Upgrade"
+                | "Downgrade"
+                | "Switch"
+                | "Remove"
+                // Decisions asked before upgrades stopped merging.
+                | "Upgrade, keeping my edits"
+                | "Upgrade, taking the new version"
+        )
+    );
     if !go {
         if what == "install" {
             // Cancelled: nothing was installed.
@@ -781,6 +938,13 @@ pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>) -> an
             }
             sqlx::query("DELETE FROM installs WHERE id = ? AND state = 'installing'").bind(id).execute(&st.store.pool).await?;
         } else {
+            // New requirements an upgrade brought are not installed.
+            for step in pending["install"].as_array().into_iter().flatten().filter(|s| s["new"] == true) {
+                sqlx::query("DELETE FROM installs WHERE id = ? AND state = 'installing'")
+                    .bind(step["id"].as_i64())
+                    .execute(&st.store.pool)
+                    .await?;
+            }
             sqlx::query("UPDATE installs SET state = 'installed', pending = NULL, decision = NULL, updated_at = ? WHERE id = ?")
                 .bind(now_ms())
                 .bind(id)
@@ -792,7 +956,7 @@ pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>) -> an
     }
     match what {
         "install" => apply_install(st, &pending).await?,
-        "upgrade" => apply_upgrade(st, id, &pending, option == Some("Upgrade, taking the new version")).await?,
+        "upgrade" => apply_upgrade(st, id, &pending).await?,
         "remove" => remove_now(st, id).await?,
         _ => {}
     }
@@ -800,45 +964,53 @@ pub async fn answer(st: &HeadState, reference: &str, option: Option<&str>) -> an
     Ok(())
 }
 
+/// What an install approves: its permissions, and what it reads.
+fn approved_of(p: &api::AppPackage) -> anyhow::Result<String> {
+    let mut v = serde_json::to_value(&p.permissions)?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("reads".into(), serde_json::to_value(&p.reads)?);
+    }
+    Ok(v.to_string())
+}
+
 async fn apply_install(st: &HeadState, pending: &Value) -> anyhow::Result<()> {
     let steps = pending["install"].as_array().cloned().unwrap_or_default();
-    // Every new app's realm first: libraries join them.
-    for step in steps.iter().filter(|s| s["new"] == true) {
-        let r = row(st, step["id"].as_i64().unwrap_or_default()).await?;
-        let (p, _) = by_digest(st, &r.get::<String, _>("digest")).await?.unwrap_or_default();
-        if !p.realm.is_empty() && !crate::realms::exists(st, &p.realm).await? {
-            let ri = api::RealmIn { id: p.realm.clone(), name: p.app.clone(), description: p.description.clone(), reads_commons: None };
-            crate::realms::create(st, &ri, &format!("app:{}", p.app)).await?;
-        }
-    }
     for step in &steps {
         let Some(id) = step["id"].as_i64() else { continue };
-        if step["new"] == true {
-            let r = row(st, id).await?;
-            let digest: String = r.get("digest");
-            let realm: String = r.get("realm");
-            let (p, _) = by_digest(st, &digest).await?.ok_or_else(|| anyhow::anyhow!("package {digest} is gone"))?;
-            let roles = roles(&p);
-            if roles.iter().any(|r| r == "app") {
-                crate::apps::apply_contents(st, &realm, &p, true).await?;
-                sqlx::query("UPDATE realms SET app = ? WHERE id = ?").bind(&p.app).bind(&realm).execute(&st.store.pool).await?;
-            } else if roles.iter().any(|r| r == "library") {
-                crate::apps::apply_contents(st, &realm, &p, false).await?;
-            }
-            sqlx::query("UPDATE installs SET state = 'installed', approved = ?, installed = ?, pending = NULL, decision = NULL, updated_at = ? WHERE id = ?")
-                .bind(serde_json::to_string(&p.permissions)?)
-                .bind(serde_json::to_string(&p)?)
-                .bind(now_ms())
-                .bind(id)
-                .execute(&st.store.pool)
-                .await?;
-            if roles.iter().any(|r| r == "app") {
-                crate::apps::next_steps(st, &realm, &p).await;
-            }
+        if step["new"] != true {
+            continue;
+        }
+        let r = row(st, id).await?;
+        let digest: String = r.get("digest");
+        let (realm, name): (String, String) = (r.get("realm"), r.get("name"));
+        let (p, _) = by_digest(st, &digest).await?.ok_or_else(|| anyhow::anyhow!("package {digest} is gone"))?;
+        let roles = roles(&p);
+        // Installed first, so what it brings sees its own code (its triggers
+        // start its templates).
+        sqlx::query(
+            "UPDATE installs SET state = 'installed', approved = ?, installed = ?, pending = NULL, decision = NULL, adopted = 1, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(approved_of(&p)?)
+        .bind(serde_json::to_string(&p)?)
+        .bind(now_ms())
+        .bind(id)
+        .execute(&st.store.pool)
+        .await?;
+        if in_realm(&roles)
+            && let Err(e) = crate::apps::apply_instance(st, &realm, &name, &p).await
+        {
+            // Nothing half-done: what it made goes, and so does the install.
+            let _ = crate::apps::remove_instance(st, &realm, &name).await;
+            sqlx::query("DELETE FROM installs WHERE id = ?").bind(id).execute(&st.store.pool).await?;
+            return Err(e);
+        }
+        if in_realm(&roles) {
+            crate::apps::next_steps(st, &realm, &name, &p).await;
         }
     }
-    // Then who requires what, and what an app requiring an app may start
-    // (once every realm exists).
+    // Then who requires what, and what an app requiring an app in another
+    // realm may start.
     for step in &steps {
         let Some(id) = step["id"].as_i64() else { continue };
         for parent in step["parents"].as_array().into_iter().flatten().filter_map(Value::as_i64) {
@@ -863,8 +1035,9 @@ async fn add_required_by(st: &HeadState, id: i64, by: i64) -> anyhow::Result<()>
     Ok(())
 }
 
-/// An app requiring an app may start the templates it exports: a grant
-/// from the required app's realm.
+/// An app requiring an app in another realm may start the templates it
+/// exports: a grant from the required app's realm. (In the same realm, the
+/// realm's sessions already have them.)
 async fn export_templates(st: &HeadState, child: i64, parent: i64) -> anyhow::Result<()> {
     let (c, p) = (install_by_id(st, child).await?, install_by_id(st, parent).await?);
     if !c.roles.iter().any(|r| r == "app") || p.realm.is_empty() || p.realm == c.realm {
@@ -888,38 +1061,63 @@ async fn export_templates(st: &HeadState, child: i64, parent: i64) -> anyhow::Re
     Ok(())
 }
 
-/// Asks to upgrade an install to the newest version a range allows (or to
-/// a version just added).
+/// Asks to upgrade (or downgrade) an install to the newest version a range
+/// allows.
 pub async fn upgrade(st: &HeadState, id: i64, version: &str) -> anyhow::Result<api::Install> {
+    upgrade_to(st, id, "", version).await
+}
+
+/// Asks to replace an instance's code with another version of its package,
+/// or of a fork of it (`package`; docs/apps.md §5.6, §12). Nothing merges:
+/// its code becomes the new version's, its settings and data stay.
+pub async fn upgrade_to(st: &HeadState, id: i64, package: &str, version: &str) -> anyhow::Result<api::Install> {
     let cur = install_by_id(st, id).await?;
     if cur.state != "installed" {
         return Err(bad_request(format!("{} is {}; wait for that first", cur.package, cur.state)));
     }
-    let (new, digest) =
-        newest(st, &cur.package, version).await?.ok_or_else(|| not_found(format!("no {} {version} in the registry", cur.package)))?;
+    let package = if package.trim().is_empty() { cur.package.clone() } else { package.trim().to_owned() };
+    let (new, digest) = newest(st, &package, version).await?.ok_or_else(|| not_found(format!("no {package} {version} in the registry")))?;
     if digest == cur.digest {
         return Err(bad_request(format!("{} {} is what is installed", cur.package, new.version)));
     }
-    let base: api::AppPackage = serde_json::from_str(&row(st, id).await?.get::<String, _>("installed")).unwrap_or_default();
     let (old, _) = by_digest(st, &cur.digest).await?.unwrap_or_default();
-    let base = if base.app.is_empty() { old.clone() } else { base };
-    // New requirements come with it.
-    let (nodes, mut problems) = resolve(st, new.clone(), digest.clone(), &cur.realm).await?;
-    problems.retain(|p| !p.contains("is already installed"));
-    let mut lines =
-        vec![format!("Upgrade **{}**{} from {} to {}.", cur.package, where_(&cur.realm), cur.version, new.version), String::new()];
-    let mut conflicts = Vec::new();
-    if !cur.realm.is_empty() {
-        let (more, c) = crate::apps::upgrade_lines(st, &cur.realm, &base, &new).await?;
-        lines.extend(more);
-        conflicts = c;
+    if package != cur.package && new.forked_from != cur.package && old.forked_from != package {
+        return Err(bad_request(format!(
+            "{package} is not a fork of {} (its forked_from says {:?}): install it as another instance instead",
+            cur.package, new.forked_from
+        )));
     }
-    let grew = grown(&old.permissions, &new.permissions);
+    // New requirements come with it.
+    let (nodes, mut problems) = resolve(st, new.clone(), digest.clone(), &cur.realm, &cur.name).await?;
+    problems.retain(|p| !p.contains("is already installed"));
+    let verb = if package != cur.package {
+        "Switch"
+    } else {
+        match (semver::Version::parse(&cur.version), semver::Version::parse(&new.version)) {
+            (Ok(a), Ok(b)) if b < a => "Downgrade",
+            _ => "Upgrade",
+        }
+    };
+    let from = if package != cur.package { format!("{} {}", cur.package, cur.version) } else { cur.version.clone() };
+    let to = if package != cur.package { format!("{package} {}", new.version) } else { new.version.clone() };
+    let mut lines = vec![format!("{verb} **{}**{} from {from} to {to}.", cur.name, where_(&cur.realm)), String::new()];
+    if !cur.realm.is_empty() {
+        lines.push("Its code becomes the new version's; its settings and data stay.".into());
+        let changes = crate::apps::code_changes(&old, &new);
+        if changes.is_empty() {
+            lines.push("No collections, triggers or settings lists change.".into());
+        } else {
+            lines.push(String::new());
+            lines.extend(changes);
+        }
+        problems.extend(crate::apps::migration_problems(st, &cur.realm, &cur.name, &new).await?);
+    }
+    let grew = grown(&old, &new);
     if !grew.is_empty() {
         lines.push(format!("\nIt asks for more than before: {}.", grew.join(", ")));
         lines.extend(permission_lines(&new).into_iter().map(|p| format!("- {p}")));
     }
-    let extra: Vec<&Node> = nodes.iter().filter(|n| n.existing.is_none() && n.pkg.app != cur.package).collect();
+    let extra: Vec<&Node> = nodes.iter().filter(|n| n.existing.is_none() && n.pkg.app != new.app).collect();
     for n in &extra {
         lines.push(format!("\nWith it, install **{}** {} ({}).", n.pkg.app, n.pkg.version, n.roles.join(" and ")));
         lines.extend(permission_lines(&n.pkg).into_iter().map(|p| format!("- {p}")));
@@ -932,19 +1130,21 @@ pub async fn upgrade(st: &HeadState, id: i64, version: &str) -> anyhow::Result<a
     let mut steps = Vec::new();
     let mut ids: Vec<Option<i64>> = Vec::new();
     for n in &nodes {
-        let id_here = if n.pkg.app == cur.package && n.target == cur.realm {
+        let id_here = if n.target == cur.realm && n.name == cur.name {
             Some(id)
         } else if let Some(e) = n.existing {
             Some(e)
         } else {
             Some(
                 sqlx::query_scalar(
-                    "INSERT INTO installs (package, version, digest, realm, state, locks, created_at, updated_at) VALUES (?, ?, ?, ?, 'installing', ?, ?, ?) RETURNING id",
+                    "INSERT INTO installs (package, version, digest, realm, name, state, locks, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, 'installing', ?, ?, ?) RETURNING id",
                 )
                 .bind(&n.pkg.app)
                 .bind(&n.pkg.version)
                 .bind(&n.digest)
                 .bind(&n.target)
+                .bind(if n.target.is_empty() { &n.pkg.app } else { &n.name })
                 .bind(serde_json::to_string(&n.locks)?)
                 .bind(now)
                 .bind(now)
@@ -962,39 +1162,47 @@ pub async fn upgrade(st: &HeadState, id: i64, version: &str) -> anyhow::Result<a
     }
     let locks = nodes.last().map(|n| n.locks.clone()).unwrap_or_default();
     sqlx::query("UPDATE installs SET state = 'upgrading', pending = ?, updated_at = ? WHERE id = ?")
-        .bind(json!({"install": steps, "digest": digest, "version": new.version, "locks": locks}).to_string())
+        .bind(json!({"install": steps, "digest": digest, "version": new.version, "package": package, "locks": locks}).to_string())
         .bind(now)
         .bind(id)
         .execute(&st.store.pool)
         .await?;
-    let options: &[&str] = if conflicts.is_empty() {
-        &["Upgrade, keeping my edits", "Cancel"]
-    } else {
-        &["Upgrade, keeping my edits", "Upgrade, taking the new version", "Cancel"]
-    };
-    ask(st, id, "upgrade", &format!("Upgrade {} to {}?", cur.package, new.version), &lines.join("\n"), options).await
+    ask(st, id, "upgrade", &format!("{verb} {} to {to}?", cur.name), &lines.join("\n"), &[verb, "Cancel"]).await
 }
 
-async fn apply_upgrade(st: &HeadState, id: i64, pending: &Value, take_theirs: bool) -> anyhow::Result<()> {
+async fn apply_upgrade(st: &HeadState, id: i64, pending: &Value) -> anyhow::Result<()> {
     let cur = install_by_id(st, id).await?;
     let digest = pending["digest"].as_str().unwrap_or_default();
     let (new, _) = by_digest(st, digest).await?.ok_or_else(|| anyhow::anyhow!("the new version is gone"))?;
+    let (old, _) = by_digest(st, &cur.digest).await?.unwrap_or_default();
     // Its new requirements first.
     let steps: Vec<Value> = pending["install"].as_array().cloned().unwrap_or_default();
     let others: Vec<Value> = steps.iter().filter(|s| s["id"].as_i64() != Some(id)).cloned().collect();
     apply_install(st, &json!({"install": others})).await?;
     if !cur.realm.is_empty() {
-        let base: api::AppPackage = serde_json::from_str(&row(st, id).await?.get::<String, _>("installed")).unwrap_or_default();
-        crate::apps::apply_upgrade(st, &cur.realm, &base, &new, take_theirs).await?;
+        crate::apps::apply_instance_upgrade(st, &cur.realm, &cur.name, &old, &new).await?;
     }
+    // Settings the new version no longer has lose their values.
+    let values: Value = serde_json::from_str(&row(st, id).await?.get::<String, _>("settings")).unwrap_or(json!({}));
+    let props = new.settings["properties"].as_object();
+    let kept: serde_json::Map<String, Value> = values
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| props.is_some_and(|p| p.contains_key(*k)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     sqlx::query(
-        "UPDATE installs SET state = 'installed', digest = ?, version = ?, locks = ?, approved = ?, installed = ?, pending = NULL, decision = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE installs SET state = 'installed', package = ?, digest = ?, version = ?, locks = ?, approved = ?, installed = ?, settings = ?, \
+         pending = NULL, decision = NULL, updated_at = ? WHERE id = ?",
     )
+    .bind(pending["package"].as_str().unwrap_or(&cur.package))
     .bind(digest)
     .bind(&new.version)
     .bind(pending["locks"].to_string())
-    .bind(serde_json::to_string(&new.permissions)?)
+    .bind(approved_of(&new)?)
     .bind(serde_json::to_string(&new)?)
+    .bind(Value::Object(kept).to_string())
     .bind(now_ms())
     .bind(id)
     .execute(&st.store.pool)
@@ -1002,7 +1210,33 @@ async fn apply_upgrade(st: &HeadState, id: i64, pending: &Value, take_theirs: bo
     Ok(())
 }
 
-/// Asks to remove an install (an app: with its realm and everything in it).
+/// Sets an instance's settings (docs/apps.md §5.4): checked against the
+/// schema its package declares.
+pub async fn set_settings(st: &HeadState, id: i64, values: &Value) -> anyhow::Result<api::Install> {
+    let cur = install_by_id(st, id).await?;
+    let (p, _) = by_digest(st, &cur.digest).await?.unwrap_or_default();
+    if p.settings.is_null() {
+        return Err(bad_request(format!("{} has no settings", cur.package)));
+    }
+    if !values.is_object() {
+        return Err(bad_request("settings are an object"));
+    }
+    let all = crate::instances::with_defaults(&p.settings, values);
+    if let Err(problems) = crate::schema::validate(&p.settings, &all) {
+        return Err(bad_request(format!("the settings do not match {}'s: {}", cur.package, problems.join("; "))));
+    }
+    sqlx::query("UPDATE installs SET settings = ?, updated_at = ? WHERE id = ?")
+        .bind(values.to_string())
+        .bind(now_ms())
+        .bind(id)
+        .execute(&st.store.pool)
+        .await?;
+    st.registry.bump();
+    install_by_id(st, id).await
+}
+
+/// Asks to remove an install: an app or library takes what it owns with
+/// it; a kit stops its tools.
 pub async fn remove(st: &HeadState, id: i64) -> anyhow::Result<api::Install> {
     let cur = install_by_id(st, id).await?;
     let users: Vec<String> = {
@@ -1016,24 +1250,17 @@ pub async fn remove(st: &HeadState, id: i64) -> anyhow::Result<api::Install> {
     if !users.is_empty() {
         return Err(bad_request(format!("{} is required by {}; remove those first", cur.package, users.join(", "))));
     }
-    let (doc, title) = if cur.roles.iter().any(|r| r == "app") {
+    let (doc, title) = if in_realm(&cur.roles) {
+        let owned = crate::apps::owned_lines(st, &cur.realm, &cur.name).await?;
         (
             format!(
-                "Removing **{}** deletes realm **{}** and everything in it: its sessions and their history, collections and records, series, \
-                 triggers, views and other settings, decisions, secrets, memory notes and knowledge. Its grants end. Model usage stays in the \
-                 usage ledger. This cannot be undone.\n\nExport it first (Settings → System → Packages → Export, with data) to keep a copy you can \
-                 install again.",
-                cur.package, cur.realm
+                "Removing **{}** from realm **{}** deletes what it owns: {}. Its sessions stay in the realm's history, and the realm stays.\
+                 \n\nExport its data first (Settings → System → Packages → Export) to keep a copy.",
+                cur.name,
+                cur.realm,
+                if owned.is_empty() { "nothing but its code".to_owned() } else { owned.join(", ") }
             ),
-            format!("Remove the app {} and its realm?", cur.package),
-        )
-    } else if cur.roles.iter().any(|r| r == "library") {
-        (
-            format!(
-                "Removing **{}** from realm **{}** takes out the settings entries and triggers it added (as they are now). Collections and their records stay.",
-                cur.package, cur.realm
-            ),
-            format!("Remove {} from {}?", cur.package, cur.realm),
+            format!("Remove {} from {}?", cur.name, cur.realm),
         )
     } else {
         (
@@ -1051,24 +1278,8 @@ pub async fn remove(st: &HeadState, id: i64) -> anyhow::Result<api::Install> {
 
 async fn remove_now(st: &HeadState, id: i64) -> anyhow::Result<()> {
     let cur = install_by_id(st, id).await?;
-    let (p, _) = by_digest(st, &cur.digest).await?.unwrap_or_default();
-    if cur.roles.iter().any(|r| r == "app") {
-        crate::apps::remove_now(st, &cur.realm).await?;
-    } else if cur.roles.iter().any(|r| r == "library") {
-        // Its list entries and triggers leave the realm.
-        for (key, entries) in &p.contents.lists {
-            let Some(l) = crate::lists::list(key) else { continue };
-            let ids: Vec<String> = entries.iter().map(|e| crate::lists::identity(l, e)).collect();
-            let mut all = crate::lists::read(&st.store.pool, key, &cur.realm).await?;
-            all.retain(|e| !ids.contains(&crate::lists::identity(l, e)));
-            crate::apps::write_list(st, &cur.realm, key, all).await?;
-        }
-        let names: Vec<String> = p.contents.triggers.iter().filter_map(|t| t.name.clone()).collect();
-        for t in crate::triggers::list(st, &crate::realms::Caller::in_realm(&cur.realm)).await? {
-            if names.contains(&t.name) {
-                crate::triggers::delete(st, &t.id).await?;
-            }
-        }
+    if in_realm(&cur.roles) {
+        crate::apps::remove_instance(st, &cur.realm, &cur.name).await?;
     }
     sqlx::query("DELETE FROM installs WHERE id = ?").bind(id).execute(&st.store.pool).await?;
     // It no longer requires what it required.
@@ -1110,21 +1321,27 @@ pub async fn apps(st: &HeadState) -> anyhow::Result<Vec<api::AppInstall>> {
     Ok(out)
 }
 
-/// `POST /api/v1/apps`: the package into the registry, then installed.
-pub async fn install_manifest(st: &HeadState, manifest: Value) -> anyhow::Result<api::AppInstall> {
+/// `POST /api/v1/apps`: the package into the registry, then installed in
+/// `realm` (default: the one it suggests if it exists, else home).
+pub async fn install_manifest(st: &HeadState, manifest: Value, realm: &str) -> anyhow::Result<api::AppInstall> {
     let info = add(st, manifest, BTreeMap::new(), "local").await?;
-    let i = install(st, &api::InstallIn { package: info.name.clone(), version: info.version.clone(), realm: String::new() }).await?;
+    let i = install(
+        st,
+        &api::InstallIn { package: info.name.clone(), version: info.version.clone(), realm: realm.to_owned(), name: String::new() },
+    )
+    .await?;
     Ok(app_install(&i, &info.description))
 }
 
 /// `POST /api/v1/apps/{realm}/upgrade`: the new version into the registry,
-/// then the app in that realm upgraded to it.
+/// then that app in that realm upgraded to it.
 pub async fn upgrade_manifest(st: &HeadState, realm: &str, manifest: Value) -> anyhow::Result<api::AppInstall> {
-    let (cur, _) = app_in(st, realm).await?.ok_or_else(|| not_found(format!("no app installed in {realm}")))?;
     let p = normalize_manifest(manifest.clone())?;
-    if p.app != cur.package {
-        return Err(bad_request(format!("realm {realm} has the app {}, not {}", cur.package, p.app)));
-    }
+    let cur = installs(st)
+        .await?
+        .into_iter()
+        .find(|i| i.realm == realm && i.package == p.app)
+        .ok_or_else(|| not_found(format!("no app {} installed in {realm}", p.app)))?;
     let info = add(st, manifest, BTreeMap::new(), "local").await?;
     let i = upgrade(st, cur.id, &info.version).await?;
     Ok(app_install(&i, &info.description))
@@ -1187,7 +1404,14 @@ pub async fn kit_spec(st: &HeadState, realm: &str, name: &str) -> anyhow::Result
     let mut builds: Vec<Value> = Vec::new();
     let mut tags: BTreeMap<String, String> = BTreeMap::new();
     // Depth first: what a kit is built from, then the kit.
-    async fn build_of(st: &HeadState, all: &[api::Install], digest: &str, builds: &mut Vec<Value>, tags: &mut BTreeMap<String, String>, depth: usize) -> anyhow::Result<String> {
+    async fn build_of(
+        st: &HeadState,
+        all: &[api::Install],
+        digest: &str,
+        builds: &mut Vec<Value>,
+        tags: &mut BTreeMap<String, String>,
+        depth: usize,
+    ) -> anyhow::Result<String> {
         if let Some(t) = tags.get(digest) {
             return Ok(t.clone());
         }
@@ -1198,7 +1422,10 @@ pub async fn kit_spec(st: &HeadState, realm: &str, name: &str) -> anyhow::Result
         let mut dockerfile = String::from_utf8_lossy(&file(st, digest, &k.build.dockerfile).await?).into_owned();
         let mut dep_tags = Vec::new();
         for r in kit_refs(&dockerfile) {
-            let dep = inst.and_then(|i| i.locks.get(&r)).cloned().ok_or_else(|| bad_request(format!("{} builds from kit:{r}, which is not installed with it", p.app)))?;
+            let dep = inst
+                .and_then(|i| i.locks.get(&r))
+                .cloned()
+                .ok_or_else(|| bad_request(format!("{} builds from kit:{r}, which is not installed with it", p.app)))?;
             let t = Box::pin(build_of(st, all, &dep, builds, tags, depth + 1)).await?;
             dockerfile = dockerfile.replace(&format!("kit:{r}"), &t);
             dep_tags.push(t);
@@ -1215,7 +1442,9 @@ pub async fn kit_spec(st: &HeadState, realm: &str, name: &str) -> anyhow::Result
     let tag = build_of(st, &all, &kit.digest, &mut builds, &mut tags, 0).await?;
     let (p, _) = by_digest(st, &kit.digest).await?.unwrap_or_default();
     let approved: api::Permissions = serde_json::from_str(&row(st, kit.id).await?.get::<String, _>("approved")).unwrap_or_default();
-    Ok(json!({"name": p.app, "version": p.version, "image": tag, "builds": builds, "tools": p.kit.map(|k| k.tools).unwrap_or_default(), "permissions": approved}))
+    Ok(
+        json!({"name": p.app, "version": p.version, "image": tag, "builds": builds, "tools": p.kit.map(|k| k.tools).unwrap_or_default(), "permissions": approved}),
+    )
 }
 
 /// The kits a realm may use, and their tools, in words for an agent.

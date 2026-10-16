@@ -46,7 +46,10 @@ async fn example_apps_install_and_work() {
     // The kit decks requires, in the registry first.
     let kit = ok(send(M::POST, "packages", serde_json::from_str(DECKS_RENDER).unwrap()).await).await;
     assert_eq!(kit["roles"], json!(["kit"]));
+    // Each in a realm of its own, which you make first (the packages
+    // suggest them; installing never makes one).
     for (pkg, realm) in [(FACTORY, "factory"), (CRM, "crm"), (DECKS, "decks")] {
+        ok(send(M::POST, "realms", json!({"id": realm, "name": realm})).await).await;
         let p: Value = serde_json::from_str(pkg).unwrap();
         let plan: AppPlan = send(M::POST, "apps/plan", p.clone()).await.json().await.unwrap();
         assert!(plan.problems.is_empty(), "{realm}: {:?}", plan.problems);
@@ -64,10 +67,13 @@ async fn example_apps_install_and_work() {
     let themes = ok(send(M::GET, "collections/themes/records?realm=decks", json!({})).await).await;
     assert_eq!(themes["total"], 3);
     assert!(themes["records"].as_array().unwrap().iter().all(|t| t["fields"]["css"].as_str().unwrap().contains("--accent")));
-    let skills = ok(send(M::GET, "settings/skills?realm=decks", json!({})).await).await;
+    // Read from the app's package (its code), not copied into the realm.
+    let from_app = |list: Value, app: &str| list.as_array().unwrap().iter().filter(|e| e["from"] == format!("app:{app}")).count();
+    let skills = ok(send(M::GET, "realms/decks/effective/skills", json!({})).await).await;
     assert!(skills.to_string().contains("@page { size: 1280px 720px"), "the base CSS is in deck-html");
-    assert_eq!(skills.as_array().unwrap().len(), 5);
-    assert_eq!(ok(send(M::GET, "settings/templates?realm=decks", json!({})).await).await.as_array().unwrap().len(), 2);
+    assert_eq!(from_app(skills, "decks"), 5);
+    assert_eq!(from_app(ok(send(M::GET, "realms/decks/effective/templates", json!({})).await).await, "decks"), 2);
+    assert_eq!(ok(send(M::GET, "settings/templates?realm=decks", json!({})).await).await, json!([]));
     assert_eq!(ok(send(M::GET, "views?realm=decks", json!({})).await).await.as_array().unwrap().len(), 2);
 
     // Everything the factory brings is there.
@@ -76,9 +82,10 @@ async fn example_apps_install_and_work() {
     let mine: Vec<&str> = cols.as_array().unwrap().iter().filter(|c| c["system"] == false).map(|c| c["name"].as_str().unwrap()).collect();
     assert_eq!(mine, vec!["candidates", "incidents", "services"]);
     assert_eq!(count("views?realm=factory".into()).await, 7);
-    assert_eq!(count("settings/templates?realm=factory".into()).await, 8);
-    assert_eq!(count("settings/skills?realm=factory".into()).await, 4);
-    assert_eq!(count("settings/policies?realm=factory".into()).await, 4);
+    let app = "service-factory";
+    assert_eq!(from_app(ok(send(M::GET, "realms/factory/effective/templates", json!({})).await).await, app), 8);
+    assert_eq!(from_app(ok(send(M::GET, "realms/factory/effective/skills", json!({})).await).await, app), 4);
+    assert_eq!(from_app(ok(send(M::GET, "realms/factory/effective/policies", json!({})).await).await, app), 4);
     let triggers: Vec<c6_api::Automation> = send(M::GET, "triggers", json!({})).await.json().await.unwrap();
     assert_eq!(triggers.len(), 10 + 3);
     // It asked for its grants, and says what is left for you.
@@ -101,21 +108,15 @@ async fn example_apps_install_and_work() {
     assert_eq!(rev["groups"], json!([["invoicer", 19.0]]), "{rev}");
 
     // A strong candidate fires the deep dive (no worker here, so the run
-    // fails to start; the wiring is what is tested).
-    ok(send(
-        M::POST,
-        "collections/candidates/records?realm=factory",
-        json!({"fields": {"name": "csv-sync", "ecosystem": "shopify", "gap": "exports", "stage": "found", "score": 8}}),
-    )
-    .await)
-    .await;
-    ok(send(
-        M::POST,
-        "collections/candidates/records?realm=factory",
-        json!({"fields": {"name": "meh", "ecosystem": "shopify", "gap": "x", "stage": "found", "score": 3}}),
-    )
-    .await)
-    .await;
+    // fails to start; the wiring is what is tested). Candidates are the
+    // factory's: its sessions write them; here you force two in.
+    for fields in [
+        json!({"name": "csv-sync", "ecosystem": "shopify", "gap": "exports", "stage": "found", "score": 8}),
+        json!({"name": "meh", "ecosystem": "shopify", "gap": "x", "stage": "found", "score": 3}),
+    ] {
+        let r = ok(send(M::POST, "collections/candidates/records?realm=factory&force=true", json!({"fields": fields})).await).await;
+        ok(send(M::POST, &format!("decisions/{}/answer", r["decision"]), json!({"option": "Write it"})).await).await;
+    }
     let strong = triggers.iter().find(|t| t.name == "strong candidate").unwrap();
     let runs: Vec<c6_api::AutomationRun> = send(M::GET, &format!("triggers/{}/runs", strong.id), json!({})).await.json().await.unwrap();
     assert_eq!(runs.len(), 1, "only the strong one: {runs:?}");

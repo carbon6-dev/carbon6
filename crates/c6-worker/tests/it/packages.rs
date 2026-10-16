@@ -96,18 +96,27 @@ async fn packages_require_install_and_remove() {
         (vec!["kit".to_owned()], vec!["library".to_owned()], vec!["app".to_owned()])
     );
 
-    // The plan: everything, deepest first, with what each asks for.
+    // The plan: everything, deepest first, with what each asks for. Apps and
+    // libraries go in the realm you choose (it must exist), and what they
+    // require goes with them.
+    let plan = ok(send(M::POST, "installs/plan", json!({"package": "factory"})).await).await;
+    assert_eq!(plan["realm"], "home", "the realm it suggests does not exist: home");
+    assert!(
+        ok(send(M::POST, "installs/plan", json!({"package": "factory", "realm": "nope"})).await).await["problems"]
+            .to_string()
+            .contains("create it first")
+    );
+    ok(send(M::POST, "realms", json!({"id": "factory", "name": "Factory"})).await).await;
     let plan = ok(send(M::POST, "installs/plan", json!({"package": "factory"})).await).await;
     let text = plan["plan"].as_str().unwrap();
     for want in [
         "**py-base** 1.0.0 (kit)",
         "**render** 1.0.0 (kit)",
-        "**decks** 1.0.0 (app) into a new realm **decks**",
-        "**style** 1.0.0 (library) into realm **factory**",
+        "**decks** 1.0.0 (app) in realm **factory**",
+        "**style** 1.0.0 (library) in realm **factory**",
         "Install **factory**",
         "No network. Up to 1 CPUs and 2.0 GB of memory, 5 minutes a run.",
         "GITHUB_TOKEN",
-        "May start decks's templates: deck",
     ] {
         assert!(text.contains(want), "{want} in {text}");
     }
@@ -116,25 +125,19 @@ async fn packages_require_install_and_remove() {
     // One decision installs them all.
     let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "factory"})).await).await).unwrap();
     let d: Decision = send(M::GET, &format!("decisions/{}", i.decision.unwrap()), json!({})).await.json().await.unwrap();
-    assert_eq!(d.title, "Install the app factory?");
+    assert_eq!(d.title, "Install the app factory in factory?");
     decide(d.id, "Install").await;
     let all: Vec<Install> = send(M::GET, "installs", json!({})).await.json().await.unwrap();
     let by = |n: &str| all.iter().find(|i| i.package == n).unwrap().clone();
     assert!(all.iter().all(|i| i.state == "installed"), "{all:?}");
-    assert_eq!((by("render").realm.as_str(), by("style").realm.as_str(), by("decks").realm.as_str()), ("", "factory", "decks"));
+    assert_eq!((by("render").realm.as_str(), by("style").realm.as_str(), by("decks").realm.as_str()), ("", "factory", "factory"));
     assert_eq!(by("render").required_by, vec![by("decks").id]);
     assert_eq!(by("py-base").required_by, vec![by("render").id]);
     assert_eq!(by("factory").locks.len(), 2);
-    let skills = ok(send(M::GET, "settings/skills?realm=factory", json!({})).await).await;
-    assert!(skills.to_string().contains("house-style"), "the library joined factory: {skills}");
-    let grants = ok(send(M::GET, "grants", json!({})).await).await;
-    assert!(
-        grants.as_array().unwrap().iter().any(|g| g["from_realm"] == "decks"
-            && g["to_realm"] == "factory"
-            && g["scope"]["methods"][0] == "template:deck"
-            && g["state"] == "active"),
-        "{grants}"
-    );
+    let skills = ok(send(M::GET, "realms/factory/effective/skills", json!({})).await).await;
+    assert!(skills.to_string().contains("house-style") && skills.to_string().contains("app:style"), "the library is in factory: {skills}");
+    let templates = ok(send(M::GET, "templates", json!({})).await).await;
+    assert!(templates.as_array().unwrap().iter().any(|t| t["realm"] == "factory" && t["name"] == "deck"), "{templates}");
 
     // Conflicts and cycles are refused.
     ok(add(json!({"package": "old-user", "version": "1.0.0", "realm": "olduser", "requires": {"decks": "^2"}}), json!({})).await).await;
@@ -157,7 +160,7 @@ async fn packages_require_install_and_remove() {
 
     // Removal waits for what requires it.
     let r = send(M::DELETE, &format!("installs/{}", by("render").id), json!({})).await;
-    assert!(r.text().await.unwrap().contains("required by decks in decks"));
+    assert!(r.text().await.unwrap().contains("required by decks in factory"));
     assert_eq!(send(M::DELETE, "packages/render/1.0.0", json!({})).await.status(), StatusCode::BAD_REQUEST);
 
     // An upgrade asks again only for what grew.
@@ -168,7 +171,7 @@ async fn packages_require_install_and_remove() {
         serde_json::from_value(ok(send(M::POST, &format!("installs/{}/upgrade", by("render").id), json!({})).await).await).unwrap();
     let d: Decision = send(M::GET, &format!("decisions/{}", up.decision.unwrap()), json!({})).await.json().await.unwrap();
     assert!(d.document.contains("It asks for more than before: network access"), "{}", d.document);
-    decide(d.id, "Upgrade, keeping my edits").await;
+    decide(d.id, "Upgrade").await;
     assert_eq!(install(&send, by("render").id).await.version, "1.1.0");
 
     // Removing the library takes its entries out of the realm; then the
@@ -367,8 +370,9 @@ async fn with_worker() -> WithWorker {
     WithWorker { head, api, wid: worker.identity.meta.worker_id.0, conn, mock, stop, _dirs: (head_dir, state) }
 }
 
-/// An app requiring an app may start the templates it exports, from its
-/// sessions; nothing else of that realm.
+/// Another realm's templates start through a grant naming them; nothing
+/// else of that realm (docs/apps.md §7). An app's own requirements are
+/// installed beside it, in its realm.
 #[tokio::test]
 async fn template_start_through_an_export() {
     use c6_testkit::Reply;
@@ -403,9 +407,23 @@ async fn template_start_through_an_export() {
     )
     .await)
     .await;
-    let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "user"})).await).await).unwrap();
-    let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
-    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    for realm in ["maker", "user"] {
+        ok(send(M::POST, "realms", json!({"id": realm})).await).await;
+    }
+    for package in ["maker", "user"] {
+        let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": package})).await).await).unwrap();
+        let r = send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await;
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    }
+    let all: Vec<Install> = send(M::GET, "installs", json!({})).await.json().await.unwrap();
+    assert!(all.iter().any(|i| i.package == "maker" && i.realm == "user"), "a requirement goes beside what requires it: {all:?}");
+    ok(send(
+        M::POST,
+        "grants",
+        json!({"from_realm": "maker", "to_realm": "user", "kind": "operations", "mode": "call", "scope": {"methods": ["template:make"]}}),
+    )
+    .await)
+    .await;
 
     w.mock
         .push(Reply::ToolCalls(vec![("template_start".into(), json!({"realm": "maker", "template": "secret", "input": "x"}).to_string())]));

@@ -37,6 +37,7 @@ fn collection_of(r: &sqlx::sqlite::SqliteRow, records: i64) -> api::Collection {
         records,
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        owner: r.try_get("owner").unwrap_or_default(),
     }
 }
 
@@ -94,6 +95,19 @@ fn check_keys(schema: &Value, keys: &[String]) -> anyhow::Result<()> {
 
 /// A new collection in `realm`.
 pub async fn create(st: &HeadState, realm: &str, c: &api::CollectionIn, by: &str, system: bool) -> anyhow::Result<api::Collection> {
+    create_owned(st, realm, c, by, system, "").await
+}
+
+/// A new collection owned by an app instance (`owner`), or by the realm
+/// (`""`): docs/apps.md §6.
+pub async fn create_owned(
+    st: &HeadState,
+    realm: &str,
+    c: &api::CollectionIn,
+    by: &str,
+    system: bool,
+    owner: &str,
+) -> anyhow::Result<api::Collection> {
     let name = c.name.trim();
     if !valid_name(name) {
         return Err(bad_request("a collection's name is letters, digits, - and _ (up to 64)"));
@@ -104,8 +118,8 @@ pub async fn create(st: &HeadState, realm: &str, c: &api::CollectionIn, by: &str
     check_keys(&schema, &keys)?;
     let now = now_ms();
     let done = sqlx::query(
-        "INSERT OR IGNORE INTO collections (realm, name, description, schema, keys, system, created_by, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO collections (realm, name, description, schema, keys, system, created_by, created_at, updated_at, owner) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(realm)
     .bind(name)
@@ -116,6 +130,7 @@ pub async fn create(st: &HeadState, realm: &str, c: &api::CollectionIn, by: &str
     .bind(by)
     .bind(now)
     .bind(now)
+    .bind(owner)
     .execute(&st.store.pool)
     .await?;
     if done.rows_affected() == 0 {
@@ -220,6 +235,7 @@ pub async fn put(
     if c.system {
         return Err(system_list(collection));
     }
+    check_owner(st, &c, by).await?;
     if !r.fields.is_object() {
         return Err(bad_request("a record's fields are an object"));
     }
@@ -348,9 +364,11 @@ fn system_list(collection: &str) -> anyhow::Error {
 
 /// Deletes a record; its history stays.
 pub async fn delete(st: &HeadState, realm: &str, collection: &str, id: &str, by: &str) -> anyhow::Result<()> {
-    if get(st, realm, collection).await?.system {
+    let c = get(st, realm, collection).await?;
+    if c.system {
         return Err(system_list(collection));
     }
+    check_owner(st, &c, by).await?;
     let r = record(st, realm, collection, id).await?;
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM records WHERE id = ?").bind(id).execute(&mut *tx).await?;
@@ -533,6 +551,113 @@ async fn unmirror(st: &HeadState, realm: &str, collection: &str, id: &str) {
     }
 }
 
+/// Who a write is from, as far as ownership goes: the app instance it acts
+/// as (`app:<name>`, or a session acting as one), and whether you forced
+/// it (docs/apps.md §6).
+pub async fn writer_of(st: &HeadState, by: &str) -> (Option<String>, bool) {
+    let mut instance = None;
+    let mut forced = false;
+    for word in by.split_whitespace() {
+        if let Some(name) = word.strip_prefix("app:") {
+            instance = Some(name.to_owned());
+        } else if let Some(session) = word.strip_prefix("session:")
+            && instance.is_none()
+        {
+            instance = crate::instances::of_session(&st.store.pool, session).await.ok().flatten().map(|i| i.name);
+        } else if word == "forced" {
+            forced = true;
+        }
+    }
+    (instance, forced)
+}
+
+/// An app instance's collection is written only by that instance (its
+/// sessions, triggers, views and operations), or by you, forced.
+pub async fn check_owner(st: &HeadState, c: &api::Collection, by: &str) -> anyhow::Result<()> {
+    if c.owner.is_empty() {
+        return Ok(());
+    }
+    let (instance, forced) = writer_of(st, by).await;
+    if forced || instance.as_deref() == Some(c.owner.as_str()) {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{} belongs to the app {}, which keeps it consistent: change it through {}'s operations{}",
+        c.name,
+        c.owner,
+        c.owner,
+        if by == "you" { ", or force the write (it asks you first)" } else { "" }
+    )))
+}
+
+/// An app instance's code (its collections' schemas, its triggers and
+/// series) changes only by upgrading it (docs/apps.md §5.5).
+pub fn check_code(c: &api::Collection) -> anyhow::Result<()> {
+    if c.owner.is_empty() {
+        return Ok(());
+    }
+    Err(bad_request(format!("{} is the app {}'s: its schema changes only when the app is upgraded (or forked)", c.name, c.owner)))
+}
+
+/// You, writing to an app's collection anyway: a decision first, naming
+/// what the app keeps true (docs/apps.md §6). `id`: the record (none:
+/// a new one); `rec` none: deleting it.
+pub async fn ask_force(
+    st: &HeadState,
+    realm: &str,
+    collection: &str,
+    id: Option<&str>,
+    rec: Option<&api::RecordIn>,
+) -> anyhow::Result<api::Decision> {
+    let c = get(st, realm, collection).await?;
+    if c.owner.is_empty() {
+        return Err(bad_request(format!("{collection} is the realm's; write it directly")));
+    }
+    let what = match (id, rec) {
+        (Some(id), None) => format!("delete record {id}"),
+        (Some(id), Some(_)) => format!("change record {id}"),
+        (None, _) => "add a record".to_owned(),
+    };
+    let mut doc = format!(
+        "**{collection}** belongs to the app **{}**, which keeps it consistent through its operations. Writing it directly can break what \
+         it keeps true.",
+        c.owner
+    );
+    if !c.description.is_empty() {
+        doc.push_str(&format!("\n\n{}", c.description));
+    }
+    if let Some(r) = rec {
+        doc.push_str(&format!("\n\nThe fields:\n\n```json\n{}\n```", serde_json::to_string_pretty(&r.fields).unwrap_or_default()));
+    }
+    let d = api::DecisionIn {
+        kind: "approve".into(),
+        title: format!("Force: {what} in {collection}?"),
+        document: doc,
+        options: ["Write it", "Cancel"].iter().map(|o| api::DecisionOption { label: (*o).to_owned(), does: String::new() }).collect(),
+        source: format!("collection:{collection}"),
+        context: json!({"realm": realm, "collection": collection, "id": id, "record": rec}),
+        ..Default::default()
+    };
+    crate::decisions::open(st, &d, realm, &format!("force:{}", uuid::Uuid::now_v7())).await
+}
+
+/// Your answer to a forced write.
+pub async fn answer_force(st: &HeadState, d: &api::Decision, option: Option<&str>) -> anyhow::Result<()> {
+    if option != Some("Write it") {
+        return Ok(());
+    }
+    let ctx = &d.context;
+    let (realm, collection) = (ctx["realm"].as_str().unwrap_or_default(), ctx["collection"].as_str().unwrap_or_default());
+    let id = ctx["id"].as_str();
+    match serde_json::from_value::<Option<api::RecordIn>>(ctx["record"].clone()).ok().flatten() {
+        Some(rec) => {
+            put(st, realm, collection, id, &rec, "you forced").await?;
+        }
+        None => delete(st, realm, collection, id.unwrap_or_default(), "you forced").await?,
+    }
+    Ok(())
+}
+
 /// An agent's call on collections, in its session's realm.
 pub async fn for_session(st: &HeadState, realm: &str, session_id: &str, what: &str, p: &Value) -> anyhow::Result<Value> {
     let mut by = format!("session:{session_id}");
@@ -553,6 +678,21 @@ pub async fn for_session(st: &HeadState, realm: &str, session_id: &str, what: &s
         by = format!("realm:{realm} {by} grant:{g}");
     }
     let realm = to.realm.as_str();
+    // An app instance's session reads what its install approved (docs/apps.md §5.2).
+    if matches!(what, "records_query" | "records_get")
+        && to.grant.is_none()
+        && let Some(me) = crate::instances::of_session(&st.store.pool, session_id).await?
+    {
+        let c = get(st, realm, name).await?;
+        let reads = crate::instances::approved_reads(&st.store.pool, me.id).await?;
+        if !crate::instances::may_read_collection(&reads, &me.name, name, &c.owner) {
+            return Err(bad_request(format!(
+                "the app {} may not read {name}: its install did not ask to (it reads {})",
+                me.name,
+                if reads.collections.is_empty() { "only its own collections".to_owned() } else { reads.collections.join(", ") }
+            )));
+        }
+    }
     match what {
         "collections" => Ok(json!(list(st, realm).await?)),
         "records_query" => {

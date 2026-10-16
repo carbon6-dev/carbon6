@@ -205,8 +205,20 @@ pub async fn remove_install(id: i64) -> Result<c6_api::Install, String> {
 }
 
 /// Where a realm's package downloads from.
-pub fn export_url(realm: &str, data: bool) -> String {
-    format!("/api/v1/apps/export?realm={}{}", enc(realm), if data { "&data=true" } else { "" })
+/// An app instance's package (`fork`: as a new package of that name, to
+/// change and install), with its data or not.
+pub fn export_url(realm: &str, instance: &str, fork: &str, data: bool) -> String {
+    format!(
+        "/api/v1/apps/export?realm={}&instance={}{}{}",
+        enc(realm),
+        enc(instance),
+        if fork.is_empty() { String::new() } else { format!("&fork={}", enc(fork)) },
+        if data { "&data=true" } else { "" }
+    )
+}
+
+pub async fn set_install_settings(id: i64, values: serde_json::Value) -> Result<c6_api::Install, String> {
+    send_json(Request::put(&format!("/api/v1/installs/{id}/settings")), &values).await
 }
 
 pub async fn grants() -> Result<Vec<c6_api::Grant>, String> {
@@ -333,8 +345,11 @@ pub async fn send_message_waking(
         Some((c, m, e)) => (Some(c), Some(m), Some(e).filter(|e| !e.is_empty())),
         None => (None, None, None),
     };
-    send_json(Request::post(&format!("/api/v1/sessions/{id}/messages")), &SendMessage { text, attachments, connection_id, model, effort, wake })
-        .await
+    send_json(
+        Request::post(&format!("/api/v1/sessions/{id}/messages")),
+        &SendMessage { text, attachments, connection_id, model, effort, wake },
+    )
+    .await
 }
 
 /// Continues a subagent whose last turn did not finish.

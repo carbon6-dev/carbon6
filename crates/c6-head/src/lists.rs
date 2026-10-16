@@ -134,21 +134,68 @@ pub async fn read(pool: &sqlx::SqlitePool, key: &str, realm: &str) -> anyhow::Re
     Ok(rows.iter().filter_map(|r| serde_json::from_str(&r.get::<String, _>("fields")).ok()).collect())
 }
 
+/// Where an entry a realm uses comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Layer {
+    Root,
+    /// An app instance in the realm (docs/apps.md §5).
+    Instance(String),
+    /// The realm's own.
+    Realm,
+}
+
 /// What a realm uses: root's entries and its own, combined by the list's
 /// rule.
 pub async fn effective(pool: &sqlx::SqlitePool, key: &str, realm: &str) -> anyhow::Result<Vec<Value>> {
+    Ok(effective_tagged(pool, key, realm, None).await?.into_iter().map(|(v, _)| v).collect())
+}
+
+/// What a realm's sessions use (`instance: None`), or an instance's
+/// sessions (docs/apps.md §5.3), each entry with where it comes from.
+///
+/// Layers, lowest first: for the realm, root's, then what its instances
+/// offer, then its own (so the realm overrides an instance); for an
+/// instance's sessions, root's, the realm's own, then the instance's
+/// (its code is its logic). The list's rule combines them: an entry
+/// replaces a lower one with the same identity (`Override`), all apply,
+/// lowest first (`RootFirst`), or the highest comes first (`RealmFirst`).
+pub async fn effective_tagged(
+    pool: &sqlx::SqlitePool,
+    key: &str,
+    realm: &str,
+    instance: Option<&str>,
+) -> anyhow::Result<Vec<(Value, Layer)>> {
     let Some(l) = list(key) else { return Ok(Vec::new()) };
-    let root = read(pool, key, ROOT).await?;
+    let tag = |v: Vec<Value>, t: Layer| v.into_iter().map(move |e| (e, t.clone())).collect::<Vec<_>>();
+    let root = tag(read(pool, key, ROOT).await?, Layer::Root);
     if realm == ROOT {
         return Ok(root);
     }
-    let own = read(pool, key, realm).await?;
+    let own = tag(read(pool, key, realm).await?, Layer::Realm);
+    let instances = crate::instances::list(pool, Some(realm)).await?;
+    let layers: Vec<Vec<(Value, Layer)>> = match instance {
+        None => {
+            let offered: Vec<(Value, Layer)> =
+                instances.iter().flat_map(|i| tag(i.entries(key), Layer::Instance(i.name.clone()))).collect();
+            vec![root, offered, own]
+        }
+        Some(me) => {
+            let mine =
+                instances.iter().find(|i| i.name == me).map(|i| tag(i.entries(key), Layer::Instance(me.to_owned()))).unwrap_or_default();
+            vec![root, own, mine]
+        }
+    };
     Ok(match l.merge {
-        Merge::RootFirst => root.into_iter().chain(own).collect(),
-        Merge::RealmFirst => own.into_iter().chain(root).collect(),
+        Merge::RootFirst => layers.into_iter().flatten().collect(),
+        Merge::RealmFirst => layers.into_iter().rev().flatten().collect(),
         Merge::Override => {
-            let mine: std::collections::HashSet<String> = own.iter().map(|e| identity(l, e)).collect();
-            root.into_iter().filter(|e| !mine.contains(&identity(l, e))).chain(own).collect()
+            let mut out: Vec<(Value, Layer)> = Vec::new();
+            for layer in layers {
+                let ids: std::collections::HashSet<String> = layer.iter().map(|(e, _)| identity(l, e)).collect();
+                out.retain(|(e, _)| !ids.contains(&identity(l, e)));
+                out.extend(layer);
+            }
+            out
         }
     })
 }

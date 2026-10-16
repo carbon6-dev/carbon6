@@ -102,7 +102,11 @@ async fn all_budgets(st: &HeadState) -> anyhow::Result<Vec<(api::Budget, Option<
         .collect();
     let realms: Vec<String> = sqlx::query_scalar("SELECT id FROM realms WHERE id != 'root'").fetch_all(&st.store.pool).await?;
     for r in realms {
-        for v in crate::lists::read(&st.store.pool, BUDGETS, &r).await? {
+        // The realm's own and its apps' (docs/apps.md §5.3).
+        for (v, layer) in crate::lists::effective_tagged(&st.store.pool, BUDGETS, &r, None).await? {
+            if layer == crate::lists::Layer::Root {
+                continue;
+            }
             if let Ok(b) = serde_json::from_value::<api::Budget>(v) {
                 out.push((b, Some(r.clone())));
             }

@@ -161,6 +161,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/installs", get(list_installs).post(add_install))
         .route("/api/v1/installs/plan", post(plan_install))
         .route("/api/v1/installs/{id}/upgrade", post(upgrade_install))
+        .route("/api/v1/installs/{id}/settings", get(install_settings).put(put_install_settings))
+        .route("/api/v1/realms/{id}/effective/{key}", get(effective_list))
         .route("/api/v1/installs/{id}", axum::routing::delete(remove_install))
         .route("/api/v1/apps", get(list_apps).post(install_app))
         .route("/api/v1/apps/plan", post(plan_app))
@@ -992,10 +994,12 @@ async fn update_automation(
     Path(id): Path<String>,
     Json(e): Json<api::AutomationEdit>,
 ) -> ApiResult<Json<api::Automation>> {
+    crate::triggers::check_edit(&st, &id, Some(&e)).await?;
     Ok(Json(crate::triggers::update(&st, &id, e).await?))
 }
 
 async fn delete_automation(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::triggers::check_edit(&st, &id, None).await?;
     crate::triggers::delete(&st, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2185,6 +2189,7 @@ async fn update_collection(
     Json(c): Json<api::CollectionIn>,
 ) -> ApiResult<Json<api::Collection>> {
     let realm = realm_for(&st, &caller, &r).await?;
+    crate::collections::check_code(&crate::collections::get(&st, &realm, &name).await?)?;
     Ok(Json(crate::collections::update(&st, &realm, &name, &c).await?))
 }
 
@@ -2195,6 +2200,7 @@ async fn drop_collection(
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<StatusCode> {
     let realm = realm_for(&st, &caller, &r).await?;
+    crate::collections::check_code(&crate::collections::get(&st, &realm, &name).await?)?;
     crate::collections::drop(&st, &realm, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2227,14 +2233,48 @@ async fn list_records(
     Ok(Json(crate::collections::query(&st, &to.realm, &name, &q).await?))
 }
 
+/// `?force=true`: you, writing an app's collection anyway; it asks you
+/// first, as a decision (docs/apps.md §6).
+#[derive(Default, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct ForceQuery {
+    #[serde(default)]
+    realm: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// A forced write: only you, never a token; answered with the decision.
+async fn forced(
+    st: &HeadState,
+    caller: &Caller,
+    internal: bool,
+    realm: &str,
+    name: &str,
+    id: Option<&str>,
+    rec: Option<&api::RecordIn>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    if caller.realm.is_some() || internal {
+        return Err(crate::forbidden("only you can force a write to an app's collection").into());
+    }
+    let d = crate::collections::ask_force(st, realm, name, id, rec).await?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"forced": "asked", "decision": d.id}))).into_response())
+}
+
 async fn create_record(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
+    internal: Option<Extension<crate::assistant::InternalCall>>,
     Path(name): Path<String>,
-    Query(r): Query<api::InRealm>,
+    Query(f): Query<ForceQuery>,
     Json(rec): Json<api::RecordIn>,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
+    let r = api::InRealm { realm: f.realm.clone() };
+    if f.force {
+        let realm = realm_for(&st, &caller, &r).await?;
+        return forced(&st, &caller, internal.is_some(), &realm, &name, None, Some(&rec)).await;
+    }
     let to = reach(&st, &caller, &r, &name, "append").await?;
     // Another realm's record for commons waits for your review.
     if to.realm == crate::realms::COMMONS && to.grant.is_some() {
@@ -2262,23 +2302,33 @@ async fn get_record(
 async fn put_record(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
+    internal: Option<Extension<crate::assistant::InternalCall>>,
     Path((name, id)): Path<(String, String)>,
-    Query(r): Query<api::InRealm>,
+    Query(f): Query<ForceQuery>,
     Json(rec): Json<api::RecordIn>,
-) -> ApiResult<Json<api::Record>> {
-    let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::collections::put(&st, &realm, &name, Some(&id), &rec, &writer(&caller)).await?))
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let realm = realm_for(&st, &caller, &api::InRealm { realm: f.realm.clone() }).await?;
+    if f.force {
+        return forced(&st, &caller, internal.is_some(), &realm, &name, Some(&id), Some(&rec)).await;
+    }
+    Ok(Json(crate::collections::put(&st, &realm, &name, Some(&id), &rec, &writer(&caller)).await?).into_response())
 }
 
 async fn delete_record(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
+    internal: Option<Extension<crate::assistant::InternalCall>>,
     Path((name, id)): Path<(String, String)>,
-    Query(r): Query<api::InRealm>,
-) -> ApiResult<StatusCode> {
-    let realm = realm_for(&st, &caller, &r).await?;
+    Query(f): Query<ForceQuery>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let realm = realm_for(&st, &caller, &api::InRealm { realm: f.realm.clone() }).await?;
+    if f.force {
+        return forced(&st, &caller, internal.is_some(), &realm, &name, Some(&id), None).await;
+    }
     crate::collections::delete(&st, &realm, &name, &id, &writer(&caller)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn record_history(
@@ -2430,12 +2480,22 @@ async fn list_apps(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::
     Ok(Json(crate::packages::apps(&st).await?))
 }
 
-async fn plan_app(State(st): State<Arc<HeadState>>, Json(p): Json<serde_json::Value>) -> ApiResult<Json<api::AppPlan>> {
-    Ok(Json(crate::packages::plan_manifest(&st, p).await?))
+/// `?realm=`: the realm to install it in (default: the one it suggests if
+/// it exists, else home).
+async fn plan_app(
+    State(st): State<Arc<HeadState>>,
+    Query(r): Query<api::InRealm>,
+    Json(p): Json<serde_json::Value>,
+) -> ApiResult<Json<api::AppPlan>> {
+    Ok(Json(crate::packages::plan_manifest(&st, p, r.realm.as_deref().unwrap_or("")).await?))
 }
 
-async fn install_app(State(st): State<Arc<HeadState>>, Json(p): Json<serde_json::Value>) -> ApiResult<Json<api::AppInstall>> {
-    Ok(Json(crate::packages::install_manifest(&st, p).await?))
+async fn install_app(
+    State(st): State<Arc<HeadState>>,
+    Query(r): Query<api::InRealm>,
+    Json(p): Json<serde_json::Value>,
+) -> ApiResult<Json<api::AppInstall>> {
+    Ok(Json(crate::packages::install_manifest(&st, p, r.realm.as_deref().unwrap_or("")).await?))
 }
 
 async fn upgrade_app(
@@ -2496,13 +2556,68 @@ async fn add_install(State(st): State<Arc<HeadState>>, Json(i): Json<api::Instal
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
 pub(crate) struct UpgradeIn {
-    /// A version range; default: the newest.
+    /// A version range (an exact older version downgrades); default: the
+    /// newest.
     #[serde(default)]
     version: String,
+    /// A fork of its package to switch to (docs/apps.md §5.6); default:
+    /// its own package.
+    #[serde(default)]
+    package: String,
 }
 
 async fn upgrade_install(State(st): State<Arc<HeadState>>, Path(id): Path<i64>, Json(u): Json<UpgradeIn>) -> ApiResult<Json<api::Install>> {
-    Ok(Json(crate::packages::upgrade(&st, id, &u.version).await?))
+    Ok(Json(crate::packages::upgrade_to(&st, id, &u.package, &u.version).await?))
+}
+
+/// A settings list as a realm's sessions use it (or, `?instance=`, as an
+/// app instance's sessions do): each entry with where it comes from (root,
+/// the realm, or `app:<name>`), docs/apps.md §5.3.
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct EffectiveQuery {
+    #[serde(default)]
+    instance: String,
+}
+
+async fn effective_list(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((realm, key)): Path<(String, String)>,
+    Query(q): Query<EffectiveQuery>,
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    if !caller.sees(&realm) || !crate::realms::exists(&st, &realm).await? {
+        return Err(crate::not_found("no such realm").into());
+    }
+    if crate::lists::list(&key).is_none() {
+        return Err(crate::bad_request(format!("{key} is not a settings list")).into());
+    }
+    let inst = Some(q.instance.as_str()).filter(|i| !i.is_empty());
+    let out = crate::lists::effective_tagged(&st.store.pool, &key, &realm, inst)
+        .await?
+        .into_iter()
+        .map(|(entry, layer)| {
+            let from = match layer {
+                crate::lists::Layer::Root => "root".to_owned(),
+                crate::lists::Layer::Realm => "realm".to_owned(),
+                crate::lists::Layer::Instance(n) => format!("app:{n}"),
+            };
+            serde_json::json!({"from": from, "entry": entry})
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// The values of an instance's settings (docs/apps.md §5.4).
+async fn install_settings(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::packages::install_by_id(&st, id).await?.settings))
+}
+
+async fn put_install_settings(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<i64>,
+    Json(v): Json<serde_json::Value>,
+) -> ApiResult<Json<api::Install>> {
+    Ok(Json(crate::packages::set_settings(&st, id, &v).await?))
 }
 
 async fn remove_install(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Install>> {
@@ -2512,12 +2627,22 @@ async fn remove_install(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -
 #[derive(schemars::JsonSchema, serde::Deserialize)]
 pub(crate) struct ExportQuery {
     realm: String,
+    /// An app instance in the realm: its package (default: the realm's own
+    /// configuration).
+    #[serde(default)]
+    instance: String,
+    /// With `instance`: as a new package of this name, forked from it.
+    #[serde(default)]
+    fork: String,
     /// Its records too.
     #[serde(default)]
     data: bool,
 }
 
 async fn export_app(State(st): State<Arc<HeadState>>, Query(q): Query<ExportQuery>) -> ApiResult<Json<api::AppPackage>> {
+    if !q.instance.is_empty() {
+        return Ok(Json(crate::apps::export_instance(&st, &q.realm, &q.instance, &q.fork, q.data).await?));
+    }
     Ok(Json(crate::apps::export(&st, &q.realm, q.data).await?))
 }
 
@@ -2594,6 +2719,7 @@ async fn update_series(
     Json(s): Json<api::SeriesIn>,
 ) -> ApiResult<Json<api::Series>> {
     let realm = realm_for(&st, &caller, &r).await?;
+    series_code(&crate::series::get(&st, &realm, &name).await?)?;
     Ok(Json(crate::series::update(&st, &realm, &name, &s).await?))
 }
 
@@ -2604,8 +2730,17 @@ async fn delete_series(
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<StatusCode> {
     let realm = realm_for(&st, &caller, &r).await?;
+    series_code(&crate::series::get(&st, &realm, &name).await?)?;
     crate::series::delete(&st, &realm, &name).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// An app's series changes with the app (docs/apps.md §5.5).
+fn series_code(s: &api::Series) -> anyhow::Result<()> {
+    if s.owner.is_empty() {
+        return Ok(());
+    }
+    Err(crate::bad_request(format!("{} is the app {}'s: it changes when the app is upgraded", s.name, s.owner)))
 }
 
 async fn record_point(

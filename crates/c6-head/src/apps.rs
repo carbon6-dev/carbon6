@@ -1,23 +1,18 @@
-//! The realm half of packages (docs/os.md §5, docs/packages.md): writing a
-//! package's configuration (collections, series, triggers, views, skills,
-//! templates and the other settings lists, memory notes, records to start
-//! with) into a realm, exporting a realm's configuration as a package,
-//! merging an upgrade three ways (the version installed, your edits since,
-//! the new version), and deleting a realm with everything in it. Installs,
-//! approvals and the registry are `packages`.
-//!
-//! Contents are written through the head's own API, so they are checked
-//! exactly as when you write them in Settings.
+//! The realm half of packages (docs/apps.md §5): creating what an app
+//! instance owns in its realm (collections, series, triggers, the records
+//! it starts with), replacing its code with another version's (nothing
+//! merges: its code is its package's), removing what it owns, adopting
+//! apps installed before instances, and exporting a realm or an instance
+//! as a package. Installs, approvals and the registry are `packages`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use c6_api as api;
-use c6_core::now_ms;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tracing::warn;
 
-use crate::realms::{COMMONS, HOME, ROOT};
+use crate::realms::{COMMONS, ROOT};
 use crate::{HeadState, bad_request};
 
 /// The settings lists an app may bring, and their API paths.
@@ -36,28 +31,6 @@ pub const LISTS: [(&str, &str); 12] = [
     ("budgets", "budgets"),
 ];
 
-/// A request the head makes to its own API, as you.
-pub(crate) async fn internal(st: &HeadState, method: &str, uri: &str, body: Option<&Value>) -> anyhow::Result<Value> {
-    use tower::ServiceExt;
-    let router = st.assistant.router().ok_or_else(|| anyhow::anyhow!("the head is starting"))?;
-    let mut req =
-        axum::http::Request::builder().method(method).uri(uri).header(axum::http::header::CONTENT_TYPE, "application/json").body(
-            match body {
-                Some(b) => axum::body::Body::from(serde_json::to_vec(b)?),
-                None => axum::body::Body::empty(),
-            },
-        )?;
-    req.extensions_mut().insert(crate::assistant::InternalCall::default());
-    let resp = router.oneshot(req).await?;
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024).await?;
-    let v: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
-    if !status.is_success() {
-        return Err(bad_request(format!("{method} {uri}: {}", v["error"].as_str().unwrap_or(status.as_str()))));
-    }
-    Ok(v)
-}
-
 /// An app's realm (packages are normalized so an app always names it).
 pub(crate) fn realm_of(p: &api::AppPackage) -> String {
     p.realm.trim().to_owned()
@@ -70,8 +43,8 @@ pub(crate) fn check_package(p: &api::AppPackage) -> Vec<String> {
         problems.push("a package's name is lowercase letters, digits and - (up to 32)".into());
     }
     let realm = realm_of(p);
-    if !realm.is_empty() && [ROOT, HOME, COMMONS].contains(&realm.as_str()) {
-        problems.push(format!("an app gets a realm of its own, not {realm}"));
+    if !realm.is_empty() && [ROOT, COMMONS].contains(&realm.as_str()) {
+        problems.push(format!("apps are not installed in {realm}"));
     }
     for key in p.contents.lists.keys() {
         if !LISTS.iter().any(|(k, _)| k == key) {
@@ -127,77 +100,239 @@ pub(crate) fn contents_lines(p: &api::AppPackage) -> Vec<String> {
     lines
 }
 
-pub(crate) fn enc(s: &str) -> String {
-    s.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect()
-}
-
-/// Writes a package's configuration into a realm: an app's new realm
-/// (made here), or the realm a library is added to (where its list entries
-/// join what is there).
-pub(crate) async fn apply_contents(st: &HeadState, realm: &str, p: &api::AppPackage, new_realm: bool) -> anyhow::Result<()> {
-    if new_realm && !crate::realms::exists(st, realm).await? {
-        let r = api::RealmIn { id: realm.to_owned(), name: p.app.clone(), description: p.description.clone(), reads_commons: None };
-        crate::realms::create(st, &r, &format!("app:{}", p.app)).await?;
-    }
+/// Creates what an instance owns in its realm (docs/apps.md §5.1): its
+/// collections, series and triggers, and the records it starts with, all
+/// as the instance. Its other code (skills, templates, views, …) is read
+/// from its package wherever it applies, so nothing of it is copied.
+pub(crate) async fn apply_instance(st: &HeadState, realm: &str, name: &str, p: &api::AppPackage) -> anyhow::Result<()> {
     let c = &p.contents;
-    let q = format!("?realm={}", enc(realm));
+    let by = format!("app:{name}");
     for col in &c.collections {
-        if new_realm || crate::collections::get(st, realm, &col.name).await.is_err() {
-            internal(st, "POST", &format!("/api/v1/collections{q}"), Some(&json!(col))).await?;
+        match crate::collections::get(st, realm, &col.name).await {
+            Ok(existing) if existing.owner == name => {}
+            Ok(existing) => {
+                return Err(bad_request(format!(
+                    "realm {realm} already has a collection {} ({})",
+                    col.name,
+                    if existing.owner.is_empty() { "the realm's".to_owned() } else { format!("the app {}'s", existing.owner) }
+                )));
+            }
+            Err(_) => {
+                crate::collections::create_owned(st, realm, col, &by, false, name).await?;
+            }
         }
     }
     for s in &c.series {
-        if new_realm || crate::series::get(st, realm, &s.name).await.is_err() {
-            internal(st, "POST", &format!("/api/v1/series{q}"), Some(&json!(s))).await?;
+        if crate::series::get(st, realm, &s.name).await.is_err() {
+            crate::series::create_owned(st, realm, s, &by, name).await?;
         }
-    }
-    for (key, entries) in &c.lists {
-        // The realm's own entries, with the package's added (or replacing
-        // ones of the same identity).
-        let mut all = if new_realm { Vec::new() } else { crate::lists::read(&st.store.pool, key, realm).await? };
-        let l = crate::lists::list(key);
-        for e in entries {
-            let id = l.map(|l| crate::lists::identity(l, e));
-            match all.iter().position(|x| l.map(|l| crate::lists::identity(l, x)) == id) {
-                Some(i) => all[i] = e.clone(),
-                None => all.push(e.clone()),
-            }
-        }
-        write_list(st, realm, key, all).await?;
     }
     for t in &c.triggers {
-        crate::triggers::create(st, t.clone(), realm).await?;
-    }
-    for m in &c.memory {
-        let note = api::Memory {
-            scope: m["scope"].as_str().unwrap_or("").to_owned(),
-            text: m["text"].as_str().unwrap_or("").to_owned(),
-            ..Default::default()
-        };
-        crate::memory::put(st, note, realm).await?;
+        let filled: api::AutomationEdit =
+            serde_json::from_value(crate::instances::fill_settings(&json!(t), &crate::instances::with_defaults(&p.settings, &json!({}))))?;
+        crate::triggers::create_owned(st, filled, realm, name).await?;
     }
     for (col, recs) in &c.records {
         for fields in recs {
-            internal(st, "POST", &format!("/api/v1/collections/{}/records{q}", enc(col)), Some(&json!({"fields": fields}))).await?;
+            let rec = api::RecordIn { fields: fields.clone(), links: None, labels: None, version: None };
+            crate::collections::put(st, realm, col, None, &rec, &by).await?;
         }
     }
     Ok(())
 }
 
-/// Replaces a realm's own entries of a list, through Settings.
-pub(crate) async fn write_list(st: &HeadState, realm: &str, key: &str, entries: Vec<Value>) -> anyhow::Result<()> {
-    let path =
-        LISTS.iter().find(|(k, _)| *k == key).map(|l| l.1).ok_or_else(|| bad_request(format!("{key} is not a list an app brings")))?;
-    internal(st, "PUT", &format!("/api/v1/settings/{path}?realm={}", enc(realm)), Some(&Value::Array(entries))).await?;
+/// What in a realm would clash with what an instance brings.
+pub(crate) async fn clashes(st: &HeadState, realm: &str, name: &str, p: &api::AppPackage) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    if realm.is_empty() || !crate::realms::exists(st, realm).await? {
+        return Ok(out);
+    }
+    for col in &p.contents.collections {
+        if let Ok(c) = crate::collections::get(st, realm, &col.name).await
+            && c.owner != name
+        {
+            out.push(format!(
+                "realm {realm} already has a collection {} ({}): install it in another realm",
+                col.name,
+                if c.owner.is_empty() { "the realm's".to_owned() } else { format!("the app {}'s", c.owner) }
+            ));
+        }
+    }
+    for s in &p.contents.series {
+        if let Ok(x) = crate::series::get(st, realm, &s.name).await
+            && x.owner != name
+        {
+            out.push(format!("realm {realm} already has a series {}", s.name));
+        }
+    }
+    Ok(out)
+}
+
+/// What an upgrade changes in an instance's code, in lines of Markdown.
+pub(crate) fn code_changes(old: &api::AppPackage, new: &api::AppPackage) -> Vec<String> {
+    let (a, b) = (items(&normalize(old)), items(&normalize(new)));
+    let keys: BTreeSet<&(String, String)> = a.keys().chain(b.keys()).collect();
+    let mut out = Vec::new();
+    for k in keys {
+        let what = match (a.get(k), b.get(k)) {
+            (None, Some(_)) => "add",
+            (Some(_), None) if k.0 == "collection" || k.0 == "series" => "stop shipping (its records stay)",
+            (Some(_), None) => "remove",
+            (Some(x), Some(y)) if x != y => "change",
+            _ => continue,
+        };
+        out.push(format!("- {what} {}", name_of(&k.0, &k.1)));
+    }
+    out
+}
+
+/// Why the new version's collections would not take the records already
+/// there: those need a migration, so the upgrade can't go ahead as it is.
+pub(crate) async fn migration_problems(st: &HeadState, realm: &str, name: &str, new: &api::AppPackage) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for col in &new.contents.collections {
+        let Ok(cur) = crate::collections::get(st, realm, &col.name).await else { continue };
+        if cur.owner != name {
+            out.push(format!("realm {realm} has a collection {} that is not {name}'s", col.name));
+            continue;
+        }
+        let Some(schema) = &col.schema else { continue };
+        if *schema == cur.schema {
+            continue;
+        }
+        if let Err(e) = crate::schema::check_schema(schema) {
+            out.push(format!("{}: {e}", col.name));
+            continue;
+        }
+        let page =
+            crate::collections::query(st, realm, &col.name, &api::RecordQuery { limit: Some(100_000), ..Default::default() }).await?;
+        let misfits = page.records.iter().filter(|r| crate::schema::validate(schema, &r.fields).is_err()).count();
+        if misfits > 0 {
+            out.push(format!(
+                "{}: the new version's schema rejects {misfits} of its records, so the change needs a migration the package does not give",
+                col.name
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Applies a new version's code to an instance: what it owns follows the
+/// package (collections and series it adds are created, changed ones
+/// updated, ones it stops shipping keep their records; its triggers are
+/// the new version's, by name, keeping their webhook URLs and whether
+/// they are on).
+pub(crate) async fn apply_instance_upgrade(
+    st: &HeadState,
+    realm: &str,
+    name: &str,
+    old: &api::AppPackage,
+    new: &api::AppPackage,
+) -> anyhow::Result<()> {
+    let by = format!("app:{name}");
+    for col in &new.contents.collections {
+        match crate::collections::get(st, realm, &col.name).await {
+            Ok(cur) if cur.owner == name => {
+                let changed = col.schema.as_ref().is_some_and(|s| *s != cur.schema)
+                    || col.description.as_ref().is_some_and(|d| *d != cur.description)
+                    || col.keys.as_ref().is_some_and(|k| *k != cur.keys);
+                if changed {
+                    crate::collections::update(st, realm, &col.name, col).await?;
+                }
+            }
+            Ok(_) => return Err(bad_request(format!("realm {realm} has a collection {} that is not {name}'s", col.name))),
+            Err(_) => {
+                crate::collections::create_owned(st, realm, col, &by, false, name).await?;
+            }
+        }
+    }
+    for s in &new.contents.series {
+        match crate::series::get(st, realm, &s.name).await {
+            Ok(cur) if cur.owner == name => {
+                crate::series::update(st, realm, &s.name, s).await?;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                crate::series::create_owned(st, realm, s, &by, name).await?;
+            }
+        }
+    }
+    let settings = crate::instances::with_defaults(&new.settings, &json!({}));
+    let mine: Vec<api::Automation> =
+        crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await?.into_iter().filter(|t| t.owner == name).collect();
+    for t in &new.contents.triggers {
+        let mut e: api::AutomationEdit = serde_json::from_value(crate::instances::fill_settings(&json!(t), &settings))?;
+        match mine.iter().find(|m| Some(&m.name) == t.name.as_ref()) {
+            Some(cur) => {
+                e.enabled = Some(cur.enabled);
+                crate::triggers::update(st, &cur.id, e).await?;
+            }
+            None => {
+                crate::triggers::create_owned(st, e, realm, name).await?;
+            }
+        }
+    }
+    let names: Vec<&str> = new.contents.triggers.iter().filter_map(|t| t.name.as_deref()).collect();
+    for cur in &mine {
+        if !names.contains(&cur.name.as_str()) {
+            crate::triggers::delete(st, &cur.id).await?;
+        }
+    }
+    let _ = old;
     Ok(())
 }
 
-/// After installing: the grants it needs (asked as decisions), and what is
-/// left for you (secrets, a worker of its own), as a follow-up.
-pub(crate) async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage) {
-    for g in &p.permissions.grants {
+/// What an instance owns, in words (for its removal).
+pub(crate) async fn owned_lines(st: &HeadState, realm: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for c in crate::collections::list(st, realm).await?.into_iter().filter(|c| c.owner == name) {
+        out.push(format!("collection {} ({} records)", c.name, c.records));
+    }
+    for s in crate::series::list(st, realm).await?.into_iter().filter(|s| s.owner == name) {
+        out.push(format!("series {}", s.name));
+    }
+    let n = crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await?.into_iter().filter(|t| t.owner == name).count();
+    if n > 0 {
+        out.push(format!("{n} triggers"));
+    }
+    Ok(out)
+}
+
+/// Removes an instance's owned data and triggers (once you decided).
+pub(crate) async fn remove_instance(st: &HeadState, realm: &str, name: &str) -> anyhow::Result<()> {
+    let running: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sessions WHERE realm = ? AND instance = ? AND status IN ('starting', 'running')")
+            .bind(realm)
+            .bind(name)
+            .fetch_one(&st.store.pool)
+            .await?;
+    if running > 0 {
+        return Err(bad_request(format!("{running} of its sessions are still running: stop them first")));
+    }
+    for t in crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await? {
+        if t.owner == name {
+            crate::triggers::delete(st, &t.id).await?;
+        }
+    }
+    for c in crate::collections::list(st, realm).await? {
+        if c.owner == name {
+            crate::collections::drop(st, realm, &c.name).await?;
+        }
+    }
+    for s in crate::series::list(st, realm).await? {
+        if s.owner == name {
+            crate::series::delete(st, realm, &s.name).await?;
+        }
+    }
+    st.registry.bump();
+    Ok(())
+}
+
+/// After installing: the grants it needs from other realms (asked as
+/// decisions), and what is left for you (secrets, a worker of its own), as
+/// a follow-up.
+pub(crate) async fn next_steps(st: &HeadState, realm: &str, name: &str, p: &api::AppPackage) {
+    for g in p.permissions.grants.iter().filter(|g| g.from_realm != realm) {
         let gi = api::GrantIn {
             from_realm: g.from_realm.clone(),
             to_realm: realm.to_owned(),
@@ -205,10 +340,10 @@ pub(crate) async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage)
             scope: g.scope.clone(),
             mode: g.mode.clone(),
             expires_at: None,
-            note: if g.note.is_empty() { format!("for the app {}", p.app) } else { g.note.clone() },
+            note: if g.note.is_empty() { format!("for the app {name}") } else { g.note.clone() },
         };
-        if let Err(e) = crate::grants::ask(st, &gi, &format!("app:{}", p.app)).await {
-            warn!(app = %p.app, "asking for a grant: {e:#}");
+        if let Err(e) = crate::grants::ask(st, &gi, &format!("app:{name}")).await {
+            warn!(app = %name, "asking for a grant: {e:#}");
         }
     }
     let have: Vec<String> =
@@ -232,14 +367,127 @@ pub(crate) async fn next_steps(st: &HeadState, realm: &str, p: &api::AppPackage)
     }
     let d = api::DecisionIn {
         kind: "follow_up".into(),
-        title: format!("Finish setting up {}", p.app),
+        title: format!("Finish setting up {name}"),
         document: todo.join("\n"),
         source: "apps".into(),
         ..Default::default()
     };
     if let Err(e) = crate::decisions::open(st, &d, realm, "").await {
-        warn!(app = %p.app, "{e:#}");
+        warn!(app = %name, "{e:#}");
     }
+}
+
+/// Apps installed before instances wrote their code into their realm's
+/// settings lists. Now their code is read from their package, so the
+/// copies go: entries still as installed are removed; entries you edited
+/// stay as the realm's own (they override the app's for the realm's
+/// sessions), and a decision asks whether to keep them (docs/apps.md §14).
+pub async fn adopt(st: &HeadState) -> anyhow::Result<()> {
+    let rows = sqlx::query("SELECT id, realm, name, digest FROM installs WHERE adopted = 0 AND realm != '' AND state = 'installed'")
+        .fetch_all(&st.store.pool)
+        .await?;
+    for r in rows {
+        let (id, realm, name, digest): (i64, String, String, String) = (r.get("id"), r.get("realm"), r.get("name"), r.get("digest"));
+        let Some((p, _)) = crate::packages::by_digest(st, &digest).await? else { continue };
+        let shipped = normalize(&p);
+        let mut edited = Vec::new();
+        for (key, entries) in &shipped.contents.lists {
+            let Some(l) = crate::lists::list(key) else { continue };
+            let mut own = crate::lists::read(&st.store.pool, key, &realm).await?;
+            let before = own.len();
+            let mut probe = api::AppPackage::default();
+            own.retain(|e| {
+                probe.contents.lists = BTreeMap::from([(key.clone(), vec![e.clone()])]);
+                let e_norm = normalize(&probe).contents.lists.remove(key).and_then(|mut v| v.pop()).unwrap_or(Value::Null);
+                match entries.iter().find(|s| crate::lists::identity(l, s) == crate::lists::identity(l, e)) {
+                    Some(s) if *s == e_norm => false,
+                    Some(_) => {
+                        edited.push(name_of(&format!("list:{key}"), &crate::lists::identity(l, e)));
+                        true
+                    }
+                    None => true,
+                }
+            });
+            if own.len() != before {
+                crate::lists::write(&st.store.pool, key, &realm, &own, "upgrade").await?;
+            }
+        }
+        sqlx::query("UPDATE installs SET adopted = 1 WHERE id = ?").bind(id).execute(&st.store.pool).await?;
+        if !edited.is_empty() {
+            let d = api::DecisionIn {
+                kind: "approve".into(),
+                title: format!("Keep your edits to {name}?"),
+                document: format!(
+                    "**{name}** now reads its code from its package, which nothing changes but an upgrade. You had edited some of what it \
+                     installed in realm **{realm}**; those stay as the realm's own, and override the app's for the realm's sessions:\n\n{}\n\n\
+                     Keep them, or use the app's? To change the app itself, export it as a fork (Settings → System → Packages).",
+                    edited.iter().map(|e| format!("- {e}")).collect::<Vec<_>>().join("\n")
+                ),
+                options: ["Keep my edits", "Use the app's"]
+                    .iter()
+                    .map(|o| api::DecisionOption { label: (*o).to_owned(), does: String::new() })
+                    .collect(),
+                source: "packages".into(),
+                context: json!({"install": id, "edited": edited}),
+                ..Default::default()
+            };
+            crate::decisions::open(st, &d, ROOT, &format!("package:adopt:{id}")).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Your answer to keeping edits made before instances.
+pub(crate) async fn answer_adopt(st: &HeadState, id: i64, option: Option<&str>) -> anyhow::Result<()> {
+    if option != Some("Use the app's") {
+        return Ok(());
+    }
+    let i = crate::packages::install_by_id(st, id).await?;
+    let (p, _) = crate::packages::by_digest(st, &i.digest).await?.unwrap_or_default();
+    for key in p.contents.lists.keys() {
+        let Some(l) = crate::lists::list(key) else { continue };
+        let shipped: Vec<String> = p.contents.lists[key].iter().map(|e| crate::lists::identity(l, e)).collect();
+        let mut own = crate::lists::read(&st.store.pool, key, &i.realm).await?;
+        let before = own.len();
+        own.retain(|e| !shipped.contains(&crate::lists::identity(l, e)));
+        if own.len() != before {
+            crate::lists::write(&st.store.pool, key, &i.realm, &own, "you").await?;
+        }
+    }
+    st.registry.bump();
+    Ok(())
+}
+
+/// An instance as a package (its package's manifest); `fork`: as a new
+/// package of that name, forked from it (docs/apps.md §5.6); with `data`,
+/// the records of the collections it owns.
+pub async fn export_instance(st: &HeadState, realm: &str, name: &str, fork: &str, data: bool) -> anyhow::Result<api::AppPackage> {
+    let i = crate::packages::installs(st)
+        .await?
+        .into_iter()
+        .find(|i| i.realm == realm && i.name == name)
+        .ok_or_else(|| crate::not_found(format!("no app {name} in realm {realm}")))?;
+    let (mut p, _) = crate::packages::by_digest(st, &i.digest).await?.unwrap_or_default();
+    if !fork.trim().is_empty() {
+        p.forked_from = p.app.clone();
+        p.app = fork.trim().to_owned();
+        p.realm = String::new();
+    }
+    if data {
+        for c in crate::collections::list(st, realm).await?.into_iter().filter(|c| c.owner == name) {
+            let page = crate::collections::query(
+                st,
+                realm,
+                &c.name,
+                &api::RecordQuery { limit: Some(100_000), sort: "created_at".into(), ..Default::default() },
+            )
+            .await?;
+            if !page.records.is_empty() {
+                p.contents.records.insert(c.name.clone(), page.records.into_iter().map(|r| r.fields).collect());
+            }
+        }
+    }
+    Ok(p)
 }
 
 /// A realm's configuration as a package; with `data`, its records too.
@@ -257,7 +505,8 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
         exports: installed.as_ref().map(|(_, m)| m.exports.clone()).unwrap_or_default(),
         ..Default::default()
     };
-    for c in crate::collections::list(st, realm).await?.into_iter().filter(|c| !c.system) {
+    // The realm's own: what its apps own is theirs (export_instance).
+    for c in crate::collections::list(st, realm).await?.into_iter().filter(|c| !c.system && c.owner.is_empty()) {
         if data {
             let page = crate::collections::query(
                 st,
@@ -277,7 +526,7 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
             keys: Some(c.keys),
         });
     }
-    for s in crate::series::list(st, realm).await?.into_iter().filter(|s| !s.system) {
+    for s in crate::series::list(st, realm).await?.into_iter().filter(|s| !s.system && s.owner.is_empty()) {
         p.contents.series.push(api::SeriesIn {
             name: s.name,
             unit: Some(s.unit),
@@ -292,7 +541,7 @@ pub async fn export(st: &HeadState, realm: &str, data: bool) -> anyhow::Result<a
             p.contents.lists.insert(key.to_owned(), entries);
         }
     }
-    for t in crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await? {
+    for t in crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await?.into_iter().filter(|t| t.owner.is_empty()) {
         p.contents.triggers.push(api::AutomationEdit {
             name: Some(t.name),
             template: Some(t.template),
@@ -413,197 +662,4 @@ fn items(p: &api::AppPackage) -> BTreeMap<(String, String), Value> {
 
 fn name_of(kind: &str, id: &str) -> String {
     format!("{} {}", kind.trim_start_matches("list:"), id.split('\u{1f}').next().unwrap_or(id).trim_matches('"'))
-}
-
-/// What an upgrade does: per item, the installed version (base), yours
-/// now (mine), and the new one (theirs).
-struct Diff {
-    apply: Vec<((String, String), Option<Value>)>,
-    conflicts: Vec<((String, String), Option<Value>)>,
-}
-
-fn diff(base: &api::AppPackage, mine: &api::AppPackage, theirs: &api::AppPackage) -> Diff {
-    let (b, m, t) = (items(&normalize(base)), items(&normalize(mine)), items(&normalize(theirs)));
-    let keys: BTreeSet<&(String, String)> = b.keys().chain(t.keys()).collect();
-    let mut d = Diff { apply: Vec::new(), conflicts: Vec::new() };
-    for k in keys {
-        let (bv, mv, tv) = (b.get(k), m.get(k), t.get(k));
-        if tv == bv || mv == tv {
-            continue;
-        }
-        if mv == bv {
-            d.apply.push((k.clone(), tv.cloned()));
-        } else {
-            d.conflicts.push((k.clone(), tv.cloned()));
-        }
-    }
-    d
-}
-
-/// What an upgrade changes in a realm, and what both you and the new
-/// version changed: lines of Markdown, and the conflicts' names.
-pub(crate) async fn upgrade_lines(
-    st: &HeadState,
-    realm: &str,
-    base: &api::AppPackage,
-    p: &api::AppPackage,
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let mine = export(st, realm, false).await?;
-    let d = diff(base, &mine, p);
-    let describe =
-        |(k, v): &((String, String), Option<Value>)| format!("- {} {}", if v.is_some() { "update" } else { "remove" }, name_of(&k.0, &k.1));
-    let mut lines = Vec::new();
-    if d.apply.is_empty() {
-        lines.push("Nothing of yours changes.".into());
-    } else {
-        lines.push("Changes:".into());
-        lines.extend(d.apply.iter().map(describe));
-    }
-    if !d.conflicts.is_empty() {
-        lines.push("\nYou and the new version both changed these; by default yours are kept:".into());
-        lines.extend(d.conflicts.iter().map(describe));
-    }
-    Ok((lines, d.conflicts.iter().map(|(k, _)| name_of(&k.0, &k.1)).collect()))
-}
-
-pub(crate) async fn apply_upgrade(
-    st: &HeadState,
-    realm: &str,
-    base: &api::AppPackage,
-    p: &api::AppPackage,
-    take_theirs: bool,
-) -> anyhow::Result<()> {
-    let mine = export(st, realm, false).await?;
-    let d = diff(base, &mine, p);
-    let changes: Vec<_> = d.apply.into_iter().chain(if take_theirs { d.conflicts } else { Vec::new() }).collect();
-    let q = format!("?realm={}", enc(realm));
-    // Lists are replaced whole: yours, with the changed entries swapped.
-    let mut lists: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for ((kind, id), new) in changes {
-        match kind.as_str() {
-            // A collection the new version drops keeps your records.
-            "collection" => {
-                if let Some(v) = new {
-                    if mine.contents.collections.iter().any(|c| c.name == id) {
-                        internal(st, "PATCH", &format!("/api/v1/collections/{}{q}", enc(&id)), Some(&v)).await?;
-                    } else {
-                        internal(st, "POST", &format!("/api/v1/collections{q}"), Some(&v)).await?;
-                    }
-                }
-            }
-            "series" => match new {
-                Some(v) if mine.contents.series.iter().any(|s| s.name == id) => {
-                    internal(st, "PATCH", &format!("/api/v1/series/{}{q}", enc(&id)), Some(&v)).await?;
-                }
-                Some(v) => {
-                    internal(st, "POST", &format!("/api/v1/series{q}"), Some(&v)).await?;
-                }
-                None => {}
-            },
-            "trigger" => {
-                let current = crate::triggers::list(st, &crate::realms::Caller::in_realm(realm)).await?.into_iter().find(|t| t.name == id);
-                match (current, new) {
-                    (Some(t), Some(v)) => {
-                        crate::triggers::update(st, &t.id, serde_json::from_value(v)?).await?;
-                    }
-                    (None, Some(v)) => {
-                        crate::triggers::create(st, serde_json::from_value(v)?, realm).await?;
-                    }
-                    (Some(t), None) => crate::triggers::delete(st, &t.id).await?,
-                    (None, None) => {}
-                }
-            }
-            "memory" => {
-                if let Some(v) = new {
-                    let note = api::Memory { scope: v["scope"].as_str().unwrap_or("").to_owned(), text: id.clone(), ..Default::default() };
-                    crate::memory::put(st, note, realm).await?;
-                }
-            }
-            k if k.starts_with("list:") => {
-                let key = &k[5..];
-                let entries = match lists.get_mut(key) {
-                    Some(e) => e,
-                    None => lists.entry(key.to_owned()).or_insert(crate::lists::read(&st.store.pool, key, realm).await?),
-                };
-                let l = crate::lists::list(key).ok_or_else(|| bad_request(format!("{key} is not a list")))?;
-                let at = entries.iter().position(|e| crate::lists::identity(l, e) == id);
-                match (at, new) {
-                    (Some(i), Some(v)) => entries[i] = v,
-                    (None, Some(v)) => entries.push(v),
-                    (Some(i), None) => {
-                        entries.remove(i);
-                    }
-                    (None, None) => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    for (key, entries) in lists {
-        write_list(st, realm, &key, entries).await?;
-    }
-    Ok(())
-}
-
-/// Deletes a realm and everything in it (an app's removal, once you
-/// decided).
-pub(crate) async fn remove_now(st: &HeadState, realm: &str) -> anyhow::Result<()> {
-    let running: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE realm = ? AND status IN ('starting', 'running')")
-        .bind(realm)
-        .fetch_one(&st.store.pool)
-        .await?;
-    if running > 0 {
-        return Err(bad_request(format!("{running} of its sessions are still running: stop them first")));
-    }
-    let now = now_ms();
-    let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    let in_sessions = "(SELECT id FROM sessions WHERE realm = ?)";
-    for sql in [
-        format!("DELETE FROM events WHERE session_id IN {in_sessions}"),
-        format!("DELETE FROM commands WHERE session_id IN {in_sessions}"),
-        format!("DELETE FROM run_sessions WHERE session_id IN {in_sessions}"),
-        format!("DELETE FROM search WHERE session_id IN {in_sessions}"),
-        "DELETE FROM sessions WHERE realm = ?".into(),
-        "DELETE FROM trigger_runs WHERE trigger_id IN (SELECT id FROM triggers WHERE realm = ?)".into(),
-        "DELETE FROM series_alerts WHERE trigger_id IN (SELECT id FROM triggers WHERE realm = ?)".into(),
-        "DELETE FROM triggers WHERE realm = ?".into(),
-        "DELETE FROM workflow_runs WHERE realm = ?".into(),
-        "DELETE FROM decisions WHERE realm = ?".into(),
-        "DELETE FROM record_history WHERE record_id IN (SELECT id FROM records WHERE realm = ?)".into(),
-        "DELETE FROM records WHERE realm = ?".into(),
-        "DELETE FROM collections WHERE realm = ?".into(),
-        "DELETE FROM points WHERE realm = ?".into(),
-        "DELETE FROM series WHERE realm = ?".into(),
-        "DELETE FROM secrets WHERE realm = ?".into(),
-        "DELETE FROM api_tokens WHERE realm = ?".into(),
-        "DELETE FROM realms WHERE id = ?".into(),
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(realm).execute(&mut *tx).await?;
-    }
-    sqlx::query("UPDATE grants SET state = 'revoked', revoked_at = ?1 WHERE (from_realm = ?2 OR to_realm = ?2) AND state IN ('active', 'requested')")
-        .bind(now)
-        .bind(realm)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    // Workers and connections kept to it serve every realm again.
-    for table in ["workers", "connections"] {
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT id, realms FROM {table} WHERE realms LIKE ?")))
-            .bind(format!("%\"{realm}\"%"))
-            .fetch_all(&st.store.pool)
-            .await?;
-        for r in rows {
-            let mut realms: Vec<String> = serde_json::from_str(&r.get::<String, _>("realms")).unwrap_or_default();
-            realms.retain(|x| x != realm);
-            let id: String = r.try_get::<String, _>("id").unwrap_or_default();
-            sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET realms = ? WHERE id = ?")))
-                .bind(serde_json::to_string(&realms)?)
-                .bind(id)
-                .execute(&st.store.pool)
-                .await?;
-        }
-    }
-    crate::memex::enqueue(st, "memex.drop_realm", json!({"realm": realm})).await;
-    st.registry.bump();
-    Ok(())
 }

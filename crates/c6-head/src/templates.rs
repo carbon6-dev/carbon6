@@ -18,18 +18,34 @@ pub async fn templates_for(st: &HeadState, realm: &str) -> anyhow::Result<Vec<ap
     Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
+/// The templates a realm's sessions use (`instance: None`), or an app
+/// instance's, each with where it comes from (docs/apps.md §5.3).
+pub async fn templates_in(
+    st: &HeadState,
+    realm: &str,
+    instance: Option<&str>,
+) -> anyhow::Result<Vec<(api::Template, crate::lists::Layer)>> {
+    Ok(crate::lists::effective_tagged(&st.store.pool, TEMPLATES, realm, instance)
+        .await?
+        .into_iter()
+        .filter_map(|(v, l)| serde_json::from_value(v).ok().map(|t| (t, l)))
+        .collect())
+}
+
 /// Every template, with its realm: home's (root's apply everywhere and
-/// are listed as home's), then each other realm's own.
+/// are listed as home's), then each other realm's own and its apps'.
 pub async fn all(st: &HeadState, caller: &crate::realms::Caller) -> anyhow::Result<Vec<api::RealmTemplate>> {
     let mut out = Vec::new();
     for r in crate::realms::list(st, caller).await? {
-        let list: Vec<api::Template> = if r.id == crate::realms::HOME {
-            templates_for(st, &r.id).await?
-        } else if r.id == crate::realms::ROOT {
+        if r.id == crate::realms::ROOT {
             continue;
-        } else {
-            crate::lists::read(&st.store.pool, TEMPLATES, &r.id).await?.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()
-        };
+        }
+        let list: Vec<api::Template> = templates_in(st, &r.id, None)
+            .await?
+            .into_iter()
+            .filter(|(_, l)| r.id == crate::realms::HOME || *l != crate::lists::Layer::Root)
+            .map(|(t, _)| t)
+            .collect();
         out.extend(list.into_iter().map(|template| api::RealmTemplate { realm: r.id.clone(), template }));
     }
     Ok(out)
@@ -82,11 +98,30 @@ pub fn fill(prompt: &str, input: &str, target: &str) -> String {
 /// the template's (e.g. automation:<name>).
 /// Starts the template's sessions in `realm`.
 pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String], realm: &str) -> anyhow::Result<api::TemplateRun> {
-    let t = templates_for(st, realm)
+    run_as(st, name, input, labels, realm, None).await
+}
+
+/// Starts a template as an app instance would (its own templates first,
+/// its sessions acting as it), or as the realm (`instance: None`), where a
+/// template an instance offers still runs as that instance.
+pub async fn run_as(
+    st: &HeadState,
+    name: &str,
+    input: &str,
+    labels: &[String],
+    realm: &str,
+    instance: Option<&str>,
+) -> anyhow::Result<api::TemplateRun> {
+    let (t, layer) = templates_in(st, realm, instance)
         .await?
         .into_iter()
-        .find(|t| t.name == name)
+        .find(|(t, _)| t.name == name)
         .ok_or_else(|| not_found(format!("no template named {name:?}")))?;
+    let acting = match (instance, &layer) {
+        (Some(me), _) => me.to_owned(),
+        (None, crate::lists::Layer::Instance(n)) => n.clone(),
+        _ => String::new(),
+    };
     if !t.enabled {
         return Err(bad_request(format!("template {name:?} is switched off")));
     }
@@ -176,7 +211,7 @@ pub async fn run(st: &HeadState, name: &str, input: &str, labels: &[String], rea
             worktree: false,
             realm: Some(realm.to_owned()),
         };
-        match crate::sessions::create(st, req).await {
+        match crate::sessions::create_as(st, req, &acting).await {
             Ok(s) => sessions.push(s),
             Err(e) => errors.push(format!("{target}: {e:#}")),
         }

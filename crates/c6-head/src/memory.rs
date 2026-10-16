@@ -53,6 +53,31 @@ pub async fn for_sessions(st: &HeadState, realm: &str) -> anyhow::Result<String>
     Ok(serde_json::to_string(&rows.iter().map(row).collect::<Vec<_>>())?)
 }
 
+/// The notes for a new session: its realm's, and, for an app instance's
+/// session, the notes its package ships (docs/apps.md §5.3).
+pub async fn for_sessions_of(st: &HeadState, realm: &str, instance: &str) -> anyhow::Result<String> {
+    let mut notes: Vec<api::Memory> = serde_json::from_str(&for_sessions(st, realm).await?)?;
+    if !instance.is_empty()
+        && let Some(i) = crate::instances::get(&st.store.pool, realm, instance).await?
+    {
+        for (n, m) in i.package.contents.memory.iter().enumerate() {
+            let m = crate::instances::fill_settings(m, &i.settings);
+            // Apps installed before instances copied their notes into the realm.
+            if notes.iter().any(|x| Some(x.text.as_str()) == m["text"].as_str()) {
+                continue;
+            }
+            notes.push(api::Memory {
+                id: format!("app:{instance}:{n}"),
+                scope: m["scope"].as_str().unwrap_or("").to_owned(),
+                text: m["text"].as_str().unwrap_or("").to_owned(),
+                session_id: None,
+                updated_at: 0,
+            });
+        }
+    }
+    Ok(serde_json::to_string(&notes)?)
+}
+
 fn check(m: &api::Memory) -> anyhow::Result<()> {
     if m.text.trim().is_empty() || m.text.len() > MAX_TEXT {
         return Err(bad_request(format!("a note has 1 to {MAX_TEXT} characters")));
