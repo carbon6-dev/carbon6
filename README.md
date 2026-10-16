@@ -191,6 +191,13 @@ A new version of carbon6 upgrades its databases when it starts: the head's (`c6h
 - **History:** **Settings → System** lists each upgrade with what changed and where its backup is.
 - **Going back:** stop carbon6 and put the backup in place of the database.
 
+**From 0.2 to 0.3:** the memex is part of the head now, and reading files and syncing Google run in kits on a worker with Docker or Podman.
+
+1. **Stop and remove c6m first:** `brew services stop c6m && brew uninstall c6m` (Ubuntu: `sudo systemctl disable --now c6m && sudo apt remove c6m`). The head takes its knowledge in, moving the folder without copying it, the first time it starts with c6m stopped.
+2. **Upgrade the head and workers** (`brew upgrade c6h c6w`, then `brew services restart c6h c6w`), and keep Docker Desktop (or Podman) running on at least one worker.
+3. **Approve "Install the kit c6-extract?"** under Decisions. Mail kept before is then read again in the background, once: about an hour per 200,000 messages on a laptop. Until a message has been read again, its thread shows its text without the HTML.
+4. **Google accounts** synced by the memex before move into the gmail, google-calendar and google-contacts apps on their own (Settings → Mail & calendar).
+
 ### Labels
 
 Sessions carry labels, which group them and decide which settings apply.
