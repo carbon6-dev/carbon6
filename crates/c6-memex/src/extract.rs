@@ -214,8 +214,19 @@ async fn step(m: &Memex) -> anyhow::Result<bool> {
     else {
         // Nothing waits at all: mail kept before messages were read once
         // is read again, a hundred at a time.
+        if m.reread.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
+        }
         let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM extractions").fetch_one(&m.store.pool).await?;
-        return Ok(waiting == 0 && crate::mail::backfill(m).await? > 0);
+        if waiting > 0 {
+            return Ok(false);
+        }
+        let queued = crate::mail::backfill(m).await?;
+        // None left (only mail kept before 0.3 is ever unread).
+        if queued == 0 {
+            m.reread.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(queued > 0);
     };
     let tool: String = first.get("tool");
     let place = worker_of(&first.get::<String, _>("input"));

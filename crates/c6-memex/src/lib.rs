@@ -87,6 +87,8 @@ pub struct Memex {
     extracted: tokio::sync::Notify,
     /// Finished jobs' outcomes (an item, or why not), for waiters.
     outcomes: Mutex<HashMap<String, Result<extract::Kept, String>>>,
+    /// Every message kept before 0.3 has been read again: no more looking.
+    pub(crate) reread: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -147,6 +149,7 @@ impl Memex {
             extract_wake: tokio::sync::Notify::new(),
             extracted: tokio::sync::Notify::new(),
             outcomes: Default::default(),
+            reread: Default::default(),
         }))
     }
 
