@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.4 (2026-10-17)
+
+- carbon6 updates itself from signed GitHub releases: the head looks every 6 hours and asks (a decision), updates itself, then each worker once its sessions are idle; by brew, a .deb's root helper or in place, rolled back if it doesn't start
+- Releases carry release.json, signed with carbon6's release key, and every binary can verify one
+- Design: carbon6 updates itself from signed GitHub releases, the head first and then its workers
+- Sessions from Claude Code and Codex come in: workers you turn it on for import theirs (and new messages as you go on), into the realm their folder maps to, as history you can continue in carbon6
+- The realm picker (and every list of realms) reloads when a realm is made, renamed or removed, or an app you approve makes one
+
 ## 0.3.3 (2026-10-17)
 
 - Mail read again once is looked for by an index, and not at all once none is left: an idle head no longer scans every message every five seconds
