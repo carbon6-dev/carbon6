@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 # Upgrading SQLite databases (the head's and the memex's).
 upgrade = ["dep:sqlx", "dep:anyhow", "dep:tracing"]
+# Verifying signed releases to update to (docs/updates.md).
+update = ["dep:ring"]
 
 [dependencies]
 anyhow = { version = "1.0.104", optional = true }
@@ -14,6 +16,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 tracing = { version = "0.1.44", optional = true }
 base64 = "0.23.1"
 hex = "0.4.3"
+ring = { version = "0.17.14", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -21,5 +24,6 @@ thiserror = "2.0.21"
 uuid = { version = "1.28.0", features = ["v7", "serde"] }
 
 [dev-dependencies]
+ring = "0.17.14"
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }

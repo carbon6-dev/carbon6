@@ -2,7 +2,7 @@
 # Publishes release <version> from <dir> (the Release workflow's artifacts:
 # .debs, tarballs and bottles): writes the Homebrew formulas pointing at the
 # GitHub release, SHA256SUMS and the notes (CHANGELOG.md's section), creates
-# the GitHub release, and pushes the formulas to the tap repository.
+# release.json and its signature (manifest.sh), the GitHub release, and pushes the formulas to the tap repository.
 #
 #   publish.sh <version> <dir>
 #
@@ -20,10 +20,12 @@ tap=${TAP_REPOSITORY:-${repo%%/*}/homebrew-carbon6}
 packaging/brew/formulas.sh "$version" "$dir" "https://github.com/$repo/releases/download/$tag" "$dir/Formula"
 cp "$dir"/Formula/*.rb "$dir/"
 (cd "$dir" && shasum -a 256 -- *.deb *.tar.gz *.rb >SHA256SUMS)
+packaging/release/manifest.sh "$version" "$dir"
 awk -v head="## $version " 'index($0, head) == 1 { on = 1; next } on && /^## / { exit } on' CHANGELOG.md | sed '/./,$!d' >"$dir/notes.md"
 [ -s "$dir/notes.md" ] || { echo "no section for $version in CHANGELOG.md" >&2; exit 1; }
 
-assets=("$dir"/*.deb "$dir"/*.tar.gz "$dir"/*.rb "$dir/SHA256SUMS")
+assets=("$dir"/*.deb "$dir"/*.tar.gz "$dir"/*.rb "$dir/SHA256SUMS" "$dir/release.json")
+[ ! -f "$dir/release.json.sig" ] || assets+=("$dir/release.json.sig")
 if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
     gh release upload "$tag" --repo "$repo" --clobber "${assets[@]}"
 else

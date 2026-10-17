@@ -517,6 +517,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "hex",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.11.0",

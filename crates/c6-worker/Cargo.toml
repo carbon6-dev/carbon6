@@ -12,7 +12,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 c6-agent.workspace = true
 c6-api.workspace = true
-c6-core.workspace = true
+c6-core = { workspace = true, features = ["update"] }
 c6-llm.workspace = true
 c6-mcp.workspace = true
 c6-proto.workspace = true

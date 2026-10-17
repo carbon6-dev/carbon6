@@ -96,4 +96,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: packaging/release/publish.sh "${GITHUB_REF_NAME#v}" dist/release
