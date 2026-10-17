@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3 (2026-10-17)
+
+- Mail read again once is looked for by an index, and not at all once none is left: an idle head no longer scans every message every five seconds
+
 ## 0.3.2 (2026-10-17)
 
 - Secrets per realm: the same name can hold a value in each realm (work's GITHUB_TOKEN and home's), a realm's sessions and apps use its own, else root's; the Google apps are listed under Packages and installed only where you choose, and Mail, Calendar and Contacts show in a realm's menu only when something feeds them there
