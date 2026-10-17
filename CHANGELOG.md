@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2 (2026-10-17)
+
+- Secrets per realm: the same name can hold a value in each realm (work's GITHUB_TOKEN and home's), a realm's sessions and apps use its own, else root's; the Google apps are listed under Packages and installed only where you choose, and Mail, Calendar and Contacts show in a realm's menu only when something feeds them there
+- Mail, calendar and contacts per realm: each realm can install the Google apps with its own accounts, syncs, mail, events and contacts in its own knowledge; your OAuth client is root's, every realm's; the mail, calendar and contacts pages and Mail & calendar settings follow the realm picked in the header
+
 ## 0.3.1 (2026-10-16)
 
 - A video's transcription takes its model call from the day's budget when it is asked for, so photos looked at meanwhile can't spend it twice
