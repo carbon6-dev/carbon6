@@ -51,6 +51,8 @@ enum Ended {
 /// Keeps the worker attached to the head until `shutdown` or a fatal
 /// rejection.
 pub async fn run(worker: Arc<Worker>, state: watch::Sender<ConnState>, shutdown: CancellationToken) -> anyhow::Result<()> {
+    // Sessions from Claude Code and Codex, when the head says this worker imports.
+    crate::imports::spawn(worker.clone(), shutdown.clone());
     let mut backoff = MIN_BACKOFF;
     loop {
         state.send_replace(ConnState::Connecting);

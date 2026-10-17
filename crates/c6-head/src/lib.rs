@@ -22,6 +22,7 @@ pub mod grants;
 pub mod guard;
 pub mod hosts;
 pub mod hub;
+pub mod imports;
 pub mod instances;
 pub mod kitjobs;
 pub mod knowledge;

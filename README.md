@@ -198,6 +198,14 @@ A new version of carbon6 upgrades its databases when it starts: the head's (`c6h
 3. **Approve "Install the kit c6-extract?"** under Decisions. Mail kept before is then read again in the background, once: about an hour per 200,000 messages on a laptop. Until a message has been read again, its thread shows its text without the HTML.
 4. **Google accounts** synced by the memex before move into the gmail, google-calendar and google-contacts apps on their own (Settings → Mail & calendar).
 
+### Sessions from Claude Code and Codex
+
+**Settings → System → Sessions from Claude Code and Codex** turns on importing for the workers you pick. Each such worker reads `~/.claude/projects` and `~/.codex/sessions` every minute, and only files that changed. Every session there becomes a carbon6 session (labelled `imported:claude-code` or `imported:codex`) with its messages, tool calls and usage. New messages follow as you keep using those tools.
+
+- **Realms:** folder rules place sessions (`~/work/**` → work), and anything else goes to home.
+- **Continuing:** send a message to an imported session, picking a connection. A Claude Code connection resumes it with Claude Code's own memory of it; any other connection continues from the history. From then on it is carbon6's, and the import leaves it alone.
+- **History only:** imported sessions start no triggers or notifications and count against no budget. Their digests go to the memex like any session's. Design: [docs/imports.md](docs/imports.md).
+
 ### Labels
 
 Sessions carry labels, which group them and decide which settings apply.

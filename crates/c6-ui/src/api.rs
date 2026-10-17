@@ -152,6 +152,20 @@ fn in_realm(sep: char) -> String {
     if r.is_empty() { String::new() } else { format!("{sep}realm={}", enc(&r)) }
 }
 
+/// Importing sessions from Claude Code and Codex (docs/imports.md).
+pub async fn session_imports() -> Result<c6_api::SessionImports, String> {
+    json(Request::get("/api/v1/settings/session_imports").send().await).await
+}
+
+pub async fn set_session_imports(s: c6_api::SessionImports) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/session_imports").json(&s).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// What was imported: sessions by source and realm.
+pub async fn imports() -> Result<serde_json::Value, String> {
+    json(Request::get("/api/v1/imports").send().await).await
+}
+
 /// The realms (it reloads when they change: track `realms_changed`).
 pub async fn realms() -> Result<Vec<c6_api::Realm>, String> {
     json(Request::get("/api/v1/realms").send().await).await
@@ -249,9 +263,11 @@ pub async fn app_accounts(realm: &str, instance: &str) -> Result<Vec<c6_api::OAu
 
 /// Starts connecting an account: where to send you.
 pub async fn connect_account(realm: &str, instance: &str, provider: &str) -> Result<String, String> {
-    let v: serde_json::Value =
-        send_json(Request::post(&format!("/api/v1/apps/{}/{}/providers/{}/connect", enc(realm), enc(instance), enc(provider))), &serde_json::json!({}))
-            .await?;
+    let v: serde_json::Value = send_json(
+        Request::post(&format!("/api/v1/apps/{}/{}/providers/{}/connect", enc(realm), enc(instance), enc(provider))),
+        &serde_json::json!({}),
+    )
+    .await?;
     Ok(v["authorize_url"].as_str().unwrap_or_default().to_owned())
 }
 

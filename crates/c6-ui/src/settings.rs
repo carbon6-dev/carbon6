@@ -233,7 +233,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> } }).into_any(),
-                    "system" => view! { <Realms /> <Apps /> <Grants /> <Upgrades /> }.into_any(),
+                    "system" => view! { <Realms /> <Apps /> <Grants /> <SessionImportsSetting /> <Upgrades /> }.into_any(),
                     "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
@@ -811,6 +811,100 @@ fn Prompts() -> impl IntoView {
 }
 
 /// Upgrades of the head's and the memex's databases, newest first.
+/// Importing sessions from Claude Code and Codex (docs/imports.md): which
+/// workers read theirs, from which tools, and which realm a folder's go to.
+#[component]
+fn SessionImportsSetting() -> impl IntoView {
+    let s = RwSignal::new(c6_api::SessionImports::default());
+    let loaded = LocalResource::new(api::session_imports);
+    let summary = LocalResource::new(api::imports);
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            s.set(v);
+        }
+    });
+    let note = RwSignal::new(None::<Result<&'static str, String>>);
+    let save = move |_| {
+        let v = s.get_untracked();
+        spawn_local(async move {
+            note.set(Some(api::set_session_imports(v).await.map(|_| "Saved. Workers look within a minute.")));
+            summary.refetch();
+        });
+    };
+    let workers = crate::api::live().workers;
+    let toggle = |list: Vec<String>, x: &str, on: bool| {
+        let mut l: Vec<String> = list.into_iter().filter(|y| y != x).collect();
+        if on {
+            l.push(x.to_owned());
+        }
+        l
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Sessions from Claude Code and Codex"</h2>
+                <p class="text-sm text-zinc-500">"A worker you turn this on for brings in the sessions it has in ~/.claude and ~/.codex, and new ones as you go on using those tools: in the Sessions list, searchable, in the memex, and continued here with a message (a Claude Code session through a Claude Code connection keeps Claude Code's own memory of it). Once you continue one here, it is carbon6's."</p>
+            </div>
+            <div class="flex flex-wrap gap-3 text-sm">
+                <span class="text-zinc-500">"Workers:"</span>
+                {move || workers.get().into_iter().filter(|w| w.role != "memex").map(|w| {
+                    let name = w.name.clone();
+                    let n2 = name.clone();
+                    view! {
+                        <label class="flex items-center gap-1">
+                            <input type="checkbox" prop:checked=move || s.get().workers.contains(&name)
+                                on:change=move |ev| { let on = event_target_checked(&ev); s.update(|v| v.workers = toggle(v.workers.clone(), &n2, on)); } />
+                            {w.name.clone()}
+                        </label>
+                    }
+                }).collect_view()}
+            </div>
+            <div class="flex flex-wrap gap-3 text-sm">
+                <span class="text-zinc-500">"From:"</span>
+                {[("claude_code", "Claude Code"), ("codex", "Codex")].into_iter().map(|(k, label)| view! {
+                    <label class="flex items-center gap-1">
+                        <input type="checkbox" prop:checked=move || { let v = s.get(); v.sources.is_empty() || v.sources.iter().any(|x| x == k) }
+                            on:change=move |ev| {
+                                let on = event_target_checked(&ev);
+                                s.update(|v| {
+                                    let all = if v.sources.is_empty() { vec!["claude_code".to_owned(), "codex".to_owned()] } else { v.sources.clone() };
+                                    v.sources = toggle(all, k, on);
+                                });
+                            } />
+                        {label}
+                    </label>
+                }).collect_view()}
+            </div>
+            <div class="space-y-1">
+                <p class="text-xs text-zinc-500">"Which realm a session goes to, by its folder (the first rule that matches; else home):"</p>
+                {move || s.get().rules.into_iter().enumerate().map(|(i, r)| view! {
+                    <div class="flex items-center gap-2">
+                        <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="~/work" prop:value=r.folder.clone()
+                            on:change=move |ev| { let f = event_target_value(&ev); s.update(|v| v.rules[i].folder = f); } />
+                        <span class="text-xs text-zinc-500">"→"</span>
+                        <input class=format!("{INPUT} w-32 py-1 font-mono text-xs") placeholder="work" prop:value=r.realm.clone()
+                            on:change=move |ev| { let x = event_target_value(&ev); s.update(|v| v.rules[i].realm = x); } />
+                        <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| s.update(|v| { v.rules.remove(i); })>"Remove"</button>
+                    </div>
+                }).collect_view()}
+                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| s.update(|v| v.rules.push(c6_api::ImportRule::default()))>"Add a rule"</button>
+            </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || note.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=save>"Save"</button>
+            </div>
+            {move || summary.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).filter(|a| !a.is_empty()).map(|rows| view! {
+                <p class="text-xs text-zinc-500">"Imported: "{rows.iter().map(|r| format!("{} {} session{} in {}",
+                    r["sessions"], if r["source"] == "codex" { "Codex" } else { "Claude Code" },
+                    if r["sessions"] == 1 { "" } else { "s" }, r["realm"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")}</p>
+            })}
+        </section>
+    }
+}
+
 #[component]
 fn Upgrades() -> impl IntoView {
     let list = LocalResource::new(crate::api::upgrades);

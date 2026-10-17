@@ -21,6 +21,7 @@ mod extract;
 mod fixtures;
 mod grants;
 mod hooks;
+mod imports;
 mod ide;
 mod journal;
 mod kitjobs;

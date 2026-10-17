@@ -94,6 +94,13 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     if role == "memex" {
         return memex_call(st, method, params).await;
     }
+    // Sessions this worker imports from Claude Code and Codex (docs/imports.md).
+    match method {
+        "imports.config" => return crate::imports::config(st, from).await,
+        "imports.status" => return crate::imports::status(st, from, params["id"].as_str().unwrap_or_default()).await,
+        "imports.append" => return crate::imports::append(st, from, &params).await,
+        _ => {}
+    }
     // Action items and the API reference, for one of this worker's sessions.
     if let Some(what) = method.strip_prefix("session.") {
         let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();

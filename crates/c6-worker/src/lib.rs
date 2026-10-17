@@ -8,6 +8,7 @@ pub mod conn;
 pub mod enroll;
 pub mod hooks;
 pub mod identity;
+pub mod imports;
 pub mod journal;
 pub mod link;
 pub mod mentions;

@@ -3775,6 +3775,31 @@ pub struct GoogleClientIn {
     pub client_secret: Option<String>,
 }
 
+/// Importing sessions from Claude Code and Codex (`/api/v1/settings/session_imports`,
+/// docs/imports.md).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionImports {
+    /// The workers that import their own sessions (names or ids).
+    #[serde(default)]
+    pub workers: Vec<String>,
+    /// `claude_code`, `codex` (empty: both).
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Which realm a session goes to, by its folder (the first that
+    /// matches; else home).
+    #[serde(default)]
+    pub rules: Vec<ImportRule>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportRule {
+    /// A folder on the worker (`~` is its home); sessions in it and below.
+    pub folder: String,
+    pub realm: String,
+}
+
 /// A connected Google account (`/api/v1/google/accounts`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

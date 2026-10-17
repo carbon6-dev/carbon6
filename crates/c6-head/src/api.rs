@@ -35,6 +35,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/google/client", get(get_google_client).put(put_google_client))
         .route("/api/v1/google/connect", post(google_connect))
         .route("/api/v1/google/install", post(google_install))
+        .route("/api/v1/settings/session_imports", get(get_session_imports).put(put_session_imports))
+        .route("/api/v1/imports", get(list_imports))
         .route("/api/v1/google/accounts", get(google_accounts))
         .route("/api/v1/google/accounts/{id}", delete(google_remove))
         .route("/ca.pem", get(ui_ca_pem))
@@ -1505,6 +1507,21 @@ async fn google_connect(
     let realm = realm_for(&st, &caller, &r).await?;
     let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
     Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, origin.as_deref()).await?})))
+}
+
+/// Importing sessions from Claude Code and Codex (docs/imports.md).
+async fn get_session_imports(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionImports>> {
+    Ok(Json(crate::imports::settings(&st).await?))
+}
+
+async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api::SessionImports>) -> ApiResult<StatusCode> {
+    crate::imports::set_settings(&st, &s).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What was imported: sessions by source and realm.
+async fn list_imports(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::imports::summary(&st).await?))
 }
 
 /// Asks you to install the Gmail, Calendar and Contacts apps in a realm.

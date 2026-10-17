@@ -767,7 +767,8 @@ async fn model_switch(
     let effort = check_effort(effort)?;
     let to = st.store.connection(connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
     let from = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
-    if (to.kind == "claude_code") != (from == "claude_code") {
+    // An imported session has no connection yet: it may take any.
+    if !session.connection_id.is_empty() && (to.kind == "claude_code") != (from == "claude_code") {
         return Err(bad_request("a session cannot switch between Claude Code and other connections"));
     }
     Ok(ModelSpec {
@@ -1175,6 +1176,14 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     let events = st.store.events_after(session_id, 0, i64::MAX).await?;
     if events.is_empty() {
         return Ok(false);
+    }
+    // An imported session has no connection until its first message here
+    // picks one (docs/imports.md).
+    let mut session = session;
+    if session.connection_id.is_empty() {
+        let Some(m) = &input.model else { return Ok(false) };
+        session.connection_id = m.connection_id.clone();
+        session.model = m.model.clone();
     }
     let seed = match (&session.parent_id, session.fork_seq) {
         (Some(p), Some(f)) => match st.store.session(p).await? {
