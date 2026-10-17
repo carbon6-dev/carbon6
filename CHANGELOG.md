@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 (2026-10-16)
+
+- A video's transcription takes its model call from the day's budget when it is asked for, so photos looked at meanwhile can't spend it twice
+- Site: the memex is part of the head, kits need Docker or Podman on a worker, and upgrading from 0.2 starts by removing c6m
+
 ## 0.3.0 (2026-10-16)
 
 - Upgrading from 0.2 to 0.3: stop and remove c6m first, keep Docker or Podman on a worker, and approve the c6-extract kit
