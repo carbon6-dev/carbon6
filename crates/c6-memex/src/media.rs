@@ -504,6 +504,11 @@ pub async fn hear(m: &Memex) -> anyhow::Result<bool> {
         sqlx::query("UPDATE media SET heard = ? WHERE item_id = ?").bind(&version).bind(&id).execute(&m.store.pool).await?;
         return Ok(true);
     }
+    // Its model call is taken from the day's budget now, so other work
+    // can't spend it while the kit reads the video.
+    if sound {
+        crate::understand::count_call(m).await?;
+    }
     let params = json!({"item": id, "version": version, "frames": frames, "sound": sound});
     crate::extract::queue(m, &format!("video:{id}"), "video", &r.get::<String, _>("path"), &r.get::<String, _>("title"), params).await?;
     Ok(true)
@@ -529,8 +534,8 @@ pub async fn video_from(m: &Memex, job: &crate::extract::Done<'_>, v: &Value) ->
             .execute(&m.store.pool)
             .await?;
     }
+    // (Its call was counted when it was asked for.)
     if let (Some(task), Some(audio), true) = (m.tasks().transcription, job.files.get("a.m4a"), v["sound"].as_bool() == Some(true)) {
-        crate::understand::count_call(m).await?;
         let transcript = transcribe(m, &task, audio).await?;
         if !transcript.trim().is_empty() {
             let (title, body): (String, String) =
