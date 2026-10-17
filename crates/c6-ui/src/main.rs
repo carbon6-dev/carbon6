@@ -204,7 +204,10 @@ fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
 /// its lists. Remembered in this browser.
 #[component]
 fn RealmSwitch() -> impl IntoView {
-    let realms = LocalResource::new(api::realms);
+    let realms = LocalResource::new(move || {
+        api::realms_changed().track();
+        api::realms()
+    });
     let current = api::realm();
     view! {
         {move || realms.get().and_then(Result::ok).filter(|rs| rs.iter().filter(|r| r.id != "root").count() > 1).map(|rs| view! {

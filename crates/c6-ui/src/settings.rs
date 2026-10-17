@@ -267,6 +267,7 @@ fn Realms() -> impl IntoView {
     let tick = RwSignal::new(0u32);
     let realms = LocalResource::new(move || {
         tick.track();
+        crate::api::realms_changed().track();
         crate::api::realms()
     });
     let connections = LocalResource::new(move || {

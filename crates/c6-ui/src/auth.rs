@@ -355,7 +355,10 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
 #[component]
 fn ApiTokens() -> impl IntoView {
     let tokens = LocalResource::new(api::api_tokens);
-    let realms = LocalResource::new(api::realms);
+    let realms = LocalResource::new(move || {
+        api::realms_changed().track();
+        api::realms()
+    });
     let name = RwSignal::new(String::new());
     // Empty: every realm (and administration).
     let realm = RwSignal::new(String::new());

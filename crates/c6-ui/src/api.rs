@@ -128,26 +128,51 @@ pub fn realm() -> RwSignal<String> {
     REALM.with(|r| r.1)
 }
 
+thread_local! {
+    /// Bumped when realms are made, renamed or removed (here, or by an app
+    /// you approve), so every list of them reloads.
+    static REALMS_CHANGED: (Owner, RwSignal<u32>) = {
+        let owner = Owner::new_root(None);
+        let signal = owner.with(|| RwSignal::new(0));
+        (owner, signal)
+    };
+}
+
+pub fn realms_changed() -> RwSignal<u32> {
+    REALMS_CHANGED.with(|r| r.1)
+}
+
+fn bump_realms() {
+    realms_changed().update(|n| *n += 1);
+}
+
 /// `?realm=…` for the realm you are looking at, or "".
 fn in_realm(sep: char) -> String {
     let r = realm().get_untracked();
     if r.is_empty() { String::new() } else { format!("{sep}realm={}", enc(&r)) }
 }
 
+/// The realms (it reloads when they change: track `realms_changed`).
 pub async fn realms() -> Result<Vec<c6_api::Realm>, String> {
     json(Request::get("/api/v1/realms").send().await).await
 }
 
 pub async fn create_realm(r: c6_api::RealmIn) -> Result<c6_api::Realm, String> {
-    send_json(Request::post("/api/v1/realms"), &r).await
+    let made = send_json(Request::post("/api/v1/realms"), &r).await;
+    bump_realms();
+    made
 }
 
 pub async fn update_realm(id: String, r: c6_api::RealmIn) -> Result<c6_api::Realm, String> {
-    send_json(Request::patch(&format!("/api/v1/realms/{}", enc(&id))), &r).await
+    let done = send_json(Request::patch(&format!("/api/v1/realms/{}", enc(&id))), &r).await;
+    bump_realms();
+    done
 }
 
 pub async fn delete_realm(id: String) -> Result<(), String> {
-    empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await
+    let done = empty(Request::delete(&format!("/api/v1/realms/{}", enc(&id))).send().await).await;
+    bump_realms();
+    done
 }
 
 // --- The realm explorer (docs/explorer.md) -----------------------------------
@@ -918,7 +943,10 @@ pub async fn edit_decision(id: i64, body: serde_json::Value) -> Result<c6_api::D
 }
 
 pub async fn answer_decision(id: i64, a: c6_api::DecisionAnswer) -> Result<c6_api::Decision, String> {
-    send_json(Request::post(&format!("/api/v1/decisions/{id}/answer")), &a).await
+    let d = send_json(Request::post(&format!("/api/v1/decisions/{id}/answer")), &a).await;
+    // An app you approve may have made a realm of its own.
+    bump_realms();
+    d
 }
 
 pub async fn decision_session(id: i64) -> Result<c6_api::Session, String> {
