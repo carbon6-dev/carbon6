@@ -841,6 +841,20 @@ impl Memex {
             m if m.starts_with("memex.mail.") || m.starts_with("memex.calendar.") || m.starts_with("memex.contacts.") => {
                 self.google_method(m, params, &allowed).await
             }
+            // Which of the mail, calendar and contacts stores this realm
+            // uses: an app feeds it, or it holds something (imported mail).
+            "memex.feeds" => {
+                let fed = |f: &str| self.accounts().iter().any(|a| a.feeds.iter().any(|x| x == f));
+                let has = |sql: &'static str| {
+                    let pool = self.store.pool.clone();
+                    async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool).await.unwrap_or(0) > 0 }
+                };
+                Ok(json!({
+                    "mail": fed("mail") || has("SELECT EXISTS (SELECT 1 FROM mail)").await,
+                    "calendar": fed("calendar") || has("SELECT EXISTS (SELECT 1 FROM events)").await,
+                    "contacts": fed("contacts") || has("SELECT EXISTS (SELECT 1 FROM contacts)").await,
+                }))
+            }
             // Where the memex's own Google sync was, for moving it to apps.
             "memex.legacy_sync" => Ok(json!(people::legacy_states(&self.store).await?)),
             "memex.move_google" => people::move_to_apps(self, &params["accounts"]).await.map(|n| json!({"moved": n})),

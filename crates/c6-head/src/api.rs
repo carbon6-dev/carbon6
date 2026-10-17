@@ -1063,11 +1063,28 @@ async fn all_templates(State(st): State<Arc<HeadState>>, Extension(caller): Exte
     Ok(Json(crate::templates::all(&st, &caller).await?))
 }
 
-async fn list_secrets(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::SecretInfo>>> {
-    Ok(Json(st.store.secrets(None).await?))
+/// Secrets: a realm's own and root's it has none of (`?realm=`), or every
+/// realm's.
+async fn list_secrets(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::SecretInfo>>> {
+    Ok(Json(match r.realm.as_deref().filter(|x| !x.trim().is_empty()) {
+        Some(_) => st.store.secrets_for(&realm_for(&st, &caller, &r).await?).await?,
+        None => st.store.secrets(None).await?,
+    }))
 }
 
-async fn put_secret(State(st): State<Arc<HeadState>>, Path(name): Path<String>, Json(req): Json<api::PutSecret>) -> ApiResult<StatusCode> {
+/// A secret of a realm (`?realm=`, default home).
+async fn put_secret(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Path(name): Path<String>,
+    Json(req): Json<api::PutSecret>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
     if !api::valid_secret_name(&name) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "a secret's name is an environment variable name: A-Z, 0-9 and _".into()));
     }
@@ -1076,14 +1093,20 @@ async fn put_secret(State(st): State<Arc<HeadState>>, Path(name): Path<String>, 
         Some(v) => Some(st.secrets.encrypt(v)?),
         None => None,
     };
-    if !st.store.put_secret(&name, value, req.description.trim(), &applies_to).await? {
+    if !st.store.put_secret(&realm, &name, value, req.description.trim(), &applies_to).await? {
         return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{name} is new: give it a value")));
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_secret(State(st): State<Arc<HeadState>>, Path(name): Path<String>) -> ApiResult<StatusCode> {
-    if !st.store.delete_secret(&name).await? {
+async fn delete_secret(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    if !st.store.delete_secret(&realm, &name).await? {
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such secret".into()));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1541,6 +1564,7 @@ async fn memex_rpc(
             r.method.as_str(),
             "memex.google"
                 | "memex.google_sync"
+                | "memex.feeds"
                 | "memex.commitments"
                 | "memex.commitment"
                 | "memex.review"

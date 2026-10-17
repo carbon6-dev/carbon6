@@ -134,6 +134,11 @@ fn Main() -> impl IntoView {
 #[component]
 fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
     let menu = NodeRef::<leptos::html::Details>::new();
+    // Mail, Calendar and Contacts are apps: shown where one is installed.
+    let feeds = LocalResource::new(move || {
+        api::realm().track();
+        api::rpc("memex.feeds", serde_json::json!({}))
+    });
     // Close after choosing something.
     let close = move |_| {
         if let Some(d) = menu.get_untracked() {
@@ -157,9 +162,12 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
                     <Go to=View::Realms class=MENU>"Realms"</Go>
                     <views::ViewsMenu class=MENU />
-                    <Go to=View::Mail class=MENU>"Mail"</Go>
-                    <Go to=View::Calendar class=MENU>"Calendar"</Go>
-                    <Go to=View::Contacts class=MENU>"Contacts"</Go>
+                    // Only what an app feeds in this realm (or it holds).
+                    {move || feeds.get().and_then(Result::ok).map(|f| view! {
+                        {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=MENU>"Mail"</Go> })}
+                        {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=MENU>"Calendar"</Go> })}
+                        {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=MENU>"Contacts"</Go> })}
+                    })}
                     <Go to=View::Photos class=MENU>"Photos"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>

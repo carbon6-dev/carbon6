@@ -456,6 +456,7 @@ Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is 
 - **The agent never sees a value.** The system prompt lists only names and descriptions, and a value that appears in command output is replaced by `[secret:NAME]` before the model or the UI sees it.
 - **Storage.** Values are encrypted on the head and can only be replaced, never read back.
 - **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. A secret scoped to a `worker:` label is only handed to that worker.
+- **Per realm.** A secret belongs to a realm, and the same name can hold a different value in each (work's `GITHUB_TOKEN` and home's). A session gets its realm's, else root's: root's secrets are every realm's that has none of its own by that name. The page follows the realm picked in the header.
 
 ### Background tasks
 

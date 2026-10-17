@@ -105,6 +105,38 @@ async fn secrets_reach_commands_but_not_the_model() {
     let evs: Value = http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap();
     assert!(evs.to_string().contains("MCP server needy not started: it needs the secret MISSING_TOKEN"), "{evs}");
 
+    // Each realm its own: work's DEPLOY_KEY is not home's, and root's are
+    // every realm's that has none of its own by that name.
+    assert!(http.post(format!("{api}/realms")).json(&json!({"id": "work"})).send().await.unwrap().status().is_success());
+    let put_in = |realm: &str, name: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/settings/secrets/{name}?realm={realm}"));
+        async move { http.put(url).json(&body).send().await.unwrap().status() }
+    };
+    assert!(put_in("work", "DEPLOY_KEY", json!({"value": "dk-work-0000", "description": "Work deploys"})).await.is_success());
+    assert!(put_in("root", "SHARED_TOKEN", json!({"value": "shared-1", "description": "Everyone's"})).await.is_success());
+    let work: Vec<c6_api::SecretInfo> = http.get(format!("{api}/settings/secrets?realm=work")).send().await.unwrap().json().await.unwrap();
+    let names: Vec<(&str, &str)> = work.iter().map(|s| (s.name.as_str(), s.realm.as_str())).collect();
+    assert_eq!(names, [("DEPLOY_KEY", "work"), ("SHARED_TOKEN", "root")], "its own, and root's");
+    mock.push(Reply::ToolCalls(vec![(
+        "bash".into(),
+        r#"{"command":"test ${#DEPLOY_KEY} -eq 12 && echo work-key; echo shared=${SHARED_TOKEN:+yes}"}"#.into(),
+    )]));
+    mock.push(Reply::Text("done".into()));
+    let before = mock.requests().len();
+    http.post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": wid, "cwd": p.display().to_string(), "connection_id": conn.id, "model": "m", "prompt": "deploy", "realm": "work"}))
+        .send()
+        .await
+        .unwrap();
+    eventually("the work session's turn", async || (mock.requests().len() == before + 2).then_some(())).await;
+    let reqs = mock.requests();
+    let out = reqs[before + 1]["messages"].to_string();
+    assert!(out.contains("work-key") && out.contains("shared=yes"), "{out}");
+    assert!(reqs[before]["messages"][0]["content"].as_str().unwrap().contains("- DEPLOY_KEY: Work deploys"));
+    // Home's is still home's.
+    let home: Vec<c6_api::SecretInfo> = http.get(format!("{api}/settings/secrets?realm=home")).send().await.unwrap().json().await.unwrap();
+    assert!(home.iter().any(|s| s.name == "DEPLOY_KEY" && s.realm == "home" && s.description.starts_with("Deploys to staging")));
+
     stop.cancel();
     head.shutdown().await.unwrap();
 }

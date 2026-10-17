@@ -60,6 +60,14 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
     checks: &[
         c6_core::upgrade::Check {
+            version: 45,
+            name: "every secret keeps its name and value",
+            before: "SELECT count(*) || ':' || coalesce(group_concat(name || '=' || hex(value), '|'), '') \
+                     FROM (SELECT * FROM before.secrets ORDER BY name)",
+            after: "SELECT count(*) || ':' || coalesce(group_concat(name || '=' || hex(value), '|'), '') \
+                    FROM (SELECT * FROM secrets ORDER BY name)",
+        },
+        c6_core::upgrade::Check {
             version: 42,
             name: "every install keeps its id, package, version, realm and state, named after its package",
             before: "SELECT count(*) || ':' || coalesce(group_concat(id || '=' || package || '@' || version || ' in ' || realm || ' ' || state, '|'), '') \
@@ -567,12 +575,13 @@ impl Store {
 
     /// Secrets (names and descriptions), of one realm or (`None`) all.
     pub async fn secrets(&self, realm: Option<&str>) -> anyhow::Result<Vec<c6_api::SecretInfo>> {
-        let rows =
-            sqlx::query("SELECT name, description, applies_to, updated_at FROM secrets WHERE (? IS NULL OR realm = ?) ORDER BY name")
-                .bind(realm)
-                .bind(realm)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT realm, name, description, applies_to, updated_at FROM secrets WHERE (? IS NULL OR realm = ?) ORDER BY name, realm",
+        )
+        .bind(realm)
+        .bind(realm)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .iter()
             .map(|r| c6_api::SecretInfo {
@@ -580,27 +589,58 @@ impl Store {
                 description: r.get("description"),
                 applies_to: serde_json::from_str(&r.get::<String, _>("applies_to")).unwrap_or_default(),
                 updated_at: r.get("updated_at"),
+                realm: r.get("realm"),
             })
             .collect())
     }
 
-    /// (encrypted value, applies_to, realm) of a secret.
-    pub async fn secret(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Vec<String>, String)>> {
-        let row = sqlx::query("SELECT value, applies_to, realm FROM secrets WHERE name = ?").bind(name).fetch_optional(&self.pool).await?;
+    /// The secrets a realm's sessions have: its own, and root's it doesn't
+    /// have under the same name.
+    pub async fn secrets_for(&self, realm: &str) -> anyhow::Result<Vec<c6_api::SecretInfo>> {
+        let mut own = self.secrets(Some(realm)).await?;
+        if realm != crate::realms::ROOT {
+            for s in self.secrets(Some(crate::realms::ROOT)).await? {
+                if !own.iter().any(|o| o.name == s.name) {
+                    own.push(s);
+                }
+            }
+            own.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        Ok(own)
+    }
+
+    /// (encrypted value, applies_to, realm) of a secret a realm has: its
+    /// own, else root's.
+    pub async fn secret(&self, realm: &str, name: &str) -> anyhow::Result<Option<(Vec<u8>, Vec<String>, String)>> {
+        let row = sqlx::query(
+            "SELECT value, applies_to, realm FROM secrets WHERE name = ? AND realm IN (?, 'root') ORDER BY realm = 'root' LIMIT 1",
+        )
+        .bind(name)
+        .bind(realm)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|r| (r.get("value"), serde_json::from_str(&r.get::<String, _>("applies_to")).unwrap_or_default(), r.get("realm"))))
     }
 
-    /// Creates or updates a secret; `value: None` keeps the current value
-    /// (and fails for a new secret).
-    pub async fn put_secret(&self, name: &str, value: Option<Vec<u8>>, description: &str, applies_to: &[String]) -> anyhow::Result<bool> {
+    /// Creates or updates a realm's secret; `value: None` keeps the current
+    /// value (and fails for a new secret).
+    pub async fn put_secret(
+        &self,
+        realm: &str,
+        name: &str,
+        value: Option<Vec<u8>>,
+        description: &str,
+        applies_to: &[String],
+    ) -> anyhow::Result<bool> {
         let now = c6_core::now_ms();
         let labels = serde_json::to_string(applies_to)?;
         let done = match value {
             Some(v) => sqlx::query(
-                "INSERT INTO secrets (name, value, description, applies_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT(name) DO UPDATE SET value = excluded.value, description = excluded.description, \
+                "INSERT INTO secrets (realm, name, value, description, applies_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(realm, name) DO UPDATE SET value = excluded.value, description = excluded.description, \
                  applies_to = excluded.applies_to, updated_at = excluded.updated_at",
             )
+            .bind(realm)
             .bind(name)
             .bind(v)
             .bind(description)
@@ -610,10 +650,11 @@ impl Store {
             .execute(&self.pool)
             .await?
             .rows_affected(),
-            None => sqlx::query("UPDATE secrets SET description = ?, applies_to = ?, updated_at = ? WHERE name = ?")
+            None => sqlx::query("UPDATE secrets SET description = ?, applies_to = ?, updated_at = ? WHERE realm = ? AND name = ?")
                 .bind(description)
                 .bind(&labels)
                 .bind(now)
+                .bind(realm)
                 .bind(name)
                 .execute(&self.pool)
                 .await?
@@ -622,13 +663,25 @@ impl Store {
         Ok(done > 0)
     }
 
-    pub async fn set_secret_realm(&self, name: &str, realm: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE secrets SET realm = ? WHERE name = ?").bind(realm).bind(name).execute(&self.pool).await?;
+    /// Moves a secret to another realm, unless that realm has one already.
+    pub async fn move_secret(&self, name: &str, from: &str, to: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE OR IGNORE secrets SET realm = ? WHERE realm = ? AND name = ?")
+            .bind(to)
+            .bind(from)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub async fn delete_secret(&self, name: &str) -> anyhow::Result<bool> {
-        Ok(sqlx::query("DELETE FROM secrets WHERE name = ?").bind(name).execute(&self.pool).await?.rows_affected() > 0)
+    pub async fn delete_secret(&self, realm: &str, name: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("DELETE FROM secrets WHERE realm = ? AND name = ?")
+            .bind(realm)
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
     }
 
     pub async fn set_session_labels(&self, id: &str, labels: &[String]) -> anyhow::Result<bool> {

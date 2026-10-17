@@ -186,7 +186,7 @@ async fn secret(st: &HeadState, name: &str) -> anyhow::Result<Option<String>> {
     if name.is_empty() {
         return Ok(None);
     }
-    let (blob, _, _) = st.store.secret(name).await?.ok_or_else(|| anyhow::anyhow!("no secret named {name}"))?;
+    let (blob, _, _) = st.store.secret(crate::realms::HOME, name).await?.ok_or_else(|| anyhow::anyhow!("no secret named {name}"))?;
     Ok(Some(st.secrets.decrypt(&blob)?))
 }
 

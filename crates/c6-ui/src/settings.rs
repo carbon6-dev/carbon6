@@ -2367,7 +2367,10 @@ fn ListItem(
 /// Values are write-only.
 #[component]
 fn SecretsSetting() -> impl IntoView {
-    let list = LocalResource::new(api::secrets);
+    let list = LocalResource::new(move || {
+        api::realm().track();
+        api::secrets()
+    });
     let name = RwSignal::new(String::new());
     let value = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
@@ -2407,16 +2410,32 @@ fn SecretsSetting() -> impl IntoView {
                 <p class="text-sm text-zinc-500">
                     "API keys, tokens and passwords for the agent's shell commands. Each is an environment variable (e.g. $GITHUB_TOKEN) in the sessions it applies to. The agent sees only its name and description: the value is never shown to it, is replaced by [secret:NAME] in command output, and stays encrypted on the head. Values can't be read back here, only replaced."
                 </p>
+                <p class="text-sm text-zinc-500">{move || {
+                    let r = api::realm().get();
+                    if r.is_empty() {
+                        "Every realm's secrets. Pick a realm in the header to set one there (new ones here go to home); root's are every realm's that has none of its own by that name.".to_owned()
+                    } else {
+                        format!("Realm {r}'s secrets, and root's it uses. Setting one here sets {r}'s own (the same name can hold another value in each realm).")
+                    }
+                }}</p>
             </div>
             <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No secrets."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|s| {
-                        let (edit, del) = (s.clone(), s.name.clone());
+                        let (edit, del, del_realm) = (s.clone(), s.name.clone(), s.realm.clone());
+                        let looking = api::realm().get_untracked();
+                        let inherited = !looking.is_empty() && s.realm != looking;
+                        let whose = if looking.is_empty() || inherited { s.realm.clone() } else { String::new() };
                         view! {
                             <div class="flex flex-wrap items-center gap-2 py-2 text-sm">
                                 <span class="font-mono">{format!("${}", s.name)}</span>
+                                {(!whose.is_empty()).then(|| view! {
+                                    <span class="rounded bg-zinc-100 px-1.5 text-xs text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
+                                        {if inherited { format!("from {whose}") } else { whose.clone() }}
+                                    </span>
+                                })}
                                 <span class="min-w-0 flex-1 truncate text-zinc-500">{s.description.clone()}</span>
                                 {s.applies_to.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
@@ -2426,15 +2445,15 @@ fn SecretsSetting() -> impl IntoView {
                                     value.set(String::new());
                                     editing.set(true);
                                 }>"Edit"</button>
-                                <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
-                                    let n = del.clone();
+                                {(!inherited).then(|| view! { <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
+                                    let (n, r) = (del.clone(), del_realm.clone());
                                     spawn_local(async move {
-                                        match api::delete_secret(n).await {
+                                        match api::delete_secret(n, r).await {
                                             Ok(()) => list.refetch(),
                                             Err(e) => status.set(Some(Err(e))),
                                         }
                                     });
-                                }>"Delete"</button>
+                                }>"Delete"</button> })}
                             </div>
                         }
                     }).collect_view().into_any(),

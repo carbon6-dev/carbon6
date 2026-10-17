@@ -2293,6 +2293,10 @@ pub struct SecretInfo {
     pub applies_to: Vec<String>,
     #[serde(default)]
     pub updated_at: UnixMs,
+    /// The realm it is in (root's are every realm's that has none of its
+    /// own by that name).
+    #[serde(default)]
+    pub realm: String,
 }
 
 /// `PUT /api/v1/settings/secrets/{name}`: create or update a secret. A

@@ -45,7 +45,8 @@ pub fn packages() -> Vec<(Value, BTreeMap<String, Vec<u8>>)> {
     ]
 }
 
-async fn register(st: &HeadState) -> anyhow::Result<()> {
+/// Lists the packages in the registry (installing is yours to do).
+pub async fn register(st: &HeadState) -> anyhow::Result<()> {
     for (manifest, files) in packages() {
         crate::packages::add(st, manifest, files, "system").await?;
     }
@@ -97,10 +98,9 @@ pub async fn get_client(st: &HeadState, realm: &str) -> anyhow::Result<api::Goog
 pub async fn set_client(st: &HeadState, c: &api::GoogleClientIn) -> anyhow::Result<()> {
     let root = crate::realms::ROOT;
     crate::secrets::put_in(st, root, CLIENT_ID, c.client_id.trim(), "Your Google OAuth client's id (Gmail, Calendar, Contacts)").await?;
-    match c.client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => crate::secrets::put_in(st, root, CLIENT_SECRET, s, "Your Google OAuth client's secret").await?,
-        // Kept, and every realm's.
-        None => st.store.set_secret_realm(CLIENT_SECRET, root).await?,
+    // No secret given: the one kept stays.
+    if let Some(s) = c.client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        crate::secrets::put_in(st, root, CLIENT_SECRET, s, "Your Google OAuth client's secret").await?;
     }
     Ok(())
 }
@@ -214,11 +214,13 @@ pub async fn sync_now(st: &std::sync::Arc<HeadState>, realm: &str) -> anyhow::Re
 /// contacts already here, with where each sync was, become the apps' (so
 /// nothing is fetched again).
 pub async fn move_in(st: &HeadState) -> anyhow::Result<()> {
-    // Your OAuth client set in 0.3.1 was home's: it is every realm's.
-    for name in [CLIENT_ID, CLIENT_SECRET] {
-        if st.store.secret(name).await?.is_some_and(|(_, _, r)| r == crate::realms::HOME) {
-            st.store.set_secret_realm(name, crate::realms::ROOT).await?;
+    // Your OAuth client set in 0.3.1 was home's: it is every realm's (once;
+    // one you give home itself later stays home's).
+    if st.store.setting("google_client_rooted").await?.is_none() {
+        for name in [CLIENT_ID, CLIENT_SECRET] {
+            st.store.move_secret(name, crate::realms::HOME, crate::realms::ROOT).await?;
         }
+        st.store.set_setting("google_client_rooted", "1").await?;
     }
     if st.store.setting("google_moved").await?.is_some() {
         return Ok(());

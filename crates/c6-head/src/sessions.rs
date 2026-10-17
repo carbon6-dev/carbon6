@@ -375,8 +375,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         skills_json: st.store.setting_in(SKILLS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting_in(HOOKS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         agents_json: st.store.setting_in(AGENTS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
-        // Only its realm's secrets.
-        secrets_json: serde_json::to_string(&st.store.secrets(Some(&row.realm)).await?)?,
+        // Its realm's secrets, and root's it has none of.
+        secrets_json: serde_json::to_string(&st.store.secrets_for(&row.realm).await?)?,
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
@@ -1241,14 +1241,11 @@ async fn secret_credential(
         },
         None => (name, crate::realms::HOME.to_owned()),
     };
-    let (blob, applies_to) = match st.store.secret(name).await {
-        Ok(Some((blob, applies_to, secret_realm))) if secret_realm == realm => (blob, applies_to),
-        Ok(Some(_)) => {
-            grant.error = format!("no secret named {name} in realm {realm}");
-            return grant;
-        }
+    // The session's realm's, else root's.
+    let (blob, applies_to) = match st.store.secret(&realm, name).await {
+        Ok(Some((blob, applies_to, _))) => (blob, applies_to),
         Ok(None) => {
-            grant.error = format!("no secret named {name}");
+            grant.error = format!("no secret named {name} in realm {realm} (or root)");
             return grant;
         }
         Err(e) => {

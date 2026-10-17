@@ -241,6 +241,10 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     if let Err(e) = apps::adopt(&state).await {
         tracing::warn!("adopting apps installed before instances: {e:#}");
     }
+    // Gmail, Calendar and Contacts are packages you can install in a realm.
+    if let Err(e) = google::register(&state).await {
+        tracing::warn!("listing the Google apps' packages: {e:#}");
+    }
     // Gmail, Calendar and Contacts the memex synced itself become apps.
     if let Err(e) = google::move_in(&state).await {
         tracing::warn!("moving Gmail, Calendar and Contacts into their apps: {e:#}");

@@ -564,7 +564,7 @@ pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::
 /// has its own); the rest is home's unless a realm's token says otherwise.
 pub async fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let area = method.split('.').nth(1).unwrap_or_default();
-    let per_realm = matches!(area, "mail" | "calendar" | "contacts" | "google" | "google_sync");
+    let per_realm = matches!(area, "mail" | "calendar" | "contacts" | "google" | "google_sync" | "feeds");
     let url = format!("/api/v1/memex/rpc{}", if per_realm { in_realm('?') } else { String::new() });
     send_json(Request::post(&url), &serde_json::json!({"method": method, "params": params})).await
 }
@@ -798,16 +798,20 @@ pub async fn stop_task(id: String, task: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/tasks/{task}/stop")).send().await).await
 }
 
+/// The realm you look at's secrets (its own and root's), or every realm's.
 pub async fn secrets() -> Result<Vec<c6_api::SecretInfo>, String> {
-    json(Request::get("/api/v1/settings/secrets").send().await).await
+    json(Request::get(&format!("/api/v1/settings/secrets{}", in_realm('?'))).send().await).await
 }
 
+/// Sets a secret in the realm you look at (home for "All realms").
 pub async fn put_secret(name: String, req: c6_api::PutSecret) -> Result<(), String> {
-    empty(Request::put(&format!("/api/v1/settings/secrets/{name}")).json(&req).map_err(|e| e.to_string())?.send().await).await
+    empty(Request::put(&format!("/api/v1/settings/secrets/{name}{}", in_realm('?'))).json(&req).map_err(|e| e.to_string())?.send().await)
+        .await
 }
 
-pub async fn delete_secret(name: String) -> Result<(), String> {
-    empty(Request::delete(&format!("/api/v1/settings/secrets/{name}")).send().await).await
+pub async fn delete_secret(name: String, realm: String) -> Result<(), String> {
+    let q = if realm.is_empty() { String::new() } else { format!("?realm={}", enc(&realm)) };
+    empty(Request::delete(&format!("/api/v1/settings/secrets/{name}{q}")).send().await).await
 }
 
 pub async fn templates() -> Result<Vec<c6_api::Template>, String> {

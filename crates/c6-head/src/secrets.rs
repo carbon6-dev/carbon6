@@ -57,16 +57,16 @@ fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 /// realm's, as its settings are): for a kit job's environment, an app's
 /// OAuth client.
 pub async fn value_in(st: &crate::HeadState, realm: &str, name: &str) -> anyhow::Result<Option<String>> {
-    match st.store.secret(name).await? {
-        Some((blob, _, r)) if r == realm || r == crate::realms::ROOT => Ok(Some(st.secrets.decrypt(&blob)?)),
-        _ => Ok(None),
+    match st.store.secret(realm, name).await? {
+        Some((blob, _, _)) => Ok(Some(st.secrets.decrypt(&blob)?)),
+        None => Ok(None),
     }
 }
 
 /// Puts a secret in a realm (creating or replacing it).
 pub async fn put_in(st: &crate::HeadState, realm: &str, name: &str, value: &str, description: &str) -> anyhow::Result<()> {
-    st.store.put_secret(name, Some(st.secrets.encrypt(value)?), description, &[]).await?;
-    st.store.set_secret_realm(name, realm).await
+    st.store.put_secret(realm, name, Some(st.secrets.encrypt(value)?), description, &[]).await?;
+    Ok(())
 }
 
 #[cfg(test)]
