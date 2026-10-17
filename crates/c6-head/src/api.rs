@@ -1444,8 +1444,14 @@ async fn memex_note(
     Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), "memex.note", params).await?))
 }
 
-async fn get_google_client(State(st): State<Arc<HeadState>>, headers: HeaderMap) -> ApiResult<Json<api::GoogleClient>> {
-    let mut c = crate::google::get_client(&st).await?;
+async fn get_google_client(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    headers: HeaderMap,
+) -> ApiResult<Json<api::GoogleClient>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    let mut c = crate::google::get_client(&st, &realm).await?;
     c.redirect_uri =
         crate::google::redirect_uri(&st, headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).or(origin_of(&headers).as_deref()))
             .await;
@@ -1467,22 +1473,44 @@ async fn put_google_client(State(st): State<Arc<HeadState>>, Json(c): Json<api::
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn google_connect(State(st): State<Arc<HeadState>>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
+async fn google_connect(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &r).await?;
     let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
-    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, origin.as_deref()).await?})))
+    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, origin.as_deref()).await?})))
 }
 
-/// Asks you to install the Gmail, Calendar and Contacts apps.
-async fn google_install(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Install>>> {
-    Ok(Json(crate::google::install(&st).await?))
+/// Asks you to install the Gmail, Calendar and Contacts apps in a realm.
+async fn google_install(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::Install>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::google::install(&st, &realm).await?))
 }
 
-async fn google_accounts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::GoogleAccount>>> {
-    Ok(Json(crate::google::accounts(&st).await?))
+async fn google_accounts(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::GoogleAccount>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::google::accounts(&st, &realm).await?))
 }
 
-async fn google_remove(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    crate::google::remove(&st, &id).await?;
+async fn google_remove(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::google::remove(&st, &realm, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1499,8 +1527,14 @@ struct RpcIn {
 async fn memex_rpc(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
+    Query(asked): Query<api::InRealm>,
     Json(r): Json<RpcIn>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // The realm you look at (a realm's token: its own); home by default.
+    let realm = match &asked.realm {
+        Some(x) if !x.trim().is_empty() => realm_for(&st, &caller, &asked).await?,
+        _ => caller.memex_realm().to_owned(),
+    };
     let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge."].iter().any(|p| r.method.starts_with(p))
         || r.method.starts_with("memex.media.")
         || matches!(
@@ -1534,9 +1568,9 @@ async fn memex_rpc(
     }
     // The mail client's accounts and syncs are the Google apps'.
     match r.method.as_str() {
-        "memex.google" => return Ok(Json(crate::google::status(&st).await?)),
+        "memex.google" => return Ok(Json(crate::google::status(&st, &realm).await?)),
         "memex.google_sync" => {
-            crate::google::sync_now(&st).await?;
+            crate::google::sync_now(&st, &realm).await?;
             return Ok(Json(serde_json::json!({})));
         }
         _ => {}
@@ -1549,9 +1583,9 @@ async fn memex_rpc(
     }
     // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
     if r.method == "memex.graph" {
-        params["policies"] = serde_json::json!(crate::claims::policies(&st, caller.memex_realm()).await);
+        params["policies"] = serde_json::json!(crate::claims::policies(&st, &realm).await);
     }
-    Ok(Json(crate::memex::call_in(&st, caller.memex_realm(), &r.method, params).await?))
+    Ok(Json(crate::memex::call_in(&st, &realm, &r.method, params).await?))
 }
 
 #[derive(serde::Deserialize)]
@@ -1559,6 +1593,8 @@ struct AttachmentQuery {
     item: String,
     #[serde(default)]
     index: u32,
+    #[serde(default)]
+    realm: Option<String>,
 }
 
 /// A mail attachment, served like an output (nosniff; sandboxed when it
@@ -1569,9 +1605,11 @@ async fn mail_attachment(
     Query(q): Query<AttachmentQuery>,
 ) -> ApiResult<Response> {
     use base64::Engine;
-    let v =
-        crate::memex::call_in(&st, caller.memex_realm(), "memex.mail.attachment", serde_json::json!({"item_id": q.item, "index": q.index}))
-            .await?;
+    let realm = match &q.realm {
+        Some(r) if !r.trim().is_empty() => realm_for(&st, &caller, &api::InRealm { realm: q.realm.clone() }).await?,
+        _ => caller.memex_realm().to_owned(),
+    };
+    let v = crate::memex::call_in(&st, &realm, "memex.mail.attachment", serde_json::json!({"item_id": q.item, "index": q.index})).await?;
     let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(anyhow::Error::from)?;
     let name = v["name"].as_str().unwrap_or("attachment").replace(['"', '\\', '\n', '\r'], "_");
     let mime = v["mime"].as_str().unwrap_or("application/octet-stream").to_owned();

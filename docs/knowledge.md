@@ -289,3 +289,11 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - The image builds, and reaches Google over TLS.
 - **Not done:** understanding (summaries, links, facts, the review queue) still runs in the knowledge store. Making it system packages that write claims, with the review queue as decisions, is the rest of step 6.
 
+### 13.7 Mail, calendar and contacts per realm
+
+- **Each realm can have its own Google apps.** The design's personal Gmail in home and a business's Workspace account in its realm now work: `gmail`, `google-calendar` and `google-contacts` install in any realm. Each realm's apps have their own accounts, syncs, and mail, events and contacts, kept in that realm's knowledge.
+- **The OAuth client is every realm's:** it is kept as root's secrets `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Realms now read root's secrets, as they inherit root's settings. Setting the client moves secrets kept in home before into root.
+- **The knowledge store** gets each realm's accounts from the head's config (`accounts: {realm: [...]}`). Every realm sends its own mail on time. Mail, calendar and contacts methods are no longer home's only; photos and folders still are.
+- **The API and UI:** the `/api/v1/google/*` routes, and the mail, calendar and contacts methods of `/api/v1/memex/rpc` and the attachment route, take `?realm=`. A realm's token stays in its realm. The Mail, Calendar and Contacts pages and Settings → Mail & calendar follow the realm picked in the header ("All realms" is home).
+- **Tested:** the Google test installs the apps in a second realm, connects its own account, syncs it, sees only its own mail there with home's untouched, and archives through that realm's app.
+

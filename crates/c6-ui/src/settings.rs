@@ -232,7 +232,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         examples=scope_examples
                     />
                     }.into_any(),
-                    "mail" => view! { <crate::mail::GoogleSettings /> }.into_any(),
+                    "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> } }).into_any(),
                     "system" => view! { <Realms /> <Apps /> <Grants /> <Upgrades /> }.into_any(),
                     "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {

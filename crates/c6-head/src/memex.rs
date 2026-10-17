@@ -282,7 +282,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
     Ok(json!({
         "embedding": embedding,
         "folders": folders,
-        "accounts": crate::providers::feeding(st, crate::realms::HOME).await.unwrap_or_default(),
+        "accounts": accounts_by_realm(st).await,
         "contacts_auto": s.contacts_auto.unwrap_or(false),
         "understanding": task(&s.understanding),
         "prompts": crate::prompts::for_memex(st).await,
@@ -293,6 +293,22 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "face_detector": s.face_detector,
         "face_embedder": s.face_embedder,
     }))
+}
+
+/// Each realm's accounts that apps connected for mail, calendars and
+/// contacts (docs/knowledge.md §6): {realm: [...]}.
+async fn accounts_by_realm(st: &HeadState) -> Value {
+    let mut out = serde_json::Map::new();
+    let realms: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT realm FROM oauth_accounts").fetch_all(&st.store.pool).await.unwrap_or_default();
+    for r in realms {
+        if let Ok(Value::Array(a)) = crate::providers::feeding(st, &r).await
+            && !a.is_empty()
+        {
+            out.insert(r, Value::Array(a));
+        }
+    }
+    Value::Object(out)
 }
 
 /// The kinds a session with `labels` may see.

@@ -99,8 +99,10 @@ async fn realms_have_their_own_knowledge() {
 
     // Its own database, under home's.
     assert!(dir.join("realms/lab/memex.db").exists());
-    // Mail and the like are home's.
-    let refused = call("lab", "memex.mail.threads", json!({})).await.unwrap_err();
+    // Photos and folders are home's (mail, calendars and contacts are each
+    // realm's own).
+    let refused = call("lab", "memex.media.list", json!({})).await.unwrap_err();
+    assert!(call("lab", "memex.mail.threads", json!({})).await.is_ok());
     assert!(format!("{refused:#}").contains("home's"), "{refused:#}");
     // A token for lab reaches lab's knowledge through the API.
     let tok: Value =

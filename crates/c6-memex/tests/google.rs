@@ -599,6 +599,59 @@ async fn google_mail_calendar_contacts() {
     let t6 = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
     assert!(t6.as_array().unwrap().iter().any(|t| t["thread_id"] == "t6" && t["account"] != "import:mbox:archive"), "{t6}");
 
+    // Another realm (a business's): its own Gmail apps, account and mail,
+    // apart from home's; your OAuth client is every realm's.
+    let home_threads = rpc("memex.mail.threads", json!({"view": "all"})).await.as_array().unwrap().len();
+    assert!(http.post(format!("{api}/realms")).json(&json!({"id": "work"})).send().await.unwrap().status().is_success());
+    let installs: Vec<c6_api::Install> = http.post(format!("{api}/google/install?realm=work")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(installs.len(), 3, "the work realm gets its own apps");
+    for i in &installs {
+        let r =
+            http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    }
+    let c: Value = http.get(format!("{api}/google/client?realm=work")).send().await.unwrap().json().await.unwrap();
+    assert!(c["client_id"] == "cid" && c["has_secret"] == true && c["apps"].as_array().unwrap().len() == 3, "{c}");
+    for (p, _) in c6_head::google::APPS {
+        let a = c6_head::providers::Kept {
+            realm: "work",
+            instance: p,
+            provider: "google",
+            account: "me@work.example",
+            name: "Me at work",
+            refresh: "rt-w",
+            access: "at-w",
+            expires: c6_core::now_ms() + 3_600_000,
+            scopes: "all",
+        };
+        c6_head::providers::keep(&head.state, &a, None).await.unwrap();
+    }
+    c6_head::memex::reload(&head.state).await;
+    let work_accounts: Vec<c6_api::GoogleAccount> =
+        http.get(format!("{api}/google/accounts?realm=work")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(work_accounts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), ["me@work.example"]);
+    let work_rpc = |method: &str, params: Value| {
+        let (http, url, body) = (http.clone(), format!("{api}/memex/rpc?realm=work"), json!({"method": method, "params": params}));
+        async move {
+            let r = http.post(url).json(&body).send().await.unwrap();
+            assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+            r.json::<Value>().await.unwrap()
+        }
+    };
+    work_rpc("memex.google_sync", json!({})).await;
+    let work = eventually("the work mailbox imported", async || {
+        let v = work_rpc("memex.mail.threads", json!({"view": "all"})).await;
+        (v.as_array()?.len() >= 3).then_some(v)
+    })
+    .await;
+    assert!(work.as_array().unwrap().iter().all(|t| t["account"] == work_accounts[0].id.as_str()), "{work}");
+    assert_eq!(rpc("memex.mail.threads", json!({"view": "all"})).await.as_array().unwrap().len(), home_threads, "home's mail is apart");
+    let s = work_rpc("memex.google", json!({})).await;
+    assert!(s["sync"].as_array().unwrap().iter().any(|x| x["kind"] == "mail" && x["email"] == "me@work.example"), "{s}");
+    // Archiving there goes through work's gmail app.
+    let t = &work[0];
+    work_rpc("memex.mail.modify", json!({"account": t["account"], "thread_id": t["thread_id"], "remove": ["INBOX"]})).await;
+
     stop.cancel();
     head.shutdown().await.unwrap();
 }

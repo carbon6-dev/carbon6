@@ -143,11 +143,11 @@ async fn google_moves_into_its_apps() {
     // Started again: moved.
     let h = start().await.unwrap();
     let st = &h.state;
-    let apps: Vec<String> = c6_head::google::installed(st).await.unwrap().into_iter().map(|(p, _)| p).collect();
+    let apps: Vec<String> = c6_head::google::installed(st, "home").await.unwrap().into_iter().map(|(p, _)| p).collect();
     assert_eq!(apps, ["gmail", "google-calendar", "google-contacts"]);
-    let client = c6_head::google::get_client(st).await.unwrap();
+    let client = c6_head::google::get_client(st, "home").await.unwrap();
     assert!(client.client_id == "cid" && client.has_secret);
-    let accounts = c6_head::google::accounts(st).await.unwrap();
+    let accounts = c6_head::google::accounts(st, "home").await.unwrap();
     assert_eq!((accounts.len(), accounts[0].id.as_str(), accounts[0].email.as_str()), (1, "acc1", "me@example.com"));
     let m = c6_head::knowledge::get(st).unwrap();
     let (source, ext): (String, String) =
@@ -155,7 +155,7 @@ async fn google_moves_into_its_apps() {
     assert_eq!((source.as_str(), ext.as_str()), ("app:gmail", "acc1:m1"), "the same item, the app's");
     let cal: String = sqlx::query_scalar("SELECT account FROM calendars").fetch_one(&m.store.pool).await.unwrap();
     assert_eq!(cal, "acc1c");
-    let status = c6_head::google::status(st).await.unwrap();
+    let status = c6_head::google::status(st, "home").await.unwrap();
     let cursor = |kind: &str| status["sync"].as_array().unwrap().iter().find(|s| s["kind"] == kind).map(|s| s["phase"].clone());
     assert_eq!(cursor("mail"), Some(json!("live")), "{status}");
     assert_eq!(cursor("cal:me@example.com"), Some(json!("live")), "{status}");

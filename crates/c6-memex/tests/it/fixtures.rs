@@ -254,7 +254,7 @@ async fn memex_fixtures_upgrade_and_serve() {
         // Another realm has its own (empty) knowledge: home's never shows there.
         let other = m.handle_method("memex.search", json!({"query": "engine", "realm": "lab"})).await.unwrap();
         assert!(!other.to_string().contains("analytical engine"), "{name}: {other}");
-        let refused = m.handle_method("memex.mail.threads", json!({"realm": "lab"})).await.unwrap_err();
+        let refused = m.handle_method("memex.media.list", json!({"realm": "lab"})).await.unwrap_err();
         assert!(refused.to_string().contains("home's"), "{name}: {refused}");
     }
 }

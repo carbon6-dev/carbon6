@@ -153,12 +153,12 @@ impl Memex {
     /// Background work: keeps the settings fresh from the head, and embeds
     /// passages that have no vector yet.
     pub fn spawn_jobs(self: &Arc<Self>) {
-        // Mail, calendars, contacts, folders and photos are home's.
+        // Folders and photos are home's; every realm sends its own mail.
         if self.is_home() {
             self.spawn_scanner();
-            self.spawn_mail();
             media::spawn(self.clone());
         }
+        self.spawn_mail();
         understand::spawn(self.clone());
         extract::spawn(self.clone());
         let m = self.clone();
@@ -173,8 +173,7 @@ impl Memex {
                                 model: c["embedding"]["model"].as_str().unwrap_or_default().to_owned(),
                             }));
                             let home = m.is_home();
-                            let accounts: Vec<people::Account> =
-                                if home { serde_json::from_value(c["accounts"].clone()).unwrap_or_default() } else { Vec::new() };
+                            let accounts: Vec<people::Account> = serde_json::from_value(c["accounts"][&m.realm].clone()).unwrap_or_default();
                             *m.accounts.lock().unwrap() = accounts;
                             let tasks = Tasks {
                                 understanding: task_of(&c["understanding"]),
@@ -609,10 +608,11 @@ impl Memex {
         // crosses. Mail, calendars, contacts, photos and folders are home's.
         let realm = params["realm"].as_str().unwrap_or(&self.realm).to_owned();
         if realm != self.realm {
-            const HOME_ONLY: [&str; 7] =
-                ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.media.", "memex.legacy_sync", "memex.scan", "memex.upgrades"];
+            // Each realm keeps its own mail, calendars and contacts (its apps'
+            // accounts'); photos and folders are home's.
+            const HOME_ONLY: [&str; 4] = ["memex.media.", "memex.legacy_sync", "memex.scan", "memex.upgrades"];
             if HOME_ONLY.iter().any(|p| method.starts_with(p)) {
-                anyhow::bail!("{method} is home's (mail, calendars, contacts, photos and folders belong to home)");
+                anyhow::bail!("{method} is home's (photos and folders belong to home)");
             }
             if method == "memex.drop_realm" {
                 return self.drop_realm(&realm).await;

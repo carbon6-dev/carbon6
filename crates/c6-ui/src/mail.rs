@@ -309,7 +309,7 @@ fn Message(m: MailMessage) -> impl IntoView {
                 <div class="flex flex-wrap gap-2 text-xs">
                     {m.attachments.iter().map(|a| view! {
                         <a class="rounded bg-zinc-100 px-2 py-1 hover:underline dark:bg-zinc-800" target="_blank" rel="noopener"
-                            href=format!("/api/v1/mail/attachment?item={}&index={}", item, a.index)>{format!("📎 {} ({} KB)", a.name, a.size / 1024)}</a>
+                            href=api::mail_attachment(&item, a.index)>{format!("📎 {} ({} KB)", a.name, a.size / 1024)}</a>
                     }).collect_view()}
                 </div>
             })}
@@ -418,8 +418,13 @@ pub fn GoogleSettings() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
-                <h2 class="font-medium">"Mail & calendar"</h2>
-                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts (in home; they run on a worker with Docker or Podman, reaching only Google). Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
+                <h2 class="font-medium">"Mail & calendar"
+                    <span class="ml-2 text-sm font-normal text-zinc-500">{move || {
+                        let r = api::realm().get();
+                        format!("in {} (pick a realm in the header for another's)", if r.is_empty() { "home".to_owned() } else { r })
+                    }}</span>
+                </h2>
+                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts, in each realm you install them in, with that realm's accounts and mail (they run on a worker with Docker or Podman, reaching only Google). Your OAuth client is every realm's. Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
             </div>
             {move || client.get().and_then(Result::ok).filter(|c| c.apps.len() < 3).map(|c| {
                 let waiting = !c.waiting.is_empty();

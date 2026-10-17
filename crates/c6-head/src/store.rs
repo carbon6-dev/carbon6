@@ -622,6 +622,11 @@ impl Store {
         Ok(done > 0)
     }
 
+    pub async fn set_secret_realm(&self, name: &str, realm: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE secrets SET realm = ? WHERE name = ?").bind(realm).bind(name).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn delete_secret(&self, name: &str) -> anyhow::Result<bool> {
         Ok(sqlx::query("DELETE FROM secrets WHERE name = ?").bind(name).execute(&self.pool).await?.rows_affected() > 0)
     }

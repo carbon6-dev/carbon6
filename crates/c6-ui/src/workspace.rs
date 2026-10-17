@@ -1030,9 +1030,11 @@ fn render_view(view: View) -> AnyView {
                     View::Mission => view! { <crate::activity::MissionPage /> }.into_any(),
                     View::Usage => view! { <crate::usage::UsagePage /> }.into_any(),
                     View::Memex => view! { <crate::memex::MemexPage /> }.into_any(),
-                    View::Mail => view! { <crate::mail::MailPage /> }.into_any(),
-                    View::Calendar => view! { <crate::calendar::CalendarPage /> }.into_any(),
-                    View::Contacts => view! { <crate::contacts::ContactsPage /> }.into_any(),
+                    // Each realm has its own mail, calendars and contacts:
+                    // drawn again for the realm you pick.
+                    View::Mail => (move || { crate::api::realm().track(); view! { <crate::mail::MailPage /> } }).into_any(),
+                    View::Calendar => (move || { crate::api::realm().track(); view! { <crate::calendar::CalendarPage /> } }).into_any(),
+                    View::Contacts => (move || { crate::api::realm().track(); view! { <crate::contacts::ContactsPage /> } }).into_any(),
                     View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
                     View::Decisions => view! { <crate::decisions::DecisionsPage /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),

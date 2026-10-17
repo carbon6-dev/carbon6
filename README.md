@@ -265,7 +265,7 @@ The memex is your knowledge store, part of the head: items, a graph of things wi
 
 ### Mail, calendar and contacts
 
-carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**). Three apps do the syncing, installed in home: **gmail**, **google-calendar** and **google-contacts**. They run on the **google** kit on a worker with Docker or Podman, which reaches only Google. Their packages are part of carbon6, and an IMAP or CalDAV app would be written the same way. Design: [docs/knowledge.md](docs/knowledge.md) §6.
+carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**). Each realm can have its own: personal Gmail in home, a business's Workspace account in that business's realm, each with its own mail, events and contacts (the pages follow the realm picked in the header). Three apps do the syncing, installed in each realm that has accounts: **gmail**, **google-calendar** and **google-contacts**. They run on the **google** kit on a worker with Docker or Podman, which reaches only Google. Their packages are part of carbon6, and an IMAP or CalDAV app would be written the same way. Design: [docs/knowledge.md](docs/knowledge.md) §6.
 
 - **Setup** (**Settings → Mail & calendar**):
   - **Install the apps** (you approve each under Decisions).

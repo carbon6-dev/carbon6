@@ -1,11 +1,14 @@
 //! Gmail, Google Calendar and Google Contacts are apps (docs/knowledge.md
 //! §6): `gmail`, `google-calendar` and `google-contacts`, on the `google`
 //! kit, installed in home with your approval. Their packages are part of
-//! carbon6 (crates/c6-google). This is what Settings → Mail & calendar
-//! does with them: your OAuth client (home's secrets GOOGLE_CLIENT_ID and
-//! GOOGLE_CLIENT_SECRET), one sign-in for all three apps, the accounts,
-//! where their syncs are; and the move of what the memex synced itself
-//! before, into the apps.
+//! carbon6 (crates/c6-google). Each realm can have them, with its own
+//! accounts and its own mail, events and contacts (personal Gmail in home,
+//! a business's Workspace account in that business's realm). This is what
+//! Settings → Mail & calendar does with them, for the realm you look at:
+//! your OAuth client (root's secrets GOOGLE_CLIENT_ID and
+//! GOOGLE_CLIENT_SECRET, every realm's), one sign-in for all three apps,
+//! the accounts, where their syncs are; and the move of what the memex
+//! synced itself before, into home's apps.
 
 use std::collections::BTreeMap;
 
@@ -49,9 +52,9 @@ async fn register(st: &HeadState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The Google apps installed in home: (package, instance name).
-pub async fn installed(st: &HeadState) -> anyhow::Result<Vec<(String, String)>> {
-    Ok(crate::instances::list(&st.store.pool, Some(crate::realms::HOME))
+/// The Google apps installed in a realm: (package, instance name).
+pub async fn installed(st: &HeadState, realm: &str) -> anyhow::Result<Vec<(String, String)>> {
+    Ok(crate::instances::list(&st.store.pool, Some(realm))
         .await?
         .into_iter()
         .filter(|i| APPS.iter().any(|(p, _)| *p == i.package.app))
@@ -59,42 +62,45 @@ pub async fn installed(st: &HeadState) -> anyhow::Result<Vec<(String, String)>> 
         .collect())
 }
 
-/// Asks you to install the Google apps that aren't yet (a decision each).
-pub async fn install(st: &HeadState) -> anyhow::Result<Vec<api::Install>> {
+/// Asks you to install the Google apps a realm doesn't have yet (a
+/// decision each).
+pub async fn install(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::Install>> {
     register(st).await?;
-    let have = installed(st).await?;
+    let have = installed(st, realm).await?;
     let pending = crate::packages::installs(st).await?;
     let mut out = Vec::new();
     for (p, _) in APPS {
-        if have.iter().any(|(x, _)| x == p) || pending.iter().any(|i| i.package == p && i.state == "installing") {
+        if have.iter().any(|(x, _)| x == p) || pending.iter().any(|i| i.package == p && i.realm == realm && i.state == "installing") {
             continue;
         }
-        out.push(
-            crate::packages::install(st, &api::InstallIn { package: p.into(), realm: crate::realms::HOME.into(), ..Default::default() })
-                .await?,
-        );
+        out.push(crate::packages::install(st, &api::InstallIn { package: p.into(), realm: realm.into(), ..Default::default() }).await?);
     }
     Ok(out)
 }
 
-pub async fn get_client(st: &HeadState) -> anyhow::Result<api::GoogleClient> {
-    let id = crate::secrets::value_in(st, crate::realms::HOME, CLIENT_ID).await?.unwrap_or_default();
-    let has_secret = crate::secrets::value_in(st, crate::realms::HOME, CLIENT_SECRET).await?.is_some_and(|s| !s.is_empty());
-    let apps = installed(st).await?.into_iter().map(|(p, _)| p).collect();
+/// Your OAuth client (any realm's view of it), and a realm's Google apps.
+pub async fn get_client(st: &HeadState, realm: &str) -> anyhow::Result<api::GoogleClient> {
+    let id = crate::secrets::value_in(st, realm, CLIENT_ID).await?.unwrap_or_default();
+    let has_secret = crate::secrets::value_in(st, realm, CLIENT_SECRET).await?.is_some_and(|s| !s.is_empty());
+    let apps = installed(st, realm).await?.into_iter().map(|(p, _)| p).collect();
     let waiting = crate::packages::installs(st)
         .await?
         .into_iter()
-        .filter(|i| i.state == "installing" && APPS.iter().any(|(p, _)| *p == i.package))
+        .filter(|i| i.state == "installing" && i.realm == realm && APPS.iter().any(|(p, _)| *p == i.package))
         .map(|i| i.package)
         .collect();
     Ok(api::GoogleClient { client_id: id, has_secret, redirect_uri: String::new(), apps, waiting })
 }
 
+/// Sets your OAuth client: root's secrets, so every realm's Google apps
+/// sign in with it.
 pub async fn set_client(st: &HeadState, c: &api::GoogleClientIn) -> anyhow::Result<()> {
-    let id = c.client_id.trim();
-    st.store.put_secret(CLIENT_ID, Some(st.secrets.encrypt(id)?), "Your Google OAuth client's id (Gmail, Calendar, Contacts)", &[]).await?;
-    if let Some(s) = c.client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        st.store.put_secret(CLIENT_SECRET, Some(st.secrets.encrypt(s)?), "Your Google OAuth client's secret", &[]).await?;
+    let root = crate::realms::ROOT;
+    crate::secrets::put_in(st, root, CLIENT_ID, c.client_id.trim(), "Your Google OAuth client's id (Gmail, Calendar, Contacts)").await?;
+    match c.client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => crate::secrets::put_in(st, root, CLIENT_SECRET, s, "Your Google OAuth client's secret").await?,
+        // Kept, and every realm's.
+        None => st.store.set_secret_realm(CLIENT_SECRET, root).await?,
     }
     Ok(())
 }
@@ -106,21 +112,21 @@ pub async fn redirect_uri(st: &HeadState, origin: Option<&str>) -> String {
     format!("{}/auth/google/callback", base.as_deref().or(origin).unwrap_or("http://localhost:7700").trim_end_matches('/'))
 }
 
-/// One sign-in for every Google app installed in home.
-pub async fn connect(st: &HeadState, origin: Option<&str>) -> anyhow::Result<String> {
-    let apps: Vec<String> = installed(st).await?.into_iter().map(|(_, n)| n).collect();
+/// One sign-in for every Google app installed in a realm.
+pub async fn connect(st: &HeadState, realm: &str, origin: Option<&str>) -> anyhow::Result<String> {
+    let apps: Vec<String> = installed(st, realm).await?.into_iter().map(|(_, n)| n).collect();
     if apps.is_empty() {
-        return Err(bad_request("install the Google apps first (Settings → Mail & calendar)"));
+        return Err(bad_request(format!("install the Google apps in {realm} first (Settings → Mail & calendar)")));
     }
     let redirect = redirect_uri(st, origin).await;
-    crate::providers::connect_many(st, crate::realms::HOME, &apps, "google", &redirect, "/settings").await
+    crate::providers::connect_many(st, realm, &apps, "google", &redirect, "/settings").await
 }
 
-/// The accounts connected, once each (the gmail app's id when it has it).
-pub async fn accounts(st: &HeadState) -> anyhow::Result<Vec<api::GoogleAccount>> {
+/// A realm's accounts, once each (the gmail app's id when it has it).
+pub async fn accounts(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::GoogleAccount>> {
     let mut out: Vec<api::GoogleAccount> = Vec::new();
-    for (_, app) in installed(st).await? {
-        for a in crate::providers::accounts(st, crate::realms::HOME, &app).await? {
+    for (_, app) in installed(st, realm).await? {
+        for a in crate::providers::accounts(st, realm, &app).await? {
             if !out.iter().any(|x| x.email.eq_ignore_ascii_case(&a.account)) {
                 out.push(api::GoogleAccount { id: a.id, email: a.account, name: a.name, added_at: a.added_at });
             }
@@ -129,16 +135,17 @@ pub async fn accounts(st: &HeadState) -> anyhow::Result<Vec<api::GoogleAccount>>
     Ok(out)
 }
 
-/// Disconnects an account from every Google app.
-pub async fn remove(st: &HeadState, id: &str) -> anyhow::Result<()> {
-    let email: String = sqlx::query_scalar("SELECT account FROM oauth_accounts WHERE id = ?")
+/// Disconnects an account from every Google app of a realm.
+pub async fn remove(st: &HeadState, realm: &str, id: &str) -> anyhow::Result<()> {
+    let email: String = sqlx::query_scalar("SELECT account FROM oauth_accounts WHERE id = ? AND realm = ?")
         .bind(id)
+        .bind(realm)
         .fetch_optional(&st.store.pool)
         .await?
         .ok_or_else(|| not_found("no such account"))?;
-    for (_, app) in installed(st).await? {
+    for (_, app) in installed(st, realm).await? {
         sqlx::query("DELETE FROM oauth_accounts WHERE realm = ? AND instance = ? AND account = ?")
-            .bind(crate::realms::HOME)
+            .bind(realm)
             .bind(&app)
             .bind(&email)
             .execute(&st.store.pool)
@@ -150,19 +157,18 @@ pub async fn remove(st: &HeadState, id: &str) -> anyhow::Result<()> {
 
 /// The accounts and where each sync is (for the mail client): kinds
 /// `mail`, `cal:<calendar>` and `contacts`.
-pub async fn status(st: &HeadState) -> anyhow::Result<Value> {
-    let accounts: Vec<Value> = accounts(st).await?.into_iter().map(|a| json!({"id": a.id, "email": a.email})).collect();
+pub async fn status(st: &HeadState, realm: &str) -> anyhow::Result<Value> {
+    let accounts: Vec<Value> = accounts(st, realm).await?.into_iter().map(|a| json!({"id": a.id, "email": a.email})).collect();
     let emails: BTreeMap<String, String> = sqlx::query_as("SELECT id, account FROM oauth_accounts WHERE realm = ?")
-        .bind(crate::realms::HOME)
+        .bind(realm)
         .fetch_all(&st.store.pool)
         .await?
         .into_iter()
         .collect();
     let mut sync = Vec::new();
-    for (p, app) in installed(st).await? {
+    for (p, app) in installed(st, realm).await? {
         let Some((_, col)) = APPS.iter().find(|(x, _)| *x == p) else { continue };
-        let Ok(page) =
-            crate::collections::query(st, crate::realms::HOME, col, &api::RecordQuery { limit: Some(1000), ..Default::default() }).await
+        let Ok(page) = crate::collections::query(st, realm, col, &api::RecordQuery { limit: Some(1000), ..Default::default() }).await
         else {
             continue;
         };
@@ -182,12 +188,12 @@ pub async fn status(st: &HeadState) -> anyhow::Result<Value> {
     Ok(json!({"accounts": accounts, "sync": sync}))
 }
 
-/// Runs the Google apps' syncs now.
-pub async fn sync_now(st: &std::sync::Arc<HeadState>) -> anyhow::Result<()> {
-    let apps: Vec<String> = installed(st).await?.into_iter().map(|(_, n)| n).collect();
+/// Runs a realm's Google apps' syncs now.
+pub async fn sync_now(st: &std::sync::Arc<HeadState>, realm: &str) -> anyhow::Result<()> {
+    let apps: Vec<String> = installed(st, realm).await?.into_iter().map(|(_, n)| n).collect();
     let ids: Vec<String> =
         sqlx::query_scalar("SELECT id FROM triggers WHERE realm = ? AND action = 'kit' AND owner IN (SELECT value FROM json_each(?))")
-            .bind(crate::realms::HOME)
+            .bind(realm)
             .bind(serde_json::to_string(&apps)?)
             .fetch_all(&st.store.pool)
             .await?;
@@ -208,6 +214,12 @@ pub async fn sync_now(st: &std::sync::Arc<HeadState>) -> anyhow::Result<()> {
 /// contacts already here, with where each sync was, become the apps' (so
 /// nothing is fetched again).
 pub async fn move_in(st: &HeadState) -> anyhow::Result<()> {
+    // Your OAuth client set in 0.3.1 was home's: it is every realm's.
+    for name in [CLIENT_ID, CLIENT_SECRET] {
+        if st.store.secret(name).await?.is_some_and(|(_, _, r)| r == crate::realms::HOME) {
+            st.store.set_secret_realm(name, crate::realms::ROOT).await?;
+        }
+    }
     if st.store.setting("google_moved").await?.is_some() {
         return Ok(());
     }
@@ -220,7 +232,7 @@ pub async fn move_in(st: &HeadState) -> anyhow::Result<()> {
     // The apps, approved: you had approved the memex's Google sync.
     register(st).await?;
     for (p, _) in APPS {
-        if installed(st).await?.iter().any(|(x, _)| x == p) {
+        if installed(st, crate::realms::HOME).await?.iter().any(|(x, _)| x == p) {
             continue;
         }
         let i =

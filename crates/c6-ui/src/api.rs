@@ -560,8 +560,18 @@ pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::
 }
 
 /// Mail, calendars and contacts: a memex method (see the head's /memex/rpc).
+/// Mail, calendars and contacts are the realm's you look at (each realm
+/// has its own); the rest is home's unless a realm's token says otherwise.
 pub async fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    send_json(Request::post("/api/v1/memex/rpc"), &serde_json::json!({"method": method, "params": params})).await
+    let area = method.split('.').nth(1).unwrap_or_default();
+    let per_realm = matches!(area, "mail" | "calendar" | "contacts" | "google" | "google_sync");
+    let url = format!("/api/v1/memex/rpc{}", if per_realm { in_realm('?') } else { String::new() });
+    send_json(Request::post(&url), &serde_json::json!({"method": method, "params": params})).await
+}
+
+/// A mail attachment's address, in the realm you look at.
+pub fn mail_attachment(item: &str, index: u32) -> String {
+    format!("/api/v1/mail/attachment?item={}&index={index}{}", enc(item), in_realm('&'))
 }
 
 pub async fn rpc_as<T: serde::de::DeserializeOwned>(method: &str, params: serde_json::Value) -> Result<T, String> {
@@ -569,7 +579,7 @@ pub async fn rpc_as<T: serde::de::DeserializeOwned>(method: &str, params: serde_
 }
 
 pub async fn google_client() -> Result<c6_api::GoogleClient, String> {
-    json(Request::get("/api/v1/google/client").send().await).await
+    json(Request::get(&format!("/api/v1/google/client{}", in_realm('?'))).send().await).await
 }
 
 pub async fn set_google_client(client_id: String, client_secret: Option<String>) -> Result<(), String> {
@@ -578,21 +588,21 @@ pub async fn set_google_client(client_id: String, client_secret: Option<String>)
 }
 
 pub async fn google_connect() -> Result<String, String> {
-    let v: serde_json::Value = json(Request::post("/api/v1/google/connect").send().await).await?;
+    let v: serde_json::Value = json(Request::post(&format!("/api/v1/google/connect{}", in_realm('?'))).send().await).await?;
     Ok(v["authorize_url"].as_str().unwrap_or_default().to_owned())
 }
 
 /// Asks to install the Gmail, Calendar and Contacts apps.
 pub async fn google_install() -> Result<Vec<c6_api::Install>, String> {
-    json(Request::post("/api/v1/google/install").send().await).await
+    json(Request::post(&format!("/api/v1/google/install{}", in_realm('?'))).send().await).await
 }
 
 pub async fn google_accounts() -> Result<Vec<c6_api::GoogleAccount>, String> {
-    json(Request::get("/api/v1/google/accounts").send().await).await
+    json(Request::get(&format!("/api/v1/google/accounts{}", in_realm('?'))).send().await).await
 }
 
 pub async fn google_remove(id: String) -> Result<(), String> {
-    empty(Request::delete(&format!("/api/v1/google/accounts/{id}")).send().await).await
+    empty(Request::delete(&format!("/api/v1/google/accounts/{id}{}", in_realm('?'))).send().await).await
 }
 
 pub async fn memex_upload(u: c6_api::MemexUpload) -> Result<serde_json::Value, String> {
