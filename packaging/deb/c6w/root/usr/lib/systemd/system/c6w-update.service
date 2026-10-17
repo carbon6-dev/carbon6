@@ -1,0 +1,10 @@
+# Run by c6w-update.path. c6w checks the request against the release's
+# signature itself (it trusts nothing the worker wrote), installs a private
+# copy of the .deb, and leaves a result for the worker.
+[Unit]
+Description=carbon6 worker: install an update it downloaded
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/c6w update-install /var/lib/c6w/update
+PrivateTmp=yes

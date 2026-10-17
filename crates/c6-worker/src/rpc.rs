@@ -109,6 +109,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
         "kit.job" => kit_job(worker, &params).await,
+        "update.apply" => crate::update::apply(worker, &params).await,
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),

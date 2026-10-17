@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-c6-core.workspace = true
+c6-core = { workspace = true, features = ["update"] }
 c6-worker.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
 tokio = { version = "1.53.2", features = ["full"] }

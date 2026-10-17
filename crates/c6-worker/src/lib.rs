@@ -17,6 +17,7 @@ pub mod pty;
 pub mod rpc;
 pub mod session;
 mod subagent;
+pub mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,6 +51,8 @@ pub struct Worker {
     /// The live connection to the head, for opening extra streams.
     channel: Mutex<Option<tonic::transport::Channel>>,
     extension: Mutex<Option<Arc<dyn Extension>>>,
+    /// Updating to a release the head says is out (docs/updates.md).
+    pub update: update::Updating,
     /// Held for the process lifetime: one worker per state directory.
     _lock: std::fs::File,
 }
@@ -86,6 +89,7 @@ impl Worker {
             terminals: pty::Terminals::default(),
             channel: Mutex::new(None),
             extension: Mutex::new(None),
+            update: Default::default(),
             _lock: lock,
         }))
     }

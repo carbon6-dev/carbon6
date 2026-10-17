@@ -6,9 +6,12 @@ if [ "$1" = configure ]; then
         adduser --quiet --system --group --home /var/lib/c6h --no-create-home c6h
     fi
     install -d -o c6h -g c6h -m 0700 /var/lib/c6h
+    # Where the head leaves updates for c6h-update.service (docs/updates.md).
+    install -d -o c6h -g c6h -m 0700 /var/lib/c6h/update
 
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload
+        systemctl enable --now c6h-update.path
         if [ -z "$2" ]; then
             systemctl enable --now c6h.service
         else

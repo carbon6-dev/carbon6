@@ -1,0 +1,11 @@
+# Installs an update the carbon6 head downloaded and checked (docs/updates.md
+# §6): the head runs as a user that can't install packages, so it leaves the
+# .deb and a request here, and c6h-update.service installs it as root.
+[Unit]
+Description=carbon6 head: install the updates it downloads
+
+[Path]
+PathExists=/var/lib/c6h/update/request
+
+[Install]
+WantedBy=multi-user.target

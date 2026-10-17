@@ -1,0 +1,10 @@
+# Run by c6h-update.path. c6h checks the request against the release's
+# signature itself (it trusts nothing the head wrote), installs a private
+# copy of the .deb, and leaves a result for the head.
+[Unit]
+Description=carbon6 head: install an update it downloaded
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/c6h update-install /var/lib/c6h/update
+PrivateTmp=yes

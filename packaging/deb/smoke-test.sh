@@ -57,6 +57,18 @@ run 'systemctl restart c6h c6w@alice'
 until_ok 'journalctl -u c6w@alice | grep -c "attached to head" | grep -qv "^1$"' "c6w@alice did not reattach after a restart"
 run '! journalctl -u c6h -u c6w@alice | grep -E "SIGKILL|Killing process|timed out"' || fail "a service had to be killed"
 
+step "Update helpers (docs/updates.md)"
+run 'systemctl is-enabled c6h-update.path c6w-update.path && systemctl is-active c6h-update.path c6w-update.path' \
+    || fail "the update path units are not enabled and active"
+# An unsigned update left by the daemon's user is refused (by root, which
+# checks it itself), and the daemon is told why.
+for who in c6h:c6h alice:c6w; do
+    user=${who%%:*} bin=${who#*:}
+    run "sudo -u $user sh -c 'cd /var/lib/$bin/update && echo {} >release.json && echo x >release.json.sig && echo x >${bin}_9.9.9_$arch.deb && echo ${bin}_9.9.9_$arch.deb >request'"
+    until_ok "grep -q '^failed: .*signature' /var/lib/$bin/update/result" "$bin-update.service did not refuse an unsigned update"
+    run "test ! -e /var/lib/$bin/update/request && rm -f /var/lib/$bin/update/*"
+done
+
 step "Upgrade over the installed packages"
 run 'dpkg -i /opt/debs/*.deb >/dev/null'
 run 'for u in c6h c6w@alice; do systemctl is-active -q $u || exit 1; done' || fail "services are not running after the upgrade"

@@ -2,8 +2,14 @@
 set -e
 
 if [ "$1" = configure ]; then
+    # Where workers (any user's) leave updates for c6w-update.service, which
+    # installs only what the release key signed (docs/updates.md).
+    install -d -m 1777 /var/lib/c6w /var/lib/c6w/update
+    chmod 0755 /var/lib/c6w
+
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload
+        systemctl enable --now c6w-update.path
         [ -z "$2" ] || systemctl try-restart 'c6w@*.service'
     fi
 

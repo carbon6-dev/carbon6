@@ -51,6 +51,8 @@ enum Ended {
 /// Keeps the worker attached to the head until `shutdown` or a fatal
 /// rejection.
 pub async fn run(worker: Arc<Worker>, state: watch::Sender<ConnState>, shutdown: CancellationToken) -> anyhow::Result<()> {
+    // An update in progress counts this start (docs/updates.md).
+    crate::update::on_start(&worker, &shutdown)?;
     // Sessions from Claude Code and Codex, when the head says this worker imports.
     crate::imports::spawn(worker.clone(), shutdown.clone());
     let mut backoff = MIN_BACKOFF;
@@ -148,6 +150,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
 
     worker.link.connected(tx.clone());
     worker.set_channel(Some(channel));
+    crate::update::attached(worker);
     let _clear_channel = ClearChannel(worker.clone());
     let uploads = CancellationToken::new();
     let _stop_uploads = uploads.clone().drop_guard();

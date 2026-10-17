@@ -3,4 +3,5 @@ set -e
 
 if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
     systemctl disable --now c6h.service || true
+    systemctl disable --now c6h-update.path || true
 fi

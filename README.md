@@ -180,6 +180,21 @@ Collections are typed tables of records in a realm, for anything apps and agents
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
+### Updates
+
+carbon6 updates itself from GitHub releases. It installs only a release whose `release.json` is signed by carbon6's release key, which is built into every binary, and only files with the checksums it lists. Design: [docs/updates.md](docs/updates.md).
+
+- **Asking first:** the head looks every 6 hours. A new release becomes a Decision, "Update carbon6 to 0.3.5?", with its notes. **Settings → System → Updates** shows the same, with Update now, Skip, and Look now.
+- **Other modes:** update on its own (patch releases, or minor ones too, optionally only within a time window), just show it, or don't look at all.
+- **Order:** the head updates first, its database upgrade making a backup as always, and restarts. Then each worker updates, one after another, once its sessions are idle (or after 24 hours).
+- **By how it was installed:**
+  - Homebrew: `brew upgrade`;
+  - .deb: the package's root helper, `c6h-update.path` / `c6w-update.path`, which checks the signature itself;
+  - a plain binary: replaced in place.
+
+  A build from source is never updated.
+- **Rollback:** a version that fails to start three times is replaced by the previous one, along with the database backup. That version is then skipped, and a Decision says so.
+
 ### Upgrades
 
 A new version of carbon6 upgrades its databases when it starts: the head's (`c6h.db`) and its knowledge's (`knowledge/memex.db`, one per realm). Workers' journals need no upgrading.

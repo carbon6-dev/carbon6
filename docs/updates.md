@@ -1,6 +1,6 @@
 # Updating carbon6 from GitHub releases — Design
 
-Status: designed (2026-10-17). Decided: ask by default, signed releases, busy workers forced after 24 h.
+Status: built (2026-10-17). Decided: ask by default, signed releases, busy workers forced after 24 h. Not yet released: the first release with it is the first a machine can update *from*; updating *to* it is by hand.
 
 ## 1. Goals
 
@@ -38,9 +38,10 @@ The Release workflow adds two files to every GitHub release:
 - `release.json.sig`: an Ed25519 signature of `release.json`, made in the publish job.
   - The private key is the Actions secret `RELEASE_SIGNING_KEY`.
   - The public key is compiled into `c6_core` (`RELEASE_KEYS`, a list, so a key can be rotated by shipping the next key one release early).
-  - The release fails if the secret is missing.
+  - Without the secret, the release is published with an unsigned `release.json` and a warning, and nothing updates itself to it.
+  - Signing is `openssl pkeyutl -sign -rawin` (`packaging/release/manifest.sh`); a test checks that ring verifies what openssl signs.
 
-`make release` writes `upgrade_from` and `manual` from lines in the CHANGELOG section (`Upgrade from: 0.3.0`, `Manual:`). The default is the previous release, with no manual steps.
+`make release MANUAL="…" UPGRADE_FROM=x.y.z` writes `Manual:` and `Upgrade from:` lines into the release's CHANGELOG section, and the publish job reads them back. By default there are no manual steps, and any version updates.
 
 ## 3. Finding a release (the head)
 
@@ -49,9 +50,8 @@ The Release workflow adds two files to every GitHub release:
   - It skips drafts and prereleases.
 - **When it finds a newer version than its own,** it downloads `release.json` and its `.sig` and checks the signature against `RELEASE_KEYS`.
   - A bad or missing signature is logged and shown in Settings → System. Nothing else happens.
-- **It keeps the verified manifest** in the `updates` table (version, manifest, signature, found_at, state) and announces it:
-  - in Settings → System ("0.3.4 is available", with its notes);
-  - to workers, over the hub (§5).
+- **It keeps the verified manifest** in the `updates` table (version, manifest, signature, where its files are, state) and shows it in Settings → System → Updates, with its notes.
+- **A newer release replaces an older one** still waiting: the older one's Decision is withdrawn.
 
 ## 4. When to update (policy)
 
@@ -64,66 +64,48 @@ The setting `updates`:
 | `window` | hours in the head's time zone, e.g. `02:00–05:00`; empty is any time | empty |
 | `skip` | versions never to apply | `[]` |
 | `drain_hours` | how long a worker waits for its sessions to go idle | `24` |
+| `parallel` | workers update all at once instead of one after another | `false` |
 
 - **`approve`** files a Decision: "Update carbon6 to 0.3.4?", with the notes and the machines it will touch. Approving it applies the release.
 - **`auto`** applies a release within `auto_for` at the next window. Anything bigger falls back to `approve`. So does anything with `manual` steps, or an `upgrade_from` newer than a machine's version.
-- **Every update can be triggered by hand,** whatever the mode: Settings → System → Update now, or `c6 update`.
+- **Every update can be triggered by hand,** whatever the mode: Settings → System → Updates → Update now (`POST /api/v1/system/updates/{version}/apply`). The same Update now tries again what failed.
 
 ## 5. The protocol
 
-### Messages (hub.proto)
+### Messages
 
-```proto
-// Head → worker.
-message UpdateAvailable {
-  string version = 1;
-  bytes manifest = 2;    // release.json, exactly as signed
-  bytes signature = 3;   // release.json.sig
-  bool apply = 4;        // false: just know; true: apply when idle
-  uint64 deadline_ms = 5;  // apply by then even if not idle (0: wait forever)
-}
+Over the calls the hub already carries, so no new protobuf messages, and an old worker simply answers "unknown method" (its update is marked failed):
 
-// Worker → head.
-message UpdateStatus {
-  string version = 1;
-  enum State {
-    UNKNOWN = 0;
-    WAITING = 1;      // for sessions to go idle
-    DOWNLOADING = 2;
-    INSTALLING = 3;
-    RESTARTING = 4;
-    FAILED = 5;
-    ROLLED_BACK = 6;
-  }
-  State state = 2;
-  string method = 3;   // brew · deb · tarball · source (§6)
-  string detail = 4;   // the error, or what it waits on
-}
-```
+- **Head → worker**, `update.apply` (an RPC): `{version, manifest, signature, base_url, deadline_ms}`.
+  - `manifest` is `release.json` exactly as signed, and `signature` is its `.sig` in hex.
+  - `deadline_ms` is when to update even if sessions are still running.
+- **Worker → head**, `update.status` (a head call): `{version, state, method, detail}`.
+  - `state` is one of `waiting` · `downloading` · `installing` · `restarting` · `done` · `failed` · `rolled_back`.
+  - `method` is brew · deb · tarball · source (§6).
+  - `detail` is the error, or what it waits on.
 
-`Hello` gains `string install_method = 8` and `string previous_version = 9`, the latter set on the first start after an update. These let the head tell a finished update from a rollback.
-
-The worker checks the manifest's signature again itself, so a compromised head can't push code to workers.
+The worker checks the manifest's signature again itself, so a compromised head can't push code to workers. It refuses a version that isn't newer than its own.
 
 ### The order
 
 1. **The head goes first.** It needs to be at least as new as the workers, since a newer worker may use messages an older head doesn't know.
-   1. It downloads its asset to `data/updates/<version>/` and checks the checksum against the manifest.
-   2. It installs the asset (§6).
-   3. It writes `data/updates/pending.json`: {from, to, started_at}.
-   4. It exits with code 75, the "restart me" code.
+   1. It downloads its file and checks the checksum against the manifest.
+   2. It installs it (§6).
+   3. It writes `data/updates/pending.json`: {from, to, tries, started_at}.
+   4. It exits with code 75, the "restart me" code. Run by hand (no systemd or launchd), it runs the new version in its own place instead.
    5. The service manager starts the new version. Its database upgrade runs as today: backup first, all or nothing.
 2. **The new head checks itself.** On start it reads `pending.json`.
-   - If it got this far (database upgraded, listening), the update has succeeded. It records that in `updates` and deletes the file.
-   - If the new version doesn't reach that point within 3 tries (the service manager restarts it), the third start runs the rollback (§7). This is counted in `pending.json` by a small check in `main()` before anything else.
-3. **The workers follow.** Once the head is healthy on the new version, it sends `UpdateAvailable{apply: true}` to each worker, one at a time, or all at once with `parallel: true` in the setting.
+   - Each start counts a try, before the database opens. After the database upgrade, the backup it made is written into `pending.json`.
+   - If it got as far as serving (database upgraded, listening), the update has succeeded. It records that and deletes the file.
+   - If the new version fails 3 times (the service manager restarts it each time), the fourth start runs the rollback (§7) and exits 75.
+3. **The workers follow.** Once the head is healthy on the new version, it sends `update.apply` to each connected worker, one at a time, or all at once with `parallel: true` in the setting.
    - Each worker waits until none of its sessions is running a turn, for at most 24 hours (`drain_hours` in the setting).
      - At the deadline it updates anyway. The interrupted turns are marked interrupted and resume after the restart, like after a crash.
-     - While waiting, it takes no new turns. They queue on the head, as they do for a worker that's away.
-     - It reports `WAITING` with the number of busy sessions.
-   - Then it downloads, verifies and installs, reports `RESTARTING`, and exits with 75.
-   - On reconnect, `Hello.version` = new and `previous_version` = old means it's done.
-   - If a worker isn't back on the new version within 10 minutes, it's marked failed and the next worker waits for you. Workers that are offline update when they next connect.
+     - It keeps taking turns while it waits. A worker that's never idle updates at the deadline.
+     - It reports `waiting` with the number of busy sessions.
+   - Then it downloads, verifies and installs, reports `restarting`, and exits with 75. Its `pending.json` is in its state folder.
+   - The new version, once attached, reports `done` (or `rolled_back`, from the old version after a rollback).
+   - If a worker isn't back within 10 minutes, it's marked failed. A failed worker doesn't hold up the others; Update now tries it again. Workers that are offline update when they next connect.
 4. **Settings → System** shows each machine's version and update state.
 
 ## 6. Installing, by how carbon6 was installed
@@ -132,10 +114,10 @@ Each binary knows how it was installed from where it runs (`current_exe`):
 
 | Method | Detected by | Install | Restart |
 |---|---|---|---|
-| **brew** | under `$(brew --prefix)/Cellar/` | `brew update && brew upgrade carbon6-dev/carbon6/<bin>`. Not the downloaded asset: brew stays the owner of the files. After the upgrade, the new binary's checksum is compared with the manifest's bottle checksum. | exit 75. The formula's `keep_alive successful_exit: false` restarts it from `opt/`, which now points to the new keg. |
-| **deb** | `/usr/bin/<bin>`, owned by the package (`dpkg -S`) | carbon6 runs as a non-root user (`c6h`, or the user in `c6w@`), so it can't install packages itself. The .deb ships `c6-update.path` and `c6-update.service` (root, oneshot). The path unit watches `/var/lib/carbon6/update/request`, which the daemon writes (group-writable to `carbon6`). The root unit checks the request's .deb against the signed manifest itself, then runs `dpkg -i`. | the package's `postinst` restarts the units, as today |
+| **brew** | under `$(brew --prefix)/Cellar/` | `brew upgrade carbon6-dev/carbon6/<bin>` (which updates the tap first). Not the downloaded asset: brew stays the owner of the files, and checks the bottle against the formula's checksum. Only the Release workflow writes the tap. Afterwards, `brew list --versions` must show the new version. | exit 75. The formula's `keep_alive successful_exit: false` restarts it from `opt/`, which now points to the new keg. |
+| **deb** | `/usr/bin/<bin>` on Linux | carbon6 runs as a non-root user (`c6h`, or the user in `c6w@`), so it can't install packages itself. Each .deb ships `<bin>-update.path` and `<bin>-update.service` (root, oneshot). The daemon leaves the .deb, `release.json`, its `.sig` and then `request` in `/var/lib/<bin>/update/`. For c6h that folder is the c6h user's; for c6w it is writable by everyone, sticky, since any user may run a worker. The path unit starts `<bin> update-install`, as root. It takes the request, checks the signature and the .deb's checksum itself, refuses anything not newer than itself, installs a private copy with `dpkg -i`, and writes `result`. The daemon waits for that, up to 10 minutes. | the package's `postinst` restarts the units, as today |
 | **tarball** | anywhere else, with the binary's directory writable | the new binary is written next to the old one, then renamed over it (atomic). The old one is kept as `<bin>.previous`. | exit 75. Without a service manager (run by hand), it re-execs itself. |
-| **source** | built by `cargo` (`debug_assertions`, or a git build version) | never updated. Settings shows "built from source". | — |
+| **source** | a debug build, or a binary in a folder it can't write | never updated. Its update fails with "built from source: update it yourself". | — |
 
 All four methods use the same rollback trigger (§7).
 
@@ -147,7 +129,7 @@ All four methods use the same rollback trigger (§7).
 - **On failure:**
   - tarball: put `<bin>.previous` back;
   - brew: the upgrade runs with `HOMEBREW_NO_INSTALL_CLEANUP=1`, so the old keg stays in the Cellar. Rollback points `$(brew --prefix)/opt/<bin>` back at it (brew has no `switch` any more), and the next `brew upgrade` puts things right. If the old keg is gone, the update is only marked failed.
-  - deb: the old .deb kept in `/var/lib/carbon6/update/` is installed again.
+  - deb: not rolled back. The update is marked failed, and the previous .deb is installed by hand. The database is already safe: a failed upgrade restores its backup.
 - **The database** needs nothing extra: a failed upgrade already restores the backup. If the new version upgraded the database and then failed later, the rollback also puts back that upgrade's backup. The pending file names it.
 - **A rolled-back version is added to `skip`,** and a Decision says what failed.
 
@@ -155,23 +137,21 @@ All four methods use the same rollback trigger (§7).
 
 - **Signature, not transport.** HTTPS to GitHub is necessary but not enough. A stolen GitHub token can replace release assets, but it can't sign a manifest without `RELEASE_SIGNING_KEY`.
 - **Who can update:**
-  - Workers update only on `UpdateAvailable` from their head, and only to a version their own built-in keys verify.
+  - Workers update only on `update.apply` from their head, and only to a version their own built-in keys verify.
   - The head never sends a binary, only the manifest. Workers fetch the assets from the manifest's GitHub URLs.
-- **No privilege in the daemons.** On Linux, only the root oneshot installs, and it checks the signature itself.
+- **No privilege in the daemons.** On Linux, only the root oneshot installs. It checks the signature itself and installs a copy nobody else can write. Anyone who can write the c6w update folder can only ask for a newer, signed release.
+- **The key** was made on the release manager's machine (`~/.config/carbon6-release/signing-key.pem`, mode 0600). It lives there and in the `RELEASE_SIGNING_KEY` secret. Keep an offline copy: losing it means shipping a new key in a release signed by the old one.
+- **Tests only:** debug builds take other keys, binaries and versions (`C6_UPDATE_KEYS`, `C6_UPDATE_EXE`, `C6_UPDATE_AS_VERSION`; the head's `update_*` config). Release builds ignore the environment variables.
 - **Mode `off`** turns all of it off, including the GitHub check (for machines that mustn't call out).
 
-## 9. Steps
+## 9. Steps (built)
 
-1. **Release side:**
-   - the signing key and `release.json` + `.sig` in `publish.sh`;
-   - `upgrade_from` and `manual` from the CHANGELOG;
-   - the key in `c6_core`;
-   - a verify function, with tests.
-2. **Head: finding and policy.** The `updates` table and setting, the GitHub check, Decisions, and Settings → System.
-3. **Install methods and exit 75,** for the head: brew, tarball, source; `pending.json`; and rollback.
-4. **The protocol for workers:** `UpdateAvailable`/`UpdateStatus`, idle-wait, ordering, and offline workers.
-5. **Linux:** `c6-update.path`/`.service` in the debs, and the smoke tests in `make docker-deb-test` updating from the previous release.
-6. **CI:** `make brew-test` and `docker-deb-test` install release N−1, then update to the build under test through a local fake GitHub (a manifest signed with a test key).
+1. **Release side:** `release.json` and `.sig` (`packaging/release/manifest.sh`, from `publish.sh`), and `c6_core::update` (verify, versions, assets), with tests.
+2. **Head:** the `updates` and `update_machines` tables, the setting, the GitHub check, the Decision, and Settings → System → Updates (`crates/c6-head/src/updates.rs`).
+3. **Install methods, exit 75, `pending.json` and rollback,** shared by head and worker (`c6_core::update`). The tarball install and rollback are unit-tested.
+4. **Workers:** `update.apply` and `update.status`, waiting for idle, ordering, and offline workers (`crates/c6-worker/src/update.rs`). `crates/c6-worker/tests/it/updates.rs` runs it end to end: a fake GitHub and a release signed with a test key; the head asks, updates and restarts; then the worker updates and reports done.
+5. **Linux:** `<bin>-update.path` and `.service` in the debs. `make docker-deb-test` checks that they run, and refuse an unsigned update as root.
+6. **Not built: CI that updates from release N−1** to the build under test, under brew and systemd. Until then, brew and deb installs are tested only up to the helper.
 
 ## 10. Open questions
 

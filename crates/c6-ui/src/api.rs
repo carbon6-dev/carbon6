@@ -525,6 +525,24 @@ pub async fn set_prompt(name: String, body: String) -> Result<(), String> {
     }
 }
 
+/// Updating carbon6 from GitHub releases (docs/updates.md).
+pub async fn updates() -> Result<c6_api::Updates, String> {
+    json(Request::get("/api/v1/system/updates").send().await).await
+}
+
+pub async fn check_updates() -> Result<c6_api::Updates, String> {
+    send_json(Request::post("/api/v1/system/updates/check"), &serde_json::json!({})).await
+}
+
+/// `what`: apply or skip.
+pub async fn update_release(version: String, what: &'static str) -> Result<c6_api::Updates, String> {
+    send_json(Request::post(&format!("/api/v1/system/updates/{version}/{what}")), &serde_json::json!({})).await
+}
+
+pub async fn set_update_settings(s: c6_api::UpdateSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/updates").json(&s).map_err(|e| e.to_string())?.send().await).await
+}
+
 pub async fn upgrades() -> Result<Vec<c6_api::Upgrade>, String> {
     json(Request::get("/api/v1/system/upgrades").send().await).await
 }

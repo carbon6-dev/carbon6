@@ -156,6 +156,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
+        .route("/api/v1/system/updates", get(get_updates))
+        .route("/api/v1/system/updates/check", post(check_updates))
+        .route("/api/v1/system/updates/{version}/apply", post(apply_update))
+        .route("/api/v1/system/updates/{version}/skip", post(skip_update))
+        .route("/api/v1/settings/updates", get(get_update_settings).put(put_update_settings))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
         .route("/api/v1/explorer/map", get(explorer_map))
@@ -1516,6 +1521,36 @@ async fn get_session_imports(State(st): State<Arc<HeadState>>) -> ApiResult<Json
 
 async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api::SessionImports>) -> ApiResult<StatusCode> {
     crate::imports::set_settings(&st, &s).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Updating carbon6 from GitHub releases (docs/updates.md).
+async fn get_updates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::Updates>> {
+    Ok(Json(crate::updates::status(&st).await?))
+}
+
+async fn check_updates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::Updates>> {
+    // A failed look is in the status (check_error), not an error here.
+    let _ = crate::updates::check(&st).await;
+    Ok(Json(crate::updates::status(&st).await?))
+}
+
+async fn apply_update(State(st): State<Arc<HeadState>>, Path(version): Path<String>) -> ApiResult<Json<api::Updates>> {
+    crate::updates::apply(&st, &version).await?;
+    Ok(Json(crate::updates::status(&st).await?))
+}
+
+async fn skip_update(State(st): State<Arc<HeadState>>, Path(version): Path<String>) -> ApiResult<Json<api::Updates>> {
+    crate::updates::skip(&st, &version).await?;
+    Ok(Json(crate::updates::status(&st).await?))
+}
+
+async fn get_update_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::UpdateSettings>> {
+    Ok(Json(crate::updates::settings(&st).await?))
+}
+
+async fn put_update_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::UpdateSettings>) -> ApiResult<StatusCode> {
+    crate::updates::set_settings(&st, &s).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -1,0 +1,11 @@
+# Installs an update the carbon6 worker downloaded and checked (docs/updates.md
+# §6): the worker runs as a user that can't install packages, so it leaves the
+# .deb and a request here, and c6w-update.service installs it as root.
+[Unit]
+Description=carbon6 worker: install the updates it downloads
+
+[Path]
+PathExists=/var/lib/c6w/update/request
+
+[Install]
+WantedBy=multi-user.target

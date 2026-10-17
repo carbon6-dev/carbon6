@@ -802,6 +802,7 @@ dependencies = [
  "dirs",
  "futures",
  "gethostname",
+ "hex",
  "ignore",
  "image",
  "nix 0.31.3",

@@ -233,7 +233,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> } }).into_any(),
-                    "system" => view! { <Realms /> <Apps /> <Grants /> <SessionImportsSetting /> <Upgrades /> }.into_any(),
+                    "system" => view! { <Realms /> <Apps /> <Grants /> <SessionImportsSetting /> <UpdatesSetting /> <Upgrades /> }.into_any(),
                     "prompts" => view! { <Prompts /> }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
@@ -901,6 +901,150 @@ fn SessionImportsSetting() -> impl IntoView {
                     r["sessions"], if r["source"] == "codex" { "Codex" } else { "Claude Code" },
                     if r["sessions"] == 1 { "" } else { "s" }, r["realm"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")}</p>
             })}
+        </section>
+    }
+}
+
+/// Updating carbon6 from GitHub releases (docs/updates.md): when, what's
+/// out, and how far each machine is.
+#[component]
+fn UpdatesSetting() -> impl IntoView {
+    let live = crate::api::live();
+    let shown = RwSignal::new(None::<c6_api::Updates>);
+    let error = RwSignal::new(None::<String>);
+    // Reloads as machines come and go (and as an update moves along).
+    let loaded = LocalResource::new(move || {
+        live.workers.track();
+        api::updates()
+    });
+    Effect::new(move || match loaded.get() {
+        Some(Ok(v)) => shown.set(Some(v)),
+        Some(Err(e)) => error.set(Some(e)),
+        None => {}
+    });
+    let s = RwSignal::new(c6_api::UpdateSettings::default());
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            s.set(v.settings);
+        }
+    });
+    let busy = RwSignal::new(false);
+    let act = move |f: std::pin::Pin<Box<dyn std::future::Future<Output = Result<c6_api::Updates, String>>>>| {
+        busy.set(true);
+        spawn_local(async move {
+            match f.await {
+                Ok(v) => {
+                    shown.set(Some(v));
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+    let save = move |_| {
+        let v = s.get_untracked();
+        spawn_local(async move {
+            match api::set_update_settings(v).await {
+                Ok(()) => {
+                    error.set(None);
+                    loaded.refetch();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    const SELECT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-700 dark:bg-zinc-900";
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <h2 class="font-medium">"Updates"</h2>
+                    <p class="text-sm text-zinc-500">"carbon6 looks for releases on GitHub every 6 hours and installs only what carbon6's release key signed. The head updates first; then each worker, once its sessions are idle. A version that doesn't start is rolled back."</p>
+                </div>
+                <button class=format!("{BUTTON_QUIET} shrink-0 whitespace-nowrap") disabled=move || busy.get() on:click=move |_| act(Box::pin(api::check_updates()))>"Look now"</button>
+            </div>
+            {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
+            {move || shown.get().map(|u| {
+                let checked = match (u.checked_at, u.check_error.is_empty()) {
+                    (_, false) => format!("The last look failed: {}", u.check_error),
+                    (Some(t), true) => format!("Looked {}.", crate::util::ago(crate::util::now_ms() - t)),
+                    (None, true) => String::new(),
+                };
+                view! {
+                    <p class="text-sm">"This is carbon6 " <span class="font-medium">{u.version.clone()}</span>". " <span class="text-zinc-500">{checked}</span></p>
+                    {u.releases.into_iter().filter(|r| r.state != "done" || r.version == u.version).take(3).map(|r| {
+                        let (v1, v2) = (r.version.clone(), r.version.clone());
+                        let open = matches!(r.state.as_str(), "available" | "failed");
+                        view! {
+                            <details class="rounded-md border border-zinc-200 px-3 py-2 dark:border-zinc-800" open=open>
+                                <summary class="cursor-pointer select-none text-sm">
+                                    <span class="font-medium">{format!("carbon6 {}", r.version)}</span>
+                                    <span class="ml-2 text-zinc-500">{r.state.replace('_', " ")}</span>
+                                    {(!r.detail.is_empty() && r.detail != "auto").then(|| view! { <span class="ml-2 text-xs text-zinc-500">{r.detail.clone()}</span> })}
+                                </summary>
+                                {r.manual.clone().map(|m| view! { <p class="mt-2 text-sm"><span class="font-medium">"Before updating: "</span>{m}</p> })}
+                                <pre class="mt-2 overflow-auto whitespace-pre-wrap font-sans text-xs text-zinc-600 dark:text-zinc-400">{r.notes.clone()}</pre>
+                                {open.then(|| view! {
+                                    <div class="mt-2 flex gap-2">
+                                        <button class=BUTTON disabled=move || busy.get() on:click=move |_| act(Box::pin(api::update_release(v1.clone(), "apply")))>"Update now"</button>
+                                        <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| act(Box::pin(api::update_release(v2.clone(), "skip")))>"Skip this version"</button>
+                                    </div>
+                                })}
+                            </details>
+                        }
+                    }).collect_view()}
+                    <table class="w-full text-left text-sm">
+                        <thead class="text-xs text-zinc-500"><tr><th class="py-1">"Machine"</th><th>"Runs"</th><th>"Installed with"</th><th>"Update"</th></tr></thead>
+                        <tbody>
+                            {u.machines.into_iter().map(|m| view! {
+                                <tr class="border-t border-zinc-100 dark:border-zinc-800">
+                                    <td class="py-1">{m.name.clone()}</td>
+                                    <td class="font-mono text-xs">{m.running.clone()}</td>
+                                    <td class="text-xs text-zinc-500">{if m.method.is_empty() { "—".to_owned() } else { m.method.clone() }}</td>
+                                    <td class="text-xs">{if m.state.is_empty() { String::new() } else { format!("{} {}", m.version, m.state.replace('_', " ")) }}
+                                        {(!m.detail.is_empty()).then(|| view! { <span class="ml-1 text-zinc-500">{format!("({})", m.detail)}</span> })}</td>
+                                </tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                }
+            })}
+            <div class="grid gap-3 text-sm sm:grid-cols-2">
+                <label class="space-y-1">
+                    <span class="block text-xs text-zinc-500">"When a release is out"</span>
+                    <select class=SELECT prop:value=move || s.get().mode on:change=move |ev| { let m = event_target_value(&ev); s.update(|v| v.mode = m); }>
+                        <option value="approve">"Ask me (a decision)"</option>
+                        <option value="auto">"Update on its own"</option>
+                        <option value="notify">"Just show it here"</option>
+                        <option value="off">"Don't look"</option>
+                    </select>
+                </label>
+                {move || (s.get().mode == "auto").then(|| view! {
+                    <label class="space-y-1">
+                        <span class="block text-xs text-zinc-500">"On its own for (bigger ones ask)"</span>
+                        <select class=SELECT prop:value=move || s.get().auto_for on:change=move |ev| { let m = event_target_value(&ev); s.update(|v| v.auto_for = m); }>
+                            <option value="patch">"Patch releases (0.3.3 → 0.3.4)"</option>
+                            <option value="minor">"Minor releases too (0.3 → 0.4)"</option>
+                        </select>
+                    </label>
+                    <label class="space-y-1">
+                        <span class="block text-xs text-zinc-500">"Only between (the head's time; empty: any time)"</span>
+                        <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="02:00-05:00" prop:value=move || s.get().window
+                            on:change=move |ev| { let w = event_target_value(&ev); s.update(|v| v.window = w); } />
+                    </label>
+                })}
+                <label class="space-y-1">
+                    <span class="block text-xs text-zinc-500">"A busy worker waits at most (hours)"</span>
+                    <input type="number" min="0" class=format!("{INPUT} w-24 py-1") prop:value=move || s.get().drain_hours.to_string()
+                        on:change=move |ev| { let h = event_target_value(&ev).parse().unwrap_or(24); s.update(|v| v.drain_hours = h); } />
+                </label>
+                <label class="flex items-center gap-2">
+                    <input type="checkbox" prop:checked=move || s.get().parallel on:change=move |ev| { let on = event_target_checked(&ev); s.update(|v| v.parallel = on); } />
+                    "Update workers all at once (else one after another)"
+                </label>
+            </div>
+            <div class="flex justify-end"><button class=BUTTON on:click=save>"Save"</button></div>
         </section>
     }
 }

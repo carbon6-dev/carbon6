@@ -330,6 +330,9 @@ async fn act(
         (Some("app" | "package"), Some(_), Some(_)) => {
             crate::packages::answer(st, reference, option, values).await?;
         }
+        (Some("update"), Some(version), _) => {
+            crate::updates::answer(st, version, option).await?;
+        }
         (Some("publish"), _, _) => {
             crate::commons::answer(st, d, option == Some("Publish")).await?;
         }

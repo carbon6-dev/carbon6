@@ -51,6 +51,7 @@ pub mod terminals;
 pub mod tls;
 pub mod triggers;
 pub mod ui_ca;
+pub mod updates;
 pub mod usage;
 pub mod views;
 mod webauthn;
@@ -136,6 +137,8 @@ pub struct HeadState {
     pub data_dir: std::path::PathBuf,
     /// The knowledge graph and its store (docs/knowledge.md), in this process.
     pub memex: std::sync::OnceLock<Arc<c6_memex::Memex>>,
+    /// Updating carbon6 from GitHub releases (docs/updates.md).
+    pub updates: updates::Updater,
 }
 
 /// A running head.
@@ -202,6 +205,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     if let Some(t) = &ui_tls {
         names.push(t.name.clone());
     }
+    // An update in progress counts this start (and rolls back after too many).
+    let updater = updates::Updater::new(&cfg);
+    updates::before_open(&updater, &cfg.data_dir)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
     let shutdown = CancellationToken::new();
     let registry = registry::Registry::new(shutdown.clone());
@@ -230,7 +236,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         shutdown: shutdown.clone(),
         data_dir: cfg.data_dir.clone(),
         memex: Default::default(),
+        updates: updater,
     });
+    updates::after_open(&state).await;
 
     let mut tasks = JoinSet::new();
 
@@ -346,6 +354,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     }
     let _ = state.ui_urls.set(ui_urls.clone());
     info!(ui = ?ui_urls, worker = ?worker_addrs, worker_url = %state.worker_url, auth = cfg.auth, "head started");
+    updates::started(&state).await;
     Ok(Head { state, ui_addrs, worker_addrs, ui_urls, shutdown, tasks })
 }
 

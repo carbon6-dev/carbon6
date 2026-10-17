@@ -76,6 +76,7 @@ The tag starts the **Release workflow**:
    - with a bottle for each;
    - downloading from `https://github.com/carbon6-dev/carbon6/releases/download/v<version>/`.
 2. **`SHA256SUMS`** of every file, and **the notes:** the version's section of `CHANGELOG.md`.
+   Also **`release.json`**, signed into `release.json.sig` with the secret `RELEASE_SIGNING_KEY` (`manifest.sh`). Without the secret it is unsigned, and machines don't update themselves to that release.
 3. **The GitHub release** `v<version>`, with the files below. If the release already exists (a re-run), missing files are uploaded.
 4. **The tap:** the formulas are committed to `carbon6-dev/homebrew-carbon6`, so `brew install carbon6-dev/carbon6/c6h` works and `brew upgrade` finds new releases.
    - This needs the repository secret `TAP_TOKEN`: a fine-grained token with *Contents: read and write* on the tap repository only.
@@ -91,6 +92,7 @@ The files on a release:
 | `c6h-<v>-darwin-arm64.tar.gz`, `-x86_64` (and the others) | each binary for macOS without Homebrew; also the formulas' source |
 | `c6h.rb` and the other formulas | the formulas, as pushed to the tap |
 | `SHA256SUMS` | checksums of all of the above |
+| `release.json`, `release.json.sig` | the manifest carbon6 updates itself from, and its Ed25519 signature ([docs/updates.md](updates.md) §2) |
 
 ## 7. Make targets
 
@@ -108,6 +110,7 @@ The files on a release:
 2. **Tap repository:** create a public, empty `carbon6-dev/homebrew-carbon6`.
 3. **Token:** make a fine-grained token for it with *Contents: read and write*, and add it to `carbon6-dev/carbon6` as the Actions secret `TAP_TOKEN`.
 4. **Release:** `make release BUMP=minor` cuts `0.2.0`.
+5. **Signing key** for self-updates: `gh secret set RELEASE_SIGNING_KEY < ~/.config/carbon6-release/signing-key.pem`. Its public half is `c6_core::update::RELEASE_KEYS`.
 
 ## 9. Open questions
 

@@ -3800,6 +3800,103 @@ pub struct ImportRule {
     pub realm: String,
 }
 
+/// When carbon6 updates itself from GitHub releases
+/// (`/api/v1/settings/updates`, docs/updates.md §4).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateSettings {
+    /// off (not even looking) · notify · approve (a Decision for each) · auto.
+    #[serde(default = "update_mode")]
+    pub mode: String,
+    /// With auto: the biggest step applied without asking (patch · minor).
+    #[serde(default = "update_auto_for")]
+    pub auto_for: String,
+    /// With auto: when, in the head's local time ("02:00-05:00"); empty: any time.
+    #[serde(default)]
+    pub window: String,
+    /// Versions never to apply.
+    #[serde(default)]
+    pub skip: Vec<String>,
+    /// How long a worker waits for its sessions to go idle before it updates anyway.
+    #[serde(default = "update_drain_hours")]
+    pub drain_hours: u32,
+    /// Workers update all at once instead of one after another.
+    #[serde(default)]
+    pub parallel: bool,
+}
+
+fn update_mode() -> String {
+    "approve".into()
+}
+fn update_auto_for() -> String {
+    "patch".into()
+}
+fn update_drain_hours() -> u32 {
+    24
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            mode: update_mode(),
+            auto_for: update_auto_for(),
+            window: String::new(),
+            skip: Vec::new(),
+            drain_hours: update_drain_hours(),
+            parallel: false,
+        }
+    }
+}
+
+/// A release found on GitHub, and how far it is (`/api/v1/system/updates`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Release {
+    pub version: String,
+    pub date: String,
+    pub notes: String,
+    /// Steps a person takes; such a release is never applied on its own.
+    #[serde(default)]
+    pub manual: Option<String>,
+    /// available · approved · skipped · applying · done · failed
+    pub state: String,
+    pub detail: String,
+    pub found_at: UnixMs,
+}
+
+/// A machine's part in an update.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MachineUpdate {
+    /// "head", or the worker's id.
+    pub machine: String,
+    pub name: String,
+    /// The version it runs now.
+    pub running: String,
+    /// The version it is updating to (empty: none).
+    pub version: String,
+    /// waiting · downloading · installing · restarting · done · failed · rolled_back
+    pub state: String,
+    /// brew · deb · tarball · source
+    pub method: String,
+    pub detail: String,
+    pub updated_at: UnixMs,
+}
+
+/// `/api/v1/system/updates`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Updates {
+    pub version: String,
+    pub settings: UpdateSettings,
+    /// Releases newer than this one, newest first, and the last few applied.
+    pub releases: Vec<Release>,
+    pub machines: Vec<MachineUpdate>,
+    pub checked_at: Option<UnixMs>,
+    /// Why the last look at GitHub failed (empty: it didn't).
+    pub check_error: String,
+}
+
 /// A connected Google account (`/api/v1/google/accounts`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

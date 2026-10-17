@@ -21,6 +21,10 @@ struct Cli {
 enum Command {
     /// Run the head (the default).
     Serve,
+    /// Install an update this daemon downloaded (run as root by
+    /// `c6h-update.service`; docs/updates.md §6).
+    #[command(hide = true)]
+    UpdateInstall { dir: PathBuf },
     /// Print a one-time worker enrollment token (valid for one hour).
     EnrollToken {
         /// Display name for the worker; defaults to its hostname.
@@ -73,7 +77,15 @@ async fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             let auth = cfg.auth;
-            let mut head = c6_head::start(cfg).await?;
+            let mut head = match c6_head::start(cfg).await {
+                Ok(h) => h,
+                // This version was rolled back: the previous one runs after a restart.
+                Err(e) if e.is::<c6_head::updates::RolledBack>() => {
+                    eprintln!("{e}");
+                    std::process::exit(c6_core::update::RESTART_CODE);
+                }
+                Err(e) => return Err(e),
+            };
             for url in &head.ui_urls {
                 eprintln!("web UI: {url}");
             }
@@ -90,7 +102,23 @@ async fn main() -> anyhow::Result<()> {
                 }
                 token.cancel();
             });
-            head.wait().await
+            let state = head.state.clone();
+            head.wait().await?;
+            // Updated (docs/updates.md): the service manager starts the new version.
+            if state.updates.restart_requested() {
+                restart();
+            }
+            Ok(())
+        }
+        Command::UpdateInstall { dir } => {
+            let r = c6_core::update::install_requested(&dir, c6_core::VERSION, c6_core::update::RELEASE_KEYS);
+            match r {
+                Ok(m) => {
+                    println!("{m}");
+                    Ok(())
+                }
+                Err(e) => anyhow::bail!(e),
+            }
         }
         Command::LoginLink => {
             for url in c6_head::offline_login_link(cfg).await.context("creating login link")? {
@@ -130,4 +158,17 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Exits so the new version runs: with the restart code under a service
+/// manager (systemd, launchd), else by running it in this process's place.
+fn restart() -> ! {
+    let supervised = ["INVOCATION_ID", "XPC_SERVICE_NAME", "LAUNCHD_SOCKET"].iter().any(|v| std::env::var_os(v).is_some_and(|x| x != "0"));
+    // As it was started (a brew symlink now points at the new version).
+    if !supervised && let Some(exe) = std::env::args_os().next() {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec();
+        eprintln!("restarting: {err}");
+    }
+    std::process::exit(c6_core::update::RESTART_CODE)
 }

@@ -228,6 +228,11 @@ impl SessionManager {
         Some(Working { counts: self.working.clone(), root: root.to_owned() })
     }
 
+    /// How many sessions are in the middle of a turn.
+    pub fn running(&self) -> usize {
+        self.actors.lock().unwrap().values().filter(|a| !a.tx.is_closed() && a.running.load(std::sync::atomic::Ordering::SeqCst)).count()
+    }
+
     /// Whether the session's actor is running a turn.
     pub(crate) fn is_running(&self, session_id: &str) -> bool {
         self.actors

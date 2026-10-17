@@ -6,4 +6,5 @@ if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
         [ -L "$link" ] && systemctl disable "$(basename "$link")" || true
     done
     systemctl stop 'c6w@*.service' || true
+    systemctl disable --now c6w-update.path || true
 fi

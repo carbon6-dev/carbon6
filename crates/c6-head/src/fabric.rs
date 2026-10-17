@@ -97,6 +97,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     // Sessions this worker imports from Claude Code and Codex (docs/imports.md).
     match method {
         "imports.config" => return crate::imports::config(st, from).await,
+        // How its update goes (docs/updates.md §5).
+        "update.status" => return crate::updates::worker_status(st, from, &params).await,
         "imports.status" => return crate::imports::status(st, from, params["id"].as_str().unwrap_or_default()).await,
         "imports.append" => return crate::imports::append(st, from, &params).await,
         _ => {}
