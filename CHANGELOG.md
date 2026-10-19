@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.5 (2026-10-19)
+
+- Model calls that fail on the way are tried again instead of stopping the turn (up to 6 times, the session saying why it waits), and a token the provider refuses is renewed through the head for each call
+
 ## 0.3.4 (2026-10-17)
 
 - carbon6 updates itself from signed GitHub releases: the head looks every 6 hours and asks (a decision), updates itself, then each worker once its sessions are idle; by brew, a .deb's root helper or in place, rolled back if it doesn't start
