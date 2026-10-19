@@ -146,6 +146,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/live", get(live))
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
+        .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
@@ -675,6 +676,15 @@ async fn session_matches(
     Query(f): Query<FindQuery>,
 ) -> ApiResult<Json<api::SessionMatches>> {
     Ok(Json(crate::search::session_matches(&st.store, &id, &f.q).await?))
+}
+
+/// The session's open decisions, to answer in it.
+async fn session_decisions(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::Decision>>> {
+    Ok(Json(crate::decisions::of_session(&st, &id, &caller).await?))
 }
 
 async fn search(

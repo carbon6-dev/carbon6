@@ -179,6 +179,26 @@ pub async fn list(st: &HeadState, state: &str, caller: &Caller) -> anyhow::Resul
     Ok(rows.iter().map(decision_of).collect())
 }
 
+/// A session's open decisions, to answer in it: what its agent raised or
+/// asked without stopping, what it asked a grant for, and what it was
+/// started to work on. Not its tool approvals and questions: the session
+/// shows those itself, from its log.
+pub async fn of_session(st: &HeadState, session_id: &str, caller: &Caller) -> anyhow::Result<Vec<api::Decision>> {
+    let rows = sqlx::query(
+        "SELECT * FROM decisions WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)) AND (? IS NULL OR realm = ?) \
+         AND (json_extract(context, '$.session') = ? OR EXISTS (SELECT 1 FROM json_each(decisions.sessions) WHERE value = ?)) \
+         AND ref NOT LIKE 'approval:%' AND ref NOT LIKE 'question:%' ORDER BY created_at",
+    )
+    .bind(now_ms())
+    .bind(&caller.realm)
+    .bind(&caller.realm)
+    .bind(session_id)
+    .bind(session_id)
+    .fetch_all(&st.store.pool)
+    .await?;
+    Ok(rows.iter().map(decision_of).collect())
+}
+
 pub async fn open_count(st: &HeadState, caller: &Caller) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT COUNT(*) FROM decisions WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)) AND (? IS NULL OR realm = ?)",

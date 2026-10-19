@@ -92,8 +92,37 @@ pub fn DecisionsPage() -> impl IntoView {
     }
 }
 
+/// A session's open decisions, answered where you are (Decisions lists
+/// them too). Reloads as sessions change, and every 30 seconds.
 #[component]
-fn DecisionCard(d: Decision, refresh: Callback<()>) -> impl IntoView {
+pub fn SessionDecisions(session: String) -> impl IntoView {
+    let live = api::live();
+    let tick = RwSignal::new(0u32);
+    let handle = set_interval_with_handle(move || tick.update(|t| *t += 1), std::time::Duration::from_secs(30)).ok();
+    on_cleanup(move || {
+        if let Some(h) = handle {
+            h.clear();
+        }
+    });
+    let session = StoredValue::new(session);
+    let list = LocalResource::new(move || {
+        tick.track();
+        live.sessions.track();
+        api::session_decisions(session.get_value())
+    });
+    let refresh = Callback::new(move |()| tick.update(|t| *t += 1));
+    view! {
+        {move || list.get().and_then(Result::ok).filter(|ds| !ds.is_empty()).map(|ds| view! {
+            <div class="space-y-2">
+                <p class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Waiting for you"</p>
+                {ds.into_iter().map(|d| view! { <DecisionCard d refresh in_session=true /> }).collect_view()}
+            </div>
+        })}
+    }
+}
+
+#[component]
+fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session: bool) -> impl IntoView {
     let ws = use_workspace();
     let id = d.id;
     let note = RwSignal::new(String::new());
@@ -171,12 +200,12 @@ fn DecisionCard(d: Decision, refresh: Callback<()>) -> impl IntoView {
                 {(d.waiting && open).then(|| view! { <span class="rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">"waiting"</span> })}
                 <h2 class="min-w-0 flex-1 font-medium">{d.title.clone()}</h2>
                 {(d.count > 1).then(|| view! { <span class="text-xs text-zinc-500">{format!("raised {}×", d.count)}</span> })}
-                <span class="text-xs text-zinc-500">{format!("{} ago", ago(now_ms() - d.updated_at))}</span>
+                <span class="text-xs text-zinc-500">{ago(now_ms() - d.updated_at)}</span>
             </div>
             {(!d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" inner_html=crate::markdown::to_html(&d.document)></div> })}
             <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-                <span>{format!("from {}", d.source)}</span>
-                {session.map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session ↗"</Go> })}
+                {(!in_session).then(|| view! { <span>{format!("from {}", d.source)}</span> })}
+                {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session ↗"</Go> })}
                 {things.into_iter().map(|k| view! { <span class="rounded bg-violet-100 px-1 font-mono text-violet-800 dark:bg-violet-950 dark:text-violet-300">{k}</span> }).collect_view()}
                 {d.sessions.iter().map(|s| view! { <Go to=View::session(s.clone()) class="text-sky-700 hover:underline dark:text-sky-400">"working session ↗"</Go> }).collect_view()}
                 {deadline.map(|t| view! { <span class="text-amber-700 dark:text-amber-400">{t}</span> })}

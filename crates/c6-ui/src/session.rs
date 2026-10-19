@@ -788,6 +788,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                     }
                 }
             </For>
+            <crate::decisions::SessionDecisions session=id.get_value() />
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
             {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
                 <div class="space-y-2">

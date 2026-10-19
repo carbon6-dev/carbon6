@@ -967,6 +967,11 @@ pub async fn decisions(state: String) -> Result<Vec<c6_api::Decision>, String> {
     json(Request::get(&format!("/api/v1/decisions?state={state}")).send().await).await
 }
 
+/// A session's open decisions (not its approvals and questions: those are in its log).
+pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await
+}
+
 pub async fn decision_count() -> Result<i64, String> {
     let v: serde_json::Value = json(Request::get("/api/v1/decisions/count").send().await).await?;
     Ok(v["open"].as_i64().unwrap_or(0))

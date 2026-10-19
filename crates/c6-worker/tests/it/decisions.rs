@@ -122,6 +122,9 @@ async fn decisions_answer_what_waits() {
     let s1 = start("deploy it").await;
     let d = eventually("the approval decision", async || open().await.into_iter().find(|d| d.kind == "approve")).await;
     assert!(d.waiting && d.title == "Allow bash?" && d.document.contains("echo deploy-ran"), "{d:?}");
+    // Not among the session's own decisions: its log shows the approval.
+    let of_s1: Vec<Decision> = http.get(format!("{api}/sessions/{}/decisions", s1.id)).send().await.unwrap().json().await.unwrap();
+    assert!(of_s1.is_empty(), "{of_s1:?}");
     assert_eq!(d.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), vec!["Allow", "Deny"]);
     assert_eq!(d.default_answer.as_deref(), Some("Deny"));
     let r = answer(d.id, json!({"option": "Maybe"})).await;
@@ -170,6 +173,9 @@ async fn decisions_answer_what_waits() {
     let s3 = start("set up staging").await;
     let d3 = eventually("the agent's question", async || open().await.into_iter().find(|d| d.title == "Which region for staging?")).await;
     assert!(d3.waiting && d3.kind == "choose" && d3.source == format!("session:{}", s3.id), "{d3:?}");
+    // The session shows it, to answer there.
+    let of_s3: Vec<Decision> = http.get(format!("{api}/sessions/{}/decisions", s3.id)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(of_s3.iter().map(|d| d.id).collect::<Vec<_>>(), vec![d3.id]);
     // The agent heard at once that it was asked (its next request).
     eventually("the tool's reply", async || {
         mock.requests().iter().any(|r| r["messages"].to_string().contains(&format!("decision #{} asked; carry on", d3.id))).then_some(())
