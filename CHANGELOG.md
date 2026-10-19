@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.6 (2026-10-19)
+
+- Tests that restart a head on its ports retry while a parallel test holds one, and the terminal test waits longer for a slow shell (both failed CI once)
+- The imports test waits for the continued turn to end before counting its events (it raced the turn's last events on Linux)
+
 ## 0.3.5 (2026-10-19)
 
 - Model calls that fail on the way are tried again instead of stopping the turn (up to 6 times, the session saying why it waits), and a token the provider refuses is renewed through the head for each call
