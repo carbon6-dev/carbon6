@@ -157,7 +157,7 @@ async fn search_finds_events_and_survives_reindex() {
     stop.cancel();
     head.state.store.set_setting("search.version", "0").await.unwrap();
     head.shutdown().await.unwrap();
-    let head = c6_head::start(cfg(head_dir.path(), ports.0, ports.1)).await.unwrap();
+    let head = crate::restart_head(cfg(head_dir.path(), ports.0, ports.1)).await;
     eventually("re-index", async || (head.state.store.setting("search.version").await.unwrap().as_deref() == Some("1")).then_some(()))
         .await;
     let r = search(&http, &api, &[("q", "quokka")]).await;

@@ -69,3 +69,19 @@ pub async fn open_worker(state: &std::path::Path) -> std::sync::Arc<c6_worker::W
         }
     }
 }
+
+/// Starts a head again on the ports it had (its workers know them). Tests
+/// run in parallel, and one may briefly hold a port just freed (a head it
+/// starts on port 0 gets it), so binding is retried for a while.
+pub async fn restart_head(cfg: c6_head::HeadConfig) -> c6_head::Head {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match c6_head::start(cfg.clone()).await {
+            Ok(h) => return h,
+            Err(e) if format!("{e:#}").contains("binding") && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("starting the head again: {e:#}"),
+        }
+    }
+}

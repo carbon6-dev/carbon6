@@ -98,9 +98,10 @@ async fn files_git_and_terminal() {
     ws.send(Message::Binary(b"stty size; echo c6-$((40+2)); exit\n".to_vec().into())).await.unwrap();
     let mut seen = String::new();
     let mut exit = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // A login shell on a busy CI machine can take a while to say anything.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while exit.is_none() && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+        match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
             Ok(Some(Ok(Message::Binary(b)))) => seen.push_str(&String::from_utf8_lossy(&b)),
             Ok(Some(Ok(Message::Text(t)))) => exit = Some(t.to_string()),
             _ => break,

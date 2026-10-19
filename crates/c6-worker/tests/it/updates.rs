@@ -27,10 +27,6 @@ async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 fn tgz(files: &[(&str, &str)]) -> Vec<u8> {
     let d = tempfile::tempdir().unwrap();
     for (name, body) in files {
@@ -95,8 +91,7 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     }
 
     let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (ui_port, worker_port) = (free_port(), free_port());
-    let cfg = |runs: &str| HeadConfig {
+    let cfg = |runs: &str, (ui_port, worker_port): (u16, u16)| HeadConfig {
         data_dir: head_dir.path().to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port,
@@ -108,8 +103,9 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
         update_as_version: Some(runs.to_owned()),
         ..Default::default()
     };
-    let mut head = c6_head::start(cfg("9.9.8")).await.unwrap();
-    let api = format!("http://127.0.0.1:{ui_port}/api/v1");
+    let mut head = c6_head::start(cfg("9.9.8", (0, 0))).await.unwrap();
+    let ports = (head.ui_addrs[0].port(), head.worker_addrs[0].port());
+    let api = format!("http://127.0.0.1:{}/api/v1", ports.0);
     let http = reqwest::Client::new();
     let get = async |path: &str| -> Value { http.get(format!("{api}/{path}")).send().await.unwrap().json().await.unwrap() };
     let post = async |path: &str, body: Value| -> Value {
@@ -144,7 +140,7 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     drop(head);
 
     // The new version starts: done; then the worker updates.
-    let head = c6_head::start(cfg(V)).await.unwrap();
+    let head = crate::restart_head(cfg(V, ports)).await;
     let s = get("system/updates").await;
     assert_eq!(s["machines"][0]["state"], "done", "{s}");
     run.await.unwrap().unwrap();

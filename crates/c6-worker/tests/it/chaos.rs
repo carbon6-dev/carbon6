@@ -81,7 +81,7 @@ impl Env {
 
     async fn restart_head(&mut self) {
         self.head.take().unwrap().shutdown().await.unwrap();
-        self.head = Some(c6_head::start(cfg(self.head_dir.path(), self.ports.0, self.ports.1)).await.unwrap());
+        self.head = Some(crate::restart_head(cfg(self.head_dir.path(), self.ports.0, self.ports.1)).await);
     }
 
     async fn create(&self, worker: &Worker, cwd: &Path, prompt: &str) -> String {
