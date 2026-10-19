@@ -164,9 +164,11 @@ async fn sessions_come_in_from_claude_code_and_codex() {
     eventually("the continued turn", async || (!mock.requests().is_empty()).then_some(())).await;
     let asked = mock.requests()[0]["messages"].to_string();
     assert!(asked.contains("fix the flaky build") && asked.contains("1 failed") && asked.contains("fix them"), "{asked}");
+    // The whole turn: its reply, then its usage and its end.
     let ev = eventually("the reply", async || {
         let ev = events(cc_id).await;
-        serde_json::to_string(&ev).unwrap().contains("Both fixed.").then_some(ev)
+        let done = serde_json::to_string(&ev).unwrap().contains("Both fixed.") && ev.last().is_some_and(|e| e["type"] == "turn_ended");
+        done.then_some(ev)
     })
     .await;
     // Carbon6's now: the file growing again changes nothing.
