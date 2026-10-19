@@ -24,7 +24,7 @@ impl c6_worker::link::LocalHead for Local {
     }
 
     async fn credential(&self, connection_id: &str) -> CredentialGrant {
-        let req = CredentialRequest { request_id: 0, connection_id: connection_id.to_owned() };
+        let req = CredentialRequest { request_id: 0, connection_id: connection_id.to_owned(), refresh: false };
         match self.st.upgrade() {
             Some(st) => crate::sessions::credential_for(&st, None, "head", req).await,
             None => CredentialGrant { connection_id: connection_id.to_owned(), error: "the head stopped".into(), ..Default::default() },

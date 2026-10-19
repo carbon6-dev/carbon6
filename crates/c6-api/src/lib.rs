@@ -2071,6 +2071,10 @@ pub enum StreamMsg {
     },
     Activity {
         running: bool,
+        /// What it's doing when that isn't streaming (waiting to try a
+        /// failed model call again); empty: nothing to say.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        status: String,
     },
     /// A secret an operation returned (a token, a code), for you only:
     /// shown live, never logged or given to the model.

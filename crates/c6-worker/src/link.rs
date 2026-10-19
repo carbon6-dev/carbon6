@@ -119,6 +119,17 @@ impl HeadLink {
     }
 
     pub async fn credential(&self, connection_id: &str) -> anyhow::Result<CredentialGrant> {
+        self.credential_with(connection_id, false).await
+    }
+
+    /// New credentials, after the provider refused the ones it had (HTTP
+    /// 401): the head signs in again where it can (ChatGPT).
+    pub async fn fresh_credential(&self, connection_id: &str) -> anyhow::Result<CredentialGrant> {
+        self.cache.lock().unwrap().remove(connection_id);
+        self.credential_with(connection_id, true).await
+    }
+
+    async fn credential_with(&self, connection_id: &str, refresh: bool) -> anyhow::Result<CredentialGrant> {
         let now = c6_core::now_ms();
         let cached = self.cache.lock().unwrap().get(connection_id).cloned();
         if let Some(g) = &cached
@@ -146,7 +157,7 @@ impl HeadLink {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
         self.waiters.lock().unwrap().insert(request_id, done);
-        let req = CredentialRequest { request_id, connection_id: connection_id.to_owned() };
+        let req = CredentialRequest { request_id, connection_id: connection_id.to_owned(), refresh };
         tx.send(WorkerMsg { msg: Some(worker_msg::Msg::CredentialRequest(req)) }).await.map_err(|_| anyhow!("head connection closed"))?;
 
         let grant = tokio::time::timeout(CREDENTIAL_TIMEOUT, wait)
@@ -165,6 +176,51 @@ impl HeadLink {
         }
         if let Some(w) = self.waiters.lock().unwrap().remove(&grant.request_id) {
             let _ = w.send(grant);
+        }
+    }
+}
+
+/// A model client that takes its credentials from the head for every call
+/// (cached until they near expiry), so a long turn never runs on an
+/// expired token; when the provider refuses them anyway (HTTP 401), it
+/// asks the head for new ones and tries once more.
+pub struct LinkedClient {
+    link: Arc<HeadLink>,
+    connection_id: String,
+    /// The client for the last bearer token, kept while the token is.
+    current: Mutex<Option<(String, Arc<dyn c6_llm::ModelClient>)>>,
+}
+
+impl LinkedClient {
+    pub fn new(link: Arc<HeadLink>, connection_id: &str) -> Self {
+        Self { link, connection_id: connection_id.to_owned(), current: Mutex::default() }
+    }
+
+    fn client(&self, g: &CredentialGrant) -> Result<Arc<dyn c6_llm::ModelClient>, c6_llm::LlmError> {
+        let mut current = self.current.lock().unwrap();
+        if let Some((bearer, c)) = current.as_ref()
+            && *bearer == g.bearer
+        {
+            return Ok(c.clone());
+        }
+        let c: Arc<dyn c6_llm::ModelClient> = Arc::from(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers.clone())?);
+        *current = Some((g.bearer.clone(), c.clone()));
+        Ok(c)
+    }
+}
+
+#[async_trait::async_trait]
+impl c6_llm::ModelClient for LinkedClient {
+    async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
+        let unreachable = |e: anyhow::Error| c6_llm::LlmError::Network(format!("credentials from the head: {e:#}"));
+        let g = self.link.credential(&self.connection_id).await.map_err(unreachable)?;
+        match self.client(&g)?.stream(req).await {
+            Err(c6_llm::LlmError::Http { status: 401, body, .. }) => {
+                tracing::warn!(connection = %self.connection_id, "the provider refused the credentials; asking the head for new ones: {body}");
+                let g = self.link.fresh_credential(&self.connection_id).await.map_err(unreachable)?;
+                self.client(&g)?.stream(req).await
+            }
+            r => r,
         }
     }
 }
@@ -209,10 +265,80 @@ mod tests {
         push_merged(&mut v, text("b", 1, "x"));
         push_merged(
             &mut v,
-            EphemeralEvent { session_id: "b".into(), kind: Some(ephemeral_event::Kind::Activity(SessionActivity { running: true })) },
+            EphemeralEvent {
+                session_id: "b".into(),
+                kind: Some(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() })),
+            },
         );
         push_merged(&mut v, text("b", 1, "y"));
         assert_eq!(v.len(), 4);
         assert_eq!(v[0], text("a", 1, "Hello"));
+    }
+
+    /// A token the provider refuses (401) is traded for a new one from the
+    /// head, and the call goes through.
+    #[tokio::test]
+    async fn refused_credentials_are_renewed() {
+        use c6_llm::ModelClient;
+        use futures::StreamExt;
+        struct Head(std::sync::atomic::AtomicU32);
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("no".into())
+            }
+            async fn credential(&self, connection_id: &str) -> CredentialGrant {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                CredentialGrant {
+                    connection_id: connection_id.into(),
+                    kind: "openai_compat".into(),
+                    base_url: std::env::var("C6_TEST_LLM").unwrap_or_default(),
+                    bearer: if n == 0 { "old".into() } else { "new".into() },
+                    expires_at_ms: c6_core::now_ms() + 3_600_000,
+                    ..Default::default()
+                }
+            }
+        }
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|h: axum::http::HeaderMap| async move {
+                if h.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer new") {
+                    return (axum::http::StatusCode::UNAUTHORIZED, r#"{"error":{"code":"token_expired"}}"#.to_owned());
+                }
+                let chunks = [
+                    r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+                ];
+                (axum::http::StatusCode::OK, chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        // SAFETY: read only by this test's fake head.
+        unsafe { std::env::set_var("C6_TEST_LLM", &url) };
+
+        let head = Arc::new(Head(Default::default()));
+        let link = Arc::new(HeadLink::local(head.clone()));
+        let client = LinkedClient::new(link, "c1");
+        let req = c6_llm::ModelRequest {
+            model: "m".into(),
+            system: String::new(),
+            messages: vec![c6_llm::Message::user_text("hi")],
+            tools: Vec::new(),
+            max_output_tokens: None,
+            cache_key: None,
+            effort: None,
+            web_search: false,
+        };
+        let mut stream = client.stream(&req).await.unwrap();
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            if let c6_llm::ModelEvent::TextDelta(t) = ev.unwrap() {
+                text.push_str(&t);
+            }
+        }
+        assert_eq!(text, "hi");
+        assert_eq!(head.0.load(Ordering::SeqCst), 2);
     }
 }

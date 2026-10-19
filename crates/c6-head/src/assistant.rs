@@ -283,7 +283,7 @@ impl Actor {
                 }
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     running = None;
-                    actor.sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
+                    actor.sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false, ..Default::default() }));
                     actor.conv = Some(match done {
                         Ok(Some(c)) => c,
                         _ => Conversation { history: history_from_events(&c6_agent::effective_events(
@@ -400,7 +400,7 @@ impl Actor {
         let mut conv = self.conv.take().unwrap_or(Conversation { history: Vec::new(), context_tokens: 0 });
         let (st, sink, inbox, env, c, connection_id) =
             (self.st.clone(), self.sink.clone(), self.inbox.clone(), self.env.clone(), cancel.clone(), self.model.connection_id.clone());
-        sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true }));
+        sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
         let task = tokio::spawn(async move {
             let dyn_sink: Arc<dyn EventSink> = sink.clone();
             let result = async {

@@ -12,7 +12,7 @@ use c6_proto::{
 };
 use prost::Message;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::store::{NewCommand, SessionRow};
@@ -1314,7 +1314,7 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
     grant.kind = conn.kind.clone();
     grant.base_url = conn.base_url.clone();
     if conn.kind == "chatgpt" {
-        match chatgpt_tokens(st, &conn.id).await {
+        match chatgpt_tokens_now(st, &conn.id, req.refresh).await {
             Ok(t) => {
                 grant.bearer = t.access_token;
                 grant.expires_at_ms = t.expires_at_ms;
@@ -1339,14 +1339,34 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
 /// Current ChatGPT tokens for a connection, refreshed here (never on
 /// workers) when close to expiry.
 pub async fn chatgpt_tokens(st: &HeadState, connection_id: &str) -> anyhow::Result<crate::oauth::ChatGptTokens> {
+    chatgpt_tokens_now(st, connection_id, false).await
+}
+
+/// When ChatGPT refused a token before its time (`refused`), it is
+/// refreshed anyway, at most once a minute per connection (the workers
+/// that all got the same refusal share the one refresh).
+async fn chatgpt_tokens_now(st: &HeadState, connection_id: &str, refused: bool) -> anyhow::Result<crate::oauth::ChatGptTokens> {
+    static FORCED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> = std::sync::LazyLock::new(Default::default);
     let lock = st.oauth.lock_for(connection_id);
     let _guard = lock.lock().await;
     // Read under the lock so a refresh that just finished is seen.
     let row = st.store.connection(connection_id).await?.ok_or_else(|| not_found("no such connection"))?;
     let blob = row.api_key.ok_or_else(|| bad_request("connection has no stored sign-in"))?;
     let tokens: crate::oauth::ChatGptTokens = serde_json::from_str(&st.secrets.decrypt(&blob)?)?;
-    if !crate::oauth::OAuth::needs_refresh(&tokens) {
+    let force = refused && {
+        let mut f = FORCED.lock().unwrap();
+        let now = now_ms();
+        let recent = f.get(connection_id).is_some_and(|t| now - t < 60_000);
+        if !recent {
+            f.insert(connection_id.to_owned(), now);
+        }
+        !recent
+    };
+    if !force && !crate::oauth::OAuth::needs_refresh(&tokens) {
         return Ok(tokens);
+    }
+    if force {
+        info!(connection = %connection_id, "ChatGPT refused its token early; refreshing it");
     }
     let refreshed = st.oauth.refresh(&st.http, tokens).await?;
     st.store.set_connection_secret(connection_id, &st.secrets.encrypt(&serde_json::to_string(&refreshed)?)?).await?;

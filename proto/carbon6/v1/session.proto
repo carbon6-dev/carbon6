@@ -339,6 +339,9 @@ message ToolOutputDelta {
 
 message SessionActivity {
   bool running = 1;
+  // What it is doing when that isn't streaming text (e.g. waiting to try
+  // a failed model call again); empty: nothing to say.
+  string status = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +546,9 @@ message CommandRejected {
 message CredentialRequest {
   uint64 request_id = 1;
   string connection_id = 2;
+  // The provider refused the last grant (HTTP 401): sign in again rather
+  // than hand out the stored token (ChatGPT's, refreshed now).
+  bool refresh = 3;
 }
 
 message CredentialGrant {

@@ -16,6 +16,8 @@ pub(crate) struct Streaming {
     pub(crate) text: String,
     thinking: String,
     tool_output: HashMap<String, String>,
+    /// Waiting to try a failed model call again, and why.
+    status: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -204,7 +206,15 @@ impl Feed {
                 StreamMsg::Text { text, .. } => streaming.update(|s| s.text.push_str(&text)),
                 StreamMsg::Thinking { text, .. } => streaming.update(|s| s.thinking.push_str(&text)),
                 StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
-                StreamMsg::Activity { running } => activity.set(Some(running)),
+                StreamMsg::Activity { running, status } => {
+                    activity.set(Some(running));
+                    // A retry starts the response over: drop what the failed call streamed.
+                    if !status.is_empty() {
+                        streaming.set(Streaming { status, ..Default::default() });
+                    } else {
+                        streaming.update(|s| s.status.clear());
+                    }
+                }
                 StreamMsg::Queue { queued: q } => queued.set(q),
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
             },
@@ -514,7 +524,9 @@ fn SubagentsPill(session: String, tree: String, events: RwSignal<Vec<Event>>, fo
     let marks = Memo::new(move |_| {
         events.with(|evs| {
             evs.iter()
-                .filter(|e| matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. }))
+                .filter(|e| {
+                    matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. })
+                })
                 .count()
         })
     });
@@ -640,7 +652,9 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
     let marks = Memo::new(move |_| {
         events.with(|evs| {
             evs.iter()
-                .filter(|e| matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. }))
+                .filter(|e| {
+                    matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. })
+                })
                 .count()
         })
     });
@@ -783,7 +797,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             }))}
             {move || (running.get() && streaming.with(|s| s.text.is_empty() && s.thinking.is_empty())).then(|| view! {
                 <div class="flex items-center gap-2 text-sm text-zinc-500">
-                    <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>"Working…"
+                    <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
+                    {move || streaming.with(|s| if s.status.is_empty() { "Working…".to_owned() } else { s.status.clone() })}
                 </div>
             })}
             {move || running.get().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
@@ -1508,14 +1523,17 @@ impl Subagents {
             })
         });
         let by_call = Memo::new(move |_| {
-            let mut m: HashMap<String, String> = children.with(|cs| cs.iter().filter_map(|c| Some((c.parent_call_id.clone()?, c.id.clone()))).collect());
+            let mut m: HashMap<String, String> =
+                children.with(|cs| cs.iter().filter_map(|c| Some((c.parent_call_id.clone()?, c.id.clone()))).collect());
             spawned.with(|sp| m.extend(sp.iter().map(|(call, child, _)| (call.clone(), child.clone()))));
             m
         });
         let by_task = Memo::new(move |_| {
             spawned.with(|sp| sp.iter().filter(|(_, _, t)| !t.is_empty()).map(|(_, child, t)| (t.clone(), child.clone())).collect())
         });
-        let rows = Memo::new(move |_| children.with(|cs| cs.iter().filter(|c| c.parent_call_id.is_some()).map(|c| (c.id.clone(), c.clone())).collect()));
+        let rows = Memo::new(move |_| {
+            children.with(|cs| cs.iter().filter(|c| c.parent_call_id.is_some()).map(|c| (c.id.clone(), c.clone())).collect())
+        });
         Self { by_call, by_task, rows }
     }
 
@@ -1639,7 +1657,9 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
         let ms: i64 = usage.with(|u| u.turns.values().map(|t| t.ended.unwrap_or_else(|| now.get()) - t.started).sum());
         (ms > 0).then(|| duration(ms))
     };
-    let resumable = move || !running.get() && matches!(end.get(), Some(TurnEndReason::Interrupted | TurnEndReason::Error | TurnEndReason::WorkerRestarted));
+    let resumable = move || {
+        !running.get() && matches!(end.get(), Some(TurnEndReason::Interrupted | TurnEndReason::Error | TurnEndReason::WorkerRestarted))
+    };
     let stop = move |_| {
         spawn_local(async move {
             if let Err(e) = api::interrupt(sid.get_value()).await {

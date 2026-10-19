@@ -150,7 +150,7 @@ pub fn ephemeral(kind: &ephemeral_event::Kind) -> api::StreamMsg {
         ephemeral_event::Kind::Text(d) => api::StreamMsg::Text { turn: d.turn, text: d.text.clone() },
         ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone() },
         ephemeral_event::Kind::ToolOutput(d) => api::StreamMsg::ToolOutput { call_id: d.call_id.clone(), text: d.text.clone() },
-        ephemeral_event::Kind::Activity(a) => api::StreamMsg::Activity { running: a.running },
+        ephemeral_event::Kind::Activity(a) => api::StreamMsg::Activity { running: a.running, status: a.status.clone() },
         ephemeral_event::Kind::Secret(c) => {
             api::StreamMsg::Secret { call_id: c.call_id.clone(), title: c.title.clone(), value: c.value.clone(), note: c.note.clone() }
         }

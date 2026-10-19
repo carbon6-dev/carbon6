@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use c6_llm::{Accumulator, Block, LlmError, Message, ModelClient, ModelEvent, ModelRequest, Role, ToolSpec, stop};
 use c6_proto::{
-    AssistantMessage, Compaction, ErrorEvent, TextDelta, ToolOutputDelta, ToolResult, TurnEndReason, TurnEnded, TurnStarted, Usage,
-    ephemeral_event, session_event,
+    AssistantMessage, Compaction, ErrorEvent, SessionActivity, TextDelta, ToolOutputDelta, ToolResult, TurnEndReason, TurnEnded,
+    TurnStarted, Usage, ephemeral_event, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
 use futures::StreamExt;
@@ -24,6 +24,18 @@ const MAX_STEPS: usize = 500;
 const MAX_STOP_HOOK_RUNS: usize = 10;
 /// Compact once the context reaches this share of the window.
 const COMPACT_AT: f64 = 0.85;
+/// Model calls that fail on the way (a dropped stream, an overloaded or
+/// erroring provider) are tried again this many times, waiting longer each
+/// time, before the turn stops with the error.
+const MODEL_RETRIES: u32 = 6;
+const MODEL_RETRY_MAX_WAIT_SECS: u64 = 60;
+
+/// Whether trying a failed model call again may work: the network, the
+/// provider's own failures, a response that broke off. Not: a request the
+/// provider rejects (4xx), which fails the same way every time.
+fn transient(e: &LlmError) -> bool {
+    matches!(e, LlmError::Network(_) | LlmError::Protocol(_)) || e.retryable()
+}
 const COMPACT_MAX_OUTPUT: u32 = 16_000;
 /// Default prompts (each an editable record of the `prompts` collection,
 /// docs/os.md §4.6): why the conversation is compacted, automatically or
@@ -221,7 +233,7 @@ impl Turn<'_> {
             }
 
             let req = self.request(conv.history.clone(), self.cfg.max_output_tokens);
-            let resp = match self.call(&req, true).await {
+            let resp = match self.call_retrying(&req).await {
                 Ok(r) => r,
                 Err(LlmError::ContextOverflow(_)) if !compacted_for_overflow => {
                     compacted_for_overflow = true;
@@ -459,6 +471,48 @@ impl Turn<'_> {
     async fn fail(&self, message: String) -> anyhow::Result<TurnEndReason> {
         fail(self.sink.as_ref(), message).await
     }
+
+    /// [`Self::call`], tried again when it fails in a way that may pass:
+    /// what a failed attempt streamed is dropped, and the same request goes
+    /// again. The session says it is waiting meanwhile.
+    async fn call_retrying(&self, req: &ModelRequest) -> Result<Response, LlmError> {
+        let mut attempt = 0;
+        loop {
+            let r = self.call(req, true).await;
+            let failed = match &r {
+                Ok(resp) if !resp.interrupted => resp.error.as_ref().filter(|e| transient(e)),
+                Err(e) if transient(e) => Some(e),
+                _ => None,
+            };
+            let Some(e) = failed else {
+                if attempt > 0 {
+                    self.sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, status: String::new() }));
+                }
+                return r;
+            };
+            if attempt >= MODEL_RETRIES {
+                return r;
+            }
+            attempt += 1;
+            let wait = std::time::Duration::from_secs((2u64 << (attempt - 1)).min(MODEL_RETRY_MAX_WAIT_SECS));
+            let why = e.to_string();
+            warn!(error = %why, attempt, ?wait, "model call failed; trying again");
+            if let Ok(resp) = &r
+                && let Err(e) = self.record_usage(&resp.usage).await
+            {
+                warn!("recording usage: {e:#}");
+            }
+            let status =
+                format!("The model call failed ({}); trying again in {}s ({attempt} of {MODEL_RETRIES})", clip(&why, 200), wait.as_secs());
+            self.sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, status }));
+            tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    return Ok(Response { message: None, usage: Default::default(), stop_reason: String::new(), interrupted: true, error: None });
+                }
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
 }
 
 /// Why a summarizing call gave no summary.
@@ -567,4 +621,12 @@ fn sink_output(sink: &Arc<dyn EventSink>, call_id: String) -> c6_tools::OutputSi
     Arc::new(move |text: &str| {
         sink.ephemeral(ephemeral_event::Kind::ToolOutput(ToolOutputDelta { call_id: call_id.clone(), text: text.to_owned() }))
     })
+}
+
+/// At most `max` characters of `s`.
+fn clip(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_owned(),
+    }
 }

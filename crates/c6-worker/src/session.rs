@@ -1238,7 +1238,7 @@ impl Actor {
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     running = None;
                     self.running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                    self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false }));
+                    self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false, ..Default::default() }));
                     match done {
                         Ok(Some(conv)) => {
                             self.conv = Some(conv);
@@ -1462,7 +1462,7 @@ impl Actor {
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
-        writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true }));
+        writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
 
         let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
         let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
@@ -1568,7 +1568,7 @@ async fn run_session_turn(
     turn: u64,
     cfg: &TurnConfig,
     connection_id: &str,
-    link: &HeadLink,
+    link: &Arc<HeadLink>,
     tools: &[Arc<dyn Tool>],
     session_tools: &Arc<SessionTools>,
     sink: &Arc<dyn EventSink>,
@@ -1592,9 +1592,11 @@ async fn run_session_turn(
         _ => {}
     }
 
+    // Credentials are checked up front (a missing sign-in says so at once),
+    // then fetched for every call, so a long turn outlives its token.
     let client: Arc<dyn c6_llm::ModelClient> =
         match link.credential(connection_id).await.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
-            Ok(c) => Arc::from(c),
+            Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), connection_id)),
             Err(e) => {
                 sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
                 sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e:#}") })).await?;

@@ -20,6 +20,9 @@ pub enum Reply {
     /// (name, arguments JSON) per call.
     ToolCalls(Vec<(String, String)>),
     Status(u16),
+    /// Half of the text, then the provider's error in the stream (a
+    /// response that breaks off).
+    Broken(String),
 }
 
 struct Step {
@@ -119,6 +122,10 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
         Reply::Text(text) => {
             let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);
             vec![delta(json!({"role": "assistant", "content": &text[..mid]})), delta(json!({"content": &text[mid..]})), finish("stop")]
+        }
+        Reply::Broken(text) => {
+            let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);
+            vec![delta(json!({"role": "assistant", "content": &text[..mid]})), json!({"error": {"message": "overloaded"}})]
         }
         Reply::ToolCalls(calls) => {
             let mut v = vec![delta(json!({"role": "assistant", "content": null}))];

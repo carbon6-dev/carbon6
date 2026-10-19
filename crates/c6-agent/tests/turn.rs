@@ -235,3 +235,51 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::SubagentSpawned(_) => "subagent_spawned",
     }
 }
+
+/// A response that breaks off is tried again (what it streamed dropped),
+/// and the turn goes on; a request the provider rejects is not.
+#[tokio::test]
+async fn failed_model_calls_are_tried_again() {
+    let mock = MockLlm::start().await;
+    mock.push(Reply::Broken("half an answer that breaks".into()));
+    mock.push(Reply::Text("The whole answer.".into()));
+    let dir = tempfile::tempdir().unwrap();
+    let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap();
+    let vec_sink = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = vec_sink.clone();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let mut conv = Conversation { history: vec![Message::user_text("hi")], context_tokens: 0 };
+    let reason =
+        run_turn(1, &cfg(), &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &CancellationToken::new()).await.unwrap();
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(mock.requests().len(), 2);
+    let events = vec_sink.events.lock().unwrap().clone();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(e)).collect();
+    assert_eq!(kinds, vec!["turn_started", "assistant", "usage", "turn_ended"], "{events:?}");
+    assert!(
+        format!("{:?}", conv.history.last().unwrap()).contains("The whole answer.") && !format!("{:?}", conv.history).contains("half an")
+    );
+    // The session said it was waiting, then that it isn't any more.
+    let statuses: Vec<String> = vec_sink
+        .ephemeral
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|k| match k {
+            ephemeral_event::Kind::Activity(a) => Some(a.status.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(statuses.first().is_some_and(|s| s.contains("trying again in 2s (1 of 6)")), "{statuses:?}");
+    assert_eq!(statuses.last().map(String::as_str), Some(""));
+
+    // Rejected (400): no retry, the turn stops with the error.
+    let mock = MockLlm::start().await;
+    mock.push(Reply::Status(400));
+    let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap();
+    let mut conv = Conversation { history: vec![Message::user_text("hi")], context_tokens: 0 };
+    let reason =
+        run_turn(2, &cfg(), &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &CancellationToken::new()).await.unwrap();
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(mock.requests().len(), 1);
+}
