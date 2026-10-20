@@ -124,12 +124,18 @@ pub struct Browser {
     shot: Option<Vec<u8>>,
 }
 
+/// How long a browser may take to start.
+const START_SECS: u64 = 60;
+
 impl Browser {
     async fn launch(chrome: &Path, profile: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(profile).map_err(|e| format!("creating the browser profile: {e}"))?;
         let port_file = profile.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
-        let child = tokio::process::Command::new(chrome)
+        // What it says on the way (why it didn't start, if it doesn't).
+        let log_path = profile.join("c6-browser.log");
+        let log = std::fs::File::create(&log_path).map_err(|e| format!("creating {}: {e}", log_path.display()))?;
+        let mut child = tokio::process::Command::new(chrome)
             .args([
                 "--headless=new",
                 "--remote-debugging-port=0",
@@ -142,12 +148,18 @@ impl Browser {
             .arg(format!("--user-data-dir={}", profile.display()))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(log)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("starting {}: {e}", chrome.display()))?;
-        // The browser writes its port and path when it is ready.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // The browser writes its port and path when it is ready. A first
+        // start on a busy machine can be slow; one that exits says why.
+        let said = || {
+            let s = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+            tail[tail.len().saturating_sub(5)..].join("\n")
+        };
+        let deadline = Instant::now() + Duration::from_secs(START_SECS);
         let url = loop {
             if let Ok(s) = std::fs::read_to_string(&port_file) {
                 let mut l = s.lines();
@@ -155,8 +167,11 @@ impl Browser {
                     break format!("ws://127.0.0.1:{}{}", port.trim(), path.trim());
                 }
             }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!("the browser exited as it started ({status}): {}", said()));
+            }
             if Instant::now() > deadline {
-                return Err("the browser did not start in 20 seconds".into());
+                return Err(format!("the browser did not start in {START_SECS} seconds: {}", said()));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
