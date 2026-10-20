@@ -4,10 +4,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Path, State};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
@@ -15,17 +15,6 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const V: &str = "9.9.9";
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 fn tgz(files: &[(&str, &str)]) -> Vec<u8> {
     let d = tempfile::tempdir().unwrap();
@@ -84,11 +73,6 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     let (c6h, c6w) = (bin.path().join("c6h"), bin.path().join("c6w"));
     std::fs::write(&c6h, "old c6h").unwrap();
     std::fs::write(&c6w, "old c6w").unwrap();
-    // SAFETY: before the worker starts; only update code reads them.
-    unsafe {
-        std::env::set_var("C6_UPDATE_EXE", &c6w);
-        std::env::set_var("C6_UPDATE_KEYS", &public);
-    }
 
     let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let cfg = |runs: &str, (ui_port, worker_port): (u16, u16)| HeadConfig {
@@ -103,7 +87,8 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
         update_as_version: Some(runs.to_owned()),
         ..Default::default()
     };
-    let mut head = c6_head::start(cfg("9.9.8", (0, 0))).await.unwrap();
+    // Ports it gets back when it restarts (its worker knows them).
+    let mut head = c6_head::start(cfg("9.9.8", (c6_testkit::port(), c6_testkit::port()))).await.unwrap();
     let ports = (head.ui_addrs[0].port(), head.worker_addrs[0].port());
     let api = format!("http://127.0.0.1:{}/api/v1", ports.0);
     let http = reqwest::Client::new();
@@ -119,9 +104,11 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     let e = c6_head::api::new_enrollment(&head.state, Some("laptop")).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
     let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let overrides = c6_worker::Overrides { update_exe: Some(c6w.clone()), update_keys: Some(vec![public.clone()]), ..Default::default() };
+    *worker.overrides.lock().unwrap() = overrides.clone();
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let run = tokio::spawn(conn::run(worker.clone(), tx, CancellationToken::new()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
 
     // Found, verified, and asked about (the default: approve).
     let s = post("system/updates/check", json!({})).await;
@@ -151,8 +138,9 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     drop(worker);
 
     // The new worker attaches, and says the update is done.
-    unsafe { std::env::set_var("C6_UPDATE_AS_VERSION", V) };
     let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    // The new version, as it says.
+    *worker.overrides.lock().unwrap() = c6_worker::Overrides { update_as_version: Some(V.into()), ..overrides };
     let (tx, _rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
@@ -162,7 +150,6 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     })
     .await;
     assert_eq!(s["machines"][1]["state"], "done", "{s}");
-    unsafe { std::env::remove_var("C6_UPDATE_AS_VERSION") };
 
     stop.cancel();
     head.shutdown().await.unwrap();

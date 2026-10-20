@@ -1,7 +1,6 @@
 //! End to end: a real head and worker over loopback mTLS.
 
 use std::path::Path;
-use std::time::Duration;
 
 use c6_api::WorkerStatus;
 use c6_head::HeadConfig;
@@ -21,7 +20,7 @@ fn head_config(data_dir: &Path, worker_port: u16) -> HeadConfig {
 }
 
 async fn wait_for(rx: &mut watch::Receiver<ConnState>, pred: impl Fn(&ConnState) -> bool) -> ConnState {
-    tokio::time::timeout(Duration::from_secs(15), rx.wait_for(|s| pred(s))).await.expect("timed out waiting for state").unwrap().clone()
+    c6_testkit::within("timed out waiting for state", rx.wait_for(|s| pred(s))).await.unwrap().clone()
 }
 
 async fn status(head: &c6_head::Head, id: c6_core::WorkerId) -> WorkerStatus {
@@ -68,7 +67,7 @@ async fn enroll_attach_restart_revoke() {
     // Revocation disconnects the worker and it stops retrying.
     assert!(head.state.store.revoke_worker(id, c6_core::now_ms()).await.unwrap());
     head.state.registry.kick(id);
-    let result = tokio::time::timeout(Duration::from_secs(15), worker).await.expect("worker should stop").unwrap();
+    let result = c6_testkit::within("worker should stop", worker).await.unwrap();
     assert!(result.is_err(), "revoked worker must stop");
     assert_eq!(status(&head, id).await, WorkerStatus::Revoked);
 

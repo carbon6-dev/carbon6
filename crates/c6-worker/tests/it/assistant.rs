@@ -4,23 +4,11 @@
 //! for your approval before destructive operations. The catalog also
 //! serves the CLI.
 
-use std::time::Duration;
-
 use c6_api::{Connection, Event, EventKind, Session, StreamMsg};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 #[tokio::test]
 async fn assistant_discovers_asks_acts_and_asks_first() {
@@ -139,15 +127,14 @@ async fn assistant_discovers_asks_acts_and_asks_first() {
         .unwrap();
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     // The secret card, live.
-    let card = tokio::time::timeout(Duration::from_secs(20), async {
+    let card = c6_testkit::within("a secret card", async {
         loop {
             if let Ok(StreamMsg::Secret { title, value, note, .. }) = live.recv().await {
                 return (title, value, note);
             }
         }
     })
-    .await
-    .expect("a secret card");
+    .await;
     assert_eq!(card.0, "Enrollment token");
     assert!(card.1.starts_with("c6e1."), "{}", card.1);
     assert!(card.2.contains("c6w enroll"));

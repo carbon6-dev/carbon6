@@ -440,14 +440,14 @@ fn files(home: &Path, sources: &[String]) -> Vec<(&'static str, PathBuf)> {
 const CHUNK: usize = 400;
 
 /// How often to look, how long a file must be unchanged before it is read
-/// (it is still being written), and whose home to look in. Tests set
-/// C6_IMPORT_EVERY_MS, C6_IMPORT_SETTLE_MS and C6_IMPORT_HOME.
-fn timing() -> (Duration, Duration, Option<PathBuf>) {
-    let env_ms = |k: &str, d: u64| Duration::from_millis(std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d));
+/// (it is still being written), and whose home to look in (tests set
+/// these on the worker).
+fn timing(worker: &Worker) -> (Duration, Duration, Option<PathBuf>) {
+    let o = worker.overrides.lock().unwrap().clone();
     (
-        env_ms("C6_IMPORT_EVERY_MS", 60_000),
-        env_ms("C6_IMPORT_SETTLE_MS", 120_000),
-        std::env::var_os("C6_IMPORT_HOME").map(PathBuf::from).or_else(dirs::home_dir),
+        o.import_every.unwrap_or(Duration::from_secs(60)),
+        o.import_settle.unwrap_or(Duration::from_secs(120)),
+        o.import_home.or_else(dirs::home_dir),
     )
 }
 
@@ -457,7 +457,7 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
     tokio::spawn(async move {
         // What was sent, by file: (size, modified).
         let mut seen: HashMap<PathBuf, (u64, std::time::SystemTime)> = HashMap::new();
-        let (every, settling, home) = timing();
+        let (every, settling, home) = timing(&worker);
         loop {
             tokio::select! {
                 _ = stop.cancelled() => return,

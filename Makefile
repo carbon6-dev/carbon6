@@ -40,7 +40,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test brew-dist brew brew-install brew-test release release-notes \
-        ui build test check dev-head dev-token dev-login-link dev-worker clean \
+        ui build test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
 help: ## Show this help
@@ -144,12 +144,16 @@ build: ui ## Build release binaries (c6h, c6w, c6) into target/release
 test: ## Run the test suite
 	cargo test
 
-check: ## Build and clippy every target (libraries, binaries, tests, examples; the web UI for wasm) and fail on any warning
+test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1); it must pass as it does otherwise (docs/testing.md)
+	scripts/test-under-load.sh $(or $(RUNS),1)
+
+check: ## Build and clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
 	@for cmd in build clippy; do for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
 		if cargo $$cmd --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
 			echo "check: warnings or errors in cargo $$cmd $$args" >&2; exit 1; \
 		fi; \
 	done; done; echo "check: no warnings"
+	@scripts/test-lint.sh
 
 dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml; state in the standard data directory)
 	cargo run -p c6h -- --config dev/c6h.toml

@@ -40,7 +40,7 @@ async fn setup() -> Setup {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     Setup { head, worker, api, http: reqwest::Client::new(), stop, _dirs: (head_dir, worker_dir) }
 }
@@ -98,12 +98,11 @@ async fn files_git_and_terminal() {
     ws.send(Message::Binary(b"stty size; echo c6-$((40+2)); exit\n".to_vec().into())).await.unwrap();
     let mut seen = String::new();
     let mut exit = None;
-    // A login shell on a busy CI machine can take a while to say anything.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while exit.is_none() && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
-            Ok(Some(Ok(Message::Binary(b)))) => seen.push_str(&String::from_utf8_lossy(&b)),
-            Ok(Some(Ok(Message::Text(t)))) => exit = Some(t.to_string()),
+    // Everything the shell says until it exits (the exit is a text frame).
+    while exit.is_none() {
+        match c6_testkit::within("the terminal's output", ws.next()).await {
+            Some(Ok(Message::Binary(b))) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Some(Ok(Message::Text(t))) => exit = Some(t.to_string()),
             _ => break,
         }
     }
@@ -154,7 +153,7 @@ async fn session_in_a_worktree() {
         .await
         .unwrap();
     let id = sess["id"].as_str().unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     loop {
         let d: SessionDetail = s.http.get(format!("{}/sessions/{id}", s.api)).send().await.unwrap().json().await.unwrap();
         if d.session.status == SessionStatus::Idle && d.queued.is_empty() && d.session.last_seq > 3 {

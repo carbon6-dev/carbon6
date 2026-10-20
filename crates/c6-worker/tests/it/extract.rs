@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+/// Building the kit's image takes up to half an hour, so each wait says how long.
+// test-lint: allow (opt-in kit build)
 async fn eventually<T>(what: &str, wait: Duration, mut f: impl AsyncFnMut() -> Option<T>) -> T {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -49,7 +51,7 @@ async fn the_kit_reads_files_on_workers() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let send = |method: reqwest::Method, path: &str, body: Value| {
         let (http, url) = (http.clone(), format!("{api}/{path}"));
         async move {

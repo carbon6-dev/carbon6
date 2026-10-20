@@ -2,10 +2,10 @@
 //! head outage mid-turn.
 
 use std::path::Path;
-use std::time::Duration;
 
 use c6_api::{Connection, Event, EventKind, Session, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::json;
@@ -20,17 +20,6 @@ fn head_config(data_dir: &Path, worker_port: u16, ui_port: u16) -> HeadConfig {
         worker_port,
         auth: false,
         ..Default::default()
-    }
-}
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -56,7 +45,7 @@ async fn task_runs_and_survives_head_outage() {
     let (state_tx, mut state_rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), state_tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), state_rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", state_rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
 
     // Connection and session through the HTTP API.
     let conn: Connection = http

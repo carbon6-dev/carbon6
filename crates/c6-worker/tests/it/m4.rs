@@ -73,7 +73,7 @@ async fn subagents_mcp_skills_and_otlp() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
 
     // Head configuration: one MCP server, one skill.
     let project = tempfile::tempdir().unwrap();
@@ -121,7 +121,7 @@ async fn subagents_mcp_skills_and_otlp() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     loop {
         let d: SessionDetail = http.get(format!("{api}/sessions/{}", sess.id)).send().await.unwrap().json().await.unwrap();
         if d.session.status == SessionStatus::Idle && d.queued.is_empty() && d.session.last_seq > 5 {
@@ -157,7 +157,7 @@ async fn subagents_mcp_skills_and_otlp() {
     assert_eq!(listed.len(), 1);
 
     // OTLP: one export per finished turn (parent + child), with GenAI spans.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     while exports.lock().unwrap().len() < 2 {
         assert!(tokio::time::Instant::now() < deadline, "no OTLP exports");
         tokio::time::sleep(Duration::from_millis(100)).await;

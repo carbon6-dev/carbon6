@@ -7,22 +7,12 @@ use std::time::Duration;
 
 use c6_api::Connection;
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 fn lines(v: &[Value]) -> String {
     v.iter().map(|l| format!("{l}\n")).collect()
@@ -61,12 +51,6 @@ async fn sessions_come_in_from_claude_code_and_codex() {
         ]),
     )
     .unwrap();
-    // SAFETY: before the worker starts; only workers that import read them.
-    unsafe {
-        std::env::set_var("C6_IMPORT_HOME", home.path());
-        std::env::set_var("C6_IMPORT_EVERY_MS", "300");
-        std::env::set_var("C6_IMPORT_SETTLE_MS", "0");
-    }
 
     let mock = MockLlm::start().await;
     let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -99,10 +83,17 @@ async fn sessions_come_in_from_claude_code_and_codex() {
     let e = c6_head::api::new_enrollment(&head.state, Some("laptop")).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
     let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    // It reads the fake home, every 300 ms, and files as soon as they're there.
+    *worker.overrides.lock().unwrap() = c6_worker::Overrides {
+        import_home: Some(home.path().to_owned()),
+        import_every: Some(std::time::Duration::from_millis(300)),
+        import_settle: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    };
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
 
     // Nothing comes in until you turn it on for the worker.
     tokio::time::sleep(Duration::from_millis(900)).await;

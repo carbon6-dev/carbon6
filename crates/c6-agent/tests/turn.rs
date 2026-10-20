@@ -91,12 +91,18 @@ async fn interrupt_mid_stream_keeps_partial_text() {
     let session = Arc::new(SessionTools::new(dir.path().to_owned()));
     let mut conv = Conversation { history: vec![Message::user_text("hi")], context_tokens: 0 };
     let cancel = CancellationToken::new();
-    let c2 = cancel.clone();
+    let (c2, seen) = (cancel.clone(), vec_sink.clone());
+    // Interrupted once the partial text has streamed (not after some time).
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        while !seen.ephemeral.lock().unwrap().iter().any(|k| matches!(k, ephemeral_event::Kind::Text(_))) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         c2.cancel();
     });
-    let reason = run_turn(1, &cfg(), &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &cancel).await.unwrap();
+    let (cfg, tools) = (cfg(), default_tools());
+    let mut nothing = Vec::new;
+    let turn = run_turn(1, &cfg, &client, &tools, &session, &sink, &mut conv, &mut nothing, &cancel);
+    let reason = c6_testkit::within("the interrupted turn", turn).await.unwrap();
     assert_eq!(reason, TurnEndReason::Interrupted);
     let events = vec_sink.events.lock().unwrap().clone();
     let kinds: Vec<&str> = events.iter().map(|e| kind_name(e)).collect();

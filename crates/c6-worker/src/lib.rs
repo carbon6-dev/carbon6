@@ -40,6 +40,21 @@ pub trait Extension: Send + Sync {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Option<anyhow::Result<serde_json::Value>>;
 }
 
+/// What tests set on a worker instead of the environment (docs/testing.md).
+#[derive(Clone, Debug, Default)]
+pub struct Overrides {
+    /// Session imports: whose home to read, how often, and how long a file
+    /// must be unchanged.
+    pub import_home: Option<PathBuf>,
+    pub import_every: Option<std::time::Duration>,
+    pub import_settle: Option<std::time::Duration>,
+    /// Updates (debug builds only): the binary to replace, the release keys,
+    /// and the version to say it runs.
+    pub update_exe: Option<PathBuf>,
+    pub update_keys: Option<Vec<String>>,
+    pub update_as_version: Option<String>,
+}
+
 /// Everything a running worker shares between its connection and sessions.
 pub struct Worker {
     pub identity: Identity,
@@ -53,6 +68,9 @@ pub struct Worker {
     extension: Mutex<Option<Arc<dyn Extension>>>,
     /// Updating to a release the head says is out (docs/updates.md).
     pub update: update::Updating,
+    /// Settings tests give this worker (never the process's environment,
+    /// which the tests running beside them share).
+    pub overrides: Mutex<Overrides>,
     /// Held for the process lifetime: one worker per state directory.
     _lock: std::fs::File,
 }
@@ -90,6 +108,7 @@ impl Worker {
             channel: Mutex::new(None),
             extension: Mutex::new(None),
             update: Default::default(),
+            overrides: Default::default(),
             _lock: lock,
         }))
     }

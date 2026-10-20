@@ -281,7 +281,7 @@ mod tests {
     async fn refused_credentials_are_renewed() {
         use c6_llm::ModelClient;
         use futures::StreamExt;
-        struct Head(std::sync::atomic::AtomicU32);
+        struct Head(std::sync::atomic::AtomicU32, String);
         #[async_trait::async_trait]
         impl LocalHead for Head {
             async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -292,7 +292,7 @@ mod tests {
                 CredentialGrant {
                     connection_id: connection_id.into(),
                     kind: "openai_compat".into(),
-                    base_url: std::env::var("C6_TEST_LLM").unwrap_or_default(),
+                    base_url: self.1.clone(),
                     bearer: if n == 0 { "old".into() } else { "new".into() },
                     expires_at_ms: c6_core::now_ms() + 3_600_000,
                     ..Default::default()
@@ -315,10 +315,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
-        // SAFETY: read only by this test's fake head.
-        unsafe { std::env::set_var("C6_TEST_LLM", &url) };
-
-        let head = Arc::new(Head(Default::default()));
+        let head = Arc::new(Head(Default::default(), url));
         let link = Arc::new(HeadLink::local(head.clone()));
         let client = LinkedClient::new(link, "c1");
         let req = c6_llm::ModelRequest {

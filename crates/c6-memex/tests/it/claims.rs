@@ -5,26 +5,14 @@
 //! map onto the shared vocabulary; removing an app retracts its claims; a
 //! fact is retired only by its owner.
 
-use std::time::Duration;
-
 use c6_api::{Claim, Connection, Install};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
 
 #[tokio::test]
 async fn claims_are_owned_and_readers_choose() {
@@ -62,7 +50,7 @@ async fn claims_are_owned_and_readers_choose() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let wid = worker.identity.meta.worker_id.0;
 
     // Things anyone may make, and an email to make claims about.

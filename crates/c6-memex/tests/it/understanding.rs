@@ -9,20 +9,10 @@ use std::time::Duration;
 
 use c6_api::{Commitment, MemexGraph, MemexReview, MemexStatus};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
 
 /// The head's own knowledge store (docs/knowledge.md), and a folder for the test's files.
 async fn memex_node(head: &c6_head::Head, _stop: &CancellationToken) -> (Arc<c6_memex::Memex>, tempfile::TempDir) {

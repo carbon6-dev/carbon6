@@ -1,4 +1,8 @@
-//! Test support: a scripted OpenAI-compatible server.
+//! Test support: a scripted OpenAI-compatible server, and waiting on
+//! conditions (docs/testing.md).
+
+pub mod wait;
+pub use wait::{eventually, have, need, port, within};
 
 use std::collections::VecDeque;
 use std::convert::Infallible;

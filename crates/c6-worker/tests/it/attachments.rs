@@ -1,27 +1,15 @@
 //! Attachments and @-mentions reach the model: images as image parts, files
 //! and mentioned paths as text.
 
-use std::time::Duration;
-
 use base64::Engine;
 use c6_api::{Connection, Event, EventKind, Session};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::json;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 #[tokio::test]
 async fn attachments_and_mentions_reach_the_model() {
@@ -45,7 +33,7 @@ async fn attachments_and_mentions_reach_the_model() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let conn: Connection = http
         .post(format!("{api}/connections"))
         .json(&json!({"name": "m", "base_url": mock.base_url()}))

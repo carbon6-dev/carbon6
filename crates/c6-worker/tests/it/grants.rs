@@ -3,27 +3,15 @@
 //! a copy once); every use is logged; revoking ends it; an agent's request
 //! for one is a decision whose answer it hears.
 
-use std::time::Duration;
-
 use c6_api::{Connection, Decision, Session, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 #[tokio::test]
 async fn grants_let_data_cross_realms() {
@@ -47,7 +35,7 @@ async fn grants_let_data_cross_realms() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let wid = worker.identity.meta.worker_id.0;
     let conn: Connection = http
         .post(format!("{api}/connections"))
@@ -266,7 +254,7 @@ async fn commons_is_shared_and_reviewed() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let wid = worker.identity.meta.worker_id.0;
     let conn: Connection = http
         .post(format!("{api}/connections"))

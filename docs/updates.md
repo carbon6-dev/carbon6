@@ -141,7 +141,7 @@ All four methods use the same rollback trigger (§7).
   - The head never sends a binary, only the manifest. Workers fetch the assets from the manifest's GitHub URLs.
 - **No privilege in the daemons.** On Linux, only the root oneshot installs. It checks the signature itself and installs a copy nobody else can write. Anyone who can write the c6w update folder can only ask for a newer, signed release.
 - **The key** was made on the release manager's machine (`~/.config/carbon6-release/signing-key.pem`, mode 0600). It lives there and in the `RELEASE_SIGNING_KEY` secret. Keep an offline copy: losing it means shipping a new key in a release signed by the old one.
-- **Tests only:** debug builds take other keys, binaries and versions (`C6_UPDATE_KEYS`, `C6_UPDATE_EXE`, `C6_UPDATE_AS_VERSION`; the head's `update_*` config). Release builds ignore the environment variables.
+- **Tests only:** debug builds take other keys, binaries and versions, set in code: the worker's `Overrides` and the head's `update_*` config. Release builds ignore the worker's.
 - **Mode `off`** turns all of it off, including the GitHub check (for machines that mustn't call out).
 
 ## 9. Steps (built)

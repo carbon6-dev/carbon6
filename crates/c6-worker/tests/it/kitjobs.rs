@@ -4,26 +4,14 @@
 //! hosts reaches those and no others. Needs Docker or Podman and the
 //! network (it builds images), so it runs only with C6_TEST_KITS=1.
 
-use std::time::Duration;
-
 use base64::Engine;
 use c6_api::Install;
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 const RUN: &str = r#"#!/bin/sh
 set -e
@@ -65,7 +53,7 @@ async fn kit_jobs_run_for_apps() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     use reqwest::Method as M;
     let send = |method: M, path: &str, body: Value| {
         let (http, url) = (http.clone(), format!("{api}/{path}"));

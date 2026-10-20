@@ -3,10 +3,10 @@
 //! of its own: it sets C6_CLAUDE_BIN.
 
 use std::path::Path;
-use std::time::Duration;
 
 use c6_api::{Session, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -30,17 +30,6 @@ JSON
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
-}
-
-async fn until<T>(what: &str, secs: u64, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 #[tokio::test]
@@ -67,7 +56,7 @@ async fn claude_codes_subagents_are_shown_read_only() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(15), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
 
     let conn: Value = http
         .post(format!("{api}/connections"))
@@ -90,12 +79,12 @@ async fn claude_codes_subagents_are_shown_read_only() {
         .await
         .unwrap();
     let id = s["id"].as_str().unwrap().to_owned();
-    until("turn done", 20, async || {
+    eventually("turn done", async || {
         let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
         (d.session.status == SessionStatus::Idle && d.session.end_reason.is_some()).then_some(())
     })
     .await;
-    let children = until("the mirrored subagent", 20, async || {
+    let children = eventually("the mirrored subagent", async || {
         let c: Vec<Session> = http.get(format!("{api}/sessions/{id}/children")).send().await.ok()?.json().await.ok()?;
         c.first().is_some_and(|c| c.end_reason.is_some()).then_some(c)
     })

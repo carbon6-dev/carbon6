@@ -28,4 +28,5 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 tokio-util = "0.7.20"
 
 [dev-dependencies]
+c6-testkit.workspace = true
 tempfile = "3.27.0"

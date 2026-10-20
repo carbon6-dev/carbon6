@@ -6,26 +6,14 @@
 //! shape: `cargo test -p c6-memex --test it fixtures -- --ignored`.
 //! It writes `crates/c6-memex/fixtures/memex-v<NNNN>.db` (synthetic data only).
 
-use std::time::Duration;
-
 use base64::Engine;
 use c6_api::Connection;
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
 
 fn mail(id: &str, reply_to: Option<&str>, subject: &str, body: &str) -> String {
     let refs = reply_to.map(|r| format!("In-Reply-To: <{r}>\r\nReferences: <{r}>\r\n")).unwrap_or_default();

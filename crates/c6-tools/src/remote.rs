@@ -21,6 +21,8 @@ pub struct SshHost {
     /// The remote home folder (for `~/` paths).
     pub home: String,
     control_dir: PathBuf,
+    /// The ssh program (`C6_SSH_BIN` overrides; tests give their own).
+    program: String,
 }
 
 /// `s` quoted for a POSIX shell.
@@ -55,12 +57,18 @@ impl SshHost {
         // control directory near the root.
         // SAFETY: getuid cannot fail and has no side effects.
         let uid = unsafe { libc_getuid() };
-        Self { target: target.to_owned(), home: home.to_owned(), control_dir: PathBuf::from(format!("/tmp/c6-ssh-{uid}")) }
+        Self {
+            target: target.to_owned(),
+            home: home.to_owned(),
+            control_dir: PathBuf::from(format!("/tmp/c6-ssh-{uid}")),
+            program: std::env::var("C6_SSH_BIN").unwrap_or_else(|_| "ssh".into()),
+        }
     }
 
-    /// The ssh program (C6_SSH_BIN overrides, for tests).
-    fn program() -> String {
-        std::env::var("C6_SSH_BIN").unwrap_or_else(|_| "ssh".into())
+    /// The same, over another ssh program (a fake one, in tests).
+    pub fn with_program(mut self, program: &Path) -> Self {
+        self.program = program.display().to_string();
+        self
     }
 
     /// An ssh command for `remote` (a shell command line on the target).
@@ -71,7 +79,7 @@ impl SshHost {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&self.control_dir, std::fs::Permissions::from_mode(0o700));
         }
-        let mut c = tokio::process::Command::new(Self::program());
+        let mut c = tokio::process::Command::new(&self.program);
         c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto"])
             .arg("-o")
             .arg(format!("ControlPath={}/%C", self.control_dir.display()))
@@ -255,13 +263,18 @@ exec sh -c "$*"
     #[tokio::test]
     async fn tools_work_on_an_ssh_target() {
         let bin = tempfile::tempdir().unwrap();
-        // SAFETY: only this test sets it; others never use ssh.
-        unsafe { std::env::set_var("C6_SSH_BIN", fake_ssh(bin.path())) };
         let remote = tempfile::tempdir().unwrap();
         let r = remote.path().canonicalize().unwrap();
-        // SAFETY: as above.
-        unsafe { std::env::set_var("C6_FAKE_HOME", &r) };
-        let host = Arc::new(SshHost::new("me@box", &r.display().to_string()));
+        let ssh = fake_ssh(bin.path());
+        // Its home, for the fake ssh (in its environment, not this process's).
+        let ssh = {
+            let w = bin.path().join("ssh-home");
+            std::fs::write(&w, format!("#!/bin/sh\nC6_FAKE_HOME={} exec {} \"$@\"\n", r.display(), ssh.display())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o755)).unwrap();
+            w
+        };
+        let host = Arc::new(SshHost::new("me@box", &r.display().to_string()).with_program(&ssh));
         let (home, cwd, system) = host.probe("~").await.unwrap();
         assert_eq!((home.as_str(), cwd.as_str()), (r.to_str().unwrap(), r.to_str().unwrap()), "{system}");
         assert!(host.probe("/no/such/dir").await.is_err());

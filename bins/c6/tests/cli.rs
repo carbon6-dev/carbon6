@@ -1,8 +1,6 @@
 //! The `c6` CLI against a real head (sign-in on, so through an API token)
 //! and worker, with a mock model.
 
-use std::time::Duration;
-
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
@@ -56,7 +54,7 @@ async fn headless_cli() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(20), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let r = reqwest::Client::new()
         .post(format!("{url}/api/v1/connections"))
         .bearer_auth(&token)

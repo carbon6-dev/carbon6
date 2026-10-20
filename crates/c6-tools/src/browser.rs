@@ -706,10 +706,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_click_type_and_screenshot() {
-        let Some(chrome) = find_chrome() else {
-            eprintln!("no Chromium-family browser here; skipped");
+        let chrome = find_chrome();
+        if !c6_testkit::need("a Chromium-family browser", chrome.is_some()) {
             return;
-        };
+        }
+        let chrome = chrome.unwrap();
         let url = site().await;
         let dir = tempfile::tempdir().unwrap();
         let session = Arc::new(SessionTools::new(dir.path().to_owned()));

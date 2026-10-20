@@ -4,7 +4,6 @@
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use c6_api::Connection;
 use c6_head::HeadConfig;
@@ -95,7 +94,7 @@ async fn web_push_to_a_device() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let conn: Connection = http
         .post(format!("{api}/connections"))
         .json(&json!({"name": "m", "base_url": mock.base_url()}))

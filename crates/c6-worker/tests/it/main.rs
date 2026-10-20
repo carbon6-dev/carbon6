@@ -58,7 +58,7 @@ mod workflows;
 /// letting go of the state directory's lock (its tasks drop their handles as
 /// they end), so that error is retried for a while; any other fails at once.
 pub async fn open_worker(state: &std::path::Path) -> std::sync::Arc<c6_worker::Worker> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     loop {
         match c6_worker::Worker::open(state, c6_worker::Identity::load(state).unwrap()).await {
             Ok(w) => return w,
@@ -70,11 +70,11 @@ pub async fn open_worker(state: &std::path::Path) -> std::sync::Arc<c6_worker::W
     }
 }
 
-/// Starts a head again on the ports it had (its workers know them). Tests
-/// run in parallel, and one may briefly hold a port just freed (a head it
-/// starts on port 0 gets it), so binding is retried for a while.
+/// Starts a head again on the ports it had (its workers know them): ports
+/// from `c6_testkit::port()`, which no other test is given. Binding is
+/// still retried while the old listener lets go.
 pub async fn restart_head(cfg: c6_head::HeadConfig) -> c6_head::Head {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     loop {
         match c6_head::start(cfg.clone()).await {
             Ok(h) => return h,

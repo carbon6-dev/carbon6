@@ -51,12 +51,11 @@ fn dir(worker: &Worker) -> PathBuf {
 }
 
 /// The binary to replace and how it was installed. Debug builds (tests)
-/// may name another binary with `C6_UPDATE_EXE`.
-fn exe_method() -> (PathBuf, Method) {
+/// may name another binary on the worker.
+fn exe_method(w: &Worker) -> (PathBuf, Method) {
     if cfg!(debug_assertions)
-        && let Some(exe) = std::env::var_os("C6_UPDATE_EXE")
+        && let Some(exe) = w.overrides.lock().unwrap().update_exe.clone()
     {
-        let exe = PathBuf::from(exe);
         let m = up::method(&exe, false);
         return (exe, m);
     }
@@ -65,24 +64,22 @@ fn exe_method() -> (PathBuf, Method) {
     (exe, m)
 }
 
-/// The version this worker runs (debug builds may say another with
-/// `C6_UPDATE_AS_VERSION`, for tests).
-fn version() -> String {
+/// The version this worker runs (debug builds may say another, for tests).
+fn version(w: &Worker) -> String {
     if cfg!(debug_assertions)
-        && let Ok(v) = std::env::var("C6_UPDATE_AS_VERSION")
+        && let Some(v) = w.overrides.lock().unwrap().update_as_version.clone()
     {
         return v;
     }
     c6_core::VERSION.to_owned()
 }
 
-/// Release keys: the built-in ones (debug builds may name others with
-/// `C6_UPDATE_KEYS`, comma-separated).
-fn keys() -> Vec<String> {
+/// Release keys: the built-in ones (debug builds may name others).
+fn keys(w: &Worker) -> Vec<String> {
     if cfg!(debug_assertions)
-        && let Ok(k) = std::env::var("C6_UPDATE_KEYS")
+        && let Some(k) = w.overrides.lock().unwrap().update_keys.clone()
     {
-        return k.split(',').map(str::to_owned).collect();
+        return k;
     }
     up::RELEASE_KEYS.iter().map(|k| k.to_string()).collect()
 }
@@ -90,8 +87,8 @@ fn keys() -> Vec<String> {
 /// First thing in `conn::run`: an update in progress counts this start.
 pub fn on_start(worker: &Worker, stop: &CancellationToken) -> anyhow::Result<()> {
     *worker.update.stop.lock().unwrap() = Some(stop.clone());
-    let (exe, method) = exe_method();
-    let s = up::on_start(&dir(worker), &version(), &method, "c6w", &exe);
+    let (exe, method) = exe_method(worker);
+    let s = up::on_start(&dir(worker), &version(worker), &method, "c6w", &exe);
     if let OnStart::RolledBack(p) = &s {
         return Err(RolledBack(p.detail.clone()).into());
     }
@@ -103,7 +100,7 @@ pub fn on_start(worker: &Worker, stop: &CancellationToken) -> anyhow::Result<()>
 /// was rolled back), and the head hears it.
 pub fn attached(worker: &Arc<Worker>) {
     let s = worker.update.on_start.lock().unwrap().take();
-    let (_, method) = exe_method();
+    let (_, method) = exe_method(worker);
     let report = match s {
         Some(OnStart::Trying(_)) => up::healthy(&dir(worker)).map(|p| json!({"version": p.to, "state": "done", "method": method.name()})),
         Some(OnStart::WasRolledBack(p)) => {
@@ -126,9 +123,9 @@ pub fn attached(worker: &Arc<Worker>) {
 pub async fn apply(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
     let s = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
     let (raw, sig) = (s("manifest"), hex::decode(s("signature"))?);
-    let m = up::verify(raw.as_bytes(), &sig, &keys())?;
-    if !up::newer(&m.version, &version()) {
-        anyhow::bail!("this worker runs {} already", version());
+    let m = up::verify(raw.as_bytes(), &sig, &keys(worker))?;
+    if !up::newer(&m.version, &version(worker)) {
+        anyhow::bail!("this worker runs {} already", version(worker));
     }
     if worker.update.busy.swap(true, Ordering::SeqCst) {
         return Ok(json!({"already": true}));
@@ -146,14 +143,14 @@ pub async fn apply(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
 
 /// Tells the head how the update goes (`update.status`).
 async fn say(w: &Worker, version: &str, state: &str, detail: &str) {
-    let r = json!({"version": version, "state": state, "method": exe_method().1.name(), "detail": detail});
+    let r = json!({"version": version, "state": state, "method": exe_method(w).1.name(), "detail": detail});
     if let Err(e) = w.link.call("update.status", r).await {
         warn!("telling the head how the update goes: {e:#}");
     }
 }
 
 async fn run(w: &Arc<Worker>, m: &up::Manifest, signed: (&str, &[u8]), base: &str, deadline: i64) -> anyhow::Result<()> {
-    let (exe, method) = exe_method();
+    let (exe, method) = exe_method(w);
     let v = m.version.as_str();
     if method == Method::Source {
         anyhow::bail!("built from source: update it yourself");
@@ -193,7 +190,7 @@ async fn run(w: &Arc<Worker>, m: &up::Manifest, signed: (&str, &[u8]), base: &st
     };
     say(w, v, "installing", "").await;
     // Before installing: a .deb's postinst restarts the worker mid-install.
-    Pending { from: version(), to: m.version.clone(), state: "installed".into(), started_at: now_ms(), ..Default::default() }
+    Pending { from: version(w), to: m.version.clone(), state: "installed".into(), started_at: now_ms(), ..Default::default() }
         .save(&dir(w))?;
     let (m2, raw, sig, exe2, method2) = (m.clone(), signed.0.to_owned(), signed.1.to_vec(), exe.clone(), method.clone());
     let restart = tokio::task::spawn_blocking(move || {

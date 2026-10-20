@@ -3,22 +3,10 @@
 //! and briefs never cross; mail and the like stay home's; a deleted
 //! realm's knowledge is dropped.
 
-use std::time::Duration;
-
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
 
 #[tokio::test]
 async fn realms_have_their_own_knowledge() {

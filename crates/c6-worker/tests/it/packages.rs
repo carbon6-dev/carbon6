@@ -282,7 +282,7 @@ async fn kits_build_and_run_sandboxed() {
     ok(send(M::POST, "sessions", json!({"worker_id": wid, "cwd": work.path(), "connection_id": conn.id, "model": "m", "prompt": "probe"}))
         .await)
     .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600); // test-lint: allow (opt-in: builds a kit image)
     let seen = loop {
         let reqs = mock.requests();
         if reqs.len() >= 5 {
@@ -354,10 +354,7 @@ async fn with_worker() -> WithWorker {
     let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
     let stop = tokio_util::sync::CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(std::time::Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. })))
-        .await
-        .unwrap()
-        .unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let conn: c6_api::Connection = reqwest::Client::new()
         .post(format!("{api}/connections"))
         .json(&json!({"name": "m", "base_url": mock.base_url()}))
@@ -443,7 +440,7 @@ async fn template_start_through_an_export() {
         .await,
     )
     .unwrap();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     let started = loop {
         let all: Vec<c6_api::Session> = send(M::GET, "sessions", json!({})).await.json().await.unwrap();
         if let Some(x) = all.into_iter().find(|x| x.labels.contains(&format!("started-by:{}", s.id))) {
@@ -520,7 +517,7 @@ async fn decks_render_kit_renders_a_deck() {
         .await
         .unwrap())
     .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1800);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1800); // test-lint: allow (opt-in: builds Chromium into a kit)
     while w.mock.requests().len() < 4 {
         assert!(tokio::time::Instant::now() < deadline, "timed out");
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

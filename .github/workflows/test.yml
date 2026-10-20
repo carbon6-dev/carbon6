@@ -33,3 +33,17 @@ jobs:
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
       - run: cargo test --locked
+
+  under-load:
+    # The same suite with every core kept busy (docs/testing.md): a test
+    # that waits on time instead of on what it checks fails here.
+    name: cargo test under load (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      - name: A git identity, for tests that commit
+        run: git config --global user.email test@c6 && git config --global user.name test
+      - run: make test-under-load

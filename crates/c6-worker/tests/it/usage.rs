@@ -6,22 +6,12 @@ use std::time::Duration;
 
 use c6_api::{Connection, Session};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::json;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 /// A stand-in for Slack and webhooks: records (path, body).
 async fn receiver() -> (String, Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
@@ -78,7 +68,7 @@ async fn usage_and_budgets() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let conn: Connection = http
         .post(format!("{api}/connections"))
         .json(&json!({"name": "m", "base_url": mock.base_url()}))
@@ -156,7 +146,7 @@ async fn usage_and_budgets() {
     calls(1).await;
     idle(s.id.clone()).await;
     // The call is recorded with the turn's events (it may trail the idle state).
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     let r = loop {
         let r = report("days=1").await;
         if r.total.calls == 1 || tokio::time::Instant::now() > deadline {

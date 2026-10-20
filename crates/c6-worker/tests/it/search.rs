@@ -1,26 +1,14 @@
 //! Session search: events are indexed as they arrive, the index is rebuilt
 //! when its version changes, and results point at the matching events.
 
-use std::time::Duration;
-
 use c6_api::{Connection, Session, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 fn cfg(dir: &std::path::Path, ui: u16, worker: u16) -> HeadConfig {
     HeadConfig {
@@ -43,7 +31,8 @@ async fn search_finds_events_and_survives_reindex() {
     let head_dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let head = c6_head::start(cfg(head_dir.path(), 0, 0)).await.unwrap();
+    // Ports it gets back when it restarts (its worker knows them).
+    let head = c6_head::start(cfg(head_dir.path(), c6_testkit::port(), c6_testkit::port())).await.unwrap();
     let ports = (head.ui_addrs[0].port(), head.worker_addrs[0].port());
     let api = format!("http://127.0.0.1:{}/api/v1", ports.0);
     let http = reqwest::Client::new();
@@ -53,7 +42,7 @@ async fn search_finds_events_and_survives_reindex() {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let conn: Connection = http
         .post(format!("{api}/connections"))
         .json(&json!({"name": "m", "base_url": mock.base_url()}))

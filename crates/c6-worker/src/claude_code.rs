@@ -27,6 +27,10 @@ pub const PROFILE: &str = "claude_code";
 /// The `claude` binary: `$C6_CLAUDE_BIN`, then `PATH`, then the usual
 /// install locations (services often run without the user's PATH).
 pub fn find_claude() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = tests::BIN.lock().unwrap().clone() {
+        return Some(p);
+    }
     if let Some(p) = std::env::var_os("C6_CLAUDE_BIN").map(PathBuf::from) {
         return p.is_file().then_some(p);
     }
@@ -467,6 +471,10 @@ fn assistant_block(b: &Value) -> Option<ContentBlock> {
 
 #[cfg(test)]
 mod tests {
+    /// The fake `claude` these tests use (not the process's environment,
+    /// which tests running beside them read).
+    pub(super) static BIN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -518,8 +526,7 @@ EOF
     async fn maps_a_turn_and_falls_back_from_resume() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_claude(dir.path());
-        // SAFETY: tests in this module do not run concurrently with others reading this var.
-        unsafe { std::env::set_var("C6_CLAUDE_BIN", &bin) };
+        *BIN.lock().unwrap() = Some(bin.clone());
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let inputs = vec![PendingInput { command_id: "c1".into(), text: "list files".into(), ..Default::default() }];

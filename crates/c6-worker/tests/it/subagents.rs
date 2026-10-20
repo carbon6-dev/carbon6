@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use c6_api::{Event, EventKind, Session, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Worker, conn, enroll};
 use serde_json::{Value, json};
@@ -87,19 +88,8 @@ async fn run_worker(state: &Path) -> (Arc<Worker>, CancellationToken) {
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(15), rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap().unwrap();
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     (w, stop)
-}
-
-async fn until<T>(what: &str, secs: u64, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 fn turn_end(events: &[Event]) -> Option<TurnEndReason> {
@@ -135,7 +125,7 @@ async fn a_subagent_is_a_session_and_stops_with_its_parent() {
     let id = env.create(&worker, project.path(), "go").await;
 
     // The parent's log links to the child while it runs.
-    let child = until("subagent spawned", 15, async || {
+    let child = eventually("subagent spawned", async || {
         env.events(&id).await.into_iter().find_map(|e| match e.kind {
             EventKind::SubagentSpawned { call_id, child_session_id, description, .. } => Some((call_id, child_session_id, description)),
             _ => None,
@@ -144,7 +134,7 @@ async fn a_subagent_is_a_session_and_stops_with_its_parent() {
     .await;
     assert_eq!(child.2, "dig");
     let child_id = child.1;
-    until("the subagent's command ran", 15, async || {
+    eventually("the subagent's command ran", async || {
         env.events(&child_id)
             .await
             .iter()
@@ -174,13 +164,13 @@ async fn a_subagent_is_a_session_and_stops_with_its_parent() {
     // Stopping the parent stops the child; both turns end as interrupted.
     let r = env.http.post(format!("{}/sessions/{id}/interrupt", env.api)).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.status());
-    let child_events = until("the subagent stopped", 15, async || {
+    let child_events = eventually("the subagent stopped", async || {
         let ev = env.events(&child_id).await;
         (turn_end(&ev) == Some(TurnEndReason::Interrupted)).then_some(ev)
     })
     .await;
     assert!(child_events.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("found-half"))));
-    let parent = until("the parent stopped", 15, async || {
+    let parent = eventually("the parent stopped", async || {
         let ev = env.events(&id).await;
         (turn_end(&ev) == Some(TurnEndReason::Interrupted)).then_some(ev)
     })
@@ -218,7 +208,7 @@ async fn a_worker_restart_keeps_the_subagents_log() {
     env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo partial"}"#.into())]));
     let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
     let id = env.create(&first, project.path(), "go").await;
-    let child_id = until("subagent working", 15, async || {
+    let child_id = eventually("subagent working", async || {
         let c = env.children(&id).await.into_iter().next()?;
         let ev = env.events(&c.id).await;
         ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("partial"))).then_some(c.id)
@@ -230,7 +220,7 @@ async fn a_worker_restart_keeps_the_subagents_log() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (second, stop_second) = run_worker(state.path()).await;
     for sid in [&id, &child_id] {
-        let ev = until("turn closed", 15, async || {
+        let ev = eventually("turn closed", async || {
             let ev = env.events(sid).await;
             (turn_end(&ev) == Some(TurnEndReason::WorkerRestarted)).then_some(ev)
         })
@@ -269,7 +259,7 @@ async fn a_failed_subagent_reports_its_changes() {
     env.mock.push(Reply::Status(400)); // the subagent's model refuses (not retried)
     env.mock.push(Reply::Text("The subagent failed; noted.".into())); // the parent
     let id = env.create(&worker, project.path(), "go").await;
-    let parent = until("parent done", 30, async || {
+    let parent = eventually("parent done", async || {
         let ev = env.events(&id).await;
         (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
     })
@@ -309,20 +299,20 @@ async fn a_lost_background_subagent_is_reported_with_its_work() {
     let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
     env.mock.push(Reply::Text("Started it.".into())); // the parent, while the subagent works
     let id = env.create(&first, project.path(), "go").await;
-    let child_id = until("subagent working", 15, async || {
+    let child_id = eventually("subagent working", async || {
         let c = env.children(&id).await.into_iter().next()?;
         let ev = env.events(&c.id).await;
         ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("partial"))).then_some(c.id)
     })
     .await;
-    until("the parent is idle", 15, async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle)).await;
+    eventually("the parent is idle", async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle)).await;
 
     stop_first.cancel();
     drop(first);
     tokio::time::sleep(Duration::from_millis(200)).await;
     env.mock.push(Reply::Text("I will continue it.".into())); // the parent, told
     let (_second, stop_second) = run_worker(state.path()).await;
-    let notice = until("the parent is told", 15, async || {
+    let notice = eventually("the parent is told", async || {
         env.events(&id).await.into_iter().find_map(|e| match e.kind {
             EventKind::User { command, text, .. } if command == "task-notification" && text.contains("lost") => Some(text),
             _ => None,
@@ -356,7 +346,7 @@ async fn interrupted_subagent(env: &Env, worker: &Worker, project: &Path) -> (St
     env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo found-half"}"#.into())]));
     let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
     let id = env.create(worker, project, "go").await;
-    let child_id = until("subagent working", 15, async || {
+    let child_id = eventually("subagent working", async || {
         let c = env.children(&id).await.into_iter().next()?;
         let ev = env.events(&c.id).await;
         ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("found-half"))).then_some(c.id)
@@ -364,9 +354,9 @@ async fn interrupted_subagent(env: &Env, worker: &Worker, project: &Path) -> (St
     .await;
     env.http.post(format!("{}/sessions/{id}/interrupt", env.api)).send().await.unwrap();
     for sid in [&id, &child_id] {
-        until("stopped", 15, async || (turn_end(&env.events(sid).await) == Some(TurnEndReason::Interrupted)).then_some(())).await;
+        eventually("stopped", async || (turn_end(&env.events(sid).await) == Some(TurnEndReason::Interrupted)).then_some(())).await;
     }
-    until("idle", 15, async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle && d.queued.is_empty())).await;
+    eventually("idle", async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle && d.queued.is_empty())).await;
     (id, child_id)
 }
 
@@ -386,7 +376,7 @@ async fn the_parent_continues_a_stopped_subagent() {
     env.mock.push(Reply::Text("Found it.".into())); // the parent
     let before = env.mock.requests().len();
     env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "continue it"})).send().await.unwrap();
-    let parent = until("parent done", 15, async || {
+    let parent = eventually("parent done", async || {
         let ev = env.events(&id).await;
         (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
     })
@@ -431,7 +421,8 @@ async fn your_message_to_a_subagent_reports_back() {
         .await
         .unwrap();
     assert!(r.status().is_success(), "{}", r.status());
-    until("subagent answered", 15, async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
+    eventually("subagent answered", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(()))
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(env.detail(&id).await.unwrap().session.last_seq, parent_seq, "nothing ran in the parent");
 
@@ -439,7 +430,7 @@ async fn your_message_to_a_subagent_reports_back() {
     env.mock.push(Reply::Text("Noted.".into()));
     let before = env.mock.requests().len();
     env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "status?"})).send().await.unwrap();
-    until("parent answered", 15, async || {
+    eventually("parent answered", async || {
         let ev = env.events(&id).await;
         (turn_end_after(&ev, parent_seq) == Some(TurnEndReason::Completed)).then_some(())
     })
@@ -457,7 +448,7 @@ async fn your_message_to_a_subagent_reports_back() {
         .send()
         .await
         .unwrap();
-    let ev = until("parent woken", 15, async || {
+    let ev = eventually("parent woken", async || {
         let ev = env.events(&id).await;
         (turn_end_after(&ev, seq) == Some(TurnEndReason::Completed)).then_some(ev)
     })
@@ -485,7 +476,7 @@ async fn resume_continues_a_stopped_subagent() {
     env.mock.push(Reply::Text("Found it after all.".into()));
     let r = env.http.post(format!("{}/sessions/{child_id}/resume", env.api)).json(&json!({})).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.status());
-    until("resumed", 15, async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
+    eventually("resumed", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
     let (text, command, _) = user_messages(&env.events(&child_id).await).pop().unwrap();
     assert_eq!(command, "resume");
     assert!(text.contains("stopped partway"), "{text}");
@@ -507,7 +498,8 @@ async fn resume_continues_a_stopped_subagent() {
         .await
         .unwrap();
     let side_id = side["id"].as_str().unwrap().to_owned();
-    until("side chat answered", 15, async || (turn_end(&env.events(&side_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
+    eventually("side chat answered", async || (turn_end(&env.events(&side_id).await) == Some(TurnEndReason::Completed)).then_some(()))
+        .await;
     let req = request_text(&env.mock.requests()[before]);
     assert!(req.contains("found-half") && req.contains("How did it search?"), "{req}");
     stop.cancel();
@@ -533,7 +525,7 @@ async fn the_parent_steers_a_running_subagent() {
     env.mock.push(Reply::Text("Dug, and the shed is empty.".into())); // the subagent, steered
     env.mock.push(Reply::Text("Good.".into())); // the parent, told
     let id = env.create(&worker, project.path(), "go").await;
-    let ev = until("parent told", 20, async || {
+    let ev = eventually("parent told", async || {
         let ev = env.events(&id).await;
         user_messages(&ev).iter().any(|(t, c, _)| c == "task-notification" && t.contains("shed is empty")).then_some(ev)
     })
@@ -586,7 +578,7 @@ async fn a_lost_subagent_is_restored_from_the_head() {
     env.mock.push(Reply::Text("Picking up where I was.".into()));
     let before = env.mock.requests().len();
     env.http.post(format!("{}/sessions/{child_id}/messages", env.api)).json(&json!({"text": "Go on."})).send().await.unwrap();
-    until("restored subagent answered", 20, async || {
+    eventually("restored subagent answered", async || {
         let ev = env.events(&child_id).await;
         (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(())
     })
@@ -619,7 +611,7 @@ async fn subagents_nest() {
     env.mock.push(Reply::Text("middle: the leaf dug".into())); // middle
     env.mock.push(Reply::Text("top: done".into())); // parent
     let id = env.create(&worker, project.path(), "go").await;
-    let ev = until("parent done", 20, async || {
+    let ev = eventually("parent done", async || {
         let ev = env.events(&id).await;
         (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
     })
@@ -665,7 +657,7 @@ async fn subagents_nest() {
     env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"leaf","prompt":"Again."}"#.into())]));
     let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
     env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "again"})).send().await.unwrap();
-    let ids = until("three levels working", 15, async || {
+    let ids = eventually("three levels working", async || {
         let tree: Vec<Session> = env.http.get(format!("{}/sessions/{id}/children?tree=1", env.api)).send().await.ok()?.json().await.ok()?;
         (tree.len() == 4
             && tree.iter().all(|s| s.status == SessionStatus::Running || s.end_reason.is_some())
@@ -675,7 +667,7 @@ async fn subagents_nest() {
     .await;
     env.http.post(format!("{}/sessions/{id}/interrupt", env.api)).send().await.unwrap();
     for sid in ids.iter().chain([&id]) {
-        until("stopped", 15, async || (turn_end(&env.events(sid).await) == Some(TurnEndReason::Interrupted)).then_some(())).await;
+        eventually("stopped", async || (turn_end(&env.events(sid).await) == Some(TurnEndReason::Interrupted)).then_some(())).await;
     }
     stop.cancel();
 }
@@ -713,7 +705,7 @@ async fn subagent_limits_apply() {
     env.mock.push(Reply::Text("one done".into())); // the one that runs
     env.mock.push(Reply::Text("Only one ran.".into()));
     let id = env.create(&worker, project.path(), "go").await;
-    let ev = until("parent done", 20, async || {
+    let ev = eventually("parent done", async || {
         let ev = env.events(&id).await;
         (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
     })

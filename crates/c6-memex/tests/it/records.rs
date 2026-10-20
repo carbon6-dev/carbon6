@@ -1,22 +1,10 @@
 //! Records of collections are mirrored into the memex (docs/os.md §4.1):
 //! search finds them, and deleting one removes it.
 
-use std::time::Duration;
-
 use c6_head::HeadConfig;
+use c6_testkit::eventually;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
 
 #[tokio::test]
 async fn records_are_searchable() {
