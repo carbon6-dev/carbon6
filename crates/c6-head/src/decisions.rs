@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::realms::Caller;
 use crate::{HeadState, bad_request, not_found};
 
-const KINDS: [&str; 7] = ["approve", "choose", "confirm", "provide", "question", "dispute", "follow_up"];
+const KINDS: [&str; 8] = ["approve", "choose", "confirm", "provide", "question", "dispute", "follow_up", "task"];
 /// How long a tool call waits for approval on the worker (then it is "no").
 const APPROVAL_WAIT_MS: i64 = 60 * 60 * 1000;
 
@@ -46,7 +46,11 @@ fn decision_of(r: &sqlx::sqlite::SqliteRow) -> api::Decision {
         note: r.get("note"),
         answered_via: r.get("answered_via"),
         answered_at: r.get("answered_at"),
-        waiting: !r.get::<String, _>("ref").is_empty(),
+        // Something waits on it, unless it's a task card (that only offers work).
+        waiting: {
+            let r: String = r.get("ref");
+            !r.is_empty() && !r.starts_with("task:")
+        },
         sessions: serde_json::from_str(&r.get::<String, _>("sessions")).unwrap_or_default(),
         count: r.get::<i64, _>("count") as u32,
         created_at: r.get("created_at"),
@@ -132,9 +136,10 @@ pub async fn open(st: &HeadState, d: &api::DecisionIn, realm: &str, reference: &
 }
 
 /// Tells you about a new decision (approvals have their own notification,
-/// with their link; those you raised yourself need none).
+/// with their link; those you raised yourself, and task cards, need none).
 async fn announce(st: &HeadState, d: &api::Decision, reference: &str) {
-    if reference.starts_with("approval:") || reference.starts_with("workflow:") || d.source == "you" {
+    // Task cards aren't urgent: they wait in their session and in Decisions.
+    if reference.starts_with("approval:") || reference.starts_with("workflow:") || reference.starts_with("task:") || d.source == "you" {
         return;
     }
     st.notifier.send(crate::notify::Note {
@@ -160,7 +165,7 @@ pub async fn list(st: &HeadState, state: &str, caller: &Caller) -> anyhow::Resul
         match state {
             "" | "open" => sqlx::query(
                 "SELECT * FROM decisions WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)) AND (? IS NULL OR realm = ?) \
-                 ORDER BY ref = '', CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, grp, updated_at DESC",
+                 ORDER BY (ref = '' OR ref LIKE 'task:%'), CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, grp, updated_at DESC",
             )
             .bind(now)
             .bind(&caller.realm)
@@ -352,6 +357,11 @@ async fn act(
         }
         (Some("update"), Some(version), _) => {
             crate::updates::answer(st, version, option).await?;
+        }
+        (Some("task"), Some(_), Some(_)) => {
+            if option == Some("Start it") {
+                start_task(st, d).await?;
+            }
         }
         (Some("publish"), _, _) => {
             crate::commons::answer(st, d, option == Some("Publish")).await?;
@@ -677,4 +687,110 @@ pub async fn from_session(st: &HeadState, session_id: &str, what: &str, params: 
         }
         other => Err(bad_request(format!("a worker may not call session.{other}"))),
     }
+}
+
+/// An agent proposes a task for a separate session, or withdraws one
+/// (docs/task-cards.md): a card in its session and in Decisions.
+pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Value) -> anyhow::Result<Value> {
+    let realm = crate::realms::of_session(st, session_id).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+    let prefix = format!("task:{session_id}:");
+    if what == "task_withdraw" {
+        let id = params["id"].as_i64().ok_or_else(|| bad_request("id is required"))?;
+        let reference: Option<String> = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ? AND state IN ('open', 'snoozed')")
+            .bind(id)
+            .fetch_optional(&st.store.pool)
+            .await?;
+        let reference =
+            reference.filter(|r| r.starts_with(&prefix)).ok_or_else(|| not_found("no open task card of this session by that id"))?;
+        let why = params["why"].as_str().unwrap_or("").trim().to_owned();
+        settle_ref(st, &reference, "withdrawn", json!({"why": why}), &format!("session:{session_id}")).await;
+        return Ok(json!({"id": id}));
+    }
+    let s = |k: &str| params[k].as_str().unwrap_or("").trim().to_owned();
+    let (title, why, prompt) = (s("title"), s("why"), s("prompt"));
+    if title.is_empty() || prompt.is_empty() {
+        return Err(bad_request("a task card has a title and a prompt"));
+    }
+    // The same title, still open in this session: the same card.
+    let same: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT id, count FROM decisions WHERE ref LIKE ? AND title = ? AND state IN ('open', 'snoozed') ORDER BY id LIMIT 1",
+    )
+    .bind(format!("{prefix}%"))
+    .bind(&title)
+    .fetch_optional(&st.store.pool)
+    .await?;
+    if let Some((id, count)) = same {
+        sqlx::query("UPDATE decisions SET count = count + 1, updated_at = ? WHERE id = ?")
+            .bind(now_ms())
+            .bind(id)
+            .execute(&st.store.pool)
+            .await?;
+        return Ok(json!({"id": id, "count": count + 1}));
+    }
+    let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    // Where it worked: its folder, or the repository its worktree came from.
+    let started = st.store.events_after(session_id, 0, 1).await?.into_iter().find_map(|e| match e.kind {
+        Some(session_event::Kind::Started(s)) => Some(s),
+        _ => None,
+    });
+    let in_worktree = started.as_ref().is_some_and(|s| !s.worktree_branch.is_empty());
+    let folder = match started.as_ref() {
+        Some(s) if in_worktree && !s.repo_root.is_empty() => s.repo_root.clone(),
+        Some(s) => s.cwd.clone(),
+        None => row.cwd.clone(),
+    };
+    let worktree = params["worktree"].as_bool().unwrap_or(in_worktree);
+    let labels: Vec<String> = params["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_owned)).collect();
+    let d = api::DecisionIn {
+        kind: "task".into(),
+        title,
+        document: why,
+        context: json!({"session": session_id, "prompt": prompt, "worker": row.worker_id, "cwd": folder, "ssh": row.ssh_target,
+            "worktree": worktree, "labels": labels}),
+        source: format!("session:{session_id}"),
+        priority: "low".into(),
+        group: "Suggested tasks".into(),
+        options: vec![
+            api::DecisionOption { label: "Start it".into(), does: "A new session does it, with the prompt below.".into() },
+            api::DecisionOption { label: "Not now".into(), does: "The card goes away.".into() },
+        ],
+        ..Default::default()
+    };
+    let decision = open(st, &d, &realm, &format!("{prefix}{}", uuid::Uuid::now_v7())).await?;
+    Ok(json!({"id": decision.id, "count": decision.count}))
+}
+
+/// "Start it": a session that does the card's task, where its session worked.
+async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
+    let c = &d.context;
+    let s = |k: &str| c[k].as_str().unwrap_or("").to_owned();
+    let workers = st.store.workers().await?;
+    let online = |w: &&crate::store::WorkerRow| {
+        w.revoked_at.is_none() && w.role == "worker" && w.id.parse().ok().is_some_and(|id| st.registry.get(id).is_some())
+    };
+    let worker = workers
+        .iter()
+        .filter(online)
+        .find(|w| w.id == s("worker"))
+        .or_else(|| workers.iter().find(online))
+        .ok_or_else(|| bad_request("no worker is online to start it"))?;
+    let mut labels: Vec<String> = c["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_owned)).collect();
+    labels.extend(["task-card".to_owned(), format!("from:{}", s("session"))]);
+    let req: api::CreateSession = serde_json::from_value(json!({
+        "worker_id": worker.id, "cwd": s("cwd"), "connection_id": "", "model": "", "realm": d.realm,
+        "ssh": if s("ssh").is_empty() { Value::Null } else { json!(s("ssh")) },
+        "worktree": c["worktree"].as_bool().unwrap_or(false),
+        "prompt": s("prompt"), "title": d.title, "labels": labels,
+    }))?;
+    let session = crate::sessions::create(st, req).await?;
+    let mut sessions = d.sessions.clone();
+    sessions.push(session.id.clone());
+    sqlx::query("UPDATE decisions SET sessions = ?, updated_at = ? WHERE id = ?")
+        .bind(serde_json::to_string(&sessions)?)
+        .bind(now_ms())
+        .bind(d.id)
+        .execute(&st.store.pool)
+        .await?;
+    info!(decision = d.id, session = %session.id, "task card started");
+    Ok(())
 }

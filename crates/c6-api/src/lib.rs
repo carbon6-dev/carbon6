@@ -1827,7 +1827,7 @@ pub struct Fact {
 pub struct Decision {
     pub id: i64,
     pub realm: String,
-    /// approve, choose, confirm, provide, question, dispute or follow_up.
+    /// approve, choose, confirm, provide, question, dispute, follow_up, or task (a task card, docs/task-cards.md).
     pub kind: String,
     pub title: String,
     /// The case: what is asked, the evidence, what each option does

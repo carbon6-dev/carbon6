@@ -114,6 +114,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         let target = session.parent_id.clone().unwrap_or(session_id);
         return match what {
             "todo" | "todo_resolve" | "decision" => crate::decisions::from_session(st, &target, what, &params).await,
+            // Task cards (docs/task-cards.md).
+            "task_propose" | "task_withdraw" => crate::decisions::task_card(st, &target, what, &params).await,
             // The API reference, for agents writing integrations.
             "api" => {
                 let urls = crate::notify::api_urls(st).await;

@@ -69,7 +69,8 @@ fn filter_tools(spec: &CreateSession, tools: Vec<Arc<dyn Tool>>, agent: Option<&
         .filter(|t| {
             let name = t.spec().name;
             let delegates = Task::is_task(&name) || SendMessage::is_send(&name);
-            !(delegates && !may_delegate(spec, depth)) && agent.is_none_or(|a| a.allows(&name))
+            // What a subagent finds goes back to its parent, not into task cards.
+            !(delegates && !may_delegate(spec, depth)) && !c6_tools::knowledge::is_task_card(&name) && agent.is_none_or(|a| a.allows(&name))
         })
         .collect()
 }
@@ -95,7 +96,7 @@ impl Subagents for Runner {
         if !p.spec.subagent_model.trim().is_empty() {
             model = p.spec.subagent_model.trim().to_owned();
         }
-        let mut system_prompt = p.started.system_prompt.clone();
+        let mut system_prompt = crate::session::without_task_cards(&p.started.system_prompt);
         if let Some(a) = agent {
             // The agent's instructions are its system prompt.
             system_prompt = format!(

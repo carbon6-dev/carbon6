@@ -197,6 +197,51 @@ simple_tool!(
 );
 
 simple_tool!(
+    TaskPropose,
+    "task_propose",
+    "TaskPropose",
+    "Proposes a task for a separate session, as a card the user can start with one click: work worth doing that does not belong \
+     in what you are doing now. You carry on without it. prompt is all the new session sees: make it stand alone (what to do, \
+     where, file paths, why, how to check it). Returns the card's id.",
+    json!({"type": "object", "properties": {
+        "title": {"type": "string", "description": "The task, as an imperative (e.g. \"Remove the dead retry module\")"},
+        "why": {"type": "string", "description": "One or two sentences: what you noticed, and why it is worth doing"},
+        "prompt": {"type": "string", "description": "The new session's first message, standing on its own"},
+        "worktree": {"type": "boolean", "description": "Start it in a fresh git worktree (default: yes when this session works in one)"},
+        "labels": {"type": "array", "items": {"type": "string"}}
+    }, "required": ["title", "why", "prompt"], "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| {
+        result(call(ctx, "session.task_propose", input).await, |v| {
+            format!(
+                "task card #{} proposed{}; carry on with your work",
+                v["id"],
+                if v["count"].as_i64().unwrap_or(1) > 1 { " (it was already open)" } else { "" }
+            )
+        })
+    }
+);
+
+simple_tool!(
+    TaskWithdraw,
+    "task_withdraw",
+    "TaskWithdraw",
+    "Withdraws a task card you proposed that no longer needs doing (you did it after all, or the user asked for it here).",
+    json!({"type": "object", "properties": {
+        "id": {"type": "integer"},
+        "why": {"type": "string"}
+    }, "required": ["id", "why"], "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| { result(call(ctx, "session.task_withdraw", input).await, |v| format!("task card #{} withdrawn", v["id"])) }
+);
+
+/// Whether `name` is a task-card tool (subagents don't get them: what they
+/// find goes back to their parent).
+pub fn is_task_card(name: &str) -> bool {
+    matches!(name, "task_propose" | "TaskPropose" | "task_withdraw" | "TaskWithdraw")
+}
+
+simple_tool!(
     DecisionRequest,
     "decision_request",
     "DecisionRequest",

@@ -1,6 +1,6 @@
 # Task cards — Design
 
-Status: designed (2026-10-20). Decided: shown in the session that raised them and in Decisions, under "Suggested tasks", at low priority.
+Status: built (2026-10-20). Decided: shown in the session that raised them and in Decisions, under "Suggested tasks", at low priority.
 
 ## 1. What it does
 

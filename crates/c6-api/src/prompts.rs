@@ -59,6 +59,18 @@ knowledge_record and re-checks with knowledge_verify; never stop to ask the user
 
 /// The first message of a session started from an action item. `{{id}}`,
 /// `{{kind}}`, `{{title}}`, `{{detail}}`, `{{context}}`.
+/// When an agent proposes a task card (docs/task-cards.md).
+pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \
+each as a task card with task_propose instead of doing it (it would bloat this change) or forgetting it; the user can start it as a \
+separate session with one click, and you carry on.\n\
+- Propose: dead code, stale or wrong docs, missing tests for code you touched, a confirmed TODO, a bug or security issue you noticed \
+in passing.\n\
+- Do not propose: vague code-smell observations, a fix small enough to do now as part of your task, low-confidence hunches, or \
+anything the user asked for in this conversation.\n\
+- Write the prompt so it stands alone: the new session sees nothing of this conversation (say what, where, why, and how to check \
+it).\n\
+- A few at most per conversation; if you later do the work after all, withdraw the card with task_withdraw.";
+
 pub const TODO_SESSION: &str = "Help me settle this action item.\n\nAction item #{{id}} ({{kind}}): {{title}}\n{{detail}}\n\nContext: \
 {{context}}\n\nIf it names facts, read them with knowledge_list (by id) and their evidence. Ask me what you need, settle it with me, and \
 record the outcome: knowledge_set for facts I confirm, correct or retire, knowledge_record for anything new, and todo_resolve with a \

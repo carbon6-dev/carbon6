@@ -203,6 +203,13 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 <span class="text-xs text-zinc-500">{ago(now_ms() - d.updated_at)}</span>
             </div>
             {(!d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" inner_html=crate::markdown::to_html(&d.document)></div> })}
+            // A task card: exactly what the new session would be told.
+            {(d.kind == "task").then(|| d.context["prompt"].as_str().map(str::to_owned)).flatten().map(|p| view! {
+                <details class="text-xs">
+                    <summary class="cursor-pointer select-none text-zinc-500">"What the new session is told"</summary>
+                    <pre class="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-zinc-50 p-2 font-mono text-[11px] dark:bg-zinc-900">{p}</pre>
+                </details>
+            })}
             <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                 {(!in_session).then(|| view! { <span>{format!("from {}", d.source)}</span> })}
                 {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session ↗"</Go> })}
@@ -243,7 +250,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                     {(d.options.is_empty()).then(|| view! {
                         <button class=BUTTON disabled=move || busy.get() on:click=move |_| answer(None)>{if has_form { "Send" } else { "Settled" }}</button>
                     })}
-                    {(!d.waiting).then(|| view! {
+                    {(!d.waiting && d.kind != "task").then(|| view! {
                         <button class=BUTTON_QUIET disabled=move || busy.get() on:click=start title="A session that helps you settle it, with its context">"Work on it"</button>
                         <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "snoozed", "snooze_until": now_ms() + 86_400_000}))>"Tomorrow"</button>
                         <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>

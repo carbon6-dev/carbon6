@@ -61,6 +61,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::COMPACT_WHY_ASKED,
     },
     Prompt {
+        name: "session.task_cards",
+        description: "When agents propose task cards: work for a separate session, started with one click (docs/task-cards.md).",
+        default: text::TASK_CARDS,
+    },
+    Prompt {
         name: "assistant.base",
         description: "The assistant's instructions. Placeholders: {{areas}}, {{context}} (what the user is looking at), {{today}}, {{realm}} (the realm it works in).",
         default: crate::assistant::PROMPT,
@@ -174,7 +179,10 @@ pub async fn get(st: &HeadState, name: &str, realm: &str) -> String {
 /// The prompts a worker gives the model itself, for a session's spec.
 pub async fn for_worker(st: &HeadState, realm: &str) -> String {
     let all = all(st, realm).await;
-    let picked: Map<String, Value> = all.into_iter().filter(|(k, _)| k.starts_with("session.subagent") || k.starts_with("session.compact")).collect();
+    let picked: Map<String, Value> = all
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("session.subagent") || k.starts_with("session.compact") || k == "session.task_cards")
+        .collect();
     Value::Object(picked).to_string()
 }
 

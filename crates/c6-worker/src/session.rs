@@ -541,6 +541,14 @@ impl SessionManager {
                     ));
                 }
             }
+            // When to propose task cards (docs/task-cards.md): an editable prompt.
+            if built.tools.iter().any(|t| c6_tools::knowledge::is_task_card(&t.spec().name)) {
+                let guidance = spec_prompt(&spec, "session.task_cards", "");
+                if !guidance.trim().is_empty() {
+                    prompt.push_str(TASK_CARDS_HEADING);
+                    prompt.push_str(guidance.trim());
+                }
+            }
             if !built.skills.is_empty() {
                 prompt.push_str("\n\n");
                 prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
@@ -1743,6 +1751,9 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::knowledge::TodoAdd::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::knowledge::TodoResolve::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::knowledge::DecisionRequest::new(profile == ToolProfile::Claude)));
+    // Work for another session, proposed as a card (docs/task-cards.md).
+    tools.push(Arc::new(c6_tools::knowledge::TaskPropose::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::knowledge::TaskWithdraw::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::knowledge::GrantRequest::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::knowledge::CommonsPublish::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::kits::KitRun::new(profile == ToolProfile::Claude)));
@@ -1990,6 +2001,18 @@ fn prune_browser_profiles(dir: &Path, age: std::time::Duration) {
     }
 }
 
+/// Where a session's prompt says when to propose task cards; a subagent,
+/// which has no such tools, leaves the section out.
+pub(crate) const TASK_CARDS_HEADING: &str = "\n\n# Task cards\n\n";
+
+/// `prompt` without its task-cards section.
+pub(crate) fn without_task_cards(prompt: &str) -> String {
+    let Some(start) = prompt.find(TASK_CARDS_HEADING) else { return prompt.to_owned() };
+    let rest = &prompt[start + TASK_CARDS_HEADING.len()..];
+    let end = rest.find("\n\n# ").map(|i| start + TASK_CARDS_HEADING.len() + i).unwrap_or(prompt.len());
+    format!("{}{}", &prompt[..start], &prompt[end..])
+}
+
 /// A prompt from the session's spec, as edited, or its default.
 pub(crate) fn spec_prompt(spec: &CreateSession, name: &str, default: &str) -> String {
     serde_json::from_str::<serde_json::Value>(&spec.prompts_json)
@@ -2011,6 +2034,14 @@ pub(crate) fn compact_prompts(spec: &CreateSession) -> c6_agent::CompactPrompts 
 #[cfg(test)]
 mod label_tests {
     use super::*;
+
+    #[test]
+    fn subagents_leave_out_the_task_cards_section() {
+        let p = format!("Base.{TASK_CARDS_HEADING}Propose cards.\n\n# Skills\n\nOne.");
+        assert_eq!(without_task_cards(&p), "Base.\n\n# Skills\n\nOne.");
+        assert_eq!(without_task_cards(&format!("Base.{TASK_CARDS_HEADING}Last.")), "Base.");
+        assert_eq!(without_task_cards("Base."), "Base.");
+    }
 
     #[test]
     fn normalizes_remotes() {

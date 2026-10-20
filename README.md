@@ -161,6 +161,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
   - facts to confirm, and disputes.
 
   Answer with an option, a form or a note, or start a session that helps you settle one. Answering one answers what waits on it, and answering in the session settles the decision. With options, a notification carries a link that answers it from your phone. With a deadline, an unanswered decision takes its default answer.
+- **Task cards:** while working, an agent proposes things worth doing that don't belong in the current change (dead code, a stale doc, a missing test, a bug noticed in passing) as cards: a title, why, and the prompt a new session would get. **Start it** runs that session where the first one worked (in a fresh worktree if it used one), and **Not now** dismisses it. Cards show in their session and in Decisions under "Suggested tasks", without notifications. When to propose is an editable prompt (`session.task_cards`). Design: [docs/task-cards.md](docs/task-cards.md).
 - **In the session, too:** a session shows its own open decisions under its transcript, as **Waiting for you**, to answer right there. These are the questions its agent asked without stopping, the grants it asked for, and what it was started to work on. Its tool approvals and questions show in the transcript itself, as before.
 - **The design:** see [docs/os.md](docs/os.md) §4.2 and [docs/follow-through.md](docs/follow-through.md) §6.
 
