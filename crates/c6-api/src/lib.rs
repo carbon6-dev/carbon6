@@ -3804,6 +3804,43 @@ pub struct ImportRule {
     pub realm: String,
 }
 
+/// A suggested next message (`/api/v1/sessions/{id}/suggestion`,
+/// docs/suggestions.md).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Suggestion {
+    pub text: String,
+    /// The session's position it was made for.
+    pub for_seq: i64,
+}
+
+/// You saw a suggestion (and took it, or not).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SuggestionSeen {
+    pub for_seq: i64,
+    #[serde(default)]
+    pub accepted: bool,
+}
+
+/// Whether sessions suggest your next message (`/api/v1/settings/suggestions`, per realm).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SuggestionSettings {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for SuggestionSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// When carbon6 updates itself from GitHub releases
 /// (`/api/v1/settings/updates`, docs/updates.md §4).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

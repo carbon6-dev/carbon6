@@ -2058,6 +2058,28 @@ fn Composer(
 ) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
+    // What you'd likely type next (docs/suggestions.md): fetched when a turn
+    // ends, shown faintly while the box is empty, taken with Tab.
+    let next = RwSignal::new(None::<c6_api::Suggestion>);
+    let suggest_for = id.clone();
+    let suggests = !inline && wake.is_none();
+    Effect::new(move |was: Option<bool>| {
+        let now = running.get();
+        if suggests && !now && was != Some(false) {
+            let id = suggest_for.clone();
+            spawn_local(async move {
+                let s = api::session_suggestion(id.clone()).await.ok().flatten();
+                if let Some(s) = &s {
+                    api::suggestion_seen(id, s.for_seq, false).await;
+                }
+                next.set(s);
+            });
+        } else if now {
+            next.set(None);
+        }
+        now
+    });
+    let shown_next = move || next.get().filter(|_| text.with(String::is_empty) && !running.get()).map(|s| s.text);
     // The model row, on phones (always shown on wider screens).
     let model_open = RwSignal::new(false);
     let id = StoredValue::new(id);
@@ -2333,7 +2355,7 @@ fn Composer(
                         node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if disabled.get() { "This session failed to start." } else if running.get() { "Send a message; it reaches the agent at its next step…" } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)" } else if inline { "Reply in this side chat (@ to mention a file, / for commands)" } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)" }
+                        placeholder=move || if let Some(s) = shown_next() { format!("{s}   (Tab)") } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
@@ -2371,6 +2393,17 @@ fn Composer(
                                     "Escape" => { ev.prevent_default(); ev.stop_propagation(); mention.set(None); command.set(None); return; }
                                     _ => {}
                                 }
+                            }
+                            // The suggested next message: Tab takes it, Esc puts it away.
+                            if let Some(s) = shown_next().filter(|_| matches!(ev.key().as_str(), "Tab" | "Escape")) {
+                                ev.prevent_default();
+                                let took = next.get_untracked().filter(|_| ev.key() == "Tab");
+                                next.set(None);
+                                if let Some(n) = took {
+                                    text.set(s);
+                                    spawn_local(api::suggestion_seen(id.get_value(), n.for_seq, true));
+                                }
+                                return;
                             }
                             if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); send(); }
                         }

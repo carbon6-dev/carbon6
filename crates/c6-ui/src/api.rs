@@ -967,6 +967,31 @@ pub async fn decisions(state: String) -> Result<Vec<c6_api::Decision>, String> {
     json(Request::get(&format!("/api/v1/decisions?state={state}")).send().await).await
 }
 
+/// What you'd likely type next in a session (docs/suggestions.md); None when there's none.
+pub async fn session_suggestion(id: String) -> Result<Option<c6_api::Suggestion>, String> {
+    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/suggestion")).send().await).await?;
+    if resp.status() == 204 {
+        return Ok(None);
+    }
+    resp.json().await.map(Some).map_err(|e| e.to_string())
+}
+
+pub async fn suggestion_settings() -> Result<c6_api::SuggestionSettings, String> {
+    json(Request::get(&format!("/api/v1/settings/suggestions{}", in_realm('?'))).send().await).await
+}
+
+pub async fn set_suggestion_settings(s: c6_api::SuggestionSettings) -> Result<(), String> {
+    empty(Request::put(&format!("/api/v1/settings/suggestions{}", in_realm('?'))).json(&s).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// A suggestion was shown, or (`accepted`) taken.
+pub async fn suggestion_seen(id: String, for_seq: i64, accepted: bool) {
+    let body = c6_api::SuggestionSeen { for_seq, accepted };
+    if let Ok(req) = Request::post(&format!("/api/v1/sessions/{id}/suggestion/seen")).json(&body) {
+        let _ = empty(req.send().await).await;
+    }
+}
+
 /// A session's open decisions (not its approvals and questions: those are in its log).
 pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await

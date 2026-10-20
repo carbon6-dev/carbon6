@@ -147,6 +147,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
+        .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
+        .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
+        .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
@@ -685,6 +688,37 @@ async fn session_decisions(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<api::Decision>>> {
     Ok(Json(crate::decisions::of_session(&st, &id, &caller).await?))
+}
+
+/// What you'd likely type next (docs/suggestions.md): 204 when there's none.
+async fn session_suggestion(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    Ok(match crate::suggestions::get(&st, &id, &caller).await? {
+        Some(s) => Json(s).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+async fn suggestion_seen(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(s): Json<api::SuggestionSeen>,
+) -> ApiResult<StatusCode> {
+    crate::suggestions::seen(&st, &id, s.for_seq, s.accepted).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_suggestion_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SuggestionSettings>> {
+    let raw = st.store.setting(crate::suggestions::KEY).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+async fn put_suggestion_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::SuggestionSettings>) -> ApiResult<StatusCode> {
+    st.store.set_setting(crate::suggestions::KEY, &serde_json::to_string(&s).unwrap_or_default()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn search(

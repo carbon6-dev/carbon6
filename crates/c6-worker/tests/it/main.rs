@@ -47,6 +47,7 @@ mod series;
 mod session;
 mod side_chat;
 mod subagents;
+mod suggestions;
 mod task_cards;
 mod triggers;
 mod updates;

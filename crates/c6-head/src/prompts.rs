@@ -61,6 +61,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::COMPACT_WHY_ASKED,
     },
     Prompt {
+        name: "session.suggest",
+        description: "How a session's next message is suggested (docs/suggestions.md). Placeholders: {{title}}, {{labels}}, {{exchanges}} (the last exchanges).",
+        default: text::SUGGEST,
+    },
+    Prompt {
         name: "session.task_cards",
         description: "When agents propose task cards: work for a separate session, started with one click (docs/task-cards.md).",
         default: text::TASK_CARDS,

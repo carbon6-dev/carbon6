@@ -126,6 +126,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                         <HooksSetting />
                         <WebSearchSetting />
+                        <SuggestionsSetting />
                         <SecretsSetting />
                     }.into_any(),
                     "rules" => view! {
@@ -901,6 +902,40 @@ fn SessionImportsSetting() -> impl IntoView {
                     r["sessions"], if r["source"] == "codex" { "Codex" } else { "Claude Code" },
                     if r["sessions"] == 1 { "" } else { "s" }, r["realm"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")}</p>
             })}
+        </section>
+    }
+}
+
+/// Suggested next messages (docs/suggestions.md), per realm.
+#[component]
+fn SuggestionsSetting() -> impl IntoView {
+    let on = RwSignal::new(true);
+    let loaded = LocalResource::new(move || {
+        api::realm().track();
+        api::suggestion_settings()
+    });
+    Effect::new(move || {
+        if let Some(Ok(s)) = loaded.get() {
+            on.set(s.enabled);
+        }
+    });
+    let error = RwSignal::new(None::<String>);
+    let toggle = move |ev: leptos::ev::Event| {
+        let enabled = event_target_checked(&ev);
+        on.set(enabled);
+        spawn_local(async move {
+            error.set(api::set_suggestion_settings(c6_api::SuggestionSettings { enabled }).await.err());
+        });
+    };
+    view! {
+        <section class="space-y-2">
+            <h2 class="font-medium">"Suggested next messages"</h2>
+            <p class="text-sm text-zinc-500">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest."</p>
+            <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" prop:checked=move || on.get() on:change=toggle />
+                "Suggest next messages"
+            </label>
+            {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
         </section>
     }
 }

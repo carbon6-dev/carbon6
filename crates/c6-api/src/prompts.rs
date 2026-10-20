@@ -59,6 +59,13 @@ knowledge_record and re-checks with knowledge_verify; never stop to ask the user
 
 /// The first message of a session started from an action item. `{{id}}`,
 /// `{{kind}}`, `{{title}}`, `{{detail}}`, `{{context}}`.
+/// What you'd likely type next (docs/suggestions.md).
+pub const SUGGEST: &str = "You suggest the user's next message to a coding agent, so they can accept it with one key instead of typing it. \
+Here is the end of their conversation (session \"{{title}}\"; labels: {{labels}}):\n\n{{exchanges}}\n\n\
+Reply with only the message the user is most likely to send next: one short line, in their voice, as they would type it (\"run the \
+tests again\", \"commit this\", \"yes, use eu-west\"). If the agent asked them something, answer it the way they most likely would. \
+If there is no clear next step, reply with a single -";
+
 /// When an agent proposes a task card (docs/task-cards.md).
 pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \
 each as a task card with task_propose instead of doing it (it would bloat this change) or forgetting it; the user can start it as a \

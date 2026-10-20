@@ -1,6 +1,6 @@
 # Suggested next messages — Design
 
-Status: designed (2026-10-20). Decided: a cheap model chosen by routing (`task:suggest`), else the session's own; made only while someone is looking.
+Status: built (2026-10-20). Decided: a cheap model chosen by routing (`task:suggest`), else the session's own; made only while someone is looking.
 
 ## 1. What it does
 
@@ -19,7 +19,7 @@ When a turn finishes and the session is waiting for you, the message box offers 
   - The session's page asks for a suggestion when its last turn has ended, its message box is empty, and nothing is queued.
   - A session nobody opens costs nothing.
   - Each turn gets one suggestion at most, cached by the session's position (`last_seq`). Reopening the page or a second tab gets the cached one.
-- **Not while something else is asked.** No suggestion while the session shows a card you answer in place: an approval, a question, or a decision under **Waiting for you**. The answer goes there, not in the box.
+- **Not while something else is asked.** No suggestion while the session shows a card you answer in place: an approval, a question, or a decision under **Waiting for you**. A task card doesn't count, since it asks nothing of you. The answer goes there, not in the box.
 - **Off per realm,** in Settings → Agents and tools → **Suggest next messages** (on by default).
 
 ## 3. How it's made
@@ -40,8 +40,8 @@ When a turn finishes and the session is waiting for you, the message box offers 
   1. The model-routing rule that applies to the session's labels plus `task:suggest`, in the session's realm (then root's). Add one to send suggestions to a small, fast model.
   2. Without such a rule, the session's own connection and model.
 
-  It runs in the head, one call with no tools, low effort, and at most 60 output tokens.
-- **Accounting.** The call counts toward the session's usage and budgets, labelled `suggestion`. A blocking budget means no suggestion.
+  It runs in the head, one call with no tools, low effort, and at most 1,024 output tokens, so a thinking model has room to reason. The answer is cut to one line. A reply with no text at all counts as a failed call, not as "no next step".
+- **Accounting.** The call counts toward the session's usage and budgets: its tokens are a usage row of the session's own, with the suggestion's model. A blocking budget means no suggestion.
 - **Clean-up.** The answer is trimmed to one line of at most 200 characters, and quotes and "User:" prefixes are stripped.
 
 ## 4. API

@@ -49,6 +49,7 @@ pub mod telemetry;
 pub mod templates;
 pub mod terminals;
 pub mod tls;
+pub mod suggestions;
 pub mod triggers;
 pub mod ui_ca;
 pub mod updates;
