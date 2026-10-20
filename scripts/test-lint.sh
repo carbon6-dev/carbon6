@@ -6,15 +6,20 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 fail=0
+# Hits (file:line:text) not allowed on their line or the line above. (No
+# `case` inside `$(…)`: macOS's bash 3.2 can't parse it.)
+unallowed() {
+    while IFS=: read -r file line rest; do
+        if printf '%s' "$rest" | grep -q 'test-lint: allow'; then continue; fi
+        if [ "$line" -gt 1 ] && sed -n "$((line - 1))p" "$file" | grep -q 'test-lint: allow'; then continue; fi
+        printf '%s:%s:%s\n' "$file" "$line" "$rest"
+    done
+}
 check() {
     local what=$1 pattern=$2; shift 2
     local hits
     # Allowed on the line itself, or by a comment on the line above.
-    hits=$(git grep -nE "$pattern" -- "$@" | while IFS=: read -r file line rest; do
-        case "$rest" in *'test-lint: allow'*) continue ;; esac
-        if [ "$line" -gt 1 ] && sed -n "$((line - 1))p" "$file" | grep -q 'test-lint: allow'; then continue; fi
-        printf '%s:%s:%s\n' "$file" "$line" "$rest"
-    done || true)
+    hits=$(git grep -nE "$pattern" -- "$@" | unallowed || true)
     if [ -n "$hits" ]; then
         printf 'test-lint: %s (docs/testing.md):\n%s\n\n' "$what" "$hits" >&2
         fail=1
