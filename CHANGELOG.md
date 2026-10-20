@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.7 (2026-10-20)
+
+- The test lint runs under macOS's bash 3.2 (no case inside $(…))
+- Tests fail only when what they check is broken (docs/testing.md): they wait on conditions with one hang deadline instead of fixed timeouts, set what they test instead of the shared environment, restart heads on reserved ports, and fail in CI when a tool they need is missing; make check lints for it, and CI runs the suite under load
+- The browser tool gives Chrome a minute to start and says why when it doesn't (it waited 20 seconds silently; CI was slower)
+- A session shows its open decisions under its transcript (what its agent asked without stopping, grants it asked for, what it was started to work on), to answer there
+
 ## 0.3.6 (2026-10-19)
 
 - Tests that restart a head on its ports retry while a parallel test holds one, and the terminal test waits longer for a slow shell (both failed CI once)
