@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.8 (2026-10-20)
+
+- Suggested next messages: when a turn finishes, the message box offers what you'd likely type next (Tab takes it), made once per turn while you look, by the model a task:suggest routing rule picks (else the session's own), counted in the session's usage
+- Task cards: agents propose work that doesn't belong in the current change as cards (in their session and in Decisions under Suggested tasks); Start it runs a session with the card's prompt where the first one worked, and when to propose is an editable prompt
+- Designs: suggested next messages (docs/suggestions.md) and task cards (docs/task-cards.md)
+
 ## 0.3.7 (2026-10-20)
 
 - The test lint runs under macOS's bash 3.2 (no case inside $(…))

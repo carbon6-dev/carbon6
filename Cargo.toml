@@ -6,7 +6,7 @@ exclude = ["site"]
 default-members = ["crates/c6-proto", "crates/c6-core", "crates/c6-api", "crates/c6-llm", "crates/c6-agent", "crates/c6-tools", "crates/c6-mcp", "crates/c6-testkit", "crates/c6-head", "crates/c6-worker", "crates/c6-memex", "bins/c6h", "bins/c6w", "bins/c6"]
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/carbon6-dev/carbon6"
