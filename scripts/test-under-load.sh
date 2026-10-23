@@ -12,7 +12,7 @@ runs=${1:-1}
 shift || true
 cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
 if [ "${NEXTEST:-}" = 1 ]; then
-    run() { cargo nextest run --locked --workspace --no-fail-fast "$@" && cargo test --locked --doc; }
+    run() { cargo nextest run --locked --workspace --no-fail-fast "$@"; }
     cargo nextest run --locked --workspace --no-run "$@" >/dev/null
 else
     run() { cargo test --locked "$@"; }

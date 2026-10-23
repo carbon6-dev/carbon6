@@ -39,8 +39,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      # nextest doesn't run doc tests; the workspace has none (`cargo test
+      # --doc` would only recompile the libraries for two minutes to find so).
       - if: runner.os == 'Linux'
-        run: cargo nextest run --locked --workspace --no-fail-fast && cargo test --locked --doc
+        run: cargo nextest run --locked --workspace --no-fail-fast
       - if: runner.os != 'Linux'
         run: cargo test --locked
 
@@ -56,7 +58,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - run: make test-under-load NEXTEST=1
+      # cargo test here: nextest's process per test, on top of a busy loop
+      # per core, made this job half again as long.
+      - run: make test-under-load
