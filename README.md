@@ -500,7 +500,7 @@ The agent can start work in the background and carry on: long builds, test suite
 
 The agent can hand work to a subagent with the Task tool. A subagent is a session of its own, shown as a thread under the call that started it (docs/subagents.md).
 
-- **Watching one.** While it works, the thread shows its last few steps live. Click the thread to open its whole conversation, or ↗ to open it in its own column. The session header's **◆** button lists every subagent in the session, at any depth, with its state. Pick one to go to its thread.
+- **Watching one.** While it works, the thread shows its last few steps live. Click the thread to open its whole conversation, or ↗ to open it beside. The session header's **◆** button lists every subagent in the session, at any depth, with its state. Pick one to go to its thread.
 - **Stopping one.** **■ Stop** in its thread ends its turn without stopping the agent that started it. That agent gets a summary of what the subagent did (its last message, the files it changed, its errors). Stopping the main turn stops the subagents it waits on too.
 - **Continuing one.** Its conversation is kept, so it can pick up where it was:
   - after a stop, a failure or a worker restart, **↻ Resume** sends it the resume prompt (Settings → Prompts);
@@ -555,14 +555,14 @@ Hooks are shell commands that run on the worker at set points in every session. 
 
 ### Workspace
 
-The UI is a workspace of up to four tiles side by side, each a stack of columns:
+The UI is a workspace of up to four **tiles** side by side: framed cards, each with its own bar (‹ › back and forward, its name, ⧉, ✕).
 
-- **Columns:** opening something (a session from the list, a search result, a side chat's parent) puts it in a column beside where you clicked, so where you came from stays open — a search stays beside the result you are reading. Earlier columns fold into spines; click one to go back to it (the columns after it fold to the right until you open something new). The header's nav swaps sections in place.
-- **Sessions side by side:** from a list (Sessions, Inbox, Mission, search results), the first session opens beside the list; each further one opens in a new tile at the right, up to four (then it replaces the least recently used tile). A session that is already open is shown where it is instead of opening twice.
-- **Tiles:** ⌘/Ctrl-click any link (or ⧉ in a column header, or **+ Tile**) to open it in a new tile. ⌘1–4 focus a tile; ⌘[ and ⌘] step back and forward in the focused tile.
+- **Inside a tile:** at most two panes, a list and the item opened from it. Clicking anything inside a tile opens it in that tile's right pane, beside the list, replacing what was there. ‹ and › (⌘[ / ⌘]) step through the tile's own history.
+- **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–4 focus a tile. With four open, a new one replaces the least recently used. A session that is already open is shown where it is instead of opening twice.
+- **The header's navigation** (Sessions, Decisions, Settings…) replaces what the focused tile shows. Back brings it back.
 - **Activity dock** (left, on wide screens): running sessions, ones that finished or failed while not on screen (amber/red), and pinned ones (☆ in a session's header). **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
-- **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; a column fills the screen, with ‹ › in its header and the nav in ☰.
-- The workspace is saved in the browser; the address bar shows the focused column, so links and reloads land in the right place.
+- **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; one pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰.
+- The workspace is saved in the browser; the address bar shows the focused pane, so links and reloads land in the right place.
 
 ### Search
 

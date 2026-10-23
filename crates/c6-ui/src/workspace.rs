@@ -1,13 +1,13 @@
-//! The workspace: up to four tiles side by side, each a stack of columns.
+//! The workspace: up to four tiles side by side, each a framed card.
 //!
-//! Opening something from a column puts it in a new column to the right
-//! (closing the columns after it), so where you came from stays open: a
-//! search stays beside the session you opened from it. Earlier columns fold
-//! into spines; a spine opens again on click, keeping the columns after it
-//! until you open something new. ⌘/Ctrl-click opens in a new tile instead.
+//! A tile has at most two panes: a list (or whatever it was opened on) and
+//! the item opened from it. One rule: a click inside a tile opens in that
+//! tile's right pane; the header's navigation replaces the whole tile; only
+//! ⌘/Ctrl-click (or a tile's ⧉) makes a new tile. Each tile keeps its own
+//! back and forward history (⌘[ and ⌘]).
 //!
-//! On a phone one tile shows at a time (a switcher at the bottom) and only
-//! its current column, with back and forward in the column header.
+//! On a phone one tile shows at a time (a switcher at the bottom) and one
+//! pane of it, with back in its header.
 //!
 //! The layout is saved in the browser; the URL shows the focused column.
 //! It also tracks attention: sessions that finished or failed while not
@@ -289,11 +289,6 @@ impl View {
         }
     }
 
-    /// Lists of sessions: opening a second session from one opens a tile.
-    fn is_list(&self) -> bool {
-        matches!(self, View::Sessions | View::Search { .. } | View::Inbox | View::Mission)
-    }
-
     /// A top-level section (not one session or worker): the header's nav
     /// and search swap one section for another in place instead of
     /// stacking columns.
@@ -313,16 +308,44 @@ pub struct Column {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Tile {
     pub key: u64,
+    /// Its panes: what it was opened on, and the item opened from it (at
+    /// most two).
     pub columns: Vec<Column>,
-    /// The column the tile is showing (the one before it shows beside it
-    /// when there is room); columns after it are folded on the right.
+    /// The pane a phone shows (a wide screen shows both).
     pub cursor: usize,
-    /// The column last interacted with: keyboard shortcuts act on it.
+    /// The pane last interacted with: keyboard shortcuts act on it.
     pub active: u64,
     /// When the tile was last focused (a counter), to pick the least
     /// recently used one to replace when all tiles are in use.
     #[serde(default)]
     pub used: u64,
+    /// Its history: what it showed before (back) and after (forward).
+    #[serde(default)]
+    pub back: Vec<Vec<Column>>,
+    #[serde(default)]
+    pub forward: Vec<Vec<Column>>,
+}
+
+/// How far back a tile remembers.
+const HISTORY: usize = 30;
+
+impl Tile {
+    /// Shows `columns` instead, remembering what it showed.
+    fn go(&mut self, columns: Vec<Column>) {
+        let before = std::mem::replace(&mut self.columns, columns);
+        self.back.push(before);
+        if self.back.len() > HISTORY {
+            self.back.remove(0);
+        }
+        self.forward.clear();
+        self.settle();
+    }
+
+    /// Shows its last pane, and makes it the active one.
+    fn settle(&mut self) {
+        self.cursor = self.columns.len() - 1;
+        self.active = self.columns[self.cursor].key;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -348,7 +371,15 @@ impl Layout {
 
     fn new_tile(&mut self, view: View) -> Tile {
         let (tk, ck) = (self.key(), self.key());
-        Tile { key: tk, columns: vec![Column { key: ck, view }], cursor: 0, active: ck, used: self.next }
+        Tile {
+            key: tk,
+            columns: vec![Column { key: ck, view }],
+            cursor: 0,
+            active: ck,
+            used: self.next,
+            back: Vec::new(),
+            forward: Vec::new(),
+        }
     }
 
     fn touch(&mut self, ti: usize) {
@@ -377,10 +408,7 @@ impl Layout {
         } else {
             let lru = (0..self.tiles.len()).filter(|&i| i != origin).min_by_key(|&i| self.tiles[i].used).unwrap_or(origin);
             let key = self.key();
-            let t = &mut self.tiles[lru];
-            t.columns = vec![Column { key, view }];
-            t.cursor = 0;
-            t.active = key;
+            self.tiles[lru].go(vec![Column { key, view }]);
             self.focus = lru;
         }
         self.touch(self.focus);
@@ -398,15 +426,15 @@ impl Layout {
         !self.tiles.is_empty()
             && self.tiles.len() <= MAX_TILES
             && self.focus < self.tiles.len()
-            && self.tiles.iter().all(|t| !t.columns.is_empty() && t.cursor < t.columns.len())
+            && self.tiles.iter().all(|t| !t.columns.is_empty() && t.columns.len() <= 2 && t.cursor < t.columns.len())
     }
 
-    /// Session ids shown now (a tile's current column and the one beside it).
+    /// Session ids shown now (in any tile's panes).
     pub fn visible_sessions(&self) -> HashSet<String> {
         let mut out = HashSet::new();
         for t in &self.tiles {
-            for i in t.cursor.saturating_sub(1)..=t.cursor {
-                if let Some(Column { view: View::Session { id, .. }, .. }) = t.columns.get(i) {
+            for c in &t.columns {
+                if let View::Session { id, .. } = &c.view {
                     out.insert(id.clone());
                 }
             }
@@ -423,7 +451,8 @@ impl Layout {
 /// How a link opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum How {
-    /// In a new column right of where it was clicked.
+    /// In this tile: its right pane (from inside it), or in place of it
+    /// (from the header's navigation).
     Beside,
     /// In a new tile (⌘/Ctrl-click).
     NewTile,
@@ -435,7 +464,8 @@ impl How {
     }
 }
 
-const LAYOUT_KEY: &str = "c6.workspace.v1";
+// v2: tiles of two panes with history (v1 tiles of column chains are dropped).
+const LAYOUT_KEY: &str = "c6.workspace.v2";
 const ATTENTION_KEY: &str = "c6.attention";
 const PINNED_KEY: &str = "c6.pinned";
 
@@ -482,12 +512,14 @@ impl Workspace {
         ws
     }
 
-    /// Opens `view` from column `from` (tile key, column key), or from the
-    /// focused tile's current column.
+    /// Opens `view` from pane `from` (tile key, pane key), or from outside
+    /// the tiles (the header, a notification).
     ///
-    /// A session already open somewhere is shown where it is. A session
-    /// opened from a list that already has something beside it gets a new
-    /// tile, so sessions open side by side instead of replacing each other.
+    /// One rule: ⌘/Ctrl-click (`NewTile`) makes a new tile; anything else
+    /// stays in its tile. From a pane, it opens in the tile's right pane
+    /// (beside a list, or in place of the item there). From outside, it
+    /// replaces the focused tile (an item goes beside the list it shows).
+    /// A session already shown somewhere is shown where it is.
     pub fn open(&self, from: Option<(u64, u64)>, view: View, how: How) {
         self.layout.update(|l| {
             let origin = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus);
@@ -504,39 +536,69 @@ impl Workspace {
                 l.touch(ti);
                 return;
             }
-            if how == How::NewTile && l.tiles.len() < MAX_TILES {
+            if how == How::NewTile {
                 l.open_tile(origin, view);
                 return;
             }
-            let from_list = from
-                .and_then(|(t, c)| l.tile(t)?.columns.iter().position(|x| x.key == c).map(|i| (t, i)))
-                .filter(|&(t, i)| l.tile(t).is_some_and(|t| t.columns[i].view.is_list() && t.columns.len() > i + 1));
-            if matches!(view, View::Session { .. }) && from_list.is_some() {
-                l.open_tile(origin, view);
-                return;
-            }
-            let ti = origin;
             let key = l.key();
-            let t = &mut l.tiles[ti];
-            let at = from.and_then(|(_, c)| t.columns.iter().position(|x| x.key == c)).unwrap_or(t.cursor);
-            if from.is_none() && t.columns[at].view.is_section() && view.is_section() {
-                // From the header (nav, search box): swap the section.
-                t.columns[at].view = view;
-                t.columns.truncate(at + 1);
-                t.cursor = at;
-                t.active = t.columns[at].key;
-            } else if t.columns.get(at + 1).is_some_and(|c| c.view == view) {
-                // Already open next to it: just show it.
-                t.cursor = at + 1;
-                t.active = t.columns[at + 1].key;
-            } else {
-                t.columns.truncate(at + 1);
-                t.columns.push(Column { key, view });
-                t.cursor = t.columns.len() - 1;
-                t.active = key;
+            let t = &mut l.tiles[origin];
+            let list = t.columns[0].clone();
+            let next = match from {
+                // Inside the tile: the item goes in the right pane.
+                Some(_) => vec![list, Column { key, view }],
+                // From outside: an item beside the list the tile shows, a
+                // section in place of the tile.
+                None if !view.is_section() && list.view.is_section() => vec![list, Column { key, view }],
+                None => vec![Column { key, view }],
+            };
+            if t.columns.iter().map(|c| &c.view).ne(next.iter().map(|c| &c.view)) {
+                t.go(next);
             }
-            l.focus = ti;
-            l.touch(ti);
+            t.settle();
+            l.focus = origin;
+            l.touch(origin);
+        });
+    }
+
+    /// Moves the item a tile shows (its right pane) into a tile of its own.
+    pub fn detach(&self, tile: u64) {
+        self.layout.update(|l| {
+            let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
+            if l.tiles[ti].columns.len() < 2 || l.tiles.len() >= MAX_TILES {
+                return;
+            }
+            let item = l.tiles[ti].columns[1].view.clone();
+            let list = l.tiles[ti].columns[0].clone();
+            l.tiles[ti].go(vec![list]);
+            l.open_tile(ti, item);
+        });
+    }
+
+    /// Back (`delta` < 0) or forward in the focused tile's history.
+    pub fn step(&self, delta: isize) {
+        self.layout.update(|l| {
+            let t = &mut l.tiles[l.focus];
+            if delta < 0 {
+                if let Some(prev) = t.back.pop() {
+                    let now = std::mem::replace(&mut t.columns, prev);
+                    t.forward.push(now);
+                    t.settle();
+                }
+            } else if let Some(next) = t.forward.pop() {
+                let now = std::mem::replace(&mut t.columns, next);
+                t.back.push(now);
+                t.settle();
+            }
+        });
+    }
+
+    /// On a phone, from the item back to the list beside it.
+    pub fn show_list(&self, tile: u64) {
+        self.layout.update(|l| {
+            if let Some(t) = l.tile_mut(tile) {
+                t.cursor = 0;
+                t.active = t.columns[0].key;
+            }
         });
     }
 
@@ -549,26 +611,37 @@ impl Workspace {
         });
     }
 
+    /// Closes a pane: the item (the list stays), or the list (the item
+    /// takes the tile); a tile's last pane closes the tile.
     pub fn close_column(&self, tile: u64, col: u64) {
         self.layout.update(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             let t = &mut l.tiles[ti];
             let Some(i) = t.columns.iter().position(|c| c.key == col) else { return };
-            t.columns.remove(i);
-            if t.columns.is_empty() {
-                if l.tiles.len() == 1 {
-                    *l = Layout::new(View::Sessions);
-                } else {
-                    l.tiles.remove(ti);
-                    l.focus = l.focus.min(l.tiles.len() - 1);
-                }
+            if t.columns.len() > 1 {
+                let mut rest = t.columns.clone();
+                rest.remove(i);
+                t.go(rest);
                 return;
             }
-            if i <= t.cursor && t.cursor > 0 {
-                t.cursor -= 1;
+            if l.tiles.len() == 1 {
+                *l = Layout::new(View::Sessions);
+            } else {
+                l.tiles.remove(ti);
+                l.focus = l.focus.min(l.tiles.len() - 1);
             }
-            t.cursor = t.cursor.min(t.columns.len() - 1);
-            t.active = t.columns[t.cursor].key;
+        });
+    }
+
+    pub fn close_tile(&self, tile: u64) {
+        self.layout.update(|l| {
+            let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
+            if l.tiles.len() == 1 {
+                *l = Layout::new(View::Sessions);
+            } else {
+                l.tiles.remove(ti);
+                l.focus = l.focus.min(l.tiles.len() - 1);
+            }
         });
     }
 
@@ -599,30 +672,6 @@ impl Workspace {
                 }
             });
         }
-    }
-
-    /// Shows column `col` (from a spine), keeping the columns after it.
-    pub fn show(&self, tile: u64, col: u64) {
-        self.layout.update(|l| {
-            if let Some(t) = l.tile_mut(tile)
-                && let Some(i) = t.columns.iter().position(|c| c.key == col)
-            {
-                t.cursor = i;
-                t.active = col;
-            }
-        });
-    }
-
-    /// Moves the focused tile's view back (left) or forward (right).
-    pub fn step(&self, delta: isize) {
-        self.layout.update(|l| {
-            let t = &mut l.tiles[l.focus];
-            let next = t.cursor as isize + delta;
-            if next >= 0 && (next as usize) < t.columns.len() {
-                t.cursor = next as usize;
-                t.active = t.columns[t.cursor].key;
-            }
-        });
     }
 
     pub fn toggle_pin(&self, id: &str) {
@@ -827,7 +876,7 @@ pub fn ScrollBox(
     }
 }
 
-/// The tiles. Keyboard: ⌘1–4 focus a tile, ⌘[ / ⌘] step back and forward.
+/// The tiles. Keyboard: ⌘1–4 focus a tile, ⌘[ / ⌘] go back and forward in it.
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
@@ -852,8 +901,9 @@ pub fn Tiles() -> impl IntoView {
         }
     });
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
+    // Tiles are cards with room between them; on a phone, one fills the screen.
     view! {
-        <div class="flex min-h-0 min-w-0 flex-1">
+        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:gap-2 md:p-2">
             <For each=move || keys.get() key=|k| *k let:key>
                 <TileView key />
             </For>
@@ -864,20 +914,55 @@ pub fn Tiles() -> impl IntoView {
 #[component]
 fn TileView(key: u64) -> impl IntoView {
     let ws = use_workspace();
+    let live = api::live();
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
     let many = Memo::new(move |_| ws.layout.with(|l| l.tiles.len() > 1));
-    let cols = Memo::new(move |_| {
-        ws.layout.with(|l| l.tile(key).map(|t| t.columns.iter().map(|c| c.key).collect::<Vec<_>>()).unwrap_or_default())
+    let tile = Memo::new(move |_| ws.layout.with(|l| l.tile(key).cloned()));
+    let cols = Memo::new(move |_| tile.get().map(|t| t.columns.iter().map(|c| c.key).collect::<Vec<_>>()).unwrap_or_default());
+    // The tile's name: what it was opened on, and the item open in it.
+    let title = Signal::derive(move || {
+        tile.get().map(|t| t.columns.iter().map(|c| c.view.label(&live)).collect::<Vec<_>>().join("  ›  ")).unwrap_or_default()
     });
+    let can_back = move || tile.get().is_some_and(|t| !t.back.is_empty());
+    let can_forward = move || tile.get().is_some_and(|t| !t.forward.is_empty());
+    let two = move || tile.get().is_some_and(|t| t.columns.len() == 2);
+    // The session the tile shows on its own (beside a list, its pane pins it).
+    let pinnable = move || match tile.get().map(|t| t.columns) {
+        Some(c) if c.len() == 1 => match &c[0].view {
+            View::Session { id, .. } => Some(id.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
         <section
             class=move || format!(
-                "@container relative min-w-0 flex-1 flex-col border-zinc-200 dark:border-zinc-800 md:flex md:border-l md:first:border-l-0 {} {}",
+                "relative min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:flex md:rounded-lg md:border md:shadow-sm {} {}",
                 if focused.get() { "flex" } else { "hidden" },
-                if focused.get() && many.get() { "md:shadow-[inset_0_2px_0_0_rgb(59_130_246)]" } else { "" },
+                if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
             )
             on:pointerdown=move |_| ws.focus_tile_key(key)
         >
+            // The tile's own bar: its history, its name, and what you can do to the whole tile.
+            <div class="flex h-9 shrink-0 items-center gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+                <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
+                <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
+                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-700 dark:text-zinc-200">{title}</span>
+                {move || pinnable().map(|id| {
+                    let (a, b) = (StoredValue::new(id.clone()), id.clone());
+                    let on = move || ws.pinned.with(|p| p.contains(&a.get_value()));
+                    view! {
+                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } on:click=move |_| ws.toggle_pin(&b)>
+                            {move || if on() { "★" } else { "☆" }}
+                        </button>
+                    }
+                })}
+                {move || (two() && ws.layout.with(|l| l.tiles.len() < MAX_TILES)).then(|| view! {
+                    <button class=format!("{btn} hidden md:inline") title="Move the open item to a tile of its own (or ⌘-click a link)" on:click=move |_| ws.detach(key)>"⧉"</button>
+                })}
+                <button class=btn title="Close this tile" on:click=move |_| ws.close_tile(key)>"✕"</button>
+            </div>
             <div class="flex min-h-0 flex-1">
                 <For each=move || cols.get() key=|k| *k let:col>
                     <ColumnView tile=key col />
@@ -887,26 +972,14 @@ fn TileView(key: u64) -> impl IntoView {
     }
 }
 
-/// Where a column is in its tile.
+/// Where a pane is in its tile.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Pos {
     index: usize,
     cursor: usize,
     len: usize,
-    /// The active column of the focused tile.
+    /// The active pane of the focused tile.
     active: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    /// The tile's current column.
-    Main,
-    /// Just before it: shown beside it when the tile is wide.
-    Prev,
-    /// Folded away to the left.
-    Folded,
-    /// Folded away to the right (after the current column).
-    After,
 }
 
 #[component]
@@ -923,94 +996,71 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
     });
     let view =
         Memo::new(move |_| ws.layout.with(|l| l.tile(tile).and_then(|t| t.columns.iter().find(|c| c.key == col)).map(|c| c.view.clone())));
-    let role = Memo::new(move |_| match pos.get() {
-        Some(p) if p.index == p.cursor => Role::Main,
-        Some(p) if p.index + 1 == p.cursor => Role::Prev,
-        Some(p) if p.index > p.cursor => Role::After,
-        _ => Role::Folded,
-    });
     let ctx = ColumnCtx {
         ws,
         tile,
         col,
-        visible: Signal::derive(move || matches!(role.get(), Role::Main | Role::Prev)),
+        visible: Signal::derive(move || pos.get().is_some()),
         active: Signal::derive(move || pos.get().is_some_and(|p| p.active)),
         scroll: StoredValue::new(0),
     };
     provide_context(ctx);
     let label = Signal::derive(move || view.get().map(|v| v.label(&live)).unwrap_or_default());
-    let spine_class = "hidden w-9 shrink-0 cursor-pointer items-start justify-center overflow-hidden border-zinc-200 bg-zinc-100/70 py-3 text-xs text-zinc-500 hover:bg-zinc-200/70 hover:text-zinc-900 dark:border-zinc-800 dark:bg-zinc-900/60 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
-        <div class=move || match role.get() {
-            Role::Main => "flex min-w-0 flex-1",
-            Role::Prev => "flex shrink-0 @min-[60rem]:min-w-0 @min-[60rem]:basis-[42%] @min-[60rem]:border-r @min-[60rem]:border-zinc-200 dark:@min-[60rem]:border-zinc-800",
-            Role::Folded | Role::After => "flex shrink-0",
-        }>
-            // Folded columns show as spines (desktop only).
-            <button
-                class=move || match role.get() {
-                    Role::Main => "hidden".to_owned(),
-                    Role::Prev => format!("{spine_class} border-r md:flex @min-[60rem]:!hidden"),
-                    Role::Folded => format!("{spine_class} border-r md:flex"),
-                    Role::After => format!("{spine_class} border-l md:flex"),
-                }
-                title=move || format!("Show {}", label.get())
-                on:click=move |_| ws.show(tile, col)
-            >
-                <span class="max-h-[60vh] truncate [writing-mode:vertical-rl]">{label}</span>
-            </button>
-            <div
-                id=ctx.root_id()
-                class=move || match role.get() {
-                    Role::Main => "flex min-w-0 flex-1 flex-col",
-                    Role::Prev => "hidden min-w-0 flex-1 flex-col @min-[60rem]:flex",
-                    Role::Folded | Role::After => "hidden",
-                }
-                on:pointerdown=move |_| ws.set_active(tile, col)
-            >
+        // The list beside an item is narrower; a phone shows one pane.
+        <div
+            id=ctx.root_id()
+            class=move || match pos.get() {
+                Some(p) if p.len == 2 && p.index == 0 => format!(
+                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:basis-[40%] md:shrink-0 {}",
+                    if p.cursor == 0 { "flex flex-1" } else { "hidden" },
+                ),
+                Some(p) => format!("min-w-0 flex-1 flex-col md:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
+                None => "hidden".to_owned(),
+            }
+            on:pointerdown=move |_| ws.set_active(tile, col)
+        >
+            // A pane has its own header only beside another; alone, the tile's bar names it.
+            {move || pos.get().is_some_and(|p| p.len == 2).then(|| view! {
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
-                <div class="relative flex min-h-0 flex-1 flex-col">
-                    {move || view.get().map(render_view)}
-                </div>
+            })}
+            <div class="relative flex min-h-0 flex-1 flex-col">
+                {move || view.get().map(render_view)}
             </div>
         </div>
     }
 }
 
-/// Back/forward (phones), the column's name, pin, new tile and close.
+/// A pane's slim header, shown when its tile has two panes: its name, pin
+/// (sessions), and close (the tile's ✕ closes the tile). On a phone, the
+/// item's header goes back to the list beside it.
 #[component]
 fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Option<View>>) -> impl IntoView {
-    let ctx = use_column().expect("in a column");
+    let ctx = use_column().expect("in a pane");
     let ws = ctx.ws;
     let session = move || match view.get() {
         Some(View::Session { id, .. }) => Some(id),
         _ => None,
     };
     let pinned = move || session().is_some_and(|id| ws.pinned.with(|p| p.contains(&id)));
-    let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    let btn = "rounded px-1 text-zinc-400 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
         <div class=move || format!(
-            "flex h-8 shrink-0 items-center gap-1 border-b px-2 text-xs {}",
-            if ctx.active.get() { "border-zinc-300 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900" } else { "border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" },
+            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] dark:border-zinc-900 {}",
+            if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-zinc-500" },
         )>
-            {move || pos.get().filter(|p| p.index > 0).map(|_| view! {
-                <button class=format!("{btn} md:hidden") title="Back" on:click=move |_| ws.step(-1)>"‹"</button>
+            {move || pos.get().filter(|p| p.index == 1).map(|_| view! {
+                <button class=format!("{btn} md:hidden") title="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>"‹"</button>
             })}
-            <span class="min-w-0 flex-1 truncate font-medium text-zinc-700 dark:text-zinc-300">{label}</span>
-            {move || pos.get().filter(|p| p.index + 1 < p.len).map(|_| view! {
-                <button class=format!("{btn} md:hidden") title="Forward" on:click=move |_| ws.step(1)>"›"</button>
-            })}
+            <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {
                 <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } on:click=move |_| ws.toggle_pin(&id)>
                     {move || if pinned() { "★" } else { "☆" }}
                 </button>
             })}
-            <button class=format!("{btn} hidden md:inline") title="Open in a new tile (or ⌘-click a link)" on:click=move |_| {
-                if let Some(v) = view.get_untracked() {
-                    ws.open(None, v, How::NewTile);
-                }
-            }>"⧉"</button>
-            <button class=btn title="Close" on:click=move |_| ctx.close()>"✕"</button>
+            {move || pos.get().filter(|p| p.len == 2).map(|_| view! {
+                <button class=btn title="Close this pane" on:click=move |_| ctx.close()>"×"</button>
+            })}
         </div>
     }
 }
