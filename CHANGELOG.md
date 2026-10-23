@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.9 (2026-10-23)
+
+- The head looks for a carbon6 release every 15 minutes instead of every 6 hours (unchanged answers cost nothing against GitHub's limit)
+- Tiles are framed cards of at most two panes (a list and the item opened from it) with their own back and forward; a click stays in its tile, only ⌘-click or ⧉ (which now moves the item) makes a new tile, and the header replaces the focused tile
+
 ## 0.3.8 (2026-10-20)
 
 - Suggested next messages: when a turn finishes, the message box offers what you'd likely type next (Tab takes it), made once per turn while you look, by the model a task:suggest routing rule picks (else the session's own), counted in the session's usage
