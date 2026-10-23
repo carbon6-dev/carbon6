@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.10 (2026-10-23)
+
+- Packages are built once per push to main, while the tests run (natively on Ubuntu 22.04 and macOS with the cargo cache), and a release commit is tagged and published from them as soon as it is green; Intel Macs are no longer built
+
 ## 0.3.9 (2026-10-23)
 
 - The head looks for a carbon6 release every 15 minutes instead of every 6 hours (unchanged answers cost nothing against GitHub's limit)
