@@ -154,8 +154,8 @@ build: ui ## Build release binaries (c6h, c6w, c6) into target/release
 test: ## Run the test suite
 	cargo test
 
-test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1); it must pass as it does otherwise (docs/testing.md)
-	scripts/test-under-load.sh $(or $(RUNS),1)
+test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NEXTEST=1 for cargo nextest); it must pass as it does otherwise (docs/testing.md)
+	NEXTEST=$(NEXTEST) scripts/test-under-load.sh $(or $(RUNS),1)
 
 check: ## Clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
 	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \

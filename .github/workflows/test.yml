@@ -26,11 +26,23 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
-      - name: Every target builds and passes clippy without warnings (and the web UI for wasm)
+      # Lints don't depend on the OS: once, on Linux.
+      - name: Every target passes clippy without warnings (and the web UI for wasm), and the tests' lint
+        if: runner.os == 'Linux'
         run: make check
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
-      - run: cargo test --locked
+      # On Linux, nextest runs every test binary at once (each test its own
+      # process). macOS stays on cargo test: a process there pays a few
+      # seconds loading the system's certificates, once per test with nextest.
+      - if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - if: runner.os == 'Linux'
+        run: cargo nextest run --locked --workspace --no-fail-fast && cargo test --locked --doc
+      - if: runner.os != 'Linux'
+        run: cargo test --locked
 
   under-load:
     # The same suite with every core kept busy (docs/testing.md): a test
@@ -44,4 +56,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
-      - run: make test-under-load
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: make test-under-load NEXTEST=1

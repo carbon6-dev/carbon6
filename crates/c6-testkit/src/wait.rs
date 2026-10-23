@@ -6,7 +6,6 @@
 //! CI machine, however loaded, reaches it while things are working.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 /// How long a test waits for anything before calling it a hang:
@@ -38,21 +37,37 @@ pub async fn within<F: Future>(what: &str, fut: F) -> F::Output {
 }
 
 /// A port for a server that must come back on the same port (a head that
-/// restarts while its workers keep its address). Ports are handed out once
-/// per test process from a range below every OS's ephemeral range, so no
-/// other test, binding port 0, is ever given one.
+/// restarts while its workers keep its address). Ports come from a range
+/// below every OS's ephemeral range, so no test binding port 0 is ever given
+/// one, and each is reserved with a file lock in the temp folder for as long
+/// as the test process lives: tests in other processes (nextest runs each
+/// test as its own) never get the same one. The OS drops the lock when the
+/// process ends, however it ends.
 pub fn port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    // Test binaries run one at a time; each starts at its own offset in
-    // case two ever overlap.
-    let base = 20_000 + (std::process::id() % 40) as u16 * 200;
-    loop {
-        let p = base + NEXT.fetch_add(1, Ordering::Relaxed) % 200;
-        // Something outside the tests may hold it: take the next.
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
+    use std::sync::Mutex;
+    static HELD: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 10_000;
+    let dir = std::env::temp_dir().join("c6-test-ports");
+    let _ = std::fs::create_dir_all(&dir);
+    // Start somewhere different in each process, so they rarely contend.
+    let start = std::process::id().wrapping_mul(7919) % COUNT;
+    for i in 0..COUNT {
+        let p = (FIRST + (start + i) % COUNT) as u16;
+        let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(p.to_string())) else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            continue; // another test process has it
         }
+        // Something outside the tests may hold it: take the next.
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_err() {
+            continue;
+        }
+        HELD.lock().unwrap().push(file);
+        return p;
     }
+    panic!("no free test port in {FIRST}..{}", FIRST + COUNT);
 }
 
 /// Whether `tool` (a program on PATH) is here: see [`need`].
@@ -72,4 +87,14 @@ pub fn need(what: &str, present: bool) -> bool {
         eprintln!("{what} is not here: skipped");
     }
     present
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ports_are_never_handed_out_twice() {
+        let a: std::collections::HashSet<u16> = (0..50).map(|_| super::port()).collect();
+        assert_eq!(a.len(), 50);
+        assert!(a.iter().all(|p| (20_000..30_000).contains(p)));
+    }
 }
