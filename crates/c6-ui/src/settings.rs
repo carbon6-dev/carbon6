@@ -995,7 +995,7 @@ fn UpdatesSetting() -> impl IntoView {
             <div class="flex items-start justify-between gap-3">
                 <div>
                     <h2 class="font-medium">"Updates"</h2>
-                    <p class="text-sm text-zinc-500">"carbon6 looks for releases on GitHub every 6 hours and installs only what carbon6's release key signed. The head updates first; then each worker, once its sessions are idle. A version that doesn't start is rolled back."</p>
+                    <p class="text-sm text-zinc-500">"carbon6 looks for releases on GitHub every 15 minutes and installs only what carbon6's release key signed. The head updates first; then each worker, once its sessions are idle. A version that doesn't start is rolled back."</p>
                 </div>
                 <button class=format!("{BUTTON_QUIET} shrink-0 whitespace-nowrap") disabled=move || busy.get() on:click=move |_| act(Box::pin(api::check_updates()))>"Look now"</button>
             </div>

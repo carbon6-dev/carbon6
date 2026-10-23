@@ -45,7 +45,7 @@ The Release workflow adds two files to every GitHub release:
 
 ## 3. Finding a release (the head)
 
-- **Every 6 hours, and on demand,** the head asks `GET https://api.github.com/repos/carbon6-dev/carbon6/releases/latest`.
+- **Every 15 minutes (`update_check_secs`), at start, and on demand,** the head asks `GET https://api.github.com/repos/carbon6-dev/carbon6/releases/latest`.
   - It sends the last `ETag`, so an unchanged answer costs nothing against the rate limit.
   - It skips drafts and prereleases.
 - **When it finds a newer version than its own,** it downloads `release.json` and its `.sig` and checks the signature against `RELEASE_KEYS`.

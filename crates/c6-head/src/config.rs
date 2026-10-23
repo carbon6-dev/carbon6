@@ -77,7 +77,7 @@ impl Default for HeadConfig {
             update_source: "https://api.github.com/repos/carbon6-dev/carbon6".into(),
             update_keys: Vec::new(),
             update_exe: None,
-            update_check_secs: 6 * 3600,
+            update_check_secs: 15 * 60,
             update_as_version: None,
         }
     }

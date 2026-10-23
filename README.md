@@ -188,7 +188,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
 
 carbon6 updates itself from GitHub releases. It installs only a release whose `release.json` is signed by carbon6's release key, which is built into every binary, and only files with the checksums it lists. Design: [docs/updates.md](docs/updates.md).
 
-- **Asking first:** the head looks every 6 hours. A new release becomes a Decision, "Update carbon6 to 0.3.5?", with its notes. **Settings → System → Updates** shows the same, with Update now, Skip, and Look now.
+- **Asking first:** the head looks every 15 minutes (`update_check_secs` in `c6h.toml`). A new release becomes a Decision, "Update carbon6 to 0.3.5?", with its notes. **Settings → System → Updates** shows the same, with Update now, Skip, and Look now.
 - **Other modes:** update on its own (patch releases, or minor ones too, optionally only within a time window), just show it, or don't look at all.
 - **Order:** the head updates first, its database upgrade making a backup as always, and restarts. Then each worker updates, one after another, once its sessions are idle (or after 24 hours).
 - **By how it was installed:**
