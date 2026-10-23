@@ -37,5 +37,27 @@ check "a fixed deadline fails a slow machine: use c6_testkit::wait::deadline()" 
 check "tests in a shared process must not change its environment: set it on what they test" 'std::env::(set_var|remove_var)\(' "${shared[@]}"
 check "a port picked and released can be taken by another test: use c6_testkit::port()" 'fn free_port' "${tests[@]}"
 
+# A code block in a doc comment is a doctest unless it names another
+# language: CI's nextest never runs doctests (and the workspace has none), so
+# one would sit there untested. Tag examples `text`, `sh`, `json`, `toml`…
+doctests=$(git ls-files 'crates/*.rs' 'bins/*.rs' | xargs awk '
+    FNR == 1 { inside = 0 }
+    /^[[:space:]]*(\/\/\/|\/\/!)[[:space:]]*```/ {
+        tag = $0
+        sub(/^[[:space:]]*(\/\/\/|\/\/!)[[:space:]]*```/, "", tag)
+        gsub(/[[:space:]]/, "", tag)
+        if (!inside) {
+            inside = 1
+            if (tag == "" || tag ~ /(^|,)(rust|ignore|no_run|should_panic|compile_fail|edition[0-9]+)(,|$)/)
+                print FILENAME ":" FNR ":" $0
+        } else {
+            inside = 0
+        }
+    }' | unallowed || true)
+if [ -n "$doctests" ]; then
+    printf 'test-lint: %s (docs/testing.md):\n%s\n\n' "a code block in a doc comment is a doctest, which CI never runs: tag it with its language (text, sh, json…)" "$doctests" >&2
+    fail=1
+fi
+
 [ $fail = 0 ] && echo "test-lint: ok"
 exit $fail

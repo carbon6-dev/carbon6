@@ -37,7 +37,8 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
 - `tokio::time::timeout(` in tests;
 - a deadline of `Instant::now() + Duration::from_…` in tests;
 - `std::env::set_var` or `remove_var` in a shared test process;
-- `fn free_port`.
+- `fn free_port`;
+- a code block in a doc comment that would be a doctest (untagged or `rust`). CI runs the Linux tests with nextest, which never runs doctests, and the workspace has none, so examples in doc comments name their language (`text`, `sh`, `json`…).
 
 A line that must break a rule says why: `// test-lint: allow (<reason>)`. Today only the opt-in kit builds do.
 
