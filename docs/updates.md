@@ -14,7 +14,7 @@ Status: built (2026-10-17). Decided: ask by default, signed releases, busy worke
 
 ## 2. The release manifest
 
-The Release workflow adds two files to every GitHub release:
+CI's publish job adds two files to every GitHub release:
 
 - `release.json`:
   ```json
@@ -114,7 +114,7 @@ Each binary knows how it was installed from where it runs (`current_exe`):
 
 | Method | Detected by | Install | Restart |
 |---|---|---|---|
-| **brew** | under `$(brew --prefix)/Cellar/` | `brew upgrade carbon6-dev/carbon6/<bin>` (which updates the tap first). Not the downloaded asset: brew stays the owner of the files, and checks the bottle against the formula's checksum. Only the Release workflow writes the tap. Afterwards, `brew list --versions` must show the new version. | exit 75. The formula's `keep_alive successful_exit: false` restarts it from `opt/`, which now points to the new keg. |
+| **brew** | under `$(brew --prefix)/Cellar/` | `brew upgrade carbon6-dev/carbon6/<bin>` (which updates the tap first). Not the downloaded asset: brew stays the owner of the files, and checks the bottle against the formula's checksum. Only CI's publish job writes the tap. Afterwards, `brew list --versions` must show the new version. | exit 75. The formula's `keep_alive successful_exit: false` restarts it from `opt/`, which now points to the new keg. |
 | **deb** | `/usr/bin/<bin>` on Linux | carbon6 runs as a non-root user (`c6h`, or the user in `c6w@`), so it can't install packages itself. Each .deb ships `<bin>-update.path` and `<bin>-update.service` (root, oneshot). The daemon leaves the .deb, `release.json`, its `.sig` and then `request` in `/var/lib/<bin>/update/`. For c6h that folder is the c6h user's; for c6w it is writable by everyone, sticky, since any user may run a worker. The path unit starts `<bin> update-install`, as root. It takes the request, checks the signature and the .deb's checksum itself, refuses anything not newer than itself, installs a private copy with `dpkg -i`, and writes `result`. The daemon waits for that, up to 10 minutes. | the package's `postinst` restarts the units, as today |
 | **tarball** | anywhere else, with the binary's directory writable | the new binary is written next to the old one, then renamed over it (atomic). The old one is kept as `<bin>.previous`. | exit 75. Without a service manager (run by hand), it re-execs itself. |
 | **source** | a debug build, or a binary in a folder it can't write | never updated. Its update fails with "built from source: update it yourself". | — |

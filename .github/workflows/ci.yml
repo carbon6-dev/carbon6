@@ -1,0 +1,137 @@
+# Every push to main: the tests, and the packages built once, in parallel.
+# A release commit ("Release <version>", which `make release` pushes) is then
+# tagged v<version> and published from those very packages, as soon as all of
+# it is green (docs/releases.md). Nothing is built twice and nobody waits to
+# push a tag.
+#
+# Run by hand (workflow_dispatch) it builds and tests main and keeps the
+# packages on the run, publishing nothing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: What this commit is
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          release=false
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$(git log -1 --format=%s)" = "Release $version" ]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+              echo "::warning::v$version is already tagged: building, not publishing"
+            else
+              release=true
+            fi
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "release=$release" >>"$GITHUB_OUTPUT"
+          echo "carbon6 $version, release: $release"
+
+  test:
+    uses: ./.github/workflows/test.yml
+
+  linux:
+    # On Ubuntu 22.04 itself (its glibc is the packages' minimum), with the
+    # cargo cache, instead of from scratch in Docker.
+    name: .debs (${{ matrix.runner }})
+    needs: meta
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      RELEASE: ${{ needs.meta.outputs.release == 'true' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the history, for between-release package versions
+      - uses: ./.github/actions/rust
+        with:
+          trunk: "true"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: sudo apt-get install -y --no-install-recommends dpkg-dev
+      - name: Build the .debs and the Linux tarball, and try them under systemd
+        run: make deb-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.runner }}
+          path: |
+            dist/deb/ubuntu-22.04/*.deb
+            dist/deb/ubuntu-22.04/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    # Apple Silicon only (Intel Macs are not built).
+    name: Bottles (macos-15)
+    needs: meta
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RELEASE: ${{ needs.meta.outputs.release == 'true' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/rust
+        with:
+          trunk: "true"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Build the bottles, and try them with brew services
+        run: make brew-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/brew/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Tag and publish
+    if: needs.meta.outputs.release == 'true'
+    needs: [meta, test, linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+      - name: Tag the release commit
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "carbon6 $VERSION" "$GITHUB_SHA"
+          git push origin "v$VERSION"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: packaging/release/publish.sh "${{ needs.meta.outputs.version }}" dist/release

@@ -74,9 +74,9 @@ make docker-token      # an enrollment token from that head
 - **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h --config $(brew --prefix)/etc/c6h/c6h.toml login-link`.
 - **`c6w`:** `c6w enroll <token>`, then `brew services start c6w`. It starts through a login shell, so sessions get your `PATH`.
 - Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`). The worker keeps the standard state folder (`~/Library/Application Support/c6w`), the same one `make dev-worker` uses.
-- `make brew-test` installs the bottles from a scratch tap and runs them, as the Release workflow does, then removes them.
+- `make brew-test` installs the bottles from a scratch tap and runs them, as CI does, then removes them.
 
-**CI and releases.** GitHub Actions runs the tests on Linux and macOS for every push to `main` and every pull request. `make release BUMP=patch|minor|major` bumps the version, adds the commits since the last release to `CHANGELOG.md`, commits, tags and pushes. The tag's Release workflow tests, builds the .debs (amd64, arm64) and bottles (Apple Silicon, Intel), smoke-tests them, and publishes the GitHub release and the Homebrew tap. See [docs/releases.md](docs/releases.md).
+**CI and releases.** GitHub Actions runs the tests on Linux and macOS for every pull request, and for every push to `main` also builds the packages (.debs for amd64 and arm64, bottles for Apple Silicon) and smoke-tests them, in parallel. `make release BUMP=patch|minor|major` bumps the version, adds the commits since the last release to `CHANGELOG.md`, commits and pushes; once that commit is green, CI tags it and publishes the packages it already built to the GitHub release and the Homebrew tap. See [docs/releases.md](docs/releases.md).
 
 **Website.** [carbon6.dev](https://carbon6.dev) is a static site generated with Leptos from `site/`, with the docs, this README's guide and the changelog rendered from the repository. `make site-serve` builds it and serves it locally; the Site workflow publishes it to GitHub Pages. See [docs/site.md](docs/site.md).
 

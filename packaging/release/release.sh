@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Cuts a release: checks, sets the workspace version, adds the release's
-# section to CHANGELOG.md, commits "Release <version>", tags v<version> and
-# pushes both, which starts the Release workflow (.github/workflows/release.yml)
-# that tests, builds, smoke-tests and publishes it.
+# section to CHANGELOG.md, commits "Release <version>" and pushes it. CI
+# (.github/workflows/ci.yml) tests that commit and builds its packages like
+# any other on main; once all of it is green it tags v<version> and
+# publishes the packages it built.
 #
 #   release.sh patch|minor|major|<x.y.z>
 #
 # It asks before pushing (YES=1 skips the question). Not pushed, the commit
-# and tag stay local; `git tag -d v<version> && git reset --hard HEAD~1` undoes them.
+# stays local; `git reset --hard HEAD~1` undoes it.
 set -euo pipefail
 
 want=${1:-patch}
@@ -58,19 +59,19 @@ notes=$(packaging/release/notes.sh "$version")
 } >CHANGELOG.md.new && mv CHANGELOG.md.new CHANGELOG.md
 git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -q -m "Release $version"
-git tag -a "v$version" -m "carbon6 $version"
 trap - ERR
 git --no-pager log --oneline -1
 echo "CHANGELOG.md: $(grep -c '^- ' <<<"$notes") changes since $current"
 
-# Pushing starts the Release workflow.
+# Pushing the release commit is the release: CI tests it, builds its
+# packages, and once all is green tags v$version and publishes them.
 if [ "${YES:-}" != 1 ]; then
-    read -r -p "Push main and v$version to $remote (starts the Release workflow)? [y/N] " answer
+    read -r -p "Push the release commit to $remote main (CI tags and publishes it once green)? [y/N] " answer
     case $answer in
         y | Y | yes) ;;
-        *) echo "Not pushed. Push later with: git push --atomic $remote main v$version"; exit 0 ;;
+        *) echo "Not pushed. Push later with: git push $remote main"; exit 0 ;;
     esac
 fi
-git push --atomic "$remote" main "v$version"
+git push "$remote" main
 url=$(git remote get-url "$remote" | sed -E 's#^git@github.com:#https://github.com/#; s#\.git$##')
-echo "Release workflow: $url/actions/workflows/release.yml"
+echo "CI: $url/actions/workflows/ci.yml (it tags v$version and publishes when green)"

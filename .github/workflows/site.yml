@@ -1,11 +1,12 @@
 # Builds the carbon6.dev website and publishes it to the GitHub Pages
 # repository (docs/site.md): on every push to main that changes what it is
-# built from, and after every release, so the install page names the new
-# version once its packages are up. Pull requests only build it.
+# built from, and after every CI run on main (a release's publishes its
+# packages), so the install page names the new version once they are up.
+# Pull requests only build it.
 #
 # The push of a release commit ("Release x.y.z") builds but doesn't publish:
 # its packages aren't up yet, so the install page's links would be dead. The
-# run after the Release workflow succeeds publishes it.
+# run after CI succeeds (which published them) publishes it.
 name: Site
 
 on:
@@ -27,7 +28,7 @@ on:
       - Cargo.toml
       - .github/workflows/site.yml
   workflow_run:
-    workflows: [Release]
+    workflows: [CI]
     types: [completed]
   workflow_dispatch:
 

@@ -21,10 +21,12 @@ UBUNTU       ?= 22.04
 DEB_DIR       = dist/deb/ubuntu-$(UBUNTU)
 CRATE_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 COMMIT_TIME   = $(shell git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)
-# Set when HEAD is the release v<crate version>: its packages get the plain
-# version. Between releases they get one that sorts after the last release
-# and every earlier commit.
-RELEASE_TAG   = $(shell git tag --points-at HEAD --list 'v$(CRATE_VERSION)')
+# Set when HEAD is the release v<crate version> (or RELEASE=1: CI building
+# the release commit before tagging it): its packages get the plain version.
+# Between releases they get one that sorts after the last release and every
+# earlier commit.
+RELEASE      ?=
+RELEASE_TAG   = $(or $(RELEASE),$(shell git tag --points-at HEAD --list 'v$(CRATE_VERSION)'))
 # <crate version>+git<commit time>.<commit> between releases.
 DEB_VERSION  ?= $(if $(RELEASE_TAG),$(CRATE_VERSION),$(CRATE_VERSION)+git$(COMMIT_TIME).$(shell git rev-parse --short HEAD))
 # The author of the commit the packages are built from.
@@ -39,7 +41,7 @@ BREW_ENV      = HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSION) --build-arg "MAINTAINER=$(DEB_MAINTAINER)"
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
-        docker-deb docker-deb-all docker-deb-test brew-dist brew brew-install brew-test release release-notes \
+        docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
         ui build test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
@@ -97,7 +99,15 @@ docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubu
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
 	@ls -l $(DEB_DIR)
 
-docker-deb-test: docker-deb ## Install the packages in an Ubuntu container under systemd: head serves, the worker attaches, c6 sees it, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
+docker-deb-test: docker-deb deb-smoke ## docker-deb, then install the packages in an Ubuntu container under systemd: head serves, the worker attaches, c6 sees it, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
+
+deb: build ## On Ubuntu $(UBUNTU) itself (CI): the .debs and Linux tarball from this machine's toolchain and cargo cache, into dist/deb/ubuntu-<UBUNTU>/
+	rm -f $(DEB_DIR)/*_$(ARCH).deb $(DEB_DIR)/*-linux-$(ARCH).tar.gz
+	MAINTAINER="$(DEB_MAINTAINER)" packaging/deb/build.sh target/release $(DEB_VERSION) $(DEB_DIR)
+
+deb-test: deb deb-smoke ## deb, then the systemd smoke test
+
+deb-smoke: ## Install the .debs in dist/deb/ubuntu-<UBUNTU>/ in an Ubuntu container under systemd: head serves, the worker attaches, c6 sees it, upgrade, remove
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) .
 	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) $(DEB_DIR) $(ARCH)
 
@@ -127,7 +137,7 @@ brew-test: brew-dist ## Install the formulas from a scratch tap and run them: he
 
 ##@ Releases
 
-release: ## Cut a release (BUMP=patch|minor|major, or VERSION=x.y.z): check, bump the version, add to CHANGELOG.md, commit, tag v<version> and push, which starts the Release workflow
+release: ## Cut a release (BUMP=patch|minor|major, or VERSION=x.y.z): check, bump the version, add to CHANGELOG.md, commit "Release <version>" and push it; CI tags and publishes it once it is green
 	packaging/release/release.sh $(if $(filter command line,$(origin VERSION)),$(VERSION),$(or $(BUMP),patch))
 
 release-notes: ## Print the CHANGELOG.md section the next release would add
@@ -139,7 +149,7 @@ ui: ## Build the web UI into crates/c6-ui/dist (embedded into c6h)
 	cd crates/c6-ui && trunk build --release
 
 build: ui ## Build release binaries (c6h, c6w, c6) into target/release
-	cargo build --release
+	cargo build --release --locked -p c6h -p c6w -p c6
 
 test: ## Run the test suite
 	cargo test
@@ -147,12 +157,12 @@ test: ## Run the test suite
 test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1); it must pass as it does otherwise (docs/testing.md)
 	scripts/test-under-load.sh $(or $(RUNS),1)
 
-check: ## Build and clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
-	@for cmd in build clippy; do for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
-		if cargo $$cmd --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
-			echo "check: warnings or errors in cargo $$cmd $$args" >&2; exit 1; \
+check: ## Clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
+	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
+		if cargo clippy --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
+			echo "check: warnings or errors in cargo clippy $$args" >&2; exit 1; \
 		fi; \
-	done; done; echo "check: no warnings"
+	done; echo "check: no warnings"
 	@scripts/test-lint.sh
 
 dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml; state in the standard data directory)

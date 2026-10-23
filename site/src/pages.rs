@@ -412,7 +412,7 @@ fn Install() -> impl IntoView {
                 </p>
 
                 <h2 id="macos">"macOS, with Homebrew"</h2>
-                <p>"Bottles for Apple Silicon and Intel, for macOS 11 and later. They need neither Xcode nor the Command Line Tools. The services run as you, under launchd."</p>
+                <p>"Bottles for Apple Silicon Macs, macOS 11 and later. They need neither Xcode nor the Command Line Tools. The services run as you, under launchd."</p>
                 <Code lines=vec![
                     "brew tap carbon6-dev/carbon6".to_string(),
                     "brew install c6h c6w c6".into(),

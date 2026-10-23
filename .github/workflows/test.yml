@@ -1,10 +1,8 @@
-# The test suite on Linux and macOS, for every push to main and every pull
-# request. The Release workflow runs it too.
+# The test suite on Linux and macOS, for every pull request; CI
+# (.github/workflows/ci.yml) runs it for every push to main.
 name: Test
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_call:
 

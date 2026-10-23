@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publishes release <version> from <dir> (the Release workflow's artifacts:
+# Publishes release <version> from <dir> (CI's packages:
 # .debs, tarballs and bottles): writes the Homebrew formulas pointing at the
 # GitHub release, SHA256SUMS and the notes (CHANGELOG.md's section), creates
 # release.json and its signature (manifest.sh), the GitHub release, and pushes the formulas to the tap repository.
