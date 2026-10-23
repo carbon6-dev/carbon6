@@ -2,7 +2,8 @@
 # A release commit ("Release <version>", which `make release` pushes) is then
 # tagged v<version> and published from those very packages, as soon as all of
 # it is green (docs/releases.md). Nothing is built twice and nobody waits to
-# push a tag.
+# push a tag. A release commit that changes only the version and the
+# changelog, on a commit CI already passed, isn't tested again: that code was.
 #
 # Run by hand (workflow_dispatch) it builds and tests main and keeps the
 # packages on the run, publishing nothing.
@@ -24,9 +25,13 @@ jobs:
   meta:
     name: What this commit is
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read # CI's runs on the commit before
     outputs:
       version: ${{ steps.v.outputs.version }}
       release: ${{ steps.v.outputs.release }}
+      tested: ${{ steps.t.outputs.tested }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -45,8 +50,29 @@ jobs:
           echo "version=$version" >>"$GITHUB_OUTPUT"
           echo "release=$release" >>"$GITHUB_OUTPUT"
           echo "carbon6 $version, release: $release"
+      # A release commit only bumps the version and adds to the changelog: if
+      # CI passed on the commit before it, its tests have nothing new to say.
+      - id: t
+        if: steps.v.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tested=false
+          other=$(git diff --name-only HEAD^ HEAD | grep -vxE 'Cargo\.toml|Cargo\.lock|CHANGELOG\.md' || true)
+          # Every other changed line of Cargo.toml and Cargo.lock is a version.
+          lines=$(git diff -U0 HEAD^ HEAD -- Cargo.toml Cargo.lock | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' | grep -vE '^[+-]version = "' || true)
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$(git rev-parse HEAD^)&status=success" --jq '.total_count')
+          if [ -z "$other" ] && [ -z "$lines" ] && [ "$passed" -gt 0 ]; then
+            tested=true
+            echo "Only the version changed since $(git rev-parse --short HEAD^), which CI passed: not testing again"
+          else
+            echo "Testing: other changes (${other:-none}; ${lines:+code lines changed}) or no green CI on the commit before ($passed)"
+          fi
+          echo "tested=$tested" >>"$GITHUB_OUTPUT"
 
   test:
+    needs: meta
+    if: needs.meta.outputs.tested != 'true'
     uses: ./.github/workflows/test.yml
 
   linux:
@@ -110,7 +136,11 @@ jobs:
 
   publish:
     name: Tag and publish
-    if: needs.meta.outputs.release == 'true'
+    # The tests passed here, or on the same code one commit before (skipped).
+    if: >-
+      !cancelled() && needs.meta.outputs.release == 'true' &&
+      (needs.test.result == 'success' || (needs.test.result == 'skipped' && needs.meta.outputs.tested == 'true')) &&
+      needs.linux.result == 'success' && needs.macos.result == 'success'
     needs: [meta, test, linux, macos]
     runs-on: ubuntu-24.04
     permissions:
