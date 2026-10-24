@@ -458,6 +458,15 @@ pub async fn watch_series(st: &HeadState, realm: Option<&str>, series: Option<&s
             continue;
         }
         let filter = p["where"].as_object().cloned().unwrap_or_default();
+        // The state before the data: a watcher that read the data before a
+        // point arrived also read the state before any change it caused.
+        let was: Option<bool> = sqlx::query_scalar("SELECT crossed FROM series_alerts WHERE trigger_id = ?")
+            .bind(&id)
+            .fetch_optional(&st.store.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|c: i64| c != 0);
         let (crossed, value) = if let Some(m) = p["silent_minutes"].as_f64().filter(|m| *m > 0.0) {
             let last = crate::series::latest_ts(st, &realm, name, &filter).await.ok().flatten();
             // Silent since the last point, or since the trigger was made.
@@ -481,29 +490,35 @@ pub async fn watch_series(st: &HeadState, realm: Option<&str>, series: Option<&s
             };
             (crossed, json!(v))
         };
-        let was: Option<bool> = sqlx::query_scalar("SELECT crossed FROM series_alerts WHERE trigger_id = ?")
-            .bind(&id)
-            .fetch_optional(&st.store.pool)
-            .await
-            .ok()
-            .flatten()
-            .map(|c: i64| c != 0);
-        if was == Some(crossed) || (was.is_none() && !crossed) {
-            if was.is_none() {
-                let _ = sqlx::query("INSERT OR REPLACE INTO series_alerts (trigger_id, crossed, at) VALUES (?, 0, ?)")
-                    .bind(&id)
-                    .bind(now_ms())
-                    .execute(&st.store.pool)
-                    .await;
-            }
+        if was == Some(crossed) {
             continue;
         }
-        let _ = sqlx::query("INSERT OR REPLACE INTO series_alerts (trigger_id, crossed, at) VALUES (?, ?, ?)")
-            .bind(&id)
-            .bind(crossed as i64)
-            .bind(now_ms())
-            .execute(&st.store.pool)
-            .await;
+        // Only the watcher that moves the state from what it read acts on
+        // the change: two at once (a point arriving during the sweep) can't
+        // both notify, or put back a state the other already moved on from.
+        let moved = match was {
+            None => {
+                sqlx::query("INSERT OR IGNORE INTO series_alerts (trigger_id, crossed, at) VALUES (?, ?, ?)")
+                    .bind(&id)
+                    .bind(crossed as i64)
+                    .bind(now_ms())
+                    .execute(&st.store.pool)
+                    .await
+            }
+            Some(was) => {
+                sqlx::query("UPDATE series_alerts SET crossed = ?, at = ? WHERE trigger_id = ? AND crossed = ?")
+                    .bind(crossed as i64)
+                    .bind(now_ms())
+                    .bind(&id)
+                    .bind(was as i64)
+                    .execute(&st.store.pool)
+                    .await
+            }
+        };
+        // Not crossed to start with is no change to tell about.
+        if !moved.is_ok_and(|r| r.rows_affected() == 1) || (was.is_none() && !crossed) {
+            continue;
+        }
         let op = if crossed { "crossed" } else { "cleared" };
         if a.event_params["ops"].as_array().is_some_and(|o| !o.is_empty() && !o.iter().any(|x| x == op)) {
             continue;
@@ -725,7 +740,8 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
             }
             let result = async {
                 for _ in 0..500 {
-                    let v = crate::kitjobs::for_instance(st, &realm, inst, kit, tool, args.clone(), Default::default(), &by, &state, None).await?;
+                    let v = crate::kitjobs::for_instance(st, &realm, inst, kit, tool, args.clone(), Default::default(), &by, &state, None)
+                        .await?;
                     if v["again"] != true {
                         break;
                     }

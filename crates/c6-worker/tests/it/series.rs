@@ -3,7 +3,6 @@
 //! usage as series; thresholds and "stopped arriving" as trigger events.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use c6_api::{Connection, SeriesResult};
 use c6_head::HeadConfig;
@@ -152,21 +151,31 @@ async fn series_record_summarize_and_alert() {
         "once, while crossed"
     );
 
-    // Stopped arriving: a heartbeat that goes quiet, then comes back.
+    // Stopped arriving: a heartbeat last seen two hours ago is silent past
+    // the hour, then comes back (no waiting on the clock either way).
     ok(send(M::POST, "series", json!({"name": "heartbeat", "dimensions": ["service"]})).await).await;
+    let then = json!({"ts": c6_core::now_ms() - 2 * 3_600_000, "value": 1, "dims": {"service": "pdfs"}});
+    ok(send(M::POST, "series/heartbeat/points", then).await).await;
     ok(send(
         M::POST,
         "triggers",
-        json!({"name": "quiet", "trigger": "series", "event_params": {"series": "heartbeat", "silent_minutes": 0.001, "where": {"service": "pdfs"}},
+        json!({"name": "quiet", "trigger": "series", "event_params": {"series": "heartbeat", "silent_minutes": 60, "where": {"service": "pdfs"}},
                "action": "notify", "action_params": {"title": "heartbeat {{$.op}}"}}),
     )
     .await)
     .await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    c6_head::triggers::watch_series(&head.state, None, None).await;
-    eventually("silent", async || got.lock().unwrap().iter().any(|n| n["title"] == "heartbeat crossed").then_some(())).await;
-    ok(send(M::POST, "series/heartbeat/points", json!({"value": 1, "dims": {"service": "pdfs"}})).await).await;
-    eventually("back", async || got.lock().unwrap().iter().any(|n| n["title"] == "heartbeat cleared").then_some(())).await;
+    // Several watchers at once (the sweep and arriving points) tell about
+    // each change once.
+    let watch = || c6_head::triggers::watch_series(&head.state, None, Some("heartbeat"));
+    let count = |title: &str| got.lock().unwrap().iter().filter(|n| n["title"] == title).count();
+    futures::future::join_all((0..4).map(|_| watch())).await;
+    eventually("silent", async || (count("heartbeat crossed") > 0).then_some(())).await;
+    let now = json!({"value": 1, "dims": {"service": "pdfs"}});
+    let (r, _) = tokio::join!(send(M::POST, "series/heartbeat/points", now), futures::future::join_all((0..4).map(|_| watch())));
+    ok(r).await;
+    eventually("back", async || (count("heartbeat cleared") > 0).then_some(())).await;
+    watch().await;
+    assert_eq!((count("heartbeat crossed"), count("heartbeat cleared")), (1, 1), "each change told once");
 
     // Agents record and read; model usage is a series.
     mock.push(Reply::ToolCalls(vec![(
@@ -179,8 +188,8 @@ async fn series_record_summarize_and_alert() {
         .await)
     .await;
     let seen = eventually("the agent's query", async || {
-        let last = mock.requests().last()?["messages"].to_string();
-        last.contains("\\\"groups\\\"").then_some(last)
+        // Any request: other model calls may follow the turn.
+        mock.requests().iter().map(|r| r["messages"].to_string()).find(|m| m.contains("\\\"groups\\\""))
     })
     .await;
     assert!(seen.contains("pdfs"), "{seen}");
