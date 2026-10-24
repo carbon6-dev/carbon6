@@ -332,6 +332,9 @@ impl Store {
 
 // --- Middleware -----------------------------------------------------------------
 
+/// The console's place: carbon6's administration, above every realm.
+pub const ADMIN_PLACE: &str = "admin";
+
 /// Endpoints reachable without a session.
 const PUBLIC: [&str; 6] = [
     "/api/v1/auth/status",
@@ -391,8 +394,12 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
             None => return next.run(req).await,
         }
     }
+    let place = browser_place(&req);
     if !st.auth.required {
-        return next.run(req).await;
+        return match place {
+            Some(place) => in_place(&st, place, req, next).await,
+            None => next.run(req).await,
+        };
     }
     let ok = match cookie_token(req.headers()) {
         Some(t) => st.store.check_auth_session(&t).await.unwrap_or_else(|e| {
@@ -401,11 +408,53 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
         }),
         None => false,
     };
-    if ok {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "sign in required".into() })).into_response()
+    if !ok {
+        return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "sign in required".into() })).into_response();
     }
+    match place {
+        Some(place) => in_place(&st, place, req, next).await,
+        // A page that doesn't say where it is gets nothing but this
+        // browser's own business: a mistake fails closed.
+        None if crate::catalog::route_scope(req.method().as_str(), &path) == crate::catalog::Scope::Device => next.run(req).await,
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(api::ApiError { error: "say which realm this is for (X-C6-Realm: <realm>, or admin for the console)".into() }),
+        )
+            .into_response(),
+    }
+}
+
+/// Where a browser's request comes from (docs/realms-ux.md §3): a realm's
+/// page or the console (`admin`), by the `X-C6-Realm` header, or
+/// `c6_realm=` in the query for what can't send headers (WebSockets,
+/// downloads, images).
+fn browser_place(req: &Request) -> Option<String> {
+    let header = req.headers().get("x-c6-realm").and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let query = || req.uri().query()?.split('&').find_map(|p| p.strip_prefix("c6_realm=")).map(str::to_owned);
+    header.or_else(query).map(|p| p.trim().to_owned()).filter(|p| !p.is_empty())
+}
+
+/// Runs a browser's request where it comes from: the console as root, a
+/// realm's page as that realm (like its API token), with its settings
+/// lists being the realm's own.
+async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Next) -> Response {
+    use crate::realms::Caller;
+    if place == ADMIN_PLACE {
+        req.extensions_mut().insert(Caller::root());
+        return next.run(req).await;
+    }
+    let refuse = |status: StatusCode, error: String| (status, Json(api::ApiError { error })).into_response();
+    match crate::realms::exists(st, &place).await {
+        Ok(true) if place != crate::realms::ROOT => {}
+        Ok(_) => return refuse(StatusCode::BAD_REQUEST, format!("no realm {place:?}")),
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+    let caller = Caller::in_realm(&place);
+    if let Err((status, error)) = crate::realms::admit(st, &caller, req.method(), req.uri().path()).await {
+        return refuse(status, error);
+    }
+    req.extensions_mut().insert(caller);
+    crate::store::SETTINGS_REALM.scope(place, next.run(req)).await
 }
 
 // --- Endpoints ------------------------------------------------------------------

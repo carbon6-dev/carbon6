@@ -37,6 +37,7 @@ mod policies;
 mod prompts;
 mod providers;
 mod push;
+mod realm_pages;
 mod realms;
 mod rewind;
 mod routing;

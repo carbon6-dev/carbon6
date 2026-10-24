@@ -96,22 +96,16 @@ pub async fn check_for_sessions(st: &HeadState, realm: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Read-only shared infrastructure a realm's token needs to start
-/// sessions: which workers, connections and models there are.
-fn shared_read(path: &str) -> bool {
-    matches!(
-        path,
-        "/api/v1/workers" | "/api/v1/connections" | "/api/v1/commands" | "/api/v1/catalog" | "/api/v1/openapi.json" | "/api/v1/realms"
-    ) || (path.starts_with("/api/v1/connections/") && path.ends_with("/models"))
-}
-
-/// Whether a realm-scoped caller may make this request at all, and if it
-/// names an object, whether that object is in the caller's realm.
-/// Everything not listed is carbon6's administration.
+/// Whether a realm's caller may make this request: by its operation's
+/// scope (docs/realms-ux.md §3), and, if it names an object, whether that
+/// object is in the caller's realm. Root callers may do anything.
 pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str) -> Result<(), (StatusCode, String)> {
+    use crate::catalog::Scope;
     let Some(realm) = caller.realm.as_deref() else { return Ok(()) };
-    if method == Method::GET && shared_read(path) {
-        return Ok(());
+    match crate::catalog::route_scope(method.as_str(), path) {
+        Scope::Device | Scope::Shared => return Ok(()),
+        Scope::Admin => return Err((StatusCode::FORBIDDEN, format!("this is limited to realm {realm}; that is carbon6's administration"))),
+        Scope::Realm => {}
     }
     let segments: Vec<&str> = path.trim_start_matches("/api/v1/").split('/').collect();
     let owned = |table: &'static str, noun: &'static str, id: String| async move {
@@ -135,27 +129,15 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         }
     };
     match segments.as_slice() {
-        // Collections whose lists and creations are filtered by realm.
-        ["sessions"] | ["search"] | ["decisions"] | ["decisions", "count"] | ["memories"] | ["automations"] | ["triggers"] => Ok(()),
         ["sessions", id, ..] => owned("sessions", "session", (*id).to_owned()).await,
-        ["decisions", id, ..] => owned("decisions", "decision", (*id).to_owned()).await,
+        ["decisions", id, ..] if *id != "count" => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,
         ["automations" | "triggers", id, ..] => owned("triggers", "trigger", (*id).to_owned()).await,
-        // Its templates, and starting their sessions (in the caller's realm).
-        ["templates"] if method == Method::GET => Ok(()),
-        ["templates", _, "run"] if method == Method::POST => Ok(()),
-        // Its own realm in the explorer.
-        ["realms", id, "summary" | "activity" | "list" | "object" | "search" | "neighborhood" | "effective", ..] if *id == realm => Ok(()),
-        // Its apps' operations.
-        ["apps", r, _, "operations", ..] if *r == realm => Ok(()),
-        // Series and views: always within the caller's realm.
-        ["series", ..] | ["views", ..] => Ok(()),
-        // Collections: within the caller's realm, or another's through a
-        // grant (checked by each call).
-        ["collections", ..] => Ok(()),
-        // The memex: the head puts the caller's realm on every call.
-        ["memex", ..] | ["mail", "attachment"] => Ok(()),
-        _ => Err((StatusCode::FORBIDDEN, format!("this token is limited to realm {realm}; that is carbon6's administration"))),
+        // Its own realm in the explorer, and its own apps.
+        ["realms", id, ..] | ["apps", id, ..] if *id != realm => Err((StatusCode::NOT_FOUND, "no such realm".into())),
+        // Everything else narrows to the caller's realm itself: lists,
+        // collections, series, views, the memex, secrets, settings lists.
+        _ => Ok(()),
     }
 }
 
@@ -168,6 +150,10 @@ pub async fn create(st: &HeadState, r: &api::RealmIn, by: &str) -> anyhow::Resul
     let id = r.id.trim();
     if !valid_id(id) {
         return Err(bad_request("a realm's id is lowercase letters, digits and - (up to 32)"));
+    }
+    // The console's place (docs/realms-ux.md §3).
+    if id == crate::auth::ADMIN_PLACE {
+        return Err(bad_request("\"admin\" is the console's name, not a realm's"));
     }
     let name = if r.name.trim().is_empty() { id } else { r.name.trim() };
     let done = sqlx::query("INSERT OR IGNORE INTO realms (id, name, description, created_at, created_by) VALUES (?, ?, ?, ?, ?)")

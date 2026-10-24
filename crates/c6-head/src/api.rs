@@ -1149,9 +1149,10 @@ async fn list_secrets(
     Extension(caller): Extension<Caller>,
     Query(r): Query<api::InRealm>,
 ) -> ApiResult<Json<Vec<api::SecretInfo>>> {
-    Ok(Json(match r.realm.as_deref().filter(|x| !x.trim().is_empty()) {
-        Some(_) => st.store.secrets_for(&realm_for(&st, &caller, &r).await?).await?,
-        None => st.store.secrets(None).await?,
+    // A realm's caller sees its own realm's; you, every realm's.
+    Ok(Json(match (r.realm.as_deref().filter(|x| !x.trim().is_empty()), &caller.realm) {
+        (Some(_), _) | (None, Some(_)) => st.store.secrets_for(&realm_for(&st, &caller, &r).await?).await?,
+        (None, None) => st.store.secrets(None).await?,
     }))
 }
 
@@ -2454,6 +2455,12 @@ async fn settings_realm(State(st): State<Arc<HeadState>>, req: axum::extract::Re
         .flatten()
         .filter(|r| !r.is_empty());
     let Some(realm) = realm else { return next.run(req).await };
+    // A realm's caller stays in its realm.
+    if let Some(mine) = req.extensions().get::<Caller>().and_then(|c| c.realm.clone())
+        && mine != realm
+    {
+        return ApiErr(StatusCode::FORBIDDEN, format!("this is limited to realm {mine}")).into_response();
+    }
     match crate::realms::exists(&st, &realm).await {
         Ok(true) => crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await,
         _ => ApiErr(StatusCode::BAD_REQUEST, format!("no realm {realm:?}")).into_response(),

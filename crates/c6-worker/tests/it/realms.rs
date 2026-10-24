@@ -97,9 +97,8 @@ async fn realms_keep_data_apart() {
     assert_eq!(realms.as_array().unwrap().len(), 1, "it sees only its realm: {realms}");
     for (method, path) in [
         (M::POST, "workers/enrollments"),
-        (M::GET, "settings/skills"),
-        (M::PUT, "settings/skills"),
-        (M::GET, "settings/secrets"),
+        (M::GET, "settings/prices"),
+        (M::PUT, "settings/routes"),
         (M::POST, "catalog/call"),
         (M::GET, "live"),
         (M::GET, "usage"),
@@ -109,6 +108,11 @@ async fn realms_keep_data_apart() {
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
     assert!(as_(&root, M::GET, "settings/skills", None).await.unwrap().status().is_success());
+    // Its own realm's settings lists are its to read and change.
+    let skill = json!([{"name": "home-only", "description": "d", "body": "b"}]);
+    assert!(as_(&home, M::PUT, "settings/skills", Some(skill)).await.unwrap().status().is_success());
+    let lab_skills: Value = as_(&root, M::GET, "settings/skills?realm=lab", None).await.unwrap().json().await.unwrap();
+    assert!(!lab_skills.to_string().contains("home-only"), "{lab_skills}");
 
     // Sessions: never in root, only in realms that exist; a scoped token's
     // land in its realm and cannot go elsewhere.

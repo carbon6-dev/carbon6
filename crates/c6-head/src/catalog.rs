@@ -31,6 +31,156 @@ pub enum Effect {
     Secret,
 }
 
+/// Who may call an operation (docs/realms-ux.md §3): a realm's callers,
+/// the console, or anyone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// The caller's realm's own data: lists narrowed to it, its objects
+    /// only, new ones made in it.
+    Realm,
+    /// Infrastructure a realm uses but doesn't own, to read.
+    Shared,
+    /// carbon6's administration: the console (root) only.
+    Admin,
+    /// This browser's own business, from anywhere.
+    Device,
+}
+
+/// An operation's scope. `None` for an operation nobody has placed yet
+/// (a test fails on it; callers treat it as administration).
+pub fn scope(name: &str) -> Option<Scope> {
+    use Scope::*;
+    const DEVICE: &[&str] = &["auth.status", "system.version", "push.key", "push.subscribe", "push.unsubscribe", "push.devices"];
+    const SHARED: &[&str] = &["workers.list", "connections.list", "connections.models", "commands.list", "realms.list", "hosts.list"];
+    // Realm data whose handlers don't narrow to the caller's realm yet
+    // (or that are carbon6-wide today): the console's, until they do.
+    const ADMIN: &[&str] = &[
+        "imports.list",
+        "imports.settings.get",
+        "imports.settings.put",
+        "sessions.suggestions.settings.get",
+        "sessions.suggestions.settings.put",
+        "sessions.grouping.get",
+        "sessions.grouping.put",
+        "usage.report",
+        "usage.analytics",
+        "explorer.map",
+        "google.client.put",
+        "google.install",
+        "apps.list",
+        "apps.install",
+        "apps.plan",
+        "apps.remove",
+        "apps.upgrade",
+        "apps.export",
+        "realms.create",
+        "realms.update",
+        "realms.delete",
+        "settings.public_url.get",
+        "settings.public_url.put",
+        "settings.prompts.get",
+        "settings.prompts.put",
+        "settings.subagent_limits.get",
+        "settings.subagent_limits.put",
+        "settings.web_search.get",
+        "settings.web_search.put",
+        "settings.assistant.get",
+        "settings.assistant.put",
+        "settings.memex.get",
+        "settings.memex.put",
+        "settings.routes.get",
+        "settings.routes.put",
+        "settings.prices.get",
+        "settings.prices.put",
+        "settings.vocabulary.get",
+        "settings.vocabulary.put",
+    ];
+    const ADMIN_AREAS: &[&str] =
+        &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants.", "workflows.", "settings.workflows."];
+    const REALM_AREAS: &[&str] = &[
+        "sessions.",
+        "decisions.",
+        "memories.",
+        "memex.",
+        "claims.",
+        "things.",
+        "knowledge.",
+        "photos.",
+        "mail.",
+        "calendar.",
+        "contacts.",
+        "google.",
+        "collections.",
+        "records.",
+        "series.",
+        "views.",
+        "templates.",
+        "triggers.",
+        "explorer.",
+        "apps.accounts",
+        "apps.operations",
+        "settings.secrets.",
+        "settings.skills.",
+        "settings.commands.",
+        "settings.agents.",
+        "settings.hooks.",
+        "settings.mcp_servers.",
+        "settings.templates.",
+        "settings.policies.",
+        "settings.channels.",
+        "settings.budgets.",
+        "settings.views.",
+        "settings.hosts.",
+        "settings.claim_policies.",
+        "settings.memex_scopes.",
+        "settings.memex_folders.",
+    ];
+    if DEVICE.contains(&name) {
+        Some(Device)
+    } else if SHARED.contains(&name) {
+        Some(Shared)
+    } else if ADMIN.contains(&name) || ADMIN_AREAS.iter().any(|a| name.starts_with(a)) {
+        Some(Admin)
+    } else if REALM_AREAS.iter().any(|a| name.starts_with(a)) || matches!(name, "realms.effective" | "notifications.test" | "hosts.check") {
+        Some(Realm)
+    } else {
+        None
+    }
+}
+
+/// Whether a request path fits a route's path (`{x}` takes one segment).
+fn fits(template: &str, path: &str) -> Option<usize> {
+    let (t, p): (Vec<&str>, Vec<&str>) = (template.split('/').collect(), path.split('/').collect());
+    if t.len() != p.len() {
+        return None;
+    }
+    let mut literal = 0;
+    for (a, b) in t.iter().zip(&p) {
+        if a.starts_with('{') && a.ends_with('}') {
+            if b.is_empty() {
+                return None;
+            }
+        } else if a == b {
+            literal += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(literal)
+}
+
+/// The scope of a request: its operation's (the route that fits it most
+/// literally), else administration.
+pub fn route_scope(method: &str, path: &str) -> Scope {
+    let ops = ops().iter().filter_map(|o| match o.via {
+        Via::Http { method: m, path: t } if m == method => fits(t, path).map(|n| (n, scope(o.name).unwrap_or(Scope::Admin))),
+        _ => None,
+    });
+    let other = NOT_OPERATIONS.iter().filter(|(m, ..)| *m == method).filter_map(|(_, t, _, s)| fits(t, path).map(|n| (n, *s)));
+    ops.chain(other).max_by_key(|(n, _)| *n).map_or(Scope::Admin, |(_, s)| s)
+}
+
 /// How an operation is called.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -535,50 +685,50 @@ pub fn list_schema(key: &str) -> Option<Value> {
 
 /// Routes the assistant does not call, and why (the parity test allows
 /// these).
-pub const NOT_OPERATIONS: &[(&str, &str, &str)] = &[
-    ("GET", "/api/v1/live", "a live WebSocket for the UI"),
-    ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only"),
-    ("GET", "/api/v1/head/fs/read", "the head's own files, for the UI's file picker only"),
-    ("GET", "/api/v1/automations", "the old name of /api/v1/triggers"),
-    ("POST", "/api/v1/automations", "the old name of /api/v1/triggers"),
-    ("PATCH", "/api/v1/automations/{id}", "the old name of /api/v1/triggers"),
-    ("DELETE", "/api/v1/automations/{id}", "the old name of /api/v1/triggers"),
-    ("POST", "/api/v1/automations/{id}/run", "the old name of /api/v1/triggers"),
-    ("GET", "/api/v1/automations/{id}/runs", "the old name of /api/v1/triggers"),
-    ("POST", "/api/v1/automations/{id}/rotate", "the old name of /api/v1/triggers"),
-    ("GET", "/api/v1/sessions/{id}/stream", "a live WebSocket for the UI"),
-    ("GET", "/api/v1/workers/{id}/terminals/{tid}/attach", "a terminal WebSocket"),
-    ("GET", "/api/v1/sessions/{id}/attachments/{seq}/{index}", "a file download"),
-    ("GET", "/api/v1/sessions/{id}/outputs/{seq}", "a file download"),
-    ("GET", "/api/v1/sessions/{id}/export", "a file download"),
-    ("GET", "/api/v1/packages/{name}/{version}/files/{*path}", "a file download"),
-    ("GET", "/api/v1/memex/items/{id}/content", "a file download"),
-    ("GET", "/api/v1/memex/media/{id}/thumb", "an image"),
-    ("GET", "/api/v1/memex/face/{id}", "an image"),
-    ("GET", "/api/v1/views/{name}/items/{id}/thumb", "an image"),
-    ("GET", "/api/v1/mail/attachment", "a file download"),
-    ("POST", "/api/v1/memex/rpc", "the memex's methods are operations of their own"),
-    ("POST", "/api/v1/webhooks/{id}/{token}", "called by other systems, with its own token"),
-    ("GET", "/callback", "the ChatGPT sign-in redirect"),
-    ("GET", "/auth/google/callback", "the Google sign-in redirect"),
-    ("GET", "/auth/oauth/callback", "the sign-in redirect of apps' OAuth providers"),
-    ("GET", "/ca.pem", "a certificate download"),
-    ("GET", "/ca.crt", "a certificate download"),
-    ("GET", "/ca.mobileconfig", "a certificate download"),
-    ("GET", "/approve/{token}", "a signed approval page"),
-    ("POST", "/approve/{token}", "a signed approval page"),
-    ("POST", "/api/v1/auth/link", "signing in a browser"),
-    ("POST", "/api/v1/auth/code", "signing in a browser"),
-    ("POST", "/api/v1/auth/logout", "signing out this browser"),
-    ("POST", "/api/v1/auth/passkeys/login/begin", "a passkey ceremony in the browser"),
-    ("POST", "/api/v1/auth/passkeys/login/finish", "a passkey ceremony in the browser"),
-    ("POST", "/api/v1/auth/passkeys/register/begin", "a passkey ceremony in the browser"),
-    ("POST", "/api/v1/auth/passkeys/register/finish", "a passkey ceremony in the browser"),
-    ("POST", "/api/v1/assistant", "starts an assistant conversation (this one)"),
-    ("GET", "/api/v1/catalog", "this catalog"),
-    ("GET", "/api/v1/openapi.json", "this catalog, as OpenAPI"),
-    ("POST", "/api/v1/catalog/call", "this catalog"),
-    ("POST", "/api/v1/sessions/{id}/answers/{call_id}", "answers the assistant's questions (the UI's forms)"),
+pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
+    ("GET", "/api/v1/live", "a live WebSocket for the UI", Scope::Admin),
+    ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only", Scope::Admin),
+    ("GET", "/api/v1/head/fs/read", "the head's own files, for the UI's file picker only", Scope::Admin),
+    ("GET", "/api/v1/automations", "the old name of /api/v1/triggers", Scope::Realm),
+    ("POST", "/api/v1/automations", "the old name of /api/v1/triggers", Scope::Realm),
+    ("PATCH", "/api/v1/automations/{id}", "the old name of /api/v1/triggers", Scope::Realm),
+    ("DELETE", "/api/v1/automations/{id}", "the old name of /api/v1/triggers", Scope::Realm),
+    ("POST", "/api/v1/automations/{id}/run", "the old name of /api/v1/triggers", Scope::Realm),
+    ("GET", "/api/v1/automations/{id}/runs", "the old name of /api/v1/triggers", Scope::Realm),
+    ("POST", "/api/v1/automations/{id}/rotate", "the old name of /api/v1/triggers", Scope::Realm),
+    ("GET", "/api/v1/sessions/{id}/stream", "a live WebSocket for the UI", Scope::Realm),
+    ("GET", "/api/v1/workers/{id}/terminals/{tid}/attach", "a terminal WebSocket", Scope::Admin),
+    ("GET", "/api/v1/sessions/{id}/attachments/{seq}/{index}", "a file download", Scope::Realm),
+    ("GET", "/api/v1/sessions/{id}/outputs/{seq}", "a file download", Scope::Realm),
+    ("GET", "/api/v1/sessions/{id}/export", "a file download", Scope::Realm),
+    ("GET", "/api/v1/packages/{name}/{version}/files/{*path}", "a file download", Scope::Admin),
+    ("GET", "/api/v1/memex/items/{id}/content", "a file download", Scope::Realm),
+    ("GET", "/api/v1/memex/media/{id}/thumb", "an image", Scope::Realm),
+    ("GET", "/api/v1/memex/face/{id}", "an image", Scope::Realm),
+    ("GET", "/api/v1/views/{name}/items/{id}/thumb", "an image", Scope::Realm),
+    ("GET", "/api/v1/mail/attachment", "a file download", Scope::Realm),
+    ("POST", "/api/v1/memex/rpc", "the memex's methods are operations of their own", Scope::Realm),
+    ("POST", "/api/v1/webhooks/{id}/{token}", "called by other systems, with its own token", Scope::Device),
+    ("GET", "/callback", "the ChatGPT sign-in redirect", Scope::Device),
+    ("GET", "/auth/google/callback", "the Google sign-in redirect", Scope::Device),
+    ("GET", "/auth/oauth/callback", "the sign-in redirect of apps' OAuth providers", Scope::Device),
+    ("GET", "/ca.pem", "a certificate download", Scope::Device),
+    ("GET", "/ca.crt", "a certificate download", Scope::Device),
+    ("GET", "/ca.mobileconfig", "a certificate download", Scope::Device),
+    ("GET", "/approve/{token}", "a signed approval page", Scope::Device),
+    ("POST", "/approve/{token}", "a signed approval page", Scope::Device),
+    ("POST", "/api/v1/auth/link", "signing in a browser", Scope::Device),
+    ("POST", "/api/v1/auth/code", "signing in a browser", Scope::Device),
+    ("POST", "/api/v1/auth/logout", "signing out this browser", Scope::Device),
+    ("POST", "/api/v1/auth/passkeys/login/begin", "a passkey ceremony in the browser", Scope::Device),
+    ("POST", "/api/v1/auth/passkeys/login/finish", "a passkey ceremony in the browser", Scope::Device),
+    ("POST", "/api/v1/auth/passkeys/register/begin", "a passkey ceremony in the browser", Scope::Admin),
+    ("POST", "/api/v1/auth/passkeys/register/finish", "a passkey ceremony in the browser", Scope::Admin),
+    ("POST", "/api/v1/assistant", "starts an assistant conversation (this one)", Scope::Admin),
+    ("GET", "/api/v1/catalog", "this catalog", Scope::Shared),
+    ("GET", "/api/v1/openapi.json", "this catalog, as OpenAPI", Scope::Shared),
+    ("POST", "/api/v1/catalog/call", "this catalog", Scope::Admin),
+    ("POST", "/api/v1/sessions/{id}/answers/{call_id}", "answers the assistant's questions (the UI's forms)", Scope::Realm),
 ];
 
 /// An operation's input schema: path parameters, then the body (under
@@ -996,7 +1146,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let excepted = |m: &str, p: &str| NOT_OPERATIONS.iter().any(|(em, ep, _)| *em == m && *ep == p);
+        let excepted = |m: &str, p: &str| NOT_OPERATIONS.iter().any(|(em, ep, ..)| *em == m && *ep == p);
         let missing: Vec<_> = routes.iter().filter(|(m, p)| !ops_http.contains(&(m.clone(), p.clone())) && !excepted(m, p)).collect();
         assert!(missing.is_empty(), "routes without an operation (add them to the catalog or NOT_OPERATIONS): {missing:?}");
         let stale: Vec<_> = ops_http.iter().filter(|r| !routes.contains(r)).collect();
@@ -1007,6 +1157,9 @@ mod tests {
         let n = names.len();
         names.dedup();
         assert_eq!(n, names.len(), "duplicate operation names");
+        // Every operation has a scope (docs/realms-ux.md §3).
+        let unplaced: Vec<&str> = ops().iter().map(|o| o.name).filter(|n| scope(n).is_none()).collect();
+        assert!(unplaced.is_empty(), "operations without a scope (place them in catalog::scope): {unplaced:?}");
         // The memex methods the UI calls.
         let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../c6-ui/src");
         let ui: Vec<String> = std::fs::read_dir(&ui_dir)

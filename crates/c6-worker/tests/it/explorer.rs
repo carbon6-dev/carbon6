@@ -166,8 +166,9 @@ async fn explorer_shows_a_realm_and_its_connections() {
     let tok = tok["token"].as_str().unwrap();
     let mine = http.get(format!("{api}/realms/crm/summary")).bearer_auth(tok).send().await.unwrap();
     assert!(mine.status().is_success());
+    // Another realm is as good as missing.
     let other = http.get(format!("{api}/realms/home/summary")).bearer_auth(tok).send().await.unwrap();
-    assert_eq!(other.status(), StatusCode::FORBIDDEN);
+    assert_eq!(other.status(), StatusCode::NOT_FOUND);
 
     head.shutdown().await.unwrap();
 }
