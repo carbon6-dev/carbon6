@@ -127,7 +127,7 @@ pub fn PhotosPage() -> impl IntoView {
 
 fn tile(it: Value, open: RwSignal<Option<String>>) -> impl IntoView {
     let id = it["id"].as_str().unwrap_or_default().to_owned();
-    let src = format!("/api/v1/memex/media/{id}/thumb");
+    let src = crate::api::url(&format!("/api/v1/memex/media/{id}/thumb"));
     let title = it["title"].as_str().unwrap_or_default().to_owned();
     let video = it["kind"] == "video";
     let duration = it["duration"].as_f64().map(|d| format!("{}:{:02}", d as u64 / 60, d as u64 % 60));
@@ -161,7 +161,7 @@ fn Facets(f: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
                     view! {
                         <button class="flex items-center gap-1 rounded-full border border-zinc-300 py-0.5 pl-0.5 pr-2 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-900"
                             on:click=move |_| about.set(Some(pick.clone()))>
-                            {faces.then(|| view! { <img src=format!("/api/v1/memex/face/{id}") class="h-5 w-5 rounded-full object-cover" alt="" /> })}
+                            {faces.then(|| view! { <img src=crate::api::url(&format!("/api/v1/memex/face/{id}")) class="h-5 w-5 rounded-full object-cover" alt="" /> })}
                             <span class:pl-1=!faces>{name}</span>
                             <span class="text-zinc-400">{t["n"].as_i64().unwrap_or(0)}</span>
                         </button>
@@ -187,7 +187,7 @@ fn PhotoView(id: String, open: RwSignal<Option<String>>, about: RwSignal<Option<
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
             <div class="flex justify-end gap-2">
-                <a href=format!("/api/v1/memex/items/{id}/content") target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original ↗"</a>
+                <a href=crate::api::url(&format!("/api/v1/memex/items/{id}/content")) target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original ↗"</a>
                 <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Close"</button>
             </div>
             {move || data.get().map(|r| match r {
@@ -209,7 +209,7 @@ fn detail(v: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
         (Some(la), Some(lo)) => Some(format!("https://www.openstreetmap.org/?mlat={la}&mlon={lo}#map=14/{la}/{lo}")),
         _ => None,
     };
-    let src = format!("/api/v1/memex/media/{id}/thumb");
+    let src = crate::api::url(&format!("/api/v1/memex/media/{id}/thumb"));
     view! {
         <div class="grid gap-3 md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
             <div class="space-y-2">
@@ -229,7 +229,7 @@ fn detail(v: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
                 </div>
                 {(frames > 1).then(|| view! {
                     <div class="flex gap-1 overflow-x-auto">
-                        {(0..frames).map(|n| view! { <img src=format!("/api/v1/memex/media/{id}/thumb?frame={n}") class="h-16 rounded" alt="a frame" /> }).collect_view()}
+                        {(0..frames).map(|n| view! { <img src=crate::api::url(&format!("/api/v1/memex/media/{id}/thumb?frame={n}")) class="h-16 rounded" alt="a frame" /> }).collect_view()}
                     </div>
                 })}
             </div>

@@ -35,11 +35,31 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
     view! { <span class=format!("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {cls}")>{label}</span> }
 }
 
+/// This browser's saved state, kept per place (docs/realms-ux.md §4):
+/// `c6.x` is `c6.<realm>.x` (or `c6.admin.x`). Home falls back to what was
+/// saved before realms had their own pages.
 pub fn storage_get(key: &str) -> Option<String> {
-    window().local_storage().ok()??.get_item(key).ok()?
+    let placed = placed_key(key);
+    storage_get_global(&placed).or_else(|| (crate::place::realm().as_deref() == Some("home")).then(|| storage_get_global(key)).flatten())
 }
 
 pub fn storage_set(key: &str, value: &str) {
+    storage_set_global(&placed_key(key), value);
+}
+
+fn placed_key(key: &str) -> String {
+    match (crate::place::header(), key.strip_prefix("c6.")) {
+        (Some(p), Some(rest)) => format!("c6.{p}.{rest}"),
+        _ => key.to_owned(),
+    }
+}
+
+/// Saved state shared by every place in this browser.
+pub fn storage_get_global(key: &str) -> Option<String> {
+    window().local_storage().ok()??.get_item(key).ok()?
+}
+
+pub fn storage_set_global(key: &str, value: &str) {
     if let Ok(Some(s)) = window().local_storage() {
         let _ = s.set_item(key, value);
     }

@@ -113,6 +113,16 @@ impl View {
     }
 
     /// The URL for this view (shown in the address bar, and for copying).
+    /// Where a page starts: a realm's sessions, or the console's realms.
+    pub fn home() -> Self {
+        if crate::place::is_console() { View::Realms } else { View::Sessions }
+    }
+
+    /// The view's address on this page (within its realm or the console).
+    pub fn href(&self) -> String {
+        crate::place::href(&self.path())
+    }
+
     pub fn path(&self) -> String {
         match self {
             View::Sessions => "/".into(),
@@ -182,7 +192,7 @@ impl View {
             })
             .unwrap_or_default();
         let hash = loc.hash().unwrap_or_default().trim_start_matches('#').to_owned();
-        Self::parse(&path, &query, &hash)
+        Self::parse(&crate::place::strip(&path), &query, &hash)
     }
 
     /// The view at a path of carbon6 (e.g. a link the head gives).
@@ -255,7 +265,7 @@ impl View {
             ["realms", realm, kind, id] => {
                 View::Explore { realm: (*realm).to_owned(), section: get("in"), kind: (*kind).to_owned(), id: (*id).to_owned() }
             }
-            _ => View::Sessions,
+            _ => View::home(),
         }
     }
 
@@ -502,7 +512,7 @@ impl Workspace {
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
-        if here != View::Sessions && ws.layout.with_untracked(|l| l.focused_view() != Some(&here)) {
+        if here != View::home() && ws.layout.with_untracked(|l| l.focused_view() != Some(&here)) {
             ws.open(None, here, How::Beside);
         }
         // Save, and show the focused column in the address bar.
@@ -510,7 +520,7 @@ impl Workspace {
             let l = ws.layout.get();
             storage_set(LAYOUT_KEY, &serde_json::to_string(&l).unwrap_or_default());
             if let Some(v) = l.focused_view() {
-                let _ = window().history().and_then(|h| h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&v.path())));
+                let _ = window().history().and_then(|h| h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&v.href())));
             }
         });
         Effect::new(move || storage_set(ATTENTION_KEY, &serde_json::to_string(&ws.attention.get()).unwrap_or_default()));
@@ -631,7 +641,7 @@ impl Workspace {
                 return;
             }
             if l.tiles.len() == 1 {
-                *l = Layout::new(View::Sessions);
+                *l = Layout::new(View::home());
             } else {
                 l.tiles.remove(ti);
                 l.focus = l.focus.min(l.tiles.len() - 1);
@@ -643,7 +653,7 @@ impl Workspace {
         self.layout.update(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             if l.tiles.len() == 1 {
-                *l = Layout::new(View::Sessions);
+                *l = Layout::new(View::home());
             } else {
                 l.tiles.remove(ti);
                 l.focus = l.focus.min(l.tiles.len() - 1);
@@ -652,7 +662,7 @@ impl Workspace {
     }
 
     pub fn new_tile(&self) {
-        self.open(None, View::Sessions, How::NewTile);
+        self.open(None, View::home(), How::NewTile);
     }
 
     pub fn focus_tile(&self, index: usize) {
@@ -825,7 +835,7 @@ pub fn Go(
 ) -> impl IntoView {
     let ws = use_workspace();
     let col = use_column();
-    let href = to.path();
+    let href = to.href();
     let to = StoredValue::new(to);
     view! {
         <a href=href class=class title=title on:click=move |ev: web_sys::MouseEvent| {

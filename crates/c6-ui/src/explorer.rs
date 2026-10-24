@@ -63,7 +63,7 @@ fn RefLine(realm: String, section: String, r: ExRef) -> impl IntoView {
 fn Ex(to: View, #[prop(optional, into)] class: String, #[prop(optional, into)] title: String, children: Children) -> impl IntoView {
     let col = crate::workspace::use_column();
     let ws = crate::workspace::use_workspace();
-    let href = to.path();
+    let href = to.href();
     let to = StoredValue::new(to);
     view! {
         <a href=href class=class title=title on:click=move |ev: web_sys::MouseEvent| {
@@ -133,6 +133,22 @@ pub fn RealmsMap() -> impl IntoView {
                                             <span class="font-mono text-xs text-zinc-500">{id.clone()}</span>
                                             <span class="flex-1"></span>
                                             {(health > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Needs attention">{health}</span> })}
+                                            // Going into a realm loads its own app (⌘-click: a new tab).
+                                            {(id != "root").then(|| {
+                                                let to = crate::place::url_of(&crate::place::Place::Realm(id.clone()));
+                                                view! {
+                                                    <span role="link" class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Go into this realm"
+                                                        on:click=move |ev: web_sys::MouseEvent| {
+                                                            ev.prevent_default();
+                                                            ev.stop_propagation();
+                                                            if ev.meta_key() || ev.ctrl_key() {
+                                                                let _ = window().open_with_url_and_target(&to, "_blank");
+                                                            } else {
+                                                                let _ = window().location().set_href(&to);
+                                                            }
+                                                        }>"Open ↗"</span>
+                                                }
+                                            })}
                                         </div>
                                         <p class="line-clamp-2 text-xs text-zinc-500">{c["realm"]["description"].as_str().unwrap_or("").to_owned()}</p>
                                         {c["app"]["app"].as_str().map(|a| view! { <p class="text-xs">{format!("app {a} {}", c["app"]["version"].as_str().unwrap_or(""))}</p> })}
@@ -212,11 +228,6 @@ const GROUPS: [(&str, &str); 6] = [
 /// an object (right).
 #[component]
 pub fn ExplorePage(realm: String, section: String, kind: String, id: String) -> impl IntoView {
-    // Exploring a realm is being in it: the rest of the UI (charts, views)
-    // follows.
-    if realm != "root" && api::realm().get_untracked() != realm {
-        api::realm().set(realm.clone());
-    }
     let r1 = realm.clone();
     let summary = LocalResource::new(move || api::realm_summary(r1.clone()));
     let has_object = !kind.is_empty();
@@ -441,7 +452,7 @@ fn Wiring(realm: String) -> impl IntoView {
                 let node = |x: f64, y: f64, text: String, to: Option<View>| {
                     let t = view! { <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class="fill-zinc-800 text-[11px] dark:fill-zinc-200">{text}</text> };
                     match to {
-                        Some(to) => { let nav = nav.clone(); view! { <a href=to.path() on:click=move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav)>{t}</a> }.into_any() }
+                        Some(to) => { let nav = nav.clone(); view! { <a href=to.href() on:click=move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav)>{t}</a> }.into_any() }
                         None => t.into_any(),
                     }
                 };
@@ -685,7 +696,7 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
                             let depth = nodes[i]["depth"].as_u64().unwrap_or(0);
                             let to = explore(&realm, &section, &r.kind, &r.id);
                             let size = match depth { 0 => "text-[12px] font-semibold", 1 => "text-[10px]", _ => "text-[9px] opacity-80" };
-                            let href = to.path();
+                            let href = to.href();
                             view! {
                                 <a href=href on:click={ let nav = nav.clone(); move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav) }>
                                     <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class=format!("fill-current {color} {size}")>

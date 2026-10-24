@@ -8,7 +8,7 @@ use c6_api::{
 };
 use futures::StreamExt;
 use futures::future::{AbortHandle, abortable};
-use gloo_net::http::{Request, RequestBuilder, Response};
+use gloo_net::http::{RequestBuilder, Response};
 use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
 use leptos::prelude::*;
@@ -99,7 +99,56 @@ pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, 
 pub fn ws_url(path: &str) -> String {
     let loc = window().location();
     let scheme = if loc.protocol().as_deref() == Ok("https:") { "wss" } else { "ws" };
-    format!("{scheme}://{}{path}", loc.host().unwrap_or_default())
+    format!("{scheme}://{}{}", loc.host().unwrap_or_default(), url(path))
+}
+
+/// An API address for what can't send headers (WebSockets, images,
+/// downloads): it says where this page is in the query.
+pub fn url(path: &str) -> String {
+    match crate::place::header() {
+        Some(p) => format!("{path}{}c6_realm={}", if path.contains('?') { '&' } else { '?' }, enc(&p)),
+        None => path.to_owned(),
+    }
+}
+
+/// Requests that say where this page is (`X-C6-Realm`, docs/realms-ux.md
+/// §3): the head keeps them there.
+pub(crate) struct Request;
+
+impl Request {
+    pub(crate) fn get(url: &str) -> RequestBuilder {
+        placed(gloo_net::http::Request::get(url))
+    }
+    pub(crate) fn post(url: &str) -> RequestBuilder {
+        placed(gloo_net::http::Request::post(url))
+    }
+    pub(crate) fn put(url: &str) -> RequestBuilder {
+        placed(gloo_net::http::Request::put(url))
+    }
+    pub(crate) fn patch(url: &str) -> RequestBuilder {
+        placed(gloo_net::http::Request::patch(url))
+    }
+    pub(crate) fn delete(url: &str) -> RequestBuilder {
+        placed(gloo_net::http::Request::delete(url))
+    }
+}
+
+fn placed(r: RequestBuilder) -> RequestBuilder {
+    match crate::place::header() {
+        Some(p) => r.header("X-C6-Realm", &p),
+        None => r,
+    }
+}
+
+/// The realm a session is in (for links from before realms had pages).
+pub async fn locate_session(id: &str) -> Result<String, String> {
+    let v: serde_json::Value = json(Request::get(&format!("/api/v1/locate/sessions/{}", enc(id))).send().await).await?;
+    v["realm"].as_str().map(str::to_owned).ok_or_else(|| "no realm".into())
+}
+
+/// What waits on you in each realm (for the switcher).
+pub async fn elsewhere() -> Result<Vec<c6_api::RealmWaiting>, String> {
+    json(Request::get("/api/v1/elsewhere").send().await).await
 }
 
 thread_local! {
@@ -118,7 +167,9 @@ thread_local! {
     /// long as the page, whichever component asks for it first.
     static REALM: (Owner, RwSignal<String>) = {
         let owner = Owner::new_root(None);
-        let signal = owner.with(|| RwSignal::new(crate::util::storage_get("c6.realm").unwrap_or_default()));
+        // This page's realm; the console's is root (Settings there edits
+        // the defaults every realm inherits).
+        let signal = owner.with(|| RwSignal::new(crate::place::realm().unwrap_or_else(|| "root".into())));
         (owner, signal)
     };
 }
@@ -873,7 +924,7 @@ pub async fn secrets() -> Result<Vec<c6_api::SecretInfo>, String> {
     json(Request::get(&format!("/api/v1/settings/secrets{}", in_realm('?'))).send().await).await
 }
 
-/// Sets a secret in the realm you look at (home for "All realms").
+/// Sets a secret in this page's realm (root's, in the console).
 pub async fn put_secret(name: String, req: c6_api::PutSecret) -> Result<(), String> {
     empty(Request::put(&format!("/api/v1/settings/secrets/{name}{}", in_realm('?'))).json(&req).map_err(|e| e.to_string())?.send().await)
         .await

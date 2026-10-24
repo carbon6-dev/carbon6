@@ -103,7 +103,7 @@ Labels keep working as they do today, inside a realm.
 - An assistant never acts in another realm. It may suggest a grant, which you approve (4.2).
 
 **As built (step 8):**
-- **The realm:** the assistant works in the realm you're looking at when you open it ("All realms" is root).
+- **The realm:** the assistant works in the realm whose page you open it from (the console's is root).
 - **What it may do:** its catalog calls go through the same admission as that realm's API token, so it reaches only that realm's data, and administration stays in root.
 - **Its instructions** are the `assistant.base` prompt, overridable per realm, which now names the realm. Its memex calls go to that realm's knowledge, and its compaction prompt is the realm's.
 
@@ -177,7 +177,7 @@ grant(id, from_realm, to_realm,
 - **Creating realms:** `POST /api/v1/realms` (id: lowercase letters, digits and `-`), rename, and delete. Only a realm that owns nothing can be deleted, and root and home stay. A new realm gets its own system collections at once.
 - **Availability:** workers and connections carry a `realms` list (migration `0032`; empty means every realm), set with `PUT /api/v1/workers/{id}/realms` and `…/connections/{id}/realms`. A session cannot start on a worker, or with a connection, that its realm may not use.
 - **Per-realm settings:** a Settings request with `?realm=` reads and writes that realm's own lists. A request-scoped value (`SETTINGS_REALM`) tells the settings store which realm, so every settings endpoint and form works per realm unchanged.
-- **UI:** a realm switcher in the header, remembered per browser ("All realms" by default; shown once a realm beyond home exists). Sessions, decisions and collections show the realm's own, new sessions start in it, and Settings edits its lists, with a note saying so. **Settings → System → Realms** creates and deletes realms, and sets which realms each worker and connection serves.
+- **UI:** each realm is its own app at `/r/<realm>/`, and administration is the console at `/admin/`, both enforced by the head (docs/realms-ux.md). **Settings → System → Realms** in the console creates and deletes realms, and sets which realms each worker and connection serves.
 
 ### 3.13 As built (step 4b)
 
@@ -888,7 +888,7 @@ Choices the design left open, made while building, for review.
 | 3 | Digests are left for triggers (step 5) | A digest is a scheduled notification of open decisions, which is exactly a trigger |
 | 4a | A realm is deleted only when it owns nothing | Removing a realm with its data belongs to an app's uninstall (step 9), with an export first |
 | 4a | Per-realm settings use a request-scoped realm read by the settings store | Every settings endpoint and form works per realm without being rewritten |
-| 4a | The realm switcher lives in the browser, and "All realms" shows everything | Single user: it is a view, not a permission |
+| 4a | Each realm's pages are its own app, enforced by the head; administration is the console (docs/realms-ux.md) | A filter in the browser leaked across realms wherever a page forgot it |
 | 4b | Another realm's memex knowledge is a separate database, not realm columns on shared tables | Isolation by construction: no query can leak, things are naturally per realm, a realm's knowledge is deleted with its file, and grants (4c) become reads across databases |
 | 4b | Deleting a realm drops its memex knowledge too | A realm is deleted only when it owns no sessions, records or decisions; what the memex derived from them goes with it |
 | 4c | A grant's `where` is kept as a second filter, not merged into the query's | Merging lets a query's own condition on the same field replace the grant's |

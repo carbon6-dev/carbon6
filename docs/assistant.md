@@ -133,8 +133,8 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
 
 ### Realms (OS step 8)
 
-- **A conversation works in one realm:** the realm picked in the header when it starts. With "All realms" it is root, which administers carbon6 and reaches every realm.
-- **Its operations are admitted like that realm's API token.** It reaches the realm's sessions, collections, decisions, triggers, views, series and knowledge. Administration (workers, connections, realms, grants, settings) answers 403, and the assistant is told to send you to "All realms" for it.
+- **A conversation works in one realm:** the realm whose page you open it from. From the console it is root, which administers carbon6 and reaches every realm.
+- **Its operations are admitted like that realm's API token.** It reaches the realm's sessions, collections, decisions, triggers, views, series and knowledge. Administration (workers, connections, realms, grants, settings) answers 403, and the assistant is told to send you to the console for it.
 - **Its instructions** are the `assistant.base` prompt as the realm has it (a realm can override it), with `{{realm}}` naming the realm.
 - **Commons** is not a place to work in.
 

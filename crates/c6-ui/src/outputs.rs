@@ -34,7 +34,7 @@ pub fn count(events: &[Event]) -> usize {
 }
 
 fn url(session: &str, seq: u64) -> String {
-    format!("/api/v1/sessions/{session}/outputs/{seq}")
+    crate::api::url(&format!("/api/v1/sessions/{session}/outputs/{seq}"))
 }
 
 fn size(n: u64) -> String {
@@ -121,7 +121,7 @@ fn Preview(url: String, mime: String) -> impl IntoView {
     } else if mime.starts_with("text/") || mime == "application/json" {
         let text = LocalResource::new(move || {
             let url = url.clone();
-            async move { gloo_net::http::Request::get(&url).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string()) }
+            async move { crate::api::Request::get(&url).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string()) }
         });
         let markdown = mime == "text/markdown";
         view! {

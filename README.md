@@ -295,7 +295,7 @@ The memex is your knowledge store, part of the head: items, a graph of things wi
 
 ### Mail, calendar and contacts
 
-carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**). Each realm can have its own: personal Gmail in home, a business's Workspace account in that business's realm, each with its own mail, events and contacts (the pages follow the realm picked in the header). Three apps do the syncing, installed in each realm that has accounts: **gmail**, **google-calendar** and **google-contacts**. They run on the **google** kit on a worker with Docker or Podman, which reaches only Google. Their packages are part of carbon6, and an IMAP or CalDAV app would be written the same way. Design: [docs/knowledge.md](docs/knowledge.md) §6.
+carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail**, **Calendar**, **Contacts**). Each realm can have its own: personal Gmail in home, a business's Workspace account in that business's realm, each with its own mail, events and contacts (each realm's pages show its own). Three apps do the syncing, installed in each realm that has accounts: **gmail**, **google-calendar** and **google-contacts**. They run on the **google** kit on a worker with Docker or Podman, which reaches only Google. Their packages are part of carbon6, and an IMAP or CalDAV app would be written the same way. Design: [docs/knowledge.md](docs/knowledge.md) §6.
 
 - **Setup** (**Settings → Mail & calendar**):
   - **Install the apps** (you approve each under Decisions).
@@ -486,7 +486,7 @@ Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is 
 - **The agent never sees a value.** The system prompt lists only names and descriptions, and a value that appears in command output is replaced by `[secret:NAME]` before the model or the UI sees it.
 - **Storage.** Values are encrypted on the head and can only be replaced, never read back.
 - **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. A secret scoped to a `worker:` label is only handed to that worker.
-- **Per realm.** A secret belongs to a realm, and the same name can hold a different value in each (work's `GITHUB_TOKEN` and home's). A session gets its realm's, else root's: root's secrets are every realm's that has none of its own by that name. The page follows the realm picked in the header.
+- **Per realm.** A secret belongs to a realm, and the same name can hold a different value in each (work's `GITHUB_TOKEN` and home's). A session gets its realm's, else root's: root's secrets are every realm's that has none of its own by that name. A realm's Settings → Secrets shows its own; the console's are root's.
 
 ### Background tasks
 
@@ -571,6 +571,7 @@ The UI is a workspace of up to four **tiles** side by side: framed cards, each w
 
   **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
 - **Session details:** **Details** in a session's header opens a card at its top right with where it runs (worker, folder, branch, worktree, model), how full its context is (with **Compact now**), its usage, and the lines it changed (**Review** opens Changes). It stays open or closed as you leave it.
+- **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, nothing of any other realm. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces this, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
 - **Light or dark:** Settings → Appearance: follow the system, or always light or dark (kept in each browser).
 - **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; one pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰.
 - The workspace is saved in the browser; the address bar shows the focused pane, so links and reloads land in the right place.

@@ -12,7 +12,7 @@ A page per realm that shows what the realm holds, how its parts connect, and let
 
 ## 2. Where it lives
 
-- **`/realms`: the map.** Every realm as a card (name, app, counts, last activity, spend this month), with grants drawn as arrows between them and commons beside them. "All realms" in the header lands here.
+- **`/realms`: the map.** Every realm as a card (name, app, counts, last activity, spend this month), with grants drawn as arrows between them and commons beside them. The console (`/admin`) lands here.
 - **`/realms/<id>`: the explorer** of one realm. Picking a realm in the header switcher offers it, and the Views menu links to it ("Explore crm").
 - **`/realms/<id>/<kind>/<id>`: an object** inside the explorer, so every object has an address you can bookmark, share in a tile, or give the assistant as context.
 

@@ -21,6 +21,7 @@ mod memex;
 mod notify;
 mod outputs;
 mod photos;
+mod place;
 mod push;
 mod search;
 mod session;
@@ -41,7 +42,10 @@ use workspace::{Go, View};
 
 fn main() {
     console_error_panic_hook::set_once();
-    leptos::mount::mount_to_body(App);
+    // Each page is one realm's app or the console (docs/realms-ux.md).
+    if place::resolve() {
+        leptos::mount::mount_to_body(App);
+    }
 }
 
 /// Signs the browser in first: until then only the sign-in pages render, so
@@ -89,46 +93,63 @@ fn Main() -> impl IntoView {
     let counts = Memo::new(move |_| labels::attention_counts(ws, live, &filter.get()));
     let attention = move || counts.get().0;
     let tiles = move || ws.layout.with(|l| l.tiles.len());
+    let console = place::is_console();
     view! {
         <div class="flex h-dvh flex-col">
             <header class="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-950">
                 <Brand />
                 <MobileMenu attention=Signal::derive(attention) />
-                <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
-                    <NavLink to=View::Sessions label="Sessions" />
-                    <NavLink to=View::Workers label="Workers" />
-                    <Go to=View::Inbox class=NAV>
-                        <span title=move || { let (s, h) = counts.get(); labels::attention_title(s, h) }>
-                            "Inbox"
-                            {move || (attention() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention()}</span> })}
-                        </span>
-                    </Go>
-                    <decisions::DecisionLink class=NAV />
-                    <NavLink to=View::Analytics label="Analytics" />
-                    <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
-                    <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
-                    <span class="hidden xl:contents"><NavLink to=View::Realms label="Realms" /></span>
-                    <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
-                </nav>
-                <span class="flex-1"></span>
-                <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
-                <RealmSwitch />
-                <assistant::AskButton />
-                <span class="hidden md:contents"><search::SearchBox /></span>
+                <PlaceMenu />
+                {if console {
+                    view! {
+                        <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
+                            <NavLink to=View::Realms label="Realms" />
+                            <NavLink to=View::Workers label="Workers" />
+                            <NavLink to=View::Analytics label="Analytics" />
+                            <NavLink to=View::Usage label="Spending" />
+                            <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
+                        </nav>
+                        <span class="flex-1"></span>
+                        <assistant::AskButton />
+                    }.into_any()
+                } else {
+                    view! {
+                        <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
+                            <NavLink to=View::Sessions label="Sessions" />
+                            <Go to=View::Inbox class=NAV>
+                                <span title=move || { let (s, h) = counts.get(); labels::attention_title(s, h) }>
+                                    "Inbox"
+                                    {move || (attention() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention()}</span> })}
+                                </span>
+                            </Go>
+                            <decisions::DecisionLink class=NAV />
+                            <NavLink to=View::Analytics label="Analytics" />
+                            <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
+                            <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
+                            <span class="hidden xl:contents"><NavLink to=View::Workers label="Workers" /></span>
+                            <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
+                        </nav>
+                        <span class="flex-1"></span>
+                        <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
+                        <assistant::AskButton />
+                        <span class="hidden md:contents"><search::SearchBox /></span>
+                    }.into_any()
+                }}
                 {move || (tiles() < workspace::MAX_TILES).then(|| view! {
                     <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="New tile (or ⌘-click any link) · ⌘1–4 switch tiles · ⌘[ ⌘] back and forward"
                         on:click=move |_| ws.new_tile()>"+ Tile"</button>
                 })}
-                <notify::NotifyToggle />
+                {(!console).then(|| view! { <notify::NotifyToggle /> })}
                 <ConnBadge connected=live.connected />
             </header>
             <UpdatedBanner />
+            <MissingRealm />
             <div class="flex min-h-0 flex-1">
-                <activity::Dock />
+                {(!console).then(|| view! { <activity::Dock /> })}
                 <workspace::Tiles />
             </div>
-            <activity::MobileBar />
+            {(!console).then(|| view! { <activity::MobileBar /> })}
         </div>
     }
     .into_any()
@@ -139,9 +160,15 @@ fn Main() -> impl IntoView {
 fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
     let menu = NodeRef::<leptos::html::Details>::new();
     // Mail, Calendar and Contacts are apps: shown where one is installed.
+    // A realm's mail, calendar and contacts (the console has none).
     let feeds = LocalResource::new(move || {
         api::realm().track();
-        api::rpc("memex.feeds", serde_json::json!({}))
+        async move {
+            if place::is_console() {
+                return Err(String::new());
+            }
+            api::rpc("memex.feeds", serde_json::json!({})).await
+        }
     });
     // Close after choosing something.
     let close = move |_| {
@@ -156,15 +183,23 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                 {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
             </summary>
             <div class="absolute left-0 top-9 z-40 w-64 space-y-1 rounded-lg border border-zinc-200 bg-white p-2 shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
-                <div on:click=|ev| ev.stop_propagation()><search::SearchBox /></div>
-                <div class="flex flex-col text-sm">
+                {place::is_console().then(|| view! {
+                    <div class="flex flex-col text-sm">
+                        <Go to=View::Realms class=MENU>"Realms"</Go>
+                        <Go to=View::Workers class=MENU>"Workers"</Go>
+                        <Go to=View::Analytics class=MENU>"Analytics"</Go>
+                        <Go to=View::Usage class=MENU>"Spending"</Go>
+                        <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
+                    </div>
+                })}
+                <div class:hidden=place::is_console() on:click=|ev| ev.stop_propagation()><search::SearchBox /></div>
+                <div class="flex flex-col text-sm" class:hidden=place::is_console()>
                     <Go to=View::Sessions class=MENU>"Sessions"</Go>
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <decisions::DecisionLink class=MENU />
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
-                    <Go to=View::Realms class=MENU>"Realms"</Go>
                     <views::ViewsMenu class=MENU />
                     // Only what an app feeds in this realm (or it holds).
                     {move || feeds.get().and_then(Result::ok).map(|f| view! {
@@ -204,30 +239,99 @@ fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
     }
 }
 
-/// Which realm you are looking at (docs/os.md §3): sessions, decisions and
-/// collections show its own, new sessions start in it, and Settings edits
-/// its lists. Remembered in this browser.
+/// A realm's colour, the same everywhere it shows.
+fn realm_colour(id: &str) -> &'static str {
+    const OTHERS: [&str; 6] = ["bg-emerald-500", "bg-violet-500", "bg-rose-500", "bg-teal-500", "bg-indigo-500", "bg-lime-500"];
+    match id {
+        "home" => "bg-sky-500",
+        "commons" => "bg-amber-500",
+        _ => OTHERS[id.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619)) as usize % OTHERS.len()],
+    }
+}
+
+/// Where you are (a realm, in its colour, or the console) and the way to
+/// the others, each with how many things wait on you there
+/// (docs/realms-ux.md §2, §6). Each is a link: ⌘-click opens it in a new
+/// tab.
 #[component]
-fn RealmSwitch() -> impl IntoView {
-    let realms = LocalResource::new(move || {
+fn PlaceMenu() -> impl IntoView {
+    let places = LocalResource::new(move || {
         api::realms_changed().track();
-        api::realms()
+        api::elsewhere()
     });
-    let current = api::realm();
+    let menu = NodeRef::<leptos::html::Details>::new();
+    let here = place::realm();
+    let elsewhere = {
+        let here = here.clone();
+        move || places.get().and_then(Result::ok).map_or(0, |ps| ps.iter().filter(|p| Some(&p.id) != here.as_ref()).map(|p| p.waiting).sum::<u64>())
+    };
+    let name = {
+        let here = here.clone();
+        move || match &here {
+            Some(r) => places.get().and_then(Result::ok).and_then(|ps| ps.into_iter().find(|p| &p.id == r).map(|p| p.name)).unwrap_or_else(|| r.clone()),
+            None => "Console".into(),
+        }
+    };
+    let dot = here.as_deref().map_or("bg-zinc-900 dark:bg-zinc-100", realm_colour);
     view! {
-        {move || realms.get().and_then(Result::ok).filter(|rs| rs.iter().filter(|r| r.id != "root").count() > 1).map(|rs| view! {
-            <select class="hidden rounded-md border border-zinc-300 bg-white px-1 py-0.5 text-xs md:block dark:border-zinc-700 dark:bg-zinc-900"
-                title="The realm you are looking at" prop:value=move || current.get()
-                on:change=move |ev| {
-                    let v = event_target_value(&ev);
-                    util::storage_set("c6.realm", &v);
-                    current.set(v);
-                }>
-                <option value="">"All realms"</option>
-                {rs.into_iter().filter(|r| r.id != "root").map(|r| view! { <option value=r.id.clone()>{r.name.clone()}</option> }).collect_view()}
-            </select>
+        <details node_ref=menu class="relative">
+            <summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700"
+                title="Where you are: a realm, or the console">
+                <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {dot}")></span>
+                <span class="max-w-32 truncate font-medium">{name}</span>
+                {move || (elsewhere() > 0).then(|| view! {
+                    <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you in other realms">{elsewhere()}</span>
+                })}
+                <span class="text-zinc-400">"▾"</span>
+            </summary>
+            <div class="absolute left-0 top-9 z-40 w-64 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
+                {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
+                    let current = here.as_deref() == Some(p.id.as_str());
+                    view! {
+                        <a href=place::url_of(&place::Place::Realm(p.id.clone()))
+                            class=format!("flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "font-medium" } else { "" })>
+                            <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {}", realm_colour(&p.id))></span>
+                            <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
+                            {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
+                            {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
+                        </a>
+                    }
+                }).collect_view()}
+                <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                <a href=place::url_of(&place::Place::Console) class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                    <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
+                    <span class="flex-1">"Console"</span>
+                    <span class="text-xs text-zinc-500">"realms, workers, system"</span>
+                </a>
+            </div>
+        </details>
+    }
+}
+
+/// A realm page for a realm that isn't there (deleted, or mistyped).
+#[component]
+fn MissingRealm() -> impl IntoView {
+    let Some(here) = place::realm() else { return ().into_any() };
+    let places = LocalResource::new(api::elsewhere);
+    view! {
+        {move || places.get().and_then(Result::ok).filter(|ps| !ps.iter().any(|p| p.id == here)).map(|ps| view! {
+            <div class="fixed inset-0 z-50 flex items-center justify-center bg-zinc-50/95 p-6 dark:bg-zinc-950/95">
+                <div class="max-w-md space-y-3 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+                    <h1 class="text-lg font-semibold">{format!("There is no realm {here:?}")}</h1>
+                    <p class="text-sm text-zinc-500">"It may have been deleted, or the address is mistyped. Go to one of yours:"</p>
+                    <div class="flex flex-wrap gap-2">
+                        {ps.into_iter().map(|p| view! {
+                            <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                                href=place::url_of(&place::Place::Realm(p.id.clone()))>{p.name}</a>
+                        }).collect_view()}
+                        <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" href=place::url_of(&place::Place::Console)>"Console"</a>
+                    </div>
+                </div>
+            </div>
         })}
     }
+    .into_any()
 }
 
 /// carbon6.dev's mark (site/static/icon.svg), drawn inline.

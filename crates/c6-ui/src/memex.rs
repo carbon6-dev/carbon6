@@ -371,7 +371,7 @@ fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<S
     let s = |k: &str| it[k].as_str().unwrap_or_default().to_owned();
     let id = s("id");
     let has_original = it["meta"]["blob"].is_string() || it["meta"]["path"].is_string();
-    let original = format!("/api/v1/memex/items/{id}/content");
+    let original = crate::api::url(&format!("/api/v1/memex/items/{id}/content"));
     let trail_target = id.clone();
     let about = it["about"].as_array().cloned().unwrap_or_default();
     let remove = move |_| {

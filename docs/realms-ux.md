@@ -1,6 +1,6 @@
 # Realms in the UI — Design
 
-Status: design (2026-10-24). Decided:
+Status: built (2026-10-24). Decided:
 - each realm is its own app at `/r/<realm>/…`, enforced by the head;
 - administration is a separate console at `/admin`;
 - a realm page shows only a count of what waits in other realms;
@@ -112,7 +112,14 @@ The same shell, with its own nav:
 - **A shared worker shares its disk.** Two realms that may use the same worker can both browse its files and open terminals on it. To keep a realm's files apart, dedicate a worker to it (os §3.2).
 - **Imports' realm rules are administration.** They decide which realm a Claude Code or Codex session lands in.
 
-## 9. Steps
+## 9. As built
+
+- **Realm toggles stay the console's for now:** suggestions, web search, the assistant's settings, subagent limits, the memex's settings and the prompts are carbon6-wide settings today, so they're administration. Making them per realm (root's as defaults) is a later step.
+- **The console's lists are root's:** in the console, Settings' list pages (skills, policies, budgets, secrets…) edit root's entries, the defaults every realm inherits. Pages that are each realm's alone (memory, memex folders and scopes, mail, views, triggers, workflows) aren't in the console.
+- **Saved browser state** lives under `c6.<realm>.…` and `c6.admin.…`. Home starts from what was saved before (`c6.…`). The theme and the last place (`c6.place`) are per browser.
+- **Old addresses:** `/` goes to the last place. `/sessions/<id>` asks the head for its realm (root's go to the console). Console settings pages go to the console, anything else to the last place.
+
+## 10. Steps
 
 1. **Head:** scopes in the catalog; `admit` reads them; browser callers from `X-C6-Realm`, with no header refused. Tests 1–3.
 2. **Head:** narrow what realm callers get from the live feed, usage and analytics, search, the explorer, workers and connections; old-link redirects; `/api/v1/elsewhere`. Tests 4–5.

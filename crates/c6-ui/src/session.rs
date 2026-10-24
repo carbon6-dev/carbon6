@@ -641,7 +641,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                             truncated: *truncated,
                             duration_ms: *duration_ms,
                             images: (0..*images)
-                                .map(|i| format!("/api/v1/sessions/{}/attachments/{}/{i}", id.get_value(), e.seq))
+                                .map(|i| crate::api::url(&format!("/api/v1/sessions/{}/attachments/{}/{i}", id.get_value(), e.seq)))
                                 .collect(),
                         },
                     )),
@@ -1391,7 +1391,7 @@ fn render_event(
         }
         .into_any(),
         EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } => {
-            let url = |i: usize| format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq);
+            let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
             // In a subagent: who sent it.
             let from = if !delegated_by.is_empty() {
                 Some("↘ from the agent that started it")
@@ -2221,7 +2221,7 @@ fn Composer(
             "/export" if !custom("export") => {
                 text.set(String::new());
                 command.set(None);
-                download(&format!("/api/v1/sessions/{}/export", id.get_value()));
+                download(&crate::api::url(&format!("/api/v1/sessions/{}/export", id.get_value())));
                 return;
             }
             "/clear" if !inline && !custom("clear") => {

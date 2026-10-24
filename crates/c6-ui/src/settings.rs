@@ -83,6 +83,46 @@ fn page(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
     GROUPS.iter().find_map(|(g, pages)| pages.iter().find(|p| p.0 == id).map(|p| (*g, p.1, p.2)))
 }
 
+/// Settings pages of the console (carbon6's administration, and the
+/// defaults every realm inherits); the rest are each realm's own.
+const CONSOLE_PAGES: &[&str] = &[
+    "models",
+    "routing",
+    "assistant",
+    "spending",
+    "account",
+    "updates",
+    "system",
+    "apps",
+    "grants",
+    "imports",
+    "upgrades",
+    "prompts",
+    "web-search",
+    "suggestions",
+    "memex",
+];
+
+pub fn in_console(id: &str) -> bool {
+    CONSOLE_PAGES.contains(&id)
+}
+
+/// Pages of lists a realm inherits from root (and adds its own to).
+const LIST_PAGES: &[&str] =
+    &["notifications", "budgets", "tools", "commands", "agents", "skills", "hooks", "secrets", "rules", "automation", "workflows", "views"];
+
+/// Each realm's alone: the console has no such defaults to inherit.
+const REALM_ONLY: &[&str] = &["memory", "memex-folders", "memex-scopes", "mail", "views", "triggers", "workflows"];
+
+/// Whether a page is shown on this page: a realm's own pages in a realm;
+/// in the console, its own and the defaults realms inherit.
+fn here(id: &str) -> bool {
+    match crate::place::is_console() {
+        true => !REALM_ONLY.contains(&id),
+        false => !in_console(id),
+    }
+}
+
 /// A page's title, for column headers.
 pub fn section_title(id: &str) -> Option<&'static str> {
     page(id).map(|p| p.1)
@@ -95,7 +135,8 @@ pub fn section_title(id: &str) -> Option<&'static str> {
 pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
     let col = crate::workspace::use_column();
     let auth_required = LocalResource::new(api::auth_status);
-    let current = RwSignal::new(if page(&section).is_some() { section } else { "models".to_owned() });
+    let first = GROUPS.iter().flat_map(|(_, pages)| pages.iter()).map(|p| p.0).find(|id| here(id)).unwrap_or("appearance");
+    let current = RwSignal::new(if page(&section).is_some() && here(&section) { section } else { first.to_owned() });
     let note = StoredValue::new(note);
     // Switching pages keeps this column and updates its address.
     let go = move |id: String| {
@@ -104,20 +145,20 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
             c.replace(crate::workspace::View::Settings { note: None, section: id });
         }
     };
-    let visible = move |id: &str| id != "account" || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required);
+    let visible = move |id: &str| here(id) && (id != "account" || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required));
     let heading = move || current.with(|c| page(c)).unwrap_or(("", "", ""));
     view! {
         <main class="mx-auto max-w-5xl px-4 py-6 md:flex md:gap-8">
             // A phone picks the page from a list; wider screens get the menu.
             <select class=format!("{INPUT} mb-4 md:hidden") prop:value=move || current.get() on:change=move |ev| go(event_target_value(&ev))>
-                {GROUPS.iter().map(|(g, pages)| view! {
+                {GROUPS.iter().filter(|(_, pages)| pages.iter().any(|p| here(p.0))).map(|(g, pages)| view! {
                     <optgroup label=*g>
                         {pages.iter().filter(|p| visible(p.0)).map(|p| view! { <option value=p.0>{p.1}</option> }).collect_view()}
                     </optgroup>
                 }).collect_view()}
             </select>
             <nav class="hidden text-sm md:sticky md:top-4 md:block md:w-52 md:shrink-0 md:self-start md:space-y-4">
-                {GROUPS.iter().map(|(g, pages)| view! {
+                {GROUPS.iter().filter(|(_, pages)| pages.iter().any(|p| here(p.0))).map(|(g, pages)| view! {
                     <div>
                         <div class="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{*g}</div>
                         {pages.iter().map(|(id, t, w)| {
@@ -140,14 +181,13 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     <p class="text-xs text-zinc-500">{move || heading().0}</p>
                     <h1 class="text-lg font-semibold">{move || heading().1}</h1>
                     <p class="text-sm text-zinc-500">{move || heading().2}</p>
-                    {move || {
-                        let r = crate::api::realm().get();
-                        (!r.is_empty()).then(|| view! {
-                            <p class="mt-2 rounded-md bg-sky-50 px-3 py-2 text-sm text-sky-900 dark:bg-sky-950 dark:text-sky-200">
-                                {format!("Lists here are realm {r}'s own. It also uses root's: its own replace root's of the same name (policies and budgets from root always apply). Choose \"All realms\" in the header for where each list lives by default.")}
-                            </p>
-                        })
-                    }}
+                    {move || LIST_PAGES.contains(&current.get().as_str()).then(|| {
+                        let text = match crate::place::realm() {
+                            Some(r) => format!("Lists here are realm {r}'s own. It also uses root's (the console's): its own replace root's of the same name, and policies and budgets from root always apply."),
+                            None => "Lists here are root's: the defaults every realm inherits (a realm's own entry of the same name replaces one; policies and budgets from root always apply).".to_owned(),
+                        };
+                        view! { <p class="mt-2 rounded-md bg-sky-50 px-3 py-2 text-sm text-sky-900 dark:bg-sky-950 dark:text-sky-200">{text}</p> }
+                    })}
                 </div>
                 {move || match current.get().as_str() {
                     "appearance" => view! {

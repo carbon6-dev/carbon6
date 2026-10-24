@@ -66,7 +66,7 @@ fn ReviewRow(
     };
     let name = RwSignal::new(String::new());
     if r.kind == "face" {
-        let picture = r.picture.clone().map(|p| format!("/api/v1/memex/{p}"));
+        let picture = r.picture.clone().map(|p| crate::api::url(&format!("/api/v1/memex/{p}")));
         let guess = r.b.clone();
         return view! {
             <li class="flex flex-wrap items-center gap-3 px-3 py-2 text-sm">
