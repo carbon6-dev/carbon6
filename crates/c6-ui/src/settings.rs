@@ -957,12 +957,21 @@ fn UpdatesSetting() -> impl IntoView {
         Some(Err(e)) => error.set(Some(e)),
         None => {}
     });
+    // The form: the saved settings, until you change one. The status above
+    // reloads every few seconds (workers' heartbeats); that must not undo
+    // what you picked before you press Save.
     let s = RwSignal::new(c6_api::UpdateSettings::default());
+    let saved = RwSignal::new(None::<c6_api::UpdateSettings>);
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
-            s.set(v.settings);
+            let untouched = saved.with_untracked(|b| b.as_ref().is_none_or(|b| *b == s.get_untracked()));
+            if untouched {
+                s.set(v.settings.clone());
+            }
+            saved.set(Some(v.settings));
         }
     });
+    let unsaved = move || saved.with(|b| b.as_ref().is_some_and(|b| *b != s.get()));
     let busy = RwSignal::new(false);
     let act = move |f: std::pin::Pin<Box<dyn std::future::Future<Output = Result<c6_api::Updates, String>>>>| {
         busy.set(true);
@@ -1086,7 +1095,10 @@ fn UpdatesSetting() -> impl IntoView {
                     "Update workers all at once (else one after another)"
                 </label>
             </div>
-            <div class="flex justify-end"><button class=BUTTON on:click=save>"Save"</button></div>
+            <div class="flex items-center justify-end gap-3">
+                {move || unsaved().then(|| view! { <span class="text-xs text-amber-700 dark:text-amber-400">"Not saved yet"</span> })}
+                <button class=BUTTON on:click=save>"Save"</button>
+            </div>
         </section>
     }
 }
