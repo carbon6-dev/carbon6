@@ -377,11 +377,16 @@ async fn google_mail_calendar_contacts() {
         let (http, url) = (http.clone(), format!("{api}/memex/get?id={id}"));
         async move { http.get(url).send().await.unwrap().json::<Value>().await.unwrap() }
     };
-    let alice = get("person:alice@acme.com").await;
+    // A message is linked to its people after it is read (in the background):
+    // wait for Alice's to be, then look.
+    let alice = eventually("Alice's mail linked to her", async || {
+        let alice = get("person:alice@acme.com").await;
+        alice["thing"]["items"].to_string().contains("Lunch on Friday?").then_some(alice)
+    })
+    .await;
     let alias = get("person:alice.smith@gmail.com").await;
     assert_eq!(alice["thing"]["thing"]["id"], alias["thing"]["thing"]["id"]);
     assert_eq!(alice["thing"]["thing"]["name"], "Alice Smith");
-    assert!(alice["thing"]["items"].to_string().contains("Lunch on Friday?"), "{alice}");
     assert_eq!(get("org:acme.com").await["thing"]["thing"]["kind"], "org");
 
     // Archive a thread: Gmail is told, the view follows.
