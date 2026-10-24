@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.11 (2026-10-23)
+
+- The edge channel: every green commit on main is published as the rolling, signed edge pre-release, and machines on that channel are offered it (builds know their exact version, compared by release then commit time; Homebrew installs take an edge build in place)
+- The test lint rejects doctests (an untagged or rust code block in a doc comment): CI's nextest never runs them
+- CI: no doc-test pass after nextest (there are no doc tests), and the suite under load back on cargo test
+- CI lints once, on Linux, and runs the Linux suites with nextest (every test its own process); test ports are reserved across processes with file locks
+- A release commit that only bumps the version and the changelog, on a commit CI passed, isn't tested again; its packages are still built
+
 ## 0.3.10 (2026-10-23)
 
 - Packages are built once per push to main, while the tests run (natively on Ubuntu 22.04 and macOS with the cargo cache), and a release commit is tagged and published from them as soon as it is green; Intel Macs are no longer built
