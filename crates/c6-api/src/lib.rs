@@ -3864,6 +3864,13 @@ pub struct UpdateSettings {
     /// Workers update all at once instead of one after another.
     #[serde(default)]
     pub parallel: bool,
+    /// stable (releases) · edge (also every green commit on main, built by CI).
+    #[serde(default = "update_channel")]
+    pub channel: String,
+}
+
+fn update_channel() -> String {
+    "stable".into()
 }
 
 fn update_mode() -> String {
@@ -3885,6 +3892,7 @@ impl Default for UpdateSettings {
             skip: Vec::new(),
             drain_hours: update_drain_hours(),
             parallel: false,
+            channel: update_channel(),
         }
     }
 }

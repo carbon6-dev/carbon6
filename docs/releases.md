@@ -57,6 +57,7 @@ Pushing it is the release. **CI** runs for it as for any push to `main`:
 | linux | ubuntu-22.04, ubuntu-22.04-arm | `make deb-test`: the .debs and `carbon6-<v>-linux-<arch>.tar.gz`, built on Ubuntu 22.04 itself (its glibc is the minimum) with the cargo cache, then installed under systemd in a container, run, upgraded and removed |
 | macos | macos-15 (Apple Silicon) | `make brew-test`: bottles and binary tarballs, with the cargo cache, then installed from a scratch tap, the head started with `brew services`, a worker attached, stopped with SIGTERM |
 | publish | ubuntu-24.04, only for a release commit, after all the others | tags `v<version>` on that commit, then `packaging/release/publish.sh` (§6) on the packages the other jobs built |
+| edge | ubuntu-24.04, for any other green push to main | `packaging/release/edge.sh`: the rolling `edge` pre-release, replaced with this commit's packages and a signed `release.json`, for machines on the edge channel (docs/updates.md §3a) |
 
 The packages are built in parallel with the tests, so a release is published about when its tests finish. Intel Macs are not built (since 0.3.10).
 

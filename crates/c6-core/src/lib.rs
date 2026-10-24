@@ -21,6 +21,24 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Version of this build, shared by `c6h` and `c6w`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// This build's exact version: the release, or for a build between
+/// releases `<release>+git<commit time>.<commit>`. The binaries read it at
+/// build time (`C6_BUILD_VERSION`, which the Makefile and CI set) and give
+/// it here as they start, so a new version recompiles only them; otherwise
+/// (tests) it is [`VERSION`]. Updates compare it.
+pub fn build() -> &'static str {
+    BUILD.get().copied().unwrap_or(VERSION)
+}
+
+static BUILD: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Called first thing by a binary: `set_build(option_env!("C6_BUILD_VERSION"))`.
+pub fn set_build(v: Option<&'static str>) {
+    if let Some(v) = v.filter(|v| !v.is_empty()) {
+        let _ = BUILD.set(v);
+    }
+}
+
 /// Whether a peer speaking `version` can talk to this build.
 pub fn protocol_compatible(version: u32) -> bool {
     version == PROTOCOL_VERSION || version + 1 == PROTOCOL_VERSION

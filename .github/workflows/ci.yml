@@ -5,6 +5,9 @@
 # push a tag. A release commit that changes only the version and the
 # changelog, on a commit CI already passed, isn't tested again: that code was.
 #
+# Any other green commit on main is published as the rolling `edge`
+# pre-release, for machines on the edge channel (docs/updates.md).
+#
 # Run by hand (workflow_dispatch) it builds and tests main and keeps the
 # packages on the run, publishing nothing.
 name: CI
@@ -165,3 +168,32 @@ jobs:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: packaging/release/publish.sh "${{ needs.meta.outputs.version }}" dist/release
+
+  edge:
+    # Every other green commit on main: the rolling `edge` pre-release, for
+    # machines on the edge channel. Releases are untouched (a pre-release is
+    # never the latest).
+    name: Publish edge
+    if: >-
+      !cancelled() && github.event_name == 'push' && needs.meta.outputs.release != 'true' &&
+      needs.test.result == 'success' && needs.linux.result == 'success' && needs.macos.result == 'success'
+    needs: [meta, test, linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: edge
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the last release, for its notes and version
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/edge
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: packaging/release/edge.sh "$(make -s print-version)" dist/edge

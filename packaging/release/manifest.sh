@@ -8,8 +8,9 @@
 set -euo pipefail
 
 version=$1 dir=$2
-notes=$(awk -v head="## $version " 'index($0, head) == 1 { on = 1; next } on && /^## / { exit } on' CHANGELOG.md | sed '/./,$!d')
-[ -n "$notes" ] || { echo "no section for $version in CHANGELOG.md" >&2; exit 1; }
+# A release's notes are its CHANGELOG.md section; an edge build's come in NOTES.
+notes=${NOTES:-$(awk -v head="## $version " 'index($0, head) == 1 { on = 1; next } on && /^## / { exit } on' CHANGELOG.md | sed '/./,$!d')}
+[ -n "$notes" ] || { echo "no section for $version in CHANGELOG.md (and no NOTES)" >&2; exit 1; }
 protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' crates/c6-core/src/lib.rs)
 (cd "$dir" && ls -- *.deb *.tar.gz 2>/dev/null) | while read -r f; do
     printf '%s\tsha256:%s\n' "$f" "$(shasum -a 256 -- "$dir/$f" | cut -d' ' -f1)"

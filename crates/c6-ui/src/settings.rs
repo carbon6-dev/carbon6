@@ -1047,6 +1047,13 @@ fn UpdatesSetting() -> impl IntoView {
             })}
             <div class="grid gap-3 text-sm sm:grid-cols-2">
                 <label class="space-y-1">
+                    <span class="block text-xs text-zinc-500">"Channel"</span>
+                    <select class=SELECT prop:value=move || s.get().channel on:change=move |ev| { let c = event_target_value(&ev); s.update(|v| v.channel = c); }>
+                        <option value="stable">"Stable: releases"</option>
+                        <option value="edge">"Edge: every green commit on main"</option>
+                    </select>
+                </label>
+                <label class="space-y-1">
                     <span class="block text-xs text-zinc-500">"When a release is out"</span>
                     <select class=SELECT prop:value=move || s.get().mode on:change=move |ev| { let m = event_target_value(&ev); s.update(|v| v.mode = m); }>
                         <option value="approve">"Ask me (a decision)"</option>

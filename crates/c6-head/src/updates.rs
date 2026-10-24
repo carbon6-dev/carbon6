@@ -20,6 +20,7 @@ use crate::{HeadState, bad_request, not_found};
 /// The setting.
 pub const KEY: &str = "updates";
 const ETAG: &str = "updates.etag";
+const ETAG_EDGE: &str = "updates.etag.edge";
 /// A worker that hasn't come back on the new version by then has failed.
 const RESTART_TIMEOUT_MS: i64 = 10 * 60 * 1000;
 
@@ -48,7 +49,7 @@ impl Updater {
             source: cfg.update_source.clone(),
             keys: cfg.update_keys.clone(),
             exe: cfg.update_exe.clone(),
-            version: cfg.update_as_version.clone().unwrap_or_else(|| c6_core::VERSION.to_owned()),
+            version: cfg.update_as_version.clone().unwrap_or_else(|| c6_core::build().to_owned()),
             every: Duration::from_secs(cfg.update_check_secs.max(1)),
             restart: AtomicBool::new(false),
             checked_at: AtomicI64::new(0),
@@ -174,6 +175,9 @@ pub async fn set_settings(st: &HeadState, s: &api::UpdateSettings) -> anyhow::Re
     if !matches!(s.mode.as_str(), "off" | "notify" | "approve" | "auto") {
         return Err(bad_request("mode is off, notify, approve or auto"));
     }
+    if !matches!(s.channel.as_str(), "stable" | "edge") {
+        return Err(bad_request("channel is stable or edge"));
+    }
     if !matches!(s.auto_for.as_str(), "patch" | "minor") {
         return Err(bad_request("auto_for is patch or minor"));
     }
@@ -226,18 +230,37 @@ pub async fn check(st: &HeadState) -> anyhow::Result<Option<String>> {
     r
 }
 
+/// The newest release (and, on the edge channel, the newest build of
+/// main) newer than this one, if any.
 async fn look(st: &HeadState) -> anyhow::Result<Option<String>> {
+    let stable = look_at(st, false).await?;
+    if settings(st).await?.channel != "edge" {
+        return Ok(stable);
+    }
+    let edge = look_at(st, true).await?;
+    Ok(match (stable, edge) {
+        (Some(a), Some(b)) => Some(if up::newer(&b, &a) { b } else { a }),
+        (a, b) => a.or(b),
+    })
+}
+
+/// One of GitHub's releases: the latest (`edge`: false), or the rolling
+/// `edge` pre-release that CI replaces for every green commit on main. Its
+/// signed manifest is kept (and, by the setting, asked about) when it is
+/// newer than this build.
+async fn look_at(st: &HeadState, edge: bool) -> anyhow::Result<Option<String>> {
     let u = &st.updates;
+    let (path, etag_key) = if edge { ("releases/tags/edge", ETAG_EDGE) } else { ("releases/latest", ETAG) };
     let mut req = st
         .http
-        .get(format!("{}/releases/latest", u.source.trim_end_matches('/')))
-        .header("User-Agent", format!("carbon6/{}", c6_core::VERSION))
+        .get(format!("{}/{path}", u.source.trim_end_matches('/')))
+        .header("User-Agent", format!("carbon6/{}", c6_core::build()))
         .header("Accept", "application/vnd.github+json");
-    if let Some(etag) = st.store.setting(ETAG).await? {
+    if let Some(etag) = st.store.setting(etag_key).await? {
         req = req.header("If-None-Match", etag);
     }
     let resp = req.send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED || (edge && resp.status() == reqwest::StatusCode::NOT_FOUND) {
         return Ok(None);
     }
     if !resp.status().is_success() {
@@ -245,35 +268,49 @@ async fn look(st: &HeadState) -> anyhow::Result<Option<String>> {
     }
     let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let release: Value = resp.json().await?;
-    if release["draft"] == true || release["prerelease"] == true {
+    if release["draft"] == true || (!edge && release["prerelease"] == true) {
         return Ok(None);
     }
-    let version = release["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_owned();
-    if !up::newer(&version, ver(st)) {
-        if let Some(e) = etag {
-            st.store.set_setting(ETAG, &e).await?;
+    let remember = async || -> anyhow::Result<()> {
+        if let Some(e) = &etag {
+            st.store.set_setting(etag_key, e).await?;
         }
+        Ok(())
+    };
+    // A release says its version in its tag; an edge build only in its manifest.
+    let tagged = release["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_owned();
+    if !edge && (!up::newer(&tagged, ver(st)) || known(st, &tagged).await?) {
+        remember().await?;
+        return Ok(up::newer(&tagged, ver(st)).then_some(tagged));
+    }
+    let url = |name: &str| {
+        release["assets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["name"] == name)
+            .and_then(|a| a["browser_download_url"].as_str())
+            .map(str::to_owned)
+    };
+    let what = if edge { "the edge build".to_owned() } else { format!("carbon6 {tagged}") };
+    let (Some(manifest_url), Some(sig_url)) = (url("release.json"), url("release.json.sig")) else {
+        anyhow::bail!("{what} has no signed release.json: it won't update to it");
+    };
+    let manifest = fetch(st, &manifest_url).await?;
+    let sig = fetch(st, &sig_url).await?;
+    let m = up::verify(&manifest, &sig, &u.keys()).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+    if !edge && m.version != tagged {
+        anyhow::bail!("{what}'s release.json is for {}", m.version);
+    }
+    if edge && !up::is_edge(&m.version) {
+        anyhow::bail!("the edge build's release.json names a release ({})", m.version);
+    }
+    let version = m.version.clone();
+    if !up::newer(&version, ver(st)) {
+        remember().await?;
         return Ok(None);
     }
     if !known(st, &version).await? {
-        let url = |name: &str| {
-            release["assets"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|a| a["name"] == name)
-                .and_then(|a| a["browser_download_url"].as_str())
-                .map(str::to_owned)
-        };
-        let (Some(manifest_url), Some(sig_url)) = (url("release.json"), url("release.json.sig")) else {
-            anyhow::bail!("carbon6 {version} has no signed release.json: it won't update to it");
-        };
-        let manifest = fetch(st, &manifest_url).await?;
-        let sig = fetch(st, &sig_url).await?;
-        let m = up::verify(&manifest, &sig, &u.keys()).map_err(|e| anyhow::anyhow!("carbon6 {version}: {e}"))?;
-        if m.version != version {
-            anyhow::bail!("carbon6 {version}'s release.json is for {}", m.version);
-        }
         let base = manifest_url.trim_end_matches("release.json").to_owned();
         let now = now_ms();
         sqlx::query(
@@ -287,17 +324,15 @@ async fn look(st: &HeadState) -> anyhow::Result<Option<String>> {
         .bind(now)
         .execute(&st.store.pool)
         .await?;
-        info!(%version, "found a carbon6 release");
+        info!(%version, edge, "found a carbon6 build to update to");
         consider(st, &version).await?;
     }
-    if let Some(e) = etag {
-        st.store.set_setting(ETAG, &e).await?;
-    }
+    remember().await?;
     Ok(Some(version))
 }
 
 async fn fetch(st: &HeadState, url: &str) -> anyhow::Result<Vec<u8>> {
-    let r = st.http.get(url).header("User-Agent", format!("carbon6/{}", c6_core::VERSION)).timeout(Duration::from_secs(600)).send().await?;
+    let r = st.http.get(url).header("User-Agent", format!("carbon6/{}", c6_core::build())).timeout(Duration::from_secs(600)).send().await?;
     if !r.status().is_success() {
         anyhow::bail!("{url}: {}", r.status());
     }
@@ -529,7 +564,8 @@ async fn update_head(st: &HeadState, rel: &Rel) -> anyhow::Result<()> {
     }
     machine(st, "head", v, "downloading", method.name(), "").await?;
     let asset = match &method {
-        Method::Brew { .. } => None,
+        // Homebrew installs a release itself; an edge build is put in place.
+        Method::Brew { .. } if !up::in_place(&method, &rel.manifest) => None,
         _ => match download(st, rel, "c6h", &method).await {
             Ok(a) => Some(a),
             Err(e) => return fail(format!("{e:#}")).await,
@@ -538,8 +574,15 @@ async fn update_head(st: &HeadState, rel: &Rel) -> anyhow::Result<()> {
     machine(st, "head", v, "installing", method.name(), "").await?;
     // Before installing: a .deb's postinst restarts the head mid-install.
     let pending = dir(&st.data_dir);
-    Pending { from: ver(st).to_owned(), to: v.clone(), state: "installed".into(), started_at: now_ms(), ..Default::default() }
-        .save(&pending)?;
+    Pending {
+        from: ver(st).to_owned(),
+        to: v.clone(),
+        state: "installed".into(),
+        started_at: now_ms(),
+        in_place: up::in_place(&method, &rel.manifest),
+        ..Default::default()
+    }
+    .save(&pending)?;
     let (m, raw, sig) = (rel.manifest.clone(), rel.raw.clone(), rel.sig.clone());
     let (exe2, method2) = (exe.clone(), method.clone());
     let done = tokio::task::spawn_blocking(move || {

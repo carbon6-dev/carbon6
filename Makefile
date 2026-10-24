@@ -20,7 +20,8 @@ WORKER_PORT  ?= 7701
 UBUNTU       ?= 22.04
 DEB_DIR       = dist/deb/ubuntu-$(UBUNTU)
 CRATE_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-COMMIT_TIME   = $(shell git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)
+# In UTC, so the same commit gets the same version on every machine.
+COMMIT_TIME   = $(shell TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S)
 # Set when HEAD is the release v<crate version> (or RELEASE=1: CI building
 # the release commit before tagging it): its packages get the plain version.
 # Between releases they get one that sorts after the last release and every
@@ -42,7 +43,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
-        ui build test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
+        ui build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
 help: ## Show this help
@@ -148,8 +149,11 @@ release-notes: ## Print the CHANGELOG.md section the next release would add
 ui: ## Build the web UI into crates/c6-ui/dist (embedded into c6h)
 	cd crates/c6-ui && trunk build --release
 
-build: ui ## Build release binaries (c6h, c6w, c6) into target/release
-	cargo build --release --locked -p c6h -p c6w -p c6
+build: ui ## Build release binaries (c6h, c6w, c6) into target/release, knowing their exact version (C6_BUILD_VERSION: the release, or <release>+git<commit time>.<commit> between releases)
+	C6_BUILD_VERSION=$(DEB_VERSION) cargo build --release --locked -p c6h -p c6w -p c6
+
+print-version: ## Print the exact version the packages of HEAD get (what `build` stamps into the binaries)
+	@echo $(DEB_VERSION)
 
 test: ## Run the test suite
 	cargo test

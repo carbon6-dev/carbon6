@@ -71,7 +71,7 @@ fn version(w: &Worker) -> String {
     {
         return v;
     }
-    c6_core::VERSION.to_owned()
+    c6_core::build().to_owned()
 }
 
 /// Release keys: the built-in ones (debug builds may name others).
@@ -170,7 +170,8 @@ async fn run(w: &Arc<Worker>, m: &up::Manifest, signed: (&str, &[u8]), base: &st
     }
     say(w, v, "downloading", "").await;
     let asset = match &method {
-        Method::Brew { .. } => None,
+        // Homebrew installs a release itself; an edge build is put in place.
+        Method::Brew { .. } if !up::in_place(&method, m) => None,
         _ => {
             let (name, sum) = up::asset(m, "c6w", method.name(), std::env::consts::OS, std::env::consts::ARCH)
                 .ok_or_else(|| anyhow::anyhow!("the release has no c6w for {} {}", std::env::consts::OS, std::env::consts::ARCH))?;
@@ -190,8 +191,15 @@ async fn run(w: &Arc<Worker>, m: &up::Manifest, signed: (&str, &[u8]), base: &st
     };
     say(w, v, "installing", "").await;
     // Before installing: a .deb's postinst restarts the worker mid-install.
-    Pending { from: version(w), to: m.version.clone(), state: "installed".into(), started_at: now_ms(), ..Default::default() }
-        .save(&dir(w))?;
+    Pending {
+        from: version(w),
+        to: m.version.clone(),
+        state: "installed".into(),
+        started_at: now_ms(),
+        in_place: up::in_place(&method, m),
+        ..Default::default()
+    }
+    .save(&dir(w))?;
     let (m2, raw, sig, exe2, method2) = (m.clone(), signed.0.to_owned(), signed.1.to_vec(), exe.clone(), method.clone());
     let restart = tokio::task::spawn_blocking(move || {
         up::install(&method2, "c6w", &exe2, &m2, (raw.as_bytes(), &sig), asset.as_ref().map(|(n, b)| (n.as_str(), b.as_slice())))

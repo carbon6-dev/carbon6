@@ -154,3 +154,117 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+/// Release files a fake GitHub serves, by path.
+type Files = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+
+/// The edge channel (docs/updates.md): a machine on it is offered the
+/// rolling `edge` pre-release (each green commit on main) when it is newer
+/// than what it runs; a machine on stable never is.
+#[tokio::test]
+async fn the_edge_channel_offers_builds_of_main() {
+    let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+    let public: String = key.public_key().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let edge = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let signed = |version: &str| {
+        let m = serde_json::to_vec(&json!({"version": version, "notes": "- Faster tiles.", "assets": {}})).unwrap();
+        let sig = key.sign(&m).as_ref().to_vec();
+        (m, sig)
+    };
+    // A fake GitHub: the latest release is 9.9.8; `edge` is whatever we put there.
+    let files: Files = Arc::default();
+    let (stable_m, stable_s) = signed("9.9.8");
+    files.lock().unwrap().insert("stable/release.json".into(), stable_m);
+    files.lock().unwrap().insert("stable/release.json.sig".into(), stable_s);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (b1, b2, e2) = (base.clone(), base.clone(), edge.clone());
+    let app = axum::Router::new()
+        .route(
+            "/repos/c6/releases/latest",
+            axum::routing::get(move || {
+                let b = b1.clone();
+                async move {
+                    axum::Json(json!({"tag_name": "v9.9.8", "draft": false, "prerelease": false, "assets": [
+                        {"name": "release.json", "browser_download_url": format!("{b}/dl/stable/release.json")},
+                        {"name": "release.json.sig", "browser_download_url": format!("{b}/dl/stable/release.json.sig")}]}))
+                }
+            }),
+        )
+        .route(
+            "/repos/c6/releases/tags/edge",
+            axum::routing::get(move || {
+                let (b, e) = (b2.clone(), e2.lock().unwrap().clone());
+                async move {
+                    if e.is_empty() {
+                        return Err(axum::http::StatusCode::NOT_FOUND);
+                    }
+                    Ok(axum::Json(json!({"tag_name": "edge", "draft": false, "prerelease": true, "assets": [
+                        {"name": "release.json", "browser_download_url": format!("{b}/dl/{e}/release.json")},
+                        {"name": "release.json.sig", "browser_download_url": format!("{b}/dl/{e}/release.json.sig")}]})))
+                }
+            }),
+        )
+        .route(
+            "/dl/{dir}/{name}",
+            axum::routing::get(
+                |State(f): State<Files>, Path((d, n)): Path<(String, String)>| async move {
+                    f.lock().unwrap().get(&format!("{d}/{n}")).cloned().ok_or(axum::http::StatusCode::NOT_FOUND)
+                },
+            ),
+        )
+        .with_state(files.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let publish_edge = |v: &str| {
+        let (m, s) = signed(v);
+        let dir = v.replace('+', "_");
+        files.lock().unwrap().insert(format!("{dir}/release.json"), m);
+        files.lock().unwrap().insert(format!("{dir}/release.json.sig"), s);
+        *edge.lock().unwrap() = dir;
+    };
+
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        update_source: format!("{base}/repos/c6"),
+        update_keys: vec![public],
+        update_as_version: Some("9.9.8".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let check = async || -> Value { http.post(format!("{api}/system/updates/check")).send().await.unwrap().json().await.unwrap() };
+    let versions =
+        |s: &Value| s["releases"].as_array().unwrap().iter().map(|r| r["version"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+
+    // On stable (the default), an edge build of main is never offered.
+    publish_edge("9.9.8+git20261023120000.aaaaaaa");
+    let s = check().await;
+    assert_eq!(s["check_error"], "", "{s}");
+    assert!(versions(&s).is_empty(), "{s}");
+
+    // On edge, it is: newer than 9.9.8, and asked about.
+    let r = http.put(format!("{api}/settings/updates")).json(&json!({"channel": "edge"})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let s = check().await;
+    assert_eq!(s["check_error"], "", "{s}");
+    assert_eq!(versions(&s), vec!["9.9.8+git20261023120000.aaaaaaa"], "{s}");
+    let decisions: Vec<Value> = http.get(format!("{api}/decisions")).send().await.unwrap().json().await.unwrap();
+    assert!(decisions.iter().any(|d| d["title"] == "Update carbon6 to 9.9.8+git20261023120000.aaaaaaa?"), "{decisions:?}");
+
+    // A later commit's build replaces it (its question goes, the new one asks).
+    publish_edge("9.9.8+git20261023130000.bbbbbbb");
+    let s = check().await;
+    let rel = |v: &str| s["releases"].as_array().unwrap().iter().find(|r| r["version"] == v).cloned().unwrap();
+    assert_eq!(rel("9.9.8+git20261023130000.bbbbbbb")["state"], "available", "{s}");
+    assert_eq!(rel("9.9.8+git20261023120000.aaaaaaa")["state"], "skipped", "{s}");
+
+    head.shutdown().await.unwrap();
+}

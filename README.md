@@ -197,6 +197,7 @@ carbon6 updates itself from GitHub releases. It installs only a release whose `r
   - a plain binary: replaced in place.
 
   A build from source is never updated.
+- **Edge channel:** set the channel to **edge** (Settings → System → Updates) and the machine is also offered every green commit on main, which CI publishes as a rolling `edge` pre-release. With **Update on its own**, each one arrives within minutes. Stable machines never see them.
 - **Rollback:** a version that fails to start three times is replaced by the previous one, along with the database backup. That version is then skipped, and a Decision says so.
 
 ### Upgrades

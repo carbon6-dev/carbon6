@@ -66,18 +66,40 @@ pub fn checksum(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
-/// A version's release part: `0.3.4`, `v0.3.4`, and builds between
-/// releases (`0.3.4+git…`, brew's `0.3.4.<time>`) are all 0.3.4.
-pub fn parse(v: &str) -> Option<(u64, u64, u64)> {
+/// A version, in order: the release (`0.3.4`, `v0.3.4`), then the commit
+/// time of a build between releases (`0.3.4+git<time>.<commit>`, brew's
+/// `0.3.4.<time>`; 0 for the release itself). So an edge build of the code
+/// after 0.3.4 sorts after 0.3.4 and before 0.3.5, and two of them by time.
+pub fn parse(v: &str) -> Option<(u64, u64, u64, u64)> {
     let v = v.trim().trim_start_matches('v');
-    let v = v.split(['+', '-']).next()?;
-    let mut it = v.split('.');
-    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    let (base, rest) = match v.find(['+', '-']) {
+        Some(i) => (&v[..i], &v[i..]),
+        None => (v, ""),
+    };
+    let mut it = base.split('.');
+    let (a, b, c) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    let digits = |s: &str| s.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok();
+    let stamp = match (it.next(), rest.strip_prefix("+git")) {
+        (Some(t), _) => digits(t).unwrap_or(0),
+        (None, Some(t)) => digits(t).unwrap_or(0),
+        _ => 0,
+    };
+    Some((a, b, c, stamp))
 }
 
-/// Whether `to` is a newer release than `from`.
+/// Whether `to` is newer than `from` (a release, or a build between).
 pub fn newer(to: &str, from: &str) -> bool {
     matches!((parse(to), parse(from)), (Some(t), Some(f)) if t > f)
+}
+
+/// The same version (a build between releases equals its brew form).
+pub fn same(a: &str, b: &str) -> bool {
+    parse(a).is_some() && parse(a) == parse(b)
+}
+
+/// A build between releases (the edge channel's), not a release.
+pub fn is_edge(v: &str) -> bool {
+    parse(v).is_some_and(|p| p.3 > 0)
 }
 
 /// How big a step from `from` to `to` is.
@@ -107,16 +129,25 @@ pub fn unattended(from: &str, m: &Manifest) -> bool {
 }
 
 /// The file of release `m` that installs `bin` (c6h, c6w, c6) by `method`
-/// on this `os` and `arch` (`std::env::consts`), and its checksum.
+/// on this `os` and `arch` (`std::env::consts`), and its checksum. Found
+/// by its shape, not its exact name: a build between releases names its
+/// .debs and its macOS files with two forms of the version.
 pub fn asset(m: &Manifest, bin: &str, method: &str, os: &str, arch: &str) -> Option<(String, String)> {
-    let v = &m.version;
-    let name = match (method, os) {
-        ("deb", "linux") => format!("{bin}_{v}_{}.deb", if arch == "aarch64" { "arm64" } else { "amd64" }),
-        ("tarball", "linux") => format!("carbon6-{v}-linux-{}.tar.gz", if arch == "aarch64" { "arm64" } else { "amd64" }),
-        ("tarball" | "brew", "macos") => format!("{bin}-{v}-darwin-{}.tar.gz", if arch == "aarch64" { "arm64" } else { "x86_64" }),
-        _ => return None,
+    let (linux, mac) = (if arch == "aarch64" { "arm64" } else { "amd64" }, if arch == "aarch64" { "arm64" } else { "x86_64" });
+    let fits = |name: &str| match (method, os) {
+        ("deb", "linux") => name.starts_with(&format!("{bin}_")) && name.ends_with(&format!("_{linux}.deb")),
+        ("tarball", "linux") => name.starts_with("carbon6-") && name.ends_with(&format!("-linux-{linux}.tar.gz")),
+        ("tarball" | "brew", "macos") => name.starts_with(&format!("{bin}-")) && name.ends_with(&format!("-darwin-{mac}.tar.gz")),
+        _ => false,
     };
-    m.assets.get(&name).map(|sum| (name, sum.clone()))
+    m.assets.iter().find(|(name, _)| fits(name)).map(|(n, sum)| (n.clone(), sum.clone()))
+}
+
+/// Whether installing `m` by `method` replaces the binary in place: an edge
+/// build on a Homebrew install (the tap has releases only). The next release
+/// goes through `brew upgrade` again.
+pub fn in_place(method: &Method, m: &Manifest) -> bool {
+    matches!(method, Method::Brew { .. }) && is_edge(&m.version)
 }
 
 /// How a binary was installed, which decides how it updates (docs/updates.md §6).
@@ -192,6 +223,9 @@ pub fn install(
     signed: (&[u8], &[u8]),
     asset: Option<(&str, &[u8])>,
 ) -> Result<Restart, String> {
+    if in_place(method, m) {
+        return install(&Method::Tarball, bin, exe, m, signed, asset);
+    }
     match method {
         Method::Source => Err("built from source: update it yourself".into()),
         Method::Brew { brew, .. } => {
@@ -206,7 +240,7 @@ pub fn install(
             }
             let listed = std::process::Command::new(brew).args(["list", "--versions", bin]).output().map_err(|e| e.to_string())?;
             let listed = String::from_utf8_lossy(&listed.stdout);
-            if !listed.split_whitespace().any(|v| parse(v) == parse(&m.version)) {
+            if !listed.split_whitespace().any(|v| same(v, &m.version)) {
                 return Err(format!("brew didn't install {} (it has {})", m.version, listed.trim()));
             }
             Ok(Restart::Exit)
@@ -370,6 +404,10 @@ pub struct Pending {
     pub backup: String,
     #[serde(default)]
     pub started_at: i64,
+    /// Installed in place over a Homebrew keg (an edge build): rolled back
+    /// the same way.
+    #[serde(default)]
+    pub in_place: bool,
 }
 
 /// Starts of a new version that don't get healthy before it is rolled back.
@@ -413,13 +451,13 @@ pub enum OnStart {
 pub fn on_start(dir: &Path, version: &str, method: &Method, bin: &str, exe: &Path) -> OnStart {
     let Some(mut p) = Pending::load(dir) else { return OnStart::Nothing };
     if p.state == "rolled_back" {
-        if parse(version) == parse(&p.from) {
+        if same(version, &p.from) {
             return OnStart::WasRolledBack(p);
         }
         Pending::clear(dir);
         return OnStart::Nothing;
     }
-    if parse(version) != parse(&p.to) {
+    if !same(version, &p.to) {
         // Something else put another version in place: not ours to judge.
         Pending::clear(dir);
         return OnStart::Nothing;
@@ -427,7 +465,8 @@ pub fn on_start(dir: &Path, version: &str, method: &Method, bin: &str, exe: &Pat
     p.tries += 1;
     if p.tries > MAX_TRIES {
         p.state = "rolled_back".into();
-        p.detail = match roll_back(method, bin, exe, &p) {
+        let how = if p.in_place { &Method::Tarball } else { method };
+        p.detail = match roll_back(how, bin, exe, &p) {
             Ok(()) => format!("{} didn't start {MAX_TRIES} times; {} is back", p.to, p.from),
             Err(e) => {
                 p.detail = format!("{} didn't start {MAX_TRIES} times, and rolling back failed: {e}", p.to);
@@ -492,6 +531,11 @@ mod tests {
         assert!(newer("0.3.4", "0.3.3") && newer("0.4.0", "0.3.9") && newer("v1.0.0", "0.9.9"));
         assert!(!newer("0.3.3", "0.3.3") && !newer("0.3.3", "0.3.3+git1700000000.abc") && !newer("0.3.3", "0.3.3.1700000000"));
         assert!(newer("0.3.4", "0.3.3.1700000000"));
+        // Edge builds: after their release, before the next, in time order.
+        assert!(newer("0.3.3+git20261023231000.f5ab776", "0.3.3") && newer("0.3.4", "0.3.3+git20261023231000.f5ab776"));
+        assert!(newer("0.3.3.20261024000000", "0.3.3+git20261023231000.f5ab776"));
+        assert!(same("0.3.3+git20261023231000.f5ab776", "0.3.3.20261023231000"));
+        assert!(is_edge("0.3.3.20261023231000") && !is_edge("0.3.3") && !same("0.3.3", "0.3.3.1"));
         assert_eq!(step("0.3.3", "0.3.4"), Some(Step::Patch));
         assert_eq!(step("0.3.3", "0.4.0"), Some(Step::Minor));
         assert_eq!(step("0.3.3", "1.0.0"), Some(Step::Major));
@@ -519,6 +563,22 @@ mod tests {
         assert_eq!(asset(&m, "c6h", "tarball", "linux", "x86_64").unwrap().1, "sha256:2");
         assert_eq!(asset(&m, "c6h", "brew", "macos", "aarch64").unwrap().1, "sha256:3");
         assert_eq!(asset(&m, "c6h", "source", "macos", "aarch64"), None);
+        // An edge build's files carry two forms of its version.
+        let edge = Manifest {
+            version: "0.3.4+git20261023231000.f5ab776".into(),
+            assets: [
+                ("c6w_0.3.4+git20261023231000.f5ab776_amd64.deb", "sha256:1"),
+                ("c6w-0.3.4.20261023231000-darwin-arm64.tar.gz", "sha256:2"),
+            ]
+            .into_iter()
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(asset(&edge, "c6w", "deb", "linux", "x86_64").unwrap().1, "sha256:1");
+        assert_eq!(asset(&edge, "c6w", "brew", "macos", "aarch64").unwrap().1, "sha256:2");
+        let brew = Method::Brew { brew: "/opt/homebrew/bin/brew".into(), prefix: "/opt/homebrew".into() };
+        assert!(in_place(&brew, &edge) && !in_place(&brew, &m) && !in_place(&Method::Tarball, &edge));
     }
 
     #[test]

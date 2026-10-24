@@ -150,7 +150,7 @@ impl WorkerHub for HubSvc {
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let welcome = Welcome {
             protocol_version: c6_core::PROTOCOL_VERSION,
-            head_version: c6_core::VERSION.into(),
+            head_version: c6_core::build().into(),
             worker_id: worker_id.to_string(),
             worker_name: row.name.clone(),
             acks: acks.into_iter().map(|(session_id, seq)| SessionCursor { session_id, seq }).collect(),

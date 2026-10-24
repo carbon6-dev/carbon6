@@ -35,7 +35,7 @@ pub async fn enroll(token: &str) -> anyhow::Result<Identity> {
             hostname: crate::hostname(),
             os: c6_core::host_os().into(),
             arch: c6_core::host_arch().into(),
-            version: c6_core::VERSION.into(),
+            version: c6_core::build().into(),
         })
         .await
         .map_err(|s| anyhow::anyhow!("enrollment rejected: {}", s.message()))?

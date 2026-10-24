@@ -69,6 +69,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The exact version this build is (docs/updates.md).
+    c6_core::set_build(option_env!("C6_BUILD_VERSION"));
     tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let cli = Cli::parse();
     let path = cli.config.unwrap_or_else(c6_head::config::default_config_path);
@@ -111,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::UpdateInstall { dir } => {
-            let r = c6_core::update::install_requested(&dir, c6_core::VERSION, c6_core::update::RELEASE_KEYS);
+            let r = c6_core::update::install_requested(&dir, c6_core::build(), c6_core::update::RELEASE_KEYS);
             match r {
                 Ok(m) => {
                     println!("{m}");

@@ -105,7 +105,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     let kits = c6_tools::kits::runtime().await.is_some();
     let hello = Hello {
         protocol_version: c6_core::PROTOCOL_VERSION,
-        version: c6_core::VERSION.into(),
+        version: c6_core::build().into(),
         hostname: crate::hostname(),
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
