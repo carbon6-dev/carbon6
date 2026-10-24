@@ -14,7 +14,8 @@ fn dot(status: SessionStatus, tracked: Tracked) -> &'static str {
         (_, Tracked::Approval) => "h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500",
         (SessionStatus::Running, _) => "h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500",
         (SessionStatus::Failed, _) => "h-2 w-2 shrink-0 rounded-full bg-red-500",
-        (_, Tracked::Attention) => "h-2 w-2 shrink-0 rounded-full bg-amber-500",
+        // Amber is for what waits on you; a finished turn is just done.
+        (_, Tracked::Attention) => "h-2 w-2 shrink-0 rounded-full bg-emerald-500",
         _ => "h-2 w-2 shrink-0 rounded-full bg-zinc-400",
     }
 }
@@ -24,7 +25,7 @@ fn what(status: SessionStatus, tracked: Tracked) -> &'static str {
         (_, Tracked::Approval) => "needs your approval",
         (SessionStatus::Running, _) => "running",
         (SessionStatus::Failed, _) => "failed",
-        (_, Tracked::Attention) => "finished",
+        (_, Tracked::Attention) => "finished, not opened yet",
         (SessionStatus::Starting, _) => "starting",
         _ => "idle",
     }
@@ -71,7 +72,27 @@ pub fn Dock() -> impl IntoView {
                         };
                         return view! { <p class="px-2 py-2 text-xs text-zinc-500">{msg}</p> }.into_any();
                     }
-                    items.into_iter().map(|(s, t)| view! { <DockItem s t /> }).collect_view().into_any()
+                    let group = |which: Tracked, title: &'static str| {
+                        let rows: Vec<_> = items.iter().filter(|(_, t)| *t == which).cloned().collect();
+                        (!rows.is_empty()).then(|| {
+                            let clear = (which == Tracked::Attention).then(|| view! {
+                                <button class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mark them all seen"
+                                    on:click=move |_| ws.attention.set(Vec::new())>"clear"</button>
+                            });
+                            view! {
+                                <div class="flex items-center justify-between px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">
+                                    {title} {clear}
+                                </div>
+                                {rows.into_iter().map(|(s, t)| view! { <DockItem s t /> }).collect_view()}
+                            }
+                        })
+                    };
+                    view! {
+                        {group(Tracked::Approval, "Waiting for you")}
+                        {group(Tracked::Running, "Running")}
+                        {group(Tracked::Attention, "Finished")}
+                        {group(Tracked::Pinned, "Pinned")}
+                    }.into_any()
                 }}
             </div>
         </aside>
@@ -142,7 +163,10 @@ pub fn InboxPage() -> impl IntoView {
                 })
             }}
             {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Approval)).then(|| section("Needs your approval", Tracked::Approval, ""))}
-            {section("Needs attention", Tracked::Attention, "Nothing finished while you were elsewhere.")}
+            {section("Finished, not opened yet", Tracked::Attention, "Nothing finished while you were elsewhere.")}
+            {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Attention)).then(|| view! {
+                <button class="-mt-4 text-xs text-zinc-500 underline" on:click=move |_| ws.attention.set(Vec::new())>"Mark all seen"</button>
+            })}
             {section("Running", Tracked::Running, "No sessions are running.")}
             {section("Pinned", Tracked::Pinned, "Pin a session with ☆ in its header to keep it here.")}
         </main>

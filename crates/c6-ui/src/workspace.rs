@@ -24,6 +24,8 @@ use crate::api::{self, LiveFeed};
 use crate::util::{storage_get, storage_set};
 
 pub const MAX_TILES: usize = 4;
+/// Finished sessions kept for you to look at.
+const MAX_ATTENTION: usize = 20;
 
 /// What a column shows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -715,6 +717,8 @@ impl Workspace {
                         a.retain(|x| x != &id);
                         a.insert(0, id);
                     }
+                    // The latest ones; older ones you've let go.
+                    a.truncate(MAX_ATTENTION);
                 });
             }
         });
