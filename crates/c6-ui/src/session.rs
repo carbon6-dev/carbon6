@@ -32,8 +32,8 @@ struct ToolResultView {
 
 /// Token usage summed over model calls.
 #[derive(Clone, Copy, Default, PartialEq)]
-struct Tokens {
-    calls: u64,
+pub(crate) struct Tokens {
+    pub(crate) calls: u64,
     input: u64,
     cache_read: u64,
     cache_write: u64,
@@ -54,12 +54,12 @@ impl Tokens {
     }
 
     /// All prompt tokens, cached or not.
-    fn prompt(&self) -> u64 {
+    pub(crate) fn prompt(&self) -> u64 {
         self.input + self.cache_read + self.cache_write
     }
 
     /// "12.3k in (85% cached, 1.2k written) · 950 out (300 reasoning)"
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let mut cache = vec![format!("{}% cached", (self.cache_read * 100).checked_div(self.prompt()).unwrap_or(0))];
         if self.cache_write > 0 {
             cache.push(format!("{} written", tokens(self.cache_write)));
@@ -70,7 +70,7 @@ impl Tokens {
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
-struct TurnStats {
+pub(crate) struct TurnStats {
     tokens: Tokens,
     started: i64,
     ended: Option<i64>,
@@ -80,14 +80,14 @@ struct TurnStats {
 
 /// Per-turn usage plus the session's totals and current context size.
 #[derive(Clone, Default, PartialEq)]
-struct UsageStats {
-    turns: HashMap<u64, TurnStats>,
+pub(crate) struct UsageStats {
+    pub(crate) turns: HashMap<u64, TurnStats>,
     current_turn: Option<u64>,
-    total: Tokens,
+    pub(crate) total: Tokens,
     /// Prompt plus output of the last model call since the last compaction:
     /// what the next request starts from.
-    context: Option<u64>,
-    context_window: u64,
+    pub(crate) context: Option<u64>,
+    pub(crate) context_window: u64,
 }
 
 impl UsageStats {
@@ -355,9 +355,18 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
 
     let find_root = root.clone();
+    let details = crate::details::remembered();
     view! {
         <div class="relative flex min-h-0 flex-1 flex-col">
         {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
+        {move || details.get().then(|| detail.get().and_then(Result::ok)).flatten().map(|d| {
+            let worker_id = d.session.worker_id;
+            let online = Signal::derive(move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online)));
+            view! {
+                <crate::details::DetailsCard session=d.session worker_name=d.worker_name online events usage started model_label
+                    running=Signal::derive(running) tab open=details />
+            }
+        })}
         <ScrollBox node_ref=scroller on_scroll>
         <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
@@ -394,6 +403,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                     <crate::fleet::TabButton tab label="Terminal" value="terminal" />
                                     {move || (events.with(|e| crate::outputs::count(e)) > 0).then(|| view! { <crate::fleet::TabButton tab label="Outputs" value="outputs" /> })}
                                     <crate::fleet::TabButton tab label="Config" value="config" />
+                                    <button class=move || format!("{BUTTON_QUIET} text-xs {}", if details.get() { "text-zinc-900 dark:text-zinc-100" } else { "text-zinc-500" })
+                                        title="Where it runs, its context, usage and changes" on:click=move |_| details.update(|d| *d = !*d)>"Details"</button>
                                     <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
                                         tab.set("transcript");
                                         find_open.set(true);
@@ -1242,7 +1253,7 @@ fn reveal_when_rendered(root: String, id: String, terms: String, tries: u32) {
     );
 }
 
-fn tokens(n: u64) -> String {
+pub(crate) fn tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1e6)
     } else if n >= 1000 {

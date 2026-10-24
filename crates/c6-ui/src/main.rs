@@ -9,6 +9,7 @@ mod calendar;
 mod collections;
 mod contacts;
 mod decisions;
+mod details;
 mod explorer;
 mod files;
 mod fleet;
