@@ -11,8 +11,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::{
-    After, DecisionQuery, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TrailEdit, TrailStepIn,
-    UpdateSession, UsageQuery, WorkflowRunsQuery,
+    After, AnalyticsQuery, DecisionQuery, FindQuery, ForSession, IdQuery, MemexSearchQuery, RunsQuery, TestConnection, TrailEdit,
+    TrailStepIn, UpdateSession, UsageQuery, WorkflowRunsQuery,
 };
 
 /// What an operation does to carbon6.
@@ -359,6 +359,7 @@ fn build() -> Vec<Op> {
         op!("hosts.check", "hosts", "POST" "/api/v1/hosts/{name}/check", Read, Input::None, "Checks a host now (reachable over SSH, system details).", choices = &[("name", "hosts.list")]),
 
         // Usage.
+        op!("usage.analytics", "usage", "GET" "/api/v1/analytics", Read, Input::Query(schema::<AnalyticsQuery>), "Analytics for the last `days`: agent, model and tool time, cost, your messages, corrections and answers, and waits on you, by day, model, tool and a label key (`by`), optionally filtered by labels."),
         op!("usage.report", "usage", "GET" "/api/v1/usage", Read, Input::Query(schema::<UsageQuery>), "Usage and estimated cost by day, model and label, for the last `days`, optionally filtered by labels."),
 
         // Notifications.

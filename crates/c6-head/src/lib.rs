@@ -1,5 +1,6 @@
 //! The carbon6 head (`c6h`): system of record, worker hub and web UI server.
 
+pub mod analytics;
 pub mod api;
 pub mod apps;
 pub mod assistant;
@@ -270,6 +271,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     series::spawn_sweeper(state.clone());
     notify::spawn(state.clone());
     usage::spawn_backfill(state.clone());
+    analytics::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());
     workflows::spawn(state.clone());
     memex::spawn(state.clone());

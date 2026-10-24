@@ -3,6 +3,7 @@
 //! templates) stay binaries of their own.
 
 mod agents;
+mod analytics;
 mod api_reference;
 mod apps;
 mod assistant;

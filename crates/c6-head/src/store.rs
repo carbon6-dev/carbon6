@@ -819,6 +819,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             crate::search::index_event(&mut tx, session_id, ev).await?;
+            crate::analytics::mark(&mut tx, session_id, ev).await?;
             last = ev.seq;
             match &ev.kind {
                 Some(Kind::Started(s)) => {

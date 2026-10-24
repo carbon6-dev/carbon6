@@ -44,3 +44,18 @@
   border-radius: 0.5rem;
   animation: c6-flash 2.5s ease-out;
 }
+
+/* Chart series (the dataviz reference palette's first slots, stepped
+   separately for light and dark surfaces). */
+.viz {
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+}
+@media (prefers-color-scheme: dark) {
+  .viz {
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+  }
+}

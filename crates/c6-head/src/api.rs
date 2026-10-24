@@ -122,6 +122,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/hosts/{name}/check", post(check_host))
         .route("/api/v1/settings/budgets", get(get_budgets).put(put_budgets))
         .route("/api/v1/usage", get(get_usage))
+        .route("/api/v1/analytics", get(get_analytics))
         .route("/api/v1/settings/channels/test", post(test_channel))
         .route("/api/v1/push/key", get(push_key))
         .route("/api/v1/push/subscriptions", get(push_devices).post(push_subscribe))
@@ -2060,6 +2061,22 @@ pub(crate) struct UsageQuery {
 async fn get_usage(State(st): State<Arc<HeadState>>, Query(q): Query<UsageQuery>) -> ApiResult<Json<api::UsageReport>> {
     let filter = api::labels::parse_labels(&q.labels);
     Ok(Json(crate::usage::report(&st, q.days.unwrap_or(30), &filter).await?))
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct AnalyticsQuery {
+    #[serde(default)]
+    days: Option<u32>,
+    #[serde(default)]
+    labels: String,
+    /// The label key to group sessions by (default `repo`).
+    #[serde(default)]
+    by: String,
+}
+
+async fn get_analytics(State(st): State<Arc<HeadState>>, Query(q): Query<AnalyticsQuery>) -> ApiResult<Json<api::AnalyticsReport>> {
+    let filter = api::labels::parse_labels(&q.labels);
+    Ok(Json(crate::analytics::report(&st, q.days.unwrap_or(30), &filter, &q.by).await?))
 }
 
 async fn get_channels(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Channel>>> {

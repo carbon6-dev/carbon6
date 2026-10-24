@@ -166,19 +166,19 @@ fn price_for<'a>(prices: &'a [api::Price], model: &str) -> Option<&'a api::Price
 }
 
 /// A model call.
-struct Call {
-    session_id: String,
-    ts: i64,
-    connection_id: String,
-    model: String,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
+pub(crate) struct Call {
+    pub(crate) session_id: String,
+    pub(crate) ts: i64,
+    pub(crate) connection_id: String,
+    pub(crate) model: String,
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_write: u64,
 }
 
 impl Call {
-    fn cost(&self, prices: &[api::Price]) -> Option<f64> {
+    pub(crate) fn cost(&self, prices: &[api::Price]) -> Option<f64> {
         let p = price_for(prices, &self.model)?;
         let per = |tokens: u64, price: f64| tokens as f64 * price / 1_000_000.0;
         Some(
@@ -202,7 +202,7 @@ fn add(row: &mut api::UsageRow, c: &Call, cost: Option<f64>) {
     }
 }
 
-async fn calls_since(st: &HeadState, since_ms: i64) -> anyhow::Result<Vec<Call>> {
+pub(crate) async fn calls_since(st: &HeadState, since_ms: i64) -> anyhow::Result<Vec<Call>> {
     let rows = sqlx::query("SELECT * FROM usage WHERE ts >= ? ORDER BY ts").bind(since_ms).fetch_all(&st.store.pool).await?;
     Ok(rows
         .iter()
@@ -264,10 +264,10 @@ pub async fn as_points(
 
 /// The sessions calls were made in, loaded once each.
 #[derive(Default)]
-struct Sessions(HashMap<String, Option<SessionRow>>);
+pub(crate) struct Sessions(HashMap<String, Option<SessionRow>>);
 
 impl Sessions {
-    async fn get(&mut self, st: &HeadState, id: &str) -> Option<&SessionRow> {
+    pub(crate) async fn get(&mut self, st: &HeadState, id: &str) -> Option<&SessionRow> {
         if !self.0.contains_key(id) {
             let row = st.store.session(id).await.ok().flatten();
             self.0.insert(id.to_owned(), row);
@@ -277,7 +277,7 @@ impl Sessions {
 }
 
 /// When the current period of a budget began.
-fn period_start(period: &str, now: DateTime<Local>) -> DateTime<Local> {
+pub(crate) fn period_start(period: &str, now: DateTime<Local>) -> DateTime<Local> {
     let today = now.date_naive();
     let day = match period {
         "week" => today - Duration::days(today.weekday().num_days_from_monday() as i64),

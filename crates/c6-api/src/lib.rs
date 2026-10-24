@@ -2959,6 +2959,86 @@ pub struct UsageReport {
     pub budgets: Vec<BudgetStatus>,
 }
 
+/// `GET /api/v1/analytics?days=N&labels=a,b&by=key` (docs/analytics.md):
+/// who worked when, what it cost, and how much it took of you.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AnalyticsReport {
+    pub since_ms: i64,
+    /// The label key `by_group` groups by (`repo` unless asked).
+    pub by: String,
+    pub total: ActivityRow,
+    /// Every day of the range (YYYY-MM-DD), oldest first.
+    pub by_day: Vec<ActivityRow>,
+    /// Most agent time first.
+    pub by_model: Vec<ActivityRow>,
+    pub by_tool: Vec<ToolRow>,
+    /// Sessions by their value for the label key `by` ("": none).
+    pub by_group: Vec<ActivityRow>,
+    pub waits: Waits,
+    /// Models used without a price (their calls count as $0).
+    pub unpriced_models: Vec<String>,
+}
+
+/// Work in a day, on a model, or in a group of sessions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ActivityRow {
+    pub key: String,
+    /// Sessions with activity.
+    pub sessions: u64,
+    /// Sessions started (their first message).
+    pub tasks: u64,
+    pub turns: u64,
+    pub turns_failed: u64,
+    pub turns_interrupted: u64,
+    /// Agents working: from each finished turn's start to its end.
+    pub agent_ms: u64,
+    /// Of that, waiting on model responses.
+    pub model_ms: u64,
+    /// Of that, running tools (parallel calls each count).
+    pub tool_ms: u64,
+    pub calls: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    /// USD, for models with a price.
+    pub cost: f64,
+    /// Your messages.
+    pub messages: u64,
+    /// Your corrections: messages after a session's first, interrupts and
+    /// rewinds.
+    pub steers: u64,
+    /// Approvals and questions you answered.
+    pub answers: u64,
+    /// The most turns running at once (days only).
+    pub peak_agents: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolRow {
+    pub key: String,
+    pub calls: u64,
+    pub failed: u64,
+    pub ms: u64,
+    pub median_ms: u64,
+}
+
+/// How long work waited for you.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Waits {
+    /// A finished turn until your next message.
+    pub replies: u64,
+    pub reply_median_ms: u64,
+    pub reply_p90_ms: u64,
+    /// An approval or question until you answered.
+    pub answers: u64,
+    pub answer_median_ms: u64,
+    pub answer_p90_ms: u64,
+}
+
 /// A browser's push subscription (`POST /api/v1/push/subscriptions`), as
 /// `PushSubscription.toJSON()` gives it, plus a name for the device.
 #[derive(Clone, Debug, Serialize, Deserialize)]

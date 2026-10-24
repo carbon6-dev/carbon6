@@ -509,6 +509,11 @@ pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String
     json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
 }
 
+pub async fn analytics(days: u32, labels: Vec<String>, by: String) -> Result<c6_api::AnalyticsReport, String> {
+    let (labels, by) = (js_sys::encode_uri_component(&labels.join(",")), js_sys::encode_uri_component(&by));
+    json(Request::get(&format!("/api/v1/analytics?days={days}&labels={labels}&by={by}")).send().await).await
+}
+
 pub async fn usage(days: u32, labels: Vec<String>) -> Result<c6_api::UsageReport, String> {
     let labels = js_sys::encode_uri_component(&labels.join(","));
     json(Request::get(&format!("/api/v1/usage?days={days}&labels={labels}")).send().await).await

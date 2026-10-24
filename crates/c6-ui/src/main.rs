@@ -1,6 +1,7 @@
 //! carbon6 web UI (Leptos CSR). Talks only to the head's `/api/v1`.
 
 mod activity;
+mod analytics;
 mod api;
 mod assistant;
 mod auth;
@@ -102,6 +103,7 @@ fn Main() -> impl IntoView {
                         </span>
                     </Go>
                     <decisions::DecisionLink class=NAV />
+                    <NavLink to=View::Analytics label="Analytics" />
                     <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
                     <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
                     <span class="hidden xl:contents"><NavLink to=View::Realms label="Realms" /></span>
@@ -171,6 +173,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     })}
                     <Go to=View::Photos class=MENU>"Photos"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
+                    <Go to=View::Analytics class=MENU>"Analytics"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                 </div>
