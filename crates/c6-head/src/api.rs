@@ -353,8 +353,7 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
     loop {
         changes.borrow_and_update();
         let Ok(workers) = workers_for(&st, &caller).await else { return };
-        let Ok(mut sessions) = sessions_snapshot(&st).await else { return };
-        sessions.retain(|s| caller.sees(&s.realm));
+        let Ok(sessions) = sessions_snapshot(&st, &caller).await else { return };
         for ev in [api::LiveEvent::Workers { workers }, api::LiveEvent::Sessions { sessions }] {
             let Ok(text) = serde_json::to_string(&ev) else { return };
             if socket.send(Message::Text(text.into())).await.is_err() {
@@ -623,11 +622,13 @@ async fn test_connection(State(st): State<Arc<HeadState>>, Json(req): Json<TestC
 const SESSION_LIST_LIMIT: i64 = 200;
 const EVENT_PAGE: i64 = 1000;
 
-pub async fn sessions_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Session>> {
+/// The session list a caller sees: its realm's, or (you, root) every
+/// realm's most recent.
+pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Session>> {
     let working = st.store.subagents_running().await?;
     Ok(st
         .store
-        .sessions(SESSION_LIST_LIMIT)
+        .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
         .await?
         .iter()
         .map(|r| api::Session { subagents_running: working.get(&r.id).copied().unwrap_or(0), ..crate::convert::session(r) })
@@ -635,7 +636,7 @@ pub async fn sessions_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Sessio
 }
 
 async fn list_sessions(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Session>>> {
-    Ok(Json(sessions_snapshot(&st).await?.into_iter().filter(|s| caller.sees(&s.realm)).collect()))
+    Ok(Json(sessions_snapshot(&st, &caller).await?))
 }
 
 async fn create_session(

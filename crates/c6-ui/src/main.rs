@@ -183,7 +183,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                 "☰"
                 {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
             </summary>
-            <div class="absolute left-0 top-9 z-40 w-64 space-y-1 rounded-lg border border-zinc-200 bg-white p-2 shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+            <div class="fixed inset-x-2 top-12 z-40 max-h-[80dvh] space-y-1 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                 {place::is_console().then(|| view! {
                     <div class="flex flex-col text-sm">
                         <Go to=View::Realms class=MENU>"Realms"</Go>
@@ -215,6 +215,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                 </div>
+                <PlaceLinks />
             </div>
         </details>
     }
@@ -286,7 +287,9 @@ fn PlaceMenu() -> impl IntoView {
                 })}
                 <span class="text-zinc-400">"▾"</span>
             </summary>
-            <div class="absolute left-0 top-9 z-40 w-64 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+            // On a phone, the width of the screen (anchored at the chip, it
+            // would run off its edge).
+            <div class="fixed inset-x-2 top-12 z-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900">
                 <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
@@ -308,6 +311,33 @@ fn PlaceMenu() -> impl IntoView {
                 </a>
             </div>
         </details>
+    }
+}
+
+/// The realms and the console, as links (the phone's ☰ menu).
+#[component]
+fn PlaceLinks() -> impl IntoView {
+    let places = LocalResource::new(api::elsewhere);
+    let here = place::realm();
+    view! {
+        <div class="border-t border-zinc-200 pt-1 text-sm dark:border-zinc-800">
+            <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
+            {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
+                let current = here.as_deref() == Some(p.id.as_str());
+                view! {
+                    <a href=place::url_of(&place::Place::Realm(p.id.clone())) class=format!("flex items-center gap-2 {MENU} {}", if current { "font-medium" } else { "" })>
+                        <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {}", realm_colour(&p.id))></span>
+                        <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
+                        {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{p.waiting}</span> })}
+                        {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
+                    </a>
+                }
+            }).collect_view()}
+            <a href=place::url_of(&place::Place::Console) class=format!("flex items-center gap-2 {MENU} {}", if place::is_console() { "font-medium" } else { "" })>
+                <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
+                <span class="flex-1">"Console"</span>
+            </a>
+        </div>
     }
 }
 
@@ -395,7 +425,7 @@ fn Brand() -> impl IntoView {
     view! {
         <Go to=View::Sessions class="mr-2 flex shrink-0 items-center gap-2 whitespace-nowrap">
             <span class="shrink-0" inner_html=MARK></span>
-            <span class="font-semibold tracking-tight">"carbon6"</span>
+            <span class="hidden font-semibold tracking-tight sm:inline">"carbon6"</span>
             {move || v.now.get().map(|full| view! {
                 <span class="rounded bg-zinc-200/70 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" title=format!("carbon6 {full}")>
                     {short_version(&full)}

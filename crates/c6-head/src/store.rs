@@ -551,11 +551,18 @@ impl Store {
         Ok(sqlx::query_as("SELECT * FROM sessions WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
 
-    pub async fn sessions(&self, limit: i64) -> anyhow::Result<Vec<SessionRow>> {
-        Ok(sqlx::query_as("SELECT * FROM sessions WHERE archived = 0 AND parent_id IS NULL ORDER BY updated_at DESC LIMIT ?")
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?)
+    /// The most recently active top-level sessions, of one realm (or
+    /// every realm's): a realm's own, so a busy realm can't crowd another
+    /// out of its list.
+    pub async fn sessions(&self, realm: Option<&str>, limit: i64) -> anyhow::Result<Vec<SessionRow>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM sessions WHERE archived = 0 AND parent_id IS NULL AND (? IS NULL OR realm = ?) ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(realm)
+        .bind(realm)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Subagents working now, per top-level session.

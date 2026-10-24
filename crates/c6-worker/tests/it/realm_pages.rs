@@ -180,6 +180,30 @@ async fn realm_pages_stay_in_their_realm() {
         }
     };
     assert_eq!((live("lab").await, live("home").await), (0, 1));
+    // A busy realm (more recent sessions than a list holds) doesn't crowd
+    // a quieter one out of its own list.
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", head_dir.path().join("c6h.db").display())).await.unwrap();
+    let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions')").fetch_all(&db).await.unwrap();
+    let picked: Vec<String> = cols
+        .iter()
+        .map(|c| match c.as_str() {
+            "id" => "'busy-' || n.i".to_owned(),
+            "realm" => "'lab'".to_owned(),
+            "updated_at" => "updated_at + 1000 + n.i".to_owned(),
+            other => other.to_owned(),
+        })
+        .collect();
+    let copy = format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 250) INSERT INTO sessions ({}) SELECT {} FROM sessions, n WHERE sessions.id = ?",
+        cols.join(", "),
+        picked.join(", ")
+    );
+    sqlx::query(sqlx::AssertSqlSafe(copy)).bind(&s.id).execute(&db).await.unwrap();
+    head.state.registry.bump();
+    assert_eq!(live("home").await, 1, "home's session still listed");
+    let home: Vec<Session> = send(M::GET, "sessions".into(), Some("home"), None).await.unwrap().json().await.unwrap();
+    assert_eq!(home.len(), 1);
+    sqlx::query("DELETE FROM sessions WHERE id LIKE 'busy-%'").execute(&db).await.unwrap();
     let turns = |place: &'static str| {
         let r = send(M::GET, "analytics?days=1".into(), Some(place), None);
         async move { r.await.unwrap().json::<Value>().await.unwrap()["total"]["turns"].as_u64().unwrap() }
