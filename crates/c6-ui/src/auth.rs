@@ -201,7 +201,7 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
         });
     };
     view! {
-        <section id="sign-in" class="space-y-3">
+        <section id="sign-in" class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div class="flex items-start justify-between gap-3">
                 <div>
                     <h2 class="text-lg font-semibold">"Sign-in"</h2>

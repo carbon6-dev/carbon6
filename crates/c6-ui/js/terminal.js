@@ -1,7 +1,7 @@
 // Thin glue between the Rust UI and xterm.js (vendored, loaded as globals).
 window.c6Terminal = {
   create(el, onData, onResize) {
-    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const dark = window.c6Theme.isDark();
     const term = new Terminal({
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",

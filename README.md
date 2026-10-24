@@ -181,7 +181,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
   - Or set `ui_tls_cert`/`ui_tls_key` to PEM files. With HTTPS on, plain HTTP on the UI port redirects to the HTTPS name.
   - Sign-in is on by default; `auth = false` turns it off.
   - Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
-  - MCP servers, slash commands, agents, skills and hooks are configured in the UI (Settings) and stored on the head.
+  - MCP servers, slash commands, agents, skills and hooks are configured in the UI (Settings) and stored on the head. Settings is grouped (General, Models, Agents and tools, Automation, Memory and memex, System), with one page per setting.
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
 
@@ -221,7 +221,7 @@ A new version of carbon6 upgrades its databases when it starts: the head's (`c6h
 
 ### Sessions from Claude Code and Codex
 
-**Settings → System → Sessions from Claude Code and Codex** turns on importing for the workers you pick. Each such worker reads `~/.claude/projects` and `~/.codex/sessions` every minute, and only files that changed. Every session there becomes a carbon6 session (labelled `imported:claude-code` or `imported:codex`) with its messages, tool calls and usage. New messages follow as you keep using those tools.
+**Settings → System → Imports** turns on importing for the workers you pick. Each such worker reads `~/.claude/projects` and `~/.codex/sessions` every minute, and only files that changed. Every session there becomes a carbon6 session (labelled `imported:claude-code` or `imported:codex`) with its messages, tool calls and usage. New messages follow as you keep using those tools.
 
 - **Realms:** folder rules place sessions (`~/work/**` → work), and anything else goes to home.
 - **Continuing:** send a message to an imported session, picking a connection. A Claude Code connection resumes it with Claude Code's own memory of it; any other connection continues from the history. From then on it is carbon6's, and the import leaves it alone.
@@ -563,7 +563,15 @@ The UI is a workspace of up to four **tiles** side by side: framed cards, each w
 - **Inside a tile:** at most two panes, a list and the item opened from it. Clicking anything inside a tile opens it in that tile's right pane, beside the list, replacing what was there. ‹ and › (⌘[ / ⌘]) step through the tile's own history.
 - **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–4 focus a tile. With four open, a new one replaces the least recently used. A session that is already open is shown where it is instead of opening twice.
 - **The header's navigation** (Sessions, Decisions, Settings…) replaces what the focused tile shows. Back brings it back.
-- **Activity dock** (left, on wide screens): running sessions, ones that finished or failed while not on screen (amber/red), and pinned ones (☆ in a session's header). **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
+- **Activity dock** (left, on wide screens), in sections:
+  - **Waiting for you** (amber): a tool call waits for your approval;
+  - **Running** (blue);
+  - **Finished** (green, red when failed): sessions that ended while not on screen, until you open them. ✕ lets one go, **clear** all of them; the latest 20 are kept;
+  - **Pinned** (☆ in a session's header).
+
+  **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
+- **Session details:** **Details** in a session's header opens a card at its top right with where it runs (worker, folder, branch, worktree, model), how full its context is (with **Compact now**), its usage, and the lines it changed (**Review** opens Changes). It stays open or closed as you leave it.
+- **Light or dark:** Settings → Appearance: follow the system, or always light or dark (kept in each browser).
 - **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; one pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰.
 - The workspace is saved in the browser; the address bar shows the focused pane, so links and reloads land in the right place.
 

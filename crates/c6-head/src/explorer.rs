@@ -1074,7 +1074,7 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             if let Some(e) = &t.last_error {
                 o.fields.push(("last error".into(), e.clone()));
             }
-            o.open = Some("/settings/automation".into());
+            o.open = Some("/settings/triggers".into());
             o.data = json!(t);
             let mut targets = Vec::new();
             for c in [t.event_params["collection"].as_str(), t.action_params["collection"].as_str()].into_iter().flatten() {
@@ -1131,7 +1131,7 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             o.title = format!("{} → {}", g.from_realm, g.to_realm);
             o.sub = format!("{} {} · {}", g.mode, crate::grants::describe(&g), g.state);
             o.body = g.note.clone();
-            o.open = Some("/settings/system".into());
+            o.open = Some("/settings/grants".into());
             o.data = json!(g);
             groups.push(group(
                 "Realms",
@@ -1195,11 +1195,17 @@ pub async fn object(st: &HeadState, realm: &str, kind: &str, id: &str) -> anyhow
             o.fields = field_list(&e).into_iter().filter(|(k, _)| k != "body" && k != "prompt" && k != "name").collect();
             o.open = Some(match key {
                 "views" => "/settings/views".into(),
-                "templates" | "workflows" => "/settings/automation".into(),
+                "templates" => "/settings/automation".into(),
+                "workflows" => "/settings/workflows".into(),
                 "policies" => "/settings/rules".into(),
-                "budgets" | "prices" => "/settings/money".into(),
-                "routes" => "/settings".into(),
+                "budgets" => "/settings/budgets".into(),
+                "prices" => "/settings/spending".into(),
+                "routes" => "/settings/routing".into(),
                 "prompts" => "/settings/prompts".into(),
+                "channels" => "/settings/notifications".into(),
+                "commands" | "agents" | "skills" | "hooks" | "hosts" => format!("/settings/{key}"),
+                "memex_folders" => "/settings/memex-folders".into(),
+                "memex_scopes" => "/settings/memex-scopes".into(),
                 _ => "/settings/tools".into(),
             });
             o.data = e.clone();

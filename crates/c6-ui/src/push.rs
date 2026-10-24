@@ -101,7 +101,7 @@ pub fn PushSetting() -> impl IntoView {
         });
     };
     view! {
-        <section class="-mt-3 space-y-2 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
+        <section class="space-y-2 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
             <div class="flex flex-wrap items-center gap-2">
                 <span class="font-medium">"Notifications on this device"</span>
                 <span class="flex-1"></span>

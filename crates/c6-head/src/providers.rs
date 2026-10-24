@@ -74,7 +74,7 @@ pub async fn redirect_uri(st: &HeadState, origin: Option<&str>) -> String {
 /// Starts a sign-in to an app's provider: the address to send you to.
 pub async fn connect(st: &HeadState, realm: &str, instance: &str, name: &str, origin: Option<&str>) -> anyhow::Result<String> {
     let redirect = redirect_uri(st, origin).await;
-    connect_many(st, realm, &[instance.to_owned()], name, &redirect, "/settings/system").await
+    connect_many(st, realm, &[instance.to_owned()], name, &redirect, "/settings/apps").await
 }
 
 /// One sign-in for several apps of a realm with the same provider (mail,
@@ -138,7 +138,7 @@ pub struct Callback {
 /// account, and goes back to Settings.
 pub async fn callback(State(st): State<std::sync::Arc<HeadState>>, Query(q): Query<Callback>) -> Response {
     let pending = PENDING.lock().unwrap().remove(&q.state);
-    let page = pending.as_ref().map(|p| p.4.clone()).unwrap_or_else(|| "/settings/system".into());
+    let page = pending.as_ref().map(|p| p.4.clone()).unwrap_or_else(|| "/settings/apps".into());
     let back = |note: &str| Redirect::to(&format!("{page}?oauth={}", urlencode(note))).into_response();
     if !q.error.is_empty() {
         return back(&q.error);

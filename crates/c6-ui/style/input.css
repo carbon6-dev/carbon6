@@ -1,6 +1,10 @@
 @import "tailwindcss";
 @source "../src/**/*.rs";
 
+/* Dark mode follows the html element's class (js/theme.js: the OS, or
+   your choice in Settings → Appearance). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* Phones: iOS zooms into fields with text under 16px when they get
    focus, which throws the layout off; give them 16px there. */
 @media (max-width: 639px) {
@@ -52,10 +56,8 @@
   --series-2: #eb6834;
   --series-3: #1baf7a;
 }
-@media (prefers-color-scheme: dark) {
-  .viz {
-    --series-1: #3987e5;
-    --series-2: #d95926;
-    --series-3: #199e70;
-  }
+.dark .viz {
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
 }
