@@ -90,7 +90,7 @@ fn Main() -> impl IntoView {
     view! {
         <div class="flex h-dvh flex-col">
             <header class="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-950">
-                <Go to=View::Sessions class="mr-2 font-semibold tracking-tight">"carbon6"</Go>
+                <Brand />
                 <MobileMenu attention=Signal::derive(attention) />
                 <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
                     <NavLink to=View::Sessions label="Sessions" />
@@ -120,6 +120,7 @@ fn Main() -> impl IntoView {
                 <notify::NotifyToggle />
                 <ConnBadge connected=live.connected />
             </header>
+            <UpdatedBanner />
             <div class="flex min-h-0 flex-1">
                 <activity::Dock />
                 <workspace::Tiles />
@@ -221,6 +222,99 @@ fn RealmSwitch() -> impl IntoView {
                 <option value="">"All realms"</option>
                 {rs.into_iter().filter(|r| r.id != "root").map(|r| view! { <option value=r.id.clone()>{r.name.clone()}</option> }).collect_view()}
             </select>
+        })}
+    }
+}
+
+/// carbon6.dev's mark (site/static/icon.svg), drawn inline.
+const MARK: &str = r##"<svg viewBox="0 0 192 192" width="22" height="22" aria-hidden="true"><rect width="192" height="192" rx="42" fill="#0b0b0c"/><path d="M151.8 100.9A56 56 0 1 1 121.4 46.1" fill="none" stroke="#38bdf8" stroke-width="22"/><circle cx="146" cy="67" r="12" fill="#f5f5f5"/></svg>"##;
+
+/// The head's version as it fits in the header: the release, or for an
+/// edge build of main `0.3.11 edge·c048da0` (the full one on hover).
+fn short_version(v: &str) -> String {
+    match v.split_once("+git") {
+        Some((release, rest)) => format!("{release} edge·{}", rest.rsplit('.').next().unwrap_or("")),
+        None => v.to_owned(),
+    }
+}
+
+/// The version the head ran when this page loaded, and what it runs now.
+#[derive(Clone, Copy)]
+struct Versions {
+    loaded: RwSignal<Option<String>>,
+    now: RwSignal<Option<String>>,
+}
+
+fn versions() -> Versions {
+    match use_context::<Versions>() {
+        Some(v) => v,
+        None => {
+            let v = Versions { loaded: RwSignal::new(None), now: RwSignal::new(None) };
+            provide_context(v);
+            // Asked when the page loads, every 30 seconds, and whenever the
+            // live connection comes back (as it does after the head restarts).
+            let ask = move || {
+                leptos::task::spawn_local(async move {
+                    if let Ok(now) = api::version().await {
+                        if v.loaded.get_untracked().is_none() {
+                            v.loaded.set(Some(now.clone()));
+                        }
+                        v.now.set(Some(now));
+                    }
+                });
+            };
+            ask();
+            let live = api::live();
+            Effect::new(move |was: Option<bool>| {
+                let up = live.connected.get();
+                if up && was == Some(false) {
+                    ask();
+                }
+                up
+            });
+            let _ = set_interval_with_handle(ask, std::time::Duration::from_secs(30));
+            v
+        }
+    }
+}
+
+/// The mark, the name and the version, always whole.
+#[component]
+fn Brand() -> impl IntoView {
+    let v = versions();
+    view! {
+        <Go to=View::Sessions class="mr-2 flex shrink-0 items-center gap-2 whitespace-nowrap">
+            <span class="shrink-0" inner_html=MARK></span>
+            <span class="font-semibold tracking-tight">"carbon6"</span>
+            {move || v.now.get().map(|full| view! {
+                <span class="rounded bg-zinc-200/70 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" title=format!("carbon6 {full}")>
+                    {short_version(&full)}
+                </span>
+            })}
+        </Go>
+    }
+}
+
+/// When the head now runs another version than this page was loaded from,
+/// says so and offers to reload (the page is the old version's).
+#[component]
+fn UpdatedBanner() -> impl IntoView {
+    let v = versions();
+    let dismissed = RwSignal::new(None::<String>);
+    let changed = move || match (v.loaded.get(), v.now.get()) {
+        (Some(a), Some(b)) if a != b && dismissed.get().as_deref() != Some(b.as_str()) => Some((a, b)),
+        _ => None,
+    };
+    view! {
+        {move || changed().map(|(was, now)| {
+            let n2 = now.clone();
+            view! {
+                <div class="flex shrink-0 items-center gap-3 border-b border-sky-200 bg-sky-50 px-3 py-1.5 text-sm text-sky-900 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200">
+                    <span class="min-w-0 flex-1">{format!("carbon6 was updated to {} (this page is {}). Reload to use the new version.", short_version(&now), short_version(&was))}</span>
+                    <button class="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-700" on:click=move |_| { let _ = window().location().reload(); }>"Reload"</button>
+                    <button class="rounded px-1.5 text-sky-700 hover:bg-sky-100 dark:text-sky-300 dark:hover:bg-sky-900" title="Not now" on:click=move |_| dismissed.set(Some(n2.clone()))>"✕"</button>
+                </div>
+            }
         })}
     }
 }

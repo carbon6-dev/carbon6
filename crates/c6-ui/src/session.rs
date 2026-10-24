@@ -155,6 +155,8 @@ pub(crate) struct Feed {
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
     secrets: RwSignal<Vec<SecretCard>>,
+    /// The log has been replayed up to where the session was when opened.
+    pub(crate) synced: RwSignal<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,8 +176,9 @@ impl Feed {
             queued: RwSignal::new(Vec::new()),
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
+            synced: RwSignal::new(false),
         };
-        let Feed { events, streaming, queued, activity, secrets } = feed;
+        let Feed { events, streaming, queued, activity, secrets, synced } = feed;
         let handle = api::stream_session(
             id,
             move |msg| match msg {
@@ -216,6 +219,7 @@ impl Feed {
                     }
                 }
                 StreamMsg::Queue { queued: q } => queued.set(q),
+                StreamMsg::Synced => synced.set(true),
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
             },
             move || events.with_untracked(|e| e.last().map(|e| e.seq).unwrap_or(0)),

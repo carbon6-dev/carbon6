@@ -161,6 +161,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/system/updates", get(get_updates))
+        .route("/api/v1/version", get(get_version))
         .route("/api/v1/system/updates/check", post(check_updates))
         .route("/api/v1/system/updates/{version}/apply", post(apply_update))
         .route("/api/v1/system/updates/{version}/skip", post(skip_update))
@@ -1568,6 +1569,11 @@ async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The version this head runs (the UI shows it, and notices when it changes).
+async fn get_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"version": c6_core::build()}))
+}
+
 /// Updating carbon6 from GitHub releases (docs/updates.md).
 async fn get_updates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::Updates>> {
     Ok(Json(crate::updates::status(&st).await?))
@@ -2167,7 +2173,7 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, after: u64, mut s
     {
         return;
     }
-    if !catch_up(&st, &session_id, &mut last, &mut socket).await {
+    if !catch_up(&st, &session_id, &mut last, &mut socket).await || !send(&mut socket, &api::StreamMsg::Synced).await {
         return;
     }
     loop {

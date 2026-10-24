@@ -131,6 +131,21 @@ async fn task_runs_and_survives_head_outage() {
 
     let synced = head.state.store.events_after(&session.id, 0, 10_000).await.unwrap();
     assert_eq!(synced, journal, "head log equals the worker journal");
+    // The stream replays the log, then says it has (what follows is live).
+    let url = format!("ws://127.0.0.1:{}/api/v1/sessions/{}/stream?after=0", ui_port, session.id);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut replayed = Vec::new();
+    loop {
+        use futures::StreamExt;
+        let msg = c6_testkit::within("the next stream message", ws.next()).await.unwrap().unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
+        match serde_json::from_str::<c6_api::StreamMsg>(&text).unwrap() {
+            c6_api::StreamMsg::Event { event } => replayed.push(event.seq),
+            c6_api::StreamMsg::Synced => break,
+            _ => {}
+        }
+    }
+    assert_eq!(replayed, synced.iter().map(|e| e.seq).collect::<Vec<_>>());
     eventually("worker to see the acks", async || worker.journal.unacked().await.unwrap().is_empty().then_some(())).await;
 
     stop.cancel();

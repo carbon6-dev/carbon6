@@ -2088,6 +2088,8 @@ pub enum StreamMsg {
     Queue {
         queued: Vec<QueuedInput>,
     },
+    /// The history asked for has all been sent; what follows is live.
+    Synced,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

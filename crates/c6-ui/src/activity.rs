@@ -222,8 +222,14 @@ fn MissionCard(id: String) -> impl IntoView {
             if ws.attention.with(|a| a.contains(&id)) { Tracked::Attention } else { Tracked::Pinned }
         }
     };
+    // The stream replays the whole log first; show the card once it has,
+    // so it doesn't scroll through it.
+    let caught_up = feed.synced;
     // The latest words: streaming text, else the last reply or message.
     let tail = Memo::new(move |_| {
+        if !caught_up.get() {
+            return String::new();
+        }
         let live_text = feed.streaming.with(|s| s.text.clone());
         if !live_text.trim().is_empty() {
             return live_text;
@@ -245,6 +251,9 @@ fn MissionCard(id: String) -> impl IntoView {
     });
     // A tool call still waiting for its result.
     let tool = Memo::new(move |_| {
+        if !caught_up.get() {
+            return None;
+        }
         feed.events.with(|evs| {
             let done: std::collections::HashSet<&str> = evs
                 .iter()

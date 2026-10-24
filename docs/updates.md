@@ -117,6 +117,7 @@ The worker checks the manifest's signature again itself, so a compromised head c
    - The new version, once attached, reports `done` (or `rolled_back`, from the old version after a rollback).
    - If a worker isn't back within 10 minutes, it's marked failed. A failed worker doesn't hold up the others; Update now tries it again. Workers that are offline update when they next connect.
 4. **Settings → System** shows each machine's version and update state.
+5. **Open pages notice.** The header always shows the head's version (`GET /api/v1/version`). A page asks again every 30 seconds and when it reconnects. When the head's version is no longer the one the page loaded with, a banner says carbon6 was updated and offers **Reload**.
 
 ## 6. Installing, by how carbon6 was installed
 

@@ -436,6 +436,7 @@ fn build() -> Vec<Op> {
         op!("grants.revoke", "system", "DELETE" "/api/v1/grants/{id}", Destructive, Input::None, "Revokes a grant (or a request for one): nothing more flows; what already crossed stays.", choices = &[("id", "grants.list")]),
         op!("grants.uses", "system", "GET" "/api/v1/grants/{id}/uses", Read, Input::None, "Each use of a grant: when, by whom, what.", choices = &[("id", "grants.list")]),
         op!("realms.list", "system", "GET" "/api/v1/realms", Read, Input::None, "Realms: root (carbon6's administration) and home (your sessions, knowledge and data); each owns its own sessions, action items, memory notes, triggers, secrets and knowledge."),
+        op!("system.version", "system", "GET" "/api/v1/version", Read, Input::None, "The version this head runs: a release (0.3.11) or an edge build of main (0.3.11+git<commit time>.<commit>)."),
         op!("system.updates", "system", "GET" "/api/v1/system/updates", Read, Input::None, "carbon6 releases found on GitHub and how far each machine (the head, each worker) is in updating to one: versions, states, how each was installed."),
         op!("system.updates.check", "system", "POST" "/api/v1/system/updates/check", Write, Input::None, "Looks at GitHub for a newer carbon6 release now."),
         op!("system.updates.apply", "system", "POST" "/api/v1/system/updates/{version}/apply", Write, Input::None, "Updates carbon6 to a release found: the head first, then each worker once its sessions are idle."),

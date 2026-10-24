@@ -525,6 +525,12 @@ pub async fn set_prompt(name: String, body: String) -> Result<(), String> {
     }
 }
 
+/// The version the head runs.
+pub async fn version() -> Result<String, String> {
+    let v: serde_json::Value = json(Request::get("/api/v1/version").send().await).await?;
+    Ok(v["version"].as_str().unwrap_or_default().to_owned())
+}
+
 /// Updating carbon6 from GitHub releases (docs/updates.md).
 pub async fn updates() -> Result<c6_api::Updates, String> {
     json(Request::get("/api/v1/system/updates").send().await).await
