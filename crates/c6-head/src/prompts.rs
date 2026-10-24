@@ -208,9 +208,39 @@ pub async fn compact(st: &HeadState, realm: &str) -> c6_agent::CompactPrompts {
     }
 }
 
-/// The prompts with their defaults, for Settings: root's (or a realm's)
-/// text, and whether it was changed from the default.
+/// The realm a Settings request is for (root's by default).
+fn request_realm() -> String {
+    crate::store::SETTINGS_REALM.try_with(Clone::clone).unwrap_or_else(|_| ROOT.to_owned())
+}
+
+/// A realm's own prompts (its overrides of root's).
+async fn own(st: &HeadState, realm: &str) -> anyhow::Result<Vec<Value>> {
+    crate::lists::read(&st.store.pool, PROMPTS, realm).await
+}
+
+/// The prompts with their defaults, for Settings: root's text and whether
+/// it was changed from the default; in a realm, the text it uses, whether
+/// it sets its own, and root's it follows otherwise.
 pub async fn list(st: &HeadState) -> anyhow::Result<Vec<api::PromptInfo>> {
+    let realm = request_realm();
+    if realm != ROOT {
+        let (mine, roots) = (own(st, &realm).await?, all(st, ROOT).await);
+        let used = all(st, &realm).await;
+        return Ok(DEFAULTS
+            .iter()
+            .map(|p| {
+                let text = |m: &Map<String, Value>| m.get(p.name).and_then(Value::as_str).unwrap_or(p.default).to_owned();
+                api::PromptInfo {
+                    name: p.name.into(),
+                    description: p.description.into(),
+                    body: text(&used),
+                    default: p.default.into(),
+                    edited: mine.iter().any(|e| e["name"] == p.name),
+                    inherited: Some(text(&roots)),
+                }
+            })
+            .collect());
+    }
     let rows = sqlx::query("SELECT fields, updated_by FROM records WHERE realm = ? AND collection = ? ORDER BY position")
         .bind(ROOT)
         .bind(PROMPTS)
@@ -232,6 +262,7 @@ pub async fn list(st: &HeadState) -> anyhow::Result<Vec<api::PromptInfo>> {
                 edited: body != p.default,
                 body,
                 default: p.default.into(),
+                inherited: None,
             }
         })
         .collect())
@@ -241,6 +272,19 @@ pub async fn list(st: &HeadState) -> anyhow::Result<Vec<api::PromptInfo>> {
 /// returns it to following the default).
 pub async fn set(st: &HeadState, name: &str, body: &str) -> anyhow::Result<()> {
     let p = DEFAULTS.iter().find(|p| p.name == name).ok_or_else(|| crate::not_found(format!("no prompt {name:?}")))?;
+    // In a realm: its own text, or (empty) back to following root's.
+    let realm = request_realm();
+    if realm != ROOT {
+        let mut mine: Vec<Value> = own(st, &realm).await?.into_iter().filter(|e| e["name"] != p.name).collect();
+        if !body.trim().is_empty() {
+            mine.push(json!({"name": p.name, "description": p.description, "body": body}));
+        }
+        crate::lists::write(&st.store.pool, PROMPTS, &realm, &mine, "you").await?;
+        if realm == crate::realms::HOME {
+            crate::memex::reload(st).await;
+        }
+        return Ok(());
+    }
     let back_to_default = body.trim().is_empty() || body == p.default;
     let body = if back_to_default { p.default } else { body };
     let fields = json!({"name": p.name, "description": p.description, "body": body});

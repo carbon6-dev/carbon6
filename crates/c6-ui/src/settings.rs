@@ -85,23 +85,8 @@ fn page(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
 
 /// Settings pages of the console (carbon6's administration, and the
 /// defaults every realm inherits); the rest are each realm's own.
-const CONSOLE_PAGES: &[&str] = &[
-    "models",
-    "routing",
-    "assistant",
-    "spending",
-    "account",
-    "updates",
-    "system",
-    "apps",
-    "grants",
-    "imports",
-    "upgrades",
-    "prompts",
-    "web-search",
-    "suggestions",
-    "memex",
-];
+const CONSOLE_PAGES: &[&str] =
+    &["models", "routing", "spending", "account", "updates", "system", "apps", "grants", "imports", "upgrades", "memex"];
 
 pub fn in_console(id: &str) -> bool {
     CONSOLE_PAGES.contains(&id)
@@ -223,6 +208,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "assistant" => view! {
+                        <OwnOrRoot name="assistant" />
                         <crate::assistant::AssistantSettings />
                     }.into_any(),
                     "spending" => view! {
@@ -276,6 +262,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         fields=AGENT_FIELDS
                         examples=agent_examples
                     />
+                        <OwnOrRoot name="subagent-limits" />
                         <SubagentLimitsSetting />
                     }.into_any(),
                     "skills" => view! {
@@ -292,9 +279,11 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         <HooksSetting />
                     }.into_any(),
                     "web-search" => view! {
+                        <OwnOrRoot name="web-search" />
                         <WebSearchSetting />
                     }.into_any(),
                     "suggestions" => view! {
+                        <OwnOrRoot name="suggestions" />
                         <SuggestionsSetting />
                     }.into_any(),
                     "secrets" => view! {
@@ -450,6 +439,92 @@ fn AppearanceSetting() -> impl IntoView {
             <p class="text-xs text-zinc-500">"Kept in this browser, so each device can have its own."</p>
         </section>
     }
+}
+
+/// In a realm, whether a setting is its own or follows root's (set in the
+/// console); changing it here gives the realm its own.
+#[component]
+fn OwnOrRoot(name: &'static str) -> impl IntoView {
+    let Some(realm) = crate::place::realm() else { return ().into_any() };
+    let own = LocalResource::new(move || api::own_setting(name));
+    let error = RwSignal::new(None::<String>);
+    let reset = move |_| {
+        spawn_local(async move {
+            match api::drop_own_setting(name).await {
+                Ok(()) => {
+                    let _ = window().location().reload();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        {move || own.get().and_then(Result::ok).map(|own| {
+            let realm = realm.clone();
+            view! {
+                <div class="flex flex-wrap items-center gap-2 rounded-md bg-zinc-100 px-3 py-2 text-sm text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                    <span class="flex-1">{if own {
+                        format!("Realm {realm} sets this itself.")
+                    } else {
+                        format!("Realm {realm} follows root's (set in the console). Changing it here gives {realm} its own.")
+                    }}</span>
+                    {own.then(|| view! { <button class=format!("{BUTTON_QUIET} text-xs") on:click=reset>"Use root's"</button> })}
+                </div>
+            }
+        })}
+        {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+    }
+    .into_any()
+}
+
+/// In a realm, root's entries of a list it uses as well as its own
+/// (read-only here: the console edits them). A realm's own entry of the
+/// same name replaces root's, so those aren't listed.
+#[component]
+fn Inherited(name: &'static str) -> impl IntoView {
+    let Some(realm) = crate::place::realm() else { return ().into_any() };
+    let key = name.replace('-', "_");
+    let entries = LocalResource::new(move || api::effective_list(realm.clone(), key.clone()));
+    let label = |e: &serde_json::Value| {
+        ["name", "model", "title", "event"]
+            .iter()
+            .find_map(|k| e[*k].as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .unwrap_or_else(|| "(entry)".into())
+    };
+    let what = |e: &serde_json::Value| {
+        ["description", "help", "url", "kind"]
+            .iter()
+            .find_map(|k| e[*k].as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .unwrap_or_default()
+    };
+    view! {
+        {move || entries.get().and_then(Result::ok).map(|all| {
+            let from_root: Vec<serde_json::Value> = all.into_iter().filter(|x| x["from"] != "realm").collect();
+            (!from_root.is_empty()).then(|| view! {
+                <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700">
+                    <summary class="cursor-pointer text-zinc-600 dark:text-zinc-400">
+                        {format!("Also in use, from root ({}): set in the console", from_root.len())}
+                    </summary>
+                    <ul class="mt-2 space-y-1">
+                        {from_root.into_iter().map(|x| {
+                            let e = &x["entry"];
+                            let from = x["from"].as_str().unwrap_or("root").to_owned();
+                            let applies: Vec<String> = e["applies_to"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                            view! {
+                                <li class="flex flex-wrap items-baseline gap-2" title=serde_json::to_string_pretty(e).unwrap_or_default()>
+                                    <span class="font-mono text-xs">{label(e)}</span>
+                                    <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{what(e)}</span>
+                                    {applies.into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
+                                    {(from != "root").then(|| view! { <span class="rounded bg-zinc-100 px-1 text-[11px] text-zinc-500 dark:bg-zinc-800">{from.clone()}</span> })}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </details>
+            })
+        })}
+    }
+    .into_any()
 }
 
 /// Realms (docs/os.md §3): yours, and which workers and connections serve
@@ -962,9 +1037,12 @@ fn Prompts() -> impl IntoView {
         tick.track();
         crate::api::prompts()
     });
+    // A realm's own text replaces root's; root's replaces carbon6's default.
+    let in_realm = crate::place::realm().is_some();
     view! {
         <section class="space-y-3">
             <p class="text-sm text-zinc-500">"Everything carbon6 tells a model is here: what agent sessions start with, how conversations are compacted, what subagents and the assistant are told, how action items are worked on, and how the memex reads your records. Change any of them; {{placeholders}} are filled in. A prompt you have not changed follows carbon6's default when a new version improves it."</p>
+            {in_realm.then(|| view! { <p class="text-sm text-zinc-500">"This realm uses root's text (set in the console) unless it sets its own here."</p> })}
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 Ok(ps) => ps.into_iter().map(|p| {
@@ -983,7 +1061,7 @@ fn Prompts() -> impl IntoView {
                         <details class="rounded-md border border-zinc-200 px-3 py-2 dark:border-zinc-800">
                             <summary class="cursor-pointer select-none text-sm">
                                 <span class="font-mono font-medium">{p.name.clone()}</span>
-                                {p.edited.then(|| view! { <span class="ml-2 rounded bg-amber-100 px-1 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">"edited"</span> })}
+                                {p.edited.then(|| view! { <span class="ml-2 rounded bg-amber-100 px-1 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">{if in_realm { "set here" } else { "edited" }}</span> })}
                                 <span class="ml-2 text-zinc-500">{p.description.clone()}</span>
                             </summary>
                             <div class="mt-2 space-y-2">
@@ -991,7 +1069,7 @@ fn Prompts() -> impl IntoView {
                                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                                 <div class="flex gap-2">
                                     <button class=BUTTON on:click=move |_| save(body.get_untracked())>"Save"</button>
-                                    {p.edited.then(|| view! { <button class=BUTTON_QUIET on:click=move |_| save(String::new())>"Back to the default"</button> })}
+                                    {p.edited.then(|| view! { <button class=BUTTON_QUIET on:click=move |_| save(String::new())>{if in_realm { "Use root's" } else { "Back to the default" }}</button> })}
                                 </div>
                             </div>
                         </details>
@@ -1881,6 +1959,7 @@ fn JsonSetting(
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">{title}</h2>
+            <Inherited name />
             <p class="text-sm text-zinc-500">{help}</p>
             <textarea class=format!("{INPUT} min-h-40 font-mono text-xs") placeholder=example
                 prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
@@ -2013,6 +2092,7 @@ fn HooksSetting() -> impl IntoView {
                 <p class="text-sm text-zinc-500">
                     "Shell commands run on the worker, in the session's folder, at points in every session: to refuse risky tool calls, check work after edits, add context to your messages, or keep the agent going until something passes. New sessions pick up changes."
                 </p>
+                <Inherited name="hooks" />
                 <details class="mt-1 text-sm text-zinc-500">
                     <summary class="cursor-pointer select-none">"How a hook works"</summary>
                     <ul class="mt-1 list-disc space-y-1 pl-5">
@@ -2727,6 +2807,7 @@ fn ListSetting(
                 <h2 class="font-medium">{title}</h2>
                 <p class="text-sm text-zinc-500">{help}</p>
             </div>
+            <Inherited name />
             <div class="space-y-3">
                 <For each=move || rows.get() key=|(id, _)| *id let:row>
                     <ListItem item=row.1 fields on_remove=move || rows.update(|r| r.retain(|(id, _)| *id != row.0)) />

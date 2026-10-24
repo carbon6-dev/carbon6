@@ -246,6 +246,23 @@ pub async fn explorer_map() -> Result<serde_json::Value, String> {
     json(Request::get("/api/v1/explorer/map").send().await).await
 }
 
+/// A settings list as a realm uses it: each entry with where it comes from
+/// (`root`, `realm`, `app:<name>`).
+pub async fn effective_list(realm: String, key: String) -> Result<Vec<serde_json::Value>, String> {
+    json(Request::get(&format!("/api/v1/realms/{}/effective/{}", enc(&realm), enc(&key))).send().await).await
+}
+
+/// Whether this realm sets a per-realm setting itself (else root's applies).
+pub async fn own_setting(name: &'static str) -> Result<bool, String> {
+    let v: serde_json::Value = json(Request::get(&format!("/api/v1/settings/own/{name}")).send().await).await?;
+    Ok(v["own"] == true)
+}
+
+/// This realm goes back to following root's value.
+pub async fn drop_own_setting(name: &'static str) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/settings/own/{name}")).send().await).await
+}
+
 pub async fn realm_summary(realm: String) -> Result<c6_api::RealmSummary, String> {
     json(Request::get(&format!("/api/v1/realms/{}/summary", enc(&realm))).send().await).await
 }

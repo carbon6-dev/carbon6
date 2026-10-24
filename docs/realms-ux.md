@@ -114,7 +114,8 @@ The same shell, with its own nav:
 
 ## 9. As built
 
-- **Realm toggles stay the console's for now:** suggestions, web search, the assistant's settings, subagent limits, the memex's settings and the prompts are carbon6-wide settings today, so they're administration. Making them per realm (root's as defaults) is a later step.
+- **Realm toggles are each realm's, root's by default:** suggestions, web search, the assistant's settings and subagent limits. Root's (set in the console) applies to a realm until its page changes it; the realm's own is kept as `<key>@<realm>`. The page says which, with **Use root's** to go back (`GET`/`DELETE /api/v1/settings/own/{name}`). Prompts work the same way, per prompt. Sessions read the value for their realm. The memex's settings stay the console's: the memex is one service.
+- **Inherited list entries:** a realm's list pages (skills, agents, commands, hooks, MCP servers, policies, budgets…) show root's entries in use there, read-only ("Also in use, from root"); its own entry of the same name replaces one.
 - **The console's lists are root's:** in the console, Settings' list pages (skills, policies, budgets, secrets…) edit root's entries, the defaults every realm inherits. Pages that are each realm's alone (memory, memex folders and scopes, mail, views, triggers, workflows) aren't in the console.
 - **Saved browser state** lives under `c6.<realm>.…` and `c6.admin.…`. Home starts from what was saved before (`c6.…`). The theme and the last place (`c6.place`) are per browser.
 - **Old addresses:** `/` goes to the last place. `/sessions/<id>` asks the head for its realm (root's go to the console). Console settings pages go to the console, anything else to the last place.

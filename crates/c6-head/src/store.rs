@@ -220,6 +220,19 @@ pub async fn check_upgrade(path: &Path) -> anyhow::Result<c6_core::upgrade::Repo
     c6_core::upgrade::check(path, opts, &MIGRATOR, &UPGRADES).await
 }
 
+/// Settings each realm may set for itself; where it hasn't, root's applies
+/// (docs/realms-ux.md §9). A realm's own is kept as `<key>@<realm>`.
+pub const PER_REALM: &[&str] = &["session_suggestions", "web_search", "assistant", "subagent_limits"];
+
+fn own_key(key: &str, realm: &str) -> String {
+    format!("{key}@{realm}")
+}
+
+/// The realm a Settings request is for (none: root's).
+fn request_realm() -> Option<String> {
+    SETTINGS_REALM.try_with(Clone::clone).ok().filter(|r| r != crate::realms::ROOT)
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Ok(Self::open_reporting(path).await?.0)
@@ -702,7 +715,33 @@ impl Store {
             let realm = SETTINGS_REALM.try_with(Clone::clone).unwrap_or_else(|_| l.realm.to_owned());
             return Ok(Some(serde_json::to_string(&crate::lists::read(&self.pool, key, &realm).await?)?));
         }
+        match request_realm().filter(|_| PER_REALM.contains(&key)) {
+            Some(realm) => self.per_realm(key, &realm).await,
+            None => self.raw_setting(key).await,
+        }
+    }
+
+    async fn raw_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
         Ok(sqlx::query("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&self.pool).await?.map(|r| r.get("value")))
+    }
+
+    /// A per-realm setting as `realm` has it: its own, else root's.
+    async fn per_realm(&self, key: &str, realm: &str) -> anyhow::Result<Option<String>> {
+        match self.raw_setting(&own_key(key, realm)).await? {
+            Some(v) => Ok(Some(v)),
+            None => self.raw_setting(key).await,
+        }
+    }
+
+    /// Whether `realm` has its own value of a per-realm setting.
+    pub async fn has_own_setting(&self, key: &str, realm: &str) -> anyhow::Result<bool> {
+        Ok(self.raw_setting(&own_key(key, realm)).await?.is_some())
+    }
+
+    /// Drops `realm`'s own value of a per-realm setting: root's applies.
+    pub async fn drop_own_setting(&self, key: &str, realm: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM settings WHERE key = ?").bind(own_key(key, realm)).execute(&self.pool).await?;
+        Ok(())
     }
 
     /// A system list as `realm` uses it (root's entries and its own), as a
@@ -711,7 +750,10 @@ impl Store {
         if crate::lists::list(key).is_some() {
             return Ok(Some(serde_json::to_string(&crate::lists::effective(&self.pool, key, realm).await?)?));
         }
-        self.setting(key).await
+        if PER_REALM.contains(&key) && realm != crate::realms::ROOT {
+            return self.per_realm(key, realm).await;
+        }
+        self.raw_setting(key).await
     }
 
     /// A system list as an app instance's sessions use it (docs/apps.md
@@ -734,6 +776,10 @@ impl Store {
             let realm = SETTINGS_REALM.try_with(Clone::clone).unwrap_or_else(|_| l.realm.to_owned());
             return crate::lists::write(&self.pool, key, &realm, &entries, "you").await;
         }
+        let key = match request_realm().filter(|_| PER_REALM.contains(&key)) {
+            Some(realm) => own_key(key, &realm),
+            None => key.to_owned(),
+        };
         sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .bind(key)
             .bind(value)

@@ -196,8 +196,11 @@ pub struct PromptInfo {
     pub description: String,
     pub body: String,
     pub default: String,
-    /// Changed from the default.
+    /// Changed from the default (in a realm: set in the realm itself).
     pub edited: bool,
+    /// In a realm, root's text it follows unless it sets its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited: Option<String>,
 }
 
 /// `PUT /api/v1/settings/prompts/{name}`: an empty body (or the default's

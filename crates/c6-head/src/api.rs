@@ -152,6 +152,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
+        .route("/api/v1/settings/own/{name}", get(get_own_setting).delete(drop_own_setting))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
@@ -745,6 +746,45 @@ async fn put_suggestion_settings(State(st): State<Arc<HeadState>>, Json(s): Json
 
 const SESSION_GROUPING: &str = "session_grouping";
 
+/// The per-realm setting behind a Settings page's name.
+fn per_realm_key(name: &str) -> ApiResult<&'static str> {
+    match name {
+        "suggestions" => Ok(crate::suggestions::KEY),
+        "web-search" => Ok(crate::sessions::WEB_SEARCH),
+        "assistant" => Ok(crate::assistant::SETTING),
+        "subagent-limits" => Ok(crate::sessions::SUBAGENT_LIMITS),
+        _ => Err(ApiErr(StatusCode::NOT_FOUND, format!("{name:?} is not a setting a realm sets for itself"))),
+    }
+}
+
+/// Whether the caller's realm sets this itself (else root's applies).
+async fn get_own_setting(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let key = per_realm_key(&name)?;
+    let own = match &caller.realm {
+        Some(r) => st.store.has_own_setting(key, r).await?,
+        None => true,
+    };
+    Ok(Json(serde_json::json!({ "own": own })))
+}
+
+/// The caller's realm goes back to root's value.
+async fn drop_own_setting(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    let key = per_realm_key(&name)?;
+    let Some(r) = &caller.realm else {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "root's is the default every realm inherits; change it instead".into()));
+    };
+    st.store.drop_own_setting(key, r).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Each realm groups its own list.
 fn grouping_key(caller: &Caller) -> String {
     match &caller.realm {
@@ -1040,7 +1080,7 @@ async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api:
 }
 
 async fn get_subagent_limits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SubagentLimits>> {
-    Ok(Json(crate::sessions::subagent_limits(&st).await?))
+    Ok(Json(crate::sessions::subagent_limits(&st, None).await?))
 }
 
 async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api::SubagentLimits>) -> ApiResult<StatusCode> {

@@ -194,16 +194,16 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         return Err(bad_request("ask something"));
     }
     let head_id = st.assistant.head_id().ok_or_else(|| bad_request("the assistant is starting; try again"))?;
-    let (connection_id, model) = crate::assistant::model(st).await?;
+    // The realm it works in: the one you are looking at, else root (all
+    // realms, with administration).
+    let realm = req.realm.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or(crate::realms::ROOT).to_owned();
+    let (connection_id, model) = crate::assistant::model(st, &realm).await?;
     let connection = st.store.connection(&connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
     if connection.kind == "claude_code" {
         return Err(bad_request(
             "the assistant calls models directly: choose an API connection for it (Settings → Assistant), not Claude Code",
         ));
     }
-    // The realm it works in: the one you are looking at, else root (all
-    // realms, with administration).
-    let realm = req.realm.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or(crate::realms::ROOT).to_owned();
     if !crate::realms::exists(st, &realm).await? || realm == crate::realms::COMMONS {
         return Err(bad_request(format!("no realm {realm:?} for the assistant")));
     }
@@ -355,7 +355,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
     let memex = crate::memex::ready(st);
     let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
-    let limits = subagent_limits(st).await?;
+    let limits = subagent_limits(st, Some(&row.realm)).await?;
     // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
     let base = crate::prompts::get(st, "session.base", &row.realm).await;
     let base_prompt =
@@ -379,7 +379,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         secrets_json: serde_json::to_string(&st.store.secrets_for(&row.realm).await?)?,
         labels: row.head_labels(),
         ssh_target: row.ssh_target.clone(),
-        web_search_json: st.store.setting(WEB_SEARCH).await?.unwrap_or_default(),
+        web_search_json: st.store.setting_for(WEB_SEARCH, &row.realm).await?.unwrap_or_default(),
         memories_json: crate::memory::for_sessions_of(st, &row.realm, &row.instance).await?,
         policies_json: with_builtin_policies(st, st.store.setting_in(POLICIES, &row.realm, &row.instance).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
@@ -698,8 +698,14 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
 /// The subagent-limits setting.
 pub const SUBAGENT_LIMITS: &str = "subagent_limits";
 
-pub async fn subagent_limits(st: &HeadState) -> anyhow::Result<api::SubagentLimits> {
-    Ok(st.store.setting(SUBAGENT_LIMITS).await?.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
+/// The limits in `realm` (its own, else root's), or in the realm of the
+/// Settings request (`None`).
+pub async fn subagent_limits(st: &HeadState, realm: Option<&str>) -> anyhow::Result<api::SubagentLimits> {
+    let raw = match realm {
+        Some(r) => st.store.setting_for(SUBAGENT_LIMITS, r).await?,
+        None => st.store.setting(SUBAGENT_LIMITS).await?,
+    };
+    Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
 }
 
 /// Continues a subagent whose last turn did not finish, with the realm's

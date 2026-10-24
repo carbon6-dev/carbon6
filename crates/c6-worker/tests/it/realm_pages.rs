@@ -226,6 +226,44 @@ async fn realm_pages_stay_in_their_realm() {
     let r = http.post(format!("{api}/realms")).bearer_auth(&root).json(&json!({"id": "admin"})).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
+    // 7. A realm's own settings, root's where it has none: the console sets
+    // root's, a realm's page its own, and "use root's" goes back.
+    let get = |path: &'static str, place: &'static str| {
+        let r = send(M::GET, path.into(), Some(place), None);
+        async move { r.await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let put = |path: &'static str, place: &'static str, body: Value| {
+        let r = send(M::PUT, path.into(), Some(place), Some(body));
+        async move { assert!(r.await.unwrap().status().is_success(), "{path} in {place}") }
+    };
+    put("settings/suggestions", "admin", json!({"enabled": false})).await;
+    put("settings/suggestions", "home", json!({"enabled": true})).await;
+    assert_eq!(get("settings/suggestions", "lab").await["enabled"], false, "lab follows root's");
+    assert_eq!(get("settings/suggestions", "home").await["enabled"], true, "home has its own");
+    assert_eq!(
+        (get("settings/own/suggestions", "home").await["own"].clone(), get("settings/own/suggestions", "lab").await["own"].clone()),
+        (json!(true), json!(false))
+    );
+    // Sessions read it for their realm.
+    let used = |realm: &'static str| head.state.store.setting_for("session_suggestions", realm);
+    assert!(used("home").await.unwrap().unwrap().contains("true"));
+    assert!(used("lab").await.unwrap().unwrap().contains("false"));
+    assert!(send(M::DELETE, "settings/own/suggestions".into(), Some("home"), None).await.unwrap().status().is_success());
+    assert_eq!(get("settings/suggestions", "home").await["enabled"], false, "back to root's");
+    // Prompts: lab's own text, home still root's.
+    put("settings/prompts/session.base", "lab", json!({"body": "LAB BASE"})).await;
+    let prompt = |place: &'static str| async move {
+        get("settings/prompts", place).await.as_array().unwrap().iter().find(|p| p["name"] == "session.base").cloned().unwrap()
+    };
+    let (lab, home_p) = (prompt("lab").await, prompt("home").await);
+    assert_eq!((lab["body"].as_str(), lab["edited"].as_bool()), (Some("LAB BASE"), Some(true)));
+    assert_eq!(home_p["edited"], false);
+    assert_ne!(home_p["body"], "LAB BASE");
+    // Root's list entries reach a realm (shown to it read-only).
+    put("settings/skills?realm=root", "admin", json!([{"name": "root-skill", "description": "everyone's", "body": "x"}])).await;
+    let used: Vec<Value> = send(M::GET, "realms/lab/effective/skills".into(), Some("lab"), None).await.unwrap().json().await.unwrap();
+    assert!(used.iter().any(|e| e["from"] == "root" && e["entry"]["name"] == "root-skill"), "{used:?}");
+
     stop.cancel();
     head.shutdown().await.unwrap();
 }

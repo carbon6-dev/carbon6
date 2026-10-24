@@ -1034,8 +1034,9 @@ pub async fn prompt(st: &HeadState, context: &str, realm: &str) -> String {
 
 /// The model for a new conversation: the setting, else the routes for the
 /// label `assistant`, else the default.
-pub async fn model(st: &HeadState) -> anyhow::Result<(String, String)> {
-    let s: api::AssistantSettings = serde_json::from_str(&st.store.setting(SETTING).await?.unwrap_or_default()).unwrap_or_default();
+pub async fn model(st: &HeadState, realm: &str) -> anyhow::Result<(String, String)> {
+    let s: api::AssistantSettings =
+        serde_json::from_str(&st.store.setting_for(SETTING, realm).await?.unwrap_or_default()).unwrap_or_default();
     let (conn, model) = match &s.model {
         Some(m) => {
             let connections = st.store.connections().await?;
