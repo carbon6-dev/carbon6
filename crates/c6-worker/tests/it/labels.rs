@@ -150,3 +150,31 @@ async fn labels_scope_settings() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn session_grouping_is_kept() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_grouping", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let get = async || http.get(&url).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(get().await, json!({"levels": []}), "a flat list at first");
+    let r = http.put(&url).json(&json!({"levels": ["repo:", " client"]})).send().await.unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(get().await, json!({"levels": ["repo", "client"]}), "keys, outermost first");
+    for bad in [json!(["repo", "repo"]), json!([""]), json!(["a b"])] {
+        let r = http.put(&url).json(&json!({ "levels": bad })).send().await.unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+    assert_eq!(get().await, json!({"levels": ["repo", "client"]}));
+    head.shutdown().await.unwrap();
+}

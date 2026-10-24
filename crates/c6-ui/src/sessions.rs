@@ -16,6 +16,7 @@ pub fn SessionsPage() -> impl IntoView {
     let query = RwSignal::new(String::new());
     let status_filter = RwSignal::new(String::new());
     let label_filter = crate::labels::use_filter().0;
+    let grouping = Grouping::load();
 
     view! {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-6">
@@ -44,6 +45,7 @@ pub fn SessionsPage() -> impl IntoView {
                     </select>
                 </div>
                 <crate::labels::LabelFilterBar />
+                <GroupBar grouping />
                 <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || {
                         let q = query.get().to_lowercase();
@@ -69,12 +71,189 @@ pub fn SessionsPage() -> impl IntoView {
                             let msg = if wanted.is_empty() && q.is_empty() { "No sessions yet." } else { "No sessions match." };
                             view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">{msg}</p> }.into_any()
                         } else {
-                            sessions.into_iter().map(|s| view! { <SessionRow s now /> }).collect_view().into_any()
+                            grouped(sessions, &grouping.levels.get(), String::new(), grouping.collapsed, now)
                         }
                     }}
                 </div>
             </section>
         </main>
+    }
+}
+
+/// How the list is grouped: label keys, outermost first, kept in the head
+/// (`session_grouping`), and the groups you folded (in this browser).
+#[derive(Clone, Copy)]
+struct Grouping {
+    levels: RwSignal<Vec<String>>,
+    collapsed: RwSignal<Vec<String>>,
+}
+
+impl Grouping {
+    const FOLDED: &str = "c6.sessions.folded";
+
+    fn load() -> Self {
+        let levels = RwSignal::new(Vec::new());
+        spawn_local(async move {
+            if let Ok(v) = api::get_setting("session_grouping").await
+                && let Ok(g) = serde_json::from_value::<c6_api::SessionGrouping>(v)
+            {
+                levels.set(g.levels);
+            }
+        });
+        let folded = storage_get(Self::FOLDED).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        Grouping { levels, collapsed: RwSignal::new(folded) }
+    }
+
+    fn save(&self, levels: Vec<String>) -> impl std::future::Future<Output = Result<(), String>> + use<> {
+        self.levels.set(levels.clone());
+        api::put_setting("session_grouping", serde_json::json!({ "levels": levels }))
+    }
+
+    fn toggle(collapsed: RwSignal<Vec<String>>, path: &str) {
+        collapsed.update(|c| {
+            if let Some(i) = c.iter().position(|p| p == path) {
+                c.remove(i);
+            } else {
+                c.push(path.to_owned());
+            }
+        });
+        storage_set(Self::FOLDED, &serde_json::to_string(&collapsed.get_untracked()).unwrap_or_default());
+    }
+}
+
+/// A session's value for a label key: its first `key:` label (folders in
+/// their `~/` form).
+fn group_value(s: &Session, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    c6_api::labels::display_labels(&s.auto_labels).iter().chain(s.labels.iter()).find_map(|l| l.strip_prefix(&prefix).map(str::to_owned))
+}
+
+/// The sessions in nested groups, one level per key: most recently active
+/// group first, sessions without the label last.
+fn grouped(sessions: Vec<Session>, levels: &[String], path: String, collapsed: RwSignal<Vec<String>>, now: RwSignal<i64>) -> AnyView {
+    let Some((key, rest)) = levels.split_first() else {
+        return sessions.into_iter().map(|s| view! { <SessionRow s now /> }).collect_view().into_any();
+    };
+    let mut groups: Vec<(Option<String>, Vec<Session>)> = Vec::new();
+    for s in sessions {
+        let v = group_value(&s, key);
+        match groups.iter_mut().find(|(g, _)| *g == v) {
+            Some((_, list)) => list.push(s),
+            None => groups.push((v, vec![s])),
+        }
+    }
+    let latest = |list: &[Session]| list.iter().map(|s| s.updated_at).max().unwrap_or_default();
+    groups.sort_by_key(|(v, list)| (v.is_none(), std::cmp::Reverse(latest(list))));
+    groups
+        .into_iter()
+        .map(|(value, list)| {
+            let here = format!("{path}{key}:{}\u{1f}", value.as_deref().unwrap_or(""));
+            let (count, running) = (list.len(), list.iter().filter(|s| s.status == SessionStatus::Running).count());
+            let name = match &value {
+                Some(v) => view! { <span class="font-mono">{v.clone()}</span> }.into_any(),
+                None => view! { <span class="italic">{format!("no {key}")}</span> }.into_any(),
+            };
+            let folded = {
+                let here = here.clone();
+                Memo::new(move |_| collapsed.with(|c| c.contains(&here)))
+            };
+            let toggle = {
+                let here = here.clone();
+                move |_| Grouping::toggle(collapsed, &here)
+            };
+            let rest = rest.to_vec();
+            view! {
+                <div>
+                    <button class="flex w-full items-center gap-2 bg-zinc-50 py-1.5 pl-3 pr-4 text-left text-xs text-zinc-600 hover:bg-zinc-100 dark:bg-zinc-900/60 dark:text-zinc-400 dark:hover:bg-zinc-900"
+                        on:click=toggle>
+                        <span class="w-3 shrink-0 text-sm text-zinc-500">{move || if folded.get() { "▸" } else { "▾" }}</span>
+                        <span class="shrink-0 text-zinc-400">{format!("{key}:")}</span>
+                        <span class="min-w-0 truncate">{name}</span>
+                        <span class="ml-auto shrink-0 tabular-nums">{count}</span>
+                        {(running > 0).then(|| view! { <span class="shrink-0 text-blue-600 dark:text-blue-400">{format!("{running} running")}</span> })}
+                    </button>
+                    <Show when=move || !folded.get()>
+                        <div class="divide-y divide-zinc-200 border-t border-zinc-200 pl-5 dark:divide-zinc-800 dark:border-zinc-800">
+                            {grouped(list.clone(), &rest, here.clone(), collapsed, now)}
+                        </div>
+                    </Show>
+                </div>
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
+/// "Group by": the levels (remove, or move one out a level) and a key to
+/// add, from the labels your sessions have.
+#[component]
+fn GroupBar(grouping: Grouping) -> impl IntoView {
+    let live = api::live();
+    let error = RwSignal::new(None::<String>);
+    let save = move |levels: Vec<String>| {
+        let done = grouping.save(levels);
+        spawn_local(async move { error.set(done.await.err()) });
+    };
+    let keys = Memo::new(move |_| {
+        let mut keys: Vec<String> = ["repo", "host", "worker", "folder", "model"].map(str::to_owned).to_vec();
+        live.sessions.with(|ss| {
+            for s in ss {
+                for l in &s.labels {
+                    if let Some((k, _)) = l.split_once(':')
+                        && !keys.iter().any(|x| x == k)
+                    {
+                        keys.push(k.to_owned());
+                    }
+                }
+            }
+        });
+        keys
+    });
+    view! {
+        <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <span>"Group by"</span>
+            {move || {
+                let levels = grouping.levels.get();
+                levels.iter().enumerate().map(|(i, k)| {
+                    let (outer, gone) = (levels.clone(), levels.clone());
+                    view! {
+                        {(i > 0).then(|| view! { <span class="text-zinc-400">"›"</span> })}
+                        <span class="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-mono text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">
+                            {(i > 0).then(|| view! {
+                                <button title="Group by this one level further out" on:click=move |_| {
+                                    let mut l = outer.clone();
+                                    l.swap(i - 1, i);
+                                    save(l);
+                                }>"‹"</button>
+                            })}
+                            {k.clone()}
+                            <button title="Stop grouping by this" on:click=move |_| {
+                                let mut l = gone.clone();
+                                l.remove(i);
+                                save(l);
+                            }>"×"</button>
+                        </span>
+                    }
+                }).collect_view()
+            }}
+            <select class=format!("{INPUT} w-auto! py-0.5 text-xs")
+                prop:value=""
+                on:change=move |ev| {
+                    let k = event_target_value(&ev);
+                    if !k.is_empty() {
+                        let mut l = grouping.levels.get_untracked();
+                        l.push(k);
+                        save(l);
+                    }
+                }>
+                <option value="">{move || if grouping.levels.with(Vec::is_empty) { "none" } else { "then by…" }}</option>
+                {move || {
+                    let chosen = grouping.levels.get();
+                    keys.get().into_iter().filter(|k| !chosen.contains(k)).map(|k| { let v = k.clone(); view! { <option value=v>{k}</option> } }).collect_view()
+                }}
+            </select>
+            {move || error.get().map(|e| view! { <span class="text-red-600">{e}</span> })}
+        </div>
     }
 }
 

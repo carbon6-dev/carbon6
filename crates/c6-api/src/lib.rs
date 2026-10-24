@@ -3843,6 +3843,16 @@ impl Default for SuggestionSettings {
     }
 }
 
+/// How the session list is grouped (`/api/v1/settings/session_grouping`):
+/// one level per label key, outermost first (`repo`, then `client`).
+/// Empty: one flat list.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionGrouping {
+    #[serde(default)]
+    pub levels: Vec<String>,
+}
+
 /// When carbon6 updates itself from GitHub releases
 /// (`/api/v1/settings/updates`, docs/updates.md §4).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

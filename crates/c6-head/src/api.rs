@@ -150,6 +150,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
+        .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
@@ -719,6 +720,31 @@ async fn get_suggestion_settings(State(st): State<Arc<HeadState>>) -> ApiResult<
 
 async fn put_suggestion_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::SuggestionSettings>) -> ApiResult<StatusCode> {
     st.store.set_setting(crate::suggestions::KEY, &serde_json::to_string(&s).unwrap_or_default()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+const SESSION_GROUPING: &str = "session_grouping";
+
+async fn get_session_grouping(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionGrouping>> {
+    let raw = st.store.setting(SESSION_GROUPING).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+/// Each level is a label key (`repo`, `client`), at most once.
+async fn put_session_grouping(State(st): State<Arc<HeadState>>, Json(mut g): Json<api::SessionGrouping>) -> ApiResult<StatusCode> {
+    for l in &mut g.levels {
+        *l = l.trim().trim_end_matches(':').to_owned();
+    }
+    let mut seen = std::collections::HashSet::new();
+    for l in &g.levels {
+        if l.is_empty() || l.len() > 64 || !l.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c)) || !seen.insert(l.clone()) {
+            return Err(ApiErr(
+                StatusCode::BAD_REQUEST,
+                format!("{l:?} is not a label key to group by (letters, digits, - _ ., each once)"),
+            ));
+        }
+    }
+    st.store.set_setting(SESSION_GROUPING, &serde_json::to_string(&g).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
