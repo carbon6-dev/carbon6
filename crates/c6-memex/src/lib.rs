@@ -4,6 +4,7 @@
 //! head's `memex.*` calls. See docs/memex.md.
 
 pub mod calendar;
+pub mod chat;
 pub mod claims;
 pub mod contacts;
 pub mod embed;
@@ -844,6 +845,7 @@ impl Memex {
             m if m.starts_with("memex.mail.") || m.starts_with("memex.calendar.") || m.starts_with("memex.contacts.") => {
                 self.google_method(m, params, &allowed).await
             }
+            m if m.starts_with("memex.chat.") => chat::method(self, m, &params, &allowed).await,
             // Which of the mail, calendar and contacts stores this realm
             // uses: an app feeds it, or it holds something (imported mail).
             "memex.feeds" => {
@@ -856,6 +858,7 @@ impl Memex {
                     "mail": fed("mail") || has("SELECT EXISTS (SELECT 1 FROM mail)").await,
                     "calendar": fed("calendar") || has("SELECT EXISTS (SELECT 1 FROM events)").await,
                     "contacts": fed("contacts") || has("SELECT EXISTS (SELECT 1 FROM contacts)").await,
+                    "chat": fed("chat") || has("SELECT EXISTS (SELECT 1 FROM items WHERE kind = 'chat')").await,
                 }))
             }
             // Where the memex's own Google sync was, for moving it to apps.

@@ -341,10 +341,10 @@ async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
         list.insert(
             0,
             serde_json::json!({
-                "name": "Sending mail and invitations needs your approval",
-                "tools": "^(mail_send|MailSend|calendar_create|CalendarCreate|calendar_rsvp|CalendarRsvp)$",
+                "name": "Sending mail, invitations and chat messages needs your approval",
+                "tools": "^(mail_send|MailSend|calendar_create|CalendarCreate|calendar_rsvp|CalendarRsvp|chat_post|ChatPost)$",
                 "action": "ask",
-                "message": "An agent wants to send mail or answer or send an invitation in your name.",
+                "message": "An agent wants to send mail, answer or send an invitation, or post in Slack in your name.",
             }),
         );
     }
@@ -387,6 +387,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         memex_tools: memex,
         memex_mail: memex && scope.iter().any(|k| k == "email"),
         memex_calendar: memex && scope.iter().any(|k| k == "event"),
+        memex_chat: memex && scope.iter().any(|k| k == "chat"),
         prompts_json: crate::prompts::for_worker(st, &row.realm).await,
         seed,
         delegation: None,

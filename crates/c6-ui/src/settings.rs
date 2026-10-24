@@ -63,6 +63,7 @@ const GROUPS: &[(&str, &[Page])] = &[
             ("memex-folders", "Memex folders", "Folders the memex keeps in sync"),
             ("memex-scopes", "Memex scopes", "What sessions may see in the memex"),
             ("mail", "Mail and calendar", "Google accounts"),
+            ("slack", "Slack", "Workspaces mirrored into the memex"),
         ],
     ),
     (
@@ -97,7 +98,7 @@ const LIST_PAGES: &[&str] =
     &["notifications", "budgets", "tools", "commands", "agents", "skills", "hooks", "secrets", "rules", "automation", "workflows", "views"];
 
 /// Each realm's alone: the console has no such defaults to inherit.
-const REALM_ONLY: &[&str] = &["memory", "memex-folders", "memex-scopes", "mail", "views", "triggers", "workflows"];
+const REALM_ONLY: &[&str] = &["memory", "memex-folders", "memex-scopes", "mail", "slack", "views", "triggers", "workflows"];
 
 /// Whether a page is shown on this page: a realm's own pages in a realm;
 /// in the console, its own and the defaults realms inherit.
@@ -367,6 +368,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                     }.into_any(),
                     "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> } }).into_any(),
+                    "slack" => view! { <crate::chat::SlackSettings /> }.into_any(),
                     "updates" => view! {
                         <UpdatesSetting />
                     }.into_any(),

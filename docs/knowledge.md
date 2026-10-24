@@ -62,7 +62,7 @@ They are apps, installed as instances in a realm (apps.md §5), exactly as decks
 - **decks is a service:** it runs when asked and hands its output over (apps.md §10).
 - **Gmail is a mirror:** it keeps a copy of data whose source of truth is elsewhere. It must be the only writer of that copy, which ownership gives it (apps.md §6): the Gmail instance owns its mail items. Archiving, labelling or sending is an operation of the instance, which writes to Gmail and then updates the copy.
 
-memex.md §6 still describes what they do (full history import, incremental sync, both-way changes, Gmail as the source of truth, spam kept out of agents' context, write-back rules for contacts, conflicts settled field by field). What changes is that they're written as packages on the primitives below, so an IMAP, Outlook, CalDAV or CardDAV app is written the same way, and none of them is special.
+Slack is a mirror app on the same primitives (docs/slack.md). memex.md §6 still describes what they do (full history import, incremental sync, both-way changes, Gmail as the source of truth, spam kept out of agents' context, write-back rules for contacts, conflicts settled field by field). What changes is that they're written as packages on the primitives below, so an IMAP, Outlook, CalDAV or CardDAV app is written the same way, and none of them is special.
 
 ### 6.1 The packages
 

@@ -688,6 +688,7 @@ dependencies = [
  "c6-head",
  "c6-llm",
  "c6-memex",
+ "c6-slack",
  "c6-testkit",
  "c6-worker",
  "chrono",
@@ -719,6 +720,17 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "c6-slack"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

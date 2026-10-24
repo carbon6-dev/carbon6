@@ -33,6 +33,12 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/auth/google/callback", get(crate::providers::callback))
         .route("/auth/oauth/callback", get(crate::providers::callback))
         .route("/api/v1/google/client", get(get_google_client).put(put_google_client))
+        .route("/api/v1/slack", get(slack_setup))
+        .route("/api/v1/slack/client", put(slack_client))
+        .route("/api/v1/slack/install", post(slack_install))
+        .route("/api/v1/slack/connect", post(slack_connect))
+        .route("/api/v1/slack/sync", post(slack_sync))
+        .route("/api/v1/slack/accounts/{id}", delete(slack_remove))
         .route("/api/v1/google/connect", post(google_connect))
         .route("/api/v1/google/install", post(google_install))
         .route("/api/v1/settings/session_imports", get(get_session_imports).put(put_session_imports))
@@ -1661,6 +1667,73 @@ async fn google_connect(
     Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, origin.as_deref()).await?})))
 }
 
+/// A page's origin: what it says, else from Host.
+fn page_origin(headers: &HeaderMap) -> Option<String> {
+    headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(headers))
+}
+
+/// Slack (docs/slack.md): a realm's setup, client, app, workspaces.
+async fn slack_setup(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    headers: HeaderMap,
+) -> ApiResult<Json<api::SlackSetup>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::slack::setup(&st, &realm, page_origin(&headers).as_deref()).await?))
+}
+
+async fn slack_client(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(c): Json<api::SlackClientIn>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::slack::set_client(&st, &realm, &c).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn slack_install(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Option<api::Install>>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(crate::slack::install(&st, &realm).await?))
+}
+
+async fn slack_connect(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    Ok(Json(serde_json::json!({"authorize_url": crate::slack::connect(&st, &realm, page_origin(&headers).as_deref()).await?})))
+}
+
+async fn slack_sync(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::slack::sync_now(&st, &realm).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn slack_remove(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let realm = realm_for(&st, &caller, &r).await?;
+    crate::slack::remove(&st, &realm, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Importing sessions from Claude Code and Codex (docs/imports.md).
 async fn get_session_imports(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionImports>> {
     Ok(Json(crate::imports::settings(&st).await?))
@@ -1794,26 +1867,27 @@ async fn memex_rpc(
         Some(x) if !x.trim().is_empty() => realm_for(&st, &caller, &asked).await?,
         _ => caller.memex_realm().to_owned(),
     };
-    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge."].iter().any(|p| r.method.starts_with(p))
-        || r.method.starts_with("memex.media.")
-        || matches!(
-            r.method.as_str(),
-            "memex.google"
-                | "memex.google_sync"
-                | "memex.feeds"
-                | "memex.commitments"
-                | "memex.commitment"
-                | "memex.review"
-                | "memex.review_decide"
-                | "memex.merge"
-                | "memex.summarize"
-                | "memex.graph"
-                | "memex.months"
-                | "memex.timeline"
-                | "memex.related"
-                | "memex.ingest"
-                | "memex.types"
-        );
+    let ok =
+        ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat."].iter().any(|p| r.method.starts_with(p))
+            || r.method.starts_with("memex.media.")
+            || matches!(
+                r.method.as_str(),
+                "memex.google"
+                    | "memex.google_sync"
+                    | "memex.feeds"
+                    | "memex.commitments"
+                    | "memex.commitment"
+                    | "memex.review"
+                    | "memex.review_decide"
+                    | "memex.merge"
+                    | "memex.summarize"
+                    | "memex.graph"
+                    | "memex.months"
+                    | "memex.timeline"
+                    | "memex.related"
+                    | "memex.ingest"
+                    | "memex.types"
+            );
     if !ok {
         return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
     }

@@ -115,7 +115,10 @@ pub async fn connect_many(
         q.append_pair("client_id", &client_id)
             .append_pair("redirect_uri", &redirect)
             .append_pair("response_type", "code")
-            .append_pair("scope", &p.scopes.join(" "))
+            .append_pair(
+                if p.scope_param.is_empty() { "scope" } else { &p.scope_param },
+                &p.scopes.join(if p.scope_separator.is_empty() { " " } else { &p.scope_separator }),
+            )
             .append_pair("state", &state);
         for (k, v) in &p.params {
             q.append_pair(k, v);
@@ -180,26 +183,48 @@ async fn finish(st: &HeadState, realm: &str, instances: &[String], name: &str, c
         .await?
         .json()
         .await?;
-    let access = tokens["access_token"].as_str().ok_or_else(|| anyhow::anyhow!("{name} gave no token: {}", tokens["error"]))?;
-    let refresh = tokens["refresh_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("{name} gave no refresh token (remove carbon6's access in that account and try again)"))?;
-    let (account, display) = if p.userinfo_url.is_empty() {
-        (format!("{name} account"), String::new())
+    let mine = at(&tokens, &p.token_path);
+    let access = mine["access_token"].as_str().ok_or_else(|| anyhow::anyhow!("{name} gave no token: {}", tokens["error"]))?;
+    // Without one, the token doesn't expire (it's kept as is); with an
+    // expiry, it must come with a way to renew it.
+    let refresh = mine["refresh_token"].as_str().unwrap_or_default();
+    if refresh.is_empty() && mine["expires_in"].is_i64() {
+        anyhow::bail!("{name} gave no refresh token (remove carbon6's access in that account and try again)");
+    }
+    let who = if p.userinfo_url.is_empty() {
+        tokens.clone()
     } else {
-        let who: Value = st.http.get(&p.userinfo_url).bearer_auth(access).send().await?.json().await?;
-        let field = if p.account_field.is_empty() { "email" } else { p.account_field.as_str() };
-        let account = who[field].as_str().ok_or_else(|| anyhow::anyhow!("{name} did not say which account this is"))?.to_owned();
-        (account, who["name"].as_str().unwrap_or("").to_owned())
+        st.http.get(&p.userinfo_url).bearer_auth(access).send().await?.json().await?
     };
-    let expires = c6_core::now_ms() + tokens["expires_in"].as_i64().unwrap_or(3600) * 1000;
+    let field = |f: &str, d: &str| if f.is_empty() { d.to_owned() } else { f.to_owned() };
+    let (account, display) = match at(&who, &field(&p.account_field, "email")).as_str() {
+        Some(a) => (a.to_owned(), at(&who, &field(&p.name_field, "name")).as_str().unwrap_or("").to_owned()),
+        None if p.userinfo_url.is_empty() && p.account_field.is_empty() => (format!("{name} account"), String::new()),
+        None => anyhow::bail!("{name} did not say which account this is"),
+    };
+    let expires = expiry(mine, refresh);
     let asked = p.scopes.join(" ");
-    let scopes = tokens["scope"].as_str().unwrap_or(&asked);
+    let scopes = mine["scope"].as_str().unwrap_or(&asked);
     for instance in instances {
         let a = Kept { realm, instance, provider: name, account: &account, name: &display, refresh, access, expires, scopes };
         keep(st, &a, None).await?;
     }
     Ok(account)
+}
+
+/// What's at a dotted path in a JSON value (`""`: the value itself).
+fn at<'v>(v: &'v Value, path: &str) -> &'v Value {
+    path.split('.').filter(|k| !k.is_empty()).fold(v, |v, k| &v[k])
+}
+
+/// When a token expires: its `expires_in`; one that can't be renewed and
+/// says nothing doesn't expire.
+fn expiry(tokens: &Value, refresh: &str) -> i64 {
+    match tokens["expires_in"].as_i64() {
+        Some(s) => c6_core::now_ms() + s * 1000,
+        None if refresh.is_empty() => i64::MAX / 2,
+        None => c6_core::now_ms() + 3600 * 1000,
+    }
 }
 
 /// An account to keep for an app.
@@ -314,9 +339,11 @@ async fn access_token(st: &HeadState, r: &sqlx::sqlite::SqliteRow) -> anyhow::Re
         .await?
         .json()
         .await?;
+    // A renewed token is where the first was, or at the top.
+    let mine = if at(&tokens, &p.token_path)["access_token"].is_string() { at(&tokens, &p.token_path) } else { &tokens };
     let access =
-        tokens["access_token"].as_str().ok_or_else(|| anyhow::anyhow!("{name} refused to refresh the sign-in: {}", tokens["error"]))?;
-    let expires = c6_core::now_ms() + tokens["expires_in"].as_i64().unwrap_or(3600) * 1000;
+        mine["access_token"].as_str().ok_or_else(|| anyhow::anyhow!("{name} refused to refresh the sign-in: {}", tokens["error"]))?;
+    let expires = expiry(mine, &refresh);
     sqlx::query("UPDATE oauth_accounts SET access_token = ?, access_expires = ? WHERE id = ?")
         .bind(st.secrets.encrypt(access)?)
         .bind(expires)

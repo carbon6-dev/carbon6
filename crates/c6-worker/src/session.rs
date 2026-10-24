@@ -1791,6 +1791,11 @@ pub(crate) async fn build_tools(
         tools.push(Arc::new(c6_tools::memex::MailDraft::new(claude)));
         tools.push(Arc::new(c6_tools::memex::MailSend::new(claude)));
     }
+    if spec.memex_chat {
+        tools.push(Arc::new(c6_tools::memex::ChatMessages::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::ChatThread::new(claude)));
+        tools.push(Arc::new(c6_tools::memex::ChatPost::new(claude)));
+    }
     if spec.memex_calendar {
         tools.push(Arc::new(c6_tools::memex::CalendarEvents::new(claude)));
         tools.push(Arc::new(c6_tools::memex::CalendarCreate::new(claude)));

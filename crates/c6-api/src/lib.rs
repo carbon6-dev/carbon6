@@ -650,9 +650,24 @@ pub struct OAuthProvider {
     /// Where to learn which account was connected (with the access token).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub userinfo_url: String,
-    /// Its field naming the account (default: email).
+    /// Its field naming the account (default: email). Without a userinfo
+    /// address, a dotted path into the token response (`team.id`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub account_field: String,
+    /// Its field with the account's display name (default: name), as
+    /// `account_field`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name_field: String,
+    /// Where the tokens are in the token response, if not at its top
+    /// (`authed_user`: a user's token beside an app's).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token_path: String,
+    /// The authorization parameter carrying the scopes (default: scope),
+    /// and what joins them (default: a space).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_param: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_separator: String,
     /// The realm secrets holding your OAuth client's id and secret.
     pub client_id_secret: String,
     pub client_secret_secret: String,
@@ -3312,8 +3327,8 @@ pub struct SessionMatch {
 
 /// What kinds of items there are. Sessions see the default kinds, plus what
 /// their scope rules add.
-pub const MEMEX_KINDS: [&str; 13] =
-    ["session", "output", "web", "note", "document", "paper", "fact", "record", "email", "event", "photo", "video", "spam"];
+pub const MEMEX_KINDS: [&str; 14] =
+    ["session", "output", "web", "note", "document", "paper", "fact", "record", "email", "chat", "event", "photo", "video", "spam"];
 /// What every session may search unless a scope rule says more (facts:
 /// environment knowledge, for every session).
 pub const MEMEX_DEFAULT_SCOPE: [&str; 8] = ["session", "output", "web", "note", "document", "paper", "fact", "record"];
@@ -3924,6 +3939,59 @@ impl Default for SuggestionSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// A realm's Slack setup (`GET /api/v1/slack`, docs/slack.md §3, §7).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SlackSetup {
+    /// Your Slack app's client ID (the realm's, else root's).
+    pub client_id: String,
+    pub has_secret: bool,
+    /// Where Slack sends you back after signing in.
+    pub redirect_uri: String,
+    /// Slack wants that address on HTTPS.
+    pub https: bool,
+    /// The app manifest to make your Slack app from (JSON).
+    pub manifest: String,
+    /// The slack app is installed in the realm; or waiting for your
+    /// approval.
+    pub installed: bool,
+    pub waiting: bool,
+    pub workspaces: Vec<SlackWorkspace>,
+}
+
+/// A connected Slack workspace, and how far its sync is.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SlackWorkspace {
+    /// The head's id for it (to disconnect it).
+    pub id: String,
+    /// Slack's id for the workspace, and its name.
+    pub team: String,
+    pub name: String,
+    pub added_at: UnixMs,
+    /// Conversations you're in, and how many are imported to their start.
+    pub conversations: u64,
+    pub imported: u64,
+    pub people: u64,
+    pub files_waiting: u64,
+    /// Slack asked to slow down: syncing again after this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_at: Option<UnixMs>,
+}
+
+/// `PUT /api/v1/slack/client`: no secret keeps the one kept.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SlackClientIn {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 /// How many things wait on you in a realm (`GET /api/v1/elsewhere`).

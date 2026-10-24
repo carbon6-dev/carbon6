@@ -326,6 +326,10 @@ carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail
   A built-in policy holds `mail_send`, `calendar_create` and `calendar_rsvp` for your approval (switch it off in **Settings → Memex**).
 - **Automations on mail:** the trigger **When mail arrives** starts a template or workflow for matching mail (`mail.received from:@acme.com subject:invoice`), with the message as its input.
 
+### Slack
+
+Each realm can mirror Slack workspaces into its memex, as it does Gmail: every conversation you're in (channels, private channels, DMs and groups), with threads and shared documents, kept current within minutes (edits and deletions too), searchable, and linked to the people your mail knows. **Settings → Slack** walks you through making your own internal Slack app from a manifest (it keeps Slack's normal rate limits, which apps from outside Slack's directory don't), then connecting workspaces. **Chat** (☰) reads conversations and threads, and posts, replies and reacts as you, with a few seconds to undo. Agents in sessions whose memex scope includes `chat` can read conversations and post; their posts wait for your approval. Design: [docs/slack.md](docs/slack.md).
+
 ### Browser
 
 Where the worker's machine has Chrome, Chromium, Brave or Edge (or `C6_CHROME` names one), sessions get a `browser` tool: a headless browser of their own.

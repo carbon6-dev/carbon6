@@ -1,0 +1,284 @@
+{
+  "package": "slack",
+  "version": "1.0.0",
+  "description": "Your Slack in carbon6: every conversation you're in (channels, private channels, DMs and groups) with its threads and shared documents, kept in the memex and searchable; posting, replying and reacting. Messages are other people's words: agents get them as quoted data, and their posts ask first.",
+  "requires": {
+    "slack-api": "^1"
+  },
+  "feeds": [
+    "chat"
+  ],
+  "permissions": {
+    "secrets": [
+      "SLACK_CLIENT_ID",
+      "SLACK_CLIENT_SECRET"
+    ]
+  },
+  "providers": [
+    {
+      "name": "slack",
+      "authorize_url": "https://slack.com/oauth/v2/authorize",
+      "token_url": "https://slack.com/api/oauth.v2.access",
+      "scopes": [
+        "channels:history",
+        "channels:read",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "im:read",
+        "mpim:history",
+        "mpim:read",
+        "users:read",
+        "users:read.email",
+        "team:read",
+        "files:read",
+        "chat:write",
+        "reactions:write",
+        "channels:write",
+        "groups:write",
+        "im:write",
+        "mpim:write"
+      ],
+      "scope_param": "user_scope",
+      "scope_separator": ",",
+      "token_path": "authed_user",
+      "account_field": "team.id",
+      "name_field": "team.name",
+      "client_id_secret": "SLACK_CLIENT_ID",
+      "client_secret_secret": "SLACK_CLIENT_SECRET"
+    }
+  ],
+  "contents": {
+    "collections": [
+      {
+        "name": "slack_sync",
+        "description": "Where each workspace's sync is: its people, each conversation's newest message read and how far back the import is, files waiting, a rate limit's wait.",
+        "schema": {
+          "type": "object",
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "team:<workspace>, or chan:<workspace>:<conversation>"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "The workspace's or conversation's name"
+            },
+            "domain": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "The workspace's address (<domain>.slack.com)"
+            },
+            "users": {
+              "type": "object",
+              "description": "The workspace's people: id to {n: name, e: email}"
+            },
+            "users_at": {
+              "type": "integer"
+            },
+            "files_queue": {
+              "type": "array",
+              "description": "Shared documents waiting to be read"
+            },
+            "retry_after": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "description": "Slack asked to slow down until then"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "description": "public, private, dm or group"
+            },
+            "latest_ts": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "The newest message read"
+            },
+            "oldest_ts": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "How far back the import is"
+            },
+            "import_done": {
+              "type": "boolean"
+            },
+            "skipped": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Why Slack won't show it (you left, it's gone)"
+            },
+            "checked_at": {
+              "type": "integer"
+            },
+            "reread_at": {
+              "type": "integer"
+            },
+            "last_at": {
+              "type": "integer",
+              "description": "When its newest message was posted"
+            },
+            "recent": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "The last week's messages, for spotting deletions"
+            },
+            "threads": {
+              "type": "object",
+              "description": "The last week's threads: thread to its latest reply"
+            },
+            "updated_at": {
+              "type": "integer"
+            }
+          }
+        },
+        "keys": [
+          "key"
+        ],
+        "card": {
+          "stability": "internal",
+          "sources": "The slack kit's syncs.",
+          "freshness": "Every run."
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "name": "slack sync",
+        "trigger": "schedule",
+        "cron": "*/2 * * * *",
+        "action": "kit",
+        "action_params": {
+          "kit": "slack-api",
+          "tool": "sync",
+          "state": [
+            "slack_sync"
+          ]
+        },
+        "per_hour": 90
+      }
+    ]
+  },
+  "operations": [
+    {
+      "name": "post",
+      "description": "Posts a message as you, in a conversation or (with thread_ts) a thread.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "channel",
+          "text"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "thread_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "kit": {
+        "kit": "slack-api",
+        "tool": "post",
+        "state": [
+          "slack_sync"
+        ]
+      }
+    },
+    {
+      "name": "react",
+      "description": "Adds (or with remove, takes back) a reaction to a message.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "channel",
+          "ts",
+          "name"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "remove": {
+            "type": "boolean"
+          }
+        }
+      },
+      "kit": {
+        "kit": "slack-api",
+        "tool": "react"
+      }
+    },
+    {
+      "name": "mark_read",
+      "description": "Marks a conversation read up to a message.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "channel",
+          "ts"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string"
+          }
+        }
+      },
+      "kit": {
+        "kit": "slack-api",
+        "tool": "mark-read"
+      }
+    }
+  ]
+}

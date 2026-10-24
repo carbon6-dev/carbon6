@@ -51,8 +51,16 @@ pub enum Scope {
 /// (a test fails on it; callers treat it as administration).
 pub fn scope(name: &str) -> Option<Scope> {
     use Scope::*;
-    const DEVICE: &[&str] =
-        &["auth.status", "system.version", "push.key", "push.subscribe", "push.unsubscribe", "push.devices", "realms.elsewhere", "sessions.locate"];
+    const DEVICE: &[&str] = &[
+        "auth.status",
+        "system.version",
+        "push.key",
+        "push.subscribe",
+        "push.unsubscribe",
+        "push.devices",
+        "realms.elsewhere",
+        "sessions.locate",
+    ];
     const SHARED: &[&str] = &["workers.list", "connections.list", "connections.models", "commands.list", "realms.list", "hosts.list"];
     // Realm data whose handlers don't narrow to the caller's realm yet
     // (or that are carbon6-wide today): the console's, until they do.
@@ -83,8 +91,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "settings.vocabulary.get",
         "settings.vocabulary.put",
     ];
-    const ADMIN_AREAS: &[&str] =
-        &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants."];
+    const ADMIN_AREAS: &[&str] = &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants."];
     const REALM_AREAS: &[&str] = &[
         "sessions.",
         "decisions.",
@@ -94,6 +101,8 @@ pub fn scope(name: &str) -> Option<Scope> {
         "things.",
         "knowledge.",
         "photos.",
+        "chat.",
+        "slack.",
         "mail.",
         "calendar.",
         "contacts.",
@@ -306,6 +315,7 @@ const AREAS: &[(&str, &str)] = &[
     ),
     ("knowledge", "Memory notes, and the memex: search, notes, trails, documents, settings, folders, review, commitments, graph."),
     ("mail", "Mail, calendar and contacts through the memex's Google accounts."),
+    ("chat", "Chat: Slack workspaces' conversations, messages and threads in the memex; posting through the slack app's operations."),
     ("photos", "Photos and videos in the memex."),
     ("notifications", "Notification channels, web push devices, the public URL for links."),
     ("usage", "Usage, prices and budgets."),
@@ -626,6 +636,18 @@ fn build() -> Vec<Op> {
         op!(memex "google.sync", "mail", "memex.google_sync", Write, r#"{"type":"object"}"#, "Syncs Google accounts now."),
         op!(memex "mail.feeds", "mail", "memex.feeds", Read, r#"{"type":"object"}"#, "Which of mail, calendar and contacts a realm has: an app feeds it, or it holds imported data."),
         op!(memex "mail.threads", "mail", "memex.mail.threads", Read, r#"{"type":"object","properties":{"account":{"type":"string","description":"an account id or address; empty: all"},"view":{"type":"string","description":"inbox (default), needs_reply, waiting, starred, sent, drafts, all, spam, trash, or a Gmail label"},"before":{"type":"integer","description":"ms, for the next page"},"limit":{"type":"integer"}}}"#, "Mail threads in a view (to search mail, use memex.search with kinds email)."),
+        op!("slack.get", "chat", "GET" "/api/v1/slack", Read, Input::Query(schema::<api::InRealm>), "A realm's Slack: whether the slack app is installed, your Slack app's client and the manifest to make one from, and each connected workspace with how far its sync is."),
+        op!("slack.client.put", "chat", "PUT" "/api/v1/slack/client", Write, Input::Body(schema::<api::SlackClientIn>), "Sets the realm's Slack app client (ID and secret, from the app you made from the manifest)."),
+        op!("slack.install", "chat", "POST" "/api/v1/slack/install", Write, Input::Query(schema::<api::InRealm>), "Asks you to install the slack app in the realm (a decision to approve)."),
+        op!("slack.connect", "chat", "POST" "/api/v1/slack/connect", Write, Input::Query(schema::<api::InRealm>), "Where to send you to connect a Slack workspace (Slack's sign-in)."),
+        op!("slack.sync", "chat", "POST" "/api/v1/slack/sync", Write, Input::Query(schema::<api::InRealm>), "Runs the realm's Slack sync now."),
+        op!("slack.accounts.remove", "chat", "DELETE" "/api/v1/slack/accounts/{id}", Destructive, Input::Query(schema::<api::InRealm>), "Disconnects a Slack workspace: its sync stops."),
+        op!(memex "chat.post", "chat", "memex.chat.post", Write, r#"{"type":"object","required":["workspace","channel","text"],"properties":{"workspace":{"type":"string"},"channel":{"type":"string"},"text":{"type":"string"},"thread_ts":{"type":"string"}}}"#, "Posts a message as you in a Slack conversation, or a thread (thread_ts)."),
+        op!(memex "chat.react", "chat", "memex.chat.react", Write, r#"{"type":"object","required":["workspace","channel","ts","name"],"properties":{"workspace":{"type":"string"},"channel":{"type":"string"},"ts":{"type":"string"},"name":{"type":"string"},"remove":{"type":"boolean"}}}"#, "Adds (or removes) a reaction to a Slack message."),
+        op!(memex "chat.mark_read", "chat", "memex.chat.mark_read", Write, r#"{"type":"object","required":["workspace","channel","ts"],"properties":{"workspace":{"type":"string"},"channel":{"type":"string"},"ts":{"type":"string"}}}"#, "Marks a Slack conversation read up to a message."),
+        op!(memex "chat.channels", "chat", "memex.chat.channels", Read, r#"{"type":"object","properties":{}}"#, "Chat conversations (Slack channels, DMs and groups), each workspace's, the most recently active first."),
+        op!(memex "chat.messages", "chat", "memex.chat.messages", Read, r#"{"type":"object","required":["workspace","channel"],"properties":{"workspace":{"type":"string"},"channel":{"type":"string"},"before":{"type":"integer"},"limit":{"type":"integer"}}}"#, "A conversation's messages, newest first, without thread replies (each first message says how many it has)."),
+        op!(memex "chat.thread", "chat", "memex.chat.thread", Read, r#"{"type":"object","required":["workspace","channel","thread_ts"],"properties":{"workspace":{"type":"string"},"channel":{"type":"string"},"thread_ts":{"type":"string"}}}"#, "A thread: its first message and the replies, oldest first."),
         op!(memex "mail.thread", "mail", "memex.mail.thread", Read, r#"{"type":"object","required":["thread_id"],"properties":{"account":{"type":"string"},"thread_id":{"type":"string"}}}"#, "A mail thread with its messages."),
         op!(memex "mail.labels", "mail", "memex.mail.labels", Read, r#"{"type":"object","properties":{"account":{"type":"string"}}}"#, "Gmail labels with counts."),
         op!(memex "mail.modify", "mail", "memex.mail.modify", Write, r#"{"type":"object","required":["thread_id"],"properties":{"account":{"type":"string"},"thread_id":{"type":"string"},"add":{"type":"array","items":{"type":"string"}},"remove":{"type":"array","items":{"type":"string"}}}}"#, "Archives, stars, marks read, labels or trashes a thread (label changes)."),

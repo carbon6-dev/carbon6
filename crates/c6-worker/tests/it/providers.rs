@@ -36,7 +36,16 @@ async fn apps_sign_in_with_their_providers() {
                 }
             }),
         )
-        .route("/me", get(|| async { axum::Json(json!({"email": "ada@example.com", "name": "Ada"})) }));
+        .route("/me", get(|| async { axum::Json(json!({"email": "ada@example.com", "name": "Ada"})) }))
+        // A user token beside an app's, that doesn't expire (Slack's shape).
+        .route(
+            "/user-token",
+            post(|Form(f): Form<std::collections::HashMap<String, String>>| async move {
+                assert_eq!(f.get("code").map(String::as_str), Some("code-2"));
+                axum::Json(json!({"ok": true, "access_token": "app-token", "authed_user": {"id": "U1", "access_token": "user-token", "scope": "read,post"},
+                                  "team": {"id": "T9", "name": "Acme"}}))
+            }),
+        );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await });
@@ -119,6 +128,34 @@ async fn apps_sign_in_with_their_providers() {
     let again = c6_head::providers::tokens_for(&head.state, "home", "mailer").await.unwrap();
     assert!(again[0].1.contains("access-2"));
     assert_eq!(*issued.lock().unwrap(), 2);
+
+    // A provider whose token is the user's, beside the app's: its scopes in
+    // their own parameter, the account from the token's answer, and a token
+    // that doesn't expire (so it is never renewed).
+    let chat = json!({"package": "chatter", "version": "1.0.0",
+        "permissions": {"secrets": ["MAIL_ID", "MAIL_SECRET"]},
+        "providers": [{"name": "chat", "authorize_url": format!("{base}/auth"), "token_url": format!("{base}/user-token"),
+                       "scopes": ["read", "post"], "scope_param": "user_scope", "scope_separator": ",", "token_path": "authed_user",
+                       "account_field": "team.id", "name_field": "team.name",
+                       "client_id_secret": "MAIL_ID", "client_secret_secret": "MAIL_SECRET"}]});
+    ok(send(M::POST, "packages", json!({"manifest": chat})).await).await;
+    let i: Install = serde_json::from_value(ok(send(M::POST, "installs", json!({"package": "chatter"})).await).await).unwrap();
+    ok(send(M::POST, &format!("decisions/{}/answer", i.decision.unwrap()), json!({"option": "Install"})).await).await;
+    let start = ok(send(M::POST, "apps/home/chatter/providers/chat/connect", json!({})).await).await;
+    let url = reqwest::Url::parse(start["authorize_url"].as_str().unwrap()).unwrap();
+    let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!((q.get("user_scope").map(String::as_str), q.get("scope")), (Some("read,post"), None), "{q:?}");
+    let back = http
+        .get(format!("http://127.0.0.1:{}/auth/oauth/callback?code=code-2&state={}", head.ui_addrs[0].port(), q["state"]))
+        .send()
+        .await
+        .unwrap();
+    assert!(back.headers()["location"].to_str().unwrap().contains("oauth=connected"), "{:?}", back.headers());
+    let chats: Vec<OAuthAccount> = serde_json::from_value(ok(send(M::GET, "apps/home/chatter/accounts", json!({})).await).await).unwrap();
+    assert_eq!((chats[0].account.as_str(), chats[0].name.as_str()), ("T9", "Acme"));
+    let env = c6_head::providers::tokens_for(&head.state, "home", "chatter").await.unwrap();
+    assert!(env[0].1.contains("\"user-token\"") && !env[0].1.contains("app-token"), "{}", env[0].1);
+    assert_eq!(*issued.lock().unwrap(), 2, "nothing renewed");
 
     // Disconnecting forgets it.
     ok(send(M::DELETE, &format!("apps/home/mailer/accounts/{}", accounts[0].id), json!({})).await).await;

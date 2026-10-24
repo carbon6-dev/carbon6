@@ -6,6 +6,7 @@ mod api;
 mod assistant;
 mod auth;
 mod calendar;
+mod chat;
 mod collections;
 mod contacts;
 mod decisions;
@@ -204,6 +205,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     // Only what an app feeds in this realm (or it holds).
                     {move || feeds.get().and_then(Result::ok).map(|f| view! {
                         {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=MENU>"Mail"</Go> })}
+                        {(f["chat"] == true).then(|| view! { <Go to=View::Chat class=MENU>"Chat"</Go> })}
                         {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=MENU>"Calendar"</Go> })}
                         {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=MENU>"Contacts"</Go> })}
                     })}

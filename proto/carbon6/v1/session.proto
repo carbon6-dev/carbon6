@@ -481,6 +481,8 @@ message CreateSession {
   // once in one tree. 0: the defaults (3 and 16).
   uint32 max_subagent_depth = 23;
   uint32 max_running_subagents = 24;
+  // The session's scope includes chat (Slack): offer the chat tools.
+  bool memex_chat = 25;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

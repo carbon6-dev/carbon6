@@ -102,6 +102,29 @@ fn default_kinds() -> Vec<Value> {
             ),
         ),
         kind(
+            "chat",
+            "A chat message (Slack and the like). Its created_at is when it was posted; its text has mentions and channel links as names.",
+            obj(
+                json!({
+                    "service": s("Which chat service: slack"), "workspace": s("The workspace's id"),
+                    "workspace_name": s("The workspace's name"), "channel": s("The conversation's id"),
+                    "channel_name": s("The conversation's name: #eng, or the people of a DM"),
+                    "channel_kind": s("public, private, dm or group"), "ts": s("The message's id in its conversation"),
+                    "thread_ts": s("The thread it replies in (its first message's ts)"), "user": s("Who posted it (the service's id)"),
+                    "user_name": s("Their name"), "reply_count": n("Replies, for a thread's first message"),
+                    "reactions": {"type": "object", "description": "Reaction name to count"},
+                    "files": {"type": "array", "description": "Files shared with it: name, mime, size, id"},
+                    "edited": {"type": "boolean"}, "deleted": {"type": "boolean", "description": "Gone from the service; kept here"},
+                }),
+                &["workspace", "channel", "ts"],
+            ),
+            card(
+                "Chat apps (Slack): one item per message, about its channel and the people it's from and mentions.",
+                &["A reply's thread_ts is its thread's first message's ts.", "Messages of one conversation share workspace and channel."],
+                "As often as its app syncs (Slack: minutes).",
+            ),
+        ),
+        kind(
             "attachment",
             "A file attached to an email.",
             obj(
@@ -182,12 +205,16 @@ fn default_kinds() -> Vec<Value> {
     ]
 }
 
+/// The default vocabulary's version: a new one adds the kinds that came
+/// later (3: chat).
+const SEEDED: &str = "3";
+
 /// Puts the default vocabulary in root (your edits are kept): once, and
 /// then the item kinds' schemas and cards, and kinds that came later.
 pub async fn seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let seeded: Option<String> =
         sqlx::query_scalar("SELECT value FROM settings WHERE key = 'vocabulary_seeded'").fetch_optional(pool).await?;
-    if seeded.as_deref() == Some("2") {
+    if seeded.as_deref() == Some(SEEDED) {
         return Ok(());
     }
     let mut entries: Vec<Value> = match seeded {
@@ -207,7 +234,8 @@ pub async fn seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
         }
     }
     crate::lists::write(pool, VOCABULARY, ROOT, &entries, "system").await?;
-    sqlx::query("INSERT INTO settings (key, value) VALUES ('vocabulary_seeded', '2') ON CONFLICT(key) DO UPDATE SET value = '2'")
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('vocabulary_seeded', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .bind(SEEDED)
         .execute(pool)
         .await?;
     Ok(())

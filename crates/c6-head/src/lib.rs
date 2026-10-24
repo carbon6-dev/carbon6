@@ -45,6 +45,7 @@ pub mod search;
 pub mod secrets;
 pub mod series;
 pub mod sessions;
+pub mod slack;
 pub mod store;
 pub mod telemetry;
 pub mod templates;
@@ -255,6 +256,10 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     // Gmail, Calendar and Contacts are packages you can install in a realm.
     if let Err(e) = google::register(&state).await {
         tracing::warn!("listing the Google apps' packages: {e:#}");
+    }
+    // Slack too (docs/slack.md).
+    if let Err(e) = slack::register(&state).await {
+        tracing::warn!("listing the Slack packages: {e:#}");
     }
     // Gmail, Calendar and Contacts the memex synced itself become apps.
     if let Err(e) = google::move_in(&state).await {

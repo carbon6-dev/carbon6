@@ -702,7 +702,7 @@ pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::
 /// has its own); the rest is home's unless a realm's token says otherwise.
 pub async fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let area = method.split('.').nth(1).unwrap_or_default();
-    let per_realm = matches!(area, "mail" | "calendar" | "contacts" | "google" | "google_sync" | "feeds");
+    let per_realm = matches!(area, "mail" | "calendar" | "contacts" | "google" | "google_sync" | "feeds" | "chat");
     let url = format!("/api/v1/memex/rpc{}", if per_realm { in_realm('?') } else { String::new() });
     send_json(Request::post(&url), &serde_json::json!({"method": method, "params": params})).await
 }
@@ -714,6 +714,34 @@ pub fn mail_attachment(item: &str, index: u32) -> String {
 
 pub async fn rpc_as<T: serde::de::DeserializeOwned>(method: &str, params: serde_json::Value) -> Result<T, String> {
     serde_json::from_value(rpc(method, params).await?).map_err(|e| e.to_string())
+}
+
+/// Slack (docs/slack.md): the realm's setup and workspaces.
+pub async fn slack_setup() -> Result<c6_api::SlackSetup, String> {
+    json(Request::get("/api/v1/slack").send().await).await
+}
+
+pub async fn slack_client(client_id: String, client_secret: Option<String>) -> Result<(), String> {
+    let body = c6_api::SlackClientIn { client_id, client_secret };
+    empty(Request::put("/api/v1/slack/client").json(&body).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn slack_install() -> Result<serde_json::Value, String> {
+    json(Request::post("/api/v1/slack/install").send().await).await
+}
+
+/// Where to send you to connect a workspace.
+pub async fn slack_connect() -> Result<String, String> {
+    let v: serde_json::Value = json(Request::post("/api/v1/slack/connect").send().await).await?;
+    v["authorize_url"].as_str().map(str::to_owned).ok_or_else(|| "no address".into())
+}
+
+pub async fn slack_sync() -> Result<(), String> {
+    empty(Request::post("/api/v1/slack/sync").send().await).await
+}
+
+pub async fn slack_remove(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/slack/accounts/{}", enc(&id))).send().await).await
 }
 
 pub async fn google_client() -> Result<c6_api::GoogleClient, String> {

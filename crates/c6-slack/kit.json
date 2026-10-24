@@ -1,0 +1,54 @@
+{
+  "package": "slack-api",
+  "version": "1.0.0",
+  "description": "Slack's Web API, for the slack app: it reaches only Slack, with the user token each run gets.",
+  "permissions": {
+    "files": "session",
+    "network": "hosts",
+    "hosts": [
+      "slack.com",
+      "files.slack.com"
+    ],
+    "cpus": 1,
+    "memory_mb": 512,
+    "timeout_s": 600
+  },
+  "kit": {
+    "build": {
+      "dockerfile": "Dockerfile",
+      "files": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/sync.rs"
+      ]
+    },
+    "tools": [
+      {
+        "name": "sync",
+        "description": "What changed in each workspace since the last run: new messages and replies, the last week read again for edits and deletions, and the import, a page at a time.",
+        "command": ["c6-slack", "sync"],
+        "args": {}
+      },
+      {
+        "name": "post",
+        "description": "Posts a message as you (input: account, channel, text, thread_ts).",
+        "command": ["c6-slack", "post"],
+        "args": {}
+      },
+      {
+        "name": "react",
+        "description": "Adds or removes a reaction (input: account, channel, ts, name, remove).",
+        "command": ["c6-slack", "react"],
+        "args": {}
+      },
+      {
+        "name": "mark-read",
+        "description": "Marks a conversation read up to a message (input: account, channel, ts).",
+        "command": ["c6-slack", "mark-read"],
+        "args": {}
+      }
+    ]
+  }
+}

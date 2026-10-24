@@ -1,6 +1,6 @@
 # Slack in the memex — Design
 
-Status: design (2026-10-24). Decided:
+Status: built (2026-10-24; §11 is what differs). Decided:
 - carbon6 syncs your view of Slack, with a user token;
 - it polls, as Gmail does;
 - posting and replying are operations, held for your approval;
@@ -139,3 +139,20 @@ They fail only when what they check is broken (docs/testing.md):
 - **Enterprise Grid org-wide installs,** and channels you aren't in.
 - **Huddles, canvases and lists.**
 - **Slack Connect channels:** they sync like any channel you're in, but their other organisation's people stay Slack users only, unless their email matches someone you know.
+
+## 11. As built
+
+- **Packages:** the kit is `slack-api` (the app is `slack`, and two packages can't share a name). Both are in `crates/c6-slack`, listed under Packages at start, and installed with your approval. A unit test ties their versions to a digest of their source (`kit.digest`).
+- **Sign-in:** the provider primitive gained `scope_param`, `scope_separator`, `token_path`, `name_field`, and `account_field`/`name_field` as paths into the token's answer when there's no userinfo address. Tokens with no expiry and no refresh token are kept and never renewed. Slack's sign-in comes back to the head's `/auth/oauth/callback`, then to the realm's Settings → Slack.
+- **The client:** Settings → Slack writes the realm's own `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET`; root's apply where a realm has none.
+- **Pace:** each run spends at most 40 requests per workspace.
+  - Conversations with a message in the last week are checked every run; the rest every 15 minutes, in turn.
+  - The last week of active ones is read again every hour.
+  - The import uses what's left, a page at a time (DMs and groups first), and asks to run again at once while it lasts.
+  - A thread's replies are read when it's new, and when its latest reply moves.
+- **Deletions remove the item,** as a mirror should (rather than keep it marked). Only a re-read of the whole week can delete: one cut short by the budget doesn't guess.
+- **Files:** documents Slack calls PDF, Word, Markdown, text, HTML or reStructuredText (up to 40 MB) are downloaded, up to 24 MB a run (the rest wait in the workspace's queue), and read by the extract kit. Other files keep their name, type and size in the message's `meta.files`.
+- **The memex:** `memex.chat.channels`, `memex.chat.messages`, `memex.chat.thread` (an index on `meta`'s workspace and channel), and `memex.chat.post`, `react` and `mark_read` through the app's operations. `memex.feeds` says `chat` once a workspace is connected.
+- **Agents:** the tools `chat_messages`, `chat_thread` and `chat_post` in sessions whose memex scope includes `chat`. The built-in approval policy for sending mail covers `chat_post` too.
+- **The UI:** Settings → Slack (the app, the manifest with a Copy button, the client, workspaces with their import progress, Sync now), and Chat (☰ → Chat once a workspace is connected). Chat shows conversations by workspace, then messages, with a thread on the right. Posting takes back for 5 seconds (Undo). It has quick reactions and Open in Slack, marks conversations read in Slack as you open them, and syncs every 30 seconds while open.
+- **Not done:** members of a channel (`member_of` claims), and unread counts per conversation.
