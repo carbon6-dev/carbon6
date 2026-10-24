@@ -160,7 +160,58 @@ async fn realm_pages_stay_in_their_realm() {
     let all: Vec<Session> = send(M::GET, "sessions".into(), Some("admin"), None).await.unwrap().json().await.unwrap();
     assert_eq!(all.len(), 1);
 
-    // 4. A page that doesn't say where it is gets only this browser's own
+    // 4. What's live and what's counted is the realm's: the live feed, the
+    // analytics, how the list is grouped, the workers it may use.
+    let live = |place: &'static str| {
+        let (url, cookie) = (format!("ws://127.0.0.1:{}/api/v1/live?c6_realm={place}", head.ui_addrs[0].port()), cookie.clone());
+        async move {
+            use futures::StreamExt;
+            use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+            let mut req = url.into_client_request().unwrap();
+            req.headers_mut().insert("cookie", cookie.parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            loop {
+                let Message::Text(t) = c6_testkit::within("a live message", ws.next()).await.unwrap().unwrap() else { continue };
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "sessions" {
+                    return v["sessions"].as_array().unwrap().len();
+                }
+            }
+        }
+    };
+    assert_eq!((live("lab").await, live("home").await), (0, 1));
+    let turns = |place: &'static str| {
+        let r = send(M::GET, "analytics?days=1".into(), Some(place), None);
+        async move { r.await.unwrap().json::<Value>().await.unwrap()["total"]["turns"].as_u64().unwrap() }
+    };
+    assert_eq!(turns("lab").await, 0);
+    assert!(turns("home").await >= 1);
+    assert!(
+        send(M::PUT, "settings/session_grouping".into(), Some("home"), Some(json!({"levels": ["repo"]})))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let lab_grouping: Value = send(M::GET, "settings/session_grouping".into(), Some("lab"), None).await.unwrap().json().await.unwrap();
+    assert_eq!(lab_grouping, json!({"levels": []}));
+    let wid = worker.identity.meta.worker_id.0.to_string();
+    seed(M::PUT, &format!("workers/{wid}/realms"), json!({"realms": ["home"]})).await;
+    let lab_workers: Vec<Value> = send(M::GET, "workers".into(), Some("lab"), None).await.unwrap().json().await.unwrap();
+    assert!(lab_workers.is_empty(), "{lab_workers:?}");
+    let r = send(M::GET, format!("workers/{wid}/fs/list?path=/"), Some("lab"), None).await.unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    assert!(send(M::GET, format!("workers/{wid}/fs/list?path=/"), Some("home"), None).await.unwrap().status().is_success());
+
+    // 5. Other realms: a count each, no more; and an old link finds its realm.
+    let elsewhere: Vec<Value> = send(M::GET, "elsewhere".into(), Some("lab"), None).await.unwrap().json().await.unwrap();
+    let waiting = |id: &str| elsewhere.iter().find(|r| r["id"] == id).map(|r| r["waiting"].as_u64().unwrap());
+    assert_eq!((waiting("home"), waiting("lab"), waiting("root")), (Some(1), Some(0), None), "{elsewhere:?}");
+    assert!(!serde_json::to_string(&elsewhere).unwrap().contains(MARK));
+    let at: Value = send(M::GET, format!("locate/sessions/{}", s.id), Some("lab"), None).await.unwrap().json().await.unwrap();
+    assert_eq!(at["realm"], "home");
+
+    // 6. A page that doesn't say where it is gets only this browser's own
     // business; nor can it claim root, or a realm that isn't there.
     assert_eq!(send(M::GET, "sessions".into(), None, None).await.unwrap().status(), StatusCode::BAD_REQUEST);
     assert!(send(M::GET, "version".into(), None, None).await.unwrap().status().is_success());

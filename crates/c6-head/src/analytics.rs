@@ -143,8 +143,9 @@ fn peak(spans: &[(i64, i64)]) -> u64 {
 }
 
 /// `GET /api/v1/analytics`: the last `days` days, for sessions with
-/// `filter`, grouped by the label key `by`.
-pub async fn report(st: &HeadState, days: u32, filter: &[String], by: &str) -> anyhow::Result<api::AnalyticsReport> {
+/// `filter` (and in `realm`, for a realm's caller), grouped by the label
+/// key `by`.
+pub async fn report(st: &HeadState, days: u32, filter: &[String], by: &str, realm: Option<&str>) -> anyhow::Result<api::AnalyticsReport> {
     let days = days.clamp(1, 366);
     let since = crate::usage::period_start("day", Local::now()) - Duration::days(days as i64 - 1);
     let since_ms = since.timestamp_millis();
@@ -160,7 +161,7 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], by: &str) -> a
         }
         let g = sessions.get(st, id).await.and_then(|s| {
             let labels = s.all_labels();
-            api::labels::applies(filter, &labels).then(|| {
+            (api::labels::applies(filter, &labels) && realm.is_none_or(|r| r == s.realm)).then(|| {
                 api::labels::display_labels(&labels).iter().find_map(|l| l.strip_prefix(&prefix).map(str::to_owned)).unwrap_or_default()
             })
         });

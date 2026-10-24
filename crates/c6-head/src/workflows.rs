@@ -538,14 +538,19 @@ pub async fn get(st: &HeadState, id: &str) -> anyhow::Result<api::WorkflowRun> {
     Ok(row_to_api(&r))
 }
 
-/// Latest runs, newest first (of one workflow, or all).
-pub async fn runs(st: &HeadState, workflow: Option<&str>, limit: u32) -> anyhow::Result<Vec<api::WorkflowRun>> {
-    let rows = sqlx::query("SELECT * FROM workflow_runs WHERE (? IS NULL OR workflow = ?) ORDER BY started_at DESC LIMIT ?")
-        .bind(workflow)
-        .bind(workflow)
-        .bind(limit.clamp(1, 200) as i64)
-        .fetch_all(&st.store.pool)
-        .await?;
+/// Latest runs, newest first (of one workflow, or all; of one realm, or
+/// every realm's).
+pub async fn runs(st: &HeadState, workflow: Option<&str>, realm: Option<&str>, limit: u32) -> anyhow::Result<Vec<api::WorkflowRun>> {
+    let rows = sqlx::query(
+        "SELECT * FROM workflow_runs WHERE (? IS NULL OR workflow = ?) AND (? IS NULL OR realm = ?) ORDER BY started_at DESC LIMIT ?",
+    )
+    .bind(workflow)
+    .bind(workflow)
+    .bind(realm)
+    .bind(realm)
+    .bind(limit.clamp(1, 200) as i64)
+    .fetch_all(&st.store.pool)
+    .await?;
     Ok(rows.iter().map(row_to_api).collect())
 }
 

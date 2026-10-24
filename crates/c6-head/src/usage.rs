@@ -450,8 +450,9 @@ fn report_label(l: &str) -> bool {
     }
 }
 
-/// `GET /api/v1/usage`: the last `days` days, for sessions with `filter`.
-pub async fn report(st: &HeadState, days: u32, filter: &[String]) -> anyhow::Result<api::UsageReport> {
+/// `GET /api/v1/usage`: the last `days` days, for sessions with `filter`
+/// (and in `realm`, for a realm's caller).
+pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<&str>) -> anyhow::Result<api::UsageReport> {
     let days = days.clamp(1, 366);
     let since = period_start("day", Local::now()) - Duration::days(days as i64 - 1);
     let prices = prices(st).await?;
@@ -464,7 +465,7 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String]) -> anyhow::Res
     for c in calls_since(st, since.timestamp_millis()).await? {
         let Some(s) = sessions.get(st, &c.session_id).await.cloned() else { continue };
         let labels = s.all_labels();
-        if !api::labels::applies(filter, &labels) {
+        if !api::labels::applies(filter, &labels) || realm.is_some_and(|r| r != s.realm) {
             continue;
         }
         let cost = c.cost(&prices);
@@ -501,7 +502,8 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String]) -> anyhow::Res
     };
     let mut budget_status = Vec::new();
     let mut spent_sessions = Sessions::default();
-    for (b, r) in all_budgets(st).await? {
+    // A realm sees root's budgets and its own.
+    for (b, r) in all_budgets(st).await?.into_iter().filter(|(_, r)| realm.is_none() || r.is_none() || r.as_deref() == realm) {
         let spent = spent(st, &b, &r, &prices, &mut spent_sessions).await?;
         budget_status.push(api::BudgetStatus {
             blocking: b.enabled && b.action == "block" && spent >= b.limit,

@@ -3923,6 +3923,16 @@ impl Default for SuggestionSettings {
     }
 }
 
+/// How many things wait on you in a realm (`GET /api/v1/elsewhere`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RealmWaiting {
+    pub id: String,
+    pub name: String,
+    /// Open decisions and approvals.
+    pub waiting: u64,
+}
+
 /// How the session list is grouped (`/api/v1/settings/session_grouping`):
 /// one level per label key, outermost first (`repo`, then `client`).
 /// Empty: one flat list.

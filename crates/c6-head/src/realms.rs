@@ -21,15 +21,23 @@ pub const COMMONS: &str = "commons";
 pub struct Caller {
     /// `None`: every realm (you, or a root token).
     pub realm: Option<String>,
+    /// Your browser (a realm's page or the console), not a token: it may
+    /// learn what waits in other realms (docs/realms-ux.md §6).
+    pub browser: bool,
 }
 
 impl Caller {
     pub fn root() -> Self {
-        Self { realm: None }
+        Self { realm: None, browser: false }
     }
 
     pub fn in_realm(realm: &str) -> Self {
-        Self { realm: Some(realm.to_owned()) }
+        Self { realm: Some(realm.to_owned()), browser: false }
+    }
+
+    /// Whether the caller may learn about realms other than its own.
+    pub fn sees_others(&self) -> bool {
+        self.realm.is_none() || self.browser
     }
 
     /// The realm whose memex knowledge the caller works with: its own, or
@@ -133,6 +141,16 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         ["decisions", id, ..] if *id != "count" => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,
         ["automations" | "triggers", id, ..] => owned("triggers", "trigger", (*id).to_owned()).await,
+        ["workflows", "runs", id, ..] => owned("workflow_runs", "workflow run", (*id).to_owned()).await,
+        // A worker's files and terminals: only on a worker serving it.
+        ["workers", id, ..] => {
+            let realms: Option<String> =
+                sqlx::query_scalar("SELECT realms FROM workers WHERE id = ?").bind(*id).fetch_optional(&st.store.pool).await.ok().flatten();
+            match realms {
+                Some(r) if available(&r, realm) => Ok(()),
+                _ => Err((StatusCode::NOT_FOUND, "no such worker".into())),
+            }
+        }
         // Its own realm in the explorer, and its own apps.
         ["realms", id, ..] | ["apps", id, ..] if *id != realm => Err((StatusCode::NOT_FOUND, "no such realm".into())),
         // Everything else narrows to the caller's realm itself: lists,
@@ -256,6 +274,12 @@ pub async fn set_availability(st: &HeadState, table: &'static str, id: &str, rea
 /// Whether a worker or connection with these realms serves `realm`.
 pub fn available(realms_json: &str, realm: &str) -> bool {
     let realms: Vec<String> = serde_json::from_str(realms_json).unwrap_or_default();
+    serves(&realms, realm)
+}
+
+/// Whether a worker or connection kept to `realms` (none: every realm)
+/// serves `realm`.
+pub fn serves(realms: &[String], realm: &str) -> bool {
     realms.is_empty() || realms.iter().any(|r| r == realm)
 }
 

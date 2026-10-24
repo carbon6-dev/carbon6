@@ -164,6 +164,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/system/updates", get(get_updates))
         .route("/api/v1/version", get(get_version))
+        .route("/api/v1/elsewhere", get(get_elsewhere))
+        .route("/api/v1/locate/sessions/{id}", get(locate_session))
         .route("/api/v1/system/updates/check", post(check_updates))
         .route("/api/v1/system/updates/{version}/apply", post(apply_update))
         .route("/api/v1/system/updates/{version}/skip", post(skip_update))
@@ -286,8 +288,17 @@ pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>
         .collect())
 }
 
-async fn list_workers(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Worker>>> {
-    Ok(Json(workers_snapshot(&st).await?))
+async fn list_workers(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Worker>>> {
+    Ok(Json(workers_for(&st, &caller).await?))
+}
+
+/// The workers a caller may use: a realm's, those serving it.
+async fn workers_for(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Worker>> {
+    let mut workers = workers_snapshot(st).await?;
+    if let Some(realm) = &caller.realm {
+        workers.retain(|w| crate::realms::serves(&w.realms, realm));
+    }
+    Ok(workers)
 }
 
 /// Creates a one-time enrollment and returns its token.
@@ -324,16 +335,19 @@ async fn delete_worker(State(st): State<Arc<HeadState>>, Path(id): Path<String>)
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn live(State(st): State<Arc<HeadState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| live_socket(st, socket))
+async fn live(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| live_socket(st, caller, socket))
 }
 
-async fn live_socket(st: Arc<HeadState>, mut socket: WebSocket) {
+/// The fleet and the sessions as they change: a realm's page gets its own
+/// sessions and the workers it may use.
+async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) {
     let mut changes = st.registry.subscribe();
     loop {
         changes.borrow_and_update();
-        let Ok(workers) = workers_snapshot(&st).await else { return };
-        let Ok(sessions) = sessions_snapshot(&st).await else { return };
+        let Ok(workers) = workers_for(&st, &caller).await else { return };
+        let Ok(mut sessions) = sessions_snapshot(&st).await else { return };
+        sessions.retain(|s| caller.sees(&s.realm));
         for ev in [api::LiveEvent::Workers { workers }, api::LiveEvent::Sessions { sessions }] {
             let Ok(text) = serde_json::to_string(&ev) else { return };
             if socket.send(Message::Text(text.into())).await.is_err() {
@@ -371,8 +385,13 @@ fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
     }
 }
 
-async fn list_connections(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Connection>>> {
-    Ok(Json(st.store.connections().await?.into_iter().map(connection_view).collect()))
+/// The connections a caller may use: a realm's, those serving it.
+async fn list_connections(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Connection>>> {
+    let mut all: Vec<api::Connection> = st.store.connections().await?.into_iter().map(connection_view).collect();
+    if let Some(realm) = &caller.realm {
+        all.retain(|c| crate::realms::serves(&c.realms, realm));
+    }
+    Ok(Json(all))
 }
 
 async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateConnection>) -> ApiResult<Json<api::Connection>> {
@@ -726,13 +745,28 @@ async fn put_suggestion_settings(State(st): State<Arc<HeadState>>, Json(s): Json
 
 const SESSION_GROUPING: &str = "session_grouping";
 
-async fn get_session_grouping(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionGrouping>> {
-    let raw = st.store.setting(SESSION_GROUPING).await?.unwrap_or_default();
+/// Each realm groups its own list.
+fn grouping_key(caller: &Caller) -> String {
+    match &caller.realm {
+        Some(r) => format!("{SESSION_GROUPING}:{r}"),
+        None => SESSION_GROUPING.to_owned(),
+    }
+}
+
+async fn get_session_grouping(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<api::SessionGrouping>> {
+    let raw = st.store.setting(&grouping_key(&caller)).await?.unwrap_or_default();
     Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
 }
 
 /// Each level is a label key (`repo`, `client`), at most once.
-async fn put_session_grouping(State(st): State<Arc<HeadState>>, Json(mut g): Json<api::SessionGrouping>) -> ApiResult<StatusCode> {
+async fn put_session_grouping(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(mut g): Json<api::SessionGrouping>,
+) -> ApiResult<StatusCode> {
     for l in &mut g.levels {
         *l = l.trim().trim_end_matches(':').to_owned();
     }
@@ -745,7 +779,7 @@ async fn put_session_grouping(State(st): State<Arc<HeadState>>, Json(mut g): Jso
             ));
         }
     }
-    st.store.set_setting(SESSION_GROUPING, &serde_json::to_string(&g).map_err(anyhow::Error::from)?).await?;
+    st.store.set_setting(&grouping_key(&caller), &serde_json::to_string(&g).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1598,6 +1632,38 @@ async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api
 }
 
 /// The version this head runs (the UI shows it, and notices when it changes).
+/// What waits on you in each realm (docs/realms-ux.md §6): counts only,
+/// for the realm switcher. A realm's token learns only about its own.
+async fn get_elsewhere(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmWaiting>>> {
+    let mut out = Vec::new();
+    for r in crate::realms::list(&st, &Caller::root()).await? {
+        if r.id == crate::realms::ROOT || !(caller.sees_others() || caller.sees(&r.id)) {
+            continue;
+        }
+        let decisions = crate::decisions::open_count(&st, &Caller::in_realm(&r.id)).await?;
+        let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE realm = ? AND awaiting > 0 AND archived = 0")
+            .bind(&r.id)
+            .fetch_one(&st.store.pool)
+            .await
+            .map_err(anyhow::Error::from)?;
+        out.push(api::RealmWaiting { id: r.id, name: r.name, waiting: (decisions + approvals).max(0) as u64 });
+    }
+    Ok(Json(out))
+}
+
+/// The realm a session is in, for links from before realms had their own
+/// pages (`/sessions/<id>`).
+async fn locate_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    match crate::realms::of_session(&st, &id).await? {
+        Some(realm) if caller.sees_others() || caller.sees(&realm) => Ok(Json(serde_json::json!({"realm": realm}))),
+        _ => Err(ApiErr(StatusCode::NOT_FOUND, "no such session".into())),
+    }
+}
+
 async fn get_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({"version": c6_core::build()}))
 }
@@ -1960,12 +2026,15 @@ async fn put_workflows(State(st): State<Arc<HeadState>>, Json(w): Json<Vec<api::
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Runs a workflow of the caller's realm (yours: home's).
 async fn run_workflow(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Path(name): Path<String>,
     Json(r): Json<api::RunWorkflow>,
 ) -> ApiResult<Json<api::WorkflowRun>> {
-    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual", crate::realms::HOME).await?))
+    let realm = caller.realm_for_new(None)?;
+    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual", &realm).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -1978,9 +2047,11 @@ pub(crate) struct WorkflowRunsQuery {
 
 async fn list_workflow_runs(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<WorkflowRunsQuery>,
 ) -> ApiResult<Json<Vec<api::WorkflowRun>>> {
-    Ok(Json(crate::workflows::runs(&st, q.workflow.as_deref().filter(|w| !w.is_empty()), q.limit.unwrap_or(20)).await?))
+    let workflow = q.workflow.as_deref().filter(|w| !w.is_empty());
+    Ok(Json(crate::workflows::runs(&st, workflow, caller.realm.as_deref(), q.limit.unwrap_or(20)).await?))
 }
 
 async fn get_workflow_run(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::WorkflowRun>> {
@@ -2059,9 +2130,13 @@ pub(crate) struct UsageQuery {
     labels: String,
 }
 
-async fn get_usage(State(st): State<Arc<HeadState>>, Query(q): Query<UsageQuery>) -> ApiResult<Json<api::UsageReport>> {
+async fn get_usage(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<UsageQuery>,
+) -> ApiResult<Json<api::UsageReport>> {
     let filter = api::labels::parse_labels(&q.labels);
-    Ok(Json(crate::usage::report(&st, q.days.unwrap_or(30), &filter).await?))
+    Ok(Json(crate::usage::report(&st, q.days.unwrap_or(30), &filter, caller.realm.as_deref()).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -2075,9 +2150,13 @@ pub(crate) struct AnalyticsQuery {
     by: String,
 }
 
-async fn get_analytics(State(st): State<Arc<HeadState>>, Query(q): Query<AnalyticsQuery>) -> ApiResult<Json<api::AnalyticsReport>> {
+async fn get_analytics(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<AnalyticsQuery>,
+) -> ApiResult<Json<api::AnalyticsReport>> {
     let filter = api::labels::parse_labels(&q.labels);
-    Ok(Json(crate::analytics::report(&st, q.days.unwrap_or(30), &filter, &q.by).await?))
+    Ok(Json(crate::analytics::report(&st, q.days.unwrap_or(30), &filter, &q.by, caller.realm.as_deref()).await?))
 }
 
 async fn get_channels(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::Channel>>> {
@@ -2426,7 +2505,15 @@ async fn static_asset(uri: Uri) -> Response {
 
 // --- The assistant and the operation catalog ----------------------------------
 
-async fn ask_assistant(State(st): State<Arc<HeadState>>, Json(req): Json<api::AskAssistant>) -> ApiResult<Json<api::Session>> {
+/// An assistant conversation: a realm's page gets that realm's assistant.
+async fn ask_assistant(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(mut req): Json<api::AskAssistant>,
+) -> ApiResult<Json<api::Session>> {
+    if let Some(realm) = &caller.realm {
+        req.realm = Some(realm.clone());
+    }
     Ok(Json(crate::sessions::create_assistant(&st, req).await?))
 }
 

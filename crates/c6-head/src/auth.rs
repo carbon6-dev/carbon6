@@ -258,7 +258,7 @@ impl Store {
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
             sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
         }
-        Ok(Some(crate::realms::Caller { realm: row.get("realm") }))
+        Ok(Some(crate::realms::Caller { realm: row.get("realm"), browser: false }))
     }
 
     async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
@@ -440,7 +440,7 @@ fn browser_place(req: &Request) -> Option<String> {
 async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Next) -> Response {
     use crate::realms::Caller;
     if place == ADMIN_PLACE {
-        req.extensions_mut().insert(Caller::root());
+        req.extensions_mut().insert(Caller { browser: true, ..Caller::root() });
         return next.run(req).await;
     }
     let refuse = |status: StatusCode, error: String| (status, Json(api::ApiError { error })).into_response();
@@ -449,7 +449,7 @@ async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Ne
         Ok(_) => return refuse(StatusCode::BAD_REQUEST, format!("no realm {place:?}")),
         Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
-    let caller = Caller::in_realm(&place);
+    let caller = Caller { browser: true, ..Caller::in_realm(&place) };
     if let Err((status, error)) = crate::realms::admit(st, &caller, req.method(), req.uri().path()).await {
         return refuse(status, error);
     }
@@ -812,14 +812,14 @@ mod tests {
         let get = |path: &str, cookie: Option<&str>| {
             let mut r = http.get(format!("{api}{path}"));
             if let Some(c) = cookie {
-                r = r.header("cookie", c);
+                r = r.header("cookie", c).header("x-c6-realm", super::ADMIN_PLACE);
             }
             r.send()
         };
         let post = |path: &str, cookie: Option<&str>, body: Value| {
             let mut r = http.post(format!("{api}{path}")).json(&body);
             if let Some(c) = cookie {
-                r = r.header("cookie", c);
+                r = r.header("cookie", c).header("x-c6-realm", super::ADMIN_PLACE);
             }
             r.send()
         };
@@ -849,7 +849,11 @@ mod tests {
         // Rename it.
         let id = webauthn::encode(&key.id);
         let rename = |name: &str| {
-            http.patch(format!("{api}/auth/passkeys/{id}")).header("cookie", &link_session).json(&json!({"name": name})).send()
+            http.patch(format!("{api}/auth/passkeys/{id}"))
+                .header("cookie", &link_session)
+                .header("x-c6-realm", super::ADMIN_PLACE)
+                .json(&json!({"name": name}))
+                .send()
         };
         assert_eq!(rename("  ").await.unwrap().status(), StatusCode::BAD_REQUEST);
         assert_eq!(rename("Google Password Manager").await.unwrap().status(), StatusCode::NO_CONTENT);
@@ -906,6 +910,7 @@ mod tests {
         assert_eq!(mine["method"], "passkey");
         http.delete(format!("{api}/auth/sessions/{}", mine["id"].as_str().unwrap()))
             .header("cookie", &passkey_session)
+            .header("x-c6-realm", super::ADMIN_PLACE)
             .send()
             .await
             .unwrap();
@@ -954,6 +959,7 @@ mod tests {
         let created: Value = http
             .post(format!("{api}/auth/tokens"))
             .header("cookie", &c)
+            .header("x-c6-realm", super::ADMIN_PLACE)
             .json(&json!({"name": "ci"}))
             .send()
             .await
@@ -973,11 +979,20 @@ mod tests {
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 
         // Listed without the secret; revoked, it stops working.
-        let list: Value = http.get(format!("{api}/auth/tokens")).header("cookie", &c).send().await.unwrap().json().await.unwrap();
+        let list: Value = http
+            .get(format!("{api}/auth/tokens"))
+            .header("cookie", &c)
+            .header("x-c6-realm", super::ADMIN_PLACE)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(list[0]["name"], "ci");
         assert!(list[0].get("token").is_none());
         let id = list[0]["id"].as_str().unwrap();
-        http.delete(format!("{api}/auth/tokens/{id}")).header("cookie", &c).send().await.unwrap();
+        http.delete(format!("{api}/auth/tokens/{id}")).header("cookie", &c).header("x-c6-realm", super::ADMIN_PLACE).send().await.unwrap();
         assert_eq!(with("/sessions", &token).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         head.shutdown().await.unwrap();
     }

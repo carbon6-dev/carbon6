@@ -51,7 +51,8 @@ pub enum Scope {
 /// (a test fails on it; callers treat it as administration).
 pub fn scope(name: &str) -> Option<Scope> {
     use Scope::*;
-    const DEVICE: &[&str] = &["auth.status", "system.version", "push.key", "push.subscribe", "push.unsubscribe", "push.devices"];
+    const DEVICE: &[&str] =
+        &["auth.status", "system.version", "push.key", "push.subscribe", "push.unsubscribe", "push.devices", "realms.elsewhere", "sessions.locate"];
     const SHARED: &[&str] = &["workers.list", "connections.list", "connections.models", "commands.list", "realms.list", "hosts.list"];
     // Realm data whose handlers don't narrow to the caller's realm yet
     // (or that are carbon6-wide today): the console's, until they do.
@@ -61,10 +62,6 @@ pub fn scope(name: &str) -> Option<Scope> {
         "imports.settings.put",
         "sessions.suggestions.settings.get",
         "sessions.suggestions.settings.put",
-        "sessions.grouping.get",
-        "sessions.grouping.put",
-        "usage.report",
-        "usage.analytics",
         "explorer.map",
         "google.client.put",
         "google.install",
@@ -97,7 +94,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "settings.vocabulary.put",
     ];
     const ADMIN_AREAS: &[&str] =
-        &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants.", "workflows.", "settings.workflows."];
+        &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants."];
     const REALM_AREAS: &[&str] = &[
         "sessions.",
         "decisions.",
@@ -135,9 +132,16 @@ pub fn scope(name: &str) -> Option<Scope> {
         "settings.claim_policies.",
         "settings.memex_scopes.",
         "settings.memex_folders.",
+        "settings.workflows.",
+        "workflows.",
+        "usage.",
     ];
+    // A worker's files, git and terminals: for a realm the worker serves.
+    const REALM_FIRST: &[&str] = &["workers.fs.", "workers.git.", "workers.terminals."];
     if DEVICE.contains(&name) {
         Some(Device)
+    } else if REALM_FIRST.iter().any(|a| name.starts_with(a)) {
+        Some(Realm)
     } else if SHARED.contains(&name) {
         Some(Shared)
     } else if ADMIN.contains(&name) || ADMIN_AREAS.iter().any(|a| name.starts_with(a)) {
@@ -589,6 +593,8 @@ fn build() -> Vec<Op> {
         op!("grants.revoke", "system", "DELETE" "/api/v1/grants/{id}", Destructive, Input::None, "Revokes a grant (or a request for one): nothing more flows; what already crossed stays.", choices = &[("id", "grants.list")]),
         op!("grants.uses", "system", "GET" "/api/v1/grants/{id}/uses", Read, Input::None, "Each use of a grant: when, by whom, what.", choices = &[("id", "grants.list")]),
         op!("realms.list", "system", "GET" "/api/v1/realms", Read, Input::None, "Realms: root (carbon6's administration) and home (your sessions, knowledge and data); each owns its own sessions, action items, memory notes, triggers, secrets and knowledge."),
+        op!("realms.elsewhere", "system", "GET" "/api/v1/elsewhere", Read, Input::None, "How many things wait on you in each realm (open decisions and approvals): counts only, for switching realm."),
+        op!("sessions.locate", "sessions", "GET" "/api/v1/locate/sessions/{id}", Read, Input::None, "The realm a session is in, to open it there."),
         op!("system.version", "system", "GET" "/api/v1/version", Read, Input::None, "The version this head runs: a release (0.3.11) or an edge build of main (0.3.11+git<commit time>.<commit>)."),
         op!("system.updates", "system", "GET" "/api/v1/system/updates", Read, Input::None, "carbon6 releases found on GitHub and how far each machine (the head, each worker) is in updating to one: versions, states, how each was installed."),
         op!("system.updates.check", "system", "POST" "/api/v1/system/updates/check", Write, Input::None, "Looks at GitHub for a newer carbon6 release now."),
@@ -686,7 +692,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
 /// Routes the assistant does not call, and why (the parity test allows
 /// these).
 pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
-    ("GET", "/api/v1/live", "a live WebSocket for the UI", Scope::Admin),
+    ("GET", "/api/v1/live", "a live WebSocket for the UI", Scope::Realm),
     ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only", Scope::Admin),
     ("GET", "/api/v1/head/fs/read", "the head's own files, for the UI's file picker only", Scope::Admin),
     ("GET", "/api/v1/automations", "the old name of /api/v1/triggers", Scope::Realm),
@@ -697,7 +703,7 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/v1/automations/{id}/runs", "the old name of /api/v1/triggers", Scope::Realm),
     ("POST", "/api/v1/automations/{id}/rotate", "the old name of /api/v1/triggers", Scope::Realm),
     ("GET", "/api/v1/sessions/{id}/stream", "a live WebSocket for the UI", Scope::Realm),
-    ("GET", "/api/v1/workers/{id}/terminals/{tid}/attach", "a terminal WebSocket", Scope::Admin),
+    ("GET", "/api/v1/workers/{id}/terminals/{tid}/attach", "a terminal WebSocket", Scope::Realm),
     ("GET", "/api/v1/sessions/{id}/attachments/{seq}/{index}", "a file download", Scope::Realm),
     ("GET", "/api/v1/sessions/{id}/outputs/{seq}", "a file download", Scope::Realm),
     ("GET", "/api/v1/sessions/{id}/export", "a file download", Scope::Realm),
@@ -724,7 +730,7 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("POST", "/api/v1/auth/passkeys/login/finish", "a passkey ceremony in the browser", Scope::Device),
     ("POST", "/api/v1/auth/passkeys/register/begin", "a passkey ceremony in the browser", Scope::Admin),
     ("POST", "/api/v1/auth/passkeys/register/finish", "a passkey ceremony in the browser", Scope::Admin),
-    ("POST", "/api/v1/assistant", "starts an assistant conversation (this one)", Scope::Admin),
+    ("POST", "/api/v1/assistant", "starts an assistant conversation (this one)", Scope::Realm),
     ("GET", "/api/v1/catalog", "this catalog", Scope::Shared),
     ("GET", "/api/v1/openapi.json", "this catalog, as OpenAPI", Scope::Shared),
     ("POST", "/api/v1/catalog/call", "this catalog", Scope::Admin),

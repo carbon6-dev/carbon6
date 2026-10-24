@@ -100,14 +100,14 @@ async fn realms_keep_data_apart() {
         (M::GET, "settings/prices"),
         (M::PUT, "settings/routes"),
         (M::POST, "catalog/call"),
-        (M::GET, "live"),
-        (M::GET, "usage"),
-        (M::POST, "assistant"),
+        (M::GET, "system/updates"),
     ] {
         let r = as_(&home, method.clone(), path, Some(json!({}))).await.unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
     assert!(as_(&root, M::GET, "settings/skills", None).await.unwrap().status().is_success());
+    // Its own usage, counted for its realm only.
+    assert!(as_(&home, M::GET, "usage", None).await.unwrap().status().is_success());
     // Its own realm's settings lists are its to read and change.
     let skill = json!([{"name": "home-only", "description": "d", "body": "b"}]);
     assert!(as_(&home, M::PUT, "settings/skills", Some(skill)).await.unwrap().status().is_success());
