@@ -58,7 +58,7 @@ async fn client(st: &HeadState, realm: &str, p: &api::OAuthProvider) -> anyhow::
     match (id, secret) {
         (Some(i), Some(s)) if !i.is_empty() && !s.is_empty() => Ok((i, s)),
         _ => Err(bad_request(format!(
-            "set your OAuth client first: the secrets {} and {} in realm {realm} (Settings → Secrets)",
+            "set your OAuth client first: the secrets {} and {}, in realm {realm} or root (on the app's page in Settings, or Settings → Secrets)",
             p.client_id_secret, p.client_secret_secret
         ))),
     }
