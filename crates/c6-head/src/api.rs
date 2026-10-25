@@ -1745,13 +1745,14 @@ async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The version this head runs (the UI shows it, and notices when it changes).
 /// What waits on you in each realm (docs/realms-ux.md §6): counts only,
 /// for the realm switcher. A realm's token learns only about its own.
 async fn get_elsewhere(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmWaiting>>> {
     let mut out = Vec::new();
     for r in crate::realms::list(&st, &Caller::root()).await? {
-        if r.id == crate::realms::ROOT || !(caller.sees_others() || caller.sees(&r.id)) {
+        // Root's is the console's (your browser's only): installs, grants.
+        let console = r.id == crate::realms::ROOT;
+        if (console && !caller.browser) || !(caller.sees_others() || caller.sees(&r.id)) {
             continue;
         }
         let decisions = crate::decisions::open_count(&st, &Caller::in_realm(&r.id)).await?;

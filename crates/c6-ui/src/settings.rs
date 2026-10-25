@@ -709,7 +709,7 @@ fn Apps() -> impl IntoView {
                     name: inst_name.get_untracked(),
                 })
                 .await?;
-                Ok(format!("Installing waits for your decision (#{}) in Decisions.", i.decision.unwrap_or_default()))
+                Ok(format!("Installing waits for your decision (#{}) in the console's Decisions.", i.decision.unwrap_or_default()))
             }
             .await;
             done(r);
@@ -749,6 +749,12 @@ fn Apps() -> impl IntoView {
                             <span class="font-medium">{title}</span>
                             <span class="text-xs text-zinc-500">{format!("{} · {}{} · {}", i.version, i.roles.join(" and "), if i.realm.is_empty() { " for workers".to_owned() } else { format!(" in {}", i.realm) }, i.state)}</span>
                             <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{(!by.is_empty()).then(|| format!("required by {}", by.join(", ")))}</span>
+                            // Waiting on your answer: in the console's Decisions.
+                            {matches!(i.state.as_str(), "installing" | "upgrading" | "removing").then(|| view! {
+                                <a rel="external" href="/admin/decisions" class="rounded bg-amber-100 px-1.5 text-xs text-amber-900 hover:underline dark:bg-amber-950 dark:text-amber-200">
+                                    {format!("Waiting for your answer{} →", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}
+                                </a>
+                            })}
                             {(!i.problems.is_empty()).then(|| view! { <span class="w-full text-xs text-red-600">{i.problems.join("; ")}</span> })}
                             {has_settings.then(|| view! {
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {

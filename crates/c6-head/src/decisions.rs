@@ -168,15 +168,15 @@ pub async fn list(st: &HeadState, state: &str, caller: &Caller) -> anyhow::Resul
                  ORDER BY (ref = '' OR ref LIKE 'task:%'), CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, grp, updated_at DESC",
             )
             .bind(now)
-            .bind(&caller.realm)
-            .bind(&caller.realm)
+            .bind(caller.listing_realm())
+            .bind(caller.listing_realm())
             .fetch_all(&st.store.pool)
             .await?,
             s => {
                 sqlx::query("SELECT * FROM decisions WHERE state = ? AND (? IS NULL OR realm = ?) ORDER BY updated_at DESC LIMIT 200")
                     .bind(s)
-                    .bind(&caller.realm)
-                    .bind(&caller.realm)
+                    .bind(caller.listing_realm())
+                    .bind(caller.listing_realm())
                     .fetch_all(&st.store.pool)
                     .await?
             }
@@ -195,8 +195,8 @@ pub async fn of_session(st: &HeadState, session_id: &str, caller: &Caller) -> an
          AND ref NOT LIKE 'approval:%' AND ref NOT LIKE 'question:%' ORDER BY created_at",
     )
     .bind(now_ms())
-    .bind(&caller.realm)
-    .bind(&caller.realm)
+    .bind(caller.listing_realm())
+    .bind(caller.listing_realm())
     .bind(session_id)
     .bind(session_id)
     .fetch_all(&st.store.pool)
@@ -209,8 +209,8 @@ pub async fn open_count(st: &HeadState, caller: &Caller) -> anyhow::Result<i64> 
         "SELECT COUNT(*) FROM decisions WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?)) AND (? IS NULL OR realm = ?)",
     )
     .bind(now_ms())
-    .bind(&caller.realm)
-    .bind(&caller.realm)
+    .bind(caller.listing_realm())
+    .bind(caller.listing_realm())
     .fetch_one(&st.store.pool)
     .await?)
 }

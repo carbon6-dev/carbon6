@@ -157,6 +157,15 @@ async fn realm_pages_stay_in_their_realm() {
     }
     // From the console they work.
     assert!(send(M::GET, "settings/prices".into(), Some("admin"), None).await.unwrap().status().is_success());
+    // The console's decisions are root's own (installs, grants), not every
+    // realm's; and what waits there shows in the realm menu.
+    seed(M::POST, "decisions?realm=root", json!({"title": "Install the slack app?"})).await;
+    let console: Vec<Value> = send(M::GET, "decisions".into(), Some("admin"), None).await.unwrap().json().await.unwrap();
+    assert_eq!(console.iter().map(|d| d["title"].as_str().unwrap()).collect::<Vec<_>>(), ["Install the slack app?"]);
+    let count: Value = send(M::GET, "decisions/count".into(), Some("admin"), None).await.unwrap().json().await.unwrap();
+    assert_eq!(count["open"], 1);
+    let places: Vec<Value> = send(M::GET, "elsewhere".into(), Some("home"), None).await.unwrap().json().await.unwrap();
+    assert_eq!(places.iter().find(|p| p["id"] == "root").map(|p| p["waiting"].clone()), Some(json!(1)), "{places:?}");
     let all: Vec<Session> = send(M::GET, "sessions".into(), Some("admin"), None).await.unwrap().json().await.unwrap();
     assert_eq!(all.len(), 1);
 
@@ -230,7 +239,7 @@ async fn realm_pages_stay_in_their_realm() {
     // 5. Other realms: a count each, no more; and an old link finds its realm.
     let elsewhere: Vec<Value> = send(M::GET, "elsewhere".into(), Some("lab"), None).await.unwrap().json().await.unwrap();
     let waiting = |id: &str| elsewhere.iter().find(|r| r["id"] == id).map(|r| r["waiting"].as_u64().unwrap());
-    assert_eq!((waiting("home"), waiting("lab"), waiting("root")), (Some(1), Some(0), None), "{elsewhere:?}");
+    assert_eq!((waiting("home"), waiting("lab"), waiting("root")), (Some(1), Some(0), Some(1)), "{elsewhere:?}");
     assert!(!serde_json::to_string(&elsewhere).unwrap().contains(MARK));
     let at: Value = send(M::GET, format!("locate/sessions/{}", s.id), Some("lab"), None).await.unwrap().json().await.unwrap();
     assert_eq!(at["realm"], "home");

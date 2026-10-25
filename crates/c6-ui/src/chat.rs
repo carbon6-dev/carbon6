@@ -347,9 +347,12 @@ pub fn SlackSettings() -> impl IntoView {
                             <h3 class="text-sm font-medium">"1. The slack app"</h3>
                             {match (s.installed, s.waiting) {
                                 (true, _) => view! { <p class="text-sm text-zinc-500">"Installed in this realm."</p> }.into_any(),
-                                (false, true) => view! { <p class="text-sm text-zinc-500">"Waiting for your approval in Decisions."</p> }.into_any(),
+                                (false, true) => view! {
+                                    <p class="text-sm text-zinc-500">"Waiting for your approval in the console's "
+                                        <a rel="external" class="underline" href="/admin/decisions">"Decisions"</a> "."</p>
+                                }.into_any(),
                                 (false, false) => view! {
-                                    <button class=BUTTON on:click=move |_| run(Box::pin(async { api::slack_install().await.map(|_| Some("Asked: approve it in Decisions.".into())) }))>"Install the slack app"</button>
+                                    <button class=BUTTON on:click=move |_| run(Box::pin(async { api::slack_install().await.map(|_| Some("Asked: approve it in the console's Decisions.".into())) }))>"Install the slack app"</button>
                                 }.into_any(),
                             }}
                         </div>

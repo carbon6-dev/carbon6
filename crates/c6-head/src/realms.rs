@@ -35,6 +35,17 @@ impl Caller {
         Self { realm: Some(realm.to_owned()), browser: false }
     }
 
+    /// Whose decisions and the like a caller lists: its realm's; the
+    /// console's are root's own (carbon6's administration: installs,
+    /// grants); a root token's, every realm's.
+    pub fn listing_realm(&self) -> Option<&str> {
+        match (&self.realm, self.browser) {
+            (Some(r), _) => Some(r),
+            (None, true) => Some(ROOT),
+            (None, false) => None,
+        }
+    }
+
     /// Whether the caller may learn about realms other than its own.
     pub fn sees_others(&self) -> bool {
         self.realm.is_none() || self.browser

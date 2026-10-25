@@ -431,7 +431,7 @@ pub fn GoogleSettings() -> impl IntoView {
                 view! {
                     <div class="flex flex-wrap items-center gap-2 rounded-md bg-amber-50 p-2 text-sm dark:bg-amber-950">
                         <span class="flex-1">{if waiting {
-                            "The Google apps wait for your approval (Decisions).".to_owned()
+                            "The Google apps wait for your approval (the console's Decisions).".to_owned()
                         } else if c.apps.is_empty() {
                             "Install the Gmail, Calendar and Contacts apps to connect accounts.".to_owned()
                         } else {
@@ -439,7 +439,7 @@ pub fn GoogleSettings() -> impl IntoView {
                         }}</span>
                         {(!waiting).then(|| view! {
                             <button class=BUTTON on:click=move |_| spawn_local(async move {
-                                note.set(Some(api::google_install().await.map(|_| "Approve each app under Decisions.".to_owned())));
+                                note.set(Some(api::google_install().await.map(|_| "Approve each app in the console's Decisions.".to_owned())));
                                 client.refetch();
                             })>"Install the apps"</button>
                         })}

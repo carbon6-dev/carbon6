@@ -105,6 +105,7 @@ fn Main() -> impl IntoView {
                     view! {
                         <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
                             <NavLink to=View::Realms label="Realms" />
+                            <decisions::DecisionLink class=NAV />
                             <NavLink to=View::Workers label="Workers" />
                             <NavLink to=View::Analytics label="Analytics" />
                             <NavLink to=View::Usage label="Spending" />
@@ -187,6 +188,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                 {place::is_console().then(|| view! {
                     <div class="flex flex-col text-sm">
                         <Go to=View::Realms class=MENU>"Realms"</Go>
+                        <decisions::DecisionLink class=MENU />
                         <Go to=View::Workers class=MENU>"Workers"</Go>
                         <Go to=View::Analytics class=MENU>"Analytics"</Go>
                         <Go to=View::Usage class=MENU>"Spending"</Go>
@@ -267,7 +269,15 @@ fn PlaceMenu() -> impl IntoView {
     let here = place::realm();
     let elsewhere = {
         let here = here.clone();
-        move || places.get().and_then(Result::ok).map_or(0, |ps| ps.iter().filter(|p| Some(&p.id) != here.as_ref()).map(|p| p.waiting).sum::<u64>())
+        // The console's too, unless you're in it.
+        move || {
+            places.get().and_then(Result::ok).map_or(0, |ps| {
+                ps.iter()
+                    .filter(|p| if p.id == "root" { !place::is_console() } else { Some(&p.id) != here.as_ref() })
+                    .map(|p| p.waiting)
+                    .sum::<u64>()
+            })
+        }
     };
     let name = {
         let here = here.clone();
@@ -292,7 +302,7 @@ fn PlaceMenu() -> impl IntoView {
             // would run off its edge).
             <div class="fixed inset-x-2 top-12 z-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900">
                 <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
-                {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
+                {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
                     view! {
                         <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))
@@ -308,11 +318,17 @@ fn PlaceMenu() -> impl IntoView {
                 <a rel="external" href=place::url_of(&place::Place::Console) class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
                     <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                     <span class="flex-1">"Console"</span>
+                    {move || console_waiting(&places).map(|n| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you: installs, grants">{n}</span> })}
                     <span class="text-xs text-zinc-500">"realms, workers, system"</span>
                 </a>
             </div>
         </details>
     }
+}
+
+/// What waits on you in the console (root's: installs, grants), if any.
+fn console_waiting(places: &LocalResource<Result<Vec<c6_api::RealmWaiting>, String>>) -> Option<u64> {
+    places.get().and_then(Result::ok)?.iter().find(|p| p.id == "root").map(|p| p.waiting).filter(|n| *n > 0)
 }
 
 /// The realms and the console, as links (the phone's ☰ menu).
@@ -323,7 +339,7 @@ fn PlaceLinks() -> impl IntoView {
     view! {
         <div class="border-t border-zinc-200 pt-1 text-sm dark:border-zinc-800">
             <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
-            {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
+            {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                 let current = here.as_deref() == Some(p.id.as_str());
                 view! {
                     <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone())) class=format!("flex items-center gap-2 {MENU} {}", if current { "font-medium" } else { "" })>
@@ -337,6 +353,7 @@ fn PlaceLinks() -> impl IntoView {
             <a rel="external" href=place::url_of(&place::Place::Console) class=format!("flex items-center gap-2 {MENU} {}", if place::is_console() { "font-medium" } else { "" })>
                 <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                 <span class="flex-1">"Console"</span>
+                {move || console_waiting(&places).map(|n| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{n}</span> })}
             </a>
         </div>
     }
@@ -354,7 +371,7 @@ fn MissingRealm() -> impl IntoView {
                     <h1 class="text-lg font-semibold">{format!("There is no realm {here:?}")}</h1>
                     <p class="text-sm text-zinc-500">"It may have been deleted, or the address is mistyped. Go to one of yours:"</p>
                     <div class="flex flex-wrap gap-2">
-                        {ps.into_iter().map(|p| view! {
+                        {ps.into_iter().filter(|p| p.id != "root").map(|p| view! {
                             <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                                 rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))>{p.name}</a>
                         }).collect_view()}
