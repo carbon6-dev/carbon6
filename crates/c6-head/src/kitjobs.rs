@@ -156,39 +156,6 @@ pub async fn ingest_with(
     let acting = format!("app:{instance} {by}");
     let mut done = json!({"records": 0, "items": 0, "things": 0, "claims": 0, "errors": []});
     let mut errors: Vec<String> = Vec::new();
-    for r in batch["records"].as_array().into_iter().flatten() {
-        let collection = r["collection"].as_str().unwrap_or_default();
-        let rec = api::RecordIn {
-            fields: r["fields"].clone(),
-            version: r["version"].as_i64(),
-            derived_from: serde_json::from_value(r["derived_from"].clone()).ok(),
-            links: serde_json::from_value(r["links"].clone()).ok(),
-            labels: None,
-        };
-        let id = r["id"].as_str().filter(|i| !i.is_empty());
-        // An update by key: the record with that key's value, if any.
-        let id = match (id, r["key"].as_str()) {
-            (Some(i), _) => Some(i.to_owned()),
-            (None, Some(k)) => {
-                let mut filter = serde_json::Map::new();
-                filter.insert(k.to_owned(), r["fields"][k].clone());
-                let q = api::RecordQuery { filter, limit: Some(1), ..Default::default() };
-                crate::collections::query(st, realm, collection, &q).await?.records.first().map(|x| x.id.clone())
-            }
-            _ => None,
-        };
-        let rec = match &id {
-            Some(i) => {
-                let cur = crate::collections::record(st, realm, collection, i).await?;
-                api::RecordIn { version: Some(cur.version), ..rec }
-            }
-            None => rec,
-        };
-        match crate::collections::put(st, realm, collection, id.as_deref(), &rec, &acting).await {
-            Ok(_) => done["records"] = json!(done["records"].as_i64().unwrap_or(0) + 1),
-            Err(e) => errors.push(format!("record in {collection}: {e:#}")),
-        }
-    }
     for t in batch["things"].as_array().into_iter().flatten() {
         match crate::claims::call(st, realm, "memex.things.create", t.clone(), &format!("app:{instance}"), &acting).await {
             Ok(_) => done["things"] = json!(done["things"].as_i64().unwrap_or(0) + 1),
@@ -256,6 +223,41 @@ pub async fn ingest_with(
         match crate::claims::call(st, realm, "memex.claims.add", c.clone(), &format!("app:{instance}"), &acting).await {
             Ok(_) => done["claims"] = json!(done["claims"].as_i64().unwrap_or(0) + 1),
             Err(e) => errors.push(format!("claim: {e:#}")),
+        }
+    }
+    // Records last: a sync's place moves on only once what it brought is
+    // kept (a run stopped partway leaves it where it was).
+    for r in batch["records"].as_array().into_iter().flatten() {
+        let collection = r["collection"].as_str().unwrap_or_default();
+        let rec = api::RecordIn {
+            fields: r["fields"].clone(),
+            version: r["version"].as_i64(),
+            derived_from: serde_json::from_value(r["derived_from"].clone()).ok(),
+            links: serde_json::from_value(r["links"].clone()).ok(),
+            labels: None,
+        };
+        let id = r["id"].as_str().filter(|i| !i.is_empty());
+        // An update by key: the record with that key's value, if any.
+        let id = match (id, r["key"].as_str()) {
+            (Some(i), _) => Some(i.to_owned()),
+            (None, Some(k)) => {
+                let mut filter = serde_json::Map::new();
+                filter.insert(k.to_owned(), r["fields"][k].clone());
+                let q = api::RecordQuery { filter, limit: Some(1), ..Default::default() };
+                crate::collections::query(st, realm, collection, &q).await?.records.first().map(|x| x.id.clone())
+            }
+            _ => None,
+        };
+        let rec = match &id {
+            Some(i) => {
+                let cur = crate::collections::record(st, realm, collection, i).await?;
+                api::RecordIn { version: Some(cur.version), ..rec }
+            }
+            None => rec,
+        };
+        match crate::collections::put(st, realm, collection, id.as_deref(), &rec, &acting).await {
+            Ok(_) => done["records"] = json!(done["records"].as_i64().unwrap_or(0) + 1),
+            Err(e) => errors.push(format!("record in {collection}: {e:#}")),
         }
     }
     done["errors"] = json!(errors);

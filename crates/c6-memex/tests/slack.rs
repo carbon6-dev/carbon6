@@ -311,8 +311,11 @@ async fn slack_mirrored_into_the_memex() {
         thread.as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap()).collect::<Vec<_>>(),
         ["Bo: Who reviews?", "Ana Lima: I will"]
     );
-    let big = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C2", "limit": 100})).await;
-    assert_eq!(big.as_array().unwrap().len(), 30, "every page imported");
+    eventually("every page of #big imported", async || {
+        let big = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C2", "limit": 100})).await;
+        (big.as_array()?.len() == 30).then_some(())
+    })
+    .await;
     // Who said it and where: Ana is the person mail knows (by email); Bo has
     // no email, so he is Slack's.
     let got: Value = http.get(format!("{api}/memex/get?id={}", eng[1]["id"].as_str().unwrap())).send().await.unwrap().json().await.unwrap();
