@@ -1649,11 +1649,22 @@ fn origin_of(headers: &HeaderMap) -> Option<String> {
     Some(format!("{proto}://{host}"))
 }
 
-async fn put_google_client(State(st): State<Arc<HeadState>>, Json(c): Json<api::GoogleClientIn>) -> ApiResult<StatusCode> {
+/// A realm's Google OAuth client (its own); from the console or a root
+/// token without `?realm=`, root's (every realm's that has none).
+async fn put_google_client(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(c): Json<api::GoogleClientIn>,
+) -> ApiResult<StatusCode> {
     if c.client_id.trim().is_empty() {
         return Err(crate::bad_request("the client ID is required").into());
     }
-    crate::google::set_client(&st, &c).await?;
+    let realm = match (&caller.realm, r.realm.as_deref().filter(|x| !x.trim().is_empty())) {
+        (None, None) => crate::realms::ROOT.to_owned(),
+        _ => realm_for(&st, &caller, &r).await?,
+    };
+    crate::google::set_client(&st, &realm, &c).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

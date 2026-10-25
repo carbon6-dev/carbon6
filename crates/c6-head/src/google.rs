@@ -79,8 +79,11 @@ pub async fn install(st: &HeadState, realm: &str) -> anyhow::Result<Vec<api::Ins
     Ok(out)
 }
 
-/// Your OAuth client (any realm's view of it), and a realm's Google apps.
+/// A realm's OAuth client (its own, else root's), and its Google apps.
 pub async fn get_client(st: &HeadState, realm: &str) -> anyhow::Result<api::GoogleClient> {
+    // Secrets fall back to root's; which one it is, the row says.
+    let from_root =
+        realm != crate::realms::ROOT && st.store.secret(realm, CLIENT_ID).await?.is_some_and(|(_, _, whose)| whose == crate::realms::ROOT);
     let id = crate::secrets::value_in(st, realm, CLIENT_ID).await?.unwrap_or_default();
     let has_secret = crate::secrets::value_in(st, realm, CLIENT_SECRET).await?.is_some_and(|s| !s.is_empty());
     let apps = installed(st, realm).await?.into_iter().map(|(p, _)| p).collect();
@@ -90,17 +93,16 @@ pub async fn get_client(st: &HeadState, realm: &str) -> anyhow::Result<api::Goog
         .filter(|i| i.state == "installing" && i.realm == realm && APPS.iter().any(|(p, _)| *p == i.package))
         .map(|i| i.package)
         .collect();
-    Ok(api::GoogleClient { client_id: id, has_secret, redirect_uri: String::new(), apps, waiting })
+    Ok(api::GoogleClient { client_id: id, has_secret, redirect_uri: String::new(), apps, waiting, from_root })
 }
 
-/// Sets your OAuth client: root's secrets, so every realm's Google apps
-/// sign in with it.
-pub async fn set_client(st: &HeadState, c: &api::GoogleClientIn) -> anyhow::Result<()> {
-    let root = crate::realms::ROOT;
-    crate::secrets::put_in(st, root, CLIENT_ID, c.client_id.trim(), "Your Google OAuth client's id (Gmail, Calendar, Contacts)").await?;
+/// Sets a realm's OAuth client (its own secrets). Root's is every realm's
+/// that has none of its own.
+pub async fn set_client(st: &HeadState, realm: &str, c: &api::GoogleClientIn) -> anyhow::Result<()> {
+    crate::secrets::put_in(st, realm, CLIENT_ID, c.client_id.trim(), "Your Google OAuth client's id (Gmail, Calendar, Contacts)").await?;
     // No secret given: the one kept stays.
     if let Some(s) = c.client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        crate::secrets::put_in(st, root, CLIENT_SECRET, s, "Your Google OAuth client's secret").await?;
+        crate::secrets::put_in(st, realm, CLIENT_SECRET, s, "Your Google OAuth client's secret").await?;
     }
     Ok(())
 }
@@ -245,7 +247,7 @@ pub async fn move_in(st: &HeadState) -> anyhow::Result<()> {
     // Your OAuth client.
     if let Some(id) = legacy["client_id"].as_str().filter(|i| !i.is_empty()) {
         let secret = legacy["secret"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| st.secrets.decrypt(&b).ok());
-        set_client(st, &api::GoogleClientIn { client_id: id.into(), client_secret: secret }).await?;
+        set_client(st, crate::realms::ROOT, &api::GoogleClientIn { client_id: id.into(), client_secret: secret }).await?;
     }
     // Each account, for each app: gmail keeps its id (the mail is filed by
     // it); the calendar's and contacts' get theirs.

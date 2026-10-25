@@ -292,6 +292,17 @@ async fn realm_pages_stay_in_their_realm() {
     assert_eq!((lab["body"].as_str(), lab["edited"].as_bool()), (Some("LAB BASE"), Some(true)));
     assert_eq!(home_p["edited"], false);
     assert_ne!(home_p["body"], "LAB BASE");
+    // Mail and calendar are a realm's: its page installs the Google apps
+    // and keeps its own OAuth client; a realm without one uses root's.
+    put("google/client", "admin", json!({"client_id": "root-client", "client_secret": "s1"})).await;
+    let lab_client = get("google/client", "lab").await;
+    assert_eq!((lab_client["client_id"].as_str(), lab_client["from_root"].as_bool()), (Some("root-client"), Some(true)), "{lab_client}");
+    put("google/client", "home", json!({"client_id": "home-client", "client_secret": "s2"})).await;
+    let home_client = get("google/client", "home").await;
+    assert_eq!((home_client["client_id"].as_str(), home_client["from_root"].as_bool()), (Some("home-client"), Some(false)));
+    assert_eq!(get("google/client", "lab").await["client_id"], "root-client", "lab still uses root's");
+    let r = send(M::POST, "google/install".into(), Some("lab"), None).await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     // Root's list entries reach a realm (shown to it read-only).
     put("settings/skills?realm=root", "admin", json!([{"name": "root-skill", "description": "everyone's", "body": "x"}])).await;
     let used: Vec<Value> = send(M::GET, "realms/lab/effective/skills".into(), Some("lab"), None).await.unwrap().json().await.unwrap();

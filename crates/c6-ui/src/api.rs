@@ -750,7 +750,7 @@ pub async fn google_client() -> Result<c6_api::GoogleClient, String> {
 
 pub async fn set_google_client(client_id: String, client_secret: Option<String>) -> Result<(), String> {
     let body = c6_api::GoogleClientIn { client_id, client_secret };
-    empty(Request::put("/api/v1/google/client").json(&body).map_err(|e| e.to_string())?.send().await).await
+    empty(Request::put(&format!("/api/v1/google/client{}", in_realm('?'))).json(&body).map_err(|e| e.to_string())?.send().await).await
 }
 
 pub async fn google_connect() -> Result<String, String> {

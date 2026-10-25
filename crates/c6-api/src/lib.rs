@@ -3868,6 +3868,9 @@ pub struct GoogleClient {
     pub apps: Vec<String>,
     #[serde(default)]
     pub waiting: Vec<String>,
+    /// The client is root's (the realm has none of its own).
+    #[serde(default)]
+    pub from_root: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

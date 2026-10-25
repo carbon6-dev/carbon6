@@ -69,8 +69,6 @@ pub fn scope(name: &str) -> Option<Scope> {
         "imports.settings.get",
         "imports.settings.put",
         "explorer.map",
-        "google.client.put",
-        "google.install",
         "apps.list",
         "apps.install",
         "apps.plan",
@@ -548,7 +546,7 @@ fn build() -> Vec<Op> {
 
         // Google accounts.
         op!("google.client.get", "mail", "GET" "/api/v1/google/client", Read, Input::Query(schema::<api::InRealm>), "The Google OAuth client carbon6 uses (its id; the secret is never shown), every realm's; and the realm's Google apps."),
-        op!("google.client.put", "mail", "PUT" "/api/v1/google/client", Write, Input::Body(schema::<api::GoogleClientIn>), "Sets the Google OAuth client (from your Google Cloud project). Ask for the secret with c6_ask (secret field)."),
+        op!("google.client.put", "mail", "PUT" "/api/v1/google/client", Write, Input::Body(schema::<api::GoogleClientIn>), "Sets a realm's Google OAuth client (from your Google Cloud project); root's (from the console) is every realm's that has none. Ask for the secret with c6_ask (secret field)."),
         op!("google.connect", "mail", "POST" "/api/v1/google/connect", Write, Input::Query(schema::<api::InRealm>), "Starts adding a Google account to a realm's Gmail, Calendar and Contacts apps: returns the address for you to open and sign in."),
         op!("imports.settings.get", "sessions", "GET" "/api/v1/settings/session_imports", Read, Input::None, "Importing sessions from Claude Code and Codex: which workers import, from which tools, and which realm a folder's sessions go to."),
         op!("imports.settings.put", "sessions", "PUT" "/api/v1/settings/session_imports", Write, Input::Body(schema::<api::SessionImports>), "Sets which workers import their Claude Code and Codex sessions, and the folder → realm rules."),

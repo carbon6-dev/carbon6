@@ -424,7 +424,7 @@ pub fn GoogleSettings() -> impl IntoView {
                         format!("in {} (pick a realm in the header for another's)", if r.is_empty() { "home".to_owned() } else { r })
                     }}</span>
                 </h2>
-                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts, in each realm you install them in, with that realm's accounts and mail (they run on a worker with Docker or Podman, reaching only Google). Your OAuth client is every realm's. Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
+                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts, in each realm you install them in, with that realm's accounts and mail (they run on a worker with Docker or Podman, reaching only Google). The OAuth client here is this realm's own; without one, root's (set in the console) applies. Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
             </div>
             {move || client.get().and_then(Result::ok).filter(|c| c.apps.len() < 3).map(|c| {
                 let waiting = !c.waiting.is_empty();
@@ -448,6 +448,9 @@ pub fn GoogleSettings() -> impl IntoView {
             })}
             {move || client.get().and_then(Result::ok).map(|c| view! {
                 <p class="text-xs text-zinc-500">"Redirect URI: " <code class="select-all font-mono">{c.redirect_uri.clone()}</code></p>
+                {(c.from_root && !c.client_id.is_empty()).then(|| view! {
+                    <p class="text-xs text-zinc-500">"Using root's client (set in the console). Saving one here gives this realm its own."</p>
+                })}
             })}
             <div class="grid gap-2 sm:grid-cols-2">
                 <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="Client ID" prop:value=move || id.get() on:input=move |ev| id.set(event_target_value(&ev)) />
