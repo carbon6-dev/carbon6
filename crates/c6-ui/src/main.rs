@@ -255,7 +255,8 @@ fn realm_colour(id: &str) -> &'static str {
 /// Where you are (a realm, in its colour, or the console) and the way to
 /// the others, each with how many things wait on you there
 /// (docs/realms-ux.md §2, §6). Each is a link: ⌘-click opens it in a new
-/// tab.
+/// tab. Links to a place are `rel="external"`: a place is fixed when the
+/// page loads, so the router must not handle them in the page.
 #[component]
 fn PlaceMenu() -> impl IntoView {
     let places = LocalResource::new(move || {
@@ -294,7 +295,7 @@ fn PlaceMenu() -> impl IntoView {
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
                     view! {
-                        <a href=place::url_of(&place::Place::Realm(p.id.clone()))
+                        <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))
                             class=format!("flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "font-medium" } else { "" })>
                             <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {}", realm_colour(&p.id))></span>
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
@@ -304,7 +305,7 @@ fn PlaceMenu() -> impl IntoView {
                     }
                 }).collect_view()}
                 <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
-                <a href=place::url_of(&place::Place::Console) class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                <a rel="external" href=place::url_of(&place::Place::Console) class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
                     <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                     <span class="flex-1">"Console"</span>
                     <span class="text-xs text-zinc-500">"realms, workers, system"</span>
@@ -325,7 +326,7 @@ fn PlaceLinks() -> impl IntoView {
             {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
                 let current = here.as_deref() == Some(p.id.as_str());
                 view! {
-                    <a href=place::url_of(&place::Place::Realm(p.id.clone())) class=format!("flex items-center gap-2 {MENU} {}", if current { "font-medium" } else { "" })>
+                    <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone())) class=format!("flex items-center gap-2 {MENU} {}", if current { "font-medium" } else { "" })>
                         <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {}", realm_colour(&p.id))></span>
                         <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                         {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{p.waiting}</span> })}
@@ -333,7 +334,7 @@ fn PlaceLinks() -> impl IntoView {
                     </a>
                 }
             }).collect_view()}
-            <a href=place::url_of(&place::Place::Console) class=format!("flex items-center gap-2 {MENU} {}", if place::is_console() { "font-medium" } else { "" })>
+            <a rel="external" href=place::url_of(&place::Place::Console) class=format!("flex items-center gap-2 {MENU} {}", if place::is_console() { "font-medium" } else { "" })>
                 <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                 <span class="flex-1">"Console"</span>
             </a>
@@ -355,9 +356,9 @@ fn MissingRealm() -> impl IntoView {
                     <div class="flex flex-wrap gap-2">
                         {ps.into_iter().map(|p| view! {
                             <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                                href=place::url_of(&place::Place::Realm(p.id.clone()))>{p.name}</a>
+                                rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))>{p.name}</a>
                         }).collect_view()}
-                        <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" href=place::url_of(&place::Place::Console)>"Console"</a>
+                        <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" rel="external" href=place::url_of(&place::Place::Console)>"Console"</a>
                     </div>
                 </div>
             </div>
