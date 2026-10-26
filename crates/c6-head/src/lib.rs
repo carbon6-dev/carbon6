@@ -181,6 +181,7 @@ impl Head {
 pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;
+    let public_ui = cfg.public_ui()?;
     c6_core::create_private_dir(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
 
     let ui_listeners = bind_all(&ips, cfg.ui_port).await.context("binding UI port")?;
@@ -322,7 +323,10 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     if let Some(t) = &ui_tls {
         t.spawn_refresh(shutdown.clone());
     }
-    let guard = guard::HostGuard::new(&ui_reach, &names);
+    let mut guard = guard::HostGuard::new(&ui_reach, &names);
+    if let Some(p) = &public_ui {
+        guard = guard.with_host(&p.host);
+    }
     let app = api::router(state.clone()).layer(axum::middleware::from_fn_with_state(guard, guard::check));
     for listener in ui_listeners {
         let (app, token) = (app.clone(), shutdown.clone());
@@ -330,12 +334,14 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
             Some(t) => Some((t.acceptor()?, t.name.clone())),
             None => None,
         };
-        tasks.spawn(async move { tls::serve(listener, app, tls, token).await.context("UI port") });
+        let public = public_ui.as_ref().map(|p| p.url.clone());
+        tasks.spawn(async move { tls::serve(listener, app, tls, public, token).await.context("UI port") });
     }
     let port = ui_addrs[0].port();
-    let ui_urls = match &ui_tls {
-        Some(t) => vec![format!("https://{}:{port}", t.name)],
-        None => {
+    let ui_urls = match (&public_ui, &ui_tls) {
+        (Some(p), _) => vec![p.url.clone()],
+        (None, Some(t)) => vec![format!("https://{}:{port}", t.name)],
+        (None, None) => {
             // localhost (where passkeys work over HTTP) when reachable there,
             // and the tailnet name.
             let mut urls = Vec::new();
@@ -416,8 +422,10 @@ pub async fn offline_login_link(cfg: HeadConfig) -> anyhow::Result<Vec<String>> 
     let token = store.create_login_link().await?;
     let port = cfg.ui_port;
     let tailnet = config::tailnet_names().await;
-    let bases: Vec<String> = if let (Some(cert), Some(_)) = (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
-        vec![format!("https://{}:{port}", tls::cert_name(cert)?)]
+    let bases: Vec<String> = if let Some(p) = cfg.public_ui()? {
+        vec![p.url]
+    } else if let (Some(cert), Some(_)) = (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
+        vec![format!("https://{}:{port}", tls::cert_name(cert, &cfg.extra_names)?)]
     } else if cfg.ui_tls_head_ca {
         let mut cfg = cfg.clone();
         cfg.extra_names.extend(tailnet);

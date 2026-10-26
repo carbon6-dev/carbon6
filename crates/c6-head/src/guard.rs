@@ -38,6 +38,13 @@ impl HostGuard {
         Self { allowed: Arc::new(allowed) }
     }
 
+    /// Also accepts `host` exactly as a browser sends it: `ui_public_url`'s
+    /// host, with its port unless that is the scheme's default.
+    pub fn with_host(mut self, host: &str) -> Self {
+        Arc::make_mut(&mut self.allowed).insert(host.to_ascii_lowercase());
+        self
+    }
+
     fn host_ok(&self, host: &str) -> bool {
         self.allowed.contains(&host.to_ascii_lowercase())
     }
@@ -77,11 +84,14 @@ mod tests {
 
     use super::*;
 
-    fn app() -> Router {
-        let guard = HostGuard::new(
+    fn guard() -> HostGuard {
+        HostGuard::new(
             &["100.64.1.2:7700".parse().unwrap(), "127.0.0.1:7700".parse().unwrap()],
             &["localhost".into(), "Head.TS.net".into()],
-        );
+        )
+    }
+
+    fn app(guard: HostGuard) -> Router {
         Router::new()
             .route("/x", get(|| async { "ok" }))
             .route("/y", post(|| async { "ok" }))
@@ -89,11 +99,15 @@ mod tests {
     }
 
     async fn status(host: &str, origin: Option<&str>, method: &str, path: &str) -> u16 {
+        status_with(guard(), host, origin, method, path).await
+    }
+
+    async fn status_with(guard: HostGuard, host: &str, origin: Option<&str>, method: &str, path: &str) -> u16 {
         let mut b = axum::http::Request::builder().method(method).uri(path).header("host", host);
         if let Some(o) = origin {
             b = b.header("origin", o);
         }
-        app().oneshot(b.body(Body::empty()).unwrap()).await.unwrap().status().as_u16()
+        app(guard).oneshot(b.body(Body::empty()).unwrap()).await.unwrap().status().as_u16()
     }
 
     #[tokio::test]
@@ -108,5 +122,15 @@ mod tests {
         // ... or opening a WebSocket (a GET with an Origin).
         assert_eq!(status("127.0.0.1:7700", Some("https://evil.example"), "GET", "/x").await, 403);
         assert_eq!(status("127.0.0.1:7700", Some("null"), "GET", "/x").await, 403);
+    }
+
+    #[tokio::test]
+    async fn the_public_address_too() {
+        // ui_public_url = "https://head.example:8443", forwarded to the head's 7700.
+        let g = || guard().with_host("Head.Example:8443");
+        assert_eq!(status_with(g(), "head.example:8443", Some("https://head.example:8443"), "POST", "/y").await, 200);
+        // Only that address: not another port of it, and not from another site.
+        assert_eq!(status_with(g(), "head.example:9443", None, "GET", "/x").await, 421);
+        assert_eq!(status_with(g(), "head.example:8443", Some("https://evil.example"), "POST", "/y").await, 403);
     }
 }

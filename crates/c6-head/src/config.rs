@@ -24,6 +24,10 @@ pub struct HeadConfig {
     pub advertise_host: Option<String>,
     /// Extra DNS names for the head's server certificate (e.g. MagicDNS names).
     pub extra_names: Vec<String>,
+    /// The web UI's address when a proxy or port forward is in front of the
+    /// head (`https://head.example`): login links, the redirect to HTTPS and
+    /// the addresses the head lists use it, and the head answers to it.
+    pub ui_public_url: Option<String>,
     /// Permit binding non-private addresses (all interfaces, or a public
     /// one). Sign-in still protects the UI, but use HTTPS (`ui_tls_*`) there.
     pub allow_public_bind: bool,
@@ -66,6 +70,7 @@ impl Default for HeadConfig {
             worker_port: 7701,
             advertise_host: None,
             extra_names: Vec::new(),
+            ui_public_url: None,
             allow_public_bind: false,
             otlp_endpoint: None,
             otlp_headers: Default::default(),
@@ -147,6 +152,42 @@ impl HeadConfig {
             })
             .unwrap_or_else(|| "127.0.0.1".into())
     }
+
+    /// `ui_public_url`, checked: an http(s) origin with no path, query or
+    /// credentials, and https when the head serves HTTPS (plain HTTP to it
+    /// redirects there).
+    pub fn public_ui(&self) -> anyhow::Result<Option<PublicUi>> {
+        let Some(raw) = self.ui_public_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+            return Ok(None);
+        };
+        let url = url::Url::parse(raw).with_context(|| format!("ui_public_url {raw:?} is not a URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("ui_public_url {raw:?} must start with https:// (or http://)");
+        }
+        let Some(host) = url.host_str() else { bail!("ui_public_url {raw:?} has no host") };
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() || url.password().is_some()
+        {
+            bail!("ui_public_url {raw:?} must be a scheme, host and optional port only, like https://head.example");
+        }
+        if url.scheme() == "http" && (self.ui_tls_head_ca || self.ui_tls_cert.is_some()) {
+            bail!("ui_public_url {raw:?} must be https:// when the head serves HTTPS");
+        }
+        // As a browser names it: no port when it's the scheme's default.
+        let host = match url.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_owned(),
+        };
+        Ok(Some(PublicUi { url: format!("{}://{host}", url.scheme()), host }))
+    }
+}
+
+/// Where the web UI is reached through a proxy or port forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicUi {
+    /// `https://head.example`, without a trailing slash.
+    pub url: String,
+    /// The `Host` a browser sends for it: `head.example`, or with its port.
+    pub host: String,
 }
 
 /// The addresses the head can be reached at: listen addresses, with an
@@ -270,6 +311,26 @@ mod tests {
         assert!(cfg.bind_ips().is_err());
         let cfg = HeadConfig { allow_public_bind: true, ..cfg };
         assert!(cfg.bind_ips().is_ok());
+    }
+
+    #[test]
+    fn public_ui_url() {
+        let public = |url: &str| HeadConfig { ui_public_url: Some(url.into()), ..Default::default() }.public_ui();
+        let ok = |url: &str| public(url).unwrap().map(|p| (p.url, p.host));
+        assert_eq!(HeadConfig::default().public_ui().unwrap(), None);
+        assert_eq!(ok(" "), None);
+        assert_eq!(ok("https://Head.Example/"), Some(("https://head.example".into(), "head.example".into())));
+        // The scheme's default port is how a browser names it: none.
+        assert_eq!(ok("https://head.example:443"), Some(("https://head.example".into(), "head.example".into())));
+        assert_eq!(ok("https://head.example:8443"), Some(("https://head.example:8443".into(), "head.example:8443".into())));
+        assert_eq!(ok("http://[fd7a::1]:7700"), Some(("http://[fd7a::1]:7700".into(), "[fd7a::1]:7700".into())));
+        for bad in ["head.example", "ftp://head.example", "https://head.example/c6", "https://head.example/?a=1", "https://me@head.example"]
+        {
+            assert!(public(bad).is_err(), "{bad}");
+        }
+        // Plain HTTP to an HTTPS head redirects to this address, so it can't be http.
+        let tls = HeadConfig { ui_public_url: Some("http://head.example".into()), ui_tls_head_ca: true, ..Default::default() };
+        assert!(tls.public_ui().is_err());
     }
 
     #[test]
