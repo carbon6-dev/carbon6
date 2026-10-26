@@ -4187,6 +4187,32 @@ pub struct Request {
     /// Requests that may be the same ask (merge them, or not).
     #[serde(default)]
     pub maybe_same: Vec<i64>,
+    /// The reply drafted for it, if any (docs/brief.md §6).
+    #[serde(default)]
+    pub draft: Option<RequestDraft>,
+}
+
+/// A request's draft reply: where to answer, and what to say, with what
+/// only you can decide left as choices (`[[one | other]]`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RequestDraft {
+    /// One of the request's conversations.
+    #[serde(default)]
+    pub target: String,
+    /// mail or chat.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    /// Anything to check before sending.
+    #[serde(default)]
+    pub note: String,
+    /// Why it couldn't be drafted.
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub at: UnixMs,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

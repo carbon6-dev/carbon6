@@ -127,12 +127,14 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
 
 async fn source(m: &Memex, id: i64, f: &Found<'_>) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO request_sources (request_id, target, kind, at) VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET at = excluded.at",
+        "INSERT INTO request_sources (request_id, target, kind, at, noted_at) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT DO UPDATE SET at = excluded.at, noted_at = excluded.noted_at",
     )
     .bind(id)
     .bind(f.target)
     .bind(f.kind)
     .bind(f.at)
+    .bind(c6_core::now_ms())
     .execute(&m.store.pool)
     .await?;
     Ok(())
@@ -205,6 +207,7 @@ async fn request(m: &Memex, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<api::
         updated_at: r.get("updated_at"),
         sources,
         maybe_same: maybe,
+        draft: r.get::<Option<String>, _>("draft").and_then(|d| serde_json::from_str(&d).ok()),
     })
 }
 
@@ -247,11 +250,14 @@ pub async fn merge(m: &Memex, into: i64, from: i64) -> anyhow::Result<api::Reque
     anyhow::ensure!(into != from, "a request is already itself");
     get(m, into).await?;
     get(m, from).await?;
-    sqlx::query("INSERT OR IGNORE INTO request_sources (request_id, target, kind, at) SELECT ?, target, kind, at FROM request_sources WHERE request_id = ?")
-        .bind(into)
-        .bind(from)
-        .execute(&m.store.pool)
-        .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO request_sources (request_id, target, kind, at, noted_at) SELECT ?, target, kind, at, noted_at \
+         FROM request_sources WHERE request_id = ?",
+    )
+    .bind(into)
+    .bind(from)
+    .execute(&m.store.pool)
+    .await?;
     sqlx::query("DELETE FROM request_sources WHERE request_id = ?").bind(from).execute(&m.store.pool).await?;
     sqlx::query("DELETE FROM request_maybe WHERE a = ?1 OR b = ?1").bind(from).execute(&m.store.pool).await?;
     sqlx::query("DELETE FROM requests WHERE id = ?").bind(from).execute(&m.store.pool).await?;
@@ -285,6 +291,14 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         "memex.requests.get" => json!(get(m, id).await?),
         "memex.requests.set" => json!(set(m, id, params["status"].as_str().unwrap_or_default(), params["until"].as_i64()).await?),
         "memex.requests.merge" => json!(merge(m, params["into"].as_i64().unwrap_or(0), params["from"].as_i64().unwrap_or(0)).await?),
+        "memex.requests.draft" => {
+            let (task, _) = m.understanding().ok_or_else(|| anyhow::anyhow!("choose an understanding model first (Settings → Memex)"))?;
+            json!(crate::drafts::draft(m, &task, id).await?)
+        }
+        "memex.requests.reply_to" => crate::drafts::reply_to(m, params["target"].as_str().unwrap_or_default()).await?,
+        "memex.requests.send" => {
+            crate::drafts::send(m, id, params["target"].as_str().unwrap_or_default(), params["text"].as_str().unwrap_or_default()).await?
+        }
         other => anyhow::bail!("the memex has no method {other}"),
     })
 }

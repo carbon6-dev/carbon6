@@ -190,6 +190,21 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 - **On a phone,** a request's title wraps under its person.
 - **Not yet:** drafts (step 4). The FYI five-line summary, the scheduled briefs and urgent notifications (step 5). Relabeling from the brief (it's on the mail thread's sorting bar).
 
+### 10.4 Drafts (step 4)
+
+- **Drafted in the memex's reading loop,** after triage and before understanding, within the same daily budget: an open request that needs you and has no draft, or whose conversations have news since it was drafted (`request_sources.noted_at`). Soonest due first, then the newest. First contacts are drafted when you ask.
+- **What the model reads** (`memex.requests.draft`):
+  - each conversation's last messages, by target;
+  - other recent mail with the person;
+  - open commitments between you;
+  - the next 7 days' busy times in your primary calendar's time zone;
+  - your voice: your last few mails to them (else anyone's) and Slack messages.
+- **What it answers:** where to answer (one of the request's conversations), the text, and anything to check first. What only you can decide is left as `[[one | other]]`. Failing to draft is kept with the reason and tried again on news.
+- **In the brief:** the draft card shows where it goes (✉ to whom and the subject, or 💬 the thread or conversation), the choices as buttons, and the editable text. Send (⌘↵) works once every choice is made; Draft again is also there.
+- **Sending** (`memex.requests.send`) goes through the mail store's queue (with its undo window) or the Slack app's post, as you. The request is done (`replied`). It doesn't go through the agents' approval policy: your keypress is the approval, and agents can't call it.
+- **API:** `memex.requests.draft` (now), `reply_to` (who and what a reply goes to), `send`; `Request.draft`.
+- **Not yet:** documents the thread names, found in the memex, as context; a cost line in the brief.
+
 ## 11. Open questions
 
 - **Gmail too?** Should a pitch also be labelled and archived in Gmail (so your phone matches), as a rule you approve once? Default: carbon6 only.

@@ -5,7 +5,8 @@
 //! last word by rule. Your marks settle a sender, your corrections become
 //! the model's examples, and a realm's memex reads with its own prompts.
 //! What needs you becomes requests: one per ask, joined across mail and
-//! chat for the same person, closed when you answer.
+//! chat for the same person, closed when you answer; each waits with a
+//! draft reply, drafted again when its conversation moves on.
 
 use c6_api::{MailThread, Request, Triage};
 use c6_head::HeadConfig;
@@ -246,8 +247,8 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
 
     // What needs you, as requests: the one due soonest first.
-    let open = |status: &'static str| {
-        async move { serde_json::from_value::<Vec<Request>>(rpc("memex.requests.list", json!({"status": status})).await).unwrap() }
+    let open = |status: &'static str| async move {
+        serde_json::from_value::<Vec<Request>>(rpc("memex.requests.list", json!({"status": status})).await).unwrap()
     };
     let reqs = open("open").await;
     let titles: Vec<&str> = reqs.iter().map(|r| r.title.as_str()).collect();
@@ -349,6 +350,42 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert!(open("open").await.iter().all(|r| r.id != raj));
     rpc("memex.requests.set", json!({"id": raj, "status": "snoozed", "until": c6_core::now_ms() - 1})).await;
     assert!(open("open").await.iter().any(|r| r.id == raj));
+
+    // Raj's request gets a draft, with the choice left to you; it can't go
+    // until you choose.
+    mock.push(Reply::Text(
+        json!({"target": "chat:T1:D9", "text": "Wednesday works. [[10:00 | 14:00]]?", "note": "Check the offsite"}).to_string(),
+    ));
+    budget(12).await;
+    let drafted = eventually("a draft", async || {
+        let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
+        r.draft.filter(|d| d.error.is_none())
+    })
+    .await;
+    assert_eq!((drafted.target.as_str(), drafted.kind.as_str(), drafted.note.as_str()), ("chat:T1:D9", "chat", "Check the offsite"));
+    let read = mock.requests().last().unwrap()["messages"].to_string();
+    assert!(read.contains("Move the 1:1 to Wednesday") && read.contains("move our 1:1") && read.contains("calendar"), "{read}");
+    let r = http
+        .post(format!("{api}/memex/rpc"))
+        .json(&json!({"method": "memex.requests.send", "params": {"id": raj, "target": "chat:T1:D9", "text": drafted.text}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.text().await.unwrap().contains("choose first"));
+    let to = rpc("memex.requests.reply_to", json!({"target": "chat:T1:D9"})).await;
+    assert_eq!((to["kind"].as_str(), to["channel"].as_str()), (Some("chat"), Some("D9")));
+    let to = rpc("memex.requests.reply_to", json!({"target": "thread:acct:t2"})).await;
+    assert_eq!((to["to"][0].as_str(), to["subject"].as_str()), (Some("bo@acme.com"), Some("Re: Deploy")), "{to}");
+    // Raj says more: sorted, then drafted again.
+    mock.push(Reply::Text(json!({"category": "needs_you", "reason": "Raj asks again", "asks": "Move the 1:1 to Wednesday"}).to_string()));
+    mock.push(Reply::Text(json!({"target": "chat:T1:D9", "text": "Wednesday at 14:00 it is.", "note": ""}).to_string()));
+    m.store.put(&chat("k5", "D9", "dm", "Or Thursday afternoon, if that's easier", HOUR / 10, false), "test-slack").await.unwrap();
+    budget(14).await;
+    eventually("drafted again", async || {
+        let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
+        (r.draft?.text == "Wednesday at 14:00 it is.").then_some(())
+    })
+    .await;
 
     // A realm's memex reads with its own prompts.
     assert!(http.post(format!("{api}/realms")).json(&json!({"id": "lab"})).send().await.unwrap().status().is_success());

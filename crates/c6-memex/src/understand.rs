@@ -243,6 +243,9 @@ pub fn spawn(m: std::sync::Arc<Memex>) {
                 && (crate::triage::step(&m).await.unwrap_or_else(|e| {
                     warn!("triage: {e:#}");
                     false
+                }) || crate::drafts::step(&m).await.unwrap_or_else(|e| {
+                    warn!("drafting: {e:#}");
+                    false
                 }) || step(&m).await.unwrap_or_else(|e| {
                     warn!("understanding: {e:#}");
                     false

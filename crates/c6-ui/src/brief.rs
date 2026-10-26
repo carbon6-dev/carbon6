@@ -62,20 +62,23 @@ impl Brief {
     fn settle(self, id: i64, status: &'static str, until: Option<i64>) {
         spawn_local(async move {
             match api::rpc("memex.requests.set", json!({"id": id, "status": status, "until": until})).await {
-                Ok(_) => {
-                    let q = self.queue.get_untracked();
-                    let at = q.iter().position(|r| r.id == id).unwrap_or(0);
-                    let next = q.iter().skip(at + 1).chain(q.iter().take(at)).find(|r| r.id != id).map(|r| r.id);
-                    self.open.update(|o| {
-                        if o.is_some() {
-                            *o = next;
-                        }
-                    });
-                    self.tick.update(|t| *t += 1);
-                }
+                Ok(_) => self.gone(id),
                 Err(e) => self.error.set(Some(e)),
             }
         });
+    }
+
+    /// A request is settled: the next one opens (as Superhuman does).
+    fn gone(self, id: i64) {
+        let q = self.queue.get_untracked();
+        let at = q.iter().position(|r| r.id == id).unwrap_or(0);
+        let next = q.iter().skip(at + 1).chain(q.iter().take(at)).find(|r| r.id != id).map(|r| r.id);
+        self.open.update(|o| {
+            if o.is_some() {
+                *o = next;
+            }
+        });
+        self.tick.update(|t| *t += 1);
     }
 
     fn merge(self, into: i64, from: i64) {
@@ -287,14 +290,118 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                     {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", day(d))}</p> })}
                     <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
                 </div>
+                <DraftCard r=r.clone() b />
                 <div class="flex flex-wrap gap-2">
-                    <button class=BUTTON on:click=move |_| act(id, "done", None)>"Done (E)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, "done", None)>"Done (E)"</button>
                     <button class=BUTTON_QUIET on:click=move |_| act(id, "snoozed", Some(at_nine(1)))>"Tomorrow (H)"</button>
                     <button class=BUTTON_QUIET on:click=move |_| act(id, "snoozed", Some(at_nine(next_monday())))>"Next week"</button>
                     <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(id, "dropped", None)>"Drop (#)"</button>
                 </div>
-                <p class="text-xs text-zinc-400">"Answer in a conversation: once you reply, it's done by itself."</p>
+                <p class="text-xs text-zinc-400">"Or answer in a conversation: once you reply, it's done by itself."</p>
             </aside>
+        </div>
+    }
+}
+
+/// The choices a draft leaves you (`[[one | other]]`): each, with its
+/// options.
+fn choices(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        let Some(len) = rest[start..].find("]]") else { break };
+        let whole = &rest[start..start + len + 2];
+        let options = whole[2..whole.len() - 2].split('|').map(|o| o.trim().to_owned()).filter(|o| !o.is_empty()).collect();
+        out.push((whole.to_owned(), options));
+        rest = &rest[start + len + 2..];
+    }
+    out
+}
+
+/// The reply drafted for a request: where it goes, your choices, the text
+/// to edit; sent with ⌘↵.
+#[component]
+fn DraftCard(r: Request, b: Brief) -> impl IntoView {
+    let id = r.id;
+    let draft = RwSignal::new(r.draft.clone().filter(|d| d.error.is_none()));
+    let failed = r.draft.as_ref().and_then(|d| d.error.clone());
+    let text = RwSignal::new(r.draft.as_ref().map(|d| d.text.clone()).unwrap_or_default());
+    let busy = RwSignal::new(false);
+    let to = LocalResource::new(move || {
+        let target = draft.get().map(|d| d.target).unwrap_or_default();
+        async move {
+            if target.is_empty() {
+                return Ok(Value::Null);
+            }
+            api::rpc("memex.requests.reply_to", json!({"target": target})).await
+        }
+    });
+    let redraft = move || {
+        busy.set(true);
+        spawn_local(async move {
+            match api::rpc_as::<c6_api::RequestDraft>("memex.requests.draft", json!({"id": id})).await {
+                Ok(d) => {
+                    text.set(d.text.clone());
+                    draft.set(Some(d));
+                }
+                Err(e) => b.error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+    let send = move || {
+        let Some(d) = draft.get_untracked() else { return };
+        busy.set(true);
+        spawn_local(async move {
+            match api::rpc("memex.requests.send", json!({"id": id, "target": d.target, "text": text.get_untracked()})).await {
+                Ok(_) => b.gone(id),
+                Err(e) => b.error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+    view! {
+        <div class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+            {move || match draft.get() {
+                None => view! {
+                    <p class="text-sm text-zinc-500">{failed.clone().map(|e| format!("Couldn't draft: {e}")).unwrap_or_else(|| {
+                        if r.category == "needs_you" { "A draft is on its way.".into() } else { "No draft yet.".into() }
+                    })}</p>
+                    <button class=BUTTON disabled=move || busy.get() on:click=move |_| redraft()>{move || if busy.get() { "Drafting…" } else { "Draft a reply" }}</button>
+                }.into_any(),
+                Some(d) => view! {
+                    <p class="text-xs text-zinc-500">{move || {
+                        let v = to.get().and_then(Result::ok).unwrap_or_default();
+                        if v["kind"] == "mail" {
+                            format!("✉ To {} <{}> · {}", v["to_name"].as_str().unwrap_or(""), v["to"][0].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""))
+                        } else if v["kind"] == "chat" {
+                            format!("💬 In {}", if v["thread_ts"].is_string() { "the thread" } else { "the conversation" })
+                        } else {
+                            String::new()
+                        }
+                    }}</p>
+                    {(!d.note.is_empty()).then(|| view! { <p class="text-xs text-amber-700 dark:text-amber-400">{format!("Check: {}", d.note)}</p> })}
+                    {move || choices(&text.get()).into_iter().map(|(whole, options)| view! {
+                        <div class="flex flex-wrap items-center gap-1 text-xs">
+                            <span class="text-zinc-500">"Choose:"</span>
+                            {options.into_iter().map(|o| {
+                                let (whole, chosen) = (whole.clone(), o.clone());
+                                view! {
+                                    <button class="rounded border border-zinc-300 px-1.5 py-0.5 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                                        on:click=move |_| text.update(|t| *t = t.replacen(&whole, &chosen, 1))>{o}</button>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }).collect_view()}
+                    <textarea class="h-40 w-full rounded-md border border-zinc-300 bg-transparent p-2 text-sm dark:border-zinc-700"
+                        prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
+                        on:keydown=move |ev| if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { ev.prevent_default(); send(); } />
+                    <div class="flex flex-wrap gap-2">
+                        <button class=BUTTON disabled=move || busy.get() || !choices(&text.get()).is_empty() on:click=move |_| send()>"Send (⌘↵)"</button>
+                        <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| redraft()>{move || if busy.get() { "…" } else { "Draft again" }}</button>
+                    </div>
+                }.into_any(),
+            }}
         </div>
     }
 }

@@ -22,6 +22,7 @@ pub mod store;
 
 /// The realm everything in the memex belongs to, so far (docs/os.md §3).
 pub const REALM_HOME: &str = "home";
+pub mod drafts;
 pub mod requests;
 pub mod triage;
 pub mod understand;

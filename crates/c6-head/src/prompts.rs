@@ -123,6 +123,11 @@ pub const DEFAULTS: &[Prompt] = &[
         description: "Whether someone's new message is the same request as one of theirs already open (joined), or another. Placeholders: {{open}}, {{new}}.",
         default: text::REQUEST_SAME,
     },
+    Prompt {
+        name: "memex.requests.draft",
+        description: "How a reply is drafted for a request that needs you: voice, facts only, choices as [[a | b]] for what only you decide. Placeholders: {{request}}, {{context}}.",
+        default: text::REQUEST_DRAFT,
+    },
     Prompt { name: "memex.page.system", description: "The system prompt for writing a system's page.", default: text::PAGE_SYSTEM },
     Prompt {
         name: "memex.page",

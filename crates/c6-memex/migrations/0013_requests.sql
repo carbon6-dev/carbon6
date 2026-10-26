@@ -22,7 +22,8 @@ CREATE TABLE request_sources (
     request_id  INTEGER NOT NULL,
     target      TEXT NOT NULL,             -- a triage target
     kind        TEXT NOT NULL,             -- mail or chat
-    at          INTEGER NOT NULL,
+    at          INTEGER NOT NULL,            -- its latest message's time
+    noted_at    INTEGER NOT NULL DEFAULT 0,  -- when that news reached the request
     PRIMARY KEY (request_id, target)
 );
 CREATE INDEX request_sources_target ON request_sources (target);
