@@ -66,6 +66,8 @@ impl Anthropic {
             body["tools"] = Value::Array(tools);
         }
         match info.thinking {
+            // No reasoning, whatever the model would do by default.
+            _ if req.effort.as_deref() == Some("none") => body["thinking"] = json!({"type": "disabled"}),
             Thinking::Adaptive => {
                 body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
                 if let Some(e) = req.effort.as_deref().or(info.default_effort) {
@@ -465,6 +467,26 @@ mod tests {
     fn overloaded_error_is_retryable_and_missing_stop_is_error() {
         let evs = run(&[r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]);
         assert!(evs[0].as_ref().unwrap_err().contains("529"));
+    }
+
+    #[test]
+    fn no_effort_turns_thinking_off() {
+        let c = Anthropic::new("http://127.0.0.1:11434", "k", HashMap::new()).unwrap();
+        for model in ["claude-opus-5-5", "qwen3.6:27b"] {
+            let req = ModelRequest {
+                model: model.into(),
+                system: "s".into(),
+                messages: vec![Message::user_text("sort this")],
+                tools: vec![],
+                max_output_tokens: Some(500),
+                cache_key: None,
+                effort: Some("none".into()),
+                web_search: false,
+            };
+            let b = c.request_body(&req);
+            assert_eq!(b["thinking"], json!({"type": "disabled"}), "{model}");
+            assert!(b.get("output_config").is_none(), "{model}");
+        }
     }
 
     #[test]

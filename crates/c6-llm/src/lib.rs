@@ -104,7 +104,8 @@ pub struct ModelRequest {
     pub max_output_tokens: Option<u32>,
     /// Stable per-conversation key for providers with keyed prefix caching.
     pub cache_key: Option<String>,
-    /// Reasoning effort ("low" … "max"); `None` uses the model default.
+    /// Reasoning effort ("low" … "max", or "none": no reasoning); `None`
+    /// uses the model default.
     pub effort: Option<String>,
     /// Offer the provider's own web search tool, where it has one.
     pub web_search: bool,
@@ -203,14 +204,11 @@ pub(crate) fn data_url(media_type: &str, data: &[u8]) -> String {
     format!("data:{media_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
 }
 
-/// Whether a connection passes the reasoning effort on to the model. Chat
-/// Completions servers other than OpenAI's own may reject the field, so it
-/// is only sent there.
-pub fn supports_effort(kind: &str, base_url: &str) -> bool {
-    match kind {
-        "openai_compat" | "" => is_openai_api(base_url),
-        _ => true,
-    }
+/// Whether a connection passes the reasoning effort on to the model. Every
+/// kind does: a Chat Completions server that rejects the field is asked
+/// again without it (openai_chat.rs).
+pub fn supports_effort(_kind: &str, _base_url: &str) -> bool {
+    true
 }
 
 pub(crate) fn is_openai_api(base_url: &str) -> bool {
@@ -252,9 +250,7 @@ pub fn install_crypto_provider() {
 mod tests {
     #[test]
     fn effort_support() {
-        assert!(super::supports_effort("openai_compat", "https://api.openai.com/v1"));
-        assert!(!super::supports_effort("openai_compat", "http://127.0.0.1:11434/v1"));
-        for kind in ["openai", "chatgpt", "anthropic", "claude_code"] {
+        for kind in ["openai_compat", "openai", "chatgpt", "anthropic", "claude_code"] {
             assert!(super::supports_effort(kind, "http://anything"), "{kind}");
         }
     }

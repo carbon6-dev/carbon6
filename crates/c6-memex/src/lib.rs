@@ -107,7 +107,11 @@ pub struct Tasks {
 }
 
 fn task_of(v: &Value) -> Option<llm::Task> {
-    Some(llm::Task { connection_id: v["connection_id"].as_str()?.to_owned(), model: v["model"].as_str().unwrap_or_default().to_owned() })
+    Some(llm::Task {
+        connection_id: v["connection_id"].as_str()?.to_owned(),
+        model: v["model"].as_str().unwrap_or_default().to_owned(),
+        effort: v["effort"].as_str().map(str::to_owned),
+    })
 }
 
 /// Folder files larger than this are not read.

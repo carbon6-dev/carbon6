@@ -20,6 +20,7 @@ mod labels;
 mod mail;
 mod markdown;
 mod memex;
+mod models;
 mod notify;
 mod outputs;
 mod photos;

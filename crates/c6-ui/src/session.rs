@@ -6,6 +6,7 @@ use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, storage_get, storage_set};
 use crate::workspace::{Go, ScrollBox, Target, View, use_column};
 use crate::{api, markdown, sessions};
@@ -1005,14 +1006,11 @@ impl ModelChoice {
     }
 }
 
-/// Connection select plus a model field that suggests the connection's
-/// models and also takes free text.
+/// Connection select plus a model field that lists the connection's models
+/// and also takes free text.
 #[component]
 fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: RwSignal<String>) -> impl IntoView {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let list_id = format!("c6-models-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let connections = LocalResource::new(api::connections);
-    let models = LocalResource::new(move || api::models(connection.get()));
     // Effort only where the connection passes it on to the model.
     let supports_effort =
         move |id: &str| connections.get().and_then(Result::ok).is_some_and(|cs| cs.iter().any(|c| c.id == id && c.supports_effort));
@@ -1031,11 +1029,7 @@ fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: Rw
                 view! { <option value=c.id.clone() selected=move || connection.get() == id>{c.name.clone()}</option> }
             }).collect_view()}
         </select>
-        <input class=format!("{SMALL_INPUT} w-56 font-mono") list=list_id.clone() placeholder="model id"
-            prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
-        <datalist id=list_id>
-            {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
-        </datalist>
+        <div class="w-56"><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" /></div>
         <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
                 <option value=value selected=move || effort.get() == value>{label}</option>

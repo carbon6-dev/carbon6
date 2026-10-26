@@ -98,13 +98,15 @@ impl OpenAiChat {
             body["max_tokens"] = n.into();
         }
         // Only OpenAI is known to accept this; strict servers reject unknown fields.
-        if self.is_openai() {
-            if let Some(key) = &req.cache_key {
-                body["prompt_cache_key"] = key.clone().into();
-            }
-            if let Some(e) = &req.effort {
-                body["reasoning_effort"] = e.clone().into();
-            }
+        if self.is_openai()
+            && let Some(key) = &req.cache_key
+        {
+            body["prompt_cache_key"] = key.clone().into();
+        }
+        // Ollama and others take it too ("none" turns a thinking model's
+        // reasoning off); a server that rejects it is asked again without.
+        if let Some(e) = &req.effort {
+            body["reasoning_effort"] = e.clone().into();
         }
         body
     }
@@ -118,7 +120,19 @@ impl ModelClient for OpenAiChat {
         if !self.bearer.is_empty() {
             headers.insert("authorization".into(), format!("Bearer {}", self.bearer));
         }
-        let resp = http::post_json(&self.http, &format!("{}/chat/completions", self.base_url), &headers, &body).await?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let resp = match http::post_json(&self.http, &url, &headers, &body).await {
+            Err(LlmError::Http { status: 400 | 422, body: why, .. })
+                if body.get("reasoning_effort").is_some() && why.to_lowercase().contains("reasoning") =>
+            {
+                let mut body = body.clone();
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("reasoning_effort");
+                }
+                http::post_json(&self.http, &url, &headers, &body).await?
+            }
+            r => r?,
+        };
 
         let state = StreamState::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
@@ -436,6 +450,9 @@ mod tests {
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "read");
         assert_eq!(msgs[3]["role"], "tool");
         assert!(body.get("prompt_cache_key").is_none(), "not sent to non-OpenAI hosts");
+        assert!(body.get("reasoning_effort").is_none());
+        let body = c.request_body(&ModelRequest { effort: Some("none".into()), ..req });
+        assert_eq!(body["reasoning_effort"], "none", "sent to every server (Ollama turns thinking off with it)");
     }
 
     #[test]

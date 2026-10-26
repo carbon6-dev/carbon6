@@ -6,6 +6,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 use crate::workspace::{How, View, use_workspace};
 
@@ -127,8 +128,7 @@ pub fn AssistantSettings() -> impl IntoView {
                 </label>
                 <label class="space-y-0.5 sm:col-span-2">
                     <span class="text-xs text-zinc-500">"Model"</span>
-                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="e.g. claude-sonnet-5-5, gpt-5, qwen3.6:27b"
-                        prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
+                    <ModelInput connection=conn value=model on_set=move |v| model.set(v) class=format!("{INPUT} py-1 text-xs") placeholder="e.g. claude-sonnet-5-5, gpt-5, qwen3.6:27b" />
                 </label>
             </div>
             <div class="flex items-center justify-end gap-3">

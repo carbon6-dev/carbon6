@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// Settings: groups of pages, (id, title, what is on it). The id is the
@@ -1612,20 +1613,17 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                 {field("API key", api_key, by_kind("sk-ant-…", "sk-…", "optional for local servers"), "password")}
                 <label class="block text-xs text-zinc-500">
                     "Default model (optional)"
-                    // Suggestions from the server after a test; any name can be typed.
-                    <input class=format!("mt-1 font-mono {INPUT}") list="c6-conn-models" autocomplete="off"
-                        placeholder=move || if matches!(tested.get(), Some(Ok(_))) { "pick or type a model" } else { by_kind("claude-opus-5-5", "gpt-5.5", "qwen3.6:27b").get() }
-                        prop:value=move || default_model.get() on:input=move |ev| default_model.set(event_target_value(&ev)) />
-                    <datalist id="c6-conn-models">
-                        {move || tested.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
-                    </datalist>
+                    // The server's models after a test; any name can be typed.
+                    <div class="mt-1"><ModelInput connection=Signal::stored(String::new()) value=default_model on_set=move |v| default_model.set(v) class=INPUT.to_owned()
+                        list=Signal::derive(move || tested.get())
+                        placeholder=Signal::derive(move || if matches!(tested.get(), Some(Ok(_))) { "pick or type a model".to_owned() } else { by_kind("claude-opus-5-5", "gpt-5.5", "qwen3.6:27b").get().to_owned() }) /></div>
                 </label>
             </div>
             {move || tested.get().map(|r| match r {
                 Ok(models) => view! {
                     <p class="text-sm text-emerald-700 dark:text-emerald-400">
                         {format!("✓ Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
-                        {(!models.is_empty()).then(|| view! { <span class="text-zinc-500">" (suggested in the model field)"</span> })}
+                        {(!models.is_empty()).then(|| view! { <span class="text-zinc-500">" (listed in the model field)"</span> })}
                     </p>
                 }.into_any(),
                 Err(e) => view! { <p class="text-sm text-red-600">{format!("✕ {e}")}</p> }.into_any(),
@@ -2208,6 +2206,11 @@ enum FieldKind {
     Labels,
     /// One of these values.
     Choice(&'static [&'static str]),
+    /// A connection, by name (empty: the placeholder's default).
+    Connection,
+    /// A model id, from the item's connection's models (or every
+    /// connection's when it has none).
+    Model,
     /// JSON (an object or a list), several lines.
     Json,
 }
@@ -2238,7 +2241,12 @@ const AGENT_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. code-reviewer", kind: FieldKind::Mono },
     Field { key: "description", label: "When to use it", placeholder: "the model reads this to pick the agent", kind: FieldKind::Line },
     Field { key: "tools", label: "Tools", placeholder: "all, or e.g. Read, Grep, Glob", kind: FieldKind::Mono },
-    Field { key: "model", label: "Model", placeholder: "same as the session (or opus, sonnet, haiku on Anthropic)", kind: FieldKind::Mono },
+    Field {
+        key: "model",
+        label: "Model",
+        placeholder: "same as the session (or opus, sonnet, haiku on Anthropic)",
+        kind: FieldKind::Model,
+    },
     Field {
         key: "applies_to",
         label: "Applies to",
@@ -2311,7 +2319,7 @@ fn policy_examples() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 const PRICE_FIELDS: &[Field] = &[
-    Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-* or gpt-5.5", kind: FieldKind::Mono },
+    Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-* or gpt-5.5", kind: FieldKind::Model },
     Field { key: "input", label: "Input ($/M tokens)", placeholder: "e.g. 3", kind: FieldKind::Mono },
     Field { key: "output", label: "Output ($/M tokens)", placeholder: "e.g. 15", kind: FieldKind::Mono },
     Field { key: "cache_read", label: "Cache read ($/M)", placeholder: "the input price", kind: FieldKind::Mono },
@@ -2516,10 +2524,15 @@ const ROUTE_FIELDS: &[Field] = &[
         placeholder: "every session, or labels, e.g. host:, template:triage",
         kind: FieldKind::Labels,
     },
-    Field { key: "connection", label: "Connection", placeholder: "the session's (or your latest)", kind: FieldKind::Line },
-    Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-5-5", kind: FieldKind::Mono },
+    Field { key: "connection", label: "Connection", placeholder: "the session's (or your latest)", kind: FieldKind::Connection },
+    Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-5-5", kind: FieldKind::Model },
     Field { key: "effort", label: "Effort", placeholder: "the model's default; or low, medium, high, xhigh, max", kind: FieldKind::Mono },
-    Field { key: "subagent_model", label: "Subagent model", placeholder: "the session's; or e.g. claude-haiku-4-5", kind: FieldKind::Mono },
+    Field {
+        key: "subagent_model",
+        label: "Subagent model",
+        placeholder: "the session's; or e.g. claude-haiku-4-5",
+        kind: FieldKind::Model,
+    },
 ];
 
 fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
@@ -2575,8 +2588,8 @@ const TEMPLATE_FIELDS: &[Field] = &[
         kind: FieldKind::Labels,
     },
     Field { key: "cwd", label: "Folder", placeholder: "scratch workspace (or home on SSH hosts)", kind: FieldKind::Mono },
-    Field { key: "connection", label: "Connection", placeholder: "by routing rules", kind: FieldKind::Line },
-    Field { key: "model", label: "Model", placeholder: "by routing rules (Settings → Model routing)", kind: FieldKind::Mono },
+    Field { key: "connection", label: "Connection", placeholder: "by routing rules", kind: FieldKind::Connection },
+    Field { key: "model", label: "Model", placeholder: "by routing rules (Settings → Model routing)", kind: FieldKind::Model },
     Field { key: "labels", label: "Labels", placeholder: "e.g. ops, daily", kind: FieldKind::Labels },
     Field { key: "prompt", label: "Prompt", placeholder: "Check {{target}} for … {{input}}", kind: FieldKind::Text },
 ];
@@ -2890,8 +2903,12 @@ fn ListItem(
     let lines: Vec<&'static Field> = rest.iter().filter(|f| !matches!(f.kind, FieldKind::Text | FieldKind::Json)).collect();
     let texts: Vec<&'static Field> = rest.iter().filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Json)).collect();
     let input_class = |f: &Field| {
-        format!("{INPUT} py-1 {}", if matches!(f.kind, FieldKind::Mono | FieldKind::Labels) { "font-mono text-xs" } else { "text-sm" })
+        format!(
+            "{INPUT} py-1 {}",
+            if matches!(f.kind, FieldKind::Mono | FieldKind::Labels | FieldKind::Model) { "font-mono text-xs" } else { "text-sm" }
+        )
     };
+    let connections = LocalResource::new(api::connections);
     view! {
         <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if enabled() { "" } else { "opacity-60" })>
             <div class="flex items-center gap-2">
@@ -2909,6 +2926,30 @@ fn ListItem(
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=get(f.key) on:change=move |ev| set(f.key, event_target_value(&ev))>
                                 {options.iter().map(|o| view! { <option value=*o>{*o}</option> }).collect_view()}
                             </select>
+                        </label>
+                    }.into_any()
+                } else if f.kind == FieldKind::Connection {
+                    view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <select class=format!("{INPUT} py-1 text-sm") prop:value=get(f.key) on:change=move |ev| set(f.key, event_target_value(&ev))>
+                                <option value="">{format!("Default: {}", f.placeholder)}</option>
+                                {move || {
+                                    let all = connections.get().and_then(Result::ok).unwrap_or_default();
+                                    // A connection named here that no longer exists stays shown.
+                                    let current = get(f.key)();
+                                    let gone = (!current.is_empty() && !all.iter().any(|c| c.name == current || c.id == current)).then_some(current);
+                                    all.into_iter().map(|c| c.name).chain(gone).map(|n| view! { <option value=n.clone()>{n.clone()}</option> }).collect_view()
+                                }}
+                            </select>
+                        </label>
+                    }.into_any()
+                } else if f.kind == FieldKind::Model {
+                    let connection = Signal::derive(move || item.with(|m| m.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_owned()));
+                    view! {
+                        <label class="space-y-0.5">
+                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <ModelInput connection value=Signal::derive(get(f.key)) on_set=move |v| set(f.key, v) class=input_class(f) placeholder=f.placeholder />
                         </label>
                     }.into_any()
                 } else if f.kind == FieldKind::Labels {

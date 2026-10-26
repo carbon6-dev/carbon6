@@ -227,6 +227,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
         if c.kind == "claude_code" {
             return Err(bad_request(format!("{what}: the memex calls models directly; choose an API connection, not {}", c.name)));
         }
+        if let Some(e) = m.effort.as_deref().filter(|e| !matches!(*e, "" | "none" | "low" | "medium" | "high" | "xhigh" | "max")) {
+            return Err(bad_request(format!("{what}: effort is none, low, medium, high, xhigh or max, not {e:?}")));
+        }
         if what == "transcription" && matches!(c.kind.as_str(), "anthropic" | "chatgpt") {
             return Err(bad_request("transcription: choose an OpenAI or OpenAI-compatible connection (one with /audio/transcriptions)"));
         }
@@ -272,14 +275,17 @@ pub fn check_scopes(scopes: &[api::MemexScope]) -> anyhow::Result<()> {
 pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
     let s = settings(st).await?;
     let connections = st.store.connections().await?;
-    let task = |m: &Option<api::MemexModel>| {
+    // Understanding sorts and drafts many times a day: by default it doesn't
+    // reason (a thinking model would spend a minute on each); vision a little.
+    let task_with = |m: &Option<api::MemexModel>, effort: &str| {
         m.as_ref().and_then(|m| {
-            connections
-                .iter()
-                .find(|c| c.id == m.connection || c.name == m.connection)
-                .map(|c| json!({"connection_id": c.id, "kind": c.kind, "model": m.model}))
+            connections.iter().find(|c| c.id == m.connection || c.name == m.connection).map(|c| {
+                let effort = m.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(effort);
+                json!({"connection_id": c.id, "kind": c.kind, "model": m.model, "effort": effort})
+            })
         })
     };
+    let task = |m: &Option<api::MemexModel>| task_with(m, "low");
     let embedding = task(&s.embedding);
     let folders: Vec<api::MemexFolder> = serde_json::from_str(&st.store.setting(FOLDERS).await?.unwrap_or_default()).unwrap_or_default();
     Ok(json!({
@@ -287,7 +293,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "folders": folders,
         "accounts": accounts_by_realm(st).await,
         "contacts_auto": s.contacts_auto.unwrap_or(false),
-        "understanding": task(&s.understanding),
+        "understanding": task_with(&s.understanding, "none"),
         "prompts": crate::prompts::for_memex(st, crate::realms::HOME).await,
         "realm_prompts": crate::prompts::for_memex_realms(st).await,
         "brief": briefs(st).await,

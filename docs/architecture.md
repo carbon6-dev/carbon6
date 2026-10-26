@@ -413,6 +413,7 @@ Decisions made while building M1 that refine the sections above:
   - Anthropic: adaptive thinking with `display: "summarized"` and effort via `output_config.effort`. Thinking blocks, including empty ones with only a signature, are stored and sent back unchanged. Caching uses an explicit breakpoint on the system prompt plus top-level automatic caching. Tools use `eager_input_streaming`, and the agent parses tool input strictly.
   - Responses: `store: false` with `include: ["reasoning.encrypted_content"]`. Reasoning items are kept in output order and sent back.
   - A client skips another provider's reasoning blocks.
+  - Effort `none` means no reasoning: Anthropic gets `thinking: {"type": "disabled"}`, Responses `reasoning.effort: "none"`, Chat Completions `reasoning_effort: "none"`. Chat Completions sends `reasoning_effort` to every server (Ollama uses it to turn a thinking model's reasoning off); a server that answers 400/422 about it is asked again without.
 - **Stop reasons.** If a response hits `max_tokens` with tool calls, none of them run: the model gets an error result for each. A `refusal` ends the turn with an error.
 - **Tool profiles (M2).** The profile is chosen from the model when the session starts and recorded in `SessionStarted.tool_profile`, so the tool list never changes during a session. All three present the same implementations:
   - Generic: read, write, edit, bash, grep, glob, update_plan.

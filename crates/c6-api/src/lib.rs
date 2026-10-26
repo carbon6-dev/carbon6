@@ -3644,6 +3644,10 @@ pub struct MemexModel {
     /// A connection name or id.
     pub connection: String,
     pub model: String,
+    /// How much the model reasons: none, low, medium or high (default: none
+    /// for understanding, which sorts and drafts; low for vision).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// `GET`/`PUT /api/v1/settings/memex`.

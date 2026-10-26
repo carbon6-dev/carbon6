@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::models::ModelInput;
 use crate::util::{BUTTON, ErrorBox, INPUT, StatusPill, ago, clock, storage_get, storage_set};
 use crate::workspace::{Go, How, View, use_column, use_workspace};
 
@@ -373,11 +374,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         let (w, c) = (worker.get(), cwd.get());
         labels.set(storage_get(&format!("c6.labels.{w}.{c}")).unwrap_or_default());
     });
-    // Default model per connection; offer the provider's model list.
-    let models = LocalResource::new(move || {
-        let c = connection.get();
-        async move { if c.is_empty() { Ok(Vec::new()) } else { api::models(c).await } }
-    });
+    // Default model per connection.
     Effect::new(move || {
         let c = connection.get();
         if c.is_empty() {
@@ -521,11 +518,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 })}
                 <label class="block text-xs text-zinc-500" class:hidden=auto>
                     "Model"
-                    <input class=format!("mt-1 font-mono {INPUT}") list="c6-models" placeholder="model id (empty: routing rules, else the default)"
-                        prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
-                    <datalist id="c6-models">
-                        {move || models.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
-                    </datalist>
+                    <div class="mt-1"><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=INPUT.to_owned() placeholder="model id (empty: routing rules, else the default)" /></div>
                 </label>
                 <label class="block text-xs text-zinc-500" class:hidden=move || !effort_supported()>
                     "Effort"

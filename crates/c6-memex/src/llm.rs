@@ -12,6 +12,8 @@ use serde_json::Value;
 pub struct Task {
     pub connection_id: String,
     pub model: String,
+    /// The reasoning effort asked for (none: no reasoning).
+    pub effort: Option<String>,
 }
 
 /// The model's text answer to `system` and the user's blocks (text and
@@ -26,7 +28,7 @@ pub async fn ask(link: &Arc<HeadLink>, task: &Task, system: &str, user: Vec<Bloc
         tools: Vec::new(),
         max_output_tokens: Some(max_tokens),
         cache_key: None,
-        effort: Some("low".into()),
+        effort: task.effort.clone().filter(|e| !e.is_empty()),
         web_search: false,
     };
     let mut stream = client.stream(&req).await?;

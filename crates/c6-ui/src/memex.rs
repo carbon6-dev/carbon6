@@ -9,6 +9,7 @@ use serde_json::Value;
 use wasm_bindgen::prelude::*;
 
 use crate::api;
+use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, View};
 
@@ -477,6 +478,9 @@ fn NoteBox() -> impl IntoView {
 }
 
 /// Settings → Memex: connecting one, its embedding model, the brief size.
+/// A model task's settings: (name, connection, model, effort).
+type ModelTask = (&'static str, RwSignal<String>, RwSignal<String>, RwSignal<String>);
+
 #[component]
 pub fn MemexSettings() -> impl IntoView {
     let status = LocalResource::new(api::memex_status);
@@ -484,9 +488,10 @@ pub fn MemexSettings() -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let (conn, model, chars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let (auto, approve) = (RwSignal::new(false), RwSignal::new(true));
-    // Model tasks: (connection, model) for understanding, vision, transcription.
-    let tasks: [(&'static str, RwSignal<String>, RwSignal<String>); 3] =
-        ["understanding", "vision", "transcription"].map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new())));
+    // Model tasks: (connection, model, effort) for understanding, vision,
+    // transcription.
+    let tasks: [ModelTask; 3] = ["understanding", "vision", "transcription"]
+        .map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new())));
     let per_day = RwSignal::new(String::new());
     // Files on the head's machine: places, face models.
     let files: [(&'static str, RwSignal<String>); 3] =
@@ -498,9 +503,10 @@ pub fn MemexSettings() -> impl IntoView {
             conn.set(v["embedding"]["connection"].as_str().unwrap_or_default().to_owned());
             model.set(v["embedding"]["model"].as_str().unwrap_or_default().to_owned());
             chars.set(v["brief_chars"].as_u64().map(|n| n.to_string()).unwrap_or_default());
-            for (k, c, m) in tasks {
+            for (k, c, m, e) in tasks {
                 c.set(v[k]["connection"].as_str().unwrap_or_default().to_owned());
                 m.set(v[k]["model"].as_str().unwrap_or_default().to_owned());
+                e.set(v[k]["effort"].as_str().unwrap_or_default().to_owned());
             }
             per_day.set(v["calls_per_day"].as_u64().map(|n| n.to_string()).unwrap_or_default());
             for (k, f) in files {
@@ -521,9 +527,12 @@ pub fn MemexSettings() -> impl IntoView {
         }
         v["contacts_auto"] = auto.get_untracked().into();
         v["send_needs_approval"] = approve.get_untracked().into();
-        for (k, c, m) in tasks {
+        for (k, c, m, e) in tasks {
             if !c.get_untracked().is_empty() {
                 v[k] = serde_json::json!({"connection": c.get_untracked(), "model": m.get_untracked().trim()});
+                if !e.get_untracked().is_empty() {
+                    v[k]["effort"] = e.get_untracked().into();
+                }
             }
         }
         if let Ok(n) = per_day.get_untracked().trim().parse::<u32>() {
@@ -564,7 +573,7 @@ pub fn MemexSettings() -> impl IntoView {
                 </label>
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Embedding model"</span>
-                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="e.g. nomic-embed-text, text-embedding-3-small" prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) />
+                    <ModelInput connection=conn value=model on_set=move |v| model.set(v) class=format!("{INPUT} py-1 text-xs") placeholder="e.g. nomic-embed-text, text-embedding-3-small" />
                 </label>
                 <label class="flex items-center gap-2 text-sm sm:col-span-3">
                     <input type="checkbox" prop:checked=move || auto.get() on:change=move |ev| auto.set(event_target_checked(&ev)) />
@@ -574,7 +583,7 @@ pub fn MemexSettings() -> impl IntoView {
                     <input type="checkbox" prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
                     "Agents' mail and calendar invitations wait for my approval"
                 </label>
-                {tasks.into_iter().map(|(k, c, m)| {
+                {tasks.into_iter().map(|(k, c, m, e)| {
                     let (title, hint) = match k {
                         "understanding" => ("Understanding", "e.g. claude-haiku-4-5, gpt-5-mini, qwen3:8b"),
                         "vision" => ("Vision (photos)", "e.g. claude-haiku-4-5, gpt-5-mini, qwen2.5vl"),
@@ -590,13 +599,22 @@ pub fn MemexSettings() -> impl IntoView {
                                     .map(|x| view! { <option value=x.name.clone()>{x.name.clone()}</option> }).collect_view()}
                             </select>
                         </label>
-                        <label class="space-y-0.5 sm:col-span-2">
+                        <label class=if k == "transcription" { "space-y-0.5 sm:col-span-2" } else { "space-y-0.5" }>
                             <span class="text-xs text-zinc-500">{format!("{title}: model")}</span>
-                            <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=hint prop:value=move || m.get() on:input=move |ev| m.set(event_target_value(&ev)) />
+                            <ModelInput connection=c value=m on_set=move |v| m.set(v) class=format!("{INPUT} py-1 text-xs") placeholder=hint />
                         </label>
+                        {(k != "transcription").then(|| view! {
+                            <label class="space-y-0.5">
+                                <span class="text-xs text-zinc-500">{format!("{title}: reasoning")}</span>
+                                <select class=format!("{INPUT} py-1 text-sm") prop:value=move || e.get() on:change=move |ev| e.set(event_target_value(&ev))>
+                                    <option value="">{if k == "understanding" { "Default (none: fastest)" } else { "Default (low)" }}</option>
+                                    {["none", "low", "medium", "high"].map(|o| view! { <option value=o>{o}</option> })}
+                                </select>
+                            </label>
+                        })}
                     }
                 }).collect_view()}
-                <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
+                <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first, and sorts and drafts for the brief. Without reasoning a local thinking model (Qwen, gpt-oss) takes seconds a conversation instead of a minute. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
                 {files.into_iter().map(|(k, f)| {
                     let (title, hint) = match k {
                         "places_file" => ("Places (GeoNames file)", "e.g. ~/memex/cities1000.txt"),

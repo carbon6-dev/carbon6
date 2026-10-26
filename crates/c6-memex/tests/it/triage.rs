@@ -246,6 +246,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert!(sorted("chat:T1:C9:8200.0001").await.is_none(), "a channel message not to you isn't sorted");
     let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
     assert_eq!(asked.len(), 5, "rules needed no model");
+    assert_eq!(mock.requests()[0]["reasoning_effort"], "none", "sorting doesn't reason by default");
     assert!(asked[0].contains("Sort this conversation") && asked[0].contains("approve the redlines"), "{}", asked[0]);
     assert!(asked[3].contains("never corresponded") && asked[3].contains("scale SDRs"), "{}", asked[3]);
     assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
