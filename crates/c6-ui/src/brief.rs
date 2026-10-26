@@ -102,6 +102,10 @@ pub fn BriefPage() -> impl IntoView {
         tick.track();
         api::rpc("memex.triage.counts", json!({}))
     });
+    let status = LocalResource::new(move || {
+        tick.track();
+        api::rpc("memex.triage.status", json!({}))
+    });
     let fyi = LocalResource::new(move || {
         tick.track();
         api::rpc_as::<Vec<Triage>>("memex.triage.list", json!({"category": "fyi", "limit": 8}))
@@ -181,6 +185,24 @@ pub fn BriefPage() -> impl IntoView {
                         <span class="flex-1"></span>
                         <span class="hidden text-xs text-zinc-400 sm:inline">"J/K move · Enter open · E done · H tomorrow · # drop · Esc back"</span>
                     </header>
+                    // Why it may be short: sorting waits for a model, or for
+                    // tomorrow's budget.
+                    {move || status.get().and_then(Result::ok).and_then(|s| {
+                        let waiting = s["waiting"].as_u64().unwrap_or(0);
+                        let why = if s["model"] != true {
+                            "No understanding model is chosen, so only what rules settle (lists, notifications, known pitches) is sorted. Choose one in Settings → Memex."
+                        } else if s["budget_left"].as_u64() == Some(0) && waiting > 0 {
+                            "Today's model calls are used up, so new mail and chat wait until tomorrow. Raise calls per day in Settings → Memex."
+                        } else {
+                            return None;
+                        };
+                        Some(view! {
+                            <div class="flex flex-wrap items-center gap-2 rounded-md bg-amber-50 p-2 text-sm dark:bg-amber-950">
+                                <span class="flex-1">{why}{(waiting > 0).then(|| format!(" {}{} conversations wait.", waiting, if waiting >= 20 { "+" } else { "" }))}</span>
+                                <Go to=View::Settings { note: None, section: "memex".into() } class=BUTTON>"Settings → Memex"</Go>
+                            </div>
+                        })
+                    })}
                     <Section title="Needs you" empty="Nothing waits on you.">
                         {move || queue.get().into_iter().enumerate().filter(|(_, r)| r.category == "needs_you").map(|(i, r)| view! { <Row r i picked b /> }).collect_view()}
                     </Section>

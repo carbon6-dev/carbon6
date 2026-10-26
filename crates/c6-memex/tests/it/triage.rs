@@ -216,6 +216,8 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert_eq!((follow.category.as_str(), follow.by.as_str()), ("pitch", "sequence"), "{follow:?}");
     assert_eq!(sorted("thread:acct:t7").await.unwrap().category, "newsletter");
     assert!(sorted("thread:acct:t1").await.is_none(), "waits for a model");
+    let status = rpc("memex.triage.status", json!({})).await;
+    assert_eq!((status["model"].as_bool(), status["waiting"].as_u64()), (Some(false), Some(5)), "the brief says why: {status}");
 
     // Then the model, newest first: Ana (known), Raj's DM, Bo (known by his
     // company), Lee and Pat (strangers: the pitch prompt).

@@ -520,6 +520,16 @@ pub async fn counts(m: &Memex) -> anyhow::Result<Value> {
     Ok(Value::Object(rows.into_iter().map(|(k, n)| (k, json!(n))).collect()))
 }
 
+/// Whether sorting can go on: a model chosen, budget left today, and how
+/// many conversations wait (up to 20).
+pub async fn status(m: &Memex) -> anyhow::Result<Value> {
+    let (model, budget) = match m.understanding() {
+        Some((_, per_day)) => (true, crate::understand::budget_left(m, per_day).await?),
+        None => (false, 0),
+    };
+    Ok(json!({"model": model, "budget_left": budget, "waiting": waiting(m).await?.len()}))
+}
+
 /// A thread's sorting, for the mail list.
 pub async fn of_thread(m: &Memex, account: &str, thread: &str) -> anyhow::Result<Option<api::Triage>> {
     let r = sqlx::query("SELECT * FROM triage WHERE target = ?")
@@ -627,6 +637,7 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
             json!(list(m, opt("category").as_deref(), opt("kind").as_deref(), params["limit"].as_u64().unwrap_or(100) as u32).await?)
         }
         "memex.triage.counts" => counts(m).await?,
+        "memex.triage.status" => status(m).await?,
         "memex.triage.get" => json!(get(m, &s("target")).await.ok()),
         "memex.triage.set" => json!(set(m, &s("target"), &s("category"), &s("note")).await?),
         "memex.triage.mark" => json!(mark(m, &s("target"), &s("mark"), params["domain"] == true).await?),
