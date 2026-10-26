@@ -447,6 +447,8 @@ carbon6 replaces the mail client, the calendar and the address book, starting wi
 
 ### 6.6 Agents and mail
 
+The triage, requests and drafts sketched here are built as the brief: see [brief.md](brief.md).
+
 - **Triage** (a workflow, on new mail or a schedule):
   - classify, summarize, extract commitments;
   - fill Needs reply and Waiting;

@@ -311,7 +311,7 @@ carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail
   - **Reading:** conversations, with HTML sandboxed and remote images off until you allow them.
   - **Writing:** Markdown compose, reply and reply all, attachments, drafts, **send later**, and **undo** (messages wait 10 seconds).
   - **In the graph:** every message is in the memex. Senders and recipients become people (one person across all their addresses), and company domains become organizations.
-  - **Inbox:** carbon6's inbox shows mail that needs a reply.
+  - **Inbox:** carbon6's inbox shows mail that needs a reply. The **Brief** (below) goes further.
 - **Calendar:**
   - **Sync:** every calendar on every account, synced both ways.
   - **Views:** agenda, week and month, with recurring events expanded (exceptions included).
@@ -329,6 +329,27 @@ carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail
 ### Slack
 
 Each realm can mirror Slack workspaces into its memex, as it does Gmail: every conversation you're in (channels, private channels, DMs and groups), with threads and shared documents, kept current within minutes (edits and deletions too), searchable, and linked to the people your mail knows. **Settings → Slack** walks you through making your own internal Slack app from a manifest (it keeps Slack's normal rate limits, which apps from outside Slack's directory don't), then connecting workspaces. **Chat** (☰) reads conversations and threads, and posts, replies and reacts as you, with a few seconds to undo. Agents in sessions whose memex scope includes `chat` can read conversations and post; their posts wait for your approval. Design: [docs/slack.md](docs/slack.md).
+
+### The brief
+
+The **Brief** (☰ or Apps) is Mail & chat's home. Instead of 200 messages, you get the handful of things people need from you. Design: [docs/brief.md](docs/brief.md).
+
+- **Sorting:** each recent mail thread and Slack conversation is sorted as one of:
+  - needs you;
+  - a real first contact;
+  - FYI;
+  - a newsletter or notification;
+  - noise;
+  - a cold pitch.
+
+  It runs in the memex's reading loop, with your understanding model and its daily budget.
+- **Cold pitches go first, mostly with no model.** Anyone you've written to (or anyone at their company), your contacts and your colleagues are never pitches. A stranger's mail sent through a sales-sequence tool, or a sequence's "bumping this" follow-up, is. The model sorts the rest. **Cold pitch** and **Not a pitch** on a thread mark the sender for good. **Sort as…** with a note teaches the sorting.
+- **Requests:** what needs you becomes a request: what's asked, by whom, by when. Ana's email and her Slack ping about the same thing are one request. It closes when you answer it, anywhere.
+- **Drafts:** each request waits with a reply drafted in your voice. It's written from the conversation, your history with the person, what's open between you and your calendar. What only you can decide is left as choices. Pick them, edit, and **⌘↵** sends (mail with its undo window).
+- **Keys:** J/K, Enter, E done, H tomorrow, # drop, Esc.
+- **Timing (Settings → Brief):** a brief notification at your times (08:30 and 13:30 by default) and a close-of-day note. Urgent requests (your rule, `memex.triage.urgent`) tell you at once. A new request is the trigger event `request.opened`.
+- **Your rules are settings:** the prompts `memex.triage`, `memex.triage.pitch`, `memex.triage.signals`, `memex.triage.urgent`, `memex.requests.same` and `memex.requests.draft` (Settings → Prompts), each realm's own.
+- **Agents** in sessions that see mail or chat get the `requests` tool.
 
 ### Browser
 

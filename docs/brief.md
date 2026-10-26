@@ -1,6 +1,6 @@
 # The brief: mail and chat as requests — Design
 
-Status: designed (2026-10-26). Decided:
+Status: built (2026-10-26; §10 is what was built, step by step). Decided:
 - the home of mail and chat is **the brief**, not a list of messages;
 - an agent **drafts a reply for every request that needs you**, before you open it;
 - **nothing goes out without your keypress**, at first; later you may approve playbooks that act alone;
