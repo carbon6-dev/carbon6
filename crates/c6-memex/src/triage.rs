@@ -484,14 +484,18 @@ async fn chat(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
 }
 
 /// Sorted conversations, newest first: of a category, or all.
-pub async fn list(m: &Memex, category: Option<&str>, kind: Option<&str>, limit: u32) -> anyhow::Result<Vec<api::Triage>> {
+/// Recent conversations as sorted; with `unseen`, only those with news since
+/// you said you'd seen them.
+pub async fn list(m: &Memex, category: Option<&str>, kind: Option<&str>, unseen: bool, limit: u32) -> anyhow::Result<Vec<api::Triage>> {
     let rows = sqlx::query(
-        "SELECT * FROM triage WHERE (?1 IS NULL OR category = ?1) AND (?2 IS NULL OR kind = ?2) AND at > ?3 ORDER BY at DESC LIMIT ?4",
+        "SELECT * FROM triage WHERE (?1 IS NULL OR category = ?1) AND (?2 IS NULL OR kind = ?2) AND at > ?3 \
+         AND (?5 = 0 OR seen_at IS NULL OR seen_at < at) ORDER BY at DESC LIMIT ?4",
     )
     .bind(category)
     .bind(kind)
     .bind(c6_core::now_ms() - WINDOW)
     .bind(limit.clamp(1, 500) as i64)
+    .bind(unseen)
     .fetch_all(&m.store.pool)
     .await?;
     Ok(rows.iter().map(row).collect())
@@ -520,14 +524,30 @@ pub async fn counts(m: &Memex) -> anyhow::Result<Value> {
     Ok(Value::Object(rows.into_iter().map(|(k, n)| (k, json!(n))).collect()))
 }
 
+/// You've seen it: it leaves the brief's FYI until something new comes.
+pub async fn seen(m: &Memex, target: &str) -> anyhow::Result<()> {
+    let r =
+        sqlx::query("UPDATE triage SET seen_at = ? WHERE target = ?").bind(c6_core::now_ms()).bind(target).execute(&m.store.pool).await?;
+    anyhow::ensure!(r.rows_affected() == 1, "no conversation {target} is sorted");
+    Ok(())
+}
+
 /// Whether sorting can go on: a model chosen, budget left today, and how
-/// many conversations wait (up to 20).
+/// many conversations wait (up to 20); and how many recent ones were sorted,
+/// by kind (mail, chat) and how many of those by the model.
 pub async fn status(m: &Memex) -> anyhow::Result<Value> {
     let (model, budget) = match m.understanding() {
         Some((_, per_day)) => (true, crate::understand::budget_left(m, per_day).await?),
         None => (false, 0),
     };
-    Ok(json!({"model": model, "budget_left": budget, "waiting": waiting(m).await?.len()}))
+    let rows: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT kind, COUNT(*), COALESCE(SUM([by] = 'model'), 0) FROM triage WHERE at > ? GROUP BY kind")
+            .bind(c6_core::now_ms() - WINDOW)
+            .fetch_all(&m.store.pool)
+            .await?;
+    let sorted: serde_json::Map<String, Value> =
+        rows.into_iter().map(|(k, n, by_model)| (k, json!({"n": n, "by_model": by_model}))).collect();
+    Ok(json!({"model": model, "budget_left": budget, "waiting": waiting(m).await?.len(), "sorted": sorted, "days": WINDOW / DAY}))
 }
 
 /// A thread's sorting, for the mail list.
@@ -634,7 +654,12 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
     let opt = |k: &str| params[k].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
     Ok(match method {
         "memex.triage.list" => {
-            json!(list(m, opt("category").as_deref(), opt("kind").as_deref(), params["limit"].as_u64().unwrap_or(100) as u32).await?)
+            let limit = params["limit"].as_u64().unwrap_or(100) as u32;
+            json!(list(m, opt("category").as_deref(), opt("kind").as_deref(), params["unseen"] == true, limit).await?)
+        }
+        "memex.triage.seen" => {
+            seen(m, &s("target")).await?;
+            json!({})
         }
         "memex.triage.counts" => counts(m).await?,
         "memex.triage.status" => status(m).await?,

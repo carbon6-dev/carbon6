@@ -52,6 +52,8 @@ fn channels(r: &Request) -> String {
 struct Brief {
     queue: Memo<Vec<Request>>,
     open: RwSignal<Option<i64>>,
+    /// The commitment or FYI row unfolded (c:<id>, f:<target>).
+    unfolded: RwSignal<Option<String>>,
     tick: RwSignal<u32>,
     error: RwSignal<Option<String>>,
 }
@@ -81,6 +83,19 @@ impl Brief {
         self.tick.update(|t| *t += 1);
     }
 
+    /// Calls `method`; then the brief again, the row folded.
+    fn call(self, method: &'static str, params: Value) {
+        spawn_local(async move {
+            match api::rpc(method, params).await {
+                Ok(_) => {
+                    self.unfolded.set(None);
+                    self.tick.update(|t| *t += 1);
+                }
+                Err(e) => self.error.set(Some(e)),
+            }
+        });
+    }
+
     fn merge(self, into: i64, from: i64) {
         spawn_local(async move {
             match api::rpc("memex.requests.merge", json!({"into": into, "from": from})).await {
@@ -108,7 +123,7 @@ pub fn BriefPage() -> impl IntoView {
     });
     let fyi = LocalResource::new(move || {
         tick.track();
-        api::rpc_as::<Vec<Triage>>("memex.triage.list", json!({"category": "fyi", "limit": 8}))
+        api::rpc_as::<Vec<Triage>>("memex.triage.list", json!({"category": "fyi", "unseen": true, "limit": 8}))
     });
     let commitments = LocalResource::new(move || {
         tick.track();
@@ -124,7 +139,24 @@ pub fn BriefPage() -> impl IntoView {
     let picked = RwSignal::new(0usize);
     let open = RwSignal::new(None::<i64>);
     let error = RwSignal::new(None::<String>);
-    let b = Brief { queue, open, tick, error };
+    let unfolded = RwSignal::new(None::<String>);
+    let b = Brief { queue, open, unfolded, tick, error };
+    // Fresh while you look: the brief again every half minute, unless you're
+    // in a request or a row.
+    let refresh = set_interval_with_handle(
+        move || {
+            if open.get_untracked().is_none() && unfolded.get_untracked().is_none() {
+                tick.update(|t| *t += 1);
+            }
+        },
+        std::time::Duration::from_secs(30),
+    )
+    .ok();
+    on_cleanup(move || {
+        if let Some(h) = refresh {
+            h.clear();
+        }
+    });
     let act = move |id: i64, status: &'static str, until: Option<i64>| b.settle(id, status, until);
     // The keys: J/K move, Enter opens, E done, H snooze to tomorrow, # drop,
     // Esc back to the list.
@@ -213,21 +245,27 @@ pub fn BriefPage() -> impl IntoView {
                     })}
                     <div class="grid gap-5 md:grid-cols-2">
                         <Section title="You owe" empty="No promises of yours open.">
-                            {move || commitments.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.who == "me").take(6).map(|c| view! { <Owed c /> }).collect_view()}
+                            {move || commitments.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.who == "me").take(6).map(|c| view! { <Owed c b /> }).collect_view()}
                         </Section>
                         <Section title="Waiting on others" empty="Nobody owes you anything.">
-                            {move || commitments.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.who != "me").take(6).map(|c| view! { <Owed c /> }).collect_view()}
+                            {move || commitments.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.who != "me").take(6).map(|c| view! { <Owed c b /> }).collect_view()}
                         </Section>
                     </div>
                     <Section title="FYI" empty="Nothing new to know.">
-                        {move || fyi.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! {
-                            <div class="flex items-baseline gap-2 px-3 py-1.5 text-sm">
-                                <span class="shrink-0 text-xs">{if t.kind == "mail" { "✉" } else { "💬" }}</span>
-                                <span class="min-w-0 flex-1 truncate"><b class="font-medium">{t.sender_name.clone()}</b>" · "{t.title.clone()}</span>
-                                <span class="shrink-0 truncate text-xs text-zinc-500">{t.reason.clone()}</span>
-                            </div>
-                        }).collect_view()}
+                        {move || fyi.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <Fyi t b /> }).collect_view()}
                     </Section>
+                    <p class="text-sm text-zinc-500">{move || {
+                        let s = status.get().and_then(Result::ok).unwrap_or_default();
+                        let n = |k: &str| s["sorted"][k]["n"].as_i64().unwrap_or(0);
+                        let by_model = s["sorted"]["mail"]["by_model"].as_i64().unwrap_or(0) + s["sorted"]["chat"]["by_model"].as_i64().unwrap_or(0);
+                        let (mail, chat) = (n("mail"), n("chat"));
+                        format!(
+                            "Read in the last {} days: {mail} {}, {chat} {} ({by_model} by the model, the rest by rules).",
+                            s["days"].as_i64().unwrap_or(14),
+                            if mail == 1 { "email thread" } else { "email threads" },
+                            if chat == 1 { "chat" } else { "chats" },
+                        )
+                    }}</p>
                     <p class="text-sm text-zinc-500">{move || {
                         let c = counts.get().and_then(Result::ok).unwrap_or_default();
                         let n = |k: &str, one: &str, many: &str| {
@@ -281,13 +319,82 @@ fn Row(r: Request, i: usize, picked: RwSignal<usize>, b: Brief) -> impl IntoView
     }
 }
 
+/// A row that unfolds on a click: `head` always, `body` when unfolded.
 #[component]
-fn Owed(c: Commitment) -> impl IntoView {
+fn Fold(key: String, b: Brief, head: ViewFn, body: ViewFn) -> impl IntoView {
+    let k = key.clone();
+    let unfolded = move || b.unfolded.get().as_deref() == Some(k.as_str());
+    let shown = unfolded.clone();
     view! {
-        <div class="flex items-baseline gap-2 px-3 py-1.5 text-sm">
-            <span class="min-w-0 flex-1 truncate" title=c.item_title.clone()>{c.what.clone()}{(c.who != "me").then(|| format!(" — {}", c.who))}</span>
-            {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{day(d)}</span> })}
+        <div>
+            <div class=move || format!("flex cursor-pointer items-baseline gap-2 px-3 py-1.5 text-sm {}", if unfolded() { "bg-zinc-100 dark:bg-zinc-900" } else { "hover:bg-zinc-50 dark:hover:bg-zinc-900/50" })
+                on:click=move |_| b.unfolded.update(|u| *u = if u.as_deref() == Some(key.as_str()) { None } else { Some(key.clone()) })>
+                {head.run()}
+            </div>
+            {move || shown().then(|| view! { <div class="space-y-2 border-t border-zinc-100 p-3 dark:border-zinc-800">{body.run()}</div> })}
         </div>
+    }
+}
+
+/// A promise, yours or someone's: unfolded, where it was made, and done or
+/// drop.
+#[component]
+fn Owed(c: Commitment, b: Brief) -> impl IntoView {
+    let id = c.id;
+    let (target, title) = (c.target.clone(), c.item_title.clone());
+    view! {
+        <Fold key=format!("c:{id}") b
+            head=ViewFn::from({
+                let c = c.clone();
+                move || view! {
+                    <span class="min-w-0 flex-1 truncate" title=c.item_title.clone()>{c.what.clone()}{(c.who != "me").then(|| format!(" — {}", c.who))}</span>
+                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{day(d)}</span> })}
+                }.into_any()
+            })
+            body=ViewFn::from(move || view! {
+                <div class="flex flex-wrap gap-2">
+                    <button class=BUTTON on:click=move |_| b.call("memex.commitment", json!({"id": id, "status": "done"}))>"Done"</button>
+                    <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| b.call("memex.commitment", json!({"id": id, "status": "dropped"}))>"Drop"</button>
+                </div>
+                {if target.is_empty() {
+                    view! { <p class="text-xs text-zinc-500">{format!("From {title}")}</p> }.into_any()
+                } else {
+                    view! { <Source target=target.clone() kind="mail".into() title=title.clone() refresh=RwSignal::new(0) /> }.into_any()
+                }}
+            }.into_any())
+        />
+    }
+}
+
+/// Something to know: unfolded, the conversation, and seen, needs me, or
+/// not for me (the sorting learns from the last two).
+#[component]
+fn Fyi(t: Triage, b: Brief) -> impl IntoView {
+    let (target, kind, title) = (t.target.clone(), t.kind.clone(), t.title.clone());
+    view! {
+        <Fold key=format!("f:{}", t.target) b
+            head=ViewFn::from({
+                let t = t.clone();
+                move || view! {
+                    <span class="shrink-0 text-xs">{if t.kind == "mail" { "✉" } else { "💬" }}</span>
+                    <span class="min-w-0 flex-1 truncate"><b class="font-medium">{t.sender_name.clone()}</b>" · "{t.title.clone()}</span>
+                    <span class="hidden shrink-0 truncate text-xs text-zinc-500 sm:inline sm:max-w-[40%]">{t.reason.clone()}</span>
+                }.into_any()
+            })
+            body=ViewFn::from(move || {
+                let (a, n, x) = (target.clone(), target.clone(), target.clone());
+                view! {
+                    <div class="flex flex-wrap gap-2">
+                        <button class=BUTTON on:click=move |_| b.call("memex.triage.seen", json!({"target": a}))>"Seen"</button>
+                        <button class=BUTTON_QUIET title="It needs you after all: it becomes a request"
+                            on:click=move |_| b.call("memex.triage.set", json!({"target": n, "category": "needs_you", "note": "You said it needs you"}))>"Needs me"</button>
+                        <button class=BUTTON_QUIET title="Not worth knowing: set aside, and the sorting learns"
+                            on:click=move |_| b.call("memex.triage.set", json!({"target": x, "category": "noise", "note": "You said it isn't worth knowing"}))>"Not for me"</button>
+                    </div>
+                    <Source target=target.clone() kind=kind.clone() title=title.clone() refresh=RwSignal::new(0) />
+                }.into_any()
+            })
+        />
     }
 }
 

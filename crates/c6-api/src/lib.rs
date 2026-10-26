@@ -3589,6 +3589,9 @@ pub struct Commitment {
     pub due: Option<UnixMs>,
     /// open, done or dropped.
     pub status: String,
+    /// The mail thread it was read from (thread:<account>:<thread>), if mail.
+    #[serde(default)]
+    pub target: String,
 }
 
 /// A suggestion for you to decide (`/api/v1/memex/review`): two things that

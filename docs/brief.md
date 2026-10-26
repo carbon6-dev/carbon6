@@ -182,9 +182,10 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 
 - **Brief** (☰ and Apps, once the realm has mail or chat; `/r/<realm>/brief`):
   - Needs you, then First contact: open requests, soonest due first, with who, what, by when and where from (✉ 💬). A request possibly the same as another shows "same? merge", which keeps the older one.
-  - You owe, and Waiting on others: open commitments.
-  - FYI: the latest conversations sorted FYI.
-  - How many were set aside (cold pitches, newsletters, notifications).
+  - You owe, and Waiting on others: open commitments. A click unfolds one: the mail thread it was read from, Done and Drop.
+  - FYI: the latest conversations sorted FYI that you haven't seen. A click unfolds one: the conversation, Seen (gone until something new comes in it), Needs me (sorted as needs you, so a request), Not for me (noise). The last two teach the sorting.
+  - How many conversations were read in the last 14 days (mail threads, chats, how many by the model), and how many were set aside (cold pitches, newsletters, notifications).
+  - It reloads every 30 seconds, unless a request or a row is open.
 - **A request opened:** its conversations on the left (the mail thread with reply, or the chat thread or DM with its box), and on the right what's asked, from whom, by when and why: Done, Tomorrow, Next week, Drop.
 - **Keys:** J/K, Enter, E (done), H (tomorrow at 9), # (drop), Esc. Settling an open request opens the next.
 - **On a phone,** a request's title wraps under its person.

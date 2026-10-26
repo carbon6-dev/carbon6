@@ -292,7 +292,8 @@ pub async fn status(m: &Memex, s: &mut api::MemexStatus) -> anyhow::Result<()> {
 
 pub async fn commitments(m: &Memex, status: &str) -> anyhow::Result<Vec<api::Commitment>> {
     let rows = sqlx::query(
-        "SELECT c.*, i.title AS title, i.kind AS kind FROM commitments c LEFT JOIN items i ON i.id = c.item_id WHERE c.status = ? \
+        "SELECT c.*, i.title AS title, i.kind AS kind, (SELECT 'thread:' || ml.account || ':' || ml.thread_id FROM mail ml WHERE ml.item_id = c.item_id) AS target \
+         FROM commitments c LEFT JOIN items i ON i.id = c.item_id WHERE c.status = ? \
          ORDER BY c.due IS NULL, c.due, c.created_at DESC LIMIT 200",
     )
     .bind(status)
@@ -308,6 +309,7 @@ pub async fn commitments(m: &Memex, status: &str) -> anyhow::Result<Vec<api::Com
             what: r.get("what"),
             due: r.get("due"),
             status: r.get("status"),
+            target: r.get::<Option<String>, _>("target").unwrap_or_default(),
         })
         .collect())
 }

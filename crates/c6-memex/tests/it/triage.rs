@@ -249,6 +249,15 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert!(asked[0].contains("Sort this conversation") && asked[0].contains("approve the redlines"), "{}", asked[0]);
     assert!(asked[3].contains("never corresponded") && asked[3].contains("scale SDRs"), "{}", asked[3]);
     assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
+    // The brief's numbers: what was read, by kind, and how much by the model.
+    let status = rpc("memex.triage.status", json!({})).await;
+    assert_eq!(status["sorted"]["chat"]["by_model"], 1, "{status}");
+    assert!(status["sorted"]["mail"]["n"].as_i64() > status["sorted"]["mail"]["by_model"].as_i64(), "rules sorted mail too: {status}");
+    // FYI you've seen leaves the brief.
+    let fyi = async || rpc("memex.triage.list", json!({"category": "fyi", "unseen": true})).await.as_array().unwrap().len();
+    assert_eq!(fyi().await, 1);
+    rpc("memex.triage.seen", json!({"target": "thread:acct:t2"})).await;
+    assert_eq!(fyi().await, 0, "seen");
 
     // What needs you, as requests: the one due soonest first.
     let open = |status: &'static str| async move {
