@@ -76,7 +76,7 @@ impl UiTls {
     /// head answers to, for a certificate from its own CA.
     pub fn setup(cfg: &HeadConfig, names: &[String], ips: &[IpAddr]) -> anyhow::Result<Option<Self>> {
         let (name, source, ca) = match (&cfg.ui_tls_cert, &cfg.ui_tls_key) {
-            (Some(cert), Some(key)) => (cert_name(cert)?, Source::Files { cert: cert.clone(), key: key.clone() }, None),
+            (Some(cert), Some(key)) => (cert_name(cert, &cfg.extra_names)?, Source::Files { cert: cert.clone(), key: key.clone() }, None),
             (Some(_), None) | (None, Some(_)) => anyhow::bail!("ui_tls_cert and ui_tls_key go together"),
             (None, None) if cfg.ui_tls_head_ca => {
                 let ca = Arc::new(UiCa::load_or_create(&cfg.data_dir.join("pki"), names)?);
@@ -139,36 +139,67 @@ fn load(source: &Source, ca: Option<&UiCa>) -> anyhow::Result<Arc<CertifiedKey>>
     Ok(Arc::new(CertifiedKey::new(chain, signer)))
 }
 
-/// The first DNS name in a certificate file.
-pub(crate) fn cert_name(path: &Path) -> anyhow::Result<String> {
+/// The name a certificate file serves HTTPS at: its first DNS name, unless
+/// that is a wildcard, which is no address. Then the first of `extra_names`
+/// the certificate covers, else its first name that isn't a wildcard.
+pub(crate) fn cert_name(path: &Path, extra_names: &[String]) -> anyhow::Result<String> {
     let der = CertificateDer::pem_file_iter(path)
         .with_context(|| format!("reading {}", path.display()))?
         .next()
         .context("no certificate in file")??;
     let (_, cert) = x509_parser::parse_x509_certificate(&der).context("parsing certificate")?;
     let san = cert.subject_alternative_name().ok().flatten().context("certificate has no subject alternative names")?;
-    san.value
+    let dns: Vec<String> = san
+        .value
         .general_names
         .iter()
-        .find_map(|n| match n {
+        .filter_map(|n| match n {
             x509_parser::extensions::GeneralName::DNSName(d) => Some(d.to_ascii_lowercase()),
             _ => None,
         })
-        .context("certificate has no DNS name")
+        .collect();
+    pick_name(&dns, extra_names).context("certificate has no DNS name")
+}
+
+fn pick_name(cert_names: &[String], extra_names: &[String]) -> Option<String> {
+    let first = cert_names.first()?;
+    if !first.starts_with("*.") {
+        return Some(first.clone());
+    }
+    extra_names
+        .iter()
+        .map(|n| n.to_ascii_lowercase())
+        .find(|n| cert_names.iter().any(|c| covers(c, n)))
+        .or_else(|| cert_names.iter().find(|c| !c.starts_with("*.")).cloned())
+        .or_else(|| Some(first.clone()))
+}
+
+/// Whether a certificate name covers `name`: the same name, or a wildcard
+/// for exactly one more label (`*.example.com` covers `a.example.com`).
+fn covers(cert_name: &str, name: &str) -> bool {
+    match cert_name.strip_prefix("*.") {
+        Some(parent) => name.split_once('.').is_some_and(|(label, rest)| !label.is_empty() && rest == parent),
+        None => cert_name == name,
+    }
 }
 
 /// Serves the UI on `listener`. With `tls`, TLS connections get the app
-/// (marked as TLS) and plain ones a redirect to `https://name:port`.
+/// (marked as TLS) and plain ones a redirect to `public` (`ui_public_url`),
+/// else to `https://name:port`.
 pub async fn serve(
     listener: TcpListener,
     app: Router,
     tls: Option<(TlsAcceptor, String)>,
+    public: Option<String>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
     let secure_app = app.clone().layer(axum::Extension(crate::auth::Tls));
     let plain_app = match &tls {
-        Some((_, name)) => app.layer(axum::middleware::from_fn_with_state(Arc::new(format!("https://{name}:{port}")), to_https)),
+        Some((_, name)) => {
+            let base = public.unwrap_or_else(|| format!("https://{name}:{port}"));
+            app.layer(axum::middleware::from_fn_with_state(Arc::new(base), to_https))
+        }
         None => app,
     };
     let acceptor = tls.map(|(a, _)| a);
@@ -220,6 +251,66 @@ async fn to_https(State(base): State<Arc<String>>, req: Request, next: Next) -> 
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
+
+    #[test]
+    fn names_from_certificate_files() {
+        let pick = |cert: &[&str], extra: &[&str]| {
+            let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            super::pick_name(&strings(cert), &strings(extra))
+        };
+        // The certificate's first name, as before, unless it is a wildcard.
+        assert_eq!(pick(&["head.example.com", "*.example.com"], &["other.example.com"]).as_deref(), Some("head.example.com"));
+        // A wildcard is no address: the first configured name the certificate covers ...
+        assert_eq!(pick(&["*.local.example.com"], &["localhost", "Head.Local.Example.com"]).as_deref(), Some("head.local.example.com"));
+        assert_eq!(pick(&["*.example.com", "head.other.com"], &["head.other.com"]).as_deref(), Some("head.other.com"));
+        // ... a wildcard covering one label only ...
+        assert_eq!(pick(&["*.example.com"], &["a.b.example.com", "head.example.com"]).as_deref(), Some("head.example.com"));
+        // ... else the certificate's first other name, else the wildcard.
+        assert_eq!(pick(&["*.example.com", "example.com"], &[]).as_deref(), Some("example.com"));
+        assert_eq!(pick(&["*.example.com"], &["head.other.com"]).as_deref(), Some("*.example.com"));
+        assert_eq!(pick(&[], &["head.example.com"]), None);
+    }
+
+    #[tokio::test]
+    async fn wildcard_certificate_and_public_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let ck = rcgen::generate_simple_self_signed(vec!["*.example.test".to_owned()]).unwrap();
+        let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        std::fs::write(&cert, ck.cert.pem()).unwrap();
+        std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+        let cfg = crate::HeadConfig {
+            data_dir: dir.path().join("head"),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            extra_names: vec!["head.example.test".into()],
+            ui_tls_cert: Some(cert),
+            ui_tls_key: Some(key),
+            ..Default::default()
+        };
+
+        // The head goes by the configured name its wildcard covers.
+        let head = crate::start(cfg.clone()).await.unwrap();
+        // Built after the head starts, which installs the TLS provider.
+        let plain = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let port = head.ui_addrs[0].port();
+        assert_eq!(head.ui_urls, [format!("https://head.example.test:{port}")]);
+        let r = plain.get(format!("http://127.0.0.1:{port}/x")).send().await.unwrap();
+        assert_eq!(r.headers()["location"], format!("https://head.example.test:{port}/x").as_str());
+        head.shutdown().await.unwrap();
+
+        // Behind a proxy on 443, its links and redirect use the public address.
+        let cfg = crate::HeadConfig { ui_public_url: Some("https://head.example.test/".into()), ..cfg };
+        let head = crate::start(cfg.clone()).await.unwrap();
+        let port = head.ui_addrs[0].port();
+        assert_eq!(head.ui_urls, ["https://head.example.test"]);
+        let r = plain.get(format!("http://127.0.0.1:{port}/sessions/x?y=1")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(r.headers()["location"], "https://head.example.test/sessions/x?y=1");
+        head.shutdown().await.unwrap();
+        let links = crate::offline_login_link(cfg).await.unwrap();
+        assert!(links.len() == 1 && links[0].starts_with("https://head.example.test/login/"), "{links:?}");
+    }
 
     #[tokio::test]
     async fn https_and_plain_on_one_port() {
