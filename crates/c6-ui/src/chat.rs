@@ -15,10 +15,10 @@ const UNDO_SECONDS: u32 = 5;
 const QUICK: [(&str, &str); 4] = [("+1", "👍"), ("white_check_mark", "✅"), ("eyes", "👀"), ("tada", "🎉")];
 
 #[derive(Clone, Debug, PartialEq)]
-struct Place {
-    workspace: String,
-    channel: String,
-    name: String,
+pub(crate) struct Place {
+    pub workspace: String,
+    pub channel: String,
+    pub name: String,
 }
 
 fn emoji(name: &str) -> String {
@@ -229,7 +229,7 @@ fn Composer(place: Place, thread_ts: Option<String>, tick: RwSignal<u32>, placeh
 }
 
 #[component]
-fn Conversation(place: Place, thread: RwSignal<Option<String>>, tick: RwSignal<u32>) -> impl IntoView {
+pub(crate) fn Conversation(place: Place, thread: RwSignal<Option<String>>, tick: RwSignal<u32>) -> impl IntoView {
     let p = place.clone();
     let messages = LocalResource::new(move || {
         tick.track();
@@ -272,7 +272,7 @@ fn Conversation(place: Place, thread: RwSignal<Option<String>>, tick: RwSignal<u
 }
 
 #[component]
-fn Thread(place: Place, thread_ts: String, close: RwSignal<Option<String>>, tick: RwSignal<u32>) -> impl IntoView {
+pub(crate) fn Thread(place: Place, thread_ts: String, close: RwSignal<Option<String>>, tick: RwSignal<u32>) -> impl IntoView {
     let (p, t) = (place.clone(), thread_ts.clone());
     let messages = LocalResource::new(move || {
         tick.track();

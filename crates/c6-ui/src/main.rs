@@ -5,6 +5,7 @@ mod analytics;
 mod api;
 mod assistant;
 mod auth;
+mod brief;
 mod calendar;
 mod chat;
 mod collections;
@@ -190,6 +191,7 @@ fn AppsMenu() -> impl IntoView {
             <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
                     {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item>"Mail"</Go> })}
+                    {(f["mail"] == true || f["chat"] == true).then(|| view! { <Go to=View::Brief class=item>"Brief"</Go> })}
                     {(f["chat"] == true).then(|| view! { <Go to=View::Chat class=item>"Chat"</Go> })}
                     {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=item>"Calendar"</Go> })}
                     {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=item>"Contacts"</Go> })}
@@ -241,6 +243,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     // Only what an app feeds in this realm (or it holds).
                     {move || feeds.get().and_then(Result::ok).map(|f| view! {
                         {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=MENU>"Mail"</Go> })}
+                        {(f["mail"] == true || f["chat"] == true).then(|| view! { <Go to=View::Brief class=MENU>"Brief"</Go> })}
                         {(f["chat"] == true).then(|| view! { <Go to=View::Chat class=MENU>"Chat"</Go> })}
                         {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=MENU>"Calendar"</Go> })}
                         {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=MENU>"Contacts"</Go> })}

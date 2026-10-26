@@ -166,6 +166,30 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 - **API:** `memex.triage.list`, `get`, `counts`, `set`, `mark`, `marks` and `unmark`; `MailThread.triage`.
 - **Not yet:** the pitch filter for Slack Connect strangers (chat counts everyone as known); the brief page and its keys (step 3).
 
+### 10.2 Requests (step 2)
+
+- **When triage sorts a conversation as needs you or first contact,** the model also says what's asked, in one line, and by when. Its request is:
+  - the open one already holding that conversation (updated);
+  - else, when the same person has one open, the one the model says is the same ask (`memex.requests.same`: same and sure). Same but unsure makes a new request marked as possibly the same, merged with one call;
+  - else a new one.
+- **The same person** across mail and chat: Slack messages carry the sender's address (`user_email`), so a request is joined by address.
+- **Closing:** a conversation sorted again as `yours` (you answered) closes its requests as done (`replied`). Sorted as FYI, newsletter and the like means `settled`. Marking a sender as a pitch drops theirs. You can set a request done, dropped, snoozed until a time, or open again.
+- **Sorting a conversation yourself** (Sort as… needs you) opens a request with no model call.
+- **Kept** in the realm memex's `requests`, `request_sources` and `request_maybe` (migration 0013).
+- **API:** `memex.requests.list` (open by default, the soonest due first), `get`, `set` and `merge`. Agents get the `requests` tool in sessions whose memex scope includes mail or chat.
+
+### 10.3 The brief page (step 3)
+
+- **Brief** (☰ and Apps, once the realm has mail or chat; `/r/<realm>/brief`):
+  - Needs you, then First contact: open requests, soonest due first, with who, what, by when and where from (✉ 💬). A request possibly the same as another shows "same? merge", which keeps the older one.
+  - You owe, and Waiting on others: open commitments.
+  - FYI: the latest conversations sorted FYI.
+  - How many were set aside (cold pitches, newsletters, notifications).
+- **A request opened:** its conversations on the left (the mail thread with reply, or the chat thread or DM with its box), and on the right what's asked, from whom, by when and why: Done, Tomorrow, Next week, Drop.
+- **Keys:** J/K, Enter, E (done), H (tomorrow at 9), # (drop), Esc. Settling an open request opens the next.
+- **On a phone,** a request's title wraps under its person.
+- **Not yet:** drafts (step 4). The FYI five-line summary, the scheduled briefs and urgent notifications (step 5). Relabeling from the brief (it's on the mail thread's sorting bar).
+
 ## 11. Open questions
 
 - **Gmail too?** Should a pitch also be labelled and archived in Gmail (so your phone matches), as a rule you approve once? Default: carbon6 only.

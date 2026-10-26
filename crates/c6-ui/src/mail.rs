@@ -72,7 +72,7 @@ pub(crate) fn when(ms: i64) -> String {
 
 /// Who and what, for a reply.
 #[derive(Clone, Default)]
-struct Draft {
+pub(crate) struct Draft {
     account: String,
     to: String,
     cc: String,
@@ -366,7 +366,7 @@ fn Outbox(refresh: RwSignal<u32>) -> impl IntoView {
 }
 
 #[component]
-fn Thread(
+pub(crate) fn Thread(
     account: String,
     thread: String,
     open: RwSignal<Option<(String, String)>>,
@@ -512,7 +512,7 @@ fn Message(m: MailMessage) -> impl IntoView {
 }
 
 #[component]
-fn Compose(
+pub(crate) fn Compose(
     d: Draft,
     compose: RwSignal<Option<Draft>>,
     status: RwSignal<Option<Result<String, String>>>,
