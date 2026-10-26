@@ -406,7 +406,19 @@ pub fn GoogleSettings() -> impl IntoView {
         });
     };
     let connect = move |_| {
+        // What's typed in and not saved yet is the client you mean.
+        let saved = client.get_untracked().and_then(Result::ok).map(|c| c.client_id).unwrap_or_default();
+        let typed = Some(secret.get_untracked()).filter(|s| !s.trim().is_empty());
+        let unsaved = (id.get_untracked().trim() != saved.trim() || typed.is_some()) && !id.get_untracked().trim().is_empty();
         spawn_local(async move {
+            if unsaved {
+                if let Err(e) = api::set_google_client(id.get_untracked(), typed).await {
+                    note.set(Some(Err(e)));
+                    return;
+                }
+                secret.set(String::new());
+                client.refetch();
+            }
             match api::google_connect().await {
                 Ok(url) => {
                     let _ = window().location().set_href(&url);
