@@ -367,7 +367,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         examples=scope_examples
                     />
                     }.into_any(),
-                    "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> } }).into_any(),
+                    "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> <crate::mail::SenderMarks /> } }).into_any(),
                     "slack" => view! { <crate::chat::SlackSettings /> }.into_any(),
                     "updates" => view! {
                         <UpdatesSetting />

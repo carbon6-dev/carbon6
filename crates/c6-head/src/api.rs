@@ -1881,7 +1881,7 @@ async fn memex_rpc(
         _ => caller.memex_realm().to_owned(),
     };
     let ok =
-        ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat."].iter().any(|p| r.method.starts_with(p))
+        ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage."].iter().any(|p| r.method.starts_with(p))
             || r.method.starts_with("memex.media.")
             || matches!(
                 r.method.as_str(),

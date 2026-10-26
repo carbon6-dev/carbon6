@@ -36,6 +36,41 @@ pub const UNDERSTAND_OTHER: &str = "JSON: {\"summary\": one or two sentences, \"
 pub const UNDERSTAND_THING: &str = "Sum up what these records say about {{name}} ({{kind}}): who or what it is, how it relates to the \
 owner, what happened over time, and what is open. Cite records by [id]. JSON: {\"summary\": a few short paragraphs}\n\n{{records}}";
 
+/// Sorting a conversation with someone the owner knows (docs/brief.md §3).
+/// `{{owner}}`, `{{examples}}`; the conversation follows.
+pub const TRIAGE: &str = "Sort this conversation for its owner ({{owner}}), who wants to see only what needs them. Categories:\n\
+- needs_you: someone is waiting on the owner: a question, a request, a decision, an approval, a review, a meeting to agree, \
+something to sign or pay.\n\
+- fyi: worth knowing, nothing asked of the owner (updates, an answer that closes the matter, news for a group).\n\
+- newsletter: a publication or bulk mailing.\n\
+- notification: automated (receipts, alerts, account and calendar notices, app notifications).\n\
+- noise: nothing of value.\n\
+The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
+JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner}";
+
+/// A conversation from someone the owner has never corresponded with:
+/// a cold pitch, or a real first contact. `{{owner}}`, `{{examples}}`.
+pub const TRIAGE_PITCH: &str = "The sender has never corresponded with the owner ({{owner}}). Decide whether this is a cold pitch: \
+unsolicited outreach selling a product or service (sales development and lead generation, agencies, outsourcing, recruiting \
+services, software, \"quick call?\" asks, follow-ups in a sequence). A real first contact (a customer, partner, candidate, investor, \
+journalist or colleague writing about something specific to the owner's work) is not a pitch, even when it asks to meet. Naming a \
+company the owner works with doesn't make it real: pitches name-drop. Categories: pitch, first_contact, fyi, newsletter, notification.\n\
+The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
+JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner}";
+
+/// What marks mail from a sales sequence, for senders the owner doesn't
+/// know: a line is a mark found in its links or text (tracking domains of
+/// sequence tools); `phrase:` lines are follow-ups in a thread the owner
+/// never answered; `#` lines are comments.
+pub const TRIAGE_SIGNALS: &str = "# Sales sequence tools (in a link or the text)\n\
+apollo.io\napollo-mail\noutreach.io\nsalesloft.com\nlemlist.com\ninstantly.ai\nsmartlead.ai\nmailshake.com\nreply.io\n\
+woodpecker.co\nklenty.com\nsaleshandy.com\nyesware.com\nmixmax.com\nmailtrack.io\nhubspotlinks.com\nhs-sales-engage\n\
+gmass.co\nquickmail.io\nsalesforceiq\n\
+# Follow-ups in a sequence\n\
+phrase: bumping this\nphrase: bump this\nphrase: circling back\nphrase: following up on my\nphrase: following up on this\n\
+phrase: did you get a chance\nphrase: did you see my\nphrase: just checking in\nphrase: floating this\nphrase: any thoughts on my\n\
+phrase: resurfacing\nphrase: in case you missed\nphrase: last attempt\nphrase: should i close your file\nphrase: not the right person";
+
 /// The system prompt for writing a system's page.
 pub const PAGE_SYSTEM: &str = "You curate a knowledge base faithfully.";
 

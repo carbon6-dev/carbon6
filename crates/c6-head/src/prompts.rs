@@ -103,6 +103,21 @@ pub const DEFAULTS: &[Prompt] = &[
         description: "How to sum up what is known about a thing. Placeholders: {{name}}, {{kind}}, {{records}}.",
         default: text::UNDERSTAND_THING,
     },
+    Prompt {
+        name: "memex.triage",
+        description: "How mail and chat from people you know are sorted for the brief (what needs you). Placeholders: {{owner}}, {{examples}} (your corrections).",
+        default: text::TRIAGE,
+    },
+    Prompt {
+        name: "memex.triage.pitch",
+        description: "How mail from someone you've never corresponded with is sorted: a cold pitch or a real first contact. Placeholders: {{owner}}, {{examples}}.",
+        default: text::TRIAGE_PITCH,
+    },
+    Prompt {
+        name: "memex.triage.signals",
+        description: "What marks a sales sequence from a stranger, no model needed: tracking domains of sequence tools, and (phrase:) follow-ups in a thread you never answered. One per line.",
+        default: text::TRIAGE_SIGNALS,
+    },
     Prompt { name: "memex.page.system", description: "The system prompt for writing a system's page.", default: text::PAGE_SYSTEM },
     Prompt {
         name: "memex.page",
@@ -191,10 +206,21 @@ pub async fn for_worker(st: &HeadState, realm: &str) -> String {
     Value::Object(picked).to_string()
 }
 
-/// The memex's prompts (it works on home's knowledge).
-pub async fn for_memex(st: &HeadState) -> Value {
-    let all = all(st, crate::realms::HOME).await;
+/// The memex's prompts as `realm` uses them (each realm's knowledge is
+/// read and sorted with its own).
+pub async fn for_memex(st: &HeadState, realm: &str) -> Value {
+    let all = all(st, realm).await;
     Value::Object(all.into_iter().filter(|(k, _)| k.starts_with("memex.")).collect())
+}
+
+/// Every realm's memex prompts, by realm.
+pub async fn for_memex_realms(st: &HeadState) -> Value {
+    let realms: Vec<String> = sqlx::query_scalar("SELECT id FROM realms").fetch_all(&st.store.pool).await.unwrap_or_default();
+    let mut out = Map::new();
+    for r in realms.into_iter().filter(|r| r != ROOT) {
+        out.insert(r.clone(), for_memex(st, &r).await);
+    }
+    Value::Object(out)
 }
 
 /// What a model is told when a conversation in `realm` is compacted.
@@ -280,9 +306,8 @@ pub async fn set(st: &HeadState, name: &str, body: &str) -> anyhow::Result<()> {
             mine.push(json!({"name": p.name, "description": p.description, "body": body}));
         }
         crate::lists::write(&st.store.pool, PROMPTS, &realm, &mine, "you").await?;
-        if realm == crate::realms::HOME {
-            crate::memex::reload(st).await;
-        }
+        // Each realm's memex reads with its own.
+        crate::memex::reload(st).await;
         return Ok(());
     }
     let back_to_default = body.trim().is_empty() || body == p.default;

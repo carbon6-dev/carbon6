@@ -115,13 +115,14 @@ Nothing here is a fixed string in code (it's carbon6's rule): each is an editabl
 
 | Setting | What |
 |---|---|
-| `brief.triage` prompt | How to sort: what "needs you" means for you, with your notes from L appended as examples |
+| `memex.triage` prompt | How to sort: what "needs you" means for you, with your notes from L appended as examples |
+| `memex.triage.pitch` prompt | The model's part of the pitch filter |
+| `memex.triage.signals` | The sequence tools' marks and follow-up phrases |
 | `brief.request` prompt | What a request is, and when two are the same |
 | `brief.draft` prompt | How to draft: tone, length, sign-off |
-| `brief.pitch` prompt | The model's part of the pitch filter |
 | `brief.important` | Who and what may interrupt you |
 | `brief.times` | When briefs come |
-| `brief.senders` | Your marks: pitch / known, by address, domain or tool |
+| sender marks | Your marks: pitch / known, by address or domain (kept in the realm's memex) |
 
 The memex reads prompts from home only today (prompts::for_memex); it will read the realm's own, so mach5 can sort and draft differently from home.
 
@@ -146,7 +147,26 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 5. **Timing:** briefs at set times, urgent notifications, close of day; `chat.received`, `request.opened`, `commitment.due` events.
 6. **Docs:** README, memex.md's §6.6 pointing here.
 
-## 10. Open questions
+## 10. As built
+
+### 10.1 Pitch filter and triage (step 1)
+
+- **What's sorted:** mail threads in the inbox, and chat conversations that may be yours (DMs and group DMs, threads you're in, messages mentioning you), with a message in the last 14 days. Each is sorted again when it has news. A conversation is `thread:<account>:<thread>` or `chat:<workspace>:<channel>[:<thread ts>]`, kept in the realm memex's `triage` table (migration 0012).
+- **In the memex's reading loop,** before understanding, newest first, sharing its model and daily budget. What rules settle is sorted even with no model or no budget left. The rest waits.
+- **Rules, no model:**
+  - you wrote last: `yours`;
+  - a list or bulk sender: `newsletter`, or `notification` for automated addresses;
+  - a sender you marked as a pitch: `pitch`;
+  - a stranger whose mail carries a sequence tool's mark (in its text or HTML), or whose latest is a sequence's follow-up: `pitch`.
+- **Known** means you've written to them, or to anyone at their company's domain (not a shared one like gmail.com). It also covers your contacts, people at your meetings, people at your own domain, anyone in a thread you've written in, and senders you marked known. Known people get the `memex.triage` prompt; strangers get `memex.triage.pitch`.
+- **Chat:** people in your workspace count as known. Slack messages now say `from_me` and `mentions_me` (slack 1.2.0, from `auth.test`), and older ones are read again for it.
+- **Settings:** the prompts are `memex.triage`, `memex.triage.pitch` and `memex.triage.signals` (the marks and `phrase:` follow-ups, one per line). They're editable per realm: the memex now reads each realm's own `memex.*` prompts, where before it read home's for all.
+- **Your marks and corrections:** "Cold pitch" and "Not a pitch" mark the sender (by address, or `domain: true` for the whole domain) in the realm's memex. They're listed and removable in Settings → Mail & calendar. "Sort as…" with a note becomes one of the model's examples (the last 20).
+- **In Mail:** the views Needs you, First contact and Cold pitches; each thread's label with its reason; the sorting bar on an open thread.
+- **API:** `memex.triage.list`, `get`, `counts`, `set`, `mark`, `marks` and `unmark`; `MailThread.triage`.
+- **Not yet:** the pitch filter for Slack Connect strangers (chat counts everyone as known); the brief page and its keys (step 3).
+
+## 11. Open questions
 
 - **Gmail too?** Should a pitch also be labelled and archived in Gmail (so your phone matches), as a rule you approve once? Default: carbon6 only.
 - **Report as spam to Google** for clear pitches? It trains Gmail but blocks the sender. Default: no.

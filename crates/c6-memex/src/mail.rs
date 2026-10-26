@@ -297,6 +297,8 @@ pub async fn threads(
     let now = c6_core::now_ms();
     let month = now - 30 * 86_400_000;
     // The view's condition on a thread's messages.
+    // As sorted for the brief (docs/brief.md): triage:<category>.
+    let sorted = view.strip_prefix("triage:").map(str::to_owned);
     let (cond, label): (&str, Option<String>) = match view {
         "inbox" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0", None),
         "starred" => ("m.starred = 1 AND m.trash = 0", None),
@@ -311,6 +313,7 @@ pub async fn threads(
         "needs_reply" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0 AND m.list = 0", None),
         // The latest message is yours, sent over two days ago, this month.
         "waiting" => ("m.trash = 0 AND m.spam = 0", None),
+        v if sorted.is_some() && v.starts_with("triage:") => ("m.trash = 0 AND m.spam = 0", None),
         v => match v.strip_prefix("label:") {
             Some(l) => ("m.trash = 0", Some(l.to_owned())),
             None => anyhow::bail!("no mail view {v:?}"),
@@ -320,6 +323,7 @@ pub async fn threads(
         "SELECT m.account AS account, m.thread_id AS thread_id, MAX(m.date) AS date, COUNT(*) AS n, MAX(m.unread) AS unread, MAX(m.starred) AS starred, \
          MAX(m.attachments) AS attachments FROM mail m WHERE {cond} AND (?1 IS NULL OR m.account = ?1) \
          AND (?4 IS NULL OR m.item_id IN (SELECT item_id FROM mail_labels WHERE label = ?4)) \
+         AND (?5 IS NULL OR EXISTS (SELECT 1 FROM triage t WHERE t.target = 'thread:' || m.account || ':' || m.thread_id AND t.category = ?5)) \
          GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) ORDER BY date DESC LIMIT ?3"
     );
     // Over-fetch for the views that look at each thread's latest message.
@@ -334,6 +338,7 @@ pub async fn threads(
             .bind(cursor)
             .bind(fetch as i64)
             .bind(&label)
+            .bind(&sorted)
             .fetch_all(&m.store.pool)
             .await?;
         let more = rows.len() as u32 == fetch && fetch > limit;
@@ -379,7 +384,9 @@ pub async fn threads(
                     people.push(label);
                 }
             }
+            let triage = crate::triage::of_thread(m, &acct, &thread).await?;
             out.push(api::MailThread {
+                triage,
                 account: acct,
                 thread_id: thread,
                 subject: last.get::<String, _>("subject"),

@@ -238,8 +238,12 @@ pub fn spawn(m: std::sync::Arc<Memex>) {
                 }
                 suggested = Some(std::time::Instant::now());
             }
+            // Sorting what's new for the brief comes before reading.
             let worked = m.link.is_connected()
-                && (step(&m).await.unwrap_or_else(|e| {
+                && (crate::triage::step(&m).await.unwrap_or_else(|e| {
+                    warn!("triage: {e:#}");
+                    false
+                }) || step(&m).await.unwrap_or_else(|e| {
                     warn!("understanding: {e:#}");
                     false
                 }) || crate::knowledge::page_step(&m).await.unwrap_or_else(|e| {

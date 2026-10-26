@@ -10,8 +10,11 @@ use serde_json::json;
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
-const VIEWS: [(&str, &str); 9] = [
+const VIEWS: [(&str, &str); 12] = [
     ("inbox", "Inbox"),
+    ("triage:needs_you", "Needs you"),
+    ("triage:first_contact", "First contact"),
+    ("triage:pitch", "Cold pitches"),
     ("needs_reply", "Needs reply"),
     ("waiting", "Waiting"),
     ("starred", "Starred"),
@@ -21,6 +24,22 @@ const VIEWS: [(&str, &str); 9] = [
     ("spam", "Spam"),
     ("trash", "Trash"),
 ];
+
+/// How a conversation was sorted for the brief, as a short label and its
+/// colour (docs/brief.md).
+pub(crate) fn sorted_as(category: &str) -> (&'static str, &'static str) {
+    match category {
+        "needs_you" => ("Needs you", "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"),
+        "first_contact" => ("First contact", "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300"),
+        "pitch" => ("Cold pitch", "bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"),
+        "newsletter" => ("Newsletter", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
+        "notification" => ("Notification", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
+        "fyi" => ("FYI", "bg-zinc-100 text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400"),
+        "noise" => ("Noise", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
+        "yours" => ("You wrote last", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
+        _ => ("", ""),
+    }
+}
 
 /// Threads a page.
 const PAGE: u32 = 50;
@@ -169,6 +188,10 @@ pub fn MailPage() -> impl IntoView {
                                                     on:click=move |_| open.set(Some(key.clone()))>
                                                     <div class="flex items-baseline gap-2 text-sm">
                                                         <span class="min-w-0 flex-1 truncate">{t.people.join(", ")}{(t.count > 1).then(|| format!(" ({})", t.count))}</span>
+                                                        {t.triage.as_ref().filter(|x| !matches!(x.category.as_str(), "yours" | "fyi")).map(|x| {
+                                                            let (label, class) = sorted_as(&x.category);
+                                                            view! { <span class=format!("shrink-0 rounded px-1.5 text-[10px] font-medium {class}") title=x.reason.clone()>{label}</span> }
+                                                        })}
                                                         {t.starred.then(|| view! { <span class="text-amber-500">"★"</span> })}
                                                         {t.attachments.then(|| view! { <span class="text-zinc-400">"📎"</span> })}
                                                         <span class="shrink-0 text-xs font-normal text-zinc-500">{when(t.date)}</span>
@@ -190,6 +213,104 @@ pub fn MailPage() -> impl IntoView {
                 }}
             </section>
         </main>
+    }
+}
+
+/// How a thread was sorted for the brief, and putting it right: a pitch
+/// (its sender's mail always is), not a pitch (they're someone you know),
+/// or another category with a note the sorting learns from.
+#[component]
+fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
+    let target = StoredValue::new(target);
+    let sorted = LocalResource::new(move || api::rpc_as::<Option<c6_api::Triage>>("memex.triage.get", json!({"target": target.get_value()})));
+    let (category, note) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let error = RwSignal::new(None::<String>);
+    let act = move |method: &'static str, params: serde_json::Value| {
+        spawn_local(async move {
+            match api::rpc(method, params).await {
+                Ok(_) => {
+                    sorted.refetch();
+                    refresh.update(|n| *n += 1);
+                    note.set(String::new());
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    move || {
+        sorted.get().and_then(Result::ok).flatten().map(|t| {
+            let (label, class) = sorted_as(&t.category);
+            let stranger = matches!(t.category.as_str(), "pitch" | "first_contact");
+            let by = match t.by.as_str() {
+                "model" => "the model",
+                "you" => "you",
+                "mark" => "your mark",
+                "signals" | "sequence" => "a sequence's marks",
+                _ => "a rule",
+            };
+            view! {
+                <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
+                    <span class=format!("rounded px-1.5 text-xs font-medium {class}")>{label}</span>
+                    <span class="min-w-0 flex-1 text-zinc-600 dark:text-zinc-400">{t.reason.clone()}<span class="text-xs text-zinc-400">{format!(" · by {by}")}</span></span>
+                    {(t.kind == "mail" && t.category != "pitch").then(|| view! {
+                        <button class=BUTTON_QUIET title="Their mail is always a cold pitch"
+                            on:click=move |_| act("memex.triage.mark", json!({"target": target.get_value(), "mark": "pitch"}))>"Cold pitch"</button>
+                    })}
+                    {(t.kind == "mail" && stranger).then(|| view! {
+                        <button class=BUTTON_QUIET title="Someone you know: their mail is never a pitch"
+                            on:click=move |_| act("memex.triage.mark", json!({"target": target.get_value(), "mark": "known"}))>"Not a pitch"</button>
+                    })}
+                    <select class=format!("{INPUT} w-auto py-1 text-xs") on:change=move |ev| category.set(event_target_value(&ev))>
+                        <option value="">"Sort as…"</option>
+                        {["needs_you", "first_contact", "fyi", "newsletter", "notification", "pitch", "noise"].into_iter().map(|c| {
+                            view! { <option value=c>{sorted_as(c).0}</option> }
+                        }).collect_view()}
+                    </select>
+                    {move || (!category.get().is_empty()).then(|| view! {
+                        <input class=format!("{INPUT} w-56 py-1 text-xs") placeholder="Why (the sorting learns from it)"
+                            prop:value=move || note.get() on:input=move |ev| note.set(event_target_value(&ev)) />
+                        <button class=BUTTON_QUIET on:click=move |_| {
+                            act("memex.triage.set", json!({"target": target.get_value(), "category": category.get_untracked(), "note": note.get_untracked()}));
+                            category.set(String::new());
+                        }>"Save"</button>
+                    })}
+                    {move || error.get().map(|e| view! { <span class="w-full text-xs text-red-600">{e}</span> })}
+                </div>
+            }
+        })
+    }
+}
+
+/// The senders you marked (a pitch, or someone you know), to take back.
+#[component]
+pub fn SenderMarks() -> impl IntoView {
+    let marks = LocalResource::new(|| api::rpc("memex.triage.marks", json!({})));
+    move || {
+        marks.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).filter(|l| !l.is_empty()).map(|list| view! {
+            <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+                <h2 class="font-medium">"Senders you marked"</h2>
+                <p class="text-sm text-zinc-500">"A pitch: everything they send is sorted as a cold pitch. Known: nothing they send is."</p>
+                <div class="divide-y divide-zinc-100 text-sm dark:divide-zinc-800">
+                    {list.into_iter().map(|x| {
+                        let pattern = x["pattern"].as_str().unwrap_or_default().to_owned();
+                        let p = pattern.clone();
+                        view! {
+                            <div class="flex items-center gap-2 py-1.5">
+                                <span class="min-w-0 flex-1 truncate font-mono text-xs">{pattern}</span>
+                                <span class="text-xs text-zinc-500">{if x["mark"] == "pitch" { "cold pitch" } else { "known" }}</span>
+                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
+                                    let p = p.clone();
+                                    spawn_local(async move {
+                                        let _ = api::rpc("memex.triage.unmark", json!({"pattern": p})).await;
+                                        marks.refetch();
+                                    });
+                                }>"Remove"</button>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            </section>
+        })
     }
 }
 
@@ -302,6 +423,7 @@ fn Thread(
                 <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| modify(vec!["TRASH"], vec!["INBOX"], true)>"Trash"</button>
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            <Sorting target=format!("thread:{account}:{thread}") refresh />
             {move || messages.get().map(|r| match r {
                 Err(e) => view! { <MailError e /> }.into_any(),
                 Ok(list) => {

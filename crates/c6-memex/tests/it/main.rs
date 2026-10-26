@@ -9,6 +9,7 @@ mod memex;
 mod move_in;
 mod realms;
 mod records;
+mod triage;
 mod understanding;
 
 /// The c6-extract kit's code, in this process (what workers run).

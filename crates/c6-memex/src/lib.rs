@@ -22,6 +22,7 @@ pub mod store;
 
 /// The realm everything in the memex belongs to, so far (docs/os.md §3).
 pub const REALM_HOME: &str = "home";
+pub mod triage;
 pub mod understand;
 
 use std::collections::HashMap;
@@ -203,7 +204,12 @@ impl Memex {
                                 m.wake.notify_waiters();
                             }
                             m.contacts_auto.store(c["contacts_auto"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
-                            *m.prompts.lock().unwrap() = serde_json::from_value(c["prompts"].clone()).unwrap_or_default();
+                            // The realm's own prompts (as it uses them), else home's.
+                            let mine = match &c["realm_prompts"][&m.realm] {
+                                Value::Null => c["prompts"].clone(),
+                                p => p.clone(),
+                            };
+                            *m.prompts.lock().unwrap() = serde_json::from_value(mine).unwrap_or_default();
                             let folders: Vec<api::MemexFolder> =
                                 if home { serde_json::from_value(c["folders"].clone()).unwrap_or_default() } else { Vec::new() };
                             let changed = *m.folders.lock().unwrap() != folders;
@@ -846,6 +852,10 @@ impl Memex {
                 self.google_method(m, params, &allowed).await
             }
             m if m.starts_with("memex.chat.") => chat::method(self, m, &params, &allowed).await,
+            m if m.starts_with("memex.triage.") => {
+                anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
+                triage::method(self, m, &params).await
+            }
             // Which of the mail, calendar and contacts stores this realm
             // uses: an app feeds it, or it holds something (imported mail).
             "memex.feeds" => {

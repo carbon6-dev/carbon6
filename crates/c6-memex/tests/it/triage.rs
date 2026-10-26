@@ -1,0 +1,303 @@
+//! Triage (docs/brief.md §3–4): recent mail threads and chat conversations
+//! sorted for the brief. Strangers' mail from a sales-sequence tool, or a
+//! sequence's follow-up, is a pitch with no model; people you know are
+//! sorted by the model, strangers by its pitch prompt; lists and your own
+//! last word by rule. Your marks settle a sender, your corrections become
+//! the model's examples, and a realm's memex reads with its own prompts.
+
+use c6_api::{MailThread, Triage};
+use c6_head::HeadConfig;
+use c6_memex::mail::{Parsed, Stored};
+use c6_testkit::eventually;
+use c6_testkit::{MockLlm, Reply};
+use serde_json::{Value, json};
+
+const HOUR: i64 = 3_600_000;
+
+/// A message in a thread, kept as a mail app's sync keeps it.
+#[allow(clippy::too_many_arguments)]
+async fn mail(
+    m: &c6_memex::Memex,
+    id: &str,
+    thread: &str,
+    from: (&str, &str),
+    to: &str,
+    subject: &str,
+    text: &str,
+    html: Option<&str>,
+    labels: &[&str],
+    ago: i64,
+) {
+    let parsed = Parsed {
+        message_id: format!("<{id}@test>"),
+        from: (from.0.into(), from.1.into()),
+        to: vec![(to.into(), String::new())],
+        subject: subject.into(),
+        text: text.into(),
+        html: html.map(|h| h.as_bytes().to_vec()),
+        list: from.0.starts_with("news@"),
+        ..Default::default()
+    };
+    let at = Stored {
+        account: "acct",
+        external_id: id,
+        thread_id: thread,
+        source: "test-mail",
+        rfc_id: &parsed.message_id,
+        origin: "mirrored",
+        owner: "me@mine.io",
+        message: id,
+    };
+    let labels: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
+    c6_memex::mail::store(m, &parsed, "", &at, &labels, c6_core::now_ms() - ago).await.unwrap();
+}
+
+#[tokio::test]
+async fn mail_and_chat_sorted_for_the_brief() {
+    crate::extract_here();
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    assert!(
+        http.post(format!("{api}/connections"))
+            .json(&json!({"name": "m", "base_url": mock.base_url()}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    let rpc = |method: &str, params: Value| {
+        let (http, url, method) = (http.clone(), format!("{api}/memex/rpc"), method.to_owned());
+        async move {
+            let r = http.post(url).json(&json!({"method": method, "params": params})).send().await.unwrap();
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(ok, "{method}: {v}");
+            v
+        }
+    };
+    // Model calls allowed today: each phase raises it by what it needs, so
+    // the reading that follows triage never takes a reply meant for it.
+    let budget = |n: u32| {
+        let (http, url) = (http.clone(), format!("{api}/settings/memex"));
+        async move {
+            let r = http
+                .put(url)
+                .json(&json!({"understanding": {"connection": "m", "model": "reader-1"}, "calls_per_day": n}))
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+        }
+    };
+    let sorted = |target: &str| {
+        let target = target.to_owned();
+        async move {
+            let all: Vec<Triage> = serde_json::from_value(rpc("memex.triage.list", json!({"limit": 100})).await).unwrap();
+            all.into_iter().find(|t| t.target == target)
+        }
+    };
+    let me = ("me@mine.io", "Me");
+
+    // You wrote to Ana at Acme once; she asks for something now.
+    mail(&m, "s0", "t0", me, "ana@acme.com", "Contract", "Here's the draft.", None, &["SENT"], 300 * HOUR).await;
+    mail(
+        &m,
+        "a1",
+        "t1",
+        ("ana@acme.com", "Ana"),
+        "me@mine.io",
+        "Redlines",
+        "Can you approve the redlines by Thursday?",
+        None,
+        &["INBOX", "UNREAD"],
+        HOUR,
+    )
+    .await;
+    // Bo, at Acme too (you never wrote to him, but to his company).
+    mail(&m, "b1", "t2", ("bo@acme.com", "Bo"), "me@mine.io", "Deploy", "FYI: the deploy is done.", None, &["INBOX"], 3 * HOUR).await;
+    // Strangers: a sequence tool's tracking link; a follow-up in a sequence;
+    // a plain pitch; a real first contact.
+    mail(
+        &m,
+        "c1",
+        "t3",
+        ("sam@growfast.io", "Sam"),
+        "me@mine.io",
+        "Pipeline",
+        "Hi! Loved your post.",
+        Some(r#"<a href="https://links.apollo.io/click/abc">book a time</a>"#),
+        &["INBOX"],
+        6 * HOUR,
+    )
+    .await;
+    mail(
+        &m,
+        "d1",
+        "t4",
+        ("kim@leadsy.co", "Kim"),
+        "me@mine.io",
+        "Re: quick question",
+        "Just bumping this to the top of your inbox.",
+        None,
+        &["INBOX"],
+        7 * HOUR,
+    )
+    .await;
+    mail(
+        &m,
+        "e1",
+        "t5",
+        ("lee@sdrhire.com", "Lee"),
+        "me@mine.io",
+        "Scale outbound",
+        "We help teams like yours scale SDRs. 15 min?",
+        None,
+        &["INBOX"],
+        4 * HOUR,
+    )
+    .await;
+    mail(
+        &m,
+        "f1",
+        "t6",
+        ("pat@northwind.com", "Pat"),
+        "me@mine.io",
+        "Pilot",
+        "We use your scheduler and want a pilot for 40 seats.",
+        None,
+        &["INBOX"],
+        5 * HOUR,
+    )
+    .await;
+    // A newsletter; and a thread you answered last.
+    mail(&m, "g1", "t7", ("news@weekly.dev", "Weekly"), "me@mine.io", "Issue 12", "This week in Rust.", None, &["INBOX"], 8 * HOUR).await;
+    mail(&m, "h1", "t8", ("ana@acme.com", "Ana"), "me@mine.io", "Lunch", "Lunch Friday?", None, &["INBOX"], 10 * HOUR).await;
+    mail(&m, "h2", "t8", me, "ana@acme.com", "Re: Lunch", "Yes!", None, &["SENT"], 9 * HOUR).await;
+    // Chat: a DM asking you something; a channel message that isn't to you.
+    let chat = |id: &str, channel: &str, kind: &str, text: &str, ago: i64, mentions_me: bool| c6_api::MemexItemIn {
+        kind: "chat".into(),
+        source: "test-slack".into(),
+        external_id: id.into(),
+        title: format!("{channel} · Raj"),
+        text: format!("Raj: {text}"),
+        created_at: Some(c6_core::now_ms() - ago),
+        meta: json!({"service": "slack", "workspace": "T1", "channel": channel, "channel_name": channel, "channel_kind": kind,
+                     "ts": format!("{}.0001", 1000 + ago / 1000), "user": "U2", "user_name": "Raj", "from_me": false, "mentions_me": mentions_me}),
+        ..Default::default()
+    };
+    m.store.put(&chat("k1", "D9", "dm", "Can we move our 1:1 to Wednesday?", 2 * HOUR, false), "test-slack").await.unwrap();
+    m.store.put(&chat("k2", "C9", "public", "Lunch is here.", 2 * HOUR, false), "test-slack").await.unwrap();
+
+    // With no model, what rules settle is sorted at once.
+    eventually("rules first", async || (sorted("thread:acct:t8").await?.category == "yours").then_some(())).await;
+    let pitch = sorted("thread:acct:t3").await.unwrap();
+    assert_eq!((pitch.category.as_str(), pitch.by.as_str()), ("pitch", "signals"), "{pitch:?}");
+    assert!(pitch.reason.contains("apollo.io"), "{pitch:?}");
+    let follow = sorted("thread:acct:t4").await.unwrap();
+    assert_eq!((follow.category.as_str(), follow.by.as_str()), ("pitch", "sequence"), "{follow:?}");
+    assert_eq!(sorted("thread:acct:t7").await.unwrap().category, "newsletter");
+    assert!(sorted("thread:acct:t1").await.is_none(), "waits for a model");
+
+    // Then the model, newest first: Ana (known), Raj's DM, Bo (known by his
+    // company), Lee and Pat (strangers: the pitch prompt).
+    for r in [
+        json!({"category": "needs_you", "reason": "Ana needs your approval by Thursday"}),
+        json!({"category": "needs_you", "reason": "Raj wants to move your 1:1"}),
+        json!({"category": "fyi", "reason": "The deploy is done"}),
+        json!({"category": "pitch", "reason": "Sells SDR outsourcing"}),
+        json!({"category": "first_contact", "reason": "A customer asks for a pilot"}),
+    ] {
+        mock.push(Reply::Text(r.to_string()));
+    }
+    budget(5).await;
+    eventually("the model's sorting", async || (sorted("thread:acct:t6").await?.category == "first_contact").then_some(())).await;
+    let want = [
+        ("thread:acct:t1", "needs_you"),
+        ("chat:T1:D9", "needs_you"),
+        ("thread:acct:t2", "fyi"),
+        ("thread:acct:t5", "pitch"),
+        ("thread:acct:t6", "first_contact"),
+    ];
+    for (t, c) in want {
+        let s = sorted(t).await.unwrap_or_else(|| panic!("{t} sorted"));
+        assert_eq!((s.category.as_str(), s.by.as_str()), (c, "model"), "{s:?}");
+    }
+    assert!(sorted("chat:T1:C9:8200.0001").await.is_none(), "a channel message not to you isn't sorted");
+    let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
+    assert_eq!(asked.len(), 5, "rules needed no model");
+    assert!(asked[0].contains("Sort this conversation") && asked[0].contains("approve the redlines"), "{}", asked[0]);
+    assert!(asked[3].contains("never corresponded") && asked[3].contains("scale SDRs"), "{}", asked[3]);
+    assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
+
+    // The mail list's views and threads say how they're sorted.
+    let pitches: Vec<MailThread> = serde_json::from_value(rpc("memex.mail.threads", json!({"view": "triage:pitch"})).await).unwrap();
+    let ids: Vec<&str> = pitches.iter().map(|t| t.thread_id.as_str()).collect();
+    assert_eq!(ids, ["t5", "t3", "t4"]);
+    assert_eq!(pitches[0].triage.as_ref().unwrap().reason, "Sells SDR outsourcing");
+    let counts = rpc("memex.triage.counts", json!({})).await;
+    assert_eq!((counts["pitch"].as_i64(), counts["needs_you"].as_i64()), (Some(3), Some(2)), "{counts}");
+
+    // You mark Lee a pitch: his next mail is one, with no model.
+    rpc("memex.triage.mark", json!({"target": "thread:acct:t5", "mark": "pitch"})).await;
+    mail(
+        &m,
+        "e2",
+        "t9",
+        ("lee@sdrhire.com", "Lee"),
+        "me@mine.io",
+        "One more idea",
+        "Have you thought about outbound?",
+        None,
+        &["INBOX"],
+        HOUR / 2,
+    )
+    .await;
+    let again = eventually("Lee's mail, settled", async || sorted("thread:acct:t9").await).await;
+    assert_eq!((again.category.as_str(), again.by.as_str()), ("pitch", "mark"));
+    // Sam is someone you know after all: sorted again, as such.
+    mock.push(Reply::Text(json!({"category": "fyi", "reason": "Sam shares a post"}).to_string()));
+    rpc("memex.triage.mark", json!({"target": "thread:acct:t3", "mark": "known"})).await;
+    budget(6).await;
+    eventually("Sam, sorted again", async || (sorted("thread:acct:t3").await?.category == "fyi").then_some(())).await;
+    let marks = rpc("memex.triage.marks", json!({})).await;
+    assert_eq!(marks.as_array().unwrap().len(), 2, "{marks}");
+
+    // You correct Bo's: deploys need your sign-off. His next is sorted with
+    // that as an example.
+    let set =
+        rpc("memex.triage.set", json!({"target": "thread:acct:t2", "category": "needs_you", "note": "deploys need my sign-off"})).await;
+    assert_eq!((set["category"].as_str(), set["by"].as_str()), (Some("needs_you"), Some("you")), "{set}");
+    mock.push(Reply::Text(json!({"category": "needs_you", "reason": "Bo's deploy needs your sign-off"}).to_string()));
+    mail(&m, "b2", "t2", ("bo@acme.com", "Bo"), "me@mine.io", "Re: Deploy", "And the hotfix is out too.", None, &["INBOX"], HOUR / 3).await;
+    budget(7).await;
+    eventually("Bo's, sorted again", async || (sorted("thread:acct:t2").await?.reason == "Bo's deploy needs your sign-off").then_some(()))
+        .await;
+    let last = mock.requests().last().unwrap()["messages"].to_string();
+    assert!(last.contains("deploys need my sign-off") && last.contains("hotfix"), "{last}");
+
+    // A realm's memex reads with its own prompts.
+    assert!(http.post(format!("{api}/realms")).json(&json!({"id": "lab"})).send().await.unwrap().status().is_success());
+    c6_head::store::SETTINGS_REALM
+        .scope("lab".into(), c6_head::prompts::set(&head.state, "memex.triage", "Lab's own sorting"))
+        .await
+        .unwrap();
+    let config = c6_head::memex::config(&head.state).await.unwrap();
+    assert_eq!(config["realm_prompts"]["lab"]["memex.triage"], "Lab's own sorting");
+    assert_ne!(config["prompts"]["memex.triage"], "Lab's own sorting", "home's stays");
+
+    head.shutdown().await.unwrap();
+}

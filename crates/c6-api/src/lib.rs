@@ -4154,6 +4154,31 @@ pub struct MailThread {
     /// Gmail label ids of its latest message.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// How it was sorted for the brief, if it was (docs/brief.md).
+    #[serde(default)]
+    pub triage: Option<Triage>,
+}
+
+/// A mail thread or chat conversation as sorted for the brief
+/// (docs/brief.md §3): its category and why.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Triage {
+    /// thread:<account>:<thread>, or chat:<workspace>:<channel>[:<thread ts>].
+    pub target: String,
+    /// mail or chat.
+    pub kind: String,
+    /// needs_you, first_contact, fyi, newsletter, notification, pitch, noise, or yours (you wrote last).
+    pub category: String,
+    pub reason: String,
+    /// rule, signals, sequence, mark, model, you, or error.
+    pub by: String,
+    /// Who wrote last (not you): an address, or a chat user's id.
+    pub sender: String,
+    pub sender_name: String,
+    /// The subject, or the conversation's name.
+    pub title: String,
+    pub at: UnixMs,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
