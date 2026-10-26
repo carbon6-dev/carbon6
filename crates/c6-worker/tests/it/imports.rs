@@ -126,8 +126,12 @@ async fn sessions_come_in_from_claude_code_and_codex() {
     let first = events(cc_id).await;
     assert!(serde_json::to_string(&first).unwrap().contains("A race in the cache."));
     assert!(first.iter().any(|e| e["type"] == "tool_result" && e["tool"] == "Bash"), "{first:?}");
-    let summary = ok(send(M::GET, "imports", json!({})).await).await;
-    assert_eq!(summary.as_array().unwrap().len(), 2, "{summary}");
+    // The import's row is written just after its session: wait for both.
+    eventually("both in the summary", async || {
+        let summary = ok(send(M::GET, "imports", json!({})).await).await;
+        (summary.as_array().unwrap().len() == 2).then_some(())
+    })
+    .await;
 
     // The file grows (you go on in Claude Code): the session follows.
     let mut f = std::fs::OpenOptions::new().append(true).open(&cc_file).unwrap();
