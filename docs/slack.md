@@ -149,7 +149,9 @@ They fail only when what they check is broken (docs/testing.md):
   - Conversations with a message in the last week are checked every run; the rest every 15 minutes, in turn.
   - The last week of active ones is read again every hour.
   - The import uses what's left, a page at a time (DMs and groups first), and asks to run again at once while it lasts.
-  - A thread's replies are read when it's new, and when its latest reply moves.
+  - A thread's replies are read when it's new, and when its latest reply moves, every page of them. Threads the budget doesn't reach wait in the conversation's `pending` and are read first next time, and runs go on at once while any wait.
+- **People from other organizations** (Slack Connect channels and DMs) aren't in `users.list`: each is looked up with `users.info` before their first message is kept. Slack limits that method on its own, so it isn't counted in the budget.
+- **Upgrades:** each conversation's record says which version of the sync made it (`rev`). One made by an older version is read again whole, so its messages take the newer names and threads; its files aren't fetched again. The hourly re-read fetches files only for messages it hasn't seen.
 - **Deletions remove the item,** as a mirror should (rather than keep it marked). Only a re-read of the whole week can delete: one cut short by the budget doesn't guess.
 - **Files:** documents Slack calls PDF, Word, Markdown, text, HTML or reStructuredText (up to 40 MB) are downloaded, up to 24 MB a run (the rest wait in the workspace's queue), and read by the extract kit. Other files keep their name, type and size in the message's `meta.files`.
 - **The memex:** `memex.chat.channels`, `memex.chat.messages`, `memex.chat.thread` (an index on `meta`'s workspace and channel), and `memex.chat.post`, `react` and `mark_read` through the app's operations. `memex.feeds` says `chat` once a workspace is connected.

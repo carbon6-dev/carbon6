@@ -4,7 +4,8 @@
 //! Each workspace's records: `team:<id>` (its name and address, its people,
 //! files waiting, and a rate limit's wait) and `chan:<id>:<channel>` per
 //! conversation (the newest message read, how far back the import is, the
-//! last week's messages and threads, for the re-read).
+//! last week's messages and threads, for the re-read, and threads whose
+//! replies are still to read).
 
 use std::collections::BTreeMap;
 
@@ -25,6 +26,10 @@ const READABLE: [&str; 6] = [
     "text/html",
     "text/x-rst",
 ];
+/// What the records were made by: a conversation from an earlier one is
+/// read again whole (2: the names of people from other organizations, and
+/// every thread's replies).
+const REV: i64 = 2;
 /// Messages that say nothing (joins, leaves, topic changes).
 const NOISE: [&str; 6] = ["channel_join", "channel_leave", "group_join", "group_leave", "channel_purpose", "channel_topic"];
 
@@ -44,6 +49,18 @@ fn person_key(team: &str, user: &str, users: &Map<String, Value>) -> String {
         Some(email) => format!("person:{}", email.to_lowercase()),
         None => format!("slack-user:{team}/{user}"),
     }
+}
+
+/// A person's name, as Slack's user object has it.
+fn display(u: &Value) -> String {
+    u["profile"]["real_name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .or(u["real_name"].as_str().filter(|n| !n.is_empty()))
+        .or(u["profile"]["display_name"].as_str().filter(|n| !n.is_empty()))
+        .or(u["name"].as_str())
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn user_name(user: &str, users: &Map<String, Value>) -> String {
@@ -231,26 +248,24 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
         team["domain"] = info["team"]["domain"].clone();
         team["name"] = info["team"]["name"].clone();
         let members = pages(r, a, "users.list", &[("limit", "200".into())], "members").await?;
-        let mut users = Map::new();
+        // Those looked up one by one (another organization's) stay.
+        let mut users: Map<String, Value> =
+            team["users"].as_object().into_iter().flatten().filter(|(_, u)| u["x"] == true).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut listed = Map::new();
         for u in &members {
             let Some(id) = u["id"].as_str() else { continue };
-            let name = u["profile"]["real_name"]
-                .as_str()
-                .filter(|n| !n.is_empty())
-                .or(u["real_name"].as_str())
-                .or(u["name"].as_str())
-                .unwrap_or(id);
+            let name = Some(display(u)).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_owned());
             let email = u["profile"]["email"].as_str().unwrap_or("");
-            users.insert(id.to_owned(), json!({"n": name, "e": email}));
+            listed.insert(id.to_owned(), json!({"n": name, "e": email}));
         }
-        for (id, u) in &users {
-            r.things.push(json!({"kind": "person", "key": person_key(&a.team, id, &users), "name": u["n"]}));
+        for (id, u) in &listed {
+            r.things.push(json!({"kind": "person", "key": person_key(&a.team, id, &listed), "name": u["n"]}));
         }
+        users.extend(listed);
         team["users"] = Value::Object(users);
         team["users_at"] = json!(now_ms());
         r.save(&tkey, team.clone());
     }
-    let users = team["users"].as_object().cloned().unwrap_or_default();
     // The conversations you're in.
     let listed = pages(
         r,
@@ -260,6 +275,10 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
         "channels",
     )
     .await?;
+    let dm_people: Vec<String> =
+        listed.iter().filter(|c| c["is_im"] == true).filter_map(|c| c["user"].as_str().map(str::to_owned)).collect();
+    learn_users(r, a, &mut team, &dm_people).await?;
+    let users = team["users"].as_object().cloned().unwrap_or_default();
     let mut convs: Vec<Conversation> = listed
         .iter()
         .filter_map(|c| {
@@ -282,10 +301,25 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
     for c in &convs {
         let key = format!("chan:{}:{}", a.team, c.id);
         let mut s = r.record(&key);
+        let mut changed = false;
         if s["name"].as_str() != Some(&c.name) {
             r.things.push(json!({"kind": "channel", "key": channel_key(&a.team, &c.id), "name": c.name}));
             s["name"] = json!(c.name);
             s["kind"] = json!(c.kind);
+            changed = true;
+        }
+        // Made by an earlier version: read again, whole (its files aren't
+        // fetched again).
+        if s["rev"].as_i64().unwrap_or(0) < REV {
+            if s["latest_ts"].is_string() || s["import_done"] == true {
+                s["import_done"] = json!(false);
+                s["oldest_ts"] = Value::Null;
+                s["redo"] = json!(true);
+            }
+            s["rev"] = json!(REV);
+            changed = true;
+        }
+        if changed {
             r.save(&key, s);
         }
     }
@@ -300,7 +334,8 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
     for c in &live {
         let s = chan(r, c);
         let active = s["last_at"].as_i64().unwrap_or(0) > now - WEEK;
-        if !active && s["checked_at"].as_i64().unwrap_or(0) > now - IDLE_EVERY {
+        let waiting = s["pending"].as_object().is_some_and(|p| !p.is_empty());
+        if !active && !waiting && s["checked_at"].as_i64().unwrap_or(0) > now - IDLE_EVERY {
             continue;
         }
         if r.budget < 2 {
@@ -332,6 +367,10 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
             conversation(r, a, &mut team, c, Pass::Import).await?;
         }
     }
+    // Threads still to read: run again at once.
+    if convs.iter().chain(&live).any(|c| chan(r, c)["pending"].as_object().is_some_and(|p| !p.is_empty())) {
+        r.again = true;
+    }
     r.save(&tkey, team);
     Ok(())
 }
@@ -354,6 +393,19 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
     s["name"] = json!(c.name);
     s["kind"] = json!(c.kind);
     let now = now_ms();
+    let files = !(s["redo"] == true && pass == Pass::Import);
+    let mut threads: Map<String, Value> = s["threads"].as_object().cloned().unwrap_or_default();
+    // Threads whose replies an earlier pass couldn't finish, first.
+    let mut pending: Map<String, Value> = s["pending"].as_object().cloned().unwrap_or_default();
+    for (ts, from) in pending.clone() {
+        if r.budget < 2 {
+            break;
+        }
+        if let Some(latest) = replies(r, a, team, c, &ts, from.as_str(), files).await? {
+            pending.remove(&ts);
+            threads.insert(ts, json!(latest));
+        }
+    }
     let mut q = vec![("channel", c.id.clone()), ("limit", "200".to_owned())];
     match pass {
         Pass::New => q.push(("oldest", s["latest_ts"].as_str().unwrap_or("0").to_owned())),
@@ -393,26 +445,31 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
             break v["has_more"] == true;
         }
     };
-    let mut threads: Map<String, Value> = s["threads"].as_object().cloned().unwrap_or_default();
+    // A re-read's messages were mostly kept before, their files with them.
+    let before: Vec<String> = s["recent"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)).collect();
     let mut seen: Vec<String> = Vec::new();
     for m in &messages {
         let Some(ts) = m["ts"].as_str() else { continue };
         seen.push(ts.to_owned());
-        keep(r, a, team, c, m).await?;
-        // Its thread's replies: all of a new one's, and new ones since.
+        let fetch = files && !(pass == Pass::Reread && before.iter().any(|b| b == ts));
+        keep(r, a, team, c, m, fetch).await?;
+        // Its thread's replies: all of a new one's, and new ones since;
+        // what the budget doesn't reach waits for the next pass.
         if m["reply_count"].as_u64().unwrap_or(0) > 0 {
             let latest = m["latest_reply"].as_str().unwrap_or("").to_owned();
             let known = threads.get(ts).and_then(Value::as_str).map(str::to_owned);
-            if known.as_deref() != Some(latest.as_str()) && r.budget > 1 {
-                let mut rq = vec![("channel", c.id.clone()), ("ts", ts.to_owned()), ("limit", "200".to_owned())];
-                if let Some(k) = &known {
-                    rq.push(("oldest", k.clone()));
+            if known.as_deref() == Some(latest.as_str()) {
+                continue;
+            }
+            let read = if r.budget > 1 { replies(r, a, team, c, ts, known.as_deref(), files).await? } else { None };
+            match read {
+                Some(l) => {
+                    pending.remove(ts);
+                    threads.insert(ts.to_owned(), json!(l));
                 }
-                let replies = r.call(a, "conversations.replies", &rq, None).await?;
-                for x in replies["messages"].as_array().into_iter().flatten().filter(|x| x["ts"].as_str() != Some(ts)) {
-                    keep(r, a, team, c, x).await?;
+                None => {
+                    pending.entry(ts.to_owned()).or_insert(known.map_or(Value::Null, Value::from));
                 }
-                threads.insert(ts.to_owned(), json!(latest));
             }
         }
     }
@@ -440,6 +497,7 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
             }
             if !more {
                 s["import_done"] = json!(true);
+                s["redo"] = Value::Null;
             }
         }
     }
@@ -469,14 +527,104 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
     threads.retain(|t, latest| ts_ms(t) >= since || ts_ms(latest.as_str().unwrap_or("0")) >= since);
     s["recent"] = json!(recent);
     s["threads"] = Value::Object(threads);
+    s["pending"] = Value::Object(pending);
     r.save(&key, s);
     Ok(())
 }
 
-/// Keeps a message, and queues its files.
-async fn keep(r: &mut Run, a: &Account, team: &mut Value, c: &Conversation, m: &Value) -> anyhow::Result<()> {
+/// A thread's replies after `from` (all of them without), every page; its
+/// latest reply, or `None` when the budget ran out first.
+async fn replies(
+    r: &mut Run,
+    a: &Account,
+    team: &mut Value,
+    c: &Conversation,
+    ts: &str,
+    from: Option<&str>,
+    files: bool,
+) -> anyhow::Result<Option<String>> {
+    let mut latest = from.unwrap_or(ts).to_owned();
+    let mut cursor = String::new();
+    loop {
+        if r.budget < 1 {
+            return Ok(None);
+        }
+        let mut q = vec![("channel", c.id.clone()), ("ts", ts.to_owned()), ("limit", "200".to_owned())];
+        if let Some(f) = from {
+            q.push(("oldest", f.to_owned()));
+        }
+        if !cursor.is_empty() {
+            q.push(("cursor", cursor.clone()));
+        }
+        let v = match r.call(a, "conversations.replies", &q, None).await {
+            Ok(v) => v,
+            // Gone (deleted, or the conversation left): nothing to read.
+            Err(e) if matches!(slack_error(&e), Some("thread_not_found" | "channel_not_found" | "not_in_channel")) => {
+                return Ok(Some(latest));
+            }
+            Err(e) => return Err(e),
+        };
+        for x in v["messages"].as_array().into_iter().flatten().filter(|x| x["ts"].as_str() != Some(ts)) {
+            if let Some(t) = x["ts"].as_str().filter(|t| ts_ms(t) > ts_ms(&latest)) {
+                latest = t.to_owned();
+            }
+            keep(r, a, team, c, x, files).await?;
+        }
+        cursor = v["response_metadata"]["next_cursor"].as_str().unwrap_or("").to_owned();
+        if cursor.is_empty() {
+            return Ok(Some(latest));
+        }
+    }
+}
+
+/// People Slack's member list leaves out (another organization's, in a
+/// shared channel or a DM), looked up one by one before their messages are
+/// kept. Slack limits `users.info` on its own (more than a hundred a
+/// minute), so it isn't the run's budget; a 429 stops the run, as always.
+async fn learn_users(r: &mut Run, a: &Account, team: &mut Value, ids: &[String]) -> anyhow::Result<()> {
+    for id in ids {
+        let known = team["users"].get(id).is_some() || team["unknown"].as_array().is_some_and(|u| u.iter().any(|x| x == id.as_str()));
+        if known || !id.starts_with(['U', 'W']) {
+            continue;
+        }
+        let budget = r.budget;
+        let asked = r.call(a, "users.info", &[("user", id.clone())], None).await;
+        r.budget = budget;
+        match asked {
+            Ok(v) => {
+                let u = &v["user"];
+                let name = Some(display(u)).filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone());
+                let email = u["profile"]["email"].as_str().unwrap_or("");
+                if !team["users"].is_object() {
+                    team["users"] = json!({});
+                }
+                team["users"][id.as_str()] = json!({"n": name, "e": email, "x": true});
+                let users = team["users"].as_object().cloned().unwrap_or_default();
+                r.things.push(json!({"kind": "person", "key": person_key(&a.team, id, &users), "name": name}));
+            }
+            Err(e) if matches!(slack_error(&e), Some("user_not_found" | "user_not_visible")) => {
+                let mut unknown = team["unknown"].as_array().cloned().unwrap_or_default();
+                unknown.push(json!(id));
+                team["unknown"] = json!(unknown);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Keeps a message (learning who its people are first), and queues its
+/// files unless they were fetched before.
+async fn keep(r: &mut Run, a: &Account, team: &mut Value, c: &Conversation, m: &Value, fetch: bool) -> anyhow::Result<()> {
+    let users = team["users"].as_object().cloned().unwrap_or_default();
+    let mut people: Vec<String> = m["user"].as_str().map(str::to_owned).into_iter().collect();
+    people.extend(plain(m["text"].as_str().unwrap_or(""), &users).1);
+    learn_users(r, a, team, &people).await?;
     let Some((item, files)) = item(a, team, c, m) else { return Ok(()) };
     r.items.push(item);
+    if !fetch {
+        return Ok(());
+    }
     let mut queue = team["files_queue"].as_array().cloned().unwrap_or_default();
     for f in files {
         let mime = f["mimetype"].as_str().unwrap_or("");

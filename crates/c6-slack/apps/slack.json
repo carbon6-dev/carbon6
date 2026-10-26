@@ -1,6 +1,6 @@
 {
   "package": "slack",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Your Slack in carbon6: every conversation you're in (channels, private channels, DMs and groups) with its threads and shared documents, kept in the memex and searchable; posting, replying and reacting. Messages are other people's words: agents get them as quoted data, and their posts ask first.",
   "requires": {
     "slack-api": "^1"
@@ -149,6 +149,28 @@
             "threads": {
               "type": "object",
               "description": "The last week's threads: thread to its latest reply"
+            },
+            "pending": {
+              "type": "object",
+              "description": "Threads whose replies are still to read: thread to the reply read up to (null: none yet)"
+            },
+            "rev": {
+              "type": "integer",
+              "description": "The version of the sync that made it (an older one's conversation is read again)"
+            },
+            "redo": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "description": "Being read again whole (its files aren't fetched again)"
+            },
+            "unknown": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "People Slack wouldn't say who they are"
             },
             "updated_at": {
               "type": "integer"

@@ -30,6 +30,8 @@ struct S {
     posted: Vec<Value>,
     reactions: Vec<Value>,
     marked: Vec<Value>,
+    /// Files downloaded.
+    downloads: usize,
 }
 
 type Mock = Arc<Mutex<S>>;
@@ -74,6 +76,17 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
                 }
             }),
         )
+        // Someone from another organization (Slack Connect): not in the
+        // member list, but Slack tells who they are.
+        .route(
+            "/api/users.info",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q["user"].as_str() {
+                    "UX1" => Json(json!({"ok": true, "user": {"id": "UX1", "name": "zed", "profile": {"real_name": "Zed Quinn"}}})),
+                    _ => fail("user_not_found"),
+                }
+            }),
+        )
         .route(
             "/api/users.conversations",
             get(|| async {
@@ -113,7 +126,13 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
                 let parent = s.messages.get(&q["channel"]).and_then(|l| l.iter().find(|m| m["ts"] == q["ts"].as_str()).cloned());
                 let mut list: Vec<Value> = parent.into_iter().collect();
                 list.extend(s.replies.get(&(q["channel"].clone(), q["ts"].clone())).cloned().unwrap_or_default());
-                Json(json!({"ok": true, "messages": list, "has_more": false}))
+                // #big's threads come two messages a page.
+                let at: usize = q.get("cursor").and_then(|c| c.parse().ok()).unwrap_or(0);
+                let page = if q["channel"] == "C2" { 2 } else { 200 };
+                let end = (at + page).min(list.len());
+                let more = end < list.len();
+                Json(json!({"ok": true, "messages": list[at.min(end)..end], "has_more": more,
+                            "response_metadata": {"next_cursor": if more { end.to_string() } else { String::new() }}}))
             }),
         )
         .route(
@@ -144,8 +163,9 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
         )
         .route(
             "/files/{id}",
-            get(|Path(id): Path<String>| async move {
+            get(|State(s): State<Mock>, Path(id): Path<String>| async move {
                 assert_eq!(id, "F1");
+                s.lock().unwrap().downloads += 1;
                 "Release notes: the parser is twice as fast."
             }),
         )
@@ -180,12 +200,25 @@ async fn slack_mirrored_into_the_memex() {
             vec![json!({"type": "message", "user": "U1", "ts": r_1, "thread_ts": m_b, "text": "I will"})],
         );
         st.messages.insert("D1".into(), vec![json!({"type": "message", "user": "U1", "ts": ts(600, 5), "text": "lunch?"})]);
-        st.messages.insert(
-            "C2".into(),
-            (0..30)
-                .map(|i| json!({"type": "message", "user": "U2", "ts": ts(7200 + i * 60, 10 + i as u32), "text": format!("big {i}")}))
-                .collect(),
-        );
+        // #big: 30 messages, each a thread of three replies (one from
+        // another organization's Zed), more than a run's budget reads.
+        let big: Vec<(String, Value)> = (0..30)
+            .map(|i| {
+                let t = ts(7200 + i * 60, 10 + i as u32);
+                let latest = ts(7200 + i * 60 - 30, 3);
+                (t.clone(), json!({"type": "message", "user": "U2", "ts": t, "text": format!("big {i}"), "thread_ts": t, "reply_count": 3, "latest_reply": latest}))
+            })
+            .collect();
+        for (i, (t, _)) in big.iter().enumerate() {
+            let replies = (1..=3)
+                .map(|n| {
+                    let user = if n == 2 { "UX1" } else { "U1" };
+                    json!({"type": "message", "user": user, "ts": ts(7200 + i as i64 * 60 - 10 * n as i64, n), "thread_ts": t, "text": format!("re {i}.{n}")})
+                })
+                .collect();
+            st.replies.insert(("C2".into(), t.clone()), replies);
+        }
+        st.messages.insert("C2".into(), big.into_iter().map(|(_, m)| m).collect());
     }
     // The slack kit's code, in this process, against the stand-in: a small
     // budget, so the import takes several runs; the re-read as the test says.
@@ -295,7 +328,7 @@ async fn slack_mirrored_into_the_memex() {
         (w["imported"] == 3 && w["files_waiting"] == 0).then_some(w)
     })
     .await;
-    assert_eq!((w["conversations"].as_u64(), w["people"].as_u64(), w["name"].as_str()), (Some(3), Some(3), Some("Acme")), "{w}");
+    assert_eq!((w["conversations"].as_u64(), w["name"].as_str()), (Some(3), Some("Acme")), "{w}");
 
     // Conversations, messages (a thread's replies under it), threads.
     let chans = rpc("memex.chat.channels", json!({})).await;
@@ -316,6 +349,19 @@ async fn slack_mirrored_into_the_memex() {
         (big.as_array()?.len() == 30).then_some(())
     })
     .await;
+    // Every thread's every reply, over the runs the budget takes; Zed by
+    // name, though the member list hasn't him.
+    let big = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C2", "limit": 100})).await;
+    let parents: Vec<String> = big.as_array().unwrap().iter().map(|m| m["meta"]["ts"].as_str().unwrap().to_owned()).collect();
+    for (i, t) in parents.iter().enumerate() {
+        let thread = eventually("a thread's replies", async || {
+            let th = rpc("memex.chat.thread", json!({"workspace": "T1", "channel": "C2", "thread_ts": t})).await;
+            (th.as_array()?.len() == 4).then_some(th)
+        })
+        .await;
+        assert_eq!(thread[2]["text"], format!("Zed Quinn: re {i}.2"), "the newest first: {thread}");
+    }
+    assert_eq!(setup().await["workspaces"][0]["people"], 4, "Ana, Bo, me and Zed");
     // Who said it and where: Ana is the person mail knows (by email); Bo has
     // no email, so he is Slack's.
     let got: Value = http.get(format!("{api}/memex/get?id={}", eng[1]["id"].as_str().unwrap())).send().await.unwrap().json().await.unwrap();
@@ -362,6 +408,31 @@ async fn slack_mirrored_into_the_memex() {
     .await;
     assert_eq!(eng[1]["meta"]["edited"], true);
     reread.store(i64::MAX / 4, Ordering::SeqCst);
+
+    // A conversation synced by an earlier version is read again whole
+    // (what changed since shows), without fetching its files again.
+    let downloads = s.lock().unwrap().downloads;
+    assert_eq!(downloads, 1);
+    {
+        let mut st = s.lock().unwrap();
+        let merged = st.messages.get_mut("C1").unwrap().iter_mut().find(|m| m["text"] == "Merged.").unwrap();
+        merged["text"] = json!("Merged to main.");
+    }
+    let mut filter = serde_json::Map::new();
+    filter.insert("key".into(), json!("chan:T1:C1"));
+    let q = c6_api::RecordQuery { filter, limit: Some(1), ..Default::default() };
+    let old = c6_head::collections::query(&head.state, "home", "slack_sync", &q).await.unwrap().records.remove(0);
+    let mut fields = old.fields.clone();
+    fields.as_object_mut().unwrap().remove("rev");
+    let back = c6_api::RecordIn { fields, version: Some(old.version), links: None, labels: None, derived_from: None };
+    c6_head::collections::put(&head.state, "home", "slack_sync", Some(&old.id), &back, "app:slack test").await.unwrap();
+    assert!(http.post(format!("{api}/slack/sync")).send().await.unwrap().status().is_success());
+    eventually("the conversation read again", async || {
+        let eng = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C1"})).await;
+        (eng[0]["text"] == "Ana Lima: Merged to main." && setup().await["workspaces"][0]["imported"] == 3).then_some(())
+    })
+    .await;
+    assert_eq!(s.lock().unwrap().downloads, downloads, "its file not fetched again");
 
     // Posting as you (the Chat page): it shows at once.
     let posted = rpc("memex.chat.post", json!({"workspace": "T1", "channel": "C1", "text": "On it", "thread_ts": m_a})).await;
