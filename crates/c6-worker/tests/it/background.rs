@@ -82,7 +82,13 @@ async fn background_tasks_notify_the_agent() {
     assert!(third.contains(r#"<background-task id=\"bg1\" kind=\"command\" status=\"exited with code 0\""#), "{third}");
     assert!(third.contains("compiled\\nbuilt ok"), "the end of its output: {third}");
     idle(&s.id).await;
-    let evs: Vec<Event> = http.get(format!("{api}/sessions/{}/events", s.id)).send().await.unwrap().json().await.unwrap();
+    // The worker's events reach the head on their own path from its status:
+    // wait for the notice itself.
+    let evs = eventually("the notice in the session's events", async || {
+        let evs: Vec<Event> = http.get(format!("{api}/sessions/{}/events", s.id)).send().await.ok()?.json().await.ok()?;
+        evs.iter().any(|e| matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification")).then_some(evs)
+    })
+    .await;
     let states: Vec<&str> = evs
         .iter()
         .filter_map(|e| match &e.kind {
@@ -91,7 +97,6 @@ async fn background_tasks_notify_the_agent() {
         })
         .collect();
     assert_eq!(states, ["started", "finished"]);
-    assert!(evs.iter().any(|e| matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification")));
 
     // A quiet task (notify: false) wakes nobody.
     mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo quiet","run_in_background":true,"notify":false}"#.into())]));
