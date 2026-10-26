@@ -51,6 +51,7 @@ fn fail(e: &str) -> Json<Value> {
 
 async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
     let app = Router::new()
+        .route("/api/auth.test", get(|| async { Json(json!({"ok": true, "user_id": "UME", "team_id": "T1"})) }))
         .route("/api/team.info", get(|| async { Json(json!({"ok": true, "team": {"id": "T1", "name": "Acme", "domain": "acme"}})) }))
         .route(
             "/api/users.list",
@@ -199,7 +200,7 @@ async fn slack_mirrored_into_the_memex() {
             ("C1".into(), m_b.clone()),
             vec![json!({"type": "message", "user": "U1", "ts": r_1, "thread_ts": m_b, "text": "I will"})],
         );
-        st.messages.insert("D1".into(), vec![json!({"type": "message", "user": "U1", "ts": ts(600, 5), "text": "lunch?"})]);
+        st.messages.insert("D1".into(), vec![json!({"type": "message", "user": "U1", "ts": ts(600, 5), "text": "<@UME> lunch?"})]);
         // #big: 30 messages, each a thread of three replies (one from
         // another organization's Zed), more than a run's budget reads.
         let big: Vec<(String, Value)> = (0..30)
@@ -334,6 +335,8 @@ async fn slack_mirrored_into_the_memex() {
     let chans = rpc("memex.chat.channels", json!({})).await;
     let names: Vec<&str> = chans.as_array().unwrap().iter().map(|c| c["channel_name"].as_str().unwrap()).collect();
     assert_eq!(names, ["@Ana Lima", "#eng", "#big"], "the most recently active first: {chans}");
+    let dm = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "D1"})).await;
+    assert_eq!((dm[0]["text"].as_str(), dm[0]["meta"]["mentions_me"].as_bool()), (Some("Ana Lima: @Me Myself lunch?"), Some(true)), "{dm}");
     let eng = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C1"})).await;
     let texts: Vec<&str> = eng.as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap()).collect();
     assert_eq!(texts, ["Bo: Who reviews?", "Ana Lima: Shipping the release @Bo, notes attached"], "no joins, no replies: {eng}");
@@ -440,6 +443,10 @@ async fn slack_mirrored_into_the_memex() {
     assert_eq!(s.lock().unwrap().posted[0]["thread_ts"], m_a.as_str());
     let thread = rpc("memex.chat.thread", json!({"workspace": "T1", "channel": "C1", "thread_ts": m_a})).await;
     assert!(thread.to_string().contains("Me Myself: On it"), "{thread}");
+    // Yours, and not; mentioning you, and not.
+    let mine = thread.as_array().unwrap().iter().find(|m| m["text"] == "Me Myself: On it").unwrap();
+    assert_eq!((mine["meta"]["from_me"].as_bool(), thread[0]["meta"]["from_me"].as_bool()), (Some(true), Some(false)), "{thread}");
+    assert_eq!(thread[0]["meta"]["mentions_me"], false);
     rpc("memex.chat.react", json!({"workspace": "T1", "channel": "C1", "ts": m_a, "name": ":tada:"})).await;
     assert_eq!(s.lock().unwrap().reactions[0]["name"], "tada");
 

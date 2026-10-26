@@ -1,6 +1,6 @@
 {
   "package": "slack-api",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Slack's Web API, for the slack app: it reaches only Slack, with the user token each run gets.",
   "permissions": {
     "files": "session",

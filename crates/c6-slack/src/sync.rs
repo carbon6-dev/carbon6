@@ -28,8 +28,9 @@ const READABLE: [&str; 6] = [
 ];
 /// What the records were made by: a conversation from an earlier one is
 /// read again whole (2: the names of people from other organizations, and
-/// every thread's replies).
-const REV: i64 = 2;
+/// every thread's replies; 3: which messages are yours, and which mention
+/// you).
+const REV: i64 = 3;
 /// Messages that say nothing (joins, leaves, topic changes).
 const NOISE: [&str; 6] = ["channel_join", "channel_leave", "group_join", "group_leave", "channel_purpose", "channel_topic"];
 
@@ -162,6 +163,11 @@ pub fn item(a: &Account, team: &Value, c: &Conversation, m: &Value) -> Option<(V
         "service": "slack", "workspace": a.team, "workspace_name": team["name"].as_str().unwrap_or(&a.name),
         "channel": c.id, "channel_name": c.name, "channel_kind": c.kind, "ts": ts, "user": user, "user_name": who,
     });
+    // Yours, or mentioning you (for sorting what needs you, docs/brief.md).
+    if let Some(me) = team["me"].as_str().filter(|m| !m.is_empty()) {
+        meta["from_me"] = json!(m["user"].as_str() == Some(me));
+        meta["mentions_me"] = json!(mentions.iter().any(|u| u == me));
+    }
     if let Some(t) = thread_ts {
         meta["thread_ts"] = json!(t);
     } else if m["reply_count"].as_u64().unwrap_or(0) > 0 {
@@ -243,7 +249,10 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
     team["retry_after"] = Value::Null;
     team["error"] = Value::Null;
     // The workspace and its people, once a day.
-    if team["domain"].is_null() || team["users_at"].as_i64().unwrap_or(0) < now_ms() - DAY {
+    if team["domain"].is_null() || team["me"].is_null() || team["users_at"].as_i64().unwrap_or(0) < now_ms() - DAY {
+        // Who you are here, so your messages and mentions of you are known.
+        let me = r.call(a, "auth.test", &[], None).await?;
+        team["me"] = me["user_id"].clone();
         let info = r.call(a, "team.info", &[], None).await?;
         team["domain"] = info["team"]["domain"].clone();
         team["name"] = info["team"]["name"].clone();

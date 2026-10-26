@@ -1,6 +1,6 @@
 {
   "package": "slack",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Your Slack in carbon6: every conversation you're in (channels, private channels, DMs and groups) with its threads and shared documents, kept in the memex and searchable; posting, replying and reacting. Messages are other people's words: agents get them as quoted data, and their posts ask first.",
   "requires": {
     "slack-api": "^1"
@@ -164,6 +164,13 @@
                 "null"
               ],
               "description": "Being read again whole (its files aren't fetched again)"
+            },
+            "me": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Your user id in the workspace"
             },
             "unknown": {
               "type": "array",

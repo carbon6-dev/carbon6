@@ -115,6 +115,8 @@ fn default_kinds() -> Vec<Value> {
                     "reactions": {"type": "object", "description": "Reaction name to count"},
                     "files": {"type": "array", "description": "Files shared with it: name, mime, size, id"},
                     "edited": {"type": "boolean"}, "deleted": {"type": "boolean", "description": "Gone from the service; kept here"},
+                    "from_me": {"type": "boolean", "description": "Posted by you"},
+                    "mentions_me": {"type": "boolean", "description": "It mentions you"},
                 }),
                 &["workspace", "channel", "ts"],
             ),
