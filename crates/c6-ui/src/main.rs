@@ -129,6 +129,7 @@ fn Main() -> impl IntoView {
                             <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
                             <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
                             <span class="hidden xl:contents"><NavLink to=View::Workers label="Workers" /></span>
+                            <span class="hidden xl:contents"><AppsMenu /></span>
                             <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                         </nav>
                         <span class="flex-1"></span>
@@ -157,13 +158,10 @@ fn Main() -> impl IntoView {
     .into_any()
 }
 
-/// Phones and narrower windows: the nav, views and search in a menu.
-#[component]
-fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
-    let menu = NodeRef::<leptos::html::Details>::new();
-    // Mail, Calendar and Contacts are apps: shown where one is installed.
-    // A realm's mail, calendar and contacts (the console has none).
-    let feeds = LocalResource::new(move || {
+/// Mail, Chat, Calendar and Contacts are apps: what an app feeds in this
+/// realm, or it holds (the console has none).
+fn feeds() -> LocalResource<Result<serde_json::Value, String>> {
+    LocalResource::new(move || {
         api::realm().track();
         async move {
             if place::is_console() {
@@ -171,7 +169,43 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
             }
             api::rpc("memex.feeds", serde_json::json!({})).await
         }
-    });
+    })
+}
+
+/// Wide windows, where there's no ☰: the realm's mail, chat, calendar,
+/// contacts, photos and memex.
+#[component]
+fn AppsMenu() -> impl IntoView {
+    let feeds = feeds();
+    let menu = NodeRef::<leptos::html::Details>::new();
+    let close = move |_| {
+        if let Some(d) = menu.get_untracked() {
+            d.set_open(false);
+        }
+    };
+    let item = "rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800";
+    view! {
+        <details node_ref=menu class="relative shrink-0">
+            <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps ▾"</summary>
+            <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+                {move || feeds.get().and_then(Result::ok).map(|f| view! {
+                    {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item>"Mail"</Go> })}
+                    {(f["chat"] == true).then(|| view! { <Go to=View::Chat class=item>"Chat"</Go> })}
+                    {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=item>"Calendar"</Go> })}
+                    {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=item>"Contacts"</Go> })}
+                })}
+                <Go to=View::Photos class=item>"Photos"</Go>
+                <Go to=View::Memex class=item>"Memex"</Go>
+            </div>
+        </details>
+    }
+}
+
+/// Phones and narrower windows: the nav, views and search in a menu.
+#[component]
+fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
+    let menu = NodeRef::<leptos::html::Details>::new();
+    let feeds = feeds();
     // Close after choosing something.
     let close = move |_| {
         if let Some(d) = menu.get_untracked() {
