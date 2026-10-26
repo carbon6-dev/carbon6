@@ -318,70 +318,85 @@ pub async fn threads(
     };
     let sql = format!(
         "SELECT m.account AS account, m.thread_id AS thread_id, MAX(m.date) AS date, COUNT(*) AS n, MAX(m.unread) AS unread, MAX(m.starred) AS starred, \
-         MAX(m.attachments) AS attachments FROM mail m WHERE {cond} AND (?1 IS NULL OR m.account = ?1) AND (?2 IS NULL OR m.date < ?2) \
+         MAX(m.attachments) AS attachments FROM mail m WHERE {cond} AND (?1 IS NULL OR m.account = ?1) \
          AND (?4 IS NULL OR m.item_id IN (SELECT item_id FROM mail_labels WHERE label = ?4)) \
-         GROUP BY m.account, m.thread_id ORDER BY date DESC LIMIT ?3"
+         GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) ORDER BY date DESC LIMIT ?3"
     );
     // Over-fetch for the views that look at each thread's latest message.
     let fetch = if matches!(view, "needs_reply" | "waiting") { limit * 5 } else { limit };
-    let rows =
-        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(account).bind(before).bind(fetch as i64).bind(label).fetch_all(&m.store.pool).await?;
     let mut out = Vec::new();
-    for r in rows {
-        let (acct, thread): (String, String) = (r.get("account"), r.get("thread_id"));
-        let msgs = sqlx::query("SELECT * FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
-            .bind(&acct)
-            .bind(&thread)
+    // Pages go by a thread's latest date (`before`, the last one shown);
+    // the filtered views read on until they fill one, or there's no more.
+    let mut cursor = before;
+    'pages: loop {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(account)
+            .bind(cursor)
+            .bind(fetch as i64)
+            .bind(&label)
             .fetch_all(&m.store.pool)
             .await?;
-        let Some(last) = msgs.last() else { continue };
-        let last_from: String = last.get("from_addr");
-        let mine = me.contains(&last_from);
-        let date: i64 = r.get("date");
-        let keep = match view {
-            "needs_reply" => {
-                let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
-                !mine && date > month && to.iter().any(|(a, _)| me.contains(a))
-            }
-            // Yours, unanswered: sent to someone else.
-            "waiting" => {
-                let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
-                mine && date < now - 2 * 86_400_000 && date > month && to.iter().any(|(a, _)| !me.contains(a))
-            }
-            _ => true,
-        };
-        if !keep {
-            continue;
-        }
-        let mut people: Vec<String> = Vec::new();
-        for x in &msgs {
-            let n: String = x.get("from_name");
-            let a: String = x.get("from_addr");
-            let label = if me.contains(&a) {
-                "me".to_owned()
-            } else if n.is_empty() {
-                a
-            } else {
-                n
+        let more = rows.len() as u32 == fetch && fetch > limit;
+        for r in rows {
+            cursor = Some(r.get("date"));
+            let (acct, thread): (String, String) = (r.get("account"), r.get("thread_id"));
+            let msgs = sqlx::query("SELECT * FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
+                .bind(&acct)
+                .bind(&thread)
+                .fetch_all(&m.store.pool)
+                .await?;
+            let Some(last) = msgs.last() else { continue };
+            let last_from: String = last.get("from_addr");
+            let mine = me.contains(&last_from);
+            let date: i64 = r.get("date");
+            let keep = match view {
+                "needs_reply" => {
+                    let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
+                    !mine && date > month && to.iter().any(|(a, _)| me.contains(a))
+                }
+                // Yours, unanswered: sent to someone else.
+                "waiting" => {
+                    let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
+                    mine && date < now - 2 * 86_400_000 && date > month && to.iter().any(|(a, _)| !me.contains(a))
+                }
+                _ => true,
             };
-            if !people.contains(&label) {
-                people.push(label);
+            if !keep {
+                continue;
+            }
+            let mut people: Vec<String> = Vec::new();
+            for x in &msgs {
+                let n: String = x.get("from_name");
+                let a: String = x.get("from_addr");
+                let label = if me.contains(&a) {
+                    "me".to_owned()
+                } else if n.is_empty() {
+                    a
+                } else {
+                    n
+                };
+                if !people.contains(&label) {
+                    people.push(label);
+                }
+            }
+            out.push(api::MailThread {
+                account: acct,
+                thread_id: thread,
+                subject: last.get::<String, _>("subject"),
+                snippet: last.get("snippet"),
+                date,
+                count: r.get::<i64, _>("n") as u32,
+                unread: r.get::<i64, _>("unread") != 0,
+                starred: r.get::<i64, _>("starred") != 0,
+                attachments: r.get::<i64, _>("attachments") != 0,
+                people,
+                labels: serde_json::from_str(&last.get::<String, _>("labels")).unwrap_or_default(),
+            });
+            if out.len() as u32 >= limit {
+                break 'pages;
             }
         }
-        out.push(api::MailThread {
-            account: acct,
-            thread_id: thread,
-            subject: last.get::<String, _>("subject"),
-            snippet: last.get("snippet"),
-            date,
-            count: r.get::<i64, _>("n") as u32,
-            unread: r.get::<i64, _>("unread") != 0,
-            starred: r.get::<i64, _>("starred") != 0,
-            attachments: r.get::<i64, _>("attachments") != 0,
-            people,
-            labels: serde_json::from_str(&last.get::<String, _>("labels")).unwrap_or_default(),
-        });
-        if out.len() as u32 >= limit {
+        if !more {
             break;
         }
     }

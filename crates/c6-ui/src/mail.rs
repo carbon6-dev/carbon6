@@ -22,6 +22,25 @@ const VIEWS: [(&str, &str); 9] = [
     ("trash", "Trash"),
 ];
 
+/// Threads a page.
+const PAGE: u32 = 50;
+
+/// Calls `f` whenever `el` comes within a screen of being seen.
+fn when_near(el: &web_sys::Element, f: impl Fn() + 'static) -> web_sys::IntersectionObserver {
+    use wasm_bindgen::JsCast;
+    let cb = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |entries: js_sys::Array| {
+        if entries.iter().any(|e| e.unchecked_into::<web_sys::IntersectionObserverEntry>().is_intersecting()) {
+            f();
+        }
+    });
+    let opts = web_sys::IntersectionObserverInit::new();
+    opts.set_root_margin("600px");
+    let o = web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &opts).expect("an observer");
+    cb.forget();
+    o.observe(el);
+    o
+}
+
 pub(crate) fn when(ms: i64) -> String {
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
     let today = js_sys::Date::new_0();
@@ -47,9 +66,55 @@ struct Draft {
 pub fn MailPage() -> impl IntoView {
     let view = RwSignal::new("inbox".to_owned());
     let refresh = RwSignal::new(0u32);
-    let threads = LocalResource::new(move || {
-        let (v, _) = (view.get(), refresh.get());
-        async move { api::rpc_as::<Vec<MailThread>>("memex.mail.threads", json!({"view": v, "limit": 60})).await }
+    // The view's threads so far, a page at a time as you scroll (by the
+    // last one's date); a new view or a refresh starts again.
+    let threads = RwSignal::new(None::<Result<Vec<MailThread>, String>>);
+    let (busy, done, era) = (RwSignal::new(false), RwSignal::new(false), StoredValue::new(0u32));
+    let more = move || {
+        if busy.get_untracked() || done.get_untracked() {
+            return;
+        }
+        let before = threads.with_untracked(|t| t.as_ref().and_then(|r| r.as_ref().ok()).and_then(|v| v.last()).map(|t| t.date));
+        let (mine, v) = (era.get_value(), view.get_untracked());
+        busy.set(true);
+        spawn_local(async move {
+            let r = api::rpc_as::<Vec<MailThread>>("memex.mail.threads", json!({"view": v, "limit": PAGE, "before": before})).await;
+            if era.get_value() != mine {
+                return;
+            }
+            busy.set(false);
+            match r {
+                Ok(page) => {
+                    done.set((page.len() as u32) < PAGE);
+                    threads.update(|t| match t {
+                        Some(Ok(v)) => v.extend(page),
+                        _ => *t = Some(Ok(page)),
+                    });
+                }
+                Err(e) => {
+                    done.set(true);
+                    if before.is_none() {
+                        threads.set(Some(Err(e)));
+                    }
+                }
+            }
+        });
+    };
+    Effect::new(move || {
+        view.track();
+        refresh.track();
+        era.update_value(|e| *e += 1);
+        busy.set(false);
+        done.set(false);
+        threads.set(None);
+        more();
+    });
+    let end = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        if let Some(el) = end.get() {
+            let o = when_near(&el, more);
+            on_cleanup(move || o.disconnect());
+        }
     });
     let labels = LocalResource::new(|| api::rpc_as::<Vec<(String, String, String)>>("memex.mail.labels", json!({})));
     let open = RwSignal::new(None::<(String, String)>);
@@ -89,8 +154,10 @@ pub fn MailPage() -> impl IntoView {
                 {move || match open.get() {
                     Some((account, thread)) => view! { <Thread account thread open compose refresh /> }.into_any(),
                     None => view! {
-                        <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
-                            {move || threads.get().map(|r| match r {
+                        <div>
+                            {move || match threads.get() {
+                                None => Some(view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any()),
+                                Some(r) => Some(match r {
                                 Err(e) => view! { <MailError e /> }.into_any(),
                                 Ok(v) if v.is_empty() => view! { <p class="p-4 text-center text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
                                 Ok(v) => view! {
@@ -112,9 +179,13 @@ pub fn MailPage() -> impl IntoView {
                                             }
                                         }).collect_view()}
                                     </div>
+                                    <div node_ref=end class="p-3 text-center text-xs text-zinc-500">
+                                        {move || if busy.get() { "Loading more…" } else if done.get() { "That's all." } else { "" }}
+                                    </div>
                                 }.into_any(),
-                            })}
-                        </Suspense>
+                            }),
+                            }}
+                        </div>
                     }.into_any(),
                 }}
             </section>

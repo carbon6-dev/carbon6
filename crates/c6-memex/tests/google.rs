@@ -367,6 +367,19 @@ async fn google_mail_calendar_contacts() {
     assert_eq!(subjects, ["Lunch on Friday?", "Re: Proposal"], "not the list mail");
     let waiting = rpc("memex.mail.threads", json!({"view": "waiting"})).await;
     assert_eq!(waiting[0]["subject"], "Follow-up", "{waiting}");
+    // A page at a time, by the last one's date: each thread once, all of
+    // them (t3's older message doesn't bring it back).
+    for (view, all) in [("inbox", &inbox), ("needs_reply", &needs)] {
+        let (mut seen, mut before) = (Vec::new(), Value::Null);
+        loop {
+            let page = rpc("memex.mail.threads", json!({"view": view, "limit": 1, "before": before})).await;
+            let Some(t) = page.as_array().unwrap().first() else { break };
+            seen.push(t["thread_id"].clone());
+            before = t["date"].clone();
+        }
+        let ids: Vec<Value> = all.as_array().unwrap().iter().map(|t| t["thread_id"].clone()).collect();
+        assert_eq!(seen, ids, "{view}");
+    }
     let thread = rpc("memex.mail.thread", json!({"account": "me@example.com", "thread_id": "t3"})).await;
     assert_eq!(thread.as_array().unwrap().len(), 2);
     assert!(thread[1]["text"].as_str().unwrap().contains("will read"));
