@@ -4159,6 +4159,48 @@ pub struct MailThread {
     pub triage: Option<Triage>,
 }
 
+/// What someone needs from you (docs/brief.md §5), from one or more
+/// conversations.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Request {
+    pub id: i64,
+    /// Who asks: an address, or a chat user's id when there's none.
+    pub person: String,
+    pub person_name: String,
+    /// What they need, one line.
+    pub title: String,
+    pub due: Option<UnixMs>,
+    /// needs_you or first_contact.
+    pub category: String,
+    /// open, snoozed, done or dropped.
+    pub status: String,
+    /// Snoozed: when it comes back.
+    pub until: Option<UnixMs>,
+    pub reason: String,
+    /// What closed it: you, replied, settled, pitch.
+    pub closed_by: Option<String>,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+    /// The conversations it came from, oldest first.
+    pub sources: Vec<RequestSource>,
+    /// Requests that may be the same ask (merge them, or not).
+    #[serde(default)]
+    pub maybe_same: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RequestSource {
+    /// A triage target: thread:<account>:<thread>, or chat:<workspace>:<channel>[:<thread ts>].
+    pub target: String,
+    /// mail or chat.
+    pub kind: String,
+    pub at: UnixMs,
+    /// Its subject, or the conversation's name.
+    pub title: String,
+}
+
 /// A mail thread or chat conversation as sorted for the brief
 /// (docs/brief.md §3): its category and why.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

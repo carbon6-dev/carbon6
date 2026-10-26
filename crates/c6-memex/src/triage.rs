@@ -150,17 +150,49 @@ fn chat_key(meta: &Value) -> Option<String> {
     })
 }
 
-/// How a conversation was sorted.
+/// How a conversation was sorted (and, when it needs you, what's asked).
 struct Sorted {
     category: String,
     reason: String,
     by: &'static str,
+    asks: String,
+    due: Option<i64>,
 }
 
 impl Sorted {
     fn new(category: &str, reason: &str, by: &'static str) -> Self {
-        Self { category: category.into(), reason: reason.into(), by }
+        Self { category: category.into(), reason: reason.into(), by, asks: String::new(), due: None }
     }
+}
+
+/// Keeps how it was sorted, and its request (docs/brief.md §5).
+#[allow(clippy::too_many_arguments)]
+async fn settle(
+    m: &Memex,
+    key: &str,
+    kind: &str,
+    s: &Sorted,
+    sender: &str,
+    sender_name: &str,
+    title: &str,
+    at: i64,
+    task: Option<&crate::llm::Task>,
+) -> anyhow::Result<bool> {
+    put(m, key, kind, s, sender, sender_name, title, at).await?;
+    let f = crate::requests::Found {
+        target: key,
+        kind,
+        category: &s.category,
+        reason: &s.reason,
+        asks: &s.asks,
+        due: s.due,
+        person: sender,
+        person_name: sender_name,
+        title,
+        at,
+    };
+    crate::requests::follow(m, &f, task).await?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -289,13 +321,24 @@ async fn ask(m: &Memex, task: &crate::llm::Task, prompt: &str, kind: &str, text:
     let v = llm::json_of(&answer)?;
     let category = v["category"].as_str().unwrap_or("").trim().to_lowercase();
     let category = if allowed.contains(&category.as_str()) { category } else { "fyi".to_owned() };
-    Ok(Sorted { category, reason: clip(v["reason"].as_str().unwrap_or("").trim(), 140), by: "model" })
+    let due = v["due"]
+        .as_str()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .and_then(|d| d.and_hms_opt(17, 0, 0))
+        .map(|d| d.and_utc().timestamp_millis());
+    Ok(Sorted {
+        category,
+        reason: clip(v["reason"].as_str().unwrap_or("").trim(), 140),
+        by: "model",
+        asks: v["asks"].as_str().unwrap_or("").trim().to_owned(),
+        due,
+    })
 }
 
 /// A mail thread. Whether it was sorted (false: it needs a model there
 /// isn't, or isn't budget for, now).
 async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::Result<bool> {
-    let (account, thread) = key.strip_prefix("thread:").and_then(|k| k.split_once(':')).ok_or_else(|| anyhow::anyhow!("not a thread"))?;
+    let (account, thread) = key.strip_prefix("thread:").and_then(|k| k.rsplit_once(':')).ok_or_else(|| anyhow::anyhow!("not a thread"))?;
     let rows = sqlx::query(
         "SELECT m.from_addr, m.from_name, m.subject, m.date, m.sent, m.list, m.text_blob, m.html_blob, i.body FROM mail m \
          JOIN items i ON i.id = m.item_id WHERE m.account = ? AND m.thread_id = ? AND m.draft = 0 AND m.trash = 0 ORDER BY m.date",
@@ -311,12 +354,11 @@ async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     let at: i64 = last.get("date");
     let subject: String = last.get("subject");
     if is_mine(last) {
-        put(m, key, "mail", &Sorted::new("yours", "You wrote last", "rule"), "", "", &subject, at).await?;
-        return Ok(true);
+        return settle(m, key, "mail", &Sorted::new("yours", "You wrote last", "rule"), "", "", &subject, at, task).await;
     }
     let (sender, sender_name): (String, String) = (last.get::<String, _>("from_addr").to_lowercase(), last.get("from_name"));
     let (who, name, title) = (sender.as_str(), sender_name.as_str(), subject.as_str());
-    let done = move |s: Sorted| async move { put(m, key, "mail", &s, who, name, title, at).await.map(|_| true) };
+    let done = move |s: Sorted| async move { settle(m, key, "mail", &s, who, name, title, at, task).await };
     if last.get::<i64, _>("list") == 1 {
         let automated = ["noreply", "no-reply", "notification", "alert", "mailer-daemon", "donotreply", "do-not-reply"];
         return if automated.iter().any(|a| sender.contains(a)) {
@@ -410,11 +452,11 @@ async fn chat(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     let at: i64 = last.get("created_at");
     let name = lm["channel_name"].as_str().unwrap_or_default().to_owned();
     if lm["from_me"] == true {
-        put(m, key, "chat", &Sorted::new("yours", "You wrote last", "rule"), "", "", &name, at).await?;
-        return Ok(true);
+        return settle(m, key, "chat", &Sorted::new("yours", "You wrote last", "rule"), "", "", &name, at, task).await;
     }
-    let (sender, sender_name) =
-        (lm["user"].as_str().unwrap_or_default().to_owned(), lm["user_name"].as_str().unwrap_or_default().to_owned());
+    // Who, as mail knows them when Slack says their address.
+    let sender = lm["user_email"].as_str().or(lm["user"].as_str()).unwrap_or_default().to_owned();
+    let sender_name = lm["user_name"].as_str().unwrap_or_default().to_owned();
     let Some(task) = task else { return Ok(false) };
     let mut text = format!("Slack conversation {name} ({})\n", lm["channel_kind"].as_str().unwrap_or(""));
     for r in rows.iter().rev() {
@@ -434,8 +476,7 @@ async fn chat(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     let prompt = m.prompt("memex.triage", api::prompts::TRIAGE);
     let allowed = ["needs_you", "fyi", "notification", "noise"];
     let s = ask(m, task, &prompt, "chat", &clip(&text, MAX_INPUT), &allowed).await?;
-    put(m, key, "chat", &s, &sender, &sender_name, &name, at).await?;
-    Ok(true)
+    settle(m, key, "chat", &s, &sender, &sender_name, &name, at, Some(task)).await
 }
 
 /// Sorted conversations, newest first: of a category, or all.
@@ -514,7 +555,9 @@ pub async fn set(m: &Memex, target: &str, category: &str, note: &str) -> anyhow:
         .execute(&m.store.pool)
         .await?;
     example(m, &t, category, note).await?;
-    get(m, target).await
+    let t = get(m, target).await?;
+    crate::requests::sorted_by_you(m, &t).await?;
+    Ok(t)
 }
 
 /// You mark a conversation's sender (or their whole domain): a pitch, so
@@ -535,6 +578,11 @@ pub async fn mark(m: &Memex, target: &str, mark: &str, whole_domain: bool) -> an
     let like = if whole_domain { format!("%{pattern}") } else { pattern.clone() };
     if mark == "pitch" {
         sqlx::query("UPDATE triage SET category = 'pitch', by = 'mark', reason = 'A sender you marked as a pitch' WHERE kind = 'mail' AND sender LIKE ?")
+            .bind(&like)
+            .execute(&m.store.pool)
+            .await?;
+        sqlx::query("UPDATE requests SET status = 'dropped', closed_by = 'pitch', updated_at = ? WHERE person LIKE ? AND status IN ('open', 'snoozed')")
+            .bind(c6_core::now_ms())
             .bind(&like)
             .execute(&m.store.pool)
             .await?;

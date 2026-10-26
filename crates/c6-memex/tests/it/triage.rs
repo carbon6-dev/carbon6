@@ -4,8 +4,10 @@
 //! sorted by the model, strangers by its pitch prompt; lists and your own
 //! last word by rule. Your marks settle a sender, your corrections become
 //! the model's examples, and a realm's memex reads with its own prompts.
+//! What needs you becomes requests: one per ask, joined across mail and
+//! chat for the same person, closed when you answer.
 
-use c6_api::{MailThread, Triage};
+use c6_api::{MailThread, Request, Triage};
 use c6_head::HeadConfig;
 use c6_memex::mail::{Parsed, Stored};
 use c6_testkit::eventually;
@@ -215,11 +217,11 @@ async fn mail_and_chat_sorted_for_the_brief() {
     // Then the model, newest first: Ana (known), Raj's DM, Bo (known by his
     // company), Lee and Pat (strangers: the pitch prompt).
     for r in [
-        json!({"category": "needs_you", "reason": "Ana needs your approval by Thursday"}),
-        json!({"category": "needs_you", "reason": "Raj wants to move your 1:1"}),
-        json!({"category": "fyi", "reason": "The deploy is done"}),
+        json!({"category": "needs_you", "reason": "Ana needs your approval by Thursday", "asks": "Approve the redlines", "due": "2031-01-09"}),
+        json!({"category": "needs_you", "reason": "Raj wants to move your 1:1", "asks": "Move the 1:1 to Wednesday", "due": null}),
+        json!({"category": "fyi", "reason": "The deploy is done", "asks": ""}),
         json!({"category": "pitch", "reason": "Sells SDR outsourcing"}),
-        json!({"category": "first_contact", "reason": "A customer asks for a pilot"}),
+        json!({"category": "first_contact", "reason": "A customer asks for a pilot", "asks": "A pilot for 40 seats"}),
     ] {
         mock.push(Reply::Text(r.to_string()));
     }
@@ -242,6 +244,18 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert!(asked[0].contains("Sort this conversation") && asked[0].contains("approve the redlines"), "{}", asked[0]);
     assert!(asked[3].contains("never corresponded") && asked[3].contains("scale SDRs"), "{}", asked[3]);
     assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
+
+    // What needs you, as requests: the one due soonest first.
+    let open = |status: &'static str| {
+        async move { serde_json::from_value::<Vec<Request>>(rpc("memex.requests.list", json!({"status": status})).await).unwrap() }
+    };
+    let reqs = open("open").await;
+    let titles: Vec<&str> = reqs.iter().map(|r| r.title.as_str()).collect();
+    assert_eq!(titles, ["Approve the redlines", "A pilot for 40 seats", "Move the 1:1 to Wednesday"], "{reqs:?}");
+    assert_eq!((reqs[0].person.as_str(), reqs[0].sources[0].target.as_str()), ("ana@acme.com", "thread:acct:t1"));
+    assert!(reqs[0].due.is_some());
+    assert_eq!((reqs[1].category.as_str(), reqs[2].person.as_str()), ("first_contact", "U2"));
+    let (ana, raj) = (reqs[0].id, reqs[2].id);
 
     // The mail list's views and threads say how they're sorted.
     let pitches: Vec<MailThread> = serde_json::from_value(rpc("memex.mail.threads", json!({"view": "triage:pitch"})).await).unwrap();
@@ -288,6 +302,53 @@ async fn mail_and_chat_sorted_for_the_brief() {
         .await;
     let last = mock.requests().last().unwrap()["messages"].to_string();
     assert!(last.contains("deploys need my sign-off") && last.contains("hotfix"), "{last}");
+    assert!(open("open").await.iter().any(|r| r.person == "bo@acme.com" && r.sources.len() == 1), "sorted by you: a request");
+
+    // Ana asks again on Slack: the same request, now from both.
+    let ana_chat = |id: &str, channel: &str, kind: &str, text: &str, ago: i64| {
+        let mut c = chat(id, channel, kind, text, ago, false);
+        c.meta["user"] = json!("UA");
+        c.meta["user_name"] = json!("Ana");
+        c.meta["user_email"] = json!("ana@acme.com");
+        c
+    };
+    mock.push(Reply::Text(
+        json!({"category": "needs_you", "reason": "Ana is waiting on the redlines", "asks": "Approve the redlines"}).to_string(),
+    ));
+    mock.push(Reply::Text(json!({"same": true, "sure": true}).to_string()));
+    m.store.put(&ana_chat("k3", "D7", "dm", "Did you see my email about the redlines?", HOUR / 4), "test-slack").await.unwrap();
+    budget(9).await;
+    let joined = eventually("joined", async || {
+        let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": ana})).await).ok()?;
+        (r.sources.len() == 2).then_some(r)
+    })
+    .await;
+    assert_eq!(joined.sources[1].target, "chat:T1:D7");
+    // Another ask the model isn't sure about: two requests, marked as
+    // possibly one; you merge them.
+    mock.push(Reply::Text(
+        json!({"category": "needs_you", "reason": "Ana wants a budget review", "asks": "Review the Q4 budget"}).to_string(),
+    ));
+    mock.push(Reply::Text(json!({"same": true, "sure": false}).to_string()));
+    m.store.put(&ana_chat("k4", "G7", "group", "Also, can you review the Q4 budget?", HOUR / 5), "test-slack").await.unwrap();
+    budget(11).await;
+    let maybe = eventually("possibly the same", async || {
+        open("open").await.into_iter().find(|r| r.title == "Review the Q4 budget" && r.maybe_same == [ana])
+    })
+    .await;
+    let merged: Request = serde_json::from_value(rpc("memex.requests.merge", json!({"into": ana, "from": maybe.id})).await).unwrap();
+    assert_eq!(merged.sources.len(), 3);
+    assert!(open("open").await.iter().all(|r| r.id != maybe.id));
+
+    // You answer Ana by mail: her request is done.
+    mail(&m, "a2", "t1", me, "ana@acme.com", "Re: Redlines", "Approved.", None, &["SENT"], HOUR / 6).await;
+    let done = eventually("answered", async || open("done").await.into_iter().find(|r| r.id == ana)).await;
+    assert_eq!(done.closed_by.as_deref(), Some("replied"));
+    // Raj's, snoozed for an hour, is out of the way; one whose time came is back.
+    rpc("memex.requests.set", json!({"id": raj, "status": "snoozed", "until": c6_core::now_ms() + HOUR})).await;
+    assert!(open("open").await.iter().all(|r| r.id != raj));
+    rpc("memex.requests.set", json!({"id": raj, "status": "snoozed", "until": c6_core::now_ms() - 1})).await;
+    assert!(open("open").await.iter().any(|r| r.id == raj));
 
     // A realm's memex reads with its own prompts.
     assert!(http.post(format!("{api}/realms")).json(&json!({"id": "lab"})).send().await.unwrap().status().is_success());

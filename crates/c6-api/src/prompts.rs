@@ -46,7 +46,9 @@ something to sign or pay.\n\
 - notification: automated (receipts, alerts, account and calendar notices, app notifications).\n\
 - noise: nothing of value.\n\
 The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
-JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner}";
+JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner, \"asks\": for needs_you, \
+what they need from the owner in one short line (\"Approve the contract redlines\"), else \"\", \"due\": \"YYYY-MM-DD\" when \
+they need it by a date, else null}";
 
 /// A conversation from someone the owner has never corresponded with:
 /// a cold pitch, or a real first contact. `{{owner}}`, `{{examples}}`.
@@ -56,7 +58,15 @@ services, software, \"quick call?\" asks, follow-ups in a sequence). A real firs
 journalist or colleague writing about something specific to the owner's work) is not a pitch, even when it asks to meet. Naming a \
 company the owner works with doesn't make it real: pitches name-drop. Categories: pitch, first_contact, fyi, newsletter, notification.\n\
 The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
-JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner}";
+JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner, \"asks\": for first_contact, \
+what they want from the owner in one short line, else \"\", \"due\": \"YYYY-MM-DD\" or null}";
+
+/// Whether a new message is the same request as one already open from the
+/// same person (docs/brief.md §5). `{{open}}`, `{{new}}`.
+pub const REQUEST_SAME: &str = "The same person asked the owner for something earlier, and has written again (perhaps elsewhere: \
+mail or chat). Is the new message the same request (a reminder, a follow-up, the same ask in another place) or a different one?\n\n\
+Earlier request: {{open}}\n\nNew: {{new}}\n\n\
+JSON: {\"same\": true or false, \"sure\": true or false}";
 
 /// What marks mail from a sales sequence, for senders the owner doesn't
 /// know: a line is a mark found in its links or text (tracking domains of

@@ -22,6 +22,7 @@ pub mod store;
 
 /// The realm everything in the memex belongs to, so far (docs/os.md §3).
 pub const REALM_HOME: &str = "home";
+pub mod requests;
 pub mod triage;
 pub mod understand;
 
@@ -852,6 +853,10 @@ impl Memex {
                 self.google_method(m, params, &allowed).await
             }
             m if m.starts_with("memex.chat.") => chat::method(self, m, &params, &allowed).await,
+            m if m.starts_with("memex.requests.") => {
+                anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
+                requests::method(self, m, &params).await
+            }
             m if m.starts_with("memex.triage.") => {
                 anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
                 triage::method(self, m, &params).await

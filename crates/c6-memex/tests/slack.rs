@@ -447,6 +447,7 @@ async fn slack_mirrored_into_the_memex() {
     let mine = thread.as_array().unwrap().iter().find(|m| m["text"] == "Me Myself: On it").unwrap();
     assert_eq!((mine["meta"]["from_me"].as_bool(), thread[0]["meta"]["from_me"].as_bool()), (Some(true), Some(false)), "{thread}");
     assert_eq!(thread[0]["meta"]["mentions_me"], false);
+    assert_eq!(thread[0]["meta"]["user_email"], "ana@acme.com", "the person mail knows");
     rpc("memex.chat.react", json!({"workspace": "T1", "channel": "C1", "ts": m_a, "name": ":tada:"})).await;
     assert_eq!(s.lock().unwrap().reactions[0]["name"], "tada");
 

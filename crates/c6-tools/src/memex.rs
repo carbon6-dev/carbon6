@@ -506,6 +506,46 @@ fn chat_lines(v: &Value) -> String {
 }
 
 tool!(
+    Requests,
+    "requests",
+    "Requests",
+    "Lists what people need from the user: one request per ask (what, from whom, by when), each with the mail threads and chat \
+     conversations it came from (thread:<account>:<thread> or chat:<workspace>:<channel>[:<thread ts>]), the soonest due first. \
+     Read a source with mail_thread or chat_thread.",
+    json!({"type": "object", "properties": {
+        "status": {"type": "string", "enum": ["open", "snoozed", "done", "dropped"], "description": "Default: open"}
+    }, "additionalProperties": false}),
+    Concurrency::Shared,
+    |ctx, input| {
+        let params = json!({"status": input["status"].as_str().unwrap_or("open"), "limit": 50});
+        match call(ctx, "memex.requests.list", params).await {
+            Ok(v) => {
+                let lines: Vec<String> = v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|r| {
+                        let due = r["due"].as_i64().map(|d| format!(", due {}", rfc3339(d))).unwrap_or_default();
+                        let from: Vec<&str> = r["sources"].as_array().into_iter().flatten().filter_map(|s| s["target"].as_str()).collect();
+                        format!(
+                            "- #{} {} (from {} <{}>{due}; {}) in {}",
+                            r["id"],
+                            r["title"].as_str().unwrap_or(""),
+                            r["person_name"].as_str().unwrap_or(""),
+                            r["person"].as_str().unwrap_or(""),
+                            r["category"].as_str().unwrap_or(""),
+                            from.join(", ")
+                        )
+                    })
+                    .collect();
+                ToolOutput::ok(if lines.is_empty() { "None.".into() } else { lines.join("\n") })
+            }
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);
+
+tool!(
     ChatMessages,
     "chat_messages",
     "ChatMessages",

@@ -163,6 +163,10 @@ pub fn item(a: &Account, team: &Value, c: &Conversation, m: &Value) -> Option<(V
         "service": "slack", "workspace": a.team, "workspace_name": team["name"].as_str().unwrap_or(&a.name),
         "channel": c.id, "channel_name": c.name, "channel_kind": c.kind, "ts": ts, "user": user, "user_name": who,
     });
+    // Who they are by address (the person mail knows), when Slack says.
+    if let Some(e) = m["user"].as_str().and_then(|u| users.get(u)).and_then(|u| u["e"].as_str()).filter(|e| !e.is_empty()) {
+        meta["user_email"] = json!(e.to_lowercase());
+    }
     // Yours, or mentioning you (for sorting what needs you, docs/brief.md).
     if let Some(me) = team["me"].as_str().filter(|m| !m.is_empty()) {
         meta["from_me"] = json!(m["user"].as_str() == Some(me));

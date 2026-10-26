@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::{HeadState, bad_request};
 
 /// What a session's tools may ask the memex.
-const SESSION_METHODS: [&str; 27] = [
+const SESSION_METHODS: [&str; 28] = [
     "memex.search",
     // Claims (docs/apps.md §9): owned by the session's app, or the realm.
     "memex.claims.add",
@@ -28,6 +28,8 @@ const SESSION_METHODS: [&str; 27] = [
     "memex.trail_append",
     "memex.trail",
     // Mail and calendars: within the session's scope (email, event).
+    // What people need from you (docs/brief.md §5).
+    "memex.requests.list",
     "memex.chat.messages",
     "memex.chat.thread",
     "memex.chat.post",

@@ -116,6 +116,7 @@ fn default_kinds() -> Vec<Value> {
                     "files": {"type": "array", "description": "Files shared with it: name, mime, size, id"},
                     "edited": {"type": "boolean"}, "deleted": {"type": "boolean", "description": "Gone from the service; kept here"},
                     "from_me": {"type": "boolean", "description": "Posted by you"},
+                    "user_email": s("Who posted it, by address (when the service says)"),
                     "mentions_me": {"type": "boolean", "description": "It mentions you"},
                 }),
                 &["workspace", "channel", "ts"],

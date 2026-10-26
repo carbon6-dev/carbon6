@@ -1791,6 +1791,9 @@ pub(crate) async fn build_tools(
         tools.push(Arc::new(c6_tools::memex::MailDraft::new(claude)));
         tools.push(Arc::new(c6_tools::memex::MailSend::new(claude)));
     }
+    if spec.memex_mail || spec.memex_chat {
+        tools.push(Arc::new(c6_tools::memex::Requests::new(claude)));
+    }
     if spec.memex_chat {
         tools.push(Arc::new(c6_tools::memex::ChatMessages::new(claude)));
         tools.push(Arc::new(c6_tools::memex::ChatThread::new(claude)));

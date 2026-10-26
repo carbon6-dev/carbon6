@@ -118,6 +118,11 @@ pub const DEFAULTS: &[Prompt] = &[
         description: "What marks a sales sequence from a stranger, no model needed: tracking domains of sequence tools, and (phrase:) follow-ups in a thread you never answered. One per line.",
         default: text::TRIAGE_SIGNALS,
     },
+    Prompt {
+        name: "memex.requests.same",
+        description: "Whether someone's new message is the same request as one of theirs already open (joined), or another. Placeholders: {{open}}, {{new}}.",
+        default: text::REQUEST_SAME,
+    },
     Prompt { name: "memex.page.system", description: "The system prompt for writing a system's page.", default: text::PAGE_SYSTEM },
     Prompt {
         name: "memex.page",
