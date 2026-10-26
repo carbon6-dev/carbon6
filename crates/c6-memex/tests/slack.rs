@@ -421,18 +421,27 @@ async fn slack_mirrored_into_the_memex() {
         let merged = st.messages.get_mut("C1").unwrap().iter_mut().find(|m| m["text"] == "Merged.").unwrap();
         merged["text"] = json!("Merged to main.");
     }
+    // As an earlier version left it: no `rev`. A sync already under way
+    // may write its own copy back over that (the last write wins), so it's
+    // made again until the conversation has been read again.
     let mut filter = serde_json::Map::new();
     filter.insert("key".into(), json!("chan:T1:C1"));
     let q = c6_api::RecordQuery { filter, limit: Some(1), ..Default::default() };
-    let old = c6_head::collections::query(&head.state, "home", "slack_sync", &q).await.unwrap().records.remove(0);
-    let mut fields = old.fields.clone();
-    fields.as_object_mut().unwrap().remove("rev");
-    let back = c6_api::RecordIn { fields, version: Some(old.version), links: None, labels: None, derived_from: None };
-    c6_head::collections::put(&head.state, "home", "slack_sync", Some(&old.id), &back, "app:slack test").await.unwrap();
-    assert!(http.post(format!("{api}/slack/sync")).send().await.unwrap().status().is_success());
     eventually("the conversation read again", async || {
         let eng = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C1"})).await;
-        (eng[0]["text"] == "Ana Lima: Merged to main." && setup().await["workspaces"][0]["imported"] == 3).then_some(())
+        if eng[0]["text"] == "Ana Lima: Merged to main." && setup().await["workspaces"][0]["imported"] == 3 {
+            return Some(());
+        }
+        let now = c6_head::collections::query(&head.state, "home", "slack_sync", &q).await.ok()?.records.pop()?;
+        if now.fields["rev"].is_number() && now.fields["redo"] != true {
+            let mut fields = now.fields.clone();
+            fields.as_object_mut()?.remove("rev");
+            let back = c6_api::RecordIn { fields, version: Some(now.version), links: None, labels: None, derived_from: None };
+            // Changed meanwhile: next time round.
+            let _ = c6_head::collections::put(&head.state, "home", "slack_sync", Some(&now.id), &back, "app:slack test").await;
+            http.post(format!("{api}/slack/sync")).send().await.ok()?;
+        }
+        None
     })
     .await;
     assert_eq!(s.lock().unwrap().downloads, downloads, "its file not fetched again");
