@@ -221,14 +221,24 @@ async fn mail_and_chat_sorted_for_the_brief() {
 
     // Then the model, newest first: Ana (known), Raj's DM, Bo (known by his
     // company), Lee and Pat (strangers: the pitch prompt).
-    for r in [
-        json!({"category": "needs_you", "reason": "Ana needs your approval by Thursday", "asks": "Approve the redlines", "due": "2031-01-09"}),
-        json!({"category": "needs_you", "reason": "Raj wants to move your 1:1", "asks": "Move the 1:1 to Wednesday", "due": null}),
-        json!({"category": "fyi", "reason": "The deploy is done", "asks": ""}),
-        json!({"category": "pitch", "reason": "Sells SDR outsourcing"}),
-        json!({"category": "first_contact", "reason": "A customer asks for a pilot", "asks": "A pilot for 40 seats"}),
+    // Each answer for its conversation, whatever order they're asked in.
+    for (about, r) in [
+        (
+            "approve the redlines",
+            json!({"category": "needs_you", "reason": "Ana needs your approval by Thursday", "asks": "Approve the redlines", "due": "2031-01-09"}),
+        ),
+        (
+            "move our 1:1",
+            json!({"category": "needs_you", "reason": "Raj wants to move your 1:1", "asks": "Move the 1:1 to Wednesday", "due": null}),
+        ),
+        ("the deploy is done", json!({"category": "fyi", "reason": "The deploy is done", "asks": ""})),
+        ("scale SDRs", json!({"category": "pitch", "reason": "Sells SDR outsourcing"})),
+        (
+            "pilot for 40 seats",
+            json!({"category": "first_contact", "reason": "A customer asks for a pilot", "asks": "A pilot for 40 seats"}),
+        ),
     ] {
-        mock.push(Reply::Text(r.to_string()));
+        mock.push_about(about, Reply::Text(r.to_string()));
     }
     budget(5).await;
     eventually("the model's sorting", async || (sorted("thread:acct:t6").await?.category == "first_contact").then_some(())).await;
@@ -247,8 +257,9 @@ async fn mail_and_chat_sorted_for_the_brief() {
     let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
     assert_eq!(asked.len(), 5, "rules needed no model");
     assert_eq!(mock.requests()[0]["reasoning_effort"], "none", "sorting doesn't reason by default");
-    assert!(asked[0].contains("Sort this conversation") && asked[0].contains("approve the redlines"), "{}", asked[0]);
-    assert!(asked[3].contains("never corresponded") && asked[3].contains("scale SDRs"), "{}", asked[3]);
+    let about = |text: &str| asked.iter().find(|a| a.contains(text)).unwrap_or_else(|| panic!("asked about {text}")).clone();
+    assert!(about("approve the redlines").contains("Sort this conversation"));
+    assert!(about("scale SDRs").contains("never corresponded"), "strangers get the pitch prompt");
     assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
     // The brief's numbers: what was read, by kind, and how much by the model.
     let status = rpc("memex.triage.status", json!({})).await;

@@ -33,6 +33,8 @@ struct Step {
     reply: Reply,
     /// If set, the first chunk is sent, then the response waits for this.
     gate: Option<Arc<Notify>>,
+    /// If set, only for a request whose messages contain this.
+    about: Option<String>,
 }
 
 #[derive(Default)]
@@ -67,14 +69,20 @@ impl MockLlm {
     }
 
     pub fn push(&self, reply: Reply) {
-        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None });
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None, about: None });
+    }
+
+    /// Queues a reply for the first request whose messages contain `about`,
+    /// whenever it comes (for callers whose order isn't the test's).
+    pub fn push_about(&self, about: &str, reply: Reply) {
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None, about: Some(about.to_owned()) });
     }
 
     /// Queues a reply that stalls after its first chunk until the returned
     /// handle is notified.
     pub fn push_gated(&self, reply: Reply) -> Arc<Notify> {
         let gate = Arc::new(Notify::new());
-        self.inner.script.lock().unwrap().push_back(Step { reply, gate: Some(gate.clone()) });
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: Some(gate.clone()), about: None });
         gate
     }
 
@@ -116,8 +124,13 @@ async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
 }
 
 async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -> Response {
+    let messages = body["messages"].to_string();
     inner.requests.lock().unwrap().push(body);
-    let step = inner.script.lock().unwrap().pop_front();
+    let step = {
+        let mut script = inner.script.lock().unwrap();
+        let at = script.iter().position(|s| s.about.as_ref().is_none_or(|a| messages.contains(a.as_str())));
+        at.and_then(|i| script.remove(i))
+    };
     let Some(step) = step else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock script exhausted").into_response();
     };
