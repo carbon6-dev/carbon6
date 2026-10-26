@@ -22,15 +22,19 @@ pub struct HostGuard {
 }
 
 impl HostGuard {
-    /// Accepts each listen address, plus each name on each listen port.
+    /// Accepts each listen address and each name, on each listen port or
+    /// without a port: browsers leave out 443, so a head behind a proxy that
+    /// passes TLS through on 443 is named without one. Against DNS rebinding
+    /// only the name matters, never the port.
     pub fn new(listen: &[SocketAddr], names: &[String]) -> Self {
-        let mut allowed = HashSet::new();
+        let mut allowed: HashSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
         for a in listen {
             let host = match a {
                 SocketAddr::V4(v4) => v4.ip().to_string(),
                 SocketAddr::V6(v6) => format!("[{}]", v6.ip()),
             };
             allowed.insert(format!("{host}:{}", a.port()));
+            allowed.insert(host);
             for n in names {
                 allowed.insert(format!("{}:{}", n.to_ascii_lowercase(), a.port()));
             }
@@ -108,5 +112,17 @@ mod tests {
         // ... or opening a WebSocket (a GET with an Origin).
         assert_eq!(status("127.0.0.1:7700", Some("https://evil.example"), "GET", "/x").await, 403);
         assert_eq!(status("127.0.0.1:7700", Some("null"), "GET", "/x").await, 403);
+    }
+
+    #[tokio::test]
+    async fn names_without_a_port() {
+        // Through a proxy that passes TLS through on 443, browsers send no port.
+        assert_eq!(status("head.ts.net", Some("https://head.ts.net"), "POST", "/y").await, 200);
+        assert_eq!(status("100.64.1.2", None, "GET", "/x").await, 200);
+        // Still only the head's own names, and still not from another site.
+        assert_eq!(status("evil.example", None, "GET", "/x").await, 421);
+        assert_eq!(status("head.ts.net", Some("https://evil.example"), "POST", "/y").await, 403);
+        // A port the head doesn't listen on is still refused.
+        assert_eq!(status("head.ts.net:8080", Some("http://head.ts.net:8080"), "GET", "/x").await, 421);
     }
 }
