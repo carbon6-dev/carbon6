@@ -114,6 +114,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::TRIAGE_PITCH,
     },
     Prompt {
+        name: "memex.triage.urgent",
+        description: "What may interrupt you: a request that needs you and fits this is told to you at once (if the realm's Brief setting allows); the rest waits for the next brief.",
+        default: text::TRIAGE_URGENT,
+    },
+    Prompt {
         name: "memex.triage.signals",
         description: "What marks a sales sequence from a stranger, no model needed: tracking domains of sequence tools, and (phrase:) follow-ups in a thread you never answered. One per line.",
         default: text::TRIAGE_SIGNALS,

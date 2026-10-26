@@ -22,6 +22,7 @@ pub mod store;
 
 /// The realm everything in the memex belongs to, so far (docs/os.md §3).
 pub const REALM_HOME: &str = "home";
+pub mod briefs;
 pub mod drafts;
 pub mod requests;
 pub mod triage;
@@ -60,6 +61,8 @@ pub struct Memex {
     folders: Mutex<Vec<api::MemexFolder>>,
     /// The memex's prompts as edited (docs/os.md §4.6), by name.
     prompts: Mutex<std::collections::HashMap<String, String>>,
+    /// When briefs come and what may interrupt (docs/brief.md §2.3).
+    pub(crate) brief_setting: Mutex<api::BriefSetting>,
     /// Wakes the folder scanner (settings changed).
     rescan: tokio::sync::Notify,
     /// The accounts apps connected for mail, calendars and contacts, from
@@ -141,6 +144,7 @@ impl Memex {
             accounts: Mutex::default(),
             contacts_auto: Default::default(),
             prompts: Default::default(),
+            brief_setting: Default::default(),
             tasks: Mutex::default(),
             wake: tokio::sync::Notify::new(),
             reload: tokio::sync::Notify::new(),
@@ -167,6 +171,7 @@ impl Memex {
         }
         self.spawn_mail();
         understand::spawn(self.clone());
+        briefs::spawn(self.clone());
         extract::spawn(self.clone());
         let m = self.clone();
         tokio::spawn(async move {
@@ -212,6 +217,7 @@ impl Memex {
                                 p => p.clone(),
                             };
                             *m.prompts.lock().unwrap() = serde_json::from_value(mine).unwrap_or_default();
+                            *m.brief_setting.lock().unwrap() = serde_json::from_value(c["brief"][&m.realm].clone()).unwrap_or_default();
                             let folders: Vec<api::MemexFolder> =
                                 if home { serde_json::from_value(c["folders"].clone()).unwrap_or_default() } else { Vec::new() };
                             let changed = *m.folders.lock().unwrap() != folders;

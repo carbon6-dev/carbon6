@@ -157,11 +157,12 @@ struct Sorted {
     by: &'static str,
     asks: String,
     due: Option<i64>,
+    urgent: bool,
 }
 
 impl Sorted {
     fn new(category: &str, reason: &str, by: &'static str) -> Self {
-        Self { category: category.into(), reason: reason.into(), by, asks: String::new(), due: None }
+        Self { category: category.into(), reason: reason.into(), by, asks: String::new(), due: None, urgent: false }
     }
 }
 
@@ -190,6 +191,7 @@ async fn settle(
         person_name: sender_name,
         title,
         at,
+        urgent: s.urgent,
     };
     crate::requests::follow(m, &f, task).await?;
     Ok(true)
@@ -314,7 +316,8 @@ async fn examples(m: &Memex, kind: &str) -> anyhow::Result<String> {
 async fn ask(m: &Memex, task: &crate::llm::Task, prompt: &str, kind: &str, text: &str, allowed: &[&str]) -> anyhow::Result<Sorted> {
     let owner: Vec<String> = m.accounts().iter().map(|a| a.email.clone()).collect();
     let owner = if owner.is_empty() { "the owner".to_owned() } else { owner.join(", ") };
-    let ask = api::prompts::fill(prompt, &[("owner", &owner), ("examples", &examples(m, kind).await?)]);
+    let rule = m.prompt("memex.triage.urgent", api::prompts::TRIAGE_URGENT);
+    let ask = api::prompts::fill(prompt, &[("owner", &owner), ("examples", &examples(m, kind).await?), ("urgent", &rule)]);
     let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
     crate::understand::count_call(m).await?;
     let answer = llm::ask(&m.link, task, &system, vec![Block::Text(format!("{ask}\n\n{text}"))], 400).await?;
@@ -332,6 +335,7 @@ async fn ask(m: &Memex, task: &crate::llm::Task, prompt: &str, kind: &str, text:
         by: "model",
         asks: v["asks"].as_str().unwrap_or("").trim().to_owned(),
         due,
+        urgent: v["urgent"] == true,
     })
 }
 

@@ -4190,6 +4190,45 @@ pub struct Request {
     /// The reply drafted for it, if any (docs/brief.md §6).
     #[serde(default)]
     pub draft: Option<RequestDraft>,
+    /// When you were told it's urgent.
+    #[serde(default)]
+    pub notified_at: Option<UnixMs>,
+}
+
+/// When briefs come and what may interrupt you, per realm
+/// (`GET`/`PUT /api/v1/settings/brief`; docs/brief.md §2.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BriefSetting {
+    /// A brief is sent at each of these times ("HH:MM", in your primary
+    /// calendar's time zone).
+    #[serde(default = "brief_times")]
+    pub times: Vec<String>,
+    /// The close of day's note ("HH:MM"); empty: none.
+    #[serde(default = "brief_close")]
+    pub close: String,
+    /// A request the model calls urgent (by the memex.triage.urgent prompt)
+    /// tells you at once.
+    #[serde(default = "brief_urgent")]
+    pub urgent: bool,
+}
+
+fn brief_times() -> Vec<String> {
+    vec!["08:30".into(), "13:30".into()]
+}
+
+fn brief_close() -> String {
+    "17:30".into()
+}
+
+fn brief_urgent() -> bool {
+    true
+}
+
+impl Default for BriefSetting {
+    fn default() -> Self {
+        Self { times: brief_times(), close: brief_close(), urgent: brief_urgent() }
+    }
 }
 
 /// A request's draft reply: where to answer, and what to say, with what

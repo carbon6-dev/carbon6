@@ -150,6 +150,7 @@ async fn announce(st: &HeadState, d: &api::Decision, reference: &str) {
         session_id: (!d.options.is_empty()).then(|| "dc:".to_owned()),
         call_id: (!d.options.is_empty()).then(|| d.id.to_string()),
         labels: Vec::new(),
+        path: None,
     });
 }
 

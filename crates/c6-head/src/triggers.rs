@@ -239,7 +239,7 @@ pub struct EventFilter {
     pub conditions: Vec<(String, String)>,
 }
 
-pub const MEMEX_EVENTS: [&str; 1] = ["mail.received"];
+pub const MEMEX_EVENTS: [&str; 2] = ["mail.received", "request.opened"];
 
 impl EventFilter {
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -548,6 +548,18 @@ fn event_text(event: &Value) -> String {
                 d["item_id"].as_str().unwrap_or(""),
                 d["thread_id"].as_str().unwrap_or(""),
                 d["account"].as_str().unwrap_or("")
+            )
+        }
+        Some("memex") if event["event"] == "request.opened" => {
+            let d = &event["data"];
+            format!(
+                "{} needs something from you: {}\n{}\n\n(request {}; {}; from {})",
+                d["from"].as_str().unwrap_or(""),
+                d["subject"].as_str().unwrap_or(""),
+                d["reason"].as_str().unwrap_or(""),
+                d["request_id"],
+                d["category"].as_str().unwrap_or(""),
+                d["sources"].as_array().into_iter().flatten().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
             )
         }
         Some("schedule") => String::new(),

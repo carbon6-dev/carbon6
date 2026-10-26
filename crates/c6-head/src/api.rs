@@ -75,6 +75,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/triggers/{id}/rotate", post(rotate_automation))
         .route("/api/v1/webhooks/{id}/{token}", post(call_webhook))
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
+        .route("/api/v1/settings/brief", get(get_brief).put(put_brief))
         .route("/api/v1/settings/subagent-limits", get(get_subagent_limits).put(put_subagent_limits))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
@@ -760,6 +761,7 @@ fn per_realm_key(name: &str) -> ApiResult<&'static str> {
         "web-search" => Ok(crate::sessions::WEB_SEARCH),
         "assistant" => Ok(crate::assistant::SETTING),
         "subagent-limits" => Ok(crate::sessions::SUBAGENT_LIMITS),
+        "brief" => Ok(crate::memex::BRIEF),
         _ => Err(ApiErr(StatusCode::NOT_FOUND, format!("{name:?} is not a setting a realm sets for itself"))),
     }
 }
@@ -1056,6 +1058,28 @@ async fn list_commands(State(st): State<Arc<HeadState>>, Query(q): Query<ForSess
     }));
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(out))
+}
+
+async fn get_brief(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::BriefSetting>> {
+    let raw = st.store.setting(crate::memex::BRIEF).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+async fn put_brief(State(st): State<Arc<HeadState>>, Json(mut s): Json<api::BriefSetting>) -> ApiResult<StatusCode> {
+    let hhmm = |t: &str| chrono::NaiveTime::parse_from_str(t.trim(), "%H:%M").map(|t| t.format("%H:%M").to_string());
+    let mut times = Vec::new();
+    for t in s.times.iter().filter(|t| !t.trim().is_empty()) {
+        times.push(hhmm(t).map_err(|_| ApiErr(StatusCode::BAD_REQUEST, format!("{t:?}: times are HH:MM")))?);
+    }
+    times.sort();
+    times.dedup();
+    s.times = times;
+    if !s.close.trim().is_empty() {
+        s.close = hhmm(&s.close).map_err(|_| ApiErr(StatusCode::BAD_REQUEST, "the close of day is HH:MM".into()))?;
+    }
+    st.store.set_setting(crate::memex::BRIEF, &serde_json::to_string(&s).unwrap_or_default()).await?;
+    crate::memex::reload(&st).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_web_search(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::WebSearchSetting>> {

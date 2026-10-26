@@ -64,6 +64,7 @@ const GROUPS: &[(&str, &[Page])] = &[
             ("memex-scopes", "Memex scopes", "What sessions may see in the memex"),
             ("mail", "Mail and calendar", "Google accounts"),
             ("slack", "Slack", "Workspaces mirrored into the memex"),
+            ("brief", "Brief", "When the brief comes, and what may interrupt you"),
         ],
     ),
     (
@@ -369,6 +370,10 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     }.into_any(),
                     "mail" => (move || { api::realm().track(); view! { <crate::mail::GoogleSettings /> <crate::mail::SenderMarks /> } }).into_any(),
                     "slack" => view! { <crate::chat::SlackSettings /> }.into_any(),
+                    "brief" => view! {
+                        <OwnOrRoot name="brief" />
+                        <BriefSetting />
+                    }.into_any(),
                     "updates" => view! {
                         <UpdatesSetting />
                     }.into_any(),
@@ -3105,6 +3110,64 @@ fn SubagentLimitsSetting() -> impl IntoView {
                         prop:value=move || setting.with(|s| s.max_running.to_string()) on:input=move |ev| setting.update(|s| s.max_running = number(&ev)) />
                 </label>
             </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=save>"Save"</button>
+            </div>
+        </section>
+    }
+}
+
+/// Settings: when the brief comes, the close of day, and whether urgent
+/// requests tell you at once (docs/brief.md §2.3).
+#[component]
+fn BriefSetting() -> impl IntoView {
+    let setting = RwSignal::new(c6_api::BriefSetting::default());
+    let times = RwSignal::new(String::new());
+    let loaded = LocalResource::new(move || api::get_setting("brief"));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            let s: c6_api::BriefSetting = serde_json::from_value(v).unwrap_or_default();
+            times.set(s.times.join(", "));
+            setting.set(s);
+        }
+    });
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let save = move |_| {
+        let mut s = setting.get_untracked();
+        s.times = times.get_untracked().split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect();
+        let v = serde_json::to_value(s).unwrap_or_default();
+        spawn_local(async move {
+            status.set(Some(api::put_setting("brief", v).await.map(|_| "Saved.")));
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"Brief"</h2>
+                <p class="text-sm text-zinc-500">
+                    "The brief (Mail & chat's home) sorts this realm's mail and Slack, and notifies you at these times with what needs you. Times are in your primary calendar's time zone. Urgent requests (by the memex.triage.urgent prompt, under Prompts) can tell you at once. Notifications go to the channels under Notifications."
+                </p>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Brief times (HH:MM, comma-separated)"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="08:30, 13:30"
+                        prop:value=move || times.get() on:input=move |ev| times.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Close of day (HH:MM, empty: none)"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="17:30"
+                        prop:value=move || setting.with(|s| s.close.clone()) on:input=move |ev| setting.update(|s| s.close = event_target_value(&ev)) />
+                </label>
+            </div>
+            <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" prop:checked=move || setting.with(|s| s.urgent) on:change=move |ev| setting.update(|s| s.urgent = event_target_checked(&ev)) />
+                "Tell me at once about urgent requests"
+            </label>
             <div class="flex items-center justify-end gap-3">
                 {move || status.get().map(|r| match r {
                     Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),

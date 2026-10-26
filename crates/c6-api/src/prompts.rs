@@ -48,7 +48,12 @@ something to sign or pay.\n\
 The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
 JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner, \"asks\": for needs_you, \
 what they need from the owner in one short line (\"Approve the contract redlines\"), else \"\", \"due\": \"YYYY-MM-DD\" when \
-they need it by a date, else null}";
+they need it by a date, else null, \"urgent\": true only for needs_you that is urgent by the owner's rule: {{urgent}}}";
+
+/// What may interrupt you (docs/brief.md §2.3): the rule the model applies
+/// when it sorts a conversation that needs you.
+pub const TRIAGE_URGENT: &str = "something due today or overdue, a production outage or security incident, or someone blocked \
+right now until the owner answers";
 
 /// A conversation from someone the owner has never corresponded with:
 /// a cold pitch, or a real first contact. `{{owner}}`, `{{examples}}`.

@@ -39,6 +39,8 @@ pub struct Note {
     pub labels: Vec<String>,
     /// For "approval": the held call.
     pub call_id: Option<String>,
+    /// A page it's about (`/r/<realm>/brief`), linked like a session's.
+    pub path: Option<String>,
 }
 
 /// The queue to the sender task.
@@ -208,7 +210,8 @@ async fn links(st: &HeadState, note: &Note) -> anyhow::Result<Links> {
         .session_id
         .as_ref()
         .filter(|id| !id.starts_with("wf:"))
-        .map(|id| if id.starts_with("dc:") { format!("{base}/decisions") } else { format!("{base}/sessions/{id}") });
+        .map(|id| if id.starts_with("dc:") { format!("{base}/decisions") } else { format!("{base}/sessions/{id}") })
+        .or_else(|| note.path.as_ref().map(|p| format!("{base}{p}")));
     let approve_url = match (&note.session_id, &note.call_id) {
         (Some(s), Some(c)) => Some(format!("{base}/approve/{}", sign(st, s, c, c6_core::now_ms() + LINK_TTL_MS).await?)),
         _ => None,

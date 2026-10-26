@@ -86,6 +86,7 @@ pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::
                 message: s("message"),
                 priority: if s("priority") == "high" { "high" } else { "normal" },
                 labels: vec!["memex".into()],
+                path: params["path"].as_str().filter(|p| p.starts_with('/')).map(str::to_owned),
                 ..Default::default()
             });
             Ok(json!({}))

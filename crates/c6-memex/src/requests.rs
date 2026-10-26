@@ -28,6 +28,8 @@ pub struct Found<'a> {
     pub person_name: &'a str,
     pub title: &'a str,
     pub at: i64,
+    /// Urgent by your rule: you're told at once.
+    pub urgent: bool,
 }
 
 /// Open, or snoozed until a time that has passed.
@@ -66,7 +68,7 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
             .execute(&m.store.pool)
             .await?;
         source(m, *id, f).await?;
-        return Ok(());
+        return urgent(m, *id, f).await;
     }
     // The same person's other open requests: is this one of them?
     let theirs: Vec<(i64, String)> = if f.person.is_empty() {
@@ -98,7 +100,7 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
                         .execute(&m.store.pool)
                         .await?;
                     source(m, *id, f).await?;
-                    return Ok(());
+                    return urgent(m, *id, f).await;
                 }
                 (true, false) => maybe = Some(*id),
                 _ => {}
@@ -122,6 +124,34 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
     if let Some(other) = maybe {
         sqlx::query("INSERT OR IGNORE INTO request_maybe (a, b) VALUES (?, ?)").bind(other).bind(id).execute(&m.store.pool).await?;
     }
+    // For triggers (request.opened).
+    let from = if f.person_name.is_empty() { f.person.to_owned() } else { format!("{} <{}>", f.person_name, f.person) };
+    m.emit(
+        "request.opened",
+        json!({"request_id": id, "from": from, "subject": title, "reason": f.reason, "category": f.category, "due": f.due, "sources": [f.target]}),
+    )
+    .await;
+    urgent(m, id, f).await
+}
+
+/// An urgent request tells you at once (once), if the realm's Brief setting
+/// allows; the rest wait for the brief.
+async fn urgent(m: &Memex, id: i64, f: &Found<'_>) -> anyhow::Result<()> {
+    if !f.urgent || f.category != "needs_you" || !m.brief_setting.lock().unwrap().urgent {
+        return Ok(());
+    }
+    let told = sqlx::query("UPDATE requests SET notified_at = ? WHERE id = ? AND notified_at IS NULL")
+        .bind(c6_core::now_ms())
+        .bind(id)
+        .execute(&m.store.pool)
+        .await?
+        .rows_affected();
+    if told == 0 {
+        return Ok(());
+    }
+    let r = get(m, id).await?;
+    let who = if r.person_name.is_empty() { r.person.clone() } else { r.person_name.clone() };
+    crate::briefs::notify(m, &format!("{who}: {}", r.title), &r.reason, "high").await;
     Ok(())
 }
 
@@ -208,6 +238,7 @@ async fn request(m: &Memex, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<api::
         sources,
         maybe_same: maybe,
         draft: r.get::<Option<String>, _>("draft").and_then(|d| serde_json::from_str(&d).ok()),
+        notified_at: r.get("notified_at"),
     })
 }
 
@@ -278,6 +309,7 @@ pub async fn sorted_by_you(m: &Memex, t: &api::Triage) -> anyhow::Result<()> {
         person_name: &t.sender_name,
         title: &t.title,
         at: t.at,
+        urgent: false,
     };
     follow(m, &f, None).await
 }

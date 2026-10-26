@@ -205,6 +205,24 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 - **API:** `memex.requests.draft` (now), `reply_to` (who and what a reply goes to), `send`; `Request.draft`.
 - **Not yet:** documents the thread names, found in the memex, as context; a cost line in the brief.
 
+### 10.5 Timing (step 5)
+
+- **Settings → Brief** (per realm, else root's; `GET`/`PUT /api/v1/settings/brief`):
+  - brief times, default 08:30 and 13:30;
+  - the close of day, default 17:30;
+  - whether urgent requests tell you at once (on by default).
+
+  Times are in your primary calendar's time zone (UTC without one).
+- **The brief** at each time is a notification with the count of requests that need you (and how many are due by tomorrow), the first five, first contacts, and how much was set aside. It isn't sent when nothing needs you. It links to the realm's Brief page.
+- **The close of day** says how many requests you handled today and what's still yours, saying which have a draft ready.
+- **Late times:** a time more than three hours past (the head was off) is let go. Each is sent once (`brief_sent`, migration 0015).
+- **Urgent:** the triage prompt asks the model whether a request that needs you is urgent by your rule (`memex.triage.urgent`: due today, an outage, someone blocked now). An urgent one notifies you at once with high priority, once (`requests.notified_at`).
+- **Events:** `request.opened` is a memex event for triggers (filtered by `from:`, as `mail.received` is), with the request's id, who, what, why, category, due and conversation. Notifications from the memex can link to a page.
+- **Not yet:**
+  - the FYI five-line summary;
+  - `chat.received` and `commitment.due` events;
+  - snoozing until there's no reply ("H if no reply").
+
 ## 11. Open questions
 
 - **Gmail too?** Should a pitch also be labelled and archived in Gmail (so your phone matches), as a rule you approve once? Default: carbon6 only.

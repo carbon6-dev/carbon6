@@ -382,6 +382,7 @@ async fn drive(st: &HeadState, id: &str) -> anyhow::Result<()> {
                             session_id: Some(format!("wf:{id}")),
                             call_id: Some(def.id.clone()),
                             labels: labels(&run.workflow, id),
+                            path: None,
                         });
                         return Ok(());
                     }

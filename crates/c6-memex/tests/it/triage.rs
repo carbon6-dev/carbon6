@@ -6,7 +6,9 @@
 //! the model's examples, and a realm's memex reads with its own prompts.
 //! What needs you becomes requests: one per ask, joined across mail and
 //! chat for the same person, closed when you answer; each waits with a
-//! draft reply, drafted again when its conversation moves on.
+//! draft reply, drafted again when its conversation moves on. An urgent
+//! one tells you at once and opens as an event for triggers; the brief
+//! comes at its times, and the close of day.
 
 use c6_api::{MailThread, Request, Triage};
 use c6_head::HeadConfig;
@@ -386,6 +388,68 @@ async fn mail_and_chat_sorted_for_the_brief() {
         (r.draft?.text == "Wednesday at 14:00 it is.").then_some(())
     })
     .await;
+
+    // A new request is an event: a trigger keeps a record of Acme's.
+    let r = http
+        .post(format!("{api}/collections"))
+        .json(&json!({"name": "opened", "description": "Requests from Acme", "schema": {"type": "object", "properties": {"who": {"type": "string"}, "what": {"type": "string"}}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let r = http
+        .post(format!("{api}/triggers"))
+        .json(&json!({"name": "acme asks", "trigger": "memex", "cron": "request.opened from:@acme.com", "action": "write",
+                      "action_params": {"collection": "opened", "fields": {"who": "$.data.from", "what": "$.data.subject"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    // Urgent by your rule: you're told at once.
+    mock.push(Reply::Text(
+        json!({"category": "needs_you", "reason": "Checkout is down", "asks": "Approve the rollback", "urgent": true}).to_string(),
+    ));
+    mail(
+        &m,
+        "a9",
+        "t10",
+        ("ana@acme.com", "Ana"),
+        "me@mine.io",
+        "Prod down",
+        "The deploy broke checkout. OK to roll back now?",
+        None,
+        &["INBOX"],
+        HOUR / 20,
+    )
+    .await;
+    budget(15).await;
+    eventually("told at once", async || {
+        open("open").await.into_iter().find(|r| r.title == "Approve the rollback" && r.notified_at.is_some())
+    })
+    .await;
+    assert!(mock.requests().last().unwrap()["messages"].to_string().contains("production outage"), "the rule is in the prompt");
+    let kept = eventually("the trigger's record", async || {
+        let v: Value = http.get(format!("{api}/collections/opened/records")).send().await.ok()?.json().await.ok()?;
+        v["records"].as_array().filter(|r| !r.is_empty()).cloned()
+    })
+    .await;
+    assert_eq!(
+        (kept[0]["fields"]["who"].as_str(), kept[0]["fields"]["what"].as_str()),
+        (Some("Ana <ana@acme.com>"), Some("Approve the rollback"))
+    );
+    // The brief at its time (13:30, with no calendar: UTC), once; the close
+    // of day at 17:30.
+    let on = |hm: &str| {
+        chrono::NaiveDateTime::parse_from_str(&format!("2031-01-08 {hm}"), "%Y-%m-%d %H:%M").unwrap().and_utc().timestamp_millis()
+    };
+    let sent = c6_memex::briefs::due(&m, on("13:31")).await.unwrap();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].0.starts_with("Brief: 3 requests need you"), "{sent:?}");
+    assert!(sent[0].1.contains("Ana: Approve the rollback") && sent[0].1.contains("1 first contact"), "{sent:?}");
+    assert!(c6_memex::briefs::due(&m, on("13:40")).await.unwrap().is_empty(), "once");
+    let close = c6_memex::briefs::due(&m, on("17:31")).await.unwrap();
+    assert_eq!(close[0].0, "Close of day");
+    assert!(close[0].1.contains("Still yours: 3 requests"), "{close:?}");
 
     // A realm's memex reads with its own prompts.
     assert!(http.post(format!("{api}/realms")).json(&json!({"id": "lab"})).send().await.unwrap().status().is_success());

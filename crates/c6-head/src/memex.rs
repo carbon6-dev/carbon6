@@ -86,6 +86,9 @@ pub fn ready(st: &HeadState) -> bool {
     crate::knowledge::get(st).is_some()
 }
 
+/// When briefs come and what may interrupt (per realm; docs/brief.md §2.3).
+pub const BRIEF: &str = "brief";
+
 /// Tells the knowledge store its settings changed.
 pub async fn reload(st: &HeadState) {
     if ready(st) {
@@ -287,6 +290,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "understanding": task(&s.understanding),
         "prompts": crate::prompts::for_memex(st, crate::realms::HOME).await,
         "realm_prompts": crate::prompts::for_memex_realms(st).await,
+        "brief": briefs(st).await,
         "vision": task(&s.vision),
         "transcription": task(&s.transcription),
         "calls_per_day": s.calls_per_day.unwrap_or(500),
@@ -294,6 +298,18 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "face_detector": s.face_detector,
         "face_embedder": s.face_embedder,
     }))
+}
+
+/// Each realm's Brief setting, by realm.
+async fn briefs(st: &HeadState) -> Value {
+    let realms: Vec<String> = sqlx::query_scalar("SELECT id FROM realms").fetch_all(&st.store.pool).await.unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for r in realms.into_iter().filter(|r| r != crate::realms::ROOT) {
+        let s: api::BriefSetting =
+            st.store.setting_for(BRIEF, &r).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+        out.insert(r, json!(s));
+    }
+    Value::Object(out)
 }
 
 /// Each realm's accounts that apps connected for mail, calendars and
