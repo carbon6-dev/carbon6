@@ -268,8 +268,11 @@ async fn understanding_review_graph() {
     assert_eq!((c[0].who.as_str(), c[0].what.as_str(), c[0].due), ("bob@x.com", "Send the Q3 numbers", None));
     let asked = mock.requests().last().unwrap().to_string();
     assert!(asked.contains("Can you send the Q3 numbers?") && asked.contains("by Monday"), "both messages: {asked}");
-    let target: String =
-        sqlx::query_scalar("SELECT target FROM enrich WHERE target LIKE 'thread:%'").fetch_one(&m.store.pool).await.unwrap();
+    // Recorded as read once its findings are in.
+    let target: String = eventually("the thread recorded as read", async || {
+        sqlx::query_scalar("SELECT target FROM enrich WHERE target LIKE 'thread:%'").fetch_optional(&m.store.pool).await.ok()?
+    })
+    .await;
     assert_eq!(target, "thread:a1:t1");
     stop.cancel();
 }

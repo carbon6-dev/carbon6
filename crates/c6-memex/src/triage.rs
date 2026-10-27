@@ -33,9 +33,21 @@ struct Target {
     kind: &'static str,
 }
 
+/// What a sorting step did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sorting {
+    /// Sorted a conversation.
+    Worked,
+    /// Nothing to sort.
+    Idle,
+    /// Conversations wait for a model call it couldn't make (no model, or
+    /// no budget left as it looked): nothing else may take a call first.
+    Waiting,
+}
+
 /// Sorts one more conversation, if there is one to sort and (when it needs
-/// a model) a model and budget. Whether it did.
-pub async fn step(m: &Memex) -> anyhow::Result<bool> {
+/// a model) a model and budget.
+pub async fn step(m: &Memex) -> anyhow::Result<Sorting> {
     // The history each conversation is read with.
     if let Err(e) = crate::relations::refresh(m).await {
         warn!("counting correspondents: {e:#}");
@@ -45,6 +57,7 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         Some((_, per_day)) => crate::understand::budget_left(m, *per_day).await? > 0,
         None => false,
     };
+    let mut waits = false;
     for t in waiting(m).await? {
         // Another step is sorting it.
         let Some(_claim) = m.claim(&format!("sort:{}", t.key)) else { continue };
@@ -53,18 +66,21 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
             _ => chat(m, &t.key, can_ask.then(|| model.as_ref().map(|(task, _)| task)).flatten()).await,
         };
         match done {
-            Ok(true) => return Ok(true),
-            Ok(false) => continue,
+            Ok(true) => return Ok(Sorting::Worked),
+            Ok(false) => {
+                waits |= !can_ask;
+                continue;
+            }
             Err(e) => {
                 warn!(target = %t.key, "triage: {e:#}");
                 // Not again until it has news.
                 let s = Sorted::new("fyi", &clip(&format!("Couldn't be sorted: {e:#}"), 140), "error");
                 put(m, &t.key, t.kind, &s, "", "", "", c6_core::now_ms()).await?;
-                return Ok(true);
+                return Ok(Sorting::Worked);
             }
         }
     }
-    Ok(false)
+    Ok(if waits { Sorting::Waiting } else { Sorting::Idle })
 }
 
 /// Recent conversations with news since they were sorted, newest first.

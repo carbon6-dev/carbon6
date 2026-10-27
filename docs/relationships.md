@@ -170,3 +170,8 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
   - With more, lane 0 only sorts and drafts, so new mail never waits behind the walk. The other lanes do everything.
 - **Claims:** steps side by side never take the same work. Each step claims what it works on (`sort:`, `draft:`, `card:`, `read:`, and `pages`) in memory, and gives it back when done. Reading picks the newest unclaimed thread. A card being written by one step is used as it is by another step's sorting. A thread being read by one step isn't read again on the spot by another.
 - **Budget:** each lane checks the daily budget before its call, so lanes side by side may overshoot it by up to *calls at once* − 1.
+
+### 8.5 Sorting keeps first claim on model calls (2026-10-27)
+
+- **The bug:** when conversations wait to be sorted and sorting can't make a call (no model, or no budget left as it looked), the rest of the reading loop's pass used to go on to drafts, cards and reading. A budget raised in between went to them instead of to the waiting mail.
+- **The fix:** `triage::step` now says Worked, Idle, or **Waiting**. When it says Waiting, nothing else in the pass calls the model, so the next pass sorts first.

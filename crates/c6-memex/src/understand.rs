@@ -108,13 +108,6 @@ async fn done(m: &Memex, target: &str, version: &str, result: anyhow::Result<()>
     if let Some(e) = &error {
         warn!(%target, "understanding: {e}");
     }
-    // Its people's cards have news.
-    if error.is_none()
-        && let Some((account, thread)) = target.strip_prefix("thread:").and_then(|t| t.rsplit_once(':'))
-        && let Err(e) = crate::cards::noted(m, account, thread).await
-    {
-        warn!(%target, "noting for cards: {e:#}");
-    }
     sqlx::query("INSERT OR REPLACE INTO enrich (target, version, done_at, error) VALUES (?, ?, ?, ?)")
         .bind(target)
         .bind(version)
@@ -122,6 +115,13 @@ async fn done(m: &Memex, target: &str, version: &str, result: anyhow::Result<()>
         .bind(&error)
         .execute(&m.store.pool)
         .await?;
+    // Its people's cards have news.
+    if error.is_none()
+        && let Some((account, thread)) = target.strip_prefix("thread:").and_then(|t| t.rsplit_once(':'))
+        && let Err(e) = crate::cards::noted(m, account, thread).await
+    {
+        warn!(%target, "noting for cards: {e:#}");
+    }
     Ok(())
 }
 
@@ -310,24 +310,37 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
         }
         let fast_only = at_once > 1 && lane == 0;
         // Sorting what's new for the brief comes before reading.
-        let worked = m.link.is_connected()
-            && (crate::triage::step(&m).await.unwrap_or_else(|e| {
+        // Sorting what's new for the brief comes before anything else that
+        // calls the model: while conversations wait for a call it couldn't
+        // make, the rest waits too (a budget raised mid-pass goes to them).
+        let sorting = if m.link.is_connected() {
+            crate::triage::step(&m).await.unwrap_or_else(|e| {
                 warn!("triage: {e:#}");
-                false
-            }) || crate::drafts::step(&m).await.unwrap_or_else(|e| {
-                warn!("drafting: {e:#}");
-                false
-            }) || (!fast_only
-                && (crate::cards::step(&m).await.unwrap_or_else(|e| {
-                    warn!("cards: {e:#}");
+                crate::triage::Sorting::Idle
+            })
+        } else {
+            crate::triage::Sorting::Waiting
+        };
+        let worked = match sorting {
+            crate::triage::Sorting::Worked => true,
+            crate::triage::Sorting::Waiting => false,
+            crate::triage::Sorting::Idle => {
+                crate::drafts::step(&m).await.unwrap_or_else(|e| {
+                    warn!("drafting: {e:#}");
                     false
-                }) || step(&m).await.unwrap_or_else(|e| {
-                    warn!("understanding: {e:#}");
-                    false
-                }) || crate::knowledge::page_step(&m).await.unwrap_or_else(|e| {
-                    warn!("system pages: {e:#}");
-                    false
-                }))));
+                }) || (!fast_only
+                    && (crate::cards::step(&m).await.unwrap_or_else(|e| {
+                        warn!("cards: {e:#}");
+                        false
+                    }) || step(&m).await.unwrap_or_else(|e| {
+                        warn!("understanding: {e:#}");
+                        false
+                    }) || crate::knowledge::page_step(&m).await.unwrap_or_else(|e| {
+                        warn!("system pages: {e:#}");
+                        false
+                    })))
+            }
+        };
         if worked {
             done += 1;
             if done.is_multiple_of(100) {
