@@ -1,9 +1,9 @@
 {
   "package": "google-contacts",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Your Google contacts in carbon6: each contact a person in your knowledge, with all of their addresses; people you add are written back, in a group named carbon6.",
   "requires": {
-    "google": "^1"
+    "google": "^1.1"
   },
   "feeds": [
     "contacts"
@@ -119,12 +119,11 @@
   "operations": [
     {
       "name": "create",
-      "description": "Adds a contact, in the carbon6 group.",
+      "description": "Adds a contact (name, email), or several at once (people), in the carbon6 group.",
       "input": {
         "type": "object",
         "required": [
-          "account",
-          "email"
+          "account"
         ],
         "properties": {
           "account": {
@@ -135,6 +134,23 @@
           },
           "email": {
             "type": "string"
+          },
+          "people": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "email"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },

@@ -120,10 +120,42 @@ pub async fn candidates(m: &Memex) -> anyhow::Result<Vec<api::ContactCandidate>>
 /// Adds a contact through the contacts app that owns the account; it is
 /// kept as it comes back.
 pub async fn create(m: &Memex, account: &str, name: &str, email: &str, by: &str) -> anyhow::Result<api::Contact> {
-    let a = m.account("contacts", account)?;
-    m.app_call(&a, "create", json!({"account": a.id, "name": name, "email": email}), by).await?;
-    info!(%email, "contact added");
+    create_many(m, account, &[(name.to_owned(), email.to_owned())], by).await?;
     Ok(list(m, email).await?.into_iter().next().unwrap_or_default())
+}
+
+/// Adds people (name, address) to your contacts, in one run of the app's
+/// tool; those already contacts are left out (a second click adds no
+/// one twice). The addresses added.
+pub async fn create_many(m: &Memex, account: &str, people: &[(String, String)], by: &str) -> anyhow::Result<Vec<String>> {
+    let a = m.account("contacts", account)?;
+    let mut new: Vec<(String, String)> = Vec::new();
+    for (name, email) in people {
+        let email = email.trim().to_lowercase();
+        if email.contains('@')
+            && !new.iter().any(|(_, e)| *e == email)
+            && list(m, &email).await?.iter().all(|c| !c.emails.iter().any(|e| e.eq_ignore_ascii_case(&email)))
+        {
+            new.push((name.trim().to_owned(), email));
+        }
+    }
+    if new.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list: Vec<Value> = new.iter().map(|(n, e)| json!({"name": n, "email": e})).collect();
+    match m.app_call(&a, "create", json!({"account": a.id, "people": list}), by).await {
+        Ok(_) => {}
+        // An app from before lists: one at a time.
+        Err(e) if new.len() > 1 || format!("{e:#}").contains("email") => {
+            tracing::warn!("adding contacts at once: {e:#}; one at a time");
+            for (name, email) in &new {
+                m.app_call(&a, "create", json!({"account": a.id, "name": name, "email": email}), by).await?;
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    info!(n = new.len(), "contacts added");
+    Ok(new.into_iter().map(|(_, e)| e).collect())
 }
 
 /// Your rule (Settings → Memex: people you have written to twice and

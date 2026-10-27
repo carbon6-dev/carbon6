@@ -163,8 +163,12 @@ async fn google(g: Mock) -> String {
             Json(json!({"name": name, "resourceName": format!("contactGroups/{name}")}))
         }))
         .route("/v1/people:createContact", post(|State(g): State<Mock>, Json(b): Json<Value>| async move {
-            g.lock().unwrap().contacts_created.push(b.clone());
-            Json(json!({"resourceName": "people/c2", "names": [{"displayName": b["names"][0]["unstructuredName"]}], "emailAddresses": b["emailAddresses"], "memberships": b["memberships"]}))
+            let n = {
+                let mut g = g.lock().unwrap();
+                g.contacts_created.push(b.clone());
+                g.contacts_created.len() + 1
+            };
+            Json(json!({"resourceName": format!("people/c{n}"), "names": [{"displayName": b["names"][0]["unstructuredName"]}], "emailAddresses": b["emailAddresses"], "memberships": b["memberships"]}))
         }))
         .with_state(g);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -431,6 +435,15 @@ async fn google_mail_calendar_contacts() {
     let created = g.lock().unwrap().contacts_created[0].clone();
     assert_eq!(created["memberships"][0]["contactGroupMembership"]["contactGroupResourceName"], "contactGroups/carbon6");
     assert!(rpc("memex.contacts.candidates", json!({})).await.as_array().unwrap().iter().all(|c| c["email"] != "bob@other.org"));
+    // Several at once, in one run: who is a contact already is left out,
+    // so a second click adds no one twice.
+    let people = json!([{"name": "Bob", "email": "bob@other.org"}, {"name": "Carol", "email": "carol@other.org"}, {"name": "Dan", "email": "dan@other.org"}]);
+    let r = rpc("memex.contacts.create_many", json!({"account": "me@example.com", "people": people})).await;
+    assert_eq!(r["added"], json!(["carol@other.org", "dan@other.org"]), "{r}");
+    assert_eq!(g.lock().unwrap().contacts_created.len(), 3);
+    let r = rpc("memex.contacts.create_many", json!({"account": "me@example.com", "people": people})).await;
+    assert_eq!(r["added"], json!([]), "{r}");
+    assert_eq!(g.lock().unwrap().contacts_created.len(), 3, "no one twice");
 
     // Calendar: the weekly standup three times minus a cancelled one, and
     // the review; answering the invitation.

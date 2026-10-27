@@ -1115,6 +1115,16 @@ impl Memex {
             "memex.contacts.list" => json!(contacts::list(self, &s("q")).await?),
             "memex.contacts.candidates" => json!(contacts::candidates(self).await?),
             "memex.contacts.create" => json!(contacts::create(self, &s("account"), &s("name"), &s("email"), &made_by).await?),
+            // Several at once: [{name, email}]; the addresses added.
+            "memex.contacts.create_many" => {
+                let people: Vec<(String, String)> = params["people"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| (p["name"].as_str().unwrap_or_default().to_owned(), p["email"].as_str().unwrap_or_default().to_owned()))
+                    .collect();
+                json!({"added": contacts::create_many(self, &s("account"), &people, &made_by).await?})
+            }
             other => anyhow::bail!("the memex has no method {other}"),
         })
     }

@@ -73,21 +73,34 @@ async fn group(r: &Run, a: &Account) -> anyhow::Result<String> {
     Ok(g["resourceName"].as_str().unwrap_or_default().to_owned())
 }
 
-/// `contacts-write`: adds a contact (`name`, `email`) in the carbon6 group.
+/// `contacts-write`: adds a contact (`name`, `email`), or several (`people`:
+/// [{name, email}], in one run), in the carbon6 group.
 pub async fn write(r: &mut Run) -> anyhow::Result<()> {
     let a = r.account(r.input["account"].as_str().unwrap_or_default())?;
-    let (name, email) = (r.input["name"].as_str().unwrap_or_default().to_owned(), r.input["email"].as_str().unwrap_or_default().to_owned());
-    anyhow::ensure!(email.contains('@'), "a contact needs an address");
+    let one = |v: &Value| (v["name"].as_str().unwrap_or_default().to_owned(), v["email"].as_str().unwrap_or_default().to_owned());
+    let people: Vec<(String, String)> = match r.input["people"].as_array() {
+        Some(list) => list.iter().map(one).collect(),
+        None => vec![one(&r.input)],
+    };
+    anyhow::ensure!(!people.is_empty() && people.iter().all(|(_, e)| e.contains('@')), "each contact needs an address");
     let g = group(r, &a).await?;
-    let body = json!({
-        "names": [{"unstructuredName": name}],
-        "emailAddresses": [{"value": email}],
-        "memberships": [{"contactGroupMembership": {"contactGroupResourceName": g}}],
-    });
-    let p = r
-        .call(&a, reqwest::Method::POST, &format!("{}/v1/people:createContact", r.people), &[("personFields", FIELDS.into())], Some(&body))
-        .await?;
-    keep(r, &a, &p);
-    r.result = json!({"account": a.id, "resource": p["resourceName"], "email": email});
+    let (mut created, mut failed) = (Vec::new(), Vec::new());
+    for (name, email) in people {
+        let body = json!({
+            "names": [{"unstructuredName": name}],
+            "emailAddresses": [{"value": email}],
+            "memberships": [{"contactGroupMembership": {"contactGroupResourceName": g}}],
+        });
+        let url = format!("{}/v1/people:createContact", r.people);
+        match r.call(&a, reqwest::Method::POST, &url, &[("personFields", FIELDS.into())], Some(&body)).await {
+            Ok(p) => {
+                keep(r, &a, &p);
+                created.push(json!({"email": email, "resource": p["resourceName"]}));
+            }
+            Err(e) => failed.push(json!({"email": email, "error": format!("{e:#}")})),
+        }
+    }
+    anyhow::ensure!(!created.is_empty() || failed.is_empty(), "no contact was added: {}", failed[0]["error"]);
+    r.result = json!({"account": a.id, "created": created, "failed": failed});
     Ok(())
 }

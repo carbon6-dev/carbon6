@@ -1,6 +1,6 @@
 {
   "package": "google",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Gmail, Google Calendar and Google Contacts over their APIs, for the gmail, google-calendar and google-contacts apps: it reaches only Google, with the access tokens each run gets.",
   "permissions": {
     "files": "session",
@@ -93,7 +93,7 @@
       },
       {
         "name": "contacts-write",
-        "description": "Adds a contact in the carbon6 group (input: account, name, email).",
+        "description": "Adds a contact in the carbon6 group (input: account, name, email), or several (input: account, people: [{name, email}]).",
         "command": [
           "c6-google",
           "contacts-write"
