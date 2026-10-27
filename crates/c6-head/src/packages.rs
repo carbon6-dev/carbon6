@@ -62,8 +62,11 @@ pub fn normalize_manifest(mut v: Value) -> anyhow::Result<api::AppPackage> {
 pub fn roles(p: &api::AppPackage) -> Vec<String> {
     let mut r = Vec::new();
     let c = &p.contents;
-    let owns =
-        !c.collections.is_empty() || !c.series.is_empty() || !c.triggers.is_empty() || !p.settings.is_null() || !p.operations.is_empty()
+    let owns = !c.collections.is_empty()
+        || !c.series.is_empty()
+        || !c.triggers.is_empty()
+        || !p.settings.is_null()
+        || !p.operations.is_empty()
         || !p.providers.is_empty();
     if owns || !p.realm.is_empty() {
         r.push("app".to_owned());
@@ -1238,6 +1241,25 @@ async fn apply_upgrade(st: &HeadState, id: i64, pending: &Value) -> anyhow::Resu
     .bind(id)
     .execute(&st.store.pool)
     .await?;
+    relock(st, &cur.digest, digest).await?;
+    Ok(())
+}
+
+/// An install's code was replaced (`from` → `to`): what required it (its
+/// locks name the old digest) now requires the new one.
+pub(crate) async fn relock(st: &HeadState, from: &str, to: &str) -> anyhow::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, locks FROM installs WHERE locks LIKE ?").bind(format!("%{from}%")).fetch_all(&st.store.pool).await?;
+    for (id, locks) in rows {
+        let mut l: BTreeMap<String, String> = serde_json::from_str(&locks).unwrap_or_default();
+        for d in l.values_mut().filter(|d| d.as_str() == from) {
+            *d = to.to_owned();
+        }
+        sqlx::query("UPDATE installs SET locks = ? WHERE id = ?").bind(serde_json::to_string(&l)?).bind(id).execute(&st.store.pool).await?;
+    }
     Ok(())
 }
 

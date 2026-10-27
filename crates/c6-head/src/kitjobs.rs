@@ -307,11 +307,21 @@ pub async fn for_instance(
         .ok_or_else(|| bad_request(format!("no app {instance} in realm {realm}")))?;
     let install = crate::packages::install_by_id(st, i.id).await?;
     let digest = install.locks.get(kit).cloned().ok_or_else(|| bad_request(format!("{instance} does not require the kit {kit}")))?;
-    let kit_install = crate::packages::installs(st)
-        .await?
-        .into_iter()
-        .find(|k| k.digest == digest && k.state == "installed")
-        .ok_or_else(|| bad_request(format!("the kit {kit} is not installed")))?;
+    let installs = crate::packages::installs(st).await?;
+    let kit_install = match installs.iter().find(|k| k.digest == digest && k.state == "installed") {
+        Some(k) => k.clone(),
+        // Upgraded in place before upgrades moved what required it along:
+        // the kit of that name, and the lock follows it.
+        None => {
+            let k = installs
+                .iter()
+                .find(|k| k.package == kit && k.realm.is_empty() && k.state == "installed")
+                .cloned()
+                .ok_or_else(|| bad_request(format!("the kit {kit} is not installed")))?;
+            crate::packages::relock(st, &digest, &k.digest).await?;
+            k
+        }
+    };
     let spec = crate::packages::kit_spec_of(st, &kit_install).await?;
     let mut env = Vec::new();
     for s in spec["permissions"]["secrets"].as_array().into_iter().flatten().filter_map(Value::as_str) {

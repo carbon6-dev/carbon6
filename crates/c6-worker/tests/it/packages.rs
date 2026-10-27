@@ -172,7 +172,11 @@ async fn packages_require_install_and_remove() {
     let d: Decision = send(M::GET, &format!("decisions/{}", up.decision.unwrap()), json!({})).await.json().await.unwrap();
     assert!(d.document.contains("It asks for more than before: network access"), "{}", d.document);
     decide(d.id, "Upgrade").await;
-    assert_eq!(install(&send, by("render").id).await.version, "1.1.0");
+    let render = install(&send, by("render").id).await;
+    assert_eq!(render.version, "1.1.0");
+    // What requires it now runs the new version: its lock follows.
+    assert_ne!(render.digest, by("render").digest);
+    assert_eq!(install(&send, by("decks").id).await.locks.get("render"), Some(&render.digest), "decks locks the upgraded kit");
 
     // Removing the library takes its entries out of the realm; then the
     // app and its realm.
