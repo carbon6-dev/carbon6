@@ -105,12 +105,12 @@ pub const DEFAULTS: &[Prompt] = &[
     },
     Prompt {
         name: "memex.triage",
-        description: "How mail and chat from people you know are sorted for the brief (what needs you). Placeholders: {{owner}}, {{examples}} (your corrections).",
+        description: "How mail and chat from people you know are sorted for the brief (what needs you, or a pitch). Mail comes with its history with the sender (counted from your mail) and what the rules noticed. Placeholders: {{owner}}, {{examples}} (your corrections), {{urgent}}.",
         default: text::TRIAGE,
     },
     Prompt {
         name: "memex.triage.pitch",
-        description: "How mail from someone you've never corresponded with is sorted: a cold pitch or a real first contact. Placeholders: {{owner}}, {{examples}}.",
+        description: "How mail from someone you've never written to (nor anyone at their company) is sorted: a cold pitch, a real first contact, a newsletter. It comes with the history with the sender and what the rules noticed. Placeholders: {{owner}}, {{examples}}.",
         default: text::TRIAGE_PITCH,
     },
     Prompt {

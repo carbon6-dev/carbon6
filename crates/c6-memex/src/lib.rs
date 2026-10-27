@@ -17,6 +17,7 @@ pub mod llm;
 pub mod mail;
 pub mod media;
 pub mod people;
+pub mod relations;
 pub mod review;
 pub mod store;
 

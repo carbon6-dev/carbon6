@@ -38,13 +38,17 @@ owner, what happened over time, and what is open. Cite records by [id]. JSON: {\
 
 /// Sorting a conversation with someone the owner knows (docs/brief.md §3).
 /// `{{owner}}`, `{{examples}}`; the conversation follows.
-pub const TRIAGE: &str = "Sort this conversation for its owner ({{owner}}), who wants to see only what needs them. Categories:\n\
+pub const TRIAGE: &str = "Sort this conversation for its owner ({{owner}}), who wants to see only what needs them. First comes the \
+history with the sender, counted from the owner's mail, and what the rules noticed; use them: someone the owner writes to often is \
+not a stranger, and someone the owner never answers is rarely waiting on them. Categories:\n\
 - needs_you: someone is waiting on the owner: a question, a request, a decision, an approval, a review, a meeting to agree, \
 something to sign or pay.\n\
 - fyi: worth knowing, nothing asked of the owner (updates, an answer that closes the matter, news for a group).\n\
-- newsletter: a publication or bulk mailing.\n\
+- pitch: unsolicited selling or outreach (a product, a service, a meeting to sell), even from someone the owner corresponded \
+with once, or a company they deal with about something else.\n\
+- newsletter: a publication or bulk mailing the owner may have subscribed to.\n\
 - notification: automated (receipts, alerts, account and calendar notices, app notifications).\n\
-- noise: nothing of value.\n\
+- noise: nothing of value (spam, scams).\n\
 The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
 JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner, \"asks\": for needs_you, \
 what they need from the owner in one short line (\"Approve the contract redlines\"), else \"\", \"due\": \"YYYY-MM-DD\" when \
@@ -55,13 +59,17 @@ they need it by a date, else null, \"urgent\": true only for needs_you that is u
 pub const TRIAGE_URGENT: &str = "something due today or overdue, a production outage or security incident, or someone blocked \
 right now until the owner answers";
 
-/// A conversation from someone the owner has never corresponded with:
+/// A conversation from someone the owner has never written to, nor anyone
+/// at their company (docs/relationships.md §3):
 /// a cold pitch, or a real first contact. `{{owner}}`, `{{examples}}`.
-pub const TRIAGE_PITCH: &str = "The sender has never corresponded with the owner ({{owner}}). Decide whether this is a cold pitch: \
-unsolicited outreach selling a product or service (sales development and lead generation, agencies, outsourcing, recruiting \
-services, software, \"quick call?\" asks, follow-ups in a sequence). A real first contact (a customer, partner, candidate, investor, \
-journalist or colleague writing about something specific to the owner's work) is not a pitch, even when it asks to meet. Naming a \
-company the owner works with doesn't make it real: pitches name-drop. Categories: pitch, first_contact, fyi, newsletter, notification.\n\
+pub const TRIAGE_PITCH: &str = "The owner ({{owner}}) has never written to the sender or anyone at their company, and isn't in a thread \
+with them; the history with the sender, counted from the owner's mail, and what the rules noticed come first. Decide whether this \
+is a cold pitch: unsolicited outreach selling a product or service (sales development and lead generation, agencies, outsourcing, \
+recruiting services, software, events, \"quick call?\" asks, follow-ups in a sequence), whether written by hand or bulk-sent from a \
+marketing address. A real first contact (a customer, partner, candidate, investor, journalist or colleague writing about something \
+specific to the owner's work) is not a pitch, even when it asks to meet. Naming a company the owner works with doesn't make it \
+real: pitches name-drop. A newsletter is a publication the owner may have subscribed to; selling to the owner is a pitch even \
+when it's bulk-sent. Categories: pitch, first_contact, fyi, newsletter, notification, noise (spam, scams).\n\
 The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
 JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner, \"asks\": for first_contact, \
 what they want from the owner in one short line, else \"\", \"due\": \"YYYY-MM-DD\" or null}";

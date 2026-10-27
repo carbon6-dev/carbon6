@@ -16,6 +16,7 @@ use tracing::warn;
 
 use crate::Memex;
 use crate::llm;
+use crate::relations::{SHARED_DOMAINS, domain};
 use crate::store::clip;
 
 const VERSION: &str = "triage-v1";
@@ -25,24 +26,6 @@ const WINDOW: i64 = 14 * DAY;
 /// What one call reads of a conversation.
 const MAX_INPUT: usize = 10_000;
 pub const CATEGORIES: [&str; 8] = ["needs_you", "first_contact", "fyi", "newsletter", "notification", "pitch", "noise", "yours"];
-/// Domains anyone can have an address at: knowing one person there says
-/// nothing about the next.
-const SHARED_DOMAINS: [&str; 14] = [
-    "gmail.com",
-    "googlemail.com",
-    "yahoo.com",
-    "hotmail.com",
-    "outlook.com",
-    "live.com",
-    "icloud.com",
-    "me.com",
-    "aol.com",
-    "proton.me",
-    "protonmail.com",
-    "gmx.com",
-    "fastmail.com",
-    "hey.com",
-];
 
 /// A conversation waiting to be sorted.
 struct Target {
@@ -53,6 +36,10 @@ struct Target {
 /// Sorts one more conversation, if there is one to sort and (when it needs
 /// a model) a model and budget. Whether it did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
+    // The history each conversation is read with.
+    if let Err(e) = crate::relations::refresh(m).await {
+        warn!("counting correspondents: {e:#}");
+    }
     let model = m.understanding();
     let can_ask = match &model {
         Some((_, per_day)) => crate::understand::budget_left(m, *per_day).await? > 0,
@@ -86,9 +73,12 @@ async fn waiting(m: &Memex) -> anyhow::Result<Vec<Target>> {
         "SELECT x.account, x.thread_id, x.at FROM (SELECT m.account, m.thread_id, MAX(m.date) AS at, MAX(i.added_at) AS added, \
          SUM(m.inbox) AS inbox, SUM(m.spam) AS spam FROM mail m JOIN items i ON i.id = m.item_id WHERE m.date > ? AND m.trash = 0 \
          AND m.draft = 0 GROUP BY m.account, m.thread_id) x LEFT JOIN triage t ON t.target = 'thread:' || x.account || ':' || x.thread_id \
-         WHERE x.inbox > 0 AND x.spam = 0 AND (t.done_at IS NULL OR t.done_at < x.added) ORDER BY x.at DESC LIMIT 20",
+         WHERE x.inbox > 0 AND x.spam = 0 AND (t.done_at IS NULL OR t.done_at < x.added \
+         OR (?2 AND t.by IN ('rule', 'signals', 'sequence') AND t.category != 'yours')) ORDER BY x.at DESC LIMIT 20",
     )
     .bind(since)
+    // What rules sorted while there was no model, the model sorts again.
+    .bind(m.understanding().is_some())
     .fetch_all(&m.store.pool)
     .await?;
     for r in threads {
@@ -219,10 +209,6 @@ async fn put(m: &Memex, key: &str, kind: &str, s: &Sorted, sender: &str, sender_
     .execute(&m.store.pool)
     .await?;
     Ok(())
-}
-
-fn domain(addr: &str) -> String {
-    addr.rsplit_once('@').map(|(_, d)| d.to_lowercase()).unwrap_or_default()
 }
 
 /// Your mark on a sender (by address, else by domain): pitch or known.
@@ -371,22 +357,65 @@ async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     let (sender, sender_name): (String, String) = (last.get::<String, _>("from_addr").to_lowercase(), last.get("from_name"));
     let (who, name, title) = (sender.as_str(), sender_name.as_str(), subject.as_str());
     let done = move |s: Sorted| async move { settle(m, key, "mail", &s, who, name, title, at, task).await };
-    if last.get::<i64, _>("list") == 1 {
-        let automated = ["noreply", "no-reply", "notification", "alert", "mailer-daemon", "donotreply", "do-not-reply"];
-        return if automated.iter().any(|a| sender.contains(a)) {
-            done(Sorted::new("notification", "Automated", "rule")).await
-        } else {
-            done(Sorted::new("newsletter", "A mailing list", "rule")).await
-        };
-    }
+    // Your marks settle it; so does a sender you marked known, as not a pitch.
     let mark = mark_of(m, &sender).await?;
     if mark.as_deref() == Some("pitch") {
         return done(Sorted::new("pitch", "A sender you marked as a pitch", "mark")).await;
     }
     let answered = rows.iter().any(is_mine);
     let knows = mark.as_deref() == Some("known") || answered || known(m, &sender, &me).await?;
-    // What the thread says, for the model and the marks.
-    let mut text = format!("Subject: {subject}\n");
+    let list = last.get::<i64, _>("list") == 1;
+    let automated = crate::relations::automated(&sender);
+    // What the rules see, for the model as hints (and, with no model, the
+    // verdict): a sequence tool's marks, a sequence's follow-up.
+    let mut hints = Vec::new();
+    if list {
+        hints.push("The latest message has mailing-list headers (it was bulk-sent).".to_owned());
+    }
+    if !knows {
+        let (marks, phrases) = signals(m);
+        for r in rows.iter().filter(|r| !is_mine(r)) {
+            let mut seen = r.get::<String, _>("body").to_lowercase();
+            for blob in [r.get::<Option<String>, _>("html_blob"), r.get::<Option<String>, _>("text_blob")].into_iter().flatten() {
+                if let Ok(b) = tokio::fs::read(m.blob_path(&blob)).await {
+                    seen.push_str(&String::from_utf8_lossy(&b).to_lowercase());
+                }
+            }
+            if let Some(found) = marks.iter().find(|x| seen.contains(x.as_str())) {
+                hints.push(format!("Its links or text carry a sales-sequence tool's mark ({found})."));
+                if task.is_none() && m.understanding().is_none() {
+                    return done(Sorted::new("pitch", &format!("Sent through a sales-sequence tool ({found})"), "signals")).await;
+                }
+                break;
+            }
+        }
+        let latest = last.get::<String, _>("body").to_lowercase();
+        if let Some(p) = phrases.iter().find(|p| latest.contains(p.as_str())) {
+            hints.push(format!("The latest message reads like a sequence's follow-up (\"{p}\")."));
+            if task.is_none() && m.understanding().is_none() {
+                return done(Sorted::new("pitch", &format!("A sequence's follow-up (\"{p}\") from a stranger"), "sequence")).await;
+            }
+        }
+    }
+    let Some(task) = task else {
+        // No model at all: the rules sort what they can (the model sorts it
+        // again once there is one). A model without budget: it waits.
+        if m.understanding().is_some() {
+            return Ok(false);
+        }
+        return match (list, automated) {
+            (_, true) => done(Sorted::new("notification", "Automated", "rule")).await,
+            (true, false) => done(Sorted::new("newsletter", "A mailing list", "rule")).await,
+            _ => Ok(false),
+        };
+    };
+    // What the thread says, after the history with the sender.
+    let history = crate::relations::history(m, &sender, &sender_name).await?;
+    let mut text = format!("History with the sender (counted from the owner's mail):\n{history}\n");
+    if !hints.is_empty() {
+        text.push_str(&format!("What the rules noticed:\n- {}\n", hints.join("\n- ")));
+    }
+    text.push_str(&format!("\nSubject: {subject}\n"));
     for r in rows.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
         let date =
             chrono::DateTime::from_timestamp_millis(r.get("date")).map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
@@ -399,32 +428,17 @@ async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     }
     let text = clip(&text, MAX_INPUT);
     if knows {
-        let Some(task) = task else { return Ok(false) };
         let prompt = m.prompt("memex.triage", api::prompts::TRIAGE);
-        let allowed = ["needs_you", "fyi", "newsletter", "notification", "noise"];
-        return done(ask(m, task, &subject, &prompt, "mail", &text, &allowed).await?).await;
+        // Someone you marked as known isn't pitching; anyone else may be.
+        let allowed: &[&str] = if mark.as_deref() == Some("known") {
+            &["needs_you", "fyi", "newsletter", "notification", "noise"]
+        } else {
+            &["needs_you", "fyi", "newsletter", "notification", "noise", "pitch"]
+        };
+        return done(ask(m, task, &subject, &prompt, "mail", &text, allowed).await?).await;
     }
-    // A stranger: a sequence tool's marks in what they sent, or a
-    // sequence's follow-up, settle it.
-    let (marks, phrases) = signals(m);
-    for r in rows.iter().filter(|r| !is_mine(r)) {
-        let mut seen = r.get::<String, _>("body").to_lowercase();
-        for blob in [r.get::<Option<String>, _>("html_blob"), r.get::<Option<String>, _>("text_blob")].into_iter().flatten() {
-            if let Ok(b) = tokio::fs::read(m.blob_path(&blob)).await {
-                seen.push_str(&String::from_utf8_lossy(&b).to_lowercase());
-            }
-        }
-        if let Some(found) = marks.iter().find(|x| seen.contains(x.as_str())) {
-            return done(Sorted::new("pitch", &format!("Sent through a sales-sequence tool ({found})"), "signals")).await;
-        }
-    }
-    let latest = last.get::<String, _>("body").to_lowercase();
-    if let Some(p) = phrases.iter().find(|p| latest.contains(p.as_str())) {
-        return done(Sorted::new("pitch", &format!("A sequence's follow-up (\"{p}\") from a stranger"), "sequence")).await;
-    }
-    let Some(task) = task else { return Ok(false) };
     let prompt = m.prompt("memex.triage.pitch", api::prompts::TRIAGE_PITCH);
-    let allowed = ["pitch", "first_contact", "fyi", "newsletter", "notification"];
+    let allowed = ["pitch", "first_contact", "fyi", "newsletter", "notification", "noise"];
     done(ask(m, task, &subject, &prompt, "mail", &text, &allowed).await?).await
 }
 

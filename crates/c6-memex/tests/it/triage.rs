@@ -220,7 +220,9 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert_eq!((status["model"].as_bool(), status["waiting"].as_u64()), (Some(false), Some(5)), "the brief says why: {status}");
 
     // Then the model, newest first: Ana (known), Raj's DM, Bo (known by his
-    // company), Lee and Pat (strangers: the pitch prompt).
+    // company), Lee and Pat (strangers: the pitch prompt); and what the rules
+    // sorted without it (Sam, Kim, the newsletter) the model sorts again,
+    // with what the rules noticed as hints.
     // Each answer for its conversation, whatever order they're asked in.
     for (about, r) in [
         (
@@ -237,17 +239,23 @@ async fn mail_and_chat_sorted_for_the_brief() {
             "pilot for 40 seats",
             json!({"category": "first_contact", "reason": "A customer asks for a pilot", "asks": "A pilot for 40 seats"}),
         ),
+        ("Loved your post", json!({"category": "pitch", "reason": "A sales sequence"})),
+        ("bumping this", json!({"category": "pitch", "reason": "A sequence's follow-up"})),
+        ("This week in Rust", json!({"category": "newsletter", "reason": "A weekly newsletter"})),
     ] {
         mock.push_about(about, Reply::Text(r.to_string()));
     }
-    budget(5).await;
-    eventually("the model's sorting", async || (sorted("thread:acct:t6").await?.category == "first_contact").then_some(())).await;
+    budget(8).await;
+    eventually("the model's sorting", async || (sorted("thread:acct:t7").await?.by == "model").then_some(())).await;
     let want = [
         ("thread:acct:t1", "needs_you"),
         ("chat:T1:D9", "needs_you"),
         ("thread:acct:t2", "fyi"),
         ("thread:acct:t5", "pitch"),
         ("thread:acct:t6", "first_contact"),
+        ("thread:acct:t3", "pitch"),
+        ("thread:acct:t4", "pitch"),
+        ("thread:acct:t7", "newsletter"),
     ];
     for (t, c) in want {
         let s = sorted(t).await.unwrap_or_else(|| panic!("{t} sorted"));
@@ -255,7 +263,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     }
     assert!(sorted("chat:T1:C9:8200.0001").await.is_none(), "a channel message not to you isn't sorted");
     let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
-    assert_eq!(asked.len(), 5, "rules needed no model");
+    assert_eq!(asked.len(), 8, "your last word needed no model");
     assert_eq!(mock.requests()[0]["reasoning_effort"], "none", "sorting doesn't reason by default");
     // Each call shows in the activity panel: what for, about what, how it went.
     let activity: Value = http.get(format!("{api}/system/activity")).send().await.unwrap().json().await.unwrap();
@@ -273,8 +281,31 @@ async fn mail_and_chat_sorted_for_the_brief() {
     );
     let about = |text: &str| asked.iter().find(|a| a.contains(text)).unwrap_or_else(|| panic!("asked about {text}")).clone();
     assert!(about("approve the redlines").contains("Sort this conversation"));
-    assert!(about("scale SDRs").contains("never corresponded"), "strangers get the pitch prompt");
+    assert!(about("scale SDRs").contains("has never written to the sender"), "strangers get the pitch prompt");
+    // Each with its history, counted from the mail, and the rules' hints.
+    assert!(
+        about("approve the redlines").contains("The owner wrote to ana@acme.com 2 times; Ana <ana@acme.com> wrote 2 messages in 2 threads"),
+        "{}",
+        about("approve the redlines")
+    );
+    assert!(
+        about("the deploy is done")
+            .contains("At acme.com (2 senders): the owner wrote 2 times, they wrote 3 messages in 3 threads, answered in 1"),
+        "{}",
+        about("the deploy is done")
+    );
+    assert!(about("Loved your post").contains("sales-sequence tool's mark (apollo.io)"), "{}", about("Loved your post"));
+    assert!(about("This week in Rust").contains("mailing-list headers"), "{}", about("This week in Rust"));
     assert_eq!(sorted("thread:acct:t1").await.unwrap().reason, "Ana needs your approval by Thursday");
+    // The participant index counts the same, for every address at once.
+    c6_memex::relations::rebuild(&m).await.unwrap();
+    let ana = c6_memex::relations::of(&m, "Ana@acme.com").await.unwrap();
+    assert_eq!((ana.received, ana.sent_to, ana.threads, ana.answered), (2, 2, 2, 1), "{ana:?}");
+    let (acme, people) = c6_memex::relations::of_domain(&m, "acme.com").await.unwrap().unwrap();
+    assert_eq!((acme.received, people), (3, 2), "{acme:?}");
+    assert!(c6_memex::relations::of_domain(&m, "gmail.com").await.unwrap().is_none(), "a shared domain has no company");
+    let weekly = c6_memex::relations::of(&m, "news@weekly.dev").await.unwrap();
+    assert_eq!((weekly.received, weekly.bulk, weekly.sent_to), (1, 1, 0));
     // The brief's numbers: what was read, by kind, and how much by the model.
     let status = rpc("memex.triage.status", json!({})).await;
     assert_eq!(status["sorted"]["chat"]["by_model"], 1, "{status}");
@@ -325,7 +356,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     // Sam is someone you know after all: sorted again, as such.
     mock.push(Reply::Text(json!({"category": "fyi", "reason": "Sam shares a post"}).to_string()));
     rpc("memex.triage.mark", json!({"target": "thread:acct:t3", "mark": "known"})).await;
-    budget(6).await;
+    budget(9).await;
     eventually("Sam, sorted again", async || (sorted("thread:acct:t3").await?.category == "fyi").then_some(())).await;
     let marks = rpc("memex.triage.marks", json!({})).await;
     assert_eq!(marks.as_array().unwrap().len(), 2, "{marks}");
@@ -337,7 +368,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert_eq!((set["category"].as_str(), set["by"].as_str()), (Some("needs_you"), Some("you")), "{set}");
     mock.push(Reply::Text(json!({"category": "needs_you", "reason": "Bo's deploy needs your sign-off"}).to_string()));
     mail(&m, "b2", "t2", ("bo@acme.com", "Bo"), "me@mine.io", "Re: Deploy", "And the hotfix is out too.", None, &["INBOX"], HOUR / 3).await;
-    budget(7).await;
+    budget(10).await;
     eventually("Bo's, sorted again", async || (sorted("thread:acct:t2").await?.reason == "Bo's deploy needs your sign-off").then_some(()))
         .await;
     let last = mock.requests().last().unwrap()["messages"].to_string();
@@ -357,7 +388,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     ));
     mock.push(Reply::Text(json!({"same": true, "sure": true}).to_string()));
     m.store.put(&ana_chat("k3", "D7", "dm", "Did you see my email about the redlines?", HOUR / 4), "test-slack").await.unwrap();
-    budget(9).await;
+    budget(12).await;
     let joined = eventually("joined", async || {
         let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": ana})).await).ok()?;
         (r.sources.len() == 2).then_some(r)
@@ -371,7 +402,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     ));
     mock.push(Reply::Text(json!({"same": true, "sure": false}).to_string()));
     m.store.put(&ana_chat("k4", "G7", "group", "Also, can you review the Q4 budget?", HOUR / 5), "test-slack").await.unwrap();
-    budget(11).await;
+    budget(14).await;
     let maybe = eventually("possibly the same", async || {
         open("open").await.into_iter().find(|r| r.title == "Review the Q4 budget" && r.maybe_same == [ana])
     })
@@ -395,7 +426,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     mock.push(Reply::Text(
         json!({"target": "chat:T1:D9", "text": "Wednesday works. [[10:00 | 14:00]]?", "note": "Check the offsite"}).to_string(),
     ));
-    budget(12).await;
+    budget(15).await;
     let drafted = eventually("a draft", async || {
         let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
         r.draft.filter(|d| d.error.is_none())
@@ -419,7 +450,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     mock.push(Reply::Text(json!({"category": "needs_you", "reason": "Raj asks again", "asks": "Move the 1:1 to Wednesday"}).to_string()));
     mock.push(Reply::Text(json!({"target": "chat:T1:D9", "text": "Wednesday at 14:00 it is.", "note": ""}).to_string()));
     m.store.put(&chat("k5", "D9", "dm", "Or Thursday afternoon, if that's easier", HOUR / 10, false), "test-slack").await.unwrap();
-    budget(14).await;
+    budget(17).await;
     eventually("drafted again", async || {
         let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
         (r.draft?.text == "Wednesday at 14:00 it is.").then_some(())
@@ -459,7 +490,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
         HOUR / 20,
     )
     .await;
-    budget(15).await;
+    budget(18).await;
     eventually("told at once", async || {
         open("open").await.into_iter().find(|r| r.title == "Approve the rollback" && r.notified_at.is_some())
     })
