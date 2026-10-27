@@ -149,3 +149,15 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
 - **In drafts:** the request's person's and organization's cards, as written (none is written for a draft).
 - **Ops:** `memex.relations.cards` returns a thing's or an address's cards. `memex.relations.write` writes or grows a card now.
 - **UI:** cards show on a person's or organization's page in the memex, and next to a request in the Brief.
+
+### 8.3 Step 3: the walk (2026-10-27)
+
+- **Reading skips automated senders:** mail from `noreply`, `no-reply`, `donotreply`, `notification…` or `mailer-daemon` addresses, as well as lists and spam, as before. Those threads are still sorted.
+- **News for cards:** each thread read successfully is noted, in table `card_news`, for its people:
+  - senders, and the people you wrote to;
+  - only those with history, counted live: you wrote to them, or more than one thread;
+  - and their organizations, when you've written to someone there.
+
+  A card written on the spot takes in its threads' news as it's written.
+- **The card step** runs in the reading loop after drafts and before reading. It takes the person or organization with the most recent news, folds in up to twelve news threads (with the card so far), and clears them. The walk reads newest first, so cards grow back through time. A failed fold clears its news, so it isn't retried in a loop.
+- **Progress:** `memex.relations.progress` reports threads read of all readable threads, the oldest date read back to, cards, cards waiting to take in news, and correspondents. The Activity page shows it for each realm. On a mailbox of 54,000 messages there are about 18,000 readable threads; the query takes about 40 ms.

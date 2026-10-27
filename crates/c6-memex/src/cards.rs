@@ -122,9 +122,22 @@ pub async fn cost(m: &Memex, task: &Task, key: &str, read: usize) -> anyhow::Res
 
 /// Writes or grows a card: reads up to `read` of their unread threads first
 /// (newest first; the rest are listed by subject), then asks the model.
+/// `only`: these threads (the walk's news), else their newest since the card.
 pub async fn write(m: &Memex, task: &Task, key: &str, name: &str, read: usize) -> anyhow::Result<Option<Card>> {
     let before = get(m, key).await?;
     let ts = threads(m, key, before.as_ref().and_then(|c| c.covered_to), THREADS).await?;
+    grow(m, task, key, name, read, before, ts).await
+}
+
+async fn grow(
+    m: &Memex,
+    task: &Task,
+    key: &str,
+    name: &str,
+    read: usize,
+    before: Option<Card>,
+    ts: Vec<(String, String, i64, String)>,
+) -> anyhow::Result<Option<Card>> {
     if ts.is_empty() {
         return Ok(before);
     }
@@ -199,7 +212,132 @@ pub async fn write(m: &Memex, task: &Task, key: &str, name: &str, read: usize) -
     .bind(c6_core::now_ms())
     .execute(&m.store.pool)
     .await?;
+    // Taken in: the walk's news of these threads.
+    for (account, thread, _, _) in &ts {
+        sqlx::query("DELETE FROM card_news WHERE key = ? AND account = ? AND thread_id = ?")
+            .bind(key)
+            .bind(account)
+            .bind(thread)
+            .execute(&m.store.pool)
+            .await?;
+    }
     get(m, key).await
+}
+
+/// A thread was read: its people with history (you wrote to them, or more
+/// than one thread), and their organizations you write to, have news for
+/// their cards.
+pub async fn noted(m: &Memex, account: &str, thread: &str) -> anyhow::Result<()> {
+    let me: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
+    let rows = sqlx::query(
+        "SELECT from_addr, from_name, sent, to_json, cc_json, date FROM mail WHERE account = ? AND thread_id = ? AND draft = 0",
+    )
+    .bind(account)
+    .bind(thread)
+    .fetch_all(&m.store.pool)
+    .await?;
+    let Some(at) = rows.iter().map(|r| r.get::<i64, _>("date")).max() else { return Ok(()) };
+    let mut people: std::collections::BTreeMap<String, String> = Default::default();
+    for r in &rows {
+        let from = r.get::<String, _>("from_addr").to_lowercase();
+        if r.get::<i64, _>("sent") == 1 || me.contains(&from) {
+            for col in ["to_json", "cc_json"] {
+                let to: Vec<(String, String)> = serde_json::from_str(&r.get::<String, _>(col)).unwrap_or_default();
+                for (a, n) in to {
+                    people.entry(a.to_lowercase()).or_insert(n);
+                }
+            }
+        } else {
+            people.insert(from, r.get("from_name"));
+        }
+    }
+    for (addr, name) in people {
+        if me.contains(&addr) || relations::automated(&addr) || !addr.contains('@') {
+            continue;
+        }
+        let (person, org) = keys(&addr);
+        // Counted now (the index may be a minute behind).
+        let (c, _) = relations::live(m, &addr, false).await?;
+        let mut news = Vec::new();
+        if c.sent_to > 0 || c.threads > 1 {
+            news.push((person, name.clone()));
+        }
+        if let Some(org) = org
+            && relations::live(m, &domain(&addr), true).await?.0.sent_to > 0
+        {
+            news.push((org, String::new()));
+        }
+        for (key, name) in news {
+            sqlx::query("INSERT INTO card_news (key, name, account, thread_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(&key)
+                .bind(&name)
+                .bind(account)
+                .bind(thread)
+                .bind(at)
+                .execute(&m.store.pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Folds the walk's news into one card: the person or organization most
+/// recently active. Whether it did.
+pub async fn step(m: &Memex) -> anyhow::Result<bool> {
+    let Some((task, per_day)) = m.understanding() else { return Ok(false) };
+    if crate::understand::budget_left(m, per_day).await? == 0 {
+        return Ok(false);
+    }
+    let next: Option<(String, String)> = sqlx::query_as("SELECT key, MAX(name) FROM card_news GROUP BY key ORDER BY MAX(at) DESC LIMIT 1")
+        .fetch_optional(&m.store.pool)
+        .await?;
+    let Some((key, name)) = next else { return Ok(false) };
+    let rows = sqlx::query(
+        "SELECT n.account, n.thread_id, n.at, (SELECT MAX(subject) FROM mail m WHERE m.account = n.account AND m.thread_id = n.thread_id) AS subject \
+         FROM card_news n WHERE n.key = ? ORDER BY n.at DESC LIMIT ?",
+    )
+    .bind(&key)
+    .bind(THREADS)
+    .fetch_all(&m.store.pool)
+    .await?;
+    let ts: Vec<(String, String, i64, String)> = rows
+        .iter()
+        .map(|r| (r.get("account"), r.get("thread_id"), r.get("at"), r.get::<Option<String>, _>("subject").unwrap_or_default()))
+        .collect();
+    let before = get(m, &key).await?;
+    if let Err(e) = grow(m, &task, &key, &name, 0, before, ts.clone()).await {
+        warn!(%key, "growing a card: {e:#}");
+        // Not again for these threads: the next news tries again.
+        for (account, thread, _, _) in &ts {
+            sqlx::query("DELETE FROM card_news WHERE key = ? AND account = ? AND thread_id = ?")
+                .bind(&key)
+                .bind(account)
+                .bind(thread)
+                .execute(&m.store.pool)
+                .await?;
+        }
+    }
+    Ok(true)
+}
+
+/// How far the walk and the cards are (for the Activity page).
+pub async fn progress(m: &Memex) -> anyhow::Result<Value> {
+    let r = sqlx::query(
+        "SELECT (SELECT COUNT(*) FROM cards) AS cards, (SELECT COUNT(DISTINCT key) FROM card_news) AS waiting, \
+         (SELECT COUNT(*) FROM enrich WHERE target LIKE 'thread:%' AND error IS NULL) AS read, \
+         (SELECT COUNT(*) FROM correspondents) AS correspondents",
+    )
+    .fetch_one(&m.store.pool)
+    .await?;
+    let (threads, oldest): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT m.account || ':' || m.thread_id), MIN(CASE WHEN e.target IS NOT NULL THEN m.date END) FROM mail m \
+         LEFT JOIN enrich e ON e.target = 'thread:' || m.account || ':' || m.thread_id AND e.error IS NULL \
+         WHERE m.spam = 0 AND m.trash = 0 AND m.list = 0 AND m.draft = 0",
+    )
+    .fetch_one(&m.store.pool)
+    .await?;
+    Ok(json!({"cards": r.get::<i64, _>("cards"), "cards_waiting": r.get::<i64, _>("waiting"), "threads_read": r.get::<i64, _>("read"),
+              "threads": threads, "oldest_read": oldest, "correspondents": r.get::<i64, _>("correspondents")}))
 }
 
 /// The cards a sorting of mail from `addr` reads: the person's, and their
@@ -284,6 +422,7 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
             anyhow::ensure!(key.starts_with("person:") || key.starts_with("org:"), "a card is person:<address> or org:<domain>");
             json!(write(m, &task, &key, &s("name"), READ_ON_THE_SPOT).await?.as_ref().map(json_of))
         }
+        "memex.relations.progress" => progress(m).await?,
         other => anyhow::bail!("the memex has no method {other}"),
     })
 }

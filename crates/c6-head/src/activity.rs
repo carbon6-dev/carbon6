@@ -159,7 +159,8 @@ async fn memex(st: &HeadState) -> Value {
     // Commons is shared knowledge: no mail or chat of its own to sort.
     for realm in realms.iter().filter(|r| crate::memex::has_memex(r) && *r != crate::realms::COMMONS) {
         if let Ok(v) = crate::memex::call_in(st, realm, "memex.triage.status", json!({})).await {
-            sorting.push(json!({"realm": realm, "status": v}));
+            let walk = crate::memex::call_in(st, realm, "memex.relations.progress", json!({})).await.unwrap_or(Value::Null);
+            sorting.push(json!({"realm": realm, "status": v, "walk": walk}));
         }
     }
     json!({"status": status, "sorting": sorting})

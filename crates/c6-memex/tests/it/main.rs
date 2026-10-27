@@ -9,6 +9,7 @@ mod memex;
 mod move_in;
 mod realms;
 mod records;
+mod relations;
 mod triage;
 mod understanding;
 

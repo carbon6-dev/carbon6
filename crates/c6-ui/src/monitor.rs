@@ -160,6 +160,24 @@ pub fn ActivityPage() -> impl IntoView {
                             ""
                         };
                         lines.push(format!("{}: {waiting}{} conversations waiting to be sorted for the brief{why}", s(&r["realm"]), if waiting >= 20 { "+" } else { "" }));
+                        // The walk back through the mail, and the cards it grows.
+                        let w = &r["walk"];
+                        if let Some(total) = w["threads"].as_i64().filter(|n| *n > 0) {
+                            let read = w["threads_read"].as_i64().unwrap_or(0);
+                            let back = w["oldest_read"].as_i64().and_then(|ms| {
+                                let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
+                                d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED).as_string()
+                            });
+                            lines.push(format!(
+                                "{}: read {read} of {total} mail threads ({}%){}; {} relationship cards{}; {} correspondents",
+                                s(&r["realm"]),
+                                read * 100 / total,
+                                back.map(|b| format!(", back to {b}")).unwrap_or_default(),
+                                w["cards"].as_i64().unwrap_or(0),
+                                w["cards_waiting"].as_i64().filter(|n| *n > 0).map(|n| format!(" ({n} waiting to take in new threads)")).unwrap_or_default(),
+                                w["correspondents"].as_i64().unwrap_or(0)
+                            ));
+                        }
                     }
                     view! {
                         <div class="space-y-1 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">

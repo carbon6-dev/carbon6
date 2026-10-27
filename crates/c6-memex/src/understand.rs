@@ -33,7 +33,9 @@ async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String
     // news since it was read); not lists or spam.
     let thread = sqlx::query(
         "SELECT m.account, m.thread_id, m.date AS d FROM mail m JOIN items i ON i.id = m.item_id \
-         WHERE m.spam = 0 AND m.trash = 0 AND m.list = 0 AND m.draft = 0 AND NOT EXISTS (SELECT 1 FROM enrich e \
+         WHERE m.spam = 0 AND m.trash = 0 AND m.list = 0 AND m.draft = 0 AND NOT (lower(m.from_addr) LIKE '%noreply%' \
+         OR lower(m.from_addr) LIKE '%no-reply%' OR lower(m.from_addr) LIKE '%donotreply%' OR lower(m.from_addr) LIKE '%do-not-reply%' \
+         OR lower(m.from_addr) LIKE 'notification%' OR lower(m.from_addr) LIKE 'mailer-daemon%') AND NOT EXISTS (SELECT 1 FROM enrich e \
          WHERE e.target = 'thread:' || m.account || ':' || m.thread_id AND e.version = ? AND e.done_at >= i.added_at) \
          ORDER BY m.date DESC LIMIT 1",
     )
@@ -99,6 +101,13 @@ async fn done(m: &Memex, target: &str, version: &str, result: anyhow::Result<()>
     let error = result.as_ref().err().map(|e| format!("{e:#}"));
     if let Some(e) = &error {
         warn!(%target, "understanding: {e}");
+    }
+    // Its people's cards have news.
+    if error.is_none()
+        && let Some((account, thread)) = target.strip_prefix("thread:").and_then(|t| t.rsplit_once(':'))
+        && let Err(e) = crate::cards::noted(m, account, thread).await
+    {
+        warn!(%target, "noting for cards: {e:#}");
     }
     sqlx::query("INSERT OR REPLACE INTO enrich (target, version, done_at, error) VALUES (?, ?, ?, ?)")
         .bind(target)
@@ -282,6 +291,9 @@ pub fn spawn(m: std::sync::Arc<Memex>) {
                     false
                 }) || crate::drafts::step(&m).await.unwrap_or_else(|e| {
                     warn!("drafting: {e:#}");
+                    false
+                }) || crate::cards::step(&m).await.unwrap_or_else(|e| {
+                    warn!("cards: {e:#}");
                     false
                 }) || step(&m).await.unwrap_or_else(|e| {
                     warn!("understanding: {e:#}");
