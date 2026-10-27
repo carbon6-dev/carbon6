@@ -54,6 +54,17 @@ JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, wri
 what they need from the owner in one short line (\"Approve the contract redlines\"), else \"\", \"due\": \"YYYY-MM-DD\" when \
 they need it by a date, else null, \"urgent\": true only for needs_you that is urgent by the owner's rule: {{urgent}}}";
 
+/// A person's or organization's card (docs/relationships.md §2.3).
+/// `{{who}}`, `{{history}}`, `{{threads}}`, `{{previous}}`.
+pub const RELATION_CARD: &str = "Write the owner's card for {{who}}: who they are to the owner, from the history with them (counted \
+from the owner's mail) and their threads with the owner (newest first; a summary each). {{previous}}When the card so far is given, \
+grow it with the new threads: keep what still holds, change what they change.\n\n\
+History:\n{{history}}\n\nThreads:\n{{threads}}\n\n\
+JSON: {\"relationship\": one of customer, prospect, partner, investor, vendor, colleague, candidate, recruiter, cold_outreach, \
+service, personal, other, \"role\": their role or company as the mail shows it, else \"\", \"story\": the story so far in at most \
+three short sentences, \"open\": what is open between them and the owner, else \"\", \"how\": how the owner deals with them in one \
+short line (answers quickly, never answers, meets monthly), else \"\"}";
+
 /// What may interrupt you (docs/brief.md §2.3): the rule the model applies
 /// when it sorts a conversation that needs you.
 pub const TRIAGE_URGENT: &str = "something due today or overdue, a production outage or security incident, or someone blocked \

@@ -90,18 +90,50 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some((target, kind, items)) = next(m, &version).await? else { return Ok(false) };
     count_call(m).await?;
     let result = read(m, &task, &kind, &items).await;
+    done(m, &target, &version, result).await?;
+    Ok(true)
+}
+
+/// Records that a target was read (or why it couldn't be).
+async fn done(m: &Memex, target: &str, version: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
     let error = result.as_ref().err().map(|e| format!("{e:#}"));
     if let Some(e) = &error {
         warn!(%target, "understanding: {e}");
     }
     sqlx::query("INSERT OR REPLACE INTO enrich (target, version, done_at, error) VALUES (?, ?, ?, ?)")
-        .bind(&target)
-        .bind(&version)
+        .bind(target)
+        .bind(version)
         .bind(c6_core::now_ms())
         .bind(&error)
         .execute(&m.store.pool)
         .await?;
-    Ok(true)
+    Ok(())
+}
+
+/// Whether a mail thread was read by this model since its latest message.
+pub(crate) async fn read_already(m: &Memex, task: &Task, account: &str, thread: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM enrich e WHERE e.target = ?1 AND e.version = ?2 AND e.done_at >= \
+         (SELECT COALESCE(MAX(i.added_at), 0) FROM mail m JOIN items i ON i.id = m.item_id WHERE m.account = ?3 AND m.thread_id = ?4))",
+    )
+    .bind(format!("thread:{account}:{thread}"))
+    .bind(version(task))
+    .bind(account)
+    .bind(thread)
+    .fetch_one(&m.store.pool)
+    .await?)
+}
+
+/// Reads one mail thread now (one model call), as the walk would.
+pub(crate) async fn read_thread(m: &Memex, task: &Task, account: &str, thread: &str) -> anyhow::Result<()> {
+    let items: Vec<String> = sqlx::query_scalar("SELECT item_id FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
+        .bind(account)
+        .bind(thread)
+        .fetch_all(&m.store.pool)
+        .await?;
+    count_call(m).await?;
+    let result = read(m, task, "thread", &items).await;
+    done(m, &format!("thread:{account}:{thread}"), &version(task), result).await
 }
 
 /// The text a model reads for these items.

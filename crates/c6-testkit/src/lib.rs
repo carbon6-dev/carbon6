@@ -33,8 +33,8 @@ struct Step {
     reply: Reply,
     /// If set, the first chunk is sent, then the response waits for this.
     gate: Option<Arc<Notify>>,
-    /// If set, only for a request whose messages contain this.
-    about: Option<String>,
+    /// If not empty, only for a request whose messages contain all of these.
+    about: Vec<String>,
 }
 
 #[derive(Default)]
@@ -69,20 +69,27 @@ impl MockLlm {
     }
 
     pub fn push(&self, reply: Reply) {
-        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None, about: None });
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None, about: Vec::new() });
     }
 
     /// Queues a reply for the first request whose messages contain `about`,
     /// whenever it comes (for callers whose order isn't the test's).
     pub fn push_about(&self, about: &str, reply: Reply) {
-        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None, about: Some(about.to_owned()) });
+        self.push_about_all(&[about], reply);
+    }
+
+    /// Queues a reply for the first request whose messages contain all of
+    /// `about` (the kind of call, and what it's about).
+    pub fn push_about_all(&self, about: &[&str], reply: Reply) {
+        let about = about.iter().map(|a| a.to_string()).collect();
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: None, about });
     }
 
     /// Queues a reply that stalls after its first chunk until the returned
     /// handle is notified.
     pub fn push_gated(&self, reply: Reply) -> Arc<Notify> {
         let gate = Arc::new(Notify::new());
-        self.inner.script.lock().unwrap().push_back(Step { reply, gate: Some(gate.clone()), about: None });
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: Some(gate.clone()), about: Vec::new() });
         gate
     }
 
@@ -128,7 +135,7 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
     inner.requests.lock().unwrap().push(body);
     let step = {
         let mut script = inner.script.lock().unwrap();
-        let at = script.iter().position(|s| s.about.as_ref().is_none_or(|a| messages.contains(a.as_str())));
+        let at = script.iter().position(|s| s.about.iter().all(|a| messages.contains(a.as_str())));
         at.and_then(|i| script.remove(i))
     };
     let Some(step) = step else {

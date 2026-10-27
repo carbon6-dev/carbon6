@@ -172,9 +172,42 @@ fn kind_color(kind: &str) -> &'static str {
     }
 }
 
+/// Who a person or organization is to you (docs/relationships.md): their
+/// cards, as the model wrote them from your mail's history with them.
+#[component]
+pub fn Cards(#[prop(into)] params: serde_json::Value) -> impl IntoView {
+    let cards = LocalResource::new(move || {
+        let p = params.clone();
+        async move { api::rpc("memex.relations.cards", p).await }
+    });
+    view! {
+        {move || cards.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).filter(|a| !a.is_empty()).map(|a| view! {
+            <div class="space-y-1.5">
+                {a.into_iter().map(|c| {
+                    let f = |k: &str| c["card"][k].as_str().unwrap_or("").to_owned();
+                    view! {
+                        <div class="space-y-0.5 rounded-md border border-zinc-200 p-2 text-sm dark:border-zinc-800">
+                            <p>
+                                <span class="font-medium">{c["name"].as_str().unwrap_or("").to_owned()}</span>
+                                <span class="ml-1.5 rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">{f("relationship").replace('_', " ")}</span>
+                                {(!f("role").is_empty()).then(|| view! { <span class="ml-1.5 text-xs text-zinc-500">{f("role")}</span> })}
+                            </p>
+                            {(!f("story").is_empty()).then(|| view! { <p>{f("story")}</p> })}
+                            {(!f("open").is_empty()).then(|| view! { <p class="text-xs"><span class="text-zinc-500">"Open: "</span>{f("open")}</p> })}
+                            {(!f("how").is_empty()).then(|| view! { <p class="text-xs"><span class="text-zinc-500">"You: "</span>{f("how")}</p> })}
+                            <p class="text-[11px] text-zinc-400">{format!("From {} thread{} with you, the model's reading", c["threads"].as_i64().unwrap_or(0), if c["threads"] == 1 { "" } else { "s" })}</p>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        })}
+    }
+}
+
 /// A thing's graph, its timeline by month, and "summarize what I know".
 #[component]
 pub fn ThingMore(key: String, open: RwSignal<Option<String>>) -> impl IntoView {
+    let cards_for = serde_json::json!({"id": key.clone()});
     let k1 = key.clone();
     let graph = LocalResource::new(move || {
         let k = k1.clone();
@@ -198,6 +231,7 @@ pub fn ThingMore(key: String, open: RwSignal<Option<String>>) -> impl IntoView {
         });
     };
     view! {
+        <Cards params=cards_for />
         <div class="flex items-center gap-2">
             <button class=BUTTON_QUIET disabled=move || busy.get() on:click=summarize>{move || if busy.get() { "Summarizing…" } else { "Summarize what I know" }}</button>
             <span class="text-xs text-zinc-500">"(saved as a note, marked as the model's)"</span>

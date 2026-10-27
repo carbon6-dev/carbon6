@@ -419,6 +419,7 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                     {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", day(d))}</p> })}
                     <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
                 </div>
+                {r.person.contains('@').then(|| view! { <crate::understanding::Cards params=json!({"address": r.person.clone()}) /> })}
                 <DraftCard r=r.clone() b />
                 <div class="flex flex-wrap gap-2">
                     <button class=BUTTON_QUIET on:click=move |_| act(id, "done", None)>"Done (E)"</button>

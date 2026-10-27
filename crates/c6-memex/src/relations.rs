@@ -216,7 +216,7 @@ fn times(n: i64) -> String {
 /// An address's or a domain's numbers, counted from the mail now (the
 /// index may be a minute behind; a conversation is sorted with exact
 /// history). `domain`: every address at it. Also how many addresses.
-async fn live(m: &Memex, who: &str, domain: bool) -> anyhow::Result<(Counts, i64)> {
+pub(crate) async fn live(m: &Memex, who: &str, domain: bool) -> anyhow::Result<(Counts, i64)> {
     let me = serde_json::to_string(&m.accounts().iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>())?;
     let mine = "(sent = 1 OR lower(from_addr) IN (SELECT value FROM json_each(?2)))";
     // Theirs: from the address, or from anyone at the domain.

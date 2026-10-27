@@ -57,6 +57,11 @@ async fn mail(
     c6_memex::mail::store(m, &parsed, "", &at, &labels, c6_core::now_ms() - ago).await.unwrap();
 }
 
+/// The sorting prompt asked about a conversation (by its text).
+fn about_card(asked: &[String], text: &str) -> String {
+    asked.iter().find(|a| a.contains(text) && a.contains("Sort this conversation")).cloned().unwrap_or_default()
+}
+
 #[tokio::test]
 async fn mail_and_chat_sorted_for_the_brief() {
     crate::extract_here();
@@ -242,10 +247,35 @@ async fn mail_and_chat_sorted_for_the_brief() {
         ("Loved your post", json!({"category": "pitch", "reason": "A sales sequence"})),
         ("bumping this", json!({"category": "pitch", "reason": "A sequence's follow-up"})),
         ("This week in Rust", json!({"category": "newsletter", "reason": "A weekly newsletter"})),
+        // Ana has history: before her mail is sorted, her three threads are
+        // read and her card written; then Acme's (you write to Acme), after
+        // reading Bo's thread.
+        (
+            "Write the owner's card for Ana",
+            json!({"relationship": "customer", "role": "Legal at Acme", "story": "Negotiating Acme's contract.", "open": "The redlines", "how": "Answers within a day"}),
+        ),
+        (
+            "Write the owner's card for acme.com",
+            json!({"relationship": "customer", "role": "", "story": "Acme is a customer.", "open": "", "how": ""}),
+        ),
     ] {
-        mock.push_about(about, Reply::Text(r.to_string()));
+        // Sorting (mail comes with its history; chat doesn't), or a card.
+        let kind = if about.starts_with("Write the") {
+            "Write the owner's card"
+        } else if about == "move our 1:1" {
+            "Sort this conversation"
+        } else {
+            "History with the sender"
+        };
+        mock.push_about_all(&[kind, about], Reply::Text(r.to_string()));
     }
-    budget(8).await;
+    for _ in 0..4 {
+        mock.push_about(
+            "This is an email thread",
+            Reply::Text(json!({"summary": "A thread with Acme.", "topics": [], "commitments": []}).to_string()),
+        );
+    }
+    budget(14).await;
     eventually("the model's sorting", async || (sorted("thread:acct:t7").await?.by == "model").then_some(())).await;
     let want = [
         ("thread:acct:t1", "needs_you"),
@@ -263,7 +293,14 @@ async fn mail_and_chat_sorted_for_the_brief() {
     }
     assert!(sorted("chat:T1:C9:8200.0001").await.is_none(), "a channel message not to you isn't sorted");
     let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
-    assert_eq!(asked.len(), 8, "your last word needed no model");
+    assert_eq!(asked.len(), 14, "your last word needed no model");
+    // Who Ana is came in with her mail; the cards are kept.
+    assert!(
+        about_card(&asked, "approve the redlines").contains("Ana <ana@acme.com> — customer (Legal at Acme). Negotiating Acme's contract.")
+    );
+    let cards = rpc("memex.relations.cards", json!({"address": "ana@acme.com"})).await;
+    let names: Vec<&str> = cards.as_array().unwrap().iter().map(|c| c["key"].as_str().unwrap()).collect();
+    assert_eq!(names, ["person:ana@acme.com", "org:acme.com"], "{cards}");
     assert_eq!(mock.requests()[0]["reasoning_effort"], "none", "sorting doesn't reason by default");
     // Each call shows in the activity panel: what for, about what, how it went.
     let activity: Value = http.get(format!("{api}/system/activity")).send().await.unwrap().json().await.unwrap();
@@ -279,7 +316,11 @@ async fn mail_and_chat_sorted_for_the_brief() {
         whole["prompt"].as_str().unwrap().contains("approve the redlines") && whole["text"].as_str().unwrap().contains("needs_you"),
         "{whole}"
     );
-    let about = |text: &str| asked.iter().find(|a| a.contains(text)).unwrap_or_else(|| panic!("asked about {text}")).clone();
+    // The sorting of a conversation (by its text), not its reading.
+    let about = |text: &str| {
+        let sorting = |a: &&String| a.contains("Sort this conversation") || a.contains("has never written to the sender");
+        asked.iter().filter(sorting).find(|a| a.contains(text)).unwrap_or_else(|| panic!("asked about {text}")).clone()
+    };
     assert!(about("approve the redlines").contains("Sort this conversation"));
     assert!(about("scale SDRs").contains("has never written to the sender"), "strangers get the pitch prompt");
     // Each with its history, counted from the mail, and the rules' hints.
@@ -356,7 +397,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     // Sam is someone you know after all: sorted again, as such.
     mock.push(Reply::Text(json!({"category": "fyi", "reason": "Sam shares a post"}).to_string()));
     rpc("memex.triage.mark", json!({"target": "thread:acct:t3", "mark": "known"})).await;
-    budget(9).await;
+    budget(15).await;
     eventually("Sam, sorted again", async || (sorted("thread:acct:t3").await?.category == "fyi").then_some(())).await;
     let marks = rpc("memex.triage.marks", json!({})).await;
     assert_eq!(marks.as_array().unwrap().len(), 2, "{marks}");
@@ -368,7 +409,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     assert_eq!((set["category"].as_str(), set["by"].as_str()), (Some("needs_you"), Some("you")), "{set}");
     mock.push(Reply::Text(json!({"category": "needs_you", "reason": "Bo's deploy needs your sign-off"}).to_string()));
     mail(&m, "b2", "t2", ("bo@acme.com", "Bo"), "me@mine.io", "Re: Deploy", "And the hotfix is out too.", None, &["INBOX"], HOUR / 3).await;
-    budget(10).await;
+    budget(16).await;
     eventually("Bo's, sorted again", async || (sorted("thread:acct:t2").await?.reason == "Bo's deploy needs your sign-off").then_some(()))
         .await;
     let last = mock.requests().last().unwrap()["messages"].to_string();
@@ -388,7 +429,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     ));
     mock.push(Reply::Text(json!({"same": true, "sure": true}).to_string()));
     m.store.put(&ana_chat("k3", "D7", "dm", "Did you see my email about the redlines?", HOUR / 4), "test-slack").await.unwrap();
-    budget(12).await;
+    budget(18).await;
     let joined = eventually("joined", async || {
         let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": ana})).await).ok()?;
         (r.sources.len() == 2).then_some(r)
@@ -402,7 +443,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     ));
     mock.push(Reply::Text(json!({"same": true, "sure": false}).to_string()));
     m.store.put(&ana_chat("k4", "G7", "group", "Also, can you review the Q4 budget?", HOUR / 5), "test-slack").await.unwrap();
-    budget(14).await;
+    budget(20).await;
     let maybe = eventually("possibly the same", async || {
         open("open").await.into_iter().find(|r| r.title == "Review the Q4 budget" && r.maybe_same == [ana])
     })
@@ -426,7 +467,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     mock.push(Reply::Text(
         json!({"target": "chat:T1:D9", "text": "Wednesday works. [[10:00 | 14:00]]?", "note": "Check the offsite"}).to_string(),
     ));
-    budget(15).await;
+    budget(21).await;
     let drafted = eventually("a draft", async || {
         let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
         r.draft.filter(|d| d.error.is_none())
@@ -450,7 +491,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
     mock.push(Reply::Text(json!({"category": "needs_you", "reason": "Raj asks again", "asks": "Move the 1:1 to Wednesday"}).to_string()));
     mock.push(Reply::Text(json!({"target": "chat:T1:D9", "text": "Wednesday at 14:00 it is.", "note": ""}).to_string()));
     m.store.put(&chat("k5", "D9", "dm", "Or Thursday afternoon, if that's easier", HOUR / 10, false), "test-slack").await.unwrap();
-    budget(17).await;
+    budget(23).await;
     eventually("drafted again", async || {
         let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
         (r.draft?.text == "Wednesday at 14:00 it is.").then_some(())
@@ -490,7 +531,7 @@ async fn mail_and_chat_sorted_for_the_brief() {
         HOUR / 20,
     )
     .await;
-    budget(18).await;
+    budget(24).await;
     eventually("told at once", async || {
         open("open").await.into_iter().find(|r| r.title == "Approve the rollback" && r.notified_at.is_some())
     })

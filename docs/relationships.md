@@ -134,3 +134,18 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
   The sorting prompt for known senders now allows `pitch` (except for senders you marked known). The pitch prompt treats bulk-sent selling as a pitch and a publication as a newsletter, and both prompts allow `noise`.
 - **With no model at all,** the old rules still sort what they can: automated mail is a notification, mailing lists are newsletters, sequence marks and follow-ups are pitches. Once a model is chosen, everything the rules sorted is sorted again by the model.
 - **Migration 0017** sorts the last 14 days again, except what you sorted or marked yourself.
+
+### 8.2 Step 2: cards (2026-10-27)
+
+- **The `cards` table** (`cards.rs`) is keyed `person:<address>` or `org:<domain>`. The card prompt is `memex.relations.card` (Settings → Prompts). A card records relationship, role, story, open and how, plus:
+  - the dates and number of the threads it has read;
+  - the model that wrote it;
+  - a `dirty` flag, which step 3 sets.
+- **Writing:** a card reads their twelve newest threads, or when growing, only those since the card's newest. Each thread is listed by date and subject with its summary. When the card is written on the spot, up to five unread threads are read first, through the reading walk's own reader, so their summaries are saved for everything else too. The model gets those threads, the history numbers, and the card so far when there is one.
+- **In sorting:** before a mail is sorted, the sender's card and their organization's card are used.
+  - A missing card is written on the spot when there's history: you wrote to them, or there's more than one thread with them. An organization card needs you to have written to someone there. Neither is written for automated addresses or shared providers.
+  - A card is only written on the spot when today's budget has room for it and the sorting.
+  - The cards go into the prompt under "Who they are to the owner".
+- **In drafts:** the request's person's and organization's cards, as written (none is written for a draft).
+- **Ops:** `memex.relations.cards` returns a thing's or an address's cards. `memex.relations.write` writes or grows a card now.
+- **UI:** cards show on a person's or organization's page in the memex, and next to a request in the Brief.

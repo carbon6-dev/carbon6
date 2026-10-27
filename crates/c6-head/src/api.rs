@@ -1922,7 +1922,7 @@ async fn memex_rpc(
         Some(x) if !x.trim().is_empty() => realm_for(&st, &caller, &asked).await?,
         _ => caller.memex_realm().to_owned(),
     };
-    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests."]
+    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests.", "memex.relations."]
         .iter()
         .any(|p| r.method.starts_with(p))
         || r.method.starts_with("memex.media.")

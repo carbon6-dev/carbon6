@@ -412,6 +412,16 @@ async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     // What the thread says, after the history with the sender.
     let history = crate::relations::history(m, &sender, &sender_name).await?;
     let mut text = format!("History with the sender (counted from the owner's mail):\n{history}\n");
+    // Who they are to the owner, from earlier mail (written now if missing).
+    let per_day = m.understanding().map(|(_, n)| n).unwrap_or(0);
+    let cards = crate::cards::for_sorting(m, task, per_day, &sender, &sender_name).await.unwrap_or_else(|e| {
+        warn!(%sender, "cards: {e:#}");
+        Vec::new()
+    });
+    if !cards.is_empty() {
+        let lines: Vec<String> = cards.iter().map(crate::cards::text).collect();
+        text.push_str(&format!("Who they are to the owner (from earlier mail):\n- {}\n", lines.join("\n- ")));
+    }
     if !hints.is_empty() {
         text.push_str(&format!("What the rules noticed:\n- {}\n", hints.join("\n- ")));
     }

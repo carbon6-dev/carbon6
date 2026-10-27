@@ -4,6 +4,7 @@
 //! head's `memex.*` calls. See docs/memex.md.
 
 pub mod calendar;
+pub mod cards;
 pub mod chat;
 pub mod claims;
 pub mod contacts;
@@ -868,6 +869,10 @@ impl Memex {
             m if m.starts_with("memex.requests.") => {
                 anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
                 requests::method(self, m, &params).await
+            }
+            m if m.starts_with("memex.relations.") => {
+                anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
+                cards::method(self, m, &params).await
             }
             m if m.starts_with("memex.triage.") => {
                 anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");

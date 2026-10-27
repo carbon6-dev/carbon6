@@ -108,6 +108,14 @@ async fn context(m: &Memex, r: &api::Request) -> anyhow::Result<String> {
     }
     let person = r.person.to_lowercase();
     if person.contains('@') {
+        // Who they are to the owner.
+        let cards = crate::cards::of(m, &person).await?;
+        if !cards.is_empty() {
+            out.push_str("\n## Who they are to you\n");
+            for c in &cards {
+                out.push_str(&format!("- {}\n", crate::cards::text(c)));
+            }
+        }
         // Other threads with them lately.
         let threads: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT subject, snippet, MAX(date) FROM mail WHERE (from_addr = ?1 OR to_json LIKE ?2) AND trash = 0 AND spam = 0 \

@@ -109,6 +109,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::TRIAGE,
     },
     Prompt {
+        name: "memex.relations.card",
+        description: "How a person's or organization's card is written: who they are to you, from your mail's history with them and their threads' summaries; grown as new threads come. Placeholders: {{who}}, {{history}}, {{threads}}, {{previous}}.",
+        default: text::RELATION_CARD,
+    },
+    Prompt {
         name: "memex.triage.pitch",
         description: "How mail from someone you've never written to (nor anyone at their company) is sorted: a cold pitch, a real first contact, a newsletter. It comes with the history with the sender and what the rules noticed. Placeholders: {{owner}}, {{examples}}.",
         default: text::TRIAGE_PITCH,
