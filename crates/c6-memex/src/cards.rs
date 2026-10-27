@@ -57,6 +57,20 @@ pub fn text(c: &Card) -> String {
     out
 }
 
+/// Whether an address has the history a card is for: you wrote to them,
+/// or more than one thread of theirs that isn't bulk mail (a list or a
+/// bulk-sending address you never wrote to has none).
+pub fn worth_a_card(addr: &str, c: &relations::Counts) -> bool {
+    if relations::automated(addr) {
+        return false;
+    }
+    if c.sent_to > 0 {
+        return true;
+    }
+    let bulk = relations::sending_subdomain(addr) || c.bulk * 2 >= c.received.max(1);
+    c.threads > 1 && !bulk
+}
+
 /// The card's key for an address (person) and its domain (organization;
 /// none at a shared provider).
 pub fn keys(addr: &str) -> (String, Option<String>) {
@@ -259,7 +273,7 @@ pub async fn noted(m: &Memex, account: &str, thread: &str) -> anyhow::Result<()>
         // Counted now (the index may be a minute behind).
         let (c, _) = relations::live(m, &addr, false).await?;
         let mut news = Vec::new();
-        if c.sent_to > 0 || c.threads > 1 {
+        if worth_a_card(&addr, &c) {
             news.push((person, name.clone()));
         }
         if let Some(org) = org
@@ -350,7 +364,7 @@ pub async fn for_sorting(m: &Memex, task: &Task, per_day: u32, addr: &str, name:
     let (c, _) = relations::live(m, addr, false).await?;
     let mut out = Vec::new();
     // Someone with history: you wrote to them, or more than one thread.
-    let history = c.sent_to > 0 || c.threads > 1;
+    let history = worth_a_card(addr, &c);
     for (key, wanted) in [(person, history && !relations::automated(addr)), (org.clone().unwrap_or_default(), org.is_some())] {
         if key.is_empty() {
             continue;

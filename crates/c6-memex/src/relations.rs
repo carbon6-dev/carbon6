@@ -292,6 +292,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn who_gets_a_card() {
+        let c = |sent_to, received, threads, bulk| Counts { sent_to, received, threads, bulk, ..Default::default() };
+        let card = crate::cards::worth_a_card;
+        assert!(card("ana@acme.com", &c(1, 0, 0, 0)), "you wrote to her");
+        assert!(card("sam@growfast.io", &c(0, 4, 3, 0)), "three hand-written threads");
+        assert!(!card("sam@growfast.io", &c(0, 1, 1, 0)), "one thread");
+        assert!(!card("news@weekly.dev", &c(0, 9, 9, 9)), "a list");
+        assert!(!card("team@comms.trinet.com", &c(0, 5, 5, 0)), "a bulk-sending subdomain");
+        assert!(!card("noreply@x.io", &c(2, 5, 5, 0)), "automated");
+    }
+
+    #[test]
     fn senders() {
         assert!(sending_subdomain("marc@updates.papermark.com"));
         assert!(sending_subdomain("ca@e.myfilingservices.com"));

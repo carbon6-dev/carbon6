@@ -175,3 +175,7 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
 
 - **The bug:** when conversations wait to be sorted and sorting can't make a call (no model, or no budget left as it looked), the rest of the reading loop's pass used to go on to drafts, cards and reading. A budget raised in between went to them instead of to the waiting mail.
 - **The fix:** `triage::step` now says Worked, Idle, or **Waiting**. When it says Waiting, nothing else in the pass calls the model, so the next pass sorts first.
+
+### 8.6 No cards for bulk senders (2026-10-27)
+
+A person gets a card when you wrote to them, or when they have more than one thread that isn't bulk mail. Bulk mail means a bulk-sending subdomain, or at least half of their messages carrying mailing-list headers. Automated addresses never get one. The same rule applies to sorting's on-the-spot cards and to the walk's card news (`cards::worth_a_card`). Live mail showed why: newsletters and event mailers, with many threads each, were getting cards.
