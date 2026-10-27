@@ -342,7 +342,7 @@ async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
             0,
             serde_json::json!({
                 "name": "Sending mail, invitations and chat messages needs your approval",
-                "tools": "^(mail_send|MailSend|calendar_create|CalendarCreate|calendar_rsvp|CalendarRsvp|chat_post|ChatPost)$",
+                "tools": "^(mail_send|MailSend|calendar_create|CalendarCreate|calendar_rsvp|CalendarRsvp|chat_post|ChatPost|chat_edit|ChatEdit|chat_delete|ChatDelete)$",
                 "action": "ask",
                 "message": "An agent wants to send mail, answer or send an invitation, or post in Slack in your name.",
             }),

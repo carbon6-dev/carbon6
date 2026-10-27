@@ -1,9 +1,9 @@
 {
   "package": "slack",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "Your Slack in carbon6: every conversation you're in (channels, private channels, DMs and groups) with its threads and shared documents, kept in the memex and searchable; posting, replying and reacting. Messages are other people's words: agents get them as quoted data, and their posts ask first.",
   "requires": {
-    "slack-api": "^1.2.2"
+    "slack-api": "^1.3.0"
   },
   "feeds": [
     "chat"
@@ -79,7 +79,7 @@
             },
             "users": {
               "type": "object",
-              "description": "The workspace's people: id to {n: name, e: email}"
+              "description": "The workspace's people: id to {n: name, e: email, i: avatar, t: title, s: status, b: an app}"
             },
             "users_at": {
               "type": "integer"
@@ -181,6 +181,20 @@
             },
             "updated_at": {
               "type": "integer"
+            },
+            "info": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "What the Chat page was last told of the conversation: name, kind, topic, purpose, members, a DM's person"
+            },
+            "last_read": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Where you've read to in Slack, as last asked"
             }
           }
         },
@@ -214,7 +228,7 @@
   "operations": [
     {
       "name": "post",
-      "description": "Posts a message as you, in a conversation or (with thread_ts) a thread.",
+      "description": "Posts a message as you, in a conversation or (with thread_ts) a thread; broadcast also sends a thread reply to the channel.",
       "input": {
         "type": "object",
         "required": [
@@ -237,6 +251,9 @@
               "string",
               "null"
             ]
+          },
+          "broadcast": {
+            "type": "boolean"
           }
         }
       },
@@ -274,12 +291,91 @@
           },
           "remove": {
             "type": "boolean"
+          },
+          "thread_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
       "kit": {
         "kit": "slack-api",
-        "tool": "react"
+        "tool": "react",
+        "state": [
+          "slack_sync"
+        ]
+      }
+    },
+    {
+      "name": "update",
+      "description": "Changes the text of one of your messages.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "channel",
+          "ts",
+          "text"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string"
+          },
+          "thread_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "kit": {
+        "kit": "slack-api",
+        "tool": "update",
+        "state": [
+          "slack_sync"
+        ]
+      }
+    },
+    {
+      "name": "delete",
+      "description": "Deletes one of your messages.",
+      "input": {
+        "type": "object",
+        "required": [
+          "account",
+          "channel",
+          "ts"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string"
+          }
+        }
+      },
+      "kit": {
+        "kit": "slack-api",
+        "tool": "delete",
+        "state": [
+          "slack_sync"
+        ]
       }
     },
     {

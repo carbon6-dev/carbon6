@@ -1925,6 +1925,8 @@ async fn memex_rpc(
     let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests.", "memex.relations."]
         .iter()
         .any(|p| r.method.starts_with(p))
+        // What apps' kits say about chat is theirs to write.
+        && r.method != "memex.chat.put"
         || r.method.starts_with("memex.media.")
         || matches!(
             r.method.as_str(),

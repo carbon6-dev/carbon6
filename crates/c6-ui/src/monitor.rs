@@ -373,9 +373,13 @@ fn Connector(c: Value, now: i64) -> impl IntoView {
 #[component]
 pub fn ActivityBadge() -> impl IntoView {
     let counts = RwSignal::new(Value::Null);
+    // Only the console may see it; elsewhere it stays empty, unasked.
+    let console = crate::place::is_console();
     let load = move || {
+        if !console {
+            return;
+        }
         leptos::task::spawn_local(async move {
-            // Only the console may see it; elsewhere it stays empty.
             counts.set(api::activity_counts().await.unwrap_or(Value::Null));
         });
     };

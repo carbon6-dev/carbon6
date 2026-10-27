@@ -219,6 +219,14 @@ pub async fn ingest_with(
             Err(e) => errors.push(format!("item: {e:#}")),
         }
     }
+    // A chat app's conversations and people (docs/chat.md §2.1).
+    if batch["chat"].is_object() {
+        let mut params = batch["chat"].clone();
+        params["source"] = json!(format!("app:{instance}"));
+        if let Err(e) = crate::memex::call_in(st, realm, "memex.chat.put", params).await {
+            errors.push(format!("chat: {e:#}"));
+        }
+    }
     for c in batch["claims"].as_array().into_iter().flatten() {
         match crate::claims::call(st, realm, "memex.claims.add", c.clone(), &format!("app:{instance}"), &acting).await {
             Ok(_) => done["claims"] = json!(done["claims"].as_i64().unwrap_or(0) + 1),

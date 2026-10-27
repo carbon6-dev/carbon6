@@ -172,6 +172,9 @@ pub async fn ingest(m: &Memex, params: Value) -> anyhow::Result<Value> {
     if params.get("items").is_none() {
         let item: api::MemexItemIn = serde_json::from_value(params)?;
         let id = m.store.put(&item, &item.source).await?;
+        if item.kind == "chat" {
+            crate::chat::seen(m, &item.meta, item.created_at.unwrap_or_else(c6_core::now_ms)).await?;
+        }
         return Ok(json!({"id": id}));
     }
     // The head writes its apps' kit output as the app (`as`); nobody else can.

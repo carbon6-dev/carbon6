@@ -64,6 +64,26 @@ fn display(u: &Value) -> String {
         .to_owned()
 }
 
+/// A person as the team record keeps them: name, email, avatar, title,
+/// status, and whether they're an app.
+fn entry(id: &str, u: &Value) -> Value {
+    let p = &u["profile"];
+    let status = format!("{} {}", p["status_emoji"].as_str().unwrap_or(""), p["status_text"].as_str().unwrap_or("")).trim().to_owned();
+    json!({
+        "n": Some(display(u)).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_owned()),
+        "e": p["email"].as_str().unwrap_or(""),
+        "i": p["image_48"].as_str().unwrap_or(""),
+        "t": p["title"].as_str().unwrap_or(""),
+        "s": status,
+        "b": u["is_bot"] == true,
+    })
+}
+
+/// A person for the Chat page.
+fn person(team: &str, id: &str, u: &Value) -> Value {
+    json!({"workspace": team, "id": id, "name": u["n"], "email": u["e"], "avatar": u["i"], "title": u["t"], "status": u["s"], "bot": u["b"]})
+}
+
 fn user_name(user: &str, users: &Map<String, Value>) -> String {
     users.get(user).and_then(|u| u["n"].as_str()).filter(|n| !n.is_empty()).unwrap_or(user).to_owned()
 }
@@ -116,6 +136,9 @@ pub struct Conversation {
     pub kind: String,
     /// When Slack last changed it (ms), for ordering the import.
     pub updated: i64,
+    /// What the Chat page shows of it (topic, purpose, …), from the
+    /// listing.
+    pub info: Value,
 }
 
 /// A message as a `chat` item, and its files.
@@ -180,10 +203,27 @@ pub fn item(a: &Account, team: &Value, c: &Conversation, m: &Value) -> Option<(V
     }
     if !reactions.is_empty() {
         meta["reactions"] = Value::Object(reactions);
+        let me = team["me"].as_str().unwrap_or("");
+        let mine: Vec<&str> = m["reactions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|x| x["users"].as_array().is_some_and(|u| u.iter().any(|u| u == me)))
+            .filter_map(|x| x["name"].as_str())
+            .collect();
+        if !mine.is_empty() {
+            meta["my_reactions"] = json!(mine);
+        }
+    }
+    if m["bot_id"].is_string() || m["subtype"] == "bot_message" {
+        meta["bot"] = json!(true);
     }
     if !files.is_empty() {
         meta["files"] = json!(
-            files.iter().map(|f| json!({"id": f["id"], "name": f["name"], "mime": f["mimetype"], "size": f["size"]})).collect::<Vec<_>>()
+            files
+                .iter()
+                .map(|f| json!({"id": f["id"], "name": f["name"], "mime": f["mimetype"], "size": f["size"], "url": f["permalink"]}))
+                .collect::<Vec<_>>()
         );
     }
     if m["edited"].is_object() {
@@ -277,12 +317,13 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
         let mut listed = Map::new();
         for u in &members {
             let Some(id) = u["id"].as_str() else { continue };
-            let name = Some(display(u)).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_owned());
-            let email = u["profile"]["email"].as_str().unwrap_or("");
-            listed.insert(id.to_owned(), json!({"n": name, "e": email}));
+            listed.insert(id.to_owned(), entry(id, u));
         }
         for (id, u) in &listed {
             r.things.push(json!({"kind": "person", "key": person_key(&a.team, id, &listed), "name": u["n"]}));
+        }
+        for (id, u) in users.iter().chain(&listed) {
+            r.people.push(person(&a.team, id, u));
         }
         users.extend(listed);
         team["users"] = Value::Object(users);
@@ -318,7 +359,12 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
             } else {
                 ("public", format!("#{}", c["name"].as_str().unwrap_or(&id)))
             };
-            Some(Conversation { id, name, kind: kind.into(), updated: c["updated"].as_i64().unwrap_or(0) })
+            let info = json!({
+                "name": name, "kind": kind, "topic": c["topic"]["value"].as_str().unwrap_or(""),
+                "purpose": c["purpose"]["value"].as_str().unwrap_or(""), "members": c["num_members"].as_i64(),
+                "user": c["user"].as_str(), "archived": c["is_archived"] == true,
+            });
+            Some(Conversation { id, name, kind: kind.into(), updated: c["updated"].as_i64().unwrap_or(0), info })
         })
         .collect();
     for c in &convs {
@@ -329,6 +375,15 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
             r.things.push(json!({"kind": "channel", "key": channel_key(&a.team, &c.id), "name": c.name}));
             s["name"] = json!(c.name);
             s["kind"] = json!(c.kind);
+            changed = true;
+        }
+        if s["info"] != c.info {
+            let mut v = c.info.clone();
+            v["workspace"] = json!(a.team);
+            v["workspace_name"] = team["name"].clone();
+            v["channel"] = json!(c.id);
+            r.conversations.push(v);
+            s["info"] = c.info.clone();
             changed = true;
         }
         // Made by an earlier version: read again, whole (its files aren't
@@ -539,6 +594,18 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
             }
         }
     }
+    // Where you've read to in Slack: when there's news, at the re-read,
+    // and once at first.
+    let news = pass == Pass::New && (!messages.is_empty() || s["last_read"].is_null());
+    if (news || pass == Pass::Reread)
+        && r.budget > 0
+        && let Ok(v) = r.call(a, "conversations.info", &[("channel", c.id.clone())], None).await
+        && let Some(lr) = v["channel"]["last_read"].as_str()
+        && s["last_read"].as_str() != Some(lr)
+    {
+        s["last_read"] = json!(lr);
+        r.conversations.push(json!({"workspace": a.team, "channel": c.id, "last_read": lr}));
+    }
     // The newest message read: where keeping up starts.
     let current = s["latest_ts"].as_str().map(str::to_owned);
     s["latest_ts"] = json!(match (current, newest.clone()) {
@@ -638,15 +705,15 @@ async fn learn_users(r: &mut Run, a: &Account, team: &mut Value, ids: &[String])
         r.budget = budget;
         match asked {
             Ok(v) => {
-                let u = &v["user"];
-                let name = Some(display(u)).filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone());
-                let email = u["profile"]["email"].as_str().unwrap_or("");
+                let mut u = entry(id, &v["user"]);
+                u["x"] = json!(true);
                 if !team["users"].is_object() {
                     team["users"] = json!({});
                 }
-                team["users"][id.as_str()] = json!({"n": name, "e": email, "x": true});
+                team["users"][id.as_str()] = u.clone();
                 let users = team["users"].as_object().cloned().unwrap_or_default();
-                r.things.push(json!({"kind": "person", "key": person_key(&a.team, id, &users), "name": name}));
+                r.things.push(json!({"kind": "person", "key": person_key(&a.team, id, &users), "name": u["n"]}));
+                r.people.push(person(&a.team, id, &u));
             }
             Err(e) if matches!(slack_error(&e), Some("user_not_found" | "user_not_visible")) => {
                 let mut unknown = team["unknown"].as_array().cloned().unwrap_or_default();
@@ -726,6 +793,7 @@ fn known(r: &Run, a: &Account, channel: &str) -> Conversation {
         name: s["name"].as_str().unwrap_or(channel).to_owned(),
         kind: s["kind"].as_str().unwrap_or("public").to_owned(),
         updated: 0,
+        info: Value::Null,
     }
 }
 
@@ -742,6 +810,9 @@ pub async fn post(r: &mut Run) -> anyhow::Result<()> {
     let mut body = json!({"channel": channel, "text": text});
     if let Some(t) = r.input["thread_ts"].as_str().filter(|t| !t.is_empty()) {
         body["thread_ts"] = json!(t);
+        if r.input["broadcast"] == true {
+            body["reply_broadcast"] = json!(true);
+        }
     }
     let v = r.call(&a, "chat.postMessage", &[], Some(&body)).await?;
     let team = r.record(&format!("team:{}", a.team));
@@ -759,6 +830,53 @@ pub async fn react(r: &mut Run) -> anyhow::Result<()> {
     let method = if r.input["remove"] == true { "reactions.remove" } else { "reactions.add" };
     let body = json!({"channel": input(r, "channel"), "timestamp": input(r, "ts"), "name": input(r, "name").trim_matches(':')});
     r.call(&a, method, &[], Some(&body)).await?;
+    // As it is now, so yours show at once.
+    again(r, &a).await?;
+    r.result = json!({"ok": true});
+    Ok(())
+}
+
+/// The message an operation names (`channel`, `ts`, a reply's
+/// `thread_ts`), read again and kept.
+async fn again(r: &mut Run, a: &Account) -> anyhow::Result<()> {
+    let (channel, ts, thread) = (input(r, "channel"), input(r, "ts"), input(r, "thread_ts"));
+    let one =
+        [("channel", channel.clone()), ("oldest", ts.clone()), ("latest", ts.clone()), ("inclusive", "true".into()), ("limit", "1".into())];
+    let v = if thread.is_empty() || thread == ts {
+        r.call(a, "conversations.history", &one, None).await?
+    } else {
+        let mut q = one.to_vec();
+        q.push(("ts", thread));
+        r.call(a, "conversations.replies", &q, None).await?
+    };
+    let team = r.record(&format!("team:{}", a.team));
+    let c = known(r, a, &channel);
+    if let Some(m) = v["messages"].as_array().into_iter().flatten().find(|m| m["ts"].as_str() == Some(&ts))
+        && let Some((it, _)) = item(a, &team, &c, m)
+    {
+        r.items.push(it);
+    }
+    Ok(())
+}
+
+/// `update`: your message's new text.
+pub async fn update(r: &mut Run) -> anyhow::Result<()> {
+    let a = r.account(&input(r, "account"))?;
+    let (channel, ts, text) = (input(r, "channel"), input(r, "ts"), input(r, "text"));
+    anyhow::ensure!(!channel.is_empty() && !ts.is_empty() && !text.trim().is_empty(), "update needs a channel, a ts and some text");
+    r.call(&a, "chat.update", &[], Some(&json!({"channel": channel, "ts": ts, "text": text}))).await?;
+    again(r, &a).await?;
+    r.result = json!({"ok": true});
+    Ok(())
+}
+
+/// `delete`: your message, gone (here too).
+pub async fn delete(r: &mut Run) -> anyhow::Result<()> {
+    let a = r.account(&input(r, "account"))?;
+    let (channel, ts) = (input(r, "channel"), input(r, "ts"));
+    anyhow::ensure!(!channel.is_empty() && !ts.is_empty(), "delete needs a channel and a ts");
+    r.call(&a, "chat.delete", &[], Some(&json!({"channel": channel, "ts": ts}))).await?;
+    r.deleted.push(json!({"external_id": format!("{}/{channel}/{ts}", a.team)}));
     r.result = json!({"ok": true});
     Ok(())
 }

@@ -102,7 +102,7 @@ The app's kit operations, run as the app:
   - the manifest to create the app, and its client ID and secret;
   - connected workspaces (connect, remove), and each one's import progress: channels done, messages so far, and any rate-limit wait;
   - the realm's options: keep or drop deleted messages, the file size limit.
-- **Chat** (a page in a realm's menu once the app feeds it): a new view kind, `conversations`, beside `messages`, `calendar` and `gallery`.
+- **Chat** (a page in a realm's menu once the app feeds it; now a full client, docs/chat.md): a new view kind, `conversations`, beside `messages`, `calendar` and `gallery`.
   - On the left: channels by workspace, with unread counts. In the middle: messages. A thread opens on the right.
   - A box to post or reply. Reactions; mark read.
   - It acts through the owning app's operations, like the mail client.

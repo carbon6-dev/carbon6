@@ -100,6 +100,10 @@ pub struct Run {
     pub input: Value,
     pub items: Vec<Value>,
     pub things: Vec<Value>,
+    /// What the Chat page shows of conversations and people (docs/chat.md
+    /// §2.1), each when it changed.
+    pub conversations: Vec<Value>,
+    pub people: Vec<Value>,
     pub deleted: Vec<Value>,
     /// Sync records to keep, by key.
     pub records: BTreeMap<String, Value>,
@@ -151,6 +155,8 @@ impl Run {
             input,
             items: Vec::new(),
             things: Vec::new(),
+            conversations: Vec::new(),
+            people: Vec::new(),
             deleted: Vec::new(),
             records: BTreeMap::new(),
             files: BTreeMap::new(),
@@ -231,7 +237,11 @@ impl Run {
     pub fn batch(&self) -> Value {
         let records: Vec<Value> =
             self.records.values().map(|f| json!({"collection": self.collection, "key": "key", "fields": f})).collect();
-        json!({"things": self.things, "items": self.items, "deleted": self.deleted, "records": records, "again": self.again, "errors": self.errors})
+        let mut batch = json!({"things": self.things, "items": self.items, "deleted": self.deleted, "records": records, "again": self.again, "errors": self.errors});
+        if !self.conversations.is_empty() || !self.people.is_empty() {
+            batch["chat"] = json!({"conversations": self.conversations, "people": self.people});
+        }
+        batch
     }
 }
 
@@ -257,6 +267,8 @@ pub async fn run(tool: &str, work: &Path, env: &Env) -> anyhow::Result<()> {
         "post" => sync::post(&mut r).await,
         "react" => sync::react(&mut r).await,
         "mark-read" => sync::mark_read(&mut r).await,
+        "update" => sync::update(&mut r).await,
+        "delete" => sync::delete(&mut r).await,
         other => Err(anyhow::anyhow!("no tool {other:?}")),
     };
     let out = work.join("out");

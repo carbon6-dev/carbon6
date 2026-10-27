@@ -37,6 +37,8 @@ struct S {
     /// in an import), and the reads so far.
     throttle: bool,
     replies_read: usize,
+    /// Where you've read to, by conversation.
+    last_read: HashMap<String, String>,
 }
 
 type Mock = Arc<Mutex<S>>;
@@ -47,6 +49,16 @@ fn ts(seconds_ago: i64, n: u32) -> String {
 
 fn secs(ts: &str) -> f64 {
     ts.parse().unwrap_or(0.0)
+}
+
+/// A message by conversation and ts, at the top or in a thread.
+fn find<'a>(s: &'a mut S, channel: &Value, ts: &Value) -> Option<&'a mut Value> {
+    let c = channel.as_str()?.to_owned();
+    let at_top = s.messages.get(&c).is_some_and(|l| l.iter().any(|m| m["ts"] == *ts));
+    if at_top {
+        return s.messages.get_mut(&c)?.iter_mut().find(|m| m["ts"] == *ts);
+    }
+    s.replies.iter_mut().filter(|((ch, _), _)| *ch == c).flat_map(|(_, l)| l.iter_mut()).find(|m| m["ts"] == *ts)
 }
 
 /// Answers `ok: false` the way Slack does.
@@ -72,7 +84,8 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
                             .unwrap();
                     }
                     let members = json!([
-                        {"id": "U1", "name": "ana", "profile": {"real_name": "Ana Lima", "email": "ana@acme.com"}},
+                        {"id": "U1", "name": "ana", "profile": {"real_name": "Ana Lima", "email": "ana@acme.com", "image_48": "https://avatars.test/ana.png",
+                                                                "title": "Engineer", "status_emoji": ":palm_tree:", "status_text": "away"}},
                         {"id": "U2", "name": "bo", "profile": {"real_name": "Bo", "email": ""}},
                         {"id": "UME", "name": "me", "profile": {"real_name": "Me Myself", "email": "me@acme.com"}}
                     ]);
@@ -97,7 +110,7 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
             "/api/users.conversations",
             get(|| async {
                 Json(json!({"ok": true, "channels": [
-                    {"id": "C1", "name": "eng", "is_private": false, "updated": 3},
+                    {"id": "C1", "name": "eng", "is_private": false, "updated": 3, "topic": {"value": "Shipping"}, "num_members": 3},
                     {"id": "D1", "is_im": true, "user": "U1", "updated": 2},
                     {"id": "C2", "name": "big", "is_private": false, "updated": 1}
                 ], "response_metadata": {"next_cursor": ""}}))
@@ -110,9 +123,11 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
                 let Some(all) = s.messages.get(&q["channel"]) else { return fail("channel_not_found") };
                 let oldest = q.get("oldest").map_or(0.0, |t| secs(t));
                 let latest = q.get("latest").map_or(f64::MAX, |t| secs(t));
+                let inclusive = q.get("inclusive").is_some_and(|i| i == "true");
+                let within = |t: f64| if inclusive { t >= oldest && t <= latest } else { t > oldest && t < latest };
                 let mut list: Vec<Value> = all
                     .iter()
-                    .filter(|m| secs(m["ts"].as_str().unwrap()) > oldest && secs(m["ts"].as_str().unwrap()) < latest)
+                    .filter(|m| within(secs(m["ts"].as_str().unwrap())))
                     .cloned()
                     .collect();
                 list.sort_by(|a, b| secs(b["ts"].as_str().unwrap()).total_cmp(&secs(a["ts"].as_str().unwrap())));
@@ -155,8 +170,13 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
                 let mut s = s.lock().unwrap();
                 s.posted.push(b.clone());
                 let mut message = json!({"type": "message", "user": "UME", "text": b["text"], "ts": ts(0, s.posted.len() as u32)});
-                if b["thread_ts"].is_string() {
-                    message["thread_ts"] = b["thread_ts"].clone();
+                let channel = b["channel"].as_str().unwrap_or_default().to_owned();
+                match b["thread_ts"].as_str() {
+                    Some(t) => {
+                        message["thread_ts"] = json!(t);
+                        s.replies.entry((channel, t.to_owned())).or_default().push(message.clone());
+                    }
+                    None => s.messages.entry(channel).or_default().push(message.clone()),
                 }
                 Json(json!({"ok": true, "channel": b["channel"], "ts": message["ts"], "message": message}))
             }),
@@ -164,14 +184,49 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
         .route(
             "/api/reactions.add",
             post(|State(s): State<Mock>, Json(b): Json<Value>| async move {
-                s.lock().unwrap().reactions.push(b);
+                let mut s = s.lock().unwrap();
+                if let Some(m) = find(&mut s, &b["channel"], &b["timestamp"]) {
+                    m["reactions"] = json!([{"name": b["name"], "users": ["UME"], "count": 1}]);
+                }
+                s.reactions.push(b);
                 Json(json!({"ok": true}))
+            }),
+        )
+        .route(
+            "/api/chat.update",
+            post(|State(s): State<Mock>, Json(b): Json<Value>| async move {
+                let mut s = s.lock().unwrap();
+                let Some(m) = find(&mut s, &b["channel"], &b["ts"]) else { return fail("message_not_found") };
+                m["text"] = b["text"].clone();
+                m["edited"] = json!({"user": "UME", "ts": ts(0, 70)});
+                Json(json!({"ok": true, "channel": b["channel"], "ts": b["ts"], "text": b["text"]}))
+            }),
+        )
+        .route(
+            "/api/chat.delete",
+            post(|State(s): State<Mock>, Json(b): Json<Value>| async move {
+                let mut s = s.lock().unwrap();
+                let (c, t) = (b["channel"].as_str().unwrap_or_default().to_owned(), b["ts"].clone());
+                if let Some(l) = s.messages.get_mut(&c) {
+                    l.retain(|m| m["ts"] != t);
+                }
+                Json(json!({"ok": true, "channel": c, "ts": t}))
+            }),
+        )
+        .route(
+            "/api/conversations.info",
+            get(|State(s): State<Mock>, Query(q): Query<HashMap<String, String>>| async move {
+                let s = s.lock().unwrap();
+                let read = s.last_read.get(&q["channel"]).cloned().unwrap_or_else(|| "0000000000.000000".into());
+                Json(json!({"ok": true, "channel": {"id": q["channel"], "last_read": read}}))
             }),
         )
         .route(
             "/api/conversations.mark",
             post(|State(s): State<Mock>, Json(b): Json<Value>| async move {
-                s.lock().unwrap().marked.push(b);
+                let mut s = s.lock().unwrap();
+                s.last_read.insert(b["channel"].as_str().unwrap_or_default().to_owned(), b["ts"].as_str().unwrap_or_default().to_owned());
+                s.marked.push(b);
                 Json(json!({"ok": true}))
             }),
         )
@@ -476,6 +531,9 @@ async fn slack_mirrored_into_the_memex() {
     assert_eq!(thread[0]["meta"]["user_email"], "ana@acme.com", "the person mail knows");
     rpc("memex.chat.react", json!({"workspace": "T1", "channel": "C1", "ts": m_a, "name": ":tada:"})).await;
     assert_eq!(s.lock().unwrap().reactions[0]["name"], "tada");
+    // The message as it is now: the reaction is yours.
+    let first = rpc("memex.chat.thread", json!({"workspace": "T1", "channel": "C1", "thread_ts": m_a})).await;
+    assert_eq!(first[0]["meta"]["my_reactions"], json!(["tada"]), "{first}");
 
     // An agent in a chat session: it reads the conversation, and its post
     // waits for you.
@@ -529,6 +587,65 @@ async fn slack_mirrored_into_the_memex() {
     http.post(format!("{api}/sessions/{}/approvals/{call}", session.id)).json(&json!({"allow": true})).send().await.unwrap();
     eventually("the agent's post", async || (s.lock().unwrap().posted.len() == 2).then_some(())).await;
     assert_eq!(s.lock().unwrap().posted[1]["text"], "Reviewed, looks good.");
+
+    // The Chat page as a client (docs/chat.md): conversations with their
+    // topic and a DM's person; people with avatars and status.
+    let chans = rpc("memex.chat.channels", json!({})).await;
+    let by = |c: &str| chans.as_array().unwrap().iter().find(|x| x["channel"] == c).cloned().unwrap();
+    assert_eq!((by("C1")["topic"].as_str(), by("C1")["members"].as_i64()), (Some("Shipping"), Some(3)), "{chans}");
+    assert_eq!(
+        (by("D1")["user_name"].as_str(), by("D1")["user_avatar"].as_str()),
+        (Some("Ana Lima"), Some("https://avatars.test/ana.png"))
+    );
+    let people = rpc("memex.chat.people", json!({"workspace": "T1"})).await;
+    let ana = people.as_array().unwrap().iter().find(|p| p["id"] == "U1").unwrap();
+    assert_eq!((ana["status"].as_str(), ana["title"].as_str()), (Some(":palm_tree: away"), Some("Engineer")), "{people}");
+    // Unread as Slack says (never read: the DM's message needs you); read
+    // here, and so in Slack; unread again from it.
+    let dm_ts = dm[0]["meta"]["ts"].as_str().unwrap().to_owned();
+    let dm_unread = || async {
+        rpc("memex.chat.channels", json!({})).await.as_array().unwrap().iter().find(|x| x["channel"] == "D1").cloned().unwrap()
+    };
+    let d = eventually("the DM unread", async || {
+        let d = dm_unread().await;
+        (d["unread"] == 1).then_some(d)
+    })
+    .await;
+    assert_eq!(d["mentions"], 1);
+    rpc("memex.chat.mark_read", json!({"workspace": "T1", "channel": "D1", "ts": dm_ts})).await;
+    assert_eq!(dm_unread().await["unread"], 0);
+    assert_eq!(s.lock().unwrap().last_read["D1"], dm_ts);
+    rpc("memex.chat.unread", json!({"workspace": "T1", "channel": "D1", "ts": dm_ts})).await;
+    assert_eq!(dm_unread().await["unread"], 1);
+    assert_eq!(s.lock().unwrap().last_read["D1"], "0000000000.000000");
+    // Read in Slack, and a new message: the count follows Slack.
+    {
+        let mut st = s.lock().unwrap();
+        st.last_read.insert("D1".into(), dm_ts.clone());
+        st.messages.get_mut("D1").unwrap().push(json!({"type": "message", "user": "U1", "ts": ts(2, 80), "text": "still hungry?"}));
+    }
+    assert!(http.post(format!("{api}/slack/sync")).send().await.unwrap().status().is_success());
+    eventually("Slack's read state", async || {
+        let d = dm_unread().await;
+        (d["read_ts"] == dm_ts.as_str() && d["unread"] == 1).then_some(())
+    })
+    .await;
+
+    // Your message: edited, then deleted; a thread reply also sent to the
+    // channel.
+    rpc("memex.chat.post", json!({"workspace": "T1", "channel": "C1", "text": "Typo herr"})).await;
+    let eng = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C1"})).await;
+    let typo = eng.as_array().unwrap().iter().find(|m| m["text"] == "Me Myself: Typo herr").cloned().expect("posted");
+    let typo_ts = typo["meta"]["ts"].as_str().unwrap().to_owned();
+    rpc("memex.chat.edit", json!({"workspace": "T1", "channel": "C1", "ts": typo_ts, "text": "Typo here"})).await;
+    let eng = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C1"})).await;
+    let fixed = eng.as_array().unwrap().iter().find(|m| m["meta"]["ts"] == typo_ts.as_str()).cloned().unwrap();
+    assert_eq!((fixed["text"].as_str(), fixed["meta"]["edited"].as_bool()), (Some("Me Myself: Typo here"), Some(true)), "{fixed}");
+    rpc("memex.chat.delete", json!({"workspace": "T1", "channel": "C1", "ts": typo_ts})).await;
+    let eng = rpc("memex.chat.messages", json!({"workspace": "T1", "channel": "C1"})).await;
+    assert!(!eng.as_array().unwrap().iter().any(|m| m["meta"]["ts"] == typo_ts.as_str()), "{eng}");
+    rpc("memex.chat.post", json!({"workspace": "T1", "channel": "C1", "text": "Also here", "thread_ts": m_a, "broadcast": true})).await;
+    assert_eq!(s.lock().unwrap().posted.last().unwrap()["reply_broadcast"], true);
 
     // Another realm has none of it.
     assert!(http.post(format!("{api}/realms")).json(&json!({"id": "lab"})).send().await.unwrap().status().is_success());

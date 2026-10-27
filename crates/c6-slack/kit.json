@@ -1,6 +1,6 @@
 {
   "package": "slack-api",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "Slack's Web API, for the slack app: it reaches only Slack, with the user token each run gets.",
   "permissions": {
     "files": "session",
@@ -33,14 +33,26 @@
       },
       {
         "name": "post",
-        "description": "Posts a message as you (input: account, channel, text, thread_ts).",
+        "description": "Posts a message as you (input: account, channel, text, thread_ts, broadcast).",
         "command": ["c6-slack", "post"],
         "args": {}
       },
       {
         "name": "react",
-        "description": "Adds or removes a reaction (input: account, channel, ts, name, remove).",
+        "description": "Adds or removes a reaction (input: account, channel, ts, thread_ts, name, remove).",
         "command": ["c6-slack", "react"],
+        "args": {}
+      },
+      {
+        "name": "update",
+        "description": "Changes the text of one of your messages (input: account, channel, ts, text, thread_ts).",
+        "command": ["c6-slack", "update"],
+        "args": {}
+      },
+      {
+        "name": "delete",
+        "description": "Deletes one of your messages (input: account, channel, ts).",
+        "command": ["c6-slack", "delete"],
         "args": {}
       },
       {

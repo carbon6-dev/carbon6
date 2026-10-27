@@ -118,6 +118,8 @@ fn default_kinds() -> Vec<Value> {
                     "from_me": {"type": "boolean", "description": "Posted by you"},
                     "user_email": s("Who posted it, by address (when the service says)"),
                     "mentions_me": {"type": "boolean", "description": "It mentions you"},
+                    "my_reactions": {"type": "array", "description": "The reactions on it that are yours"},
+                    "bot": {"type": "boolean", "description": "Posted by an app"},
                 }),
                 &["workspace", "channel", "ts"],
             ),
@@ -210,8 +212,8 @@ fn default_kinds() -> Vec<Value> {
 
 /// The default vocabulary's version: a new one adds the kinds that came
 /// later (3: chat) and the fields their schemas gained (4: chat's from_me,
-/// mentions_me and user_email).
-const SEEDED: &str = "4";
+/// mentions_me and user_email; 5: its my_reactions and bot).
+const SEEDED: &str = "5";
 
 /// Puts the default vocabulary in root (your edits are kept): once, and
 /// then the item kinds' schemas and cards, kinds that came later, and
