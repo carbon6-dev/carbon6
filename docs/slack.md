@@ -79,7 +79,7 @@ The kit reads them as `state/slack_sync.json` and writes back what changed.
   - for each channel with activity since its `latest_ts`, `conversations.history` with `oldest`;
   - and the replies of threads whose `latest_reply` moved.
 - **Edits and deletions:** polling doesn't see them, so the last 7 days of each active channel are read again every hour. Changed messages are updated. Ones gone from Slack are marked deleted: they stay in the memex marked so, unless the realm's setting says to drop them.
-- **Rate limits:** a 429 stops the run and records `retry_after`. Runs wait until it has passed. Each run spends at most 40 requests, within Slack's tier-3 limit of about 50 a minute for history.
+- **Rate limits:** a 429 stops the run and records `retry_after`. Runs wait until it has passed. What the run read before it is kept: a thread cut short waits in `pending`, and the page it was on is saved. Each run spends at most 40 requests, within Slack's tier-3 limit of about 50 a minute for history. While an import is under way, keeping up and the re-read take at most half of them, the conversations checked longest ago first, so the import moves on.
 - **Users:** `users.list` once a day, and whenever a message names someone unknown.
 - **Leaving:** a channel you leave stops syncing. What was synced stays (it's yours), unless you remove the account, which removes its items with it.
 

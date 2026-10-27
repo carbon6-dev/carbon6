@@ -207,7 +207,17 @@ pub async fn sync(r: &mut Run) -> anyhow::Result<()> {
     for a in r.accounts.clone() {
         r.budget = r.per_workspace;
         r.file_bytes = 0;
-        if let Err(e) = workspace(r, &a).await {
+        let done = workspace(r, &a).await;
+        // Slack slowed a pass down: what it read is kept, and the
+        // workspace waits.
+        if let (Ok(()), Some(s)) = (&done, r.limited.take()) {
+            let key = format!("team:{}", a.team);
+            let mut team = r.record(&key);
+            team["retry_after"] = json!(now_ms() + s as i64 * 1000);
+            r.save(&key, team);
+        }
+        r.limited = None;
+        if let Err(e) = done {
             let key = format!("team:{}", a.team);
             let mut team = r.record(&key);
             match e.downcast_ref::<Limited>() {
@@ -343,7 +353,15 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
     let chan = |r: &Run, c: &Conversation| r.record(&format!("chan:{}:{}", a.team, c.id));
     // 1. Keeping up: active conversations every run, the rest in turn.
     let mut live: Vec<Conversation> = convs.iter().filter(|c| chan(r, c)["latest_ts"].is_string()).cloned().collect();
-    live.sort_by_key(|c| std::cmp::Reverse(chan(r, c)["last_at"].as_i64().unwrap_or(0)));
+    // While an import is under way, keeping up takes half the budget at
+    // most (the longest unchecked first), so the import moves on.
+    let importing = convs.iter().any(|c| chan(r, c)["import_done"] != true);
+    let keep = if importing { r.per_workspace / 2 } else { 0 };
+    if importing {
+        live.sort_by_key(|c| chan(r, c)["checked_at"].as_i64().unwrap_or(0));
+    } else {
+        live.sort_by_key(|c| std::cmp::Reverse(chan(r, c)["last_at"].as_i64().unwrap_or(0)));
+    }
     for c in &live {
         let s = chan(r, c);
         let active = s["last_at"].as_i64().unwrap_or(0) > now - WEEK;
@@ -351,7 +369,7 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
         if !active && !waiting && s["checked_at"].as_i64().unwrap_or(0) > now - IDLE_EVERY {
             continue;
         }
-        if r.budget < 2 {
+        if r.budget < keep.max(2) {
             break;
         }
         conversation(r, a, &mut team, c, Pass::New).await?;
@@ -362,7 +380,7 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
         if s["last_at"].as_i64().unwrap_or(0) < now - WEEK || s["reread_at"].as_i64().unwrap_or(0) > now - r.reread_every {
             continue;
         }
-        if r.budget < 4 {
+        if r.budget < keep.max(4) {
             break;
         }
         conversation(r, a, &mut team, c, Pass::Reread).await?;
@@ -414,7 +432,7 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
         if r.budget < 2 {
             break;
         }
-        if let Some(latest) = replies(r, a, team, c, &ts, from.as_str(), files).await? {
+        if let Some(latest) = slowed(replies(r, a, team, c, &ts, from.as_str(), files).await)? {
             pending.remove(&ts);
             threads.insert(ts, json!(latest));
         }
@@ -447,6 +465,13 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
                 r.save(&key, s);
                 return Ok(());
             }
+            // Slowed down before this page: the threads read are kept.
+            Err(e) if e.is::<Limited>() && messages.is_empty() => {
+                s["threads"] = Value::Object(threads);
+                s["pending"] = Value::Object(pending);
+                r.save(&key, s);
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         messages.extend(v["messages"].as_array().cloned().unwrap_or_default());
@@ -474,7 +499,7 @@ async fn conversation(r: &mut Run, a: &Account, team: &mut Value, c: &Conversati
             if known.as_deref() == Some(latest.as_str()) {
                 continue;
             }
-            let read = if r.budget > 1 { replies(r, a, team, c, ts, known.as_deref(), files).await? } else { None };
+            let read = if r.budget > 1 { slowed(replies(r, a, team, c, ts, known.as_deref(), files).await)? } else { None };
             match read {
                 Some(l) => {
                     pending.remove(ts);
@@ -587,6 +612,14 @@ async fn replies(
         if cursor.is_empty() {
             return Ok(Some(latest));
         }
+    }
+}
+
+/// A thread's replies cut short by Slack slowing down: it waits, pending.
+fn slowed(read: anyhow::Result<Option<String>>) -> anyhow::Result<Option<String>> {
+    match read {
+        Err(e) if e.is::<Limited>() => Ok(None),
+        other => other,
     }
 }
 

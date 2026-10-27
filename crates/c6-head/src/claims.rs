@@ -209,11 +209,13 @@ fn default_kinds() -> Vec<Value> {
 }
 
 /// The default vocabulary's version: a new one adds the kinds that came
-/// later (3: chat).
-const SEEDED: &str = "3";
+/// later (3: chat) and the fields their schemas gained (4: chat's from_me,
+/// mentions_me and user_email).
+const SEEDED: &str = "4";
 
 /// Puts the default vocabulary in root (your edits are kept): once, and
-/// then the item kinds' schemas and cards, and kinds that came later.
+/// then the item kinds' schemas and cards, kinds that came later, and
+/// fields a kind's schema gained (an item with them is refused without).
 pub async fn seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let seeded: Option<String> =
         sqlx::query_scalar("SELECT value FROM settings WHERE key = 'vocabulary_seeded'").fetch_optional(pool).await?;
@@ -230,6 +232,11 @@ pub async fn seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
                 for f in ["schema", "card"] {
                     if e.get(f).is_none_or(Value::is_null) && !k[f].is_null() {
                         e[f] = k[f].clone();
+                    }
+                }
+                if let (Some(have), Some(new)) = (e["schema"]["properties"].as_object_mut(), k["schema"]["properties"].as_object()) {
+                    for (name, field) in new {
+                        have.entry(name.clone()).or_insert_with(|| field.clone());
                     }
                 }
             }

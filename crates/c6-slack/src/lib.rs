@@ -113,6 +113,9 @@ pub struct Run {
     pub per_workspace: u32,
     pub reread_every: i64,
     pub file_bytes: u64,
+    /// Slack asked to slow down (seconds): the run stops asking, keeping
+    /// what it read.
+    pub limited: Option<u64>,
 }
 
 impl Run {
@@ -158,6 +161,7 @@ impl Run {
             per_workspace: env.budget,
             reread_every: env.reread_every,
             file_bytes: 0,
+            limited: None,
         })
     }
 
@@ -182,6 +186,8 @@ impl Run {
         let resp = req.send().await?;
         if resp.status().as_u16() == 429 {
             let wait = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(60);
+            self.limited = Some(wait);
+            self.budget = 0;
             return Err(Limited(wait).into());
         }
         let status = resp.status();
@@ -200,6 +206,8 @@ impl Run {
         let resp = self.http.get(url).bearer_auth(&a.token).send().await?;
         if resp.status().as_u16() == 429 {
             let wait = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(60);
+            self.limited = Some(wait);
+            self.budget = 0;
             return Err(Limited(wait).into());
         }
         anyhow::ensure!(resp.status().is_success(), "downloading a file: {}", resp.status());

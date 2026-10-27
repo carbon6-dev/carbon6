@@ -1,9 +1,10 @@
 //! Slack as an app (docs/slack.md), against a stand-in Slack, its kit's
 //! code run in this process: installing it, the manifest and sign-in
 //! address; the import across runs, with threads, DMs, people and a shared
-//! document; a rate limit; keeping up; edits and deletions caught by the
-//! re-read; posting as you; an agent's post only after your approval; and
-//! another realm seeing none of it.
+//! document; rate limits (a run slowed down keeps what it read); keeping
+//! up; edits and deletions caught by the re-read; posting as you; an
+//! agent's post only after your approval; and another realm seeing none
+//! of it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -32,6 +33,10 @@ struct S {
     marked: Vec<Value>,
     /// Files downloaded.
     downloads: usize,
+    /// Slowing down every third thread read (Slack's rate limit, often hit
+    /// in an import), and the reads so far.
+    throttle: bool,
+    replies_read: usize,
 }
 
 type Mock = Arc<Mutex<S>>;
@@ -123,7 +128,15 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
         .route(
             "/api/conversations.replies",
             get(|State(s): State<Mock>, Query(q): Query<HashMap<String, String>>| async move {
-                let s = s.lock().unwrap();
+                let mut s = s.lock().unwrap();
+                s.replies_read += 1;
+                if s.throttle && s.replies_read % 3 == 0 {
+                    return axum::response::Response::builder()
+                        .status(429)
+                        .header("Retry-After", "0")
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
                 let parent = s.messages.get(&q["channel"]).and_then(|l| l.iter().find(|m| m["ts"] == q["ts"].as_str()).cloned());
                 let mut list: Vec<Value> = parent.into_iter().collect();
                 list.extend(s.replies.get(&(q["channel"].clone(), q["ts"].clone())).cloned().unwrap_or_default());
@@ -132,8 +145,8 @@ async fn slack(s: Mock, limited: Arc<AtomicBool>) -> String {
                 let page = if q["channel"] == "C2" { 2 } else { 200 };
                 let end = (at + page).min(list.len());
                 let more = end < list.len();
-                Json(json!({"ok": true, "messages": list[at.min(end)..end], "has_more": more,
-                            "response_metadata": {"next_cursor": if more { end.to_string() } else { String::new() }}}))
+                axum::response::IntoResponse::into_response(Json(json!({"ok": true, "messages": list[at.min(end)..end], "has_more": more,
+                            "response_metadata": {"next_cursor": if more { end.to_string() } else { String::new() }}})))
             }),
         )
         .route(
@@ -322,7 +335,10 @@ async fn slack_mirrored_into_the_memex() {
     assert!(http.post(format!("{api}/slack/sync")).send().await.unwrap().status().is_success());
     eventually("the rate limit noted", async || setup().await["workspaces"][0]["retry_after"].as_i64().map(|_| ())).await;
     assert!(!limited.load(Ordering::SeqCst));
-    // Then it imports, over several runs (each kept to its budget).
+    // Then it imports, over several runs (each kept to its budget), though
+    // Slack slows it down every third thread read: what a run read before
+    // is kept.
+    s.lock().unwrap().throttle = true;
     assert!(http.post(format!("{api}/slack/sync")).send().await.unwrap().status().is_success());
     let w = eventually("the import", async || {
         let w = setup().await["workspaces"][0].clone();
@@ -365,6 +381,7 @@ async fn slack_mirrored_into_the_memex() {
         assert_eq!(thread[2]["text"], format!("Zed Quinn: re {i}.2"), "the newest first: {thread}");
     }
     assert_eq!(setup().await["workspaces"][0]["people"], 4, "Ana, Bo, me and Zed");
+    s.lock().unwrap().throttle = false;
     // Who said it and where: Ana is the person mail knows (by email); Bo has
     // no email, so he is Slack's.
     let got: Value = http.get(format!("{api}/memex/get?id={}", eng[1]["id"].as_str().unwrap())).send().await.unwrap().json().await.unwrap();

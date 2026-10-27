@@ -234,6 +234,11 @@ fn request_realm() -> Option<String> {
 }
 
 impl Store {
+    /// The database (for tests that set up what an earlier version left).
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Ok(Self::open_reporting(path).await?.0)
     }

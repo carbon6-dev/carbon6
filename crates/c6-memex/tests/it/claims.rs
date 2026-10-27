@@ -186,3 +186,36 @@ async fn claims_are_owned_and_readers_choose() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+/// A kind's schema that gained fields since your vocabulary was seeded
+/// gets them (items with them are refused without), your edits kept.
+#[tokio::test]
+async fn a_kinds_new_fields_reach_a_seeded_vocabulary() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let pool = head.state.store.pool();
+    // As an earlier version left it: chat without from_me, and your edit.
+    let mut vocab = c6_head::lists::read(pool, "vocabulary", "root").await.unwrap();
+    let chat = vocab.iter_mut().find(|e| e["name"] == "chat" && e["kind"] == "kind").unwrap();
+    chat["schema"]["properties"].as_object_mut().unwrap().remove("from_me");
+    chat["schema"]["properties"]["user_name"]["description"] = json!("Who, as you put it");
+    c6_head::lists::write(pool, "vocabulary", "root", &vocab, "you").await.unwrap();
+    sqlx::query("UPDATE settings SET value = '3' WHERE key = 'vocabulary_seeded'").execute(pool).await.unwrap();
+    let meta = json!({"workspace": "T1", "channel": "C1", "ts": "1.0", "from_me": true});
+    let schema = c6_head::claims::kind_schema(&head.state, "chat").await.unwrap();
+    assert!(c6_head::schema::validate(&schema, &meta).is_err(), "refused before");
+
+    c6_head::claims::seed(pool).await.unwrap();
+    let schema = c6_head::claims::kind_schema(&head.state, "chat").await.unwrap();
+    assert!(c6_head::schema::validate(&schema, &meta).is_ok(), "{schema}");
+    assert_eq!(schema["properties"]["user_name"]["description"], "Who, as you put it", "your edit kept");
+}

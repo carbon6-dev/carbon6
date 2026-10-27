@@ -231,7 +231,7 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
 ### 13.5 Shared item kinds and their views (step 5)
 
 - **Item kinds in root's vocabulary:** `email`, `attachment`, `event`, `contact`, `document`, `paper`, `photo`, `video` (and `note`, `session`, `record`). Each has a `schema`, the JSON Schema of its items' `meta` (for example, an email has a `thread_id`; an event has `end` and `all_day`), and a data `card` (sources, invariants, freshness).
-  - Vocabularies seeded before this get the schemas, cards and new kinds added. Entries you changed keep your changes.
+  - Vocabularies seeded before this get the schemas, cards and new kinds added, and the fields a kind's schema gained later (an item carrying a field its schema lacks is refused). Entries you changed keep your changes.
   - A schema is checked when you save the vocabulary.
 - **Apps' items are checked:** an item in a kit's `out/ingest.json` of a kind with a schema must fit it, or it is refused, with the reason among the run's errors. Items carbon6 makes itself (the Gmail sync until step 6, extraction) already fit.
 - **View kinds** `messages` (email), `calendar` (event) and `gallery` (photo and video). Their source is `{"items": kind, "owner"?: app}`.

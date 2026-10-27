@@ -260,6 +260,9 @@ pub async fn ingest_with(
             Err(e) => errors.push(format!("record in {collection}: {e:#}")),
         }
     }
+    if let Some(first) = errors.first() {
+        tracing::warn!(realm, instance, errors = errors.len(), "ingesting: {first}");
+    }
     done["errors"] = json!(errors);
     Ok(done)
 }

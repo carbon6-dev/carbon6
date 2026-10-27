@@ -39,7 +39,7 @@ pub(crate) fn round_ran(key: &str, result: &Value) {
         r.runs += 1;
         r.items += n("items");
         r.records += n("records");
-        r.errors += n("errors");
+        r.errors += result["ingested"]["errors"].as_array().map_or(0, |e| e.len() as u64);
     }
 }
 
