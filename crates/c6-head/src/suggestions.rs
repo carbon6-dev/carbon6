@@ -204,6 +204,13 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
             .await;
     anyhow::ensure!(grant.error.is_empty(), "{}", grant.error);
     let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
+    let origin = c6_llm::activity::Origin {
+        what: "suggestion".into(),
+        about: row.title.clone(),
+        connection: connection.clone(),
+        realm: row.realm.clone(),
+    };
+    let client = c6_llm::activity::track(client, origin);
     let req = ModelRequest {
         model: model.clone(),
         system: String::new(),

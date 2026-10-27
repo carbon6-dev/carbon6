@@ -196,9 +196,9 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
         // trigger's own app, or the one it names.
         "kit" => {
             let inst = if a.owner.is_empty() { p["instance"].as_str().unwrap_or_default() } else { a.owner.as_str() };
-            let i = crate::instances::get(&st.store.pool, realm, inst)
-                .await?
-                .ok_or_else(|| bad_request(format!("a kit action names an app in realm {realm}: {{\"instance\", \"kit\", \"tool\", \"args\"}}")))?;
+            let i = crate::instances::get(&st.store.pool, realm, inst).await?.ok_or_else(|| {
+                bad_request(format!("a kit action names an app in realm {realm}: {{\"instance\", \"kit\", \"tool\", \"args\"}}"))
+            })?;
             let kit = p["kit"].as_str().unwrap_or_default();
             if !i.package.requires.contains_key(kit) {
                 return Err(bad_request(format!("the app {inst} does not require the kit {kit:?}")));
@@ -750,10 +750,12 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
             if !KIT_RUNS.lock().unwrap().insert(key.clone()) {
                 return Ok(());
             }
+            crate::activity::round_started(&key);
             let result = async {
                 for _ in 0..500 {
                     let v = crate::kitjobs::for_instance(st, &realm, inst, kit, tool, args.clone(), Default::default(), &by, &state, None)
                         .await?;
+                    crate::activity::round_ran(&key, &v);
                     if v["again"] != true {
                         break;
                     }
@@ -763,6 +765,7 @@ async fn do_action(st: &HeadState, a: &api::Automation, event: &Value) -> anyhow
             }
             .await;
             KIT_RUNS.lock().unwrap().remove(&key);
+            crate::activity::round_ended(&key, result.as_ref().err().map(|e| format!("{e:#}")));
             result?;
         }
         "notify" => {

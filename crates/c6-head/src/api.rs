@@ -171,6 +171,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/system/updates", get(get_updates))
+        .route("/api/v1/system/activity", get(get_activity))
+        .route("/api/v1/system/activity/counts", get(get_activity_counts))
+        .route("/api/v1/system/activity/calls/{id}", get(get_activity_call))
         .route("/api/v1/version", get(get_version))
         .route("/api/v1/elsewhere", get(get_elsewhere))
         .route("/api/v1/locate/sessions/{id}", get(locate_session))
@@ -1819,6 +1822,21 @@ async fn get_version() -> Json<serde_json::Value> {
 }
 
 /// Updating carbon6 from GitHub releases (docs/updates.md).
+async fn get_activity(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::activity::get(&st).await?))
+}
+
+async fn get_activity_counts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(crate::activity::counts(&st).await?))
+}
+
+async fn get_activity_call(State(st): State<Arc<HeadState>>, Path(id): Path<u64>) -> ApiResult<Json<serde_json::Value>> {
+    crate::activity::call(&st, id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such call (they're kept in memory, the last 200)".into()))
+}
+
 async fn get_updates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::Updates>> {
     Ok(Json(crate::updates::status(&st).await?))
 }
@@ -1904,27 +1922,28 @@ async fn memex_rpc(
         Some(x) if !x.trim().is_empty() => realm_for(&st, &caller, &asked).await?,
         _ => caller.memex_realm().to_owned(),
     };
-    let ok =
-        ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests."].iter().any(|p| r.method.starts_with(p))
-            || r.method.starts_with("memex.media.")
-            || matches!(
-                r.method.as_str(),
-                "memex.google"
-                    | "memex.google_sync"
-                    | "memex.feeds"
-                    | "memex.commitments"
-                    | "memex.commitment"
-                    | "memex.review"
-                    | "memex.review_decide"
-                    | "memex.merge"
-                    | "memex.summarize"
-                    | "memex.graph"
-                    | "memex.months"
-                    | "memex.timeline"
-                    | "memex.related"
-                    | "memex.ingest"
-                    | "memex.types"
-            );
+    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests."]
+        .iter()
+        .any(|p| r.method.starts_with(p))
+        || r.method.starts_with("memex.media.")
+        || matches!(
+            r.method.as_str(),
+            "memex.google"
+                | "memex.google_sync"
+                | "memex.feeds"
+                | "memex.commitments"
+                | "memex.commitment"
+                | "memex.review"
+                | "memex.review_decide"
+                | "memex.merge"
+                | "memex.summarize"
+                | "memex.graph"
+                | "memex.months"
+                | "memex.timeline"
+                | "memex.related"
+                | "memex.ingest"
+                | "memex.types"
+        );
     if !ok {
         return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
     }

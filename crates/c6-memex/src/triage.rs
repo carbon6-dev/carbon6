@@ -313,14 +313,22 @@ async fn examples(m: &Memex, kind: &str) -> anyhow::Result<String> {
 }
 
 /// Asks the model to sort a conversation with `prompt`.
-async fn ask(m: &Memex, task: &crate::llm::Task, prompt: &str, kind: &str, text: &str, allowed: &[&str]) -> anyhow::Result<Sorted> {
+async fn ask(
+    m: &Memex,
+    task: &crate::llm::Task,
+    about: &str,
+    prompt: &str,
+    kind: &str,
+    text: &str,
+    allowed: &[&str],
+) -> anyhow::Result<Sorted> {
     let owner: Vec<String> = m.accounts().iter().map(|a| a.email.clone()).collect();
     let owner = if owner.is_empty() { "the owner".to_owned() } else { owner.join(", ") };
     let rule = m.prompt("memex.triage.urgent", api::prompts::TRIAGE_URGENT);
     let ask = api::prompts::fill(prompt, &[("owner", &owner), ("examples", &examples(m, kind).await?), ("urgent", &rule)]);
     let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
     crate::understand::count_call(m).await?;
-    let answer = llm::ask(&m.link, task, &system, vec![Block::Text(format!("{ask}\n\n{text}"))], 400).await?;
+    let answer = llm::ask(m, task, "sorting", about, &system, vec![Block::Text(format!("{ask}\n\n{text}"))], 400).await?;
     let v = llm::json_of(&answer)?;
     let category = v["category"].as_str().unwrap_or("").trim().to_lowercase();
     let category = if allowed.contains(&category.as_str()) { category } else { "fyi".to_owned() };
@@ -394,7 +402,7 @@ async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
         let Some(task) = task else { return Ok(false) };
         let prompt = m.prompt("memex.triage", api::prompts::TRIAGE);
         let allowed = ["needs_you", "fyi", "newsletter", "notification", "noise"];
-        return done(ask(m, task, &prompt, "mail", &text, &allowed).await?).await;
+        return done(ask(m, task, &subject, &prompt, "mail", &text, &allowed).await?).await;
     }
     // A stranger: a sequence tool's marks in what they sent, or a
     // sequence's follow-up, settle it.
@@ -417,7 +425,7 @@ async fn mail(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     let Some(task) = task else { return Ok(false) };
     let prompt = m.prompt("memex.triage.pitch", api::prompts::TRIAGE_PITCH);
     let allowed = ["pitch", "first_contact", "fyi", "newsletter", "notification"];
-    done(ask(m, task, &prompt, "mail", &text, &allowed).await?).await
+    done(ask(m, task, &subject, &prompt, "mail", &text, &allowed).await?).await
 }
 
 /// A chat conversation (people in your workspace are known to you).
@@ -479,7 +487,7 @@ async fn chat(m: &Memex, key: &str, task: Option<&crate::llm::Task>) -> anyhow::
     }
     let prompt = m.prompt("memex.triage", api::prompts::TRIAGE);
     let allowed = ["needs_you", "fyi", "notification", "noise"];
-    let s = ask(m, task, &prompt, "chat", &clip(&text, MAX_INPUT), &allowed).await?;
+    let s = ask(m, task, &name, &prompt, "chat", &clip(&text, MAX_INPUT), &allowed).await?;
     settle(m, key, "chat", &s, &sender, &sender_name, &name, at, Some(task)).await
 }
 

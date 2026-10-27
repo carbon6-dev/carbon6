@@ -1,6 +1,7 @@
 //! Model clients and the provider-neutral conversation model.
 
 mod accumulate;
+pub mod activity;
 pub mod anthropic;
 mod http;
 pub mod models;

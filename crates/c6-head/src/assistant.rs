@@ -401,6 +401,7 @@ impl Actor {
         let (st, sink, inbox, env, c, connection_id) =
             (self.st.clone(), self.sink.clone(), self.inbox.clone(), self.env.clone(), cancel.clone(), self.model.connection_id.clone());
         sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
+        let session_id = self.session_id.clone();
         let task = tokio::spawn(async move {
             let dyn_sink: Arc<dyn EventSink> = sink.clone();
             let result = async {
@@ -422,7 +423,16 @@ impl Actor {
                 )
                 .await;
                 let client = if grant.error.is_empty() {
-                    c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers).map_err(|e| e.to_string())
+                    let title = st.store.session(&session_id).await.ok().flatten().map(|r| r.title).filter(|t| !t.is_empty());
+                    let origin = c6_llm::activity::Origin {
+                        what: "assistant".into(),
+                        about: title.unwrap_or_else(|| session_id.clone()),
+                        connection: connection_id.clone(),
+                        realm: env.realm.clone(),
+                    };
+                    c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers)
+                        .map(|c| c6_llm::activity::track(c, origin))
+                        .map_err(|e| e.to_string())
                 } else {
                     Err(grant.error)
                 };

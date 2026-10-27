@@ -1,12 +1,11 @@
 //! Asking a model (the understanding task's, or the vision task's), once,
 //! through one of carbon6's connections.
 
-use std::sync::Arc;
-
 use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
-use c6_worker::link::HeadLink;
 use futures_util::StreamExt;
 use serde_json::Value;
+
+use crate::Memex;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Task {
@@ -17,10 +16,26 @@ pub struct Task {
 }
 
 /// The model's text answer to `system` and the user's blocks (text and
-/// images).
-pub async fn ask(link: &Arc<HeadLink>, task: &Task, system: &str, user: Vec<Block>, max_tokens: u32) -> anyhow::Result<String> {
-    let grant = link.credential(&task.connection_id).await?;
+/// images); `what` it's for and what it's `about` show in the activity
+/// panel.
+pub async fn ask(
+    m: &Memex,
+    task: &Task,
+    what: &str,
+    about: &str,
+    system: &str,
+    user: Vec<Block>,
+    max_tokens: u32,
+) -> anyhow::Result<String> {
+    let grant = m.link.credential(&task.connection_id).await?;
     let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
+    let origin = c6_llm::activity::Origin {
+        what: what.to_owned(),
+        about: about.to_owned(),
+        connection: task.connection_id.clone(),
+        realm: m.realm.clone(),
+    };
+    let client = c6_llm::activity::track(client, origin);
     let req = ModelRequest {
         model: task.model.clone(),
         system: system.to_owned(),

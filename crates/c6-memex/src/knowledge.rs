@@ -510,7 +510,7 @@ pub async fn page_step(m: &Memex) -> anyhow::Result<bool> {
     let template = m.prompt("memex.page", api::prompts::PAGE);
     let prompt = api::prompts::fill(&template, &[("name", &name), ("key", &key), ("facts", &lines.join("\n"))]);
     let system = m.prompt("memex.page.system", api::prompts::PAGE_SYSTEM);
-    let page = crate::llm::ask(&m.link, &task, &system, vec![c6_llm::Block::Text(prompt)], 3000).await?;
+    let page = crate::llm::ask(m, &task, "page", &name, &system, vec![c6_llm::Block::Text(prompt)], 3000).await?;
     sqlx::query("UPDATE things SET page = ?, page_at = ? WHERE id = ?")
         .bind(page.trim())
         .bind(now)

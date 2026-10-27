@@ -20,6 +20,7 @@ mod labels;
 mod mail;
 mod markdown;
 mod memex;
+mod monitor;
 mod models;
 mod notify;
 mod outputs;
@@ -110,10 +111,12 @@ fn Main() -> impl IntoView {
                             <decisions::DecisionLink class=NAV />
                             <NavLink to=View::Workers label="Workers" />
                             <NavLink to=View::Analytics label="Analytics" />
+                            <NavLink to=View::Activity label="Activity" />
                             <NavLink to=View::Usage label="Spending" />
                             <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
                         </nav>
                         <span class="flex-1"></span>
+                        <monitor::ActivityBadge />
                         <assistant::AskButton />
                     }.into_any()
                 } else {
@@ -136,6 +139,7 @@ fn Main() -> impl IntoView {
                         </nav>
                         <span class="flex-1"></span>
                         <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
+                        <monitor::ActivityBadge />
                         <assistant::AskButton />
                         <span class="hidden md:contents"><search::SearchBox /></span>
                     }.into_any()
@@ -228,6 +232,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                         <decisions::DecisionLink class=MENU />
                         <Go to=View::Workers class=MENU>"Workers"</Go>
                         <Go to=View::Analytics class=MENU>"Analytics"</Go>
+                        <Go to=View::Activity class=MENU>"Activity"</Go>
                         <Go to=View::Usage class=MENU>"Spending"</Go>
                         <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                     </div>

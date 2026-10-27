@@ -257,6 +257,20 @@ async fn mail_and_chat_sorted_for_the_brief() {
     let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
     assert_eq!(asked.len(), 5, "rules needed no model");
     assert_eq!(mock.requests()[0]["reasoning_effort"], "none", "sorting doesn't reason by default");
+    // Each call shows in the activity panel: what for, about what, how it went.
+    let activity: Value = http.get(format!("{api}/system/activity")).send().await.unwrap().json().await.unwrap();
+    let call = activity["calls"].as_array().unwrap().iter().find(|c| c["what"] == "sorting" && c["about"] == "Redlines").cloned();
+    let call = call.unwrap_or_else(|| panic!("the sorting of Ana's mail in {activity}"));
+    assert_eq!(
+        (call["state"].as_str(), call["connection_name"].as_str(), call["effort"].as_str()),
+        (Some("done"), Some("m"), Some("none"))
+    );
+    assert!(call.get("prompt").is_none(), "the list leaves the text out");
+    let whole: Value = http.get(format!("{api}/system/activity/calls/{}", call["id"])).send().await.unwrap().json().await.unwrap();
+    assert!(
+        whole["prompt"].as_str().unwrap().contains("approve the redlines") && whole["text"].as_str().unwrap().contains("needs_you"),
+        "{whole}"
+    );
     let about = |text: &str| asked.iter().find(|a| a.contains(text)).unwrap_or_else(|| panic!("asked about {text}")).clone();
     assert!(about("approve the redlines").contains("Sort this conversation"));
     assert!(about("scale SDRs").contains("never corresponded"), "strangers get the pitch prompt");

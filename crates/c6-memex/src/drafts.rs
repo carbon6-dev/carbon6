@@ -65,7 +65,7 @@ pub async fn draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<api::
     let prompt = api::prompts::fill(&template, &[("request", &request), ("context", &clip(&context, MAX_CONTEXT))]);
     let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
     crate::understand::count_call(m).await?;
-    let v = llm::json_of(&llm::ask(&m.link, task, &system, vec![Block::Text(prompt)], 1500).await?)?;
+    let v = llm::json_of(&llm::ask(m, task, "draft", &r.title, &system, vec![Block::Text(prompt)], 1500).await?)?;
     let text = v["text"].as_str().unwrap_or("").trim().to_owned();
     anyhow::ensure!(!text.is_empty(), "the model wrote no draft");
     // Where to answer: one of its conversations (the latest, if the model

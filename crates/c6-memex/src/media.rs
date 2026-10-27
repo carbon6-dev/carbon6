@@ -439,7 +439,7 @@ async fn see(m: &Memex, task: &Task, version: &str, r: &sqlx::sqlite::SqliteRow)
     let intro = if r.get::<String, _>("kind") == "video" { "These are frames from one video, in order. " } else { "" };
     blocks.push(Block::Text(format!("{intro}{}", m.prompt("memex.look", LOOK))));
     let system = m.prompt("memex.look.system", api::prompts::LOOK_SYSTEM);
-    let answer = llm::ask(&m.link, task, &system, blocks, 2500).await?;
+    let answer = llm::ask(m, task, "vision", &id, &system, blocks, 2500).await?;
     let v = llm::json_of(&answer)?;
     let s = |k: &str| v[k].as_str().unwrap_or("").trim().to_owned();
     let (caption, scene, seen_text) = (s("caption"), s("scene"), s("text"));

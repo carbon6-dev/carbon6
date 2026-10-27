@@ -330,6 +330,10 @@ carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail
 
 Each realm can mirror Slack workspaces into its memex, as it does Gmail: every conversation you're in (channels, private channels, DMs and groups), with threads and shared documents, kept current within minutes (edits and deletions too), searchable, and linked to the people your mail knows. **Settings → Slack** walks you through making your own internal Slack app from a manifest (it keeps Slack's normal rate limits, which apps from outside Slack's directory don't), then connecting workspaces. **Chat** (☰) reads conversations and threads, and posts, replies and reacts as you, with a few seconds to undo. Agents in sessions whose memex scope includes `chat` can read conversations and post; their posts wait for your approval. Design: [docs/slack.md](docs/slack.md).
 
+### Activity
+
+The console's **Activity** page shows what carbon6 is doing now: each model call as it streams (what it's for, the model, how long, tokens per second, and its prompt and answer when you click it), sessions running, each connector's sync (mail, calendar, contacts, Slack: the round under way, each account's state, rate limits) and the memex's work. A dot in the top bar says when anything is in flight. It's kept in memory only. Design: [docs/activity.md](docs/activity.md).
+
 ### The brief
 
 The **Brief** (☰ or Apps) is Mail & chat's home. Instead of 200 messages, you get the handful of things people need from you. Design: [docs/brief.md](docs/brief.md).

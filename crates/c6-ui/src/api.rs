@@ -609,6 +609,19 @@ pub async fn updates() -> Result<c6_api::Updates, String> {
     json(Request::get("/api/v1/system/updates").send().await).await
 }
 
+/// The activity panel: model calls, sessions running, connectors' syncs.
+pub async fn activity() -> Result<serde_json::Value, String> {
+    json(Request::get("/api/v1/system/activity").send().await).await
+}
+
+pub async fn activity_counts() -> Result<serde_json::Value, String> {
+    json(Request::get("/api/v1/system/activity/counts").send().await).await
+}
+
+pub async fn activity_call(id: u64) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/system/activity/calls/{id}")).send().await).await
+}
+
 pub async fn check_updates() -> Result<c6_api::Updates, String> {
     send_json(Request::post("/api/v1/system/updates/check"), &serde_json::json!({})).await
 }
