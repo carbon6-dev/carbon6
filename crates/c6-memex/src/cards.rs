@@ -295,9 +295,41 @@ pub async fn noted(m: &Memex, account: &str, thread: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Removes the cards of people who aren't worth one (written before the
+/// rule left out bulk senders), and their news. Once. How many went.
+pub async fn prune(m: &Memex) -> anyhow::Result<usize> {
+    let done: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memex_once WHERE name = 'prune-bulk-cards')").fetch_one(&m.store.pool).await?;
+    if done {
+        return Ok(0);
+    }
+    let keys: Vec<String> =
+        sqlx::query_scalar("SELECT key FROM cards WHERE key LIKE 'person:%' UNION SELECT key FROM card_news WHERE key LIKE 'person:%'")
+            .fetch_all(&m.store.pool)
+            .await?;
+    let mut gone = 0;
+    for key in keys {
+        let addr = key.trim_start_matches("person:");
+        let (c, _) = relations::live(m, addr, false).await?;
+        if !worth_a_card(addr, &c) {
+            sqlx::query("DELETE FROM cards WHERE key = ?").bind(&key).execute(&m.store.pool).await?;
+            sqlx::query("DELETE FROM card_news WHERE key = ?").bind(&key).execute(&m.store.pool).await?;
+            gone += 1;
+        }
+    }
+    sqlx::query("INSERT INTO memex_once (name, at) VALUES ('prune-bulk-cards', ?)").bind(c6_core::now_ms()).execute(&m.store.pool).await?;
+    if gone > 0 {
+        tracing::info!(gone, "cards of bulk senders removed");
+    }
+    Ok(gone)
+}
+
 /// Folds the walk's news into one card: the person or organization most
 /// recently active. Whether it did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
+    if let Err(e) = prune(m).await {
+        warn!("removing bulk senders' cards: {e:#}");
+    }
     let Some((task, per_day)) = m.understanding() else { return Ok(false) };
     if crate::understand::budget_left(m, per_day).await? == 0 {
         return Ok(false);

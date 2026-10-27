@@ -127,6 +127,34 @@ async fn the_walk_grows_cards_back_through_time() {
     assert_eq!(asked.len(), 9, "three reads, three times two cards");
     let last_card = asked.iter().rfind(|a| a.contains("Write the owner's card for Dana")).unwrap();
     assert!(last_card.contains("The card so far") && last_card.contains("Globex signed the first deal."), "{last_card}");
+    // A card written for a newsletter before the rule (its news too) is
+    // removed, once; Dana's stays.
+    sqlx::query("DELETE FROM memex_once").execute(&m.store.pool).await.unwrap();
+    for i in 0..3 {
+        mail(
+            &m,
+            &format!("n{i}"),
+            &format!("news{i}"),
+            ("hi@news.example", "News"),
+            "me@mine.io",
+            "Issue",
+            "This week.",
+            false,
+            (300 + i) * DAY,
+        )
+        .await;
+    }
+    sqlx::query("UPDATE mail SET list = 1 WHERE from_addr = 'hi@news.example'").execute(&m.store.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO cards (key, name, card, threads, model, updated_at) VALUES ('person:hi@news.example', 'News', '{}', 3, 'm', 0)",
+    )
+    .execute(&m.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(c6_memex::cards::prune(&m).await.unwrap(), 1);
+    assert!(c6_memex::cards::get(&m, "person:hi@news.example").await.unwrap().is_none());
+    assert!(c6_memex::cards::get(&m, "person:dana@globex.com").await.unwrap().is_some());
+    assert_eq!(c6_memex::cards::prune(&m).await.unwrap(), 0, "once");
     let progress = rpc("memex.relations.progress", json!({})).await;
     assert_eq!(
         (progress["cards"].as_i64(), progress["threads_read"].as_i64(), progress["cards_waiting"].as_i64()),

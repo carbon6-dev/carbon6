@@ -178,4 +178,4 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
 
 ### 8.6 No cards for bulk senders (2026-10-27)
 
-A person gets a card when you wrote to them, or when they have more than one thread that isn't bulk mail. Bulk mail means a bulk-sending subdomain, or at least half of their messages carrying mailing-list headers. Automated addresses never get one. The same rule applies to sorting's on-the-spot cards and to the walk's card news (`cards::worth_a_card`). Live mail showed why: newsletters and event mailers, with many threads each, were getting cards.
+A person gets a card when you wrote to them, or when they have more than one thread that isn't bulk mail. Bulk mail means a bulk-sending subdomain, or at least half of their messages carrying mailing-list headers. Automated addresses never get one. The same rule applies to sorting's on-the-spot cards and to the walk's card news (`cards::worth_a_card`). Live mail showed why: newsletters and event mailers, with many threads each, were getting cards. Cards written before the rule are removed once, with their news (`cards::prune`, recorded in `memex_once`).
