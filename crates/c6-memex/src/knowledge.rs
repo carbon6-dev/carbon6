@@ -491,6 +491,8 @@ pub async fn for_brief(m: &Memex, keys: &[String], labels: &[String], max: usize
 /// Writes system pages from their facts (with the understanding model),
 /// one per call. Whether it did one.
 pub async fn page_step(m: &Memex) -> anyhow::Result<bool> {
+    // One step writes pages at a time.
+    let Some(_claim) = m.claim("pages") else { return Ok(false) };
     let Some((task, per_day)) = m.understanding() else { return Ok(false) };
     if crate::understand::budget_left(m, per_day).await? == 0 {
         return Ok(false);

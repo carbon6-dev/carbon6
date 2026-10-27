@@ -241,6 +241,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
     {
         return Err(bad_request("faces need both models: a detector and an embedder"));
     }
+    if s.calls_at_once.is_some_and(|n| n == 0 || n > MAX_AT_ONCE) {
+        return Err(bad_request(format!("calls at once is 1 to {MAX_AT_ONCE}")));
+    }
     if s.calls_per_day == Some(0) {
         return Err(bad_request("calls a day: at least 1 (or leave the model unset to turn it off)"));
     }
@@ -269,6 +272,9 @@ pub fn check_scopes(scopes: &[api::MemexScope]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// The most model calls understanding may make side by side.
+pub const MAX_AT_ONCE: u32 = 8;
 
 /// What the memex asks for at start: its models, with each connection's id
 /// (it fetches credentials for them like a worker does).
@@ -300,6 +306,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "vision": task(&s.vision),
         "transcription": task(&s.transcription),
         "calls_per_day": s.calls_per_day.unwrap_or(500),
+        "calls_at_once": s.calls_at_once.unwrap_or(1).clamp(1, crate::memex::MAX_AT_ONCE),
         "places_file": s.places_file,
         "face_detector": s.face_detector,
         "face_embedder": s.face_embedder,

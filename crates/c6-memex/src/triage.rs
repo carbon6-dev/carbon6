@@ -46,6 +46,8 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         None => false,
     };
     for t in waiting(m).await? {
+        // Another step is sorting it.
+        let Some(_claim) = m.claim(&format!("sort:{}", t.key)) else { continue };
         let done = match t.kind {
             "mail" => mail(m, &t.key, can_ask.then(|| model.as_ref().map(|(task, _)| task)).flatten()).await,
             _ => chat(m, &t.key, can_ask.then(|| model.as_ref().map(|(task, _)| task)).flatten()).await,

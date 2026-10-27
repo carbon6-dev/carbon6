@@ -493,6 +493,7 @@ pub fn MemexSettings() -> impl IntoView {
     let tasks: [ModelTask; 3] = ["understanding", "vision", "transcription"]
         .map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new())));
     let per_day = RwSignal::new(String::new());
+    let at_once = RwSignal::new(String::new());
     // Files on the head's machine: places, face models.
     let files: [(&'static str, RwSignal<String>); 3] =
         ["places_file", "face_detector", "face_embedder"].map(|k| (k, RwSignal::new(String::new())));
@@ -509,6 +510,7 @@ pub fn MemexSettings() -> impl IntoView {
                 e.set(v[k]["effort"].as_str().unwrap_or_default().to_owned());
             }
             per_day.set(v["calls_per_day"].as_u64().map(|n| n.to_string()).unwrap_or_default());
+            at_once.set(v["calls_at_once"].as_u64().map(|n| n.to_string()).unwrap_or_default());
             for (k, f) in files {
                 f.set(v[k].as_str().unwrap_or_default().to_owned());
             }
@@ -537,6 +539,9 @@ pub fn MemexSettings() -> impl IntoView {
         }
         if let Ok(n) = per_day.get_untracked().trim().parse::<u32>() {
             v["calls_per_day"] = n.into();
+        }
+        if let Ok(n) = at_once.get_untracked().trim().parse::<u32>() {
+            v["calls_at_once"] = n.into();
         }
         for (k, f) in files {
             let path = f.get_untracked().trim().to_owned();
@@ -632,6 +637,10 @@ pub fn MemexSettings() -> impl IntoView {
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Model calls a day"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />
+                </label>
+                <label class="space-y-0.5" title="Model calls understanding makes side by side (1 to 8). With more than one, new mail keeps one for itself. A local Ollama answers one at a time unless started with OLLAMA_NUM_PARALLEL.">
+                    <span class="text-xs text-zinc-500">"Calls at once"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="1" prop:value=move || at_once.get() on:input=move |ev| at_once.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
                     <span class="text-xs text-zinc-500">"Brief size (characters)"</span>

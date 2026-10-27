@@ -82,7 +82,7 @@ Both the walk and the cards keep their place, so a restart continues where it le
 
 ## 5. Calls at once
 
-Each realm's loop makes one model call at a time. A local server answers one at a time unless it's told otherwise (`OLLAMA_NUM_PARALLEL`). A connection setting, **calls at once** (default 1), will let the loop run that many steps side by side. Sorting new mail always keeps one slot for itself.
+Each realm's loop makes one model call at a time by default. A local server answers one at a time unless it's told otherwise (`OLLAMA_NUM_PARALLEL`). **Calls at once** (Settings → Memex, 1 to 8) lets the loop run that many steps side by side, and sorting new mail always keeps one of them for itself.
 
 ## 6. Cost, on a local model at about 5 s a call
 
@@ -112,7 +112,7 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
    - Finished threads mark their people's cards for an update.
    - Card updates run in the loop (section 4).
    - Progress shows on the Activity page.
-4. **Calls at once:** the connection setting, and a loop that runs that many steps side by side.
+4. **Calls at once:** the setting, and a loop that runs that many steps side by side.
 
 ## 8. As built
 
@@ -161,3 +161,12 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
   A card written on the spot takes in its threads' news as it's written.
 - **The card step** runs in the reading loop after drafts and before reading. It takes the person or organization with the most recent news, folds in up to twelve news threads (with the card so far), and clears them. The walk reads newest first, so cards grow back through time. A failed fold clears its news, so it isn't retried in a loop.
 - **Progress:** `memex.relations.progress` reports threads read of all readable threads, the oldest date read back to, cards, cards waiting to take in news, and correspondents. The Activity page shows it for each realm. On a mailbox of 54,000 messages there are about 18,000 readable threads; the query takes about 40 ms.
+
+### 8.4 Step 4: calls at once (2026-10-27)
+
+- **The setting** is Settings → Memex → **Calls at once** (`calls_at_once`, 1 to 8, default 1). It lives with the memex's other model settings rather than on the connection: the memex is what runs calls side by side, and connections have no edit path.
+- **Lanes:** the reading loop runs as eight lanes, of which the first *calls at once* are active.
+  - With one lane, it does everything in order: sorting, drafts, cards, reading, pages.
+  - With more, lane 0 only sorts and drafts, so new mail never waits behind the walk. The other lanes do everything.
+- **Claims:** steps side by side never take the same work. Each step claims what it works on (`sort:`, `draft:`, `card:`, `read:`, and `pages`) in memory, and gives it back when done. Reading picks the newest unclaimed thread. A card being written by one step is used as it is by another step's sorting. A thread being read by one step isn't read again on the spot by another.
+- **Budget:** each lane checks the daily budget before its call, so lanes side by side may overshoot it by up to *calls at once* − 1.

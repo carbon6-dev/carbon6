@@ -28,15 +28,16 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     }
     // Needs you, open, never drafted or drafted before its news; the soonest
     // due first, then the newest.
-    let id: Option<i64> = sqlx::query_scalar(
+    let ids: Vec<i64> = sqlx::query_scalar(
         "SELECT r.id FROM requests r WHERE r.category = 'needs_you' AND (r.status = 'open' OR (r.status = 'snoozed' AND r.until <= ?1)) \
          AND (r.drafted_at IS NULL OR r.drafted_at < (SELECT MAX(noted_at) FROM request_sources s WHERE s.request_id = r.id)) \
-         ORDER BY r.due IS NULL, r.due, r.updated_at DESC LIMIT 1",
+         ORDER BY r.due IS NULL, r.due, r.updated_at DESC LIMIT 10",
     )
     .bind(c6_core::now_ms())
-    .fetch_optional(&m.store.pool)
+    .fetch_all(&m.store.pool)
     .await?;
-    let Some(id) = id else { return Ok(false) };
+    // The first no other step is drafting.
+    let Some((id, _claim)) = ids.into_iter().find_map(|id| m.claim(&format!("draft:{id}")).map(|c| (id, c))) else { return Ok(false) };
     if let Err(e) = draft(m, &task, id).await {
         warn!(id, "drafting: {e:#}");
         // Not again until the conversation has news.

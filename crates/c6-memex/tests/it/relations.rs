@@ -134,3 +134,59 @@ async fn the_walk_grows_cards_back_through_time() {
         "{progress}"
     );
 }
+
+#[tokio::test]
+async fn lanes_side_by_side_never_take_the_same_thread() {
+    crate::extract_here();
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    // Old mail from six strangers (nothing to sort, no cards): six threads.
+    for i in 0..6 {
+        let from = format!("p{i}@firm{i}.com");
+        mail(&m, &format!("x{i}"), &format!("t{i}"), (&from, "P"), "me@mine.io", &format!("Topic {i}"), "Hello.", false, (30 + i) * DAY)
+            .await;
+        mock.push_about("This is an email thread", Reply::Text(json!({"summary": "A note.", "topics": [], "commitments": []}).to_string()));
+    }
+    let r = http
+        .put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": "m", "model": "reader-1"}, "calls_per_day": 6, "calls_at_once": 4}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let read = async || {
+        let v: Value = http
+            .post(format!("{api}/memex/rpc"))
+            .json(&json!({"method": "memex.relations.progress", "params": {}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["threads_read"].as_i64()
+    };
+    eventually("all six read", async || (read().await == Some(6)).then_some(())).await;
+    let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
+    assert_eq!(asked.len(), 6, "each thread once");
+    for i in 0..6 {
+        assert_eq!(asked.iter().filter(|a| a.contains(&format!("Topic {i} "))).count(), 1, "Topic {i}");
+    }
+    let r = http.put(format!("{api}/settings/memex")).json(&json!({"calls_at_once": 9})).send().await.unwrap();
+    assert_eq!(r.status(), 400, "at most 8");
+}

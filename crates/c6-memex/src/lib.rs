@@ -98,6 +98,21 @@ pub struct Memex {
     outcomes: Mutex<HashMap<String, Result<extract::Kept, String>>>,
     /// Every message kept before 0.3 has been read again: no more looking.
     pub(crate) reread: std::sync::atomic::AtomicBool,
+    /// What the reading loop's steps are working on now (a conversation, a
+    /// request, a card, a thread), so steps side by side never take the same.
+    claims: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Work a reading step has taken (`Memex::claim`).
+pub(crate) struct Claim<'a> {
+    m: &'a Memex,
+    what: String,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.m.claims.lock().unwrap().remove(&self.what);
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -106,6 +121,8 @@ pub struct Tasks {
     pub vision: Option<llm::Task>,
     pub transcription: Option<llm::Task>,
     pub per_day: u32,
+    /// Model calls side by side (at least 1).
+    pub at_once: u32,
 }
 
 fn task_of(v: &Value) -> Option<llm::Task> {
@@ -164,6 +181,7 @@ impl Memex {
             extracted: tokio::sync::Notify::new(),
             outcomes: Default::default(),
             reread: Default::default(),
+            claims: Default::default(),
         }))
     }
 
@@ -198,6 +216,7 @@ impl Memex {
                                 vision: task_of(&c["vision"]),
                                 transcription: task_of(&c["transcription"]),
                                 per_day: c["calls_per_day"].as_u64().unwrap_or(500) as u32,
+                                at_once: c["calls_at_once"].as_u64().unwrap_or(1).clamp(1, understand::MAX_AT_ONCE as u64) as u32,
                             };
                             if home {
                                 let places = c["places_file"].as_str().filter(|p| !p.is_empty()).map(str::to_owned);
@@ -285,6 +304,17 @@ impl Memex {
         self.link
             .call("app.call", json!({"realm": self.realm, "app": account.app, "operation": operation, "input": input, "by": by}))
             .await
+    }
+
+    /// Takes `what` for this step, unless another has it; given back when
+    /// the claim is dropped.
+    pub(crate) fn claim(&self, what: &str) -> Option<Claim<'_>> {
+        self.claims.lock().unwrap().insert(what.to_owned()).then(|| Claim { m: self, what: what.to_owned() })
+    }
+
+    /// Whether another step has `what` now.
+    pub(crate) fn claimed(&self, what: &str) -> bool {
+        self.claims.lock().unwrap().contains(what)
     }
 
     pub fn tasks(&self) -> Tasks {

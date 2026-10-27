@@ -37,11 +37,16 @@ async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String
          OR lower(m.from_addr) LIKE '%no-reply%' OR lower(m.from_addr) LIKE '%donotreply%' OR lower(m.from_addr) LIKE '%do-not-reply%' \
          OR lower(m.from_addr) LIKE 'notification%' OR lower(m.from_addr) LIKE 'mailer-daemon%') AND NOT EXISTS (SELECT 1 FROM enrich e \
          WHERE e.target = 'thread:' || m.account || ':' || m.thread_id AND e.version = ? AND e.done_at >= i.added_at) \
-         ORDER BY m.date DESC LIMIT 1",
+         ORDER BY m.date DESC LIMIT 40",
     )
     .bind(version)
-    .fetch_optional(&m.store.pool)
+    .fetch_all(&m.store.pool)
     .await?;
+    // The newest one no other step is reading.
+    let thread = thread.into_iter().find(|t| {
+        let key = format!("thread:{}:{}", t.get::<String, _>("account"), t.get::<String, _>("thread_id"));
+        !m.claimed(&format!("read:{key}"))
+    });
     let item = sqlx::query(
         "SELECT id, kind, created_at FROM items i WHERE kind IN ('session', 'document', 'paper', 'web') \
          AND NOT EXISTS (SELECT 1 FROM enrich e WHERE e.target = 'item:' || i.id AND e.version = ?) ORDER BY created_at DESC LIMIT 1",
@@ -90,6 +95,7 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     }
     let version = version(&task);
     let Some((target, kind, items)) = next(m, &version).await? else { return Ok(false) };
+    let Some(_claim) = m.claim(&format!("read:{target}")) else { return Ok(false) };
     count_call(m).await?;
     let result = read(m, &task, &kind, &items).await;
     done(m, &target, &version, result).await?;
@@ -135,6 +141,8 @@ pub(crate) async fn read_already(m: &Memex, task: &Task, account: &str, thread: 
 
 /// Reads one mail thread now (one model call), as the walk would.
 pub(crate) async fn read_thread(m: &Memex, task: &Task, account: &str, thread: &str) -> anyhow::Result<()> {
+    // Being read by another step: it will be read.
+    let Some(_claim) = m.claim(&format!("read:thread:{account}:{thread}")) else { return Ok(()) };
     let items: Vec<String> = sqlx::query_scalar("SELECT item_id FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
         .bind(account)
         .bind(thread)
@@ -272,27 +280,45 @@ async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], v: &Value) 
     Ok(())
 }
 
-/// Reads in the background while there is work and budget.
+/// The most reading steps side by side (Settings → Memex: calls at once).
+pub const MAX_AT_ONCE: u32 = 8;
+
+/// Reads in the background while there is work and budget: as many lanes
+/// as calls at once. With more than one, the first lane only sorts new mail
+/// and drafts, so new mail never waits behind the walk.
 pub fn spawn(m: std::sync::Arc<Memex>) {
-    tokio::spawn(async move {
-        let mut done = 0u64;
-        let mut suggested: Option<std::time::Instant> = None;
-        loop {
-            if suggested.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(600)) {
-                if let Err(e) = crate::review::suggest(&m.store).await {
-                    warn!("suggesting merges: {e:#}");
-                }
-                suggested = Some(std::time::Instant::now());
+    for lane in 0..MAX_AT_ONCE {
+        let m = m.clone();
+        tokio::spawn(async move { run(m, lane).await });
+    }
+}
+
+async fn run(m: std::sync::Arc<Memex>, lane: u32) {
+    let mut done = 0u64;
+    let mut suggested: Option<std::time::Instant> = None;
+    loop {
+        let at_once = m.tasks().at_once.max(1);
+        if lane >= at_once {
+            m.wake.notified().await;
+            continue;
+        }
+        if lane == 0 && suggested.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(600)) {
+            if let Err(e) = crate::review::suggest(&m.store).await {
+                warn!("suggesting merges: {e:#}");
             }
-            // Sorting what's new for the brief comes before reading.
-            let worked = m.link.is_connected()
-                && (crate::triage::step(&m).await.unwrap_or_else(|e| {
-                    warn!("triage: {e:#}");
-                    false
-                }) || crate::drafts::step(&m).await.unwrap_or_else(|e| {
-                    warn!("drafting: {e:#}");
-                    false
-                }) || crate::cards::step(&m).await.unwrap_or_else(|e| {
+            suggested = Some(std::time::Instant::now());
+        }
+        let fast_only = at_once > 1 && lane == 0;
+        // Sorting what's new for the brief comes before reading.
+        let worked = m.link.is_connected()
+            && (crate::triage::step(&m).await.unwrap_or_else(|e| {
+                warn!("triage: {e:#}");
+                false
+            }) || crate::drafts::step(&m).await.unwrap_or_else(|e| {
+                warn!("drafting: {e:#}");
+                false
+            }) || (!fast_only
+                && (crate::cards::step(&m).await.unwrap_or_else(|e| {
                     warn!("cards: {e:#}");
                     false
                 }) || step(&m).await.unwrap_or_else(|e| {
@@ -301,23 +327,20 @@ pub fn spawn(m: std::sync::Arc<Memex>) {
                 }) || crate::knowledge::page_step(&m).await.unwrap_or_else(|e| {
                     warn!("system pages: {e:#}");
                     false
-                }));
-            if worked {
-                done += 1;
-                if done.is_multiple_of(100) {
-                    info!(done, "understanding: read");
-                }
+                }))));
+        if worked {
+            done += 1;
+            if done.is_multiple_of(100) {
+                info!(done, lane, "understanding: read");
             }
-            if worked {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            } else {
-                tokio::select! {
-                    _ = m.wake.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
-                }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        } else {
+            tokio::select! {
+                _ = m.wake.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
             }
         }
-    });
+    }
 }
 
 /// How far understanding has got, for the status.

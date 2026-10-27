@@ -288,10 +288,12 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     if crate::understand::budget_left(m, per_day).await? == 0 {
         return Ok(false);
     }
-    let next: Option<(String, String)> = sqlx::query_as("SELECT key, MAX(name) FROM card_news GROUP BY key ORDER BY MAX(at) DESC LIMIT 1")
-        .fetch_optional(&m.store.pool)
-        .await?;
-    let Some((key, name)) = next else { return Ok(false) };
+    let next: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, MAX(name) FROM card_news GROUP BY key ORDER BY MAX(at) DESC LIMIT 10").fetch_all(&m.store.pool).await?;
+    // The first no other step is writing.
+    let Some((key, name, _claim)) = next.into_iter().find_map(|(k, n)| m.claim(&format!("card:{k}")).map(|c| (k, n, c))) else {
+        return Ok(false);
+    };
     let rows = sqlx::query(
         "SELECT n.account, n.thread_id, n.at, (SELECT MAX(subject) FROM mail m WHERE m.account = n.account AND m.thread_id = n.thread_id) AS subject \
          FROM card_news n WHERE n.key = ? ORDER BY n.at DESC LIMIT ?",
@@ -360,7 +362,9 @@ pub async fn for_sorting(m: &Memex, task: &Task, per_day: u32, addr: &str, name:
                 let (dc, _) = relations::live(m, &domain(addr), true).await?;
                 dc.sent_to > 0
             });
-        if wanted
+        // Another step writing it: sort with what there is.
+        let claim = if wanted { m.claim(&format!("card:{key}")) } else { None };
+        if let Some(_claim) = claim
             && let Some(calls) = cost(m, task, &key, READ_ON_THE_SPOT).await?
             // Room for the card and the sorting itself.
             && crate::understand::budget_left(m, per_day).await? as usize > calls

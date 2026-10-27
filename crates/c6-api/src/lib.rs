@@ -3677,6 +3677,10 @@ pub struct MemexSettings {
     /// Model calls a day for understanding and vision (default 500).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls_per_day: Option<u32>,
+    /// How many model calls understanding makes side by side (1 to 8,
+    /// default 1); new mail keeps one of them for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_at_once: Option<u32>,
     /// Looks at photos (and video frames): captions, objects, scenes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<MemexModel>,
