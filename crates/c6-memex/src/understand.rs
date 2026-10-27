@@ -309,10 +309,16 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
             suggested = Some(std::time::Instant::now());
         }
         let fast_only = at_once > 1 && lane == 0;
-        // Sorting what's new for the brief comes before reading.
         // Sorting what's new for the brief comes before anything else that
         // calls the model: while conversations wait for a call it couldn't
         // make, the rest waits too (a budget raised mid-pass goes to them).
+        // The rest also calls only in a pass that began with a model and
+        // budget: one raised after sorting looked (with nothing waiting yet)
+        // is the next pass's, so sorting, then drafts, see it first.
+        let could = match m.understanding() {
+            Some((_, per_day)) => budget_left(&m, per_day).await.is_ok_and(|n| n > 0),
+            None => false,
+        };
         let sorting = if m.link.is_connected() {
             crate::triage::step(&m).await.unwrap_or_else(|e| {
                 warn!("triage: {e:#}");
@@ -324,6 +330,7 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
         let worked = match sorting {
             crate::triage::Sorting::Worked => true,
             crate::triage::Sorting::Waiting => false,
+            crate::triage::Sorting::Idle if !could => false,
             crate::triage::Sorting::Idle => {
                 crate::drafts::step(&m).await.unwrap_or_else(|e| {
                     warn!("drafting: {e:#}");
