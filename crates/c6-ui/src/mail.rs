@@ -222,7 +222,8 @@ pub fn MailPage() -> impl IntoView {
 #[component]
 fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
     let target = StoredValue::new(target);
-    let sorted = LocalResource::new(move || api::rpc_as::<Option<c6_api::Triage>>("memex.triage.get", json!({"target": target.get_value()})));
+    let sorted =
+        LocalResource::new(move || api::rpc_as::<Option<c6_api::Triage>>("memex.triage.get", json!({"target": target.get_value()})));
     let (category, note) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
     let error = RwSignal::new(None::<String>);
     let act = move |method: &'static str, params: serde_json::Value| {
@@ -429,8 +430,17 @@ pub(crate) fn Thread(
                 Ok(list) => {
                     let subject = list.last().map(|m| m.subject.clone()).unwrap_or_default();
                     let last = list.last().cloned();
+                    // Who the people writing are to you (their cards), the latest first.
+                    let mut senders: Vec<String> = Vec::new();
+                    for m in list.iter().rev() {
+                        let a = m.from.to_lowercase();
+                        if a.contains('@') && !senders.contains(&a) {
+                            senders.push(a);
+                        }
+                    }
                     view! {
                         <h1 class="text-lg font-semibold">{subject}</h1>
+                        {senders.into_iter().take(2).map(|a| view! { <crate::understanding::Cards params=serde_json::json!({"address": a}) /> }).collect_view()}
                         {list.into_iter().map(|m| view! { <Message m /> }).collect_view()}
                         {last.map(|m| {
                             let (m1, m2) = (m.clone(), m.clone());

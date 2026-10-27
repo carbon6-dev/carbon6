@@ -317,7 +317,10 @@ pub async fn prune(m: &Memex) -> anyhow::Result<usize> {
             gone += 1;
         }
     }
-    sqlx::query("INSERT INTO memex_once (name, at) VALUES ('prune-bulk-cards', ?)").bind(c6_core::now_ms()).execute(&m.store.pool).await?;
+    sqlx::query("INSERT OR IGNORE INTO memex_once (name, at) VALUES ('prune-bulk-cards', ?)")
+        .bind(c6_core::now_ms())
+        .execute(&m.store.pool)
+        .await?;
     if gone > 0 {
         tracing::info!(gone, "cards of bulk senders removed");
     }

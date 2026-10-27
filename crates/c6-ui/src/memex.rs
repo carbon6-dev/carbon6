@@ -428,6 +428,8 @@ fn thing_view(t: Value, open: RwSignal<Option<String>>) -> impl IntoView {
             <h2 class="text-lg font-semibold">{thing["name"].as_str().unwrap_or_default().to_owned()}</h2>
             <span class="font-mono text-xs text-zinc-500">{thing["label"].as_str().unwrap_or_default().to_owned()}</span>
         </div>
+        // Who they are to you, first.
+        <crate::understanding::Cards params=serde_json::json!({"id": key.clone()}) />
         {(!notes.is_empty()).then(|| view! { <h3 class="text-xs font-medium uppercase text-zinc-500">"Notes"</h3><ul class="space-y-1">{rows(notes.clone())}</ul> })}
         {(!items.is_empty()).then(|| view! { <h3 class="text-xs font-medium uppercase text-zinc-500">"Items"</h3><ul class="space-y-1">{rows(items.clone())}</ul> })}
         {(!related.is_empty()).then(|| view! {

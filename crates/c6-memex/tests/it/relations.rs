@@ -129,7 +129,6 @@ async fn the_walk_grows_cards_back_through_time() {
     assert!(last_card.contains("The card so far") && last_card.contains("Globex signed the first deal."), "{last_card}");
     // A card written for a newsletter before the rule (its news too) is
     // removed, once; Dana's stays.
-    sqlx::query("DELETE FROM memex_once").execute(&m.store.pool).await.unwrap();
     for i in 0..3 {
         mail(
             &m,
@@ -151,8 +150,14 @@ async fn the_walk_grows_cards_back_through_time() {
     .execute(&m.store.pool)
     .await
     .unwrap();
-    assert_eq!(c6_memex::cards::prune(&m).await.unwrap(), 1);
-    assert!(c6_memex::cards::get(&m, "person:hi@news.example").await.unwrap().is_none());
+    // Then the clean-up may run again: the reading loop runs it (or this
+    // call does, first).
+    sqlx::query("DELETE FROM memex_once").execute(&m.store.pool).await.unwrap();
+    let _ = c6_memex::cards::prune(&m).await.unwrap();
+    eventually("the newsletter's card gone", async || {
+        c6_memex::cards::get(&m, "person:hi@news.example").await.ok()?.is_none().then_some(())
+    })
+    .await;
     assert!(c6_memex::cards::get(&m, "person:dana@globex.com").await.unwrap().is_some());
     assert_eq!(c6_memex::cards::prune(&m).await.unwrap(), 0, "once");
     let progress = rpc("memex.relations.progress", json!({})).await;

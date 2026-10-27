@@ -207,7 +207,6 @@ pub fn Cards(#[prop(into)] params: serde_json::Value) -> impl IntoView {
 /// A thing's graph, its timeline by month, and "summarize what I know".
 #[component]
 pub fn ThingMore(key: String, open: RwSignal<Option<String>>) -> impl IntoView {
-    let cards_for = serde_json::json!({"id": key.clone()});
     let k1 = key.clone();
     let graph = LocalResource::new(move || {
         let k = k1.clone();
@@ -231,7 +230,6 @@ pub fn ThingMore(key: String, open: RwSignal<Option<String>>) -> impl IntoView {
         });
     };
     view! {
-        <Cards params=cards_for />
         <div class="flex items-center gap-2">
             <button class=BUTTON_QUIET disabled=move || busy.get() on:click=summarize>{move || if busy.get() { "Summarizing…" } else { "Summarize what I know" }}</button>
             <span class="text-xs text-zinc-500">"(saved as a note, marked as the model's)"</span>
