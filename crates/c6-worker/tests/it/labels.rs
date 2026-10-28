@@ -203,8 +203,15 @@ async fn sessions_get_colours_you_can_change() {
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
     c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let wid = worker.identity.meta.worker_id.0;
-    let conn: Connection =
-        http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap().json().await.unwrap();
+    let conn: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let start = async || -> Session {
         http.post(format!("{api}/sessions"))
             .json(&json!({"worker_id": wid, "cwd": project.path().display().to_string(), "connection_id": conn.id, "model": "m"}))
@@ -219,7 +226,9 @@ async fn sessions_get_colours_you_can_change() {
     let (a, b, c) = (start().await, start().await, start().await);
     assert_eq!([a.colour.as_str(), b.colour.as_str(), c.colour.as_str()], ["sky", "emerald", "amber"]);
 
-    let set = async |id: &str, colour: &str| http.put(format!("{api}/sessions/{id}/colour")).json(&json!({ "colour": colour })).send().await.unwrap();
+    let set = async |id: &str, colour: &str| {
+        http.put(format!("{api}/sessions/{id}/colour")).json(&json!({ "colour": colour })).send().await.unwrap()
+    };
     let r = set(&b.id, "rose").await;
     assert!(r.status().is_success());
     assert_eq!(r.json::<Session>().await.unwrap().colour, "rose");

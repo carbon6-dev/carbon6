@@ -236,7 +236,8 @@ impl Tool for SendMessage {
         }
         if input["run_in_background"].as_bool() == Some(true) {
             let (id, cancel) = ctx.session.background.start_agent(&format!("continue {to}"), true);
-            let (session, call_id, to, message, task) = (ctx.session.clone(), ctx.call_id.clone(), to.to_owned(), message.to_owned(), id.clone());
+            let (session, call_id, to, message, task) =
+                (ctx.session.clone(), ctx.call_id.clone(), to.to_owned(), message.to_owned(), id.clone());
             tokio::spawn(async move {
                 let result = agents.send(&call_id, &to, &message, Some(&task), cancel).await.map(Option::unwrap_or_default);
                 session.background.finish_agent(&task, result);

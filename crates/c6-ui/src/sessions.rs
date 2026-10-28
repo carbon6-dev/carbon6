@@ -150,7 +150,14 @@ fn group_value(s: &Session, key: &str) -> Option<String> {
 
 /// The sessions in nested groups, one level per key: most recently active
 /// group first, sessions without the label last. `compact`: the rail's.
-fn grouped(sessions: Vec<Session>, levels: &[String], path: String, folded: Folded, row: &dyn Fn(Session) -> AnyView, compact: bool) -> AnyView {
+fn grouped(
+    sessions: Vec<Session>,
+    levels: &[String],
+    path: String,
+    folded: Folded,
+    row: &dyn Fn(Session) -> AnyView,
+    compact: bool,
+) -> AnyView {
     let Some((key, rest)) = levels.split_first() else {
         return sessions.into_iter().map(row).collect_view().into_any();
     };
@@ -376,7 +383,9 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
             .into_iter()
             .filter(|s| crate::labels::matches(s, &wanted) && (realm.is_empty() || s.realm == realm))
             .filter(|s| {
-                q.is_empty() || s.title.to_lowercase().contains(&q) || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
+                q.is_empty()
+                    || s.title.to_lowercase().contains(&q)
+                    || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
             })
             .collect::<Vec<_>>()
     });
@@ -517,7 +526,10 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
     let place = match (&s.ssh, s.cwd.is_empty()) {
         (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
         (None, true) => "scratch workspace".to_owned(),
-        (None, false) => c6_api::labels::display_labels(&s.auto_labels).iter().find_map(|l| l.strip_prefix("folder:").map(str::to_owned)).unwrap_or_else(|| s.cwd.clone()),
+        (None, false) => c6_api::labels::display_labels(&s.auto_labels)
+            .iter()
+            .find_map(|l| l.strip_prefix("folder:").map(str::to_owned))
+            .unwrap_or_else(|| s.cwd.clone()),
     };
     let act = "rounded-md border border-zinc-200 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
     view! {

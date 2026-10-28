@@ -60,14 +60,12 @@ async fn agents_propose_tasks_you_start_with_one_click() {
                 .unwrap()
         }
     };
-    let ended = |id: String| {
-        async move {
-            eventually("the turn to end", async || {
-                let ev: Vec<Event> = serde_json::from_value(get(format!("sessions/{id}/events")).await).ok()?;
-                ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { .. })).then_some(ev)
-            })
-            .await
-        }
+    let ended = |id: String| async move {
+        eventually("the turn to end", async || {
+            let ev: Vec<Event> = serde_json::from_value(get(format!("sessions/{id}/events")).await).ok()?;
+            ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { .. })).then_some(ev)
+        })
+        .await
     };
 
     // 1. While fixing a test, the agent proposes a cleanup (twice: one card).
