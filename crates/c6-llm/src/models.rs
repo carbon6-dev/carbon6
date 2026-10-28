@@ -89,7 +89,10 @@ pub fn model_info(provider: Provider, model: &str) -> ModelInfo {
             default_effort: if old { None } else { Some("high") },
         };
     }
-    if m.starts_with("gpt-5") || m.starts_with("codex") || m.starts_with("o3") || m.starts_with("o4") {
+    // GPT-5 and later (gpt-6.1-sol, …): unknown, they'd get 128k and so
+    // compact every few minutes.
+    let gpt5_on = m.strip_prefix("gpt-").and_then(|v| v.split(['.', '-']).next()?.parse::<u32>().ok()).is_some_and(|v| v >= 5);
+    if gpt5_on || m.starts_with("codex") || m.starts_with("o3") || m.starts_with("o4") {
         return ModelInfo {
             context_window: 272_000,
             max_output: 128_000,
@@ -119,6 +122,9 @@ mod tests {
         assert_eq!(model_info(Provider::Anthropic, "claude-sonnet-4-5").thinking, Thinking::Budget);
         assert_eq!(model_info(Provider::Anthropic, "claude-fable-5-1").thinking, Thinking::Adaptive);
         assert_eq!(model_info(Provider::OpenAiResponses, "gpt-5.5-codex").tool_profile, ToolProfile::Codex);
+        let sol = model_info(Provider::OpenAiResponses, "gpt-6.1-sol");
+        assert_eq!((sol.context_window, sol.tool_profile), (272_000, ToolProfile::Codex));
+        assert_eq!(model_info(Provider::OpenAiChat, "gpt-4o").context_window, 128_000);
         assert_eq!(model_info(Provider::OpenAiChat, "qwen3.6:27b").tool_profile, ToolProfile::Generic);
         assert_eq!(model_info(Provider::OpenAiChat, "anthropic/claude-sonnet-5-5").tool_profile, ToolProfile::Claude);
     }
