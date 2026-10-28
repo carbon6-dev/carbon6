@@ -776,11 +776,9 @@ pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str, re
     }
     let realm = realm.filter(|r| *r != crate::realms::ROOT);
     match &op.via {
-        Via::Memex { method } => {
-            args["made_by"] = json!(made_by);
-            // As you, on the realm's knowledge (home's, from root).
-            Ok(crate::memex::call_in(st, realm.unwrap_or(crate::realms::HOME), method, args).await?)
-        }
+        // As you, on the realm's knowledge (home's, from root), as the API
+        // calls it.
+        Via::Memex { method } => crate::memex::call_as(st, realm.unwrap_or(crate::realms::HOME), method, args, made_by).await,
         Via::Http { method, path } => {
             let router = st.assistant.router.get().ok_or_else(|| anyhow::anyhow!("the head is starting"))?.clone();
             let mut uri = (*path).to_owned();

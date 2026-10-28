@@ -6,7 +6,7 @@
 //! themselves.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use c6_api as api;
 use c6_llm::LlmError;
@@ -25,15 +25,7 @@ pub const MAX_SLOTS: u32 = 64;
 /// The head's pools, by connection id.
 #[derive(Default)]
 pub struct Pools {
-    head: OnceLock<Weak<HeadState>>,
     pools: Mutex<HashMap<String, Arc<Pool>>>,
-}
-
-impl Pools {
-    /// The head, for members' credentials (set once it is made).
-    pub fn attach(&self, st: &Arc<HeadState>) {
-        let _ = self.head.set(Arc::downgrade(st));
-    }
 }
 
 /// Members' credentials, as the head gives them to itself.
@@ -72,7 +64,7 @@ pub async fn get(st: &HeadState, id: &str) -> anyhow::Result<Option<Arc<Pool>>> 
     }
     let mut pools = st.pools.pools.lock().unwrap();
     let pool = pools.entry(c.id.clone()).or_insert_with(|| {
-        let head = st.pools.head.get().cloned().unwrap_or_default();
+        let head = st.arc().map(|a| Arc::downgrade(&a)).unwrap_or_default();
         Pool::new(&c.id, Vec::new(), Arc::new(Dial { head }))
     });
     pool.set_members(list);

@@ -2017,35 +2017,7 @@ async fn memex_rpc(
     if !ok {
         return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
     }
-    // Ingest from outside is a batch of typed items, with labels checked as
-    // uploads are; the head's own generic items are not sent through here.
-    if r.method == "memex.ingest" {
-        let batch: api::MemexIngest = serde_json::from_value(r.params.clone())
-            .map_err(|e| crate::bad_request(format!("memex.ingest takes {{\"items\": [...]}}: {e}")))?;
-        for item in &batch.items {
-            crate::sessions::check_labels(&item.labels)?;
-        }
-    }
-    // The mail client's accounts and syncs are the Google apps'.
-    match r.method.as_str() {
-        "memex.google" => return Ok(Json(crate::google::status(&st, &realm).await?)),
-        "memex.google_sync" => {
-            crate::google::sync_now(&st, &realm).await?;
-            return Ok(Json(serde_json::json!({})));
-        }
-        _ => {}
-    }
-    let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
-    params["made_by"] = serde_json::json!("you");
-    // Only the head writes as an app (its kits' output).
-    if let Some(o) = params.as_object_mut() {
-        o.remove("as");
-    }
-    // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
-    if r.method == "memex.graph" {
-        params["policies"] = serde_json::json!(crate::claims::policies(&st, &realm).await);
-    }
-    Ok(Json(crate::memex::call_in(&st, &realm, &r.method, params).await?))
+    Ok(Json(crate::memex::call_as(&st, &realm, &r.method, r.params, "you").await?))
 }
 
 #[derive(serde::Deserialize)]

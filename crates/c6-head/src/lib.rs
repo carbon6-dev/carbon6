@@ -149,6 +149,15 @@ pub struct HeadState {
     pub updates: updates::Updater,
     /// Pools of connections (docs/pools.md).
     pub pools: pools::Pools,
+    /// Itself, for what must outlive a borrow (set once it is made).
+    me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
+}
+
+impl HeadState {
+    /// The head, shared (none while it is being made or once it stopped).
+    pub fn arc(&self) -> Option<Arc<HeadState>> {
+        self.me.get()?.upgrade()
+    }
 }
 
 /// A running head.
@@ -250,8 +259,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         memex: Default::default(),
         updates: updater,
         pools: Default::default(),
+        me: Default::default(),
     });
-    state.pools.attach(&state);
+    let _ = state.me.set(Arc::downgrade(&state));
     updates::after_open(&state).await;
 
     let mut tasks = JoinSet::new();

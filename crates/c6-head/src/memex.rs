@@ -64,6 +64,43 @@ pub async fn call_in(st: &HeadState, realm: &str, method: &str, params: Value) -
     call(st, method, in_realm(params, realm)).await
 }
 
+/// A memex method called by a person (`made_by`), through the API or an
+/// operation: what the head answers itself (the Google apps' accounts and
+/// syncs), checks (ingest's labels) or adds (the graph's reader policies)
+/// first, and never as an app.
+pub async fn call_as(st: &HeadState, realm: &str, method: &str, params: Value, made_by: &str) -> anyhow::Result<Value> {
+    // Ingest from outside is a batch of typed items, with labels checked as
+    // uploads are; the head's own generic items are not sent through here.
+    if method == "memex.ingest" {
+        let batch: api::MemexIngest =
+            serde_json::from_value(params.clone()).map_err(|e| bad_request(format!("memex.ingest takes {{\"items\": [...]}}: {e}")))?;
+        for item in &batch.items {
+            crate::sessions::check_labels(&item.labels)?;
+        }
+    }
+    // The mail client's accounts and syncs are the Google apps'.
+    match method {
+        "memex.google" => return crate::google::status(st, realm).await,
+        "memex.google_sync" => {
+            let st = st.arc().ok_or_else(|| anyhow::anyhow!("the head stopped"))?;
+            crate::google::sync_now(&st, realm).await?;
+            return Ok(json!({}));
+        }
+        _ => {}
+    }
+    let mut params = if params.is_object() { params } else { json!({}) };
+    params["made_by"] = json!(made_by);
+    // Only the head writes as an app (its kits' output).
+    if let Some(o) = params.as_object_mut() {
+        o.remove("as");
+    }
+    // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
+    if method == "memex.graph" {
+        params["policies"] = json!(crate::claims::policies(st, realm).await);
+    }
+    call_in(st, realm, method, params).await
+}
+
 /// Calls the knowledge store (in the head, docs/knowledge.md).
 pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
     // Ingest and uploads wait a while for what a worker reads (extract.rs).
