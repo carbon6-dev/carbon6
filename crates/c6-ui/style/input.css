@@ -75,4 +75,3 @@
 
 /* Clear of a phone's rounded corners and home indicator. */
 .notice-safe { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
-.safe-x { padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right)); }

@@ -89,6 +89,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/sessions/{id}/outputs/{seq}", get(output))
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
+        .route("/api/v1/sessions/{id}/colour", put(set_session_colour))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
         .route("/api/v1/sessions/{id}/approvals/{call_id}", post(decide_approval))
         .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
@@ -1424,6 +1425,14 @@ async fn set_session_labels(
     Json(req): Json<api::SetLabels>,
 ) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::sessions::set_labels(&st, &id, &req.labels).await?))
+}
+
+async fn set_session_colour(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::SetColour>,
+) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::sessions::set_colour(&st, &id, &req.colour).await?))
 }
 
 async fn session_config(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::EffectiveConfig>> {

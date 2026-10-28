@@ -51,4 +51,4 @@ The **Activity** page shows each call with the member that took it and the pool,
 
 - The scheduler is `c6_llm::pool`: `Pool::acquire` takes a slot (or waits for one), and `PoolClient` is a model client over a pool. `Pool::run` does the same for embeddings and transcription.
 - The head keeps one pool per pool connection (`c6-head/src/pools.rs`). Its members get credentials as the head's own calls do. The memex reaches it through its in-process link (`HeadLink::pool`).
-- The members are stored in the `connections.members` column (migration 0050).
+- The members are stored in the `connections.members` column (migration 0051).

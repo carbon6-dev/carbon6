@@ -172,6 +172,7 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         root_id: None,
         observed: false,
         instance: instance.to_owned(),
+        colour: String::new(),
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     // Context from the memex, for what is known at creation.
@@ -244,6 +245,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         root_id: None,
         observed: false,
         instance: String::new(),
+        colour: String::new(),
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
@@ -314,6 +316,8 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         observed: false,
         // And acts as what its parent acts as.
         instance: parent.instance.clone(),
+        // A side chat has its parent's colour.
+        colour: parent.colour.clone(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
@@ -457,11 +461,11 @@ async fn insert(
             text: Some(text),
         });
     }
-    st.store.create_session(&row, &commands).await?;
+    let colour = st.store.create_session(&row, &commands).await?;
     st.hub.owners.lock().unwrap().insert(session_id.clone(), worker_id);
     st.registry.deliver(worker_id);
     st.registry.bump();
-    Ok(convert::session(&row))
+    Ok(convert::session(&SessionRow { colour, ..row }))
 }
 
 fn default_title(prompt: Option<&str>) -> String {
@@ -573,6 +577,19 @@ pub fn check_labels(labels: &[String]) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Sets a session's colour, one of `SESSION_COLOURS`.
+pub async fn set_colour(st: &HeadState, session_id: &str, colour: &str) -> anyhow::Result<api::Session> {
+    if !api::SESSION_COLOURS.contains(&colour) {
+        return Err(bad_request(format!("{colour:?} is not a session colour (one of {})", api::SESSION_COLOURS.join(", "))));
+    }
+    if !st.store.set_session_colour(session_id, colour).await? {
+        return Err(not_found("no such session"));
+    }
+    st.registry.bump();
+    let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(crate::convert::session(&row))
 }
 
 /// Replaces the labels you attached to a session (and its side chats keep

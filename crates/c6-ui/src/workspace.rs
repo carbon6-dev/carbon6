@@ -1,4 +1,7 @@
-//! The workspace: up to four tiles side by side, each a framed card.
+//! The workspace: tiles, each a framed card. Up to four sit side by side;
+//! more stack in those four columns (the fifth under the first, the sixth
+//! under the second, …), and in a column of three or more the tile last
+//! used there takes half its height (see [`arrange`]).
 //!
 //! A tile has at most two panes: a list (or whatever it was opened on) and
 //! the item opened from it. One rule: a click inside a tile opens in that
@@ -23,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::{self, LiveFeed};
 use crate::util::{storage_get, storage_set};
 
-pub const MAX_TILES: usize = 4;
+/// Tiles side by side before they stack.
+pub const COLUMNS: usize = 4;
 /// Finished sessions kept for you to look at.
 const MAX_ATTENTION: usize = 20;
 
@@ -426,20 +430,12 @@ impl Layout {
             .find_map(|(ti, t)| t.columns.iter().position(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|ci| (ti, ci)))
     }
 
-    /// Opens `view` in a new tile at the right end (left to right in the
-    /// order opened), or, when all tiles are in use, in place of the least
-    /// recently used tile other than `origin`.
-    fn open_tile(&mut self, origin: usize, view: View) {
-        if self.tiles.len() < MAX_TILES {
-            let tile = self.new_tile(view);
-            self.tiles.push(tile);
-            self.focus = self.tiles.len() - 1;
-        } else {
-            let lru = (0..self.tiles.len()).filter(|&i| i != origin).min_by_key(|&i| self.tiles[i].used).unwrap_or(origin);
-            let key = self.key();
-            self.tiles[lru].go(vec![Column { key, view }]);
-            self.focus = lru;
-        }
+    /// Opens `view` in a new tile, after the others (left to right, then
+    /// stacking down the columns, in the order opened).
+    fn open_tile(&mut self, view: View) {
+        let tile = self.new_tile(view);
+        self.tiles.push(tile);
+        self.focus = self.tiles.len() - 1;
         self.touch(self.focus);
     }
 
@@ -453,7 +449,6 @@ impl Layout {
 
     fn valid(&self) -> bool {
         !self.tiles.is_empty()
-            && self.tiles.len() <= MAX_TILES
             && self.focus < self.tiles.len()
             && self.tiles.iter().all(|t| !t.columns.is_empty() && t.columns.len() <= 2 && t.cursor < t.columns.len())
     }
@@ -501,6 +496,9 @@ const PINNED_KEY: &str = "c6.pinned";
 #[derive(Clone, Copy)]
 pub struct Workspace {
     pub layout: RwSignal<Layout>,
+    /// What each session pane offers its tile's bar (its details), by pane
+    /// key, while it is shown.
+    pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
     pub pinned: RwSignal<Vec<String>>,
@@ -520,6 +518,7 @@ impl Workspace {
         };
         let ws = Workspace {
             layout: RwSignal::new(layout),
+            chrome: RwSignal::new(HashMap::new()),
             attention: RwSignal::new(load(ATTENTION_KEY).unwrap_or_default()),
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
         };
@@ -566,7 +565,7 @@ impl Workspace {
                 return;
             }
             if how == How::NewTile {
-                l.open_tile(origin, view);
+                l.open_tile(view);
                 return;
             }
             let key = l.key();
@@ -593,13 +592,13 @@ impl Workspace {
     pub fn detach(&self, tile: u64) {
         self.layout.update(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
-            if l.tiles[ti].columns.len() < 2 || l.tiles.len() >= MAX_TILES {
+            if l.tiles[ti].columns.len() < 2 {
                 return;
             }
             let item = l.tiles[ti].columns[1].view.clone();
             let list = l.tiles[ti].columns[0].clone();
             l.tiles[ti].go(vec![list]);
-            l.open_tile(ti, item);
+            l.open_tile(item);
         });
     }
 
@@ -687,9 +686,23 @@ impl Workspace {
         });
     }
 
+    /// Focuses a tile you pressed on, without growing it yet: that waits
+    /// for the click to finish ([`Workspace::grow`]), so what you clicked
+    /// doesn't move away under the pointer.
     fn focus_tile_key(&self, key: u64) {
-        if let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key)) {
-            self.focus_tile(i);
+        if let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key))
+            && self.layout.with_untracked(|l| l.focus != i)
+        {
+            self.layout.update(|l| l.focus = i);
+        }
+    }
+
+    /// Marks a tile the last used (in a tall column, it takes half the
+    /// height).
+    fn grow(&self, key: u64) {
+        let latest = self.layout.with_untracked(|l| l.tile(key).is_none_or(|t| t.used == l.next));
+        if !latest && let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key)) {
+            self.layout.update(|l| l.touch(i));
         }
     }
 
@@ -907,7 +920,42 @@ pub fn ScrollBox(
     }
 }
 
-/// The tiles. Keyboard: ⌘1–4 focus a tile, ⌘[ / ⌘] go back and forward in it.
+/// Where a tile goes, as fractions of the workspace.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Where each tile goes, given when each was last used (in tile order).
+/// Up to [`COLUMNS`] tiles sit side by side; beyond that tile `i` stacks in
+/// column `i % COLUMNS` (the fifth under the first, …, the ninth makes the
+/// first column three high). A column of two splits evenly; in a column of
+/// three or more, the tile last used there takes half the height and the
+/// others share the rest.
+pub fn arrange(used: &[u64]) -> Vec<Rect> {
+    let n = used.len();
+    let cols = n.clamp(1, COLUMNS);
+    let mut out = vec![Rect::default(); n];
+    for c in 0..cols.min(n) {
+        let members: Vec<usize> = (c..n).step_by(cols).collect();
+        let k = members.len();
+        let big = members.iter().copied().max_by_key(|&i| used[i]);
+        let weight = |i: usize| if k >= 3 && Some(i) == big { (k - 1) as f64 } else { 1.0 };
+        let total: f64 = members.iter().map(|&i| weight(i)).sum();
+        let mut top = 0.0;
+        for &i in &members {
+            let height = weight(i) / total;
+            out[i] = Rect { left: c as f64 / cols as f64, top, width: 1.0 / cols as f64, height };
+            top += height;
+        }
+    }
+    out
+}
+
+/// The tiles. Keyboard: ⌘1–9 focus a tile, ⌘[ / ⌘] go back and forward in it.
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
@@ -916,7 +964,7 @@ pub fn Tiles() -> impl IntoView {
             return;
         }
         match ev.key().as_str() {
-            k @ ("1" | "2" | "3" | "4") => {
+            k @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
                 ev.prevent_default();
                 ws.focus_tile(k.parse::<usize>().unwrap() - 1);
             }
@@ -932,18 +980,76 @@ pub fn Tiles() -> impl IntoView {
         }
     });
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
-    // Tiles are cards with room between them; on a phone, one fills the screen.
+    let rects = Memo::new(move |_| {
+        ws.layout.with(|l| {
+            let used: Vec<u64> = l.tiles.iter().map(|t| t.used).collect();
+            l.tiles.iter().map(|t| t.key).zip(arrange(&used)).collect::<HashMap<u64, Rect>>()
+        })
+    });
+    // Tiles are cards with room between them, placed by `arrange` (so one
+    // moving to another column keeps what it shows); on a phone, one fills
+    // the screen.
     view! {
-        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:gap-2 md:p-2">
-            <For each=move || keys.get() key=|k| *k let:key>
-                <TileView key />
-            </For>
+        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:p-1">
+            <div class="relative flex min-h-0 min-w-0 flex-1">
+                <For each=move || keys.get() key=|k| *k let:key>
+                    <TileView key rect=Signal::derive(move || rects.with(|r| r.get(&key).copied().unwrap_or_default())) />
+                </For>
+            </div>
         </div>
     }
 }
 
+/// A session's state, as its tile's bar shows it.
+fn status_pill(s: &Session) -> (&'static str, &'static str) {
+    if s.awaiting_approval {
+        return ("bg-amber-500 text-white", "needs approval");
+    }
+    match s.status {
+        SessionStatus::Running => ("bg-blue-600 text-white", "running"),
+        SessionStatus::Idle => ("bg-white/70 text-zinc-600 dark:bg-black/30 dark:text-zinc-300", "idle"),
+        SessionStatus::Starting => ("bg-white/70 text-amber-700 dark:bg-black/30 dark:text-amber-300", "starting"),
+        SessionStatus::Failed => ("bg-red-600 text-white", "failed"),
+    }
+}
+
+/// Where a popover opens: below the element clicked, kept on screen.
+pub fn below(ev: &web_sys::MouseEvent, width: f64) -> (f64, f64) {
+    let rect = ev
+        .current_target()
+        .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
+        .map(|el| el.get_bounding_client_rect());
+    let vw = window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1200.0);
+    match rect {
+        Some(r) => ((r.left()).min(vw - width - 8.0).max(8.0), r.bottom() + 4.0),
+        None => (8.0, 48.0),
+    }
+}
+
+/// A popover at a place on screen (from [`below`]); a click outside it
+/// closes it, and so does Esc.
 #[component]
-fn TileView(key: u64) -> impl IntoView {
+pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> impl IntoView {
+    let class = StoredValue::new(class);
+    let children = StoredValue::new(children);
+    move || {
+        at.get().map(|(x, y)| {
+            view! {
+                <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
+                <div
+                    class=format!("fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
+                    style=format!("left:{x}px;top:{y}px")
+                    on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); at.set(None) }
+                >
+                    {children.with_value(|c| c())}
+                </div>
+            }
+        })
+    }
+}
+
+#[component]
+fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
@@ -965,21 +1071,61 @@ fn TileView(key: u64) -> impl IntoView {
         },
         _ => None,
     };
-    let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    // The session it shows (alone, or as the item beside a list): its pane,
+    // and how it is now. The bar wears its colour and says its state.
+    let shown = Memo::new(move |_| {
+        tile.get().and_then(|t| match t.columns.last().map(|c| (c.key, &c.view)) {
+            Some((col, View::Session { id, .. })) => Some((col, id.clone())),
+            _ => None,
+        })
+    });
+    let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
+    let colour = Memo::new(move |_| session.get().map(|s| crate::colour::of(&s)));
+    let palette_at = RwSignal::new(None::<(f64, f64)>);
+    let details_at = RwSignal::new(None::<(f64, f64)>);
+    let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
+    let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-white/10 dark:hover:text-zinc-100";
     view! {
+        <div
+            class=move || format!(
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:flex md:p-1 md:transition-[left,top,width,height] md:duration-150 {}",
+                if focused.get() { "flex" } else { "hidden" },
+            )
+            style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
+        >
         <section
             class=move || format!(
-                "relative min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:flex md:rounded-lg md:border md:shadow-sm {} {}",
-                if focused.get() { "flex" } else { "hidden" },
+                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
                 if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
             )
             on:pointerdown=move |_| ws.focus_tile_key(key)
+            on:click=move |_| ws.grow(key)
         >
-            // The tile's own bar: its history, its name, and what you can do to the whole tile.
-            <div class="flex h-9 shrink-0 items-center gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+            // The tile's own bar: its history, its name (and a session's
+            // colour and state), and what you can do to the whole tile.
+            <div class=move || format!(
+                "flex h-9 shrink-0 items-center gap-1 border-b px-2 text-xs {}",
+                crate::colour::bar(colour.get().unwrap_or_default()),
+            )>
                 <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
                 <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
-                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-700 dark:text-zinc-200">{title}</span>
+                {move || colour.get().map(|c| view! {
+                    <button class=format!("ml-0.5 h-3 w-3 shrink-0 rounded-full ring-1 ring-black/10 hover:scale-125 dark:ring-white/20 {}", crate::colour::solid(c))
+                        title="This session's colour: change it" on:click=move |ev| palette_at.set(Some(below(&ev, 180.0)))></button>
+                })}
+                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-700 dark:text-zinc-200" title=move || title.get()>{title}</span>
+                {move || session.get().map(|s| {
+                    let (cls, label) = status_pill(&s);
+                    view! {
+                        <span class=format!("flex shrink-0 items-center gap-1 rounded-full px-1.5 py-px text-[10px] font-medium {cls}")>
+                            {(s.status == SessionStatus::Running).then(|| view! { <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-white"></span> })}
+                            {label}
+                        </span>
+                    }
+                })}
+                {move || chrome().is_some().then(|| view! {
+                    <button class=btn title="Details: where it runs, labels, transcript, changes, files, terminal…" on:click=move |ev| details_at.set(Some(below(&ev, 560.0)))>"⋯"</button>
+                })}
                 {move || pinnable().map(|id| {
                     let (a, b) = (StoredValue::new(id.clone()), id.clone());
                     let on = move || ws.pinned.with(|p| p.contains(&a.get_value()));
@@ -989,17 +1135,59 @@ fn TileView(key: u64) -> impl IntoView {
                         </button>
                     }
                 })}
-                {move || (two() && ws.layout.with(|l| l.tiles.len() < MAX_TILES)).then(|| view! {
+                {move || two().then(|| view! {
                     <button class=format!("{btn} hidden md:inline") title="Move the open item to a tile of its own (or ⌘-click a link)" on:click=move |_| ws.detach(key)>"⧉"</button>
                 })}
                 <button class=btn title="Close this tile" on:click=move |_| ws.close_tile(key)>"✕"</button>
             </div>
+            <Popover at=palette_at class="w-auto">
+                {move || shown.get().map(|(_, id)| view! { <crate::colour::Palette session=id on_pick=move |()| palette_at.set(None) /> })}
+            </Popover>
+            <Popover at=details_at class="w-[min(35rem,calc(100vw-1rem))] p-3">
+                {move || chrome().map(|c| view! { <crate::session::SessionMeta chrome=c on_act=move |()| details_at.set(None) /> })}
+            </Popover>
             <div class="flex min-h-0 flex-1">
                 <For each=move || cols.get() key=|k| *k let:col>
                     <ColumnView tile=key col />
                 </For>
             </div>
         </section>
+        </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(left: f64, top: f64, width: f64, height: f64) -> Rect {
+        Rect { left, top, width, height }
+    }
+
+    #[test]
+    fn up_to_four_tiles_sit_side_by_side() {
+        assert_eq!(arrange(&[1]), vec![r(0.0, 0.0, 1.0, 1.0)]);
+        assert_eq!(arrange(&[1, 2, 3]), vec![r(0.0, 0.0, 1.0 / 3.0, 1.0), r(1.0 / 3.0, 0.0, 1.0 / 3.0, 1.0), r(2.0 / 3.0, 0.0, 1.0 / 3.0, 1.0)]);
+        assert!(arrange(&[1, 2, 3, 4]).iter().all(|x| x.width == 0.25 && x.height == 1.0));
+    }
+
+    #[test]
+    fn more_stack_in_the_columns_in_turn() {
+        // The fifth halves the first column; the others stay full height.
+        let five = arrange(&[1, 2, 3, 4, 5]);
+        assert_eq!((five[0], five[4]), (r(0.0, 0.0, 0.25, 0.5), r(0.0, 0.5, 0.25, 0.5)));
+        assert!(five[1..4].iter().all(|x| x.height == 1.0));
+        // The sixth halves the second; by eight, every column is two high.
+        assert_eq!(arrange(&[1, 2, 3, 4, 5, 6])[5], r(0.25, 0.5, 0.25, 0.5));
+        assert!(arrange(&[1, 2, 3, 4, 5, 6, 7, 8]).iter().all(|x| x.height == 0.5));
+    }
+
+    #[test]
+    fn in_a_tall_column_the_last_used_tile_takes_half() {
+        // Nine: the first column is three high; tile 4 (in it) was used last.
+        let nine = arrange(&[1, 2, 3, 4, 50, 6, 7, 8, 9]);
+        assert_eq!((nine[0], nine[4], nine[8]), (r(0.0, 0.0, 0.25, 0.25), r(0.0, 0.25, 0.25, 0.5), r(0.0, 0.75, 0.25, 0.25)));
+        assert!(nine[1..4].iter().chain(&nine[5..8]).all(|x| x.height == 0.5), "columns of two split evenly");
     }
 }
 

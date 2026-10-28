@@ -205,7 +205,16 @@ pub struct Session {
     /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance: String,
+    /// Its colour, one of [`SESSION_COLOURS`]: the cue that tells its tiles
+    /// apart. Picked when it starts; empty for sessions from before colours.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub colour: String,
 }
+
+/// The colours a session can have, in the order new sessions take them
+/// (the one least used among the realm's recent sessions).
+pub const SESSION_COLOURS: [&str; 12] =
+    ["sky", "emerald", "amber", "rose", "violet", "teal", "orange", "indigo", "lime", "pink", "cyan", "fuchsia"];
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -3234,6 +3243,13 @@ pub const HOOK_EVENTS: [&str; 5] = ["PreToolUse", "PostToolUse", "UserPromptSubm
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetLabels {
     pub labels: Vec<String>,
+}
+
+/// `PUT /api/v1/sessions/{id}/colour`: one of [`SESSION_COLOURS`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetColour {
+    pub colour: String,
 }
 
 /// `GET /api/v1/sessions/{id}/config`: what applies to a session, from the
