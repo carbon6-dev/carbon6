@@ -77,8 +77,15 @@ impl Chat {
             workspace: RwSignal::new(None),
             order: RwSignal::new(Vec::new()),
         };
+        // One reload at a time: asked again meanwhile, once more after it.
+        let busy = StoredValue::new((false, false));
         Effect::new(move || {
             let n = c.tick.get();
+            if busy.get_value().0 {
+                busy.update_value(|b| b.1 = true);
+                return;
+            }
+            busy.set_value((true, false));
             spawn_local(async move {
                 if let Ok(v) = api::rpc("memex.chat.channels", json!({})).await {
                     c.channels.set(v.as_array().cloned().unwrap_or_default());
@@ -93,6 +100,11 @@ impl Chat {
                 }
                 if let Ok(v) = api::rpc("memex.chat.threads", json!({"limit": 100})).await {
                     c.threads_new.set(v.as_array().map_or(0, |l| l.iter().filter(|t| t["new"].as_u64().unwrap_or(0) > 0).count()));
+                }
+                let again = busy.get_value().1;
+                busy.set_value((false, false));
+                if again {
+                    c.refresh();
                 }
             });
         });

@@ -153,10 +153,12 @@ pub async fn put(m: &Memex, p: &Value) -> anyhow::Result<Value> {
 }
 
 /// Unread messages of a conversation `c` (an alias), and those of them
-/// that need you (mention you, or in a DM or group), as SQL.
+/// that need you (mention you, or in a DM or group), as SQL. `+c.workspace`:
+/// without the column's affinity, items_chat is searched (not every chat
+/// item walked for each conversation).
 fn counts() -> (String, String) {
     let base = format!(
-        "SELECT COUNT(*) FROM items i WHERE i.kind = 'chat' AND {w} = c.workspace AND {ch} = c.channel \
+        "SELECT COUNT(*) FROM items i WHERE i.kind = 'chat' AND {w} = +c.workspace AND {ch} = +c.channel \
          AND c.read_ts IS NOT NULL AND i.created_at > {read} AND {top} AND {theirs}",
         w = "json_extract(i.meta, '$.workspace')",
         ch = "json_extract(i.meta, '$.channel')",
@@ -668,5 +670,22 @@ pub async fn method(m: &Memex, method: &str, params: &Value, allowed: &[String])
             m.app_call(&a, op, Value::Object(input), &by).await
         }
         other => anyhow::bail!("the memex has no method {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unread_counts_search_the_chat_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("memex.db")).await.unwrap();
+        let (unread, mentions) = counts();
+        let sql = format!("EXPLAIN QUERY PLAN SELECT {unread}, {mentions} FROM chat_conversations c");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_all(&store.pool).await.unwrap();
+        let plan: Vec<String> = rows.iter().map(|r| r.get("detail")).collect();
+        let searches = plan.iter().filter(|d| d.starts_with("SEARCH i USING INDEX items_chat (<expr>=? AND <expr>=?")).count();
+        assert_eq!(searches, 2, "{plan:#?}");
     }
 }
