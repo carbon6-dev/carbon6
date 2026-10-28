@@ -14,6 +14,7 @@ window.c6Theme = (() => {
     root.style.colorScheme = dark ? "dark" : "light";
     const meta = document.querySelector('meta[name="theme-color"]');
     if (meta) meta.setAttribute("content", dark ? "#09090b" : "#fafafa");
+    window.dispatchEvent(new Event("c6-theme"));
   };
   media.addEventListener("change", apply);
   apply();

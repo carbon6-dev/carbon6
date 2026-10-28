@@ -504,10 +504,25 @@ fn reply(account: &str, m: &MailMessage, all: bool) -> Draft {
     }
 }
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = c6Theme, js_name = isDark)]
+    fn theme_is_dark() -> bool;
+}
+
 #[component]
 fn Message(m: MailMessage) -> impl IntoView {
     let images = RwSignal::new(false);
     let html = m.html.clone();
+    let supports_dark = html.as_deref().is_some_and(crate::mail_html::supports_dark);
+    let dark = RwSignal::new(supports_dark && theme_is_dark());
+    let theme = window_event_listener(leptos::ev::Custom::new("c6-theme"), move |_: web_sys::Event| {
+        let next = supports_dark && theme_is_dark();
+        if dark.get_untracked() != next {
+            dark.set(next);
+        }
+    });
+    on_cleanup(move || theme.remove());
     let item = m.item_id.clone();
     let has_html = html.is_some();
     view! {
@@ -524,8 +539,9 @@ fn Message(m: MailMessage) -> impl IntoView {
                         // Sandboxed: no scripts, an opaque origin; remote
                         // images only when you allow them.
                         <iframe class="h-96 w-full rounded border border-zinc-100 bg-white dark:border-zinc-800" sandbox="allow-popups allow-popups-to-escape-sandbox"
-                            srcdoc=move || format!("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data: {}\"><base target=\"_blank\">{h}",
-                                if images.get() { "https: http:" } else { "" })></iframe>
+                            style=move || if dark.get() { "color-scheme: dark; background-color: Canvas" } else { "color-scheme: light; background-color: white" }
+                            srcdoc=move || format!("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data: {}\"><base target=\"_blank\">{}",
+                                if images.get() { "https: http:" } else { "" }, crate::mail_html::themed(&h, dark.get()))></iframe>
                         {move || (!images.get()).then(|| view! {
                             <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| images.set(true)>"Show images (lets the sender see you opened it)"</button>
                         })}

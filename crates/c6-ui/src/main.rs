@@ -19,6 +19,7 @@ mod fleet;
 mod itemviews;
 mod labels;
 mod mail;
+mod mail_html;
 mod markdown;
 mod memex;
 mod models;
