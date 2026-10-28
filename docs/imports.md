@@ -40,6 +40,8 @@ Sessions you had in Claude Code or Codex come into carbon6 as sessions:
 - `sources`: `claude_code`, `codex`;
 - `rules`: `[{folder, realm}]`, in order. A session whose folder is under `folder` (`~` is the worker's home) goes to `realm`; anything else goes to home.
 
+The head takes imports only from the workers listed, and only into realms the worker is available to (Settings → Workers): a session whose folder maps to another realm is refused.
+
 ## 4. Not done
 
 - Claude Code's subagents' side chains (`isSidechain`) are left out, as are attachments' bytes (images pasted into Claude Code).

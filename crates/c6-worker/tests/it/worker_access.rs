@@ -226,3 +226,27 @@ async fn templates_from_a_session_run_on_its_worker() {
     drop((ga, gb));
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn imports_come_only_from_enabled_workers_into_their_realms() {
+    let (head, _dir) = head().await;
+    let (st, api) = (&head.state, Api::of(&head));
+    use reqwest::Method as M;
+    api.ok(M::POST, "realms", json!({"id": "work"})).await;
+    let (a, b) = (worker(st, "a", &["work"]).await, worker(st, "b", &[]).await);
+    api.ok(M::PUT, "settings/session_imports", json!({"workers": ["a"], "rules": [{"folder": "~/work/**", "realm": "work"}]})).await;
+    let import = |from: WorkerId, cwd: &str| {
+        let id = uuid::Uuid::now_v7().to_string();
+        let p = json!({"source": "claude_code", "id": id, "meta": {"cwd": cwd, "home": "/home/me"}, "events": []});
+        async move { c6_head::imports::append(st, from, &p).await.map(|_| id).map_err(|e| e.to_string()) }
+    };
+
+    let e = import(b, "/home/me/work/app").await.unwrap_err();
+    assert!(e.contains("imports are off for b"), "{e}");
+    // Home's folder, from a worker kept to work.
+    let e = import(a, "/home/me/notes").await.unwrap_err();
+    assert!(e.contains("not available to realm home"), "{e}");
+    let id = import(a, "/home/me/work/app").await.unwrap();
+    assert_eq!(st.store.session(&id).await.unwrap().unwrap().realm, "work");
+    head.shutdown().await.unwrap();
+}

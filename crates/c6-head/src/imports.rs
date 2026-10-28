@@ -37,11 +37,15 @@ pub async fn set_settings(st: &HeadState, s: &api::SessionImports) -> anyhow::Re
     st.store.set_setting(KEY, &serde_json::to_string(s)?).await
 }
 
+/// Whether the setting turns imports on for this worker.
+fn enabled(s: &api::SessionImports, worker: &crate::store::WorkerRow) -> bool {
+    s.workers.iter().any(|w| *w == worker.name || *w == worker.id)
+}
+
 /// `imports.config`: whether this worker imports, and from what.
 pub async fn config(st: &HeadState, from: WorkerId) -> anyhow::Result<Value> {
     let s = settings(st).await?;
-    let me = st.store.worker(from).await?.map(|w| w.name).unwrap_or_default();
-    let enabled = s.workers.iter().any(|w| *w == me || *w == from.to_string());
+    let enabled = st.store.worker(from).await?.is_some_and(|w| enabled(&s, &w));
     let sources = if s.sources.is_empty() { SOURCES.iter().map(|x| x.to_string()).collect() } else { s.sources };
     Ok(json!({"enabled": enabled, "sources": sources}))
 }
@@ -87,15 +91,23 @@ pub async fn append(st: &HeadState, from: WorkerId, p: &Value) -> anyhow::Result
     if !SOURCES.contains(&source.as_str()) || id.is_empty() || id.len() > 100 {
         return Err(bad_request("an import names its source and the session's id"));
     }
+    let worker = st.store.worker(from).await?.ok_or_else(|| bad_request("an unknown worker"))?;
+    let settings = settings(st).await?;
+    if !enabled(&settings, &worker) {
+        return Err(bad_request(format!("imports are off for {} (Settings → System → Imports)", worker.name)));
+    }
     let status = status(st, from, &id).await?;
     if status["taken"] == true {
         return Err(bad_request(format!("session {id} is carbon6's now (it was continued here)")));
     }
     let m = &p["meta"];
     let ms = |k: &str| m[k].as_str().unwrap_or_default().to_owned();
-    let worker = st.store.worker(from).await?.ok_or_else(|| bad_request("an unknown worker"))?;
     if st.store.session(&id).await?.is_none() {
-        let rules = settings(st).await?.rules;
+        // Only into a realm the worker serves.
+        let realm = realm_for(&settings.rules, &ms("cwd"), &ms("home"));
+        if !crate::realms::available(&worker.realms, &realm) {
+            return Err(bad_request(format!("{} is not available to realm {realm}, where {} would go", worker.name, ms("cwd"))));
+        }
         let now = c6_core::now_ms();
         let started = m["started_at"].as_i64().filter(|t| *t > 0).unwrap_or(now);
         let title = ms("title");
@@ -129,7 +141,7 @@ pub async fn append(st: &HeadState, from: WorkerId, p: &Value) -> anyhow::Result
             ssh_target: String::new(),
             awaiting: 0,
             subagent_model: String::new(),
-            realm: realm_for(&rules, &ms("cwd"), &ms("home")),
+            realm,
             agent: String::new(),
             end_reason: String::new(),
             root_id: None,
