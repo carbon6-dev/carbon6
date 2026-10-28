@@ -1,6 +1,16 @@
 //! The memex's integration tests, in one binary. Tests that set
 //! environment variables (google, media) stay binaries of their own.
 
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static RAISE_NOFILE: unsafe extern "C" fn() = raise_nofile_before_tests;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn raise_nofile_before_tests() {
+    c6_testkit::raise_open_file_limit();
+}
+
 mod chat;
 mod claims;
 mod docs;
