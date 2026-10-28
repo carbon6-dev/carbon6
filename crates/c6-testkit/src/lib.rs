@@ -50,6 +50,7 @@ struct Inner {
 pub struct MockLlm {
     pub addr: SocketAddr,
     inner: Arc<Inner>,
+    server: Arc<tokio::task::AbortHandle>,
 }
 
 impl MockLlm {
@@ -63,8 +64,14 @@ impl MockLlm {
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Self { addr, inner }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }).abort_handle();
+        Self { addr, inner, server: Arc::new(server) }
+    }
+
+    /// Stops listening, as a server that went away: new connections are
+    /// refused.
+    pub fn stop(&self) {
+        self.server.abort();
     }
 
     pub fn base_url(&self) -> String {

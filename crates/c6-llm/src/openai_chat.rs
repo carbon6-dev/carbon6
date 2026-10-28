@@ -20,12 +20,25 @@ pub struct OpenAiChat {
     base_url: String,
     bearer: String,
     headers: HashMap<String, String>,
+    /// Attempts at each request (`http::post_json`).
+    attempts: u32,
 }
 
 impl OpenAiChat {
     pub fn new(base_url: &str, bearer: &str, headers: HashMap<String, String>) -> Result<Self, LlmError> {
         let http = http::client()?;
-        Ok(Self { http, base_url: base_url.trim_end_matches('/').to_owned(), bearer: bearer.to_owned(), headers })
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            bearer: bearer.to_owned(),
+            headers,
+            attempts: http::MAX_ATTEMPTS,
+        })
+    }
+
+    /// Gives up after the first failed attempt.
+    pub fn once(self) -> Self {
+        Self { attempts: 1, ..self }
     }
 
     fn is_openai(&self) -> bool {
@@ -121,7 +134,7 @@ impl ModelClient for OpenAiChat {
             headers.insert("authorization".into(), format!("Bearer {}", self.bearer));
         }
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = match http::post_json(&self.http, &url, &headers, &body).await {
+        let resp = match http::post_json(&self.http, &url, &headers, &body, self.attempts).await {
             Err(LlmError::Http { status: 400 | 422, body: why, .. })
                 if body.get("reasoning_effort").is_some() && why.to_lowercase().contains("reasoning") =>
             {
@@ -129,7 +142,7 @@ impl ModelClient for OpenAiChat {
                 if let Some(o) = body.as_object_mut() {
                     o.remove("reasoning_effort");
                 }
-                http::post_json(&self.http, &url, &headers, &body).await?
+                http::post_json(&self.http, &url, &headers, &body, self.attempts).await?
             }
             r => r?,
         };

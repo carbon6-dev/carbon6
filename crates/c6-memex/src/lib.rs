@@ -160,7 +160,7 @@ impl Memex {
             realm: realm.to_owned(),
             realms: Default::default(),
             store,
-            embed: embed::Embedder::new(link.clone()),
+            embed: embed::Embedder::new(link.clone(), realm),
             link,
             last_error: Mutex::new(None),
             dir: dir.to_owned(),

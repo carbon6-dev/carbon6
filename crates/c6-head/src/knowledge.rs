@@ -30,6 +30,14 @@ impl c6_worker::link::LocalHead for Local {
             None => CredentialGrant { connection_id: connection_id.to_owned(), error: "the head stopped".into(), ..Default::default() },
         }
     }
+
+    async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
+        let st = self.st.upgrade()?;
+        crate::pools::get(&st, connection_id).await.unwrap_or_else(|e| {
+            tracing::warn!(connection = %connection_id, "a pool: {e:#}");
+            None
+        })
+    }
 }
 
 /// The knowledge folder in the head's data folder.

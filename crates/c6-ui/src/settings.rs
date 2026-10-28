@@ -1,6 +1,6 @@
 //! Settings: LLM connections, MCP servers, skills and hooks.
 
-use c6_api::{Connection, CreateConnection, Hook};
+use c6_api::{Connection, CreateConnection, Hook, PoolMember};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -1421,6 +1421,7 @@ fn Upgrades() -> impl IntoView {
 #[component]
 fn Connections(signed_in: bool) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
+    let all = Signal::derive(move || connections.get().and_then(Result::ok).unwrap_or_default());
     let error = RwSignal::new(None::<String>);
     let signed_in = move || signed_in;
     view! {
@@ -1436,7 +1437,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                     <Suspense fallback=|| ()>
                         {move || connections.get().map(|r| match r {
                             Ok(cs) if cs.is_empty() => view! { <p class="px-4 py-6 text-center text-sm text-zinc-500">"No connections yet."</p> }.into_any(),
-                            Ok(cs) => cs.into_iter().map(|c| view! { <ConnectionRow c on_change=move || connections.refetch() error /> }).collect_view().into_any(),
+                            Ok(cs) => cs.into_iter().map(|c| view! { <ConnectionRow c all on_change=move || connections.refetch() error /> }).collect_view().into_any(),
                             Err(e) => view! { <div class="p-3"><ErrorBox message=e /></div> }.into_any(),
                         })}
                     </Suspense>
@@ -1447,7 +1448,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                     "Signed in with ChatGPT."
                 </div>
             })}
-            <AddConnection on_added=move || connections.refetch() />
+            <AddConnection all on_added=move || connections.refetch() />
             <ChatGptSignIn on_added=move || connections.refetch() />
     }
 }
@@ -1458,12 +1459,82 @@ fn kind_label(kind: &str) -> &'static str {
         "openai" => "OpenAI",
         "chatgpt" => "ChatGPT plan",
         "claude_code" => "Claude Code",
+        "pool" => "Pool",
         _ => "OpenAI-compatible",
     }
 }
 
+/// A pool's members (docs/pools.md): each connection and its calls at once.
 #[component]
-fn ConnectionRow(c: Connection, on_change: impl Fn() + Copy + Send + Sync + 'static, error: RwSignal<Option<String>>) -> impl IntoView {
+fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>) -> impl IntoView {
+    let choices = move || all.get().into_iter().filter(|c| !matches!(c.kind.as_str(), "pool" | "claude_code")).collect::<Vec<_>>();
+    view! {
+        <div class="space-y-2">
+            {move || members.get().into_iter().enumerate().map(|(i, m)| view! {
+                <div class="flex items-center gap-2">
+                    <select class=INPUT prop:value=m.connection_id.clone()
+                        on:change=move |ev| members.update(|ms| ms[i].connection_id = event_target_value(&ev))>
+                        <option value="">"Choose a connection"</option>
+                        {choices().into_iter().map(|c| view! { <option value=c.id.clone() selected=c.id == m.connection_id>{c.name}</option> }).collect_view()}
+                    </select>
+                    <label class="flex shrink-0 items-center gap-1 text-xs text-zinc-500">
+                        "Calls at once"
+                        <input type="number" min="1" max="64" class="w-16 rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+                            prop:value=m.slots.to_string()
+                            on:change=move |ev| members.update(|ms| ms[i].slots = event_target_value(&ev).parse().unwrap_or(1)) />
+                    </label>
+                    <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=move |_| members.update(|ms| { ms.remove(i); })>"Remove"</button>
+                </div>
+            }).collect_view()}
+            <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| members.update(|ms| ms.push(PoolMember { connection_id: String::new(), slots: 1 }))>
+                "Add a member"
+            </button>
+            <p class="text-xs text-zinc-500">
+                "Each call goes to the least busy member with a free slot, else waits its turn; a member that fails rests and the call goes to another. Pools are for what runs in the head (the memex, the assistant, suggestions), not sessions. Set Settings → Memex → calls at once to about the total of the members' calls at once."
+            </p>
+        </div>
+    }
+}
+
+#[component]
+fn ConnectionRow(
+    c: Connection,
+    all: Signal<Vec<Connection>>,
+    on_change: impl Fn() + Copy + Send + Sync + 'static,
+    error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let pool = c.kind == "pool";
+    let members = RwSignal::new(c.members.clone());
+    let editing = RwSignal::new(false);
+    let save_id = c.id.clone();
+    let save = move |_| {
+        let id = save_id.clone();
+        let req = c6_api::UpdateConnection { name: None, members: Some(members.get_untracked()) };
+        spawn_local(async move {
+            match api::update_connection(id, req).await {
+                Ok(_) => {
+                    editing.set(false);
+                    error.set(None);
+                    on_change();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    // "mac ×2, mumuzz ×1"
+    let shown = c.members.clone();
+    let members_text = move || {
+        let names = all.get();
+        shown
+            .iter()
+            .map(|m| {
+                let name =
+                    names.iter().find(|c| c.id == m.connection_id).map(|c| c.name.clone()).unwrap_or_else(|| m.connection_id.clone());
+                format!("{name} ×{}", m.slots)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let id = c.id.clone();
     let name = c.name.clone();
     let remove = move |_| {
@@ -1497,22 +1568,32 @@ fn ConnectionRow(c: Connection, on_change: impl Fn() + Copy + Send + Sync + 'sta
                     Err(e) => view! { <div class="text-xs text-red-600">{format!("✕ {e}")}</div> }.into_any(),
                 })}
                 <div class="truncate font-mono text-xs text-zinc-500">
-                    {kind_label(&c.kind)} {(c.kind != "claude_code").then(|| format!(" · {}", c.base_url))}
+                    {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
+                    {pool.then_some(move || format!(" · {}", members_text()))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
-                    {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code", _) => "", (_, true) => " · key set", _ => " · no key" }}
+                    {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code" | "pool", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
             </div>
+            {pool.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
             {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}
             <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=test>"Test"</button>
             <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=remove>"Delete"</button>
         </div>
         {move || reauth.get().then(|| view! { <ChatGptSignIn on_added=move || { reauth.set(false); on_change(); } again=again_id.clone() /> })}
+        {move || editing.get().then(|| view! {
+            <div class="space-y-2 px-4 pb-3">
+                <PoolMembers members all />
+                <div class="flex justify-end"><button class=BUTTON on:click=save.clone()>"Save members"</button></div>
+            </div>
+        })}
     }
 }
 
 #[component]
-fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
+fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
     let kind = RwSignal::new("anthropic".to_owned());
+    let members = RwSignal::new(vec![PoolMember { connection_id: String::new(), slots: 1 }]);
+    let pool = move || kind.get() == "pool";
     let name = RwSignal::new(String::new());
     let base_url = RwSignal::new(String::new());
     let api_key = RwSignal::new(String::new());
@@ -1553,6 +1634,7 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
             base_url: base_url.get_untracked(),
             api_key: Some(api_key.get_untracked()).filter(|k| !k.is_empty()),
             default_model: Some(default_model.get_untracked()).filter(|m| !m.is_empty()),
+            members: if kind.get_untracked() == "pool" { members.get_untracked() } else { Vec::new() },
         };
         spawn_local(async move {
             match api::create_connection(req).await {
@@ -1562,6 +1644,7 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                     base_url.set(String::new());
                     api_key.set(String::new());
                     default_model.set(String::new());
+                    members.set(vec![PoolMember { connection_id: String::new(), slots: 1 }]);
                     tested.set(None);
                     on_added();
                 }
@@ -1599,15 +1682,22 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
                     <option value="openai">"OpenAI API (Responses)"</option>
                     <option value="openai_compat">"OpenAI-compatible (Chat Completions: Ollama, vLLM, OpenRouter, …)"</option>
                     <option value="claude_code">"Claude Code (each worker's own signed-in claude CLI)"</option>
+                    <option value="pool">"Pool (other connections, for the memex, the assistant and suggestions)"</option>
                 </select>
             </label>
+            {move || pool().then(|| view! {
+                <div class="space-y-3">
+                    {field("Name", name, Signal::stored("Ollamas"), "text")}
+                    <PoolMembers members all />
+                </div>
+            })}
             {move || (kind.get() == "claude_code").then(|| view! {
                 <p class="text-sm text-zinc-500">
                     "Sessions run the official Claude Code CLI on the worker, with its own tools and sign-in (your Claude subscription or API key). Install it on each worker and run "
                     <code class="font-mono">"claude auth login"</code> " there. No key is stored here."
                 </p>
             })}
-            <div class="grid gap-3 sm:grid-cols-2">
+            <div class="grid gap-3 sm:grid-cols-2" class:hidden=pool>
                 {field("Name", name, by_kind("Anthropic", "OpenAI", "Ollama"), "text")}
                 {field("Base URL", base_url, by_kind("https://api.anthropic.com (default)", "https://api.openai.com/v1 (default)", "http://127.0.0.1:11434/v1"), "url")}
                 {field("API key", api_key, by_kind("sk-ant-…", "sk-…", "optional for local servers"), "password")}
@@ -1630,7 +1720,7 @@ fn AddConnection(on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl Int
             })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex justify-end gap-2">
-                <button class=BUTTON_QUIET disabled=move || testing.get() on:click=test>
+                <button class=BUTTON_QUIET class:hidden=pool disabled=move || testing.get() on:click=test>
                     {move || if testing.get() { "Testing…" } else { "Test connection" }}
                 </button>
                 <button class=BUTTON disabled=move || pending.get() on:click=add>"Add connection"</button>

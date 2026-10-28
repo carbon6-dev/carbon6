@@ -414,6 +414,18 @@ Routing rules (**Settings → Model routing**) choose the connection and model f
 - **No match:** the connection of your latest session (if you didn't pick one), its default model, else the model of your latest session on it.
 - **Presets:** Opus with Haiku subagents everywhere, remote hosts on a fast model at low effort, research at high effort, a template on a local model.
 
+### Pools
+
+A pool is a connection made of other connections, each taking some calls at once. What runs in the head (the memex, the assistant, suggestions) spreads its calls over a pool's members, for example Ollama on your laptop and on your server.
+
+- **Picking:** each call goes to the least busy member with a free slot. With every slot taken, it waits its turn in the head.
+- **Failing over:** a member that fails (unreachable, 429, 5xx) rests, with backoff, and the call goes to another member. Members without the model, or not for the caller's realm, are passed over.
+- **Setting one up:** add each server as a connection, then a connection of kind **Pool** with its members and their calls at once, and choose the pool in **Settings → Memex**. Set the memex's **calls at once** to about the total of the members' slots.
+- **Sessions** don't use pools: their workers dial their own connection.
+- **Seeing it:** **Activity** shows which member took each call.
+
+Details: [docs/pools.md](docs/pools.md).
+
 ### Templates and fleet runs
 
 A template (**Settings → Templates**) is a saved way to start a session:

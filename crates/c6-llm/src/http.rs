@@ -8,7 +8,8 @@ use tracing::warn;
 
 use crate::LlmError;
 
-const MAX_ATTEMPTS: u32 = 5;
+/// Attempts at a request before giving up (`post_json`).
+pub const MAX_ATTEMPTS: u32 = 5;
 
 pub fn client() -> Result<reqwest::Client, LlmError> {
     crate::install_crypto_provider();
@@ -21,19 +22,20 @@ pub fn client() -> Result<reqwest::Client, LlmError> {
 }
 
 /// POSTs JSON, retrying connection errors, 408/409/429 and 5xx before any
-/// response body is consumed. Honours `retry-after`.
+/// response body is consumed, up to `attempts` times. Honours `retry-after`.
 pub async fn post_json(
     http: &reqwest::Client,
     url: &str,
     headers: &HashMap<String, String>,
     body: &Value,
+    attempts: u32,
 ) -> Result<reqwest::Response, LlmError> {
     let mut attempt = 0;
     loop {
         attempt += 1;
         match post_once(http, url, headers, body).await {
             Ok(r) => return Ok(r),
-            Err(e) if e.retryable() && attempt < MAX_ATTEMPTS => {
+            Err(e) if e.retryable() && attempt < attempts => {
                 let wait = match &e {
                     LlmError::Http { retry_after: Some(d), .. } => *d,
                     _ => Duration::from_millis(1000 * 2u64.pow(attempt - 1)).min(Duration::from_secs(30)),

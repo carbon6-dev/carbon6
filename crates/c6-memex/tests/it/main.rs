@@ -8,6 +8,7 @@ mod fixtures;
 mod knowledge;
 mod memex;
 mod move_in;
+mod pools;
 mod realms;
 mod records;
 mod relations;

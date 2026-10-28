@@ -49,15 +49,20 @@ pub async fn ask(
     user: Vec<Block>,
     max_tokens: u32,
 ) -> anyhow::Result<String> {
-    let grant = m.link.credential(&task.connection_id).await?;
-    let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
     let origin = c6_llm::activity::Origin {
         what: what.to_owned(),
         about: about.to_owned(),
         connection: task.connection_id.clone(),
         realm: m.realm.clone(),
+        via: String::new(),
     };
-    let client = c6_llm::activity::track(client, origin);
+    let client: Box<dyn c6_llm::ModelClient> = match m.link.pool(&task.connection_id).await {
+        Some(pool) => Box::new(c6_llm::pool::PoolClient::new(pool, &m.realm, origin)),
+        None => {
+            let grant = m.link.credential(&task.connection_id).await?;
+            c6_llm::activity::track(c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?, origin)
+        }
+    };
     let effort = task.effort.clone().filter(|e| !e.is_empty());
     let req = ModelRequest {
         model: task.model.clone(),

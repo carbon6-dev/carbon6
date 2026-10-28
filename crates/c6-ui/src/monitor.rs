@@ -235,7 +235,8 @@ fn CallLine(c: Value, now: i64, open: RwSignal<Option<u64>>) -> impl IntoView {
                 <span class=format!("h-2 w-2 shrink-0 self-center rounded-full {}", state_dot(&state)) title=state.clone()></span>
                 <span class="w-24 shrink-0 font-medium">{s(&c["what"])}</span>
                 <span class="min-w-0 flex-1 truncate" title=s(&c["about"])>{s(&c["about"])}</span>
-                <span class="shrink-0 text-xs text-zinc-500">{format!("{} · {}{}", s(&c["connection_name"]), s(&c["model"]), if c["effort"].as_str().is_some_and(|e| !e.is_empty()) { format!(" · {}", s(&c["effort"])) } else { String::new() })}</span>
+                // A pool's call: the member that took it, and the pool.
+                <span class="shrink-0 text-xs text-zinc-500">{format!("{}{} · {}{}", s(&c["connection_name"]), if s(&c["via_name"]).is_empty() { String::new() } else { format!(" (pool {})", s(&c["via_name"])) }, s(&c["model"]), if c["effort"].as_str().is_some_and(|e| !e.is_empty()) { format!(" · {}", s(&c["effort"])) } else { String::new() })}</span>
                 <span class="w-full truncate pl-4 text-xs text-zinc-500 sm:w-auto sm:pl-0">{format!("{state} · {timing}{}{}", if tokens.is_empty() { String::new() } else { format!(" · {tokens}") }, if when.is_empty() { String::new() } else { format!(" · {when}") })}</span>
                 {(c["ended_at"].is_null() || !c["latest"].as_str().unwrap_or_default().is_empty()).then(|| view! {
                     <span class="w-full truncate pl-4 font-mono text-[11px] text-zinc-400">{s(&c["latest"])}</span>

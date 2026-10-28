@@ -18,8 +18,8 @@ use c6_api as api;
 use c6_core::{WorkerId, now_ms};
 use c6_llm::{Message, Provider, Role, ToolSpec, model_info};
 use c6_proto::{
-    CredentialRequest, ErrorEvent, HeadMsg, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionEventBatch,
-    SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
+    ErrorEvent, HeadMsg, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionEventBatch, SessionStarted, TurnEndReason,
+    TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
 use prost::Message as _;
@@ -416,26 +416,16 @@ impl Actor {
                     _ if !blocks.is_empty() => conv.history.push(Message { role: Role::User, blocks }),
                     _ => {}
                 }
-                let grant = crate::sessions::credential(
-                    &st,
-                    sink.head_id,
-                    CredentialRequest { connection_id: connection_id.clone(), ..Default::default() },
-                )
-                .await;
-                let client = if grant.error.is_empty() {
-                    let title = st.store.session(&session_id).await.ok().flatten().map(|r| r.title).filter(|t| !t.is_empty());
-                    let origin = c6_llm::activity::Origin {
-                        what: "assistant".into(),
-                        about: title.unwrap_or_else(|| session_id.clone()),
-                        connection: connection_id.clone(),
-                        realm: env.realm.clone(),
-                    };
-                    c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers)
-                        .map(|c| c6_llm::activity::track(c, origin))
-                        .map_err(|e| e.to_string())
-                } else {
-                    Err(grant.error)
+                let title = st.store.session(&session_id).await.ok().flatten().map(|r| r.title).filter(|t| !t.is_empty());
+                let origin = c6_llm::activity::Origin {
+                    what: "assistant".into(),
+                    about: title.unwrap_or_else(|| session_id.clone()),
+                    connection: connection_id.clone(),
+                    realm: env.realm.clone(),
+                    via: String::new(),
                 };
+                // Through the pool, when its connection is one.
+                let client = crate::pools::client(&st, &connection_id, &env.realm, origin).await.map_err(|e| format!("{e:#}"));
                 let client = match client {
                     Ok(c) => c,
                     Err(e) => {

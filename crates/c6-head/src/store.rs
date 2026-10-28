@@ -374,18 +374,34 @@ pub struct ConnectionRow {
     pub created_at: i64,
     /// The realms it is available to (JSON array; empty: all).
     pub realms: String,
+    /// A pool's members (JSON array of `api::PoolMember`).
+    pub members: String,
 }
 
 impl Store {
     pub async fn insert_connection(&self, c: &ConnectionRow) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-            .bind(&c.id)
-            .bind(&c.name)
-            .bind(&c.kind)
-            .bind(&c.base_url)
-            .bind(&c.api_key)
-            .bind(&c.default_model)
-            .bind(c.created_at)
+        sqlx::query(
+            "INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at, members) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&c.id)
+        .bind(&c.name)
+        .bind(&c.kind)
+        .bind(&c.base_url)
+        .bind(&c.api_key)
+        .bind(&c.default_model)
+        .bind(c.created_at)
+        .bind(&c.members)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Renames a connection, and (a pool's) sets its members.
+    pub async fn update_connection(&self, id: &str, name: &str, members: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE connections SET name = ?, members = ? WHERE id = ?")
+            .bind(name)
+            .bind(members)
+            .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())

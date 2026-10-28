@@ -7,6 +7,7 @@ mod http;
 pub mod models;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod pool;
 mod sse;
 
 use std::time::Duration;
@@ -245,6 +246,21 @@ pub fn client_for(
         Provider::OpenAiChat => Box::new(openai_chat::OpenAiChat::new(base_url, bearer, headers)?),
         Provider::OpenAiResponses => Box::new(openai_responses::OpenAiResponses::new(base_url, bearer, headers, kind == "chatgpt")?),
         Provider::Anthropic => Box::new(anthropic::Anthropic::new(base_url, bearer, headers)?),
+    })
+}
+
+/// `client_for`, giving up after the first failed attempt: a pool member
+/// that fails is passed over for another, not waited on.
+pub fn client_once(
+    kind: &str,
+    base_url: &str,
+    bearer: &str,
+    headers: std::collections::HashMap<String, String>,
+) -> Result<Box<dyn ModelClient>, LlmError> {
+    Ok(match Provider::from_kind(kind).ok_or_else(|| LlmError::Config(format!("unknown connection kind `{kind}`")))? {
+        Provider::OpenAiChat => Box::new(openai_chat::OpenAiChat::new(base_url, bearer, headers)?.once()),
+        Provider::OpenAiResponses => Box::new(openai_responses::OpenAiResponses::new(base_url, bearer, headers, kind == "chatgpt")?.once()),
+        Provider::Anthropic => Box::new(anthropic::Anthropic::new(base_url, bearer, headers)?.once()),
     })
 }
 

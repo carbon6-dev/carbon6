@@ -200,6 +200,40 @@ pub async fn scopes(st: &HeadState) -> anyhow::Result<Vec<api::MemexScope>> {
     Ok(serde_json::from_str(&st.store.setting(SCOPES).await?.unwrap_or_default()).unwrap_or_default())
 }
 
+/// Why a member of a pool can't serve the memex's `what` model, if it can't.
+fn unfit(what: &str, kind: &str) -> Option<&'static str> {
+    match (what, kind) {
+        ("embedding", "anthropic" | "chatgpt") => Some("has no embedding models (choose OpenAI or OpenAI-compatible members, e.g. Ollama)"),
+        ("transcription", "anthropic" | "chatgpt") => Some("has no /audio/transcriptions (choose OpenAI or OpenAI-compatible members)"),
+        _ => None,
+    }
+}
+
+/// A pool's members, for the memex's `what` model: each must fit it.
+async fn check_pool_members(st: &HeadState, what: &str, pool: &str, members: &[api::PoolMember]) -> anyhow::Result<()> {
+    for m in members {
+        let Some(c) = st.store.connection(&m.connection_id).await? else { continue };
+        if let Some(why) = unfit(what, &c.kind) {
+            return Err(bad_request(format!("{what}: {} in pool {pool} {why}", c.name)));
+        }
+    }
+    Ok(())
+}
+
+/// A pool's new members, for what the memex uses it for.
+pub async fn check_pool_use(st: &HeadState, pool_id: &str, members: &[api::PoolMember]) -> anyhow::Result<()> {
+    let s = settings(st).await?;
+    let Some(pool) = st.store.connection(pool_id).await? else { return Ok(()) };
+    let uses =
+        [("embedding", &s.embedding), ("understanding", &s.understanding), ("vision", &s.vision), ("transcription", &s.transcription)];
+    for (what, m) in uses {
+        if m.as_ref().is_some_and(|m| m.connection == pool.id || m.connection == pool.name) {
+            check_pool_members(st, what, &pool.name, members).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::Result<()> {
     if let Some(m) = &s.embedding {
         let connections = st.store.connections().await?;
@@ -207,6 +241,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
             .iter()
             .find(|c| c.id == m.connection || c.name == m.connection)
             .ok_or_else(|| bad_request(format!("no connection {:?}", m.connection)))?;
+        if c.kind == crate::pools::KIND {
+            check_pool_members(st, "embedding", &c.name, &crate::pools::members(c)).await?;
+        }
         if matches!(c.kind.as_str(), "anthropic" | "claude_code" | "chatgpt") {
             return Err(bad_request(format!(
                 "{} has no embedding models; choose an OpenAI or OpenAI-compatible (e.g. Ollama) connection",
@@ -232,6 +269,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
         }
         if what == "transcription" && matches!(c.kind.as_str(), "anthropic" | "chatgpt") {
             return Err(bad_request("transcription: choose an OpenAI or OpenAI-compatible connection (one with /audio/transcriptions)"));
+        }
+        if c.kind == crate::pools::KIND {
+            check_pool_members(st, what, &c.name, &crate::pools::members(c)).await?;
         }
         if m.model.trim().is_empty() {
             return Err(bad_request(format!("choose a model for {what}")));

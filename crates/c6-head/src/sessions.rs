@@ -128,10 +128,11 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         }
         (routed.connection, routed.model, routed.subagent_model)
     };
-    if let Some(c) = st.store.connection(&connection_id).await?
-        && !crate::realms::available(&c.realms, &realm)
-    {
-        return Err(bad_request(format!("the connection {} is not available to realm {realm}", c.name)));
+    if let Some(c) = st.store.connection(&connection_id).await? {
+        if !crate::realms::available(&c.realms, &realm) {
+            return Err(bad_request(format!("the connection {} is not available to realm {realm}", c.name)));
+        }
+        crate::pools::not_for_sessions(&c, "a session")?;
     }
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
@@ -773,6 +774,7 @@ async fn model_switch(
 ) -> anyhow::Result<ModelSpec> {
     let effort = check_effort(effort)?;
     let to = st.store.connection(connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    crate::pools::not_for_sessions(&to, "a session")?;
     let from = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
     // An imported session has no connection yet: it may take any.
     if !session.connection_id.is_empty() && (to.kind == "claude_code") != (from == "claude_code") {
@@ -857,7 +859,14 @@ async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String],
     if !connection.is_empty() && !connections.iter().any(|c| c.id == connection) {
         return Err(bad_request("no such connection"));
     }
-    let first = || connections.first().map(|c| c.id.clone()).ok_or_else(|| bad_request("add a connection first (Settings → Connections)"));
+    // Not a pool: sessions dial their connection.
+    let first = || {
+        connections
+            .iter()
+            .find(|c| c.kind != crate::pools::KIND)
+            .map(|c| c.id.clone())
+            .ok_or_else(|| bad_request("add a connection first (Settings → Connections)"))
+    };
     if !model.is_empty() {
         let connection = if connection.is_empty() { first()? } else { connection.to_owned() };
         return Ok(Routed { connection, model: model.to_owned(), ..Default::default() });
@@ -917,8 +926,16 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
             return Err(bad_request(format!("routing rule {:?}: a model is required", r.name)));
         }
         let want = r.connection.trim();
-        if !want.is_empty() && !connections.iter().any(|c| c.id == want || c.name == want) {
-            return Err(bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)));
+        if !want.is_empty() {
+            let c = connections
+                .iter()
+                .find(|c| c.id == want || c.name == want)
+                .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
+            // A pool only for what runs in the head (the assistant, suggestions).
+            let head_side = r.applies_to.iter().any(|l| l == crate::assistant::LABEL || l == crate::suggestions::ROUTE_LABEL);
+            if !head_side {
+                crate::pools::not_for_sessions(c, &format!("routing rule {:?} (unless it applies to assistant or task:suggest)", r.name))?;
+            }
         }
         check_effort(Some(r.effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: {e}", r.name)))?;
         check_selector(&r.applies_to)?;

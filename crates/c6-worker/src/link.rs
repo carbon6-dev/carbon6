@@ -26,6 +26,11 @@ const COALESCE: Duration = Duration::from_millis(25);
 pub trait LocalHead: Send + Sync {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
     async fn credential(&self, connection_id: &str) -> CredentialGrant;
+    /// The pool a connection is, if it is one: the head spreads its calls
+    /// over the pool's members.
+    async fn pool(&self, _connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -120,6 +125,12 @@ impl HeadLink {
 
     pub async fn credential(&self, connection_id: &str) -> anyhow::Result<CredentialGrant> {
         self.credential_with(connection_id, false).await
+    }
+
+    /// The pool a connection is, when the head is in this process and it is
+    /// one (pools are only for what runs in the head).
+    pub async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
+        self.local.get()?.pool(connection_id).await
     }
 
     /// New credentials, after the provider refused the ones it had (HTTP

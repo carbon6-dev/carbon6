@@ -36,6 +36,7 @@ pub mod oauth;
 pub mod operations;
 pub mod packages;
 pub mod pki;
+pub mod pools;
 pub mod prompts;
 pub mod providers;
 pub mod push;
@@ -143,6 +144,8 @@ pub struct HeadState {
     pub memex: std::sync::OnceLock<Arc<c6_memex::Memex>>,
     /// Updating carbon6 from GitHub releases (docs/updates.md).
     pub updates: updates::Updater,
+    /// Pools of connections (docs/pools.md).
+    pub pools: pools::Pools,
 }
 
 /// A running head.
@@ -242,7 +245,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         data_dir: cfg.data_dir.clone(),
         memex: Default::default(),
         updates: updater,
+        pools: Default::default(),
     });
+    state.pools.attach(&state);
     updates::after_open(&state).await;
 
     let mut tasks = JoinSet::new();

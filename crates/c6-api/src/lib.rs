@@ -76,7 +76,8 @@ pub enum LiveEvent {
 pub struct Connection {
     pub id: String,
     pub name: String,
-    /// `openai_compat` for now.
+    /// `openai_compat`, `openai`, `anthropic`, `chatgpt`, `claude_code`, or
+    /// `pool` (docs/pools.md).
     pub kind: String,
     pub base_url: String,
     pub default_model: Option<String>,
@@ -88,20 +89,48 @@ pub struct Connection {
     /// The realms whose sessions may use it (empty: all).
     #[serde(default)]
     pub realms: Vec<String>,
+    /// A pool's members (docs/pools.md).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<PoolMember>,
+}
+
+/// A pool's member: one of the other connections, and how many calls it
+/// takes at once (docs/pools.md).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PoolMember {
+    /// The connection (its id, or name).
+    pub connection_id: String,
+    /// Calls at once (1 to 64).
+    pub slots: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateConnection {
-    /// `openai_compat` (default), `openai`, `anthropic`, or `claude_code`
-    /// (runs the worker's own signed-in Claude Code). ChatGPT
+    /// `openai_compat` (default), `openai`, `anthropic`, `claude_code`
+    /// (runs the worker's own signed-in Claude Code), or `pool` (other
+    /// connections, for what runs in the head: docs/pools.md). ChatGPT
     /// connections are created by signing in instead.
     #[serde(default)]
     pub kind: Option<String>,
     pub name: String,
+    #[serde(default)]
     pub base_url: String,
     pub api_key: Option<String>,
     pub default_model: Option<String>,
+    /// A pool's members.
+    #[serde(default)]
+    pub members: Vec<PoolMember>,
+}
+
+/// `PATCH /api/v1/connections/{id}`: what changes (what is left out stays).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateConnection {
+    pub name: Option<String>,
+    /// A pool's members, all of them.
+    pub members: Option<Vec<PoolMember>>,
 }
 
 // --- Sessions ---------------------------------------------------------------

@@ -21,6 +21,8 @@ pub struct OpenAiResponses {
     plan: bool,
     /// api.openai.com (not a compatible server): built-in tools are available.
     official: bool,
+    /// Attempts at each request (`http::post_json`).
+    attempts: u32,
 }
 
 impl OpenAiResponses {
@@ -30,7 +32,13 @@ impl OpenAiResponses {
             headers.insert("authorization".into(), format!("Bearer {bearer}"));
         }
         let official = url::Url::parse(base_url).ok().and_then(|u| u.host_str().map(|h| h == "api.openai.com")).unwrap_or(false);
-        Ok(Self { http: http::client()?, base_url: base_url.trim_end_matches('/').to_owned(), headers, plan, official })
+        let base_url = base_url.trim_end_matches('/').to_owned();
+        Ok(Self { http: http::client()?, base_url, headers, plan, official, attempts: http::MAX_ATTEMPTS })
+    }
+
+    /// Gives up after the first failed attempt.
+    pub fn once(self) -> Self {
+        Self { attempts: 1, ..self }
     }
 
     pub fn request_body(&self, req: &ModelRequest) -> Value {
@@ -129,7 +137,7 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
 impl ModelClient for OpenAiResponses {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
-        let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &self.headers, &body).await?;
+        let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &self.headers, &body, self.attempts).await?;
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
             loop {

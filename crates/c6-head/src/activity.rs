@@ -58,6 +58,7 @@ fn listed(c: c6_llm::activity::Call, names: &HashMap<String, String>) -> Value {
     };
     let mut v = json!(c);
     v["connection_name"] = json!(names.get(&c.connection).cloned().unwrap_or_default());
+    v["via_name"] = json!(names.get(&c.via).cloned().unwrap_or_default());
     v["latest"] = json!(if c.text.is_empty() { last(&c.thinking) } else { last(&c.text) });
     // Only how long each is; the call itself has them.
     if let Some(o) = v.as_object_mut() {
@@ -75,6 +76,7 @@ pub async fn call(st: &HeadState, id: u64) -> anyhow::Result<Option<Value>> {
     Ok(c6_llm::activity::calls().into_iter().find(|c| c.id == id).map(|c| {
         let mut v = json!(c);
         v["connection_name"] = json!(names.get(&c.connection).cloned().unwrap_or_default());
+        v["via_name"] = json!(names.get(&c.via).cloned().unwrap_or_default());
         v
     }))
 }

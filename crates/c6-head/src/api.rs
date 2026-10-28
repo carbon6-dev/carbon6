@@ -24,7 +24,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/workers/{id}", delete(delete_worker))
         .route("/api/v1/connections", get(list_connections).post(create_connection))
         .route("/api/v1/connections/test", post(test_connection))
-        .route("/api/v1/connections/{id}", delete(delete_connection))
+        .route("/api/v1/connections/{id}", delete(delete_connection).patch(update_connection))
         .route("/api/v1/connections/{id}/models", get(connection_models))
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
@@ -383,6 +383,7 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
 
 fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
     api::Connection {
+        members: crate::pools::members(&c),
         supports_effort: c6_llm::supports_effort(&c.kind, &c.base_url),
         id: c.id,
         name: c.name,
@@ -406,13 +407,16 @@ async fn list_connections(State(st): State<Arc<HeadState>>, Extension(caller): E
 
 async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateConnection>) -> ApiResult<Json<api::Connection>> {
     let kind = req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()).unwrap_or("openai_compat");
+    if kind == crate::pools::KIND {
+        return Ok(Json(create_pool(&st, &req).await?));
+    }
     let default_url = match kind {
         "openai_compat" => None,
         "claude_code" => Some("local"),
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com"),
         "chatgpt" => return Err(ApiErr(StatusCode::BAD_REQUEST, "ChatGPT connections are created with Sign in with ChatGPT".into())),
-        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai, anthropic or claude_code".into())),
+        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai, anthropic, claude_code or pool".into())),
     };
     let name = req.name.trim();
     let base_url = Some(req.base_url.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).or(default_url).unwrap_or("");
@@ -436,8 +440,59 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         default_model: req.default_model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
         created_at: now_ms(),
         realms: "[]".into(),
+        members: "[]".into(),
     };
     st.store.insert_connection(&row).await?;
+    Ok(Json(connection_view(row)))
+}
+
+/// A pool (docs/pools.md): other connections, each with its calls at once.
+async fn create_pool(st: &HeadState, req: &api::CreateConnection) -> anyhow::Result<api::Connection> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(crate::bad_request("name is required"));
+    }
+    let id = uuid::Uuid::now_v7().to_string();
+    let members = crate::pools::check_members(st, &id, &req.members).await?;
+    let row = crate::store::ConnectionRow {
+        id,
+        name: name.to_owned(),
+        kind: crate::pools::KIND.into(),
+        base_url: String::new(),
+        api_key: None,
+        default_model: req.default_model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned),
+        created_at: now_ms(),
+        realms: "[]".into(),
+        members: serde_json::to_string(&members)?,
+    };
+    st.store.insert_connection(&row).await?;
+    Ok(connection_view(row))
+}
+
+/// Renames a connection, or sets a pool's members.
+async fn update_connection(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::UpdateConnection>,
+) -> ApiResult<Json<api::Connection>> {
+    let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
+    let name = req.name.as_deref().map(str::trim).unwrap_or(&c.name).to_owned();
+    if name.is_empty() {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "name is required".into()));
+    }
+    let members = match &req.members {
+        Some(_) if c.kind != crate::pools::KIND => {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{} is not a pool: only pools have members", c.name)));
+        }
+        Some(m) => {
+            let members = crate::pools::check_members(&st, &c.id, m).await?;
+            crate::memex::check_pool_use(&st, &c.id, &members).await?;
+            serde_json::to_string(&members).map_err(anyhow::Error::from)?
+        }
+        None => c.members.clone(),
+    };
+    st.store.update_connection(&id, &name, &members).await?;
+    let row = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
     Ok(Json(connection_view(row)))
 }
 
@@ -514,6 +569,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         default_model: None,
         created_at: now_ms(),
         realms: "[]".into(),
+        members: "[]".into(),
     };
     st.store.insert_connection(&row).await?;
     Ok(connection_view(row))
@@ -563,11 +619,19 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
 /// all model calls for sessions happen on workers.
 async fn connection_models(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<String>>> {
     let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
+    if c.kind == crate::pools::KIND {
+        return Ok(Json(crate::pools::models(&st, &c).await?));
+    }
+    connection_models_of(&st, &c).await.map(Json)
+}
+
+/// A (non-pool) connection's models, from its provider.
+pub(crate) async fn connection_models_of(st: &HeadState, c: &crate::store::ConnectionRow) -> ApiResult<Vec<String>> {
     let key = match c.kind.as_str() {
-        "chatgpt" => crate::sessions::chatgpt_tokens(&st, &c.id).await?.access_token,
+        "chatgpt" => crate::sessions::chatgpt_tokens(st, &c.id).await?.access_token,
         _ => c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default(),
     };
-    list_models(&c.kind, &c.base_url, &key).await.map(Json)
+    list_models(&c.kind, &c.base_url, &key).await
 }
 
 /// Lists a provider's models; this doubles as the connection check, since it
