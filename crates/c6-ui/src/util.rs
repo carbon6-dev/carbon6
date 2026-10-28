@@ -121,13 +121,122 @@ pub fn NoticeHost() -> impl IntoView {
     }
 }
 
+/// How something that pops up goes away.
+type PutAway = std::rc::Rc<dyn Fn()>;
+type Hook = wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>;
+
+thread_local! {
+    static POPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// What pops up now, and how it goes away: one at a time.
+    static SHOWN: std::cell::RefCell<Option<(u64, PutAway)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The document's listeners while something pops up; dropped, they go.
+struct Dismiss {
+    id: u64,
+    hooks: Vec<(&'static str, Hook)>,
+}
+
+impl Drop for Dismiss {
+    fn drop(&mut self) {
+        for (kind, f) in &self.hooks {
+            let _ = document().remove_event_listener_with_callback_and_bool(kind, wasm_bindgen::JsCast::unchecked_ref(f.as_ref()), true);
+        }
+        SHOWN.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.as_ref().is_some_and(|(i, _)| *i == self.id) {
+                *s = None;
+            }
+        });
+    }
+}
+
+/// Puts away what `shown` says is open (`close`) as phones and desktops
+/// expect: a press anywhere else (`pointerdown`, a tap and a click alike;
+/// a touch scroll starts with one), a wheel scrolling anywhere else, focus
+/// moving elsewhere, Escape (which goes no further, so it doesn't also stop
+/// a running turn), and another one opening. Scrolling the page by itself
+/// (a transcript following its turn) leaves it open. Nothing covers the
+/// page, so scrolling stays the page's. What belongs to it (its button and
+/// what it shows) carries `data-pop`, the value returned.
+pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
+    use wasm_bindgen::JsCast;
+    let id = POPS.with(|n| {
+        n.set(n.get() + 1);
+        n.get()
+    });
+    let key = format!("pop{id}");
+    let mine = format!("[data-pop=\"{key}\"]");
+    let hooks = StoredValue::new_local(None::<Dismiss>);
+    Effect::new(move || {
+        if !shown() {
+            hooks.set_value(None);
+            return;
+        }
+        if hooks.with_value(Option::is_some) {
+            return;
+        }
+        let put_away: PutAway = std::rc::Rc::new(close.clone());
+        let before = SHOWN.with(|s| s.borrow_mut().replace((id, put_away)));
+        if let Some((other, put_away)) = before
+            && other != id
+        {
+            put_away();
+        }
+        let outside = {
+            let mine = mine.clone();
+            move |ev: &web_sys::Event| {
+                !ev.target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .is_some_and(|el| el.closest(&mine).ok().flatten().is_some())
+            }
+        };
+        let mut d = Dismiss { id, hooks: Vec::new() };
+        for kind in ["pointerdown", "wheel", "focusin"] {
+            let (outside, close) = (outside.clone(), close.clone());
+            d.hooks.push((
+                kind,
+                wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
+                    if outside(&ev) {
+                        close();
+                    }
+                }),
+            ));
+        }
+        let close = close.clone();
+        d.hooks.push((
+            "keydown",
+            wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
+                if ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|k| k.key() == "Escape") {
+                    ev.stop_propagation();
+                    close();
+                }
+            }),
+        ));
+        let opts = web_sys::AddEventListenerOptions::new();
+        opts.set_capture(true);
+        opts.set_passive(true);
+        for (kind, f) in &d.hooks {
+            let _ = document().add_event_listener_with_callback_and_add_event_listener_options(kind, f.as_ref().unchecked_ref(), &opts);
+        }
+        hooks.set_value(Some(d));
+    });
+    key
+}
+
 /// A "⋯" button and its menu. With `row`, it's a row's: on touch screens
 /// always there, elsewhere on hover or keyboard focus (style/input.css).
 /// The menu is fixed to the screen, so a scrolling list doesn't clip it,
-/// and a tap anywhere else closes it.
+/// and goes away as `dismissable` says.
 #[component]
 pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: bool, #[prop(optional, into)] label: String) -> impl IntoView {
     let open = RwSignal::new(None::<(f64, f64)>);
+    let pop = dismissable(
+        move || open.get().is_some(),
+        move || {
+            open.try_set(None);
+        },
+    );
     let items = StoredValue::new(items);
     let trigger = if row {
         "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
@@ -137,7 +246,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
     let label = if label.is_empty() { "More".to_owned() } else { label };
     view! {
         <button class=trigger title=label.clone() aria-label=label aria-haspopup="menu" aria-expanded=move || open.get().is_some().to_string()
-            on:click=move |ev| {
+            data-pop=pop.clone() on:click=move |ev| {
                 ev.prevent_default();
                 ev.stop_propagation();
                 if open.get_untracked().is_some() {
@@ -152,12 +261,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                 open.set(at.or(Some((0.0, 0.0))));
             }>"⋯"</button>
         {move || open.get().map(|(top, right)| view! {
-            <div class="fixed inset-0 z-40" on:click=move |ev| {
-                ev.prevent_default();
-                ev.stop_propagation();
-                open.set(None);
-            }></div>
-            <div role="menu" class="fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+            <div role="menu" data-pop=pop.clone() class="fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
                 style=format!("top: {}px; right: {}px", top + 4.0, right.max(8.0))>
                 {items.get_value().into_iter().map(|(name, run)| view! {
                     <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"

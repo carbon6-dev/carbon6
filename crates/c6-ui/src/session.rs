@@ -247,8 +247,8 @@ impl Feed {
 /// loads (from search).
 /// The header, once it has scrolled away: one line with the title, the
 /// status, and the header's actions in a "⋯" menu, fit for a phone.
-/// Tapping it brings the whole header back (to the top), as scrolling back
-/// up does.
+/// Tapping it shows the whole header over the conversation (`expanded`),
+/// where you are; it goes as `util::dismissable` says (`pop`).
 #[component]
 fn CompactHeader(
     detail: LocalResource<Result<c6_api::SessionDetail, String>>,
@@ -258,6 +258,8 @@ fn CompactHeader(
     find_open: RwSignal<bool>,
     scroller: NodeRef<leptos::html::Div>,
     col: Option<crate::workspace::ColumnCtx>,
+    expanded: RwSignal<bool>,
+    pop: String,
 ) -> impl IntoView {
     let session = move || detail.get().and_then(Result::ok).map(|d| d.session);
     let to_top = move || {
@@ -300,8 +302,9 @@ fn CompactHeader(
         }),
     ));
     view! {
-        <div class="safe-x absolute inset-x-0 top-0 z-20 flex min-h-11 items-center gap-2 border-b border-zinc-200 bg-white/95 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95">
-            <button class="flex min-h-11 min-w-0 flex-1 items-center text-left" title="Show the whole header" on:click=move |_| to_top()>
+        <div data-pop=pop class="safe-x absolute inset-x-0 top-0 z-20 flex min-h-11 items-center gap-2 border-b border-zinc-200 bg-white/95 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95">
+            <button class="flex min-h-11 min-w-0 flex-1 items-center text-left" title="Show the whole header" aria-expanded=move || expanded.get().to_string()
+                on:click=move |_| expanded.update(|e| *e = !*e)>
                 <span class="truncate text-sm font-semibold">{move || session().map(|s| s.title).unwrap_or_default()}</span>
             </button>
             {move || view! { <StatusPill status=status.get() /> }}
@@ -375,12 +378,23 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     // The header, and whether it has scrolled away (a compact bar stands in).
     let header = NodeRef::<leptos::html::Div>::new();
     let collapsed = RwSignal::new(false);
+    // The whole header, shown over the conversation from the compact bar.
+    let expanded = RwSignal::new(false);
+    let pop = crate::util::dismissable(
+        move || expanded.get(),
+        move || {
+            expanded.try_set(false);
+        },
+    );
     let on_scroll = Callback::new(move |()| {
         if let Some(el) = scroller.get_untracked() {
             if let Some(h) = header.get_untracked() {
                 let gone = h.get_bounding_client_rect().bottom() <= el.get_bounding_client_rect().top();
                 if gone != collapsed.get_untracked() {
                     collapsed.set(gone);
+                    if !gone {
+                        expanded.set(false);
+                    }
                 }
             }
             stick.set(el.scroll_height() - el.scroll_top() - el.client_height() < 120);
@@ -431,6 +445,76 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
     let find_root = root.clone();
     let details = crate::details::remembered();
+    // The header's lines and actions: in place, and over the conversation
+    // when the compact bar opens it.
+    let heading = {
+        let root = root.clone();
+        move |d: &c6_api::SessionDetail| {
+            let s = d.session.clone();
+            let worker_id = s.worker_id;
+            let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
+            let root = root.clone();
+            view! {
+                <div class="min-w-0">
+                    <h1 class="truncate text-lg font-semibold">{s.title.clone()}</h1>
+                    <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
+                        <span class="flex items-center gap-1">
+                            <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
+                            {d.worker_name.clone()}
+                        </span>
+                        {s.ssh.clone().map(|t| view! { <span class="rounded bg-sky-100 px-1 font-mono text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Working on this machine over SSH, through the worker">{format!("⇄ {t}")}</span> })}
+                        <span class="break-all font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
+                        {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
+                            <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
+                        })}
+                        <span>{move || { let m = model_label.get(); if m.is_empty() { s.model.clone() } else { m } }}</span>
+                    </div>
+                    <crate::labels::SessionLabels session=s.id.clone() labels=s.labels.clone() auto_labels=s.auto_labels.clone() />
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <crate::fleet::TabButton tab label="Transcript" value="transcript" />
+                    {s.ssh.is_none().then(|| view! {
+                        <crate::fleet::TabButton tab label="Changes" value="changes" />
+                        <crate::fleet::TabButton tab label="Files" value="files" />
+                    })}
+                    <crate::fleet::TabButton tab label="Terminal" value="terminal" />
+                    {move || (events.with(|e| crate::outputs::count(e)) > 0).then(|| view! { <crate::fleet::TabButton tab label="Outputs" value="outputs" /> })}
+                    <crate::fleet::TabButton tab label="Config" value="config" />
+                    <button class=move || format!("{BUTTON_QUIET} text-xs {}", if details.get() { "text-zinc-900 dark:text-zinc-100" } else { "text-zinc-500" })
+                        title="Where it runs, its context, usage and changes" on:click=move |_| details.update(|d| *d = !*d)>"Details"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
+                        tab.set("transcript");
+                        find_open.set(true);
+                    }>"Find"</button>
+                    <crate::tasks::RunningTasks session=id_stored.get_value() events />
+                    <SubagentsPill session=id_stored.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.clone() />
+                    {move || view! { <StatusPill status=status.get() /> }}
+                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
+                        spawn_local(async move {
+                            if api::archive(id_stored.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
+                        });
+                    }>"Archive"</button>
+                </div>
+            }
+        }
+    };
+    let heading_here = heading.clone();
+    // Choosing in it puts it away; a tab starts at its top.
+    Effect::watch(
+        move || (tab.get(), find_open.get(), details.get()),
+        move |now, before, _| {
+            if !expanded.get_untracked() {
+                return;
+            }
+            expanded.set(false);
+            if before.is_some_and(|b| b.0 != now.0)
+                && let Some(el) = scroller.get_untracked()
+            {
+                el.set_scroll_top(0);
+            }
+        },
+        false,
+    );
     view! {
         <div class="relative flex min-h-0 flex-1 flex-col">
         {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
@@ -442,7 +526,15 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     running=Signal::derive(running) tab open=details />
             }
         })}
-        {move || collapsed.get().then(|| view! { <CompactHeader detail status tab details find_open scroller col /> })}
+        {
+            let pop = pop.clone();
+            move || collapsed.get().then(|| view! { <CompactHeader detail status tab details find_open scroller col expanded pop=pop.clone() /> })
+        }
+        {move || (collapsed.get() && expanded.get()).then(|| detail.get().and_then(Result::ok)).flatten().map(|d| view! {
+            <div data-pop=pop.clone() class="safe-x absolute inset-x-0 top-11 z-20 max-h-[70vh] overflow-y-auto border-b border-zinc-200 bg-white px-4 py-3 shadow-lg dark:border-zinc-800 dark:bg-zinc-950">
+                <div class="flex flex-wrap items-start justify-between gap-3">{heading(&d)}</div>
+            </div>
+        })}
         <ScrollBox node_ref=scroller on_scroll>
         <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
@@ -454,46 +546,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
                         view! {
                             <div node_ref=header class="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
-                                <div class="min-w-0">
-                                    <h1 class="truncate text-lg font-semibold">{s.title.clone()}</h1>
-                                    <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
-                                        <span class="flex items-center gap-1">
-                                            <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
-                                            {d.worker_name.clone()}
-                                        </span>
-                                        {s.ssh.clone().map(|t| view! { <span class="rounded bg-sky-100 px-1 font-mono text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Working on this machine over SSH, through the worker">{format!("⇄ {t}")}</span> })}
-                                        <span class="break-all font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
-                                        {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
-                                            <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
-                                        })}
-                                        <span>{move || { let m = model_label.get(); if m.is_empty() { s.model.clone() } else { m } }}</span>
-                                    </div>
-                                    <crate::labels::SessionLabels session=s.id.clone() labels=s.labels.clone() auto_labels=s.auto_labels.clone() />
-                                </div>
-                                <div class="flex flex-wrap items-center gap-2">
-                                    <crate::fleet::TabButton tab label="Transcript" value="transcript" />
-                                    {s.ssh.is_none().then(|| view! {
-                                        <crate::fleet::TabButton tab label="Changes" value="changes" />
-                                        <crate::fleet::TabButton tab label="Files" value="files" />
-                                    })}
-                                    <crate::fleet::TabButton tab label="Terminal" value="terminal" />
-                                    {move || (events.with(|e| crate::outputs::count(e)) > 0).then(|| view! { <crate::fleet::TabButton tab label="Outputs" value="outputs" /> })}
-                                    <crate::fleet::TabButton tab label="Config" value="config" />
-                                    <button class=move || format!("{BUTTON_QUIET} text-xs {}", if details.get() { "text-zinc-900 dark:text-zinc-100" } else { "text-zinc-500" })
-                                        title="Where it runs, its context, usage and changes" on:click=move |_| details.update(|d| *d = !*d)>"Details"</button>
-                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
-                                        tab.set("transcript");
-                                        find_open.set(true);
-                                    }>"Find"</button>
-                                    <crate::tasks::RunningTasks session=id_stored.get_value() events />
-                                    <SubagentsPill session=id_stored.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.clone() />
-                                    {move || view! { <StatusPill status=status.get() /> }}
-                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
-                                        spawn_local(async move {
-                                            if api::archive(id_stored.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
-                                        });
-                                    }>"Archive"</button>
-                                </div>
+                                {heading_here(&d)}
                             </div>
                             <SessionStats usage />
                             {s.error.clone().map(|e| view! { <ErrorBox message=format!("The session failed to start: {e}") /> })}
