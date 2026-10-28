@@ -237,8 +237,12 @@ pub fn expand(start: i64, tz: &str, lines: &[String], from: i64, to: i64) -> any
 
 /// Times you are busy in [from, to): merged intervals.
 pub async fn busy(m: &Memex, from: i64, to: i64) -> anyhow::Result<Vec<(i64, i64)>> {
-    let mut spans: Vec<(i64, i64)> =
+    let spans =
         events(m, from, to).await?.into_iter().filter(|e| e.busy && !e.all_day).map(|e| (e.start.max(from), e.end.min(to))).collect();
+    Ok(merge_busy(spans))
+}
+
+pub(crate) fn merge_busy(mut spans: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     spans.sort();
     let mut out: Vec<(i64, i64)> = Vec::new();
     for (s, e) in spans {
@@ -247,7 +251,7 @@ pub async fn busy(m: &Memex, from: i64, to: i64) -> anyhow::Result<Vec<(i64, i64
             _ => out.push((s, e)),
         }
     }
-    Ok(out)
+    out
 }
 
 pub async fn calendars(m: &Memex) -> anyhow::Result<Vec<api::Calendar>> {
