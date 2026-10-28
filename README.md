@@ -308,7 +308,7 @@ carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail
   The head keeps the sign-in encrypted; the apps' syncs get short-lived access tokens only. A head that synced Google itself before moves your accounts, client and everything synced into the apps when it starts, so nothing is fetched again.
 - **Mail:**
   - **Import:** your whole mailbox is imported, newest first and resumable, then kept in sync every two minutes. Labels, read state, archive and drafts sync both ways.
-  - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list; once sorted for the Brief, only what needs you or is a real first contact, and before that nothing from an automated sender), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
+  - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list, in the last two weeks; with a model, what it sorted for the Brief as needing you or a real first contact; with none, nothing from an automated sender), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
   - **Reading:** conversations, with HTML sandboxed and remote images off until you allow them.
   - **Writing:** Markdown compose, reply and reply all, attachments, drafts, **send later**, and **undo** (messages wait 10 seconds).
   - **In the graph:** every message is in the memex. Senders and recipients become people (one person across all their addresses), and company domains become organizations.

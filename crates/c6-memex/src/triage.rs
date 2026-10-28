@@ -21,8 +21,9 @@ use crate::store::clip;
 
 const VERSION: &str = "triage-v1";
 const DAY: i64 = 86_400_000;
-/// Only what's recent is sorted: the brief is about now.
-const WINDOW: i64 = 14 * DAY;
+/// Only what's recent is sorted: the brief is about now (and so is Mail's
+/// "Needs reply").
+pub const WINDOW: i64 = 14 * DAY;
 /// What one call reads of a conversation.
 const MAX_INPUT: usize = 10_000;
 pub const CATEGORIES: [&str; 8] = ["needs_you", "first_contact", "fyi", "newsletter", "notification", "pitch", "noise", "yours"];

@@ -296,6 +296,9 @@ pub async fn threads(
     let me: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
     let now = c6_core::now_ms();
     let month = now - 30 * 86_400_000;
+    // What needs a reply is as recent as what is sorted, so the two agree.
+    let recent = now - crate::triage::WINDOW;
+    let model = m.understanding().is_some();
     // The view's condition on a thread's messages.
     // As sorted for the brief (docs/brief.md): triage:<category>. What
     // needs you (or is a first contact) is what waits on you there: in the
@@ -311,7 +314,8 @@ pub async fn threads(
         "trash" => ("m.trash = 1", None),
         "all" => ("m.trash = 0 AND m.spam = 0", None),
         // The latest message is from someone else, to you directly, in the
-        // inbox, not a list, this month; and as sorted (`needs_reply`).
+        // inbox, not a list, as recent as what is sorted; and as sorted
+        // (`needs_reply`).
         "needs_reply" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0 AND m.list = 0", None),
         // The latest message is yours, sent over two days ago, this month.
         "waiting" => ("m.trash = 0 AND m.spam = 0", None),
@@ -328,8 +332,15 @@ pub async fn threads(
          AND (?5 IS NULL OR EXISTS (SELECT 1 FROM triage t WHERE t.target = 'thread:' || m.account || ':' || m.thread_id AND t.category = ?5 \
              AND (?5 NOT IN ('needs_you', 'first_contact') OR (m.inbox = 1 AND EXISTS (SELECT 1 FROM request_sources s JOIN requests r \
              ON r.id = s.request_id WHERE s.target = t.target AND (r.status = 'open' OR (r.status = 'snoozed' AND r.until <= ?6))))))) \
-         GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) ORDER BY date DESC LIMIT ?3"
+         GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) AND (?7 IS NULL OR MAX(m.date) > ?7) \
+         ORDER BY date DESC LIMIT ?3"
     );
+    // The views of recent mail read no further back.
+    let since = match view {
+        "needs_reply" => Some(recent),
+        "waiting" => Some(month),
+        _ => None,
+    };
     // Over-fetch for the views that look at each thread's latest message.
     let fetch = if matches!(view, "needs_reply" | "waiting") { limit * 5 } else { limit };
     let mut out = Vec::new();
@@ -344,6 +355,7 @@ pub async fn threads(
             .bind(&label)
             .bind(&sorted)
             .bind(now)
+            .bind(since)
             .fetch_all(&m.store.pool)
             .await?;
         let more = rows.len() as u32 == fetch && fetch > limit;
@@ -363,7 +375,10 @@ pub async fn threads(
             let keep = match view {
                 "needs_reply" => {
                     let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
-                    !mine && date > month && to.iter().any(|(a, _)| me.contains(a)) && needs_reply(triage.as_ref(), date, &last_from)
+                    !mine
+                        && date > recent
+                        && to.iter().any(|(a, _)| me.contains(a))
+                        && needs_reply(triage.as_ref(), date, &last_from, model)
                 }
                 // Yours, unanswered: sent to someone else.
                 "waiting" => {
@@ -444,15 +459,16 @@ fn encode(s: &str) -> String {
 }
 
 /// Whether a thread whose latest message (at `latest`, from `sender`) is
-/// someone else's to you needs your reply: as it was sorted, when that
-/// sorting saw the message (it needs you, or is a real first contact, and
-/// its request is open), else (not sorted yet) unless an automated sender
-/// wrote it. Shipping notices and receipts come straight to you without
-/// list headers.
-fn needs_reply(sorted: Option<&api::Triage>, latest: i64, sender: &str) -> bool {
+/// someone else's to you needs your reply: as it was sorted (it needs you,
+/// or is a real first contact, and its request is open). With a model,
+/// only that: what isn't sorted yet soon is, and a rule can't tell a
+/// person from a support desk or a store's receipts sent straight to you.
+/// With none, a sorting that saw the latest message, else anyone's but an
+/// automated sender's.
+fn needs_reply(sorted: Option<&api::Triage>, latest: i64, sender: &str, model: bool) -> bool {
     match sorted {
-        Some(t) if t.at >= latest => matches!(t.category.as_str(), "needs_you" | "first_contact") && t.request.is_some(),
-        _ => !crate::relations::automated(sender),
+        Some(t) if model || t.at >= latest => matches!(t.category.as_str(), "needs_you" | "first_contact") && t.request.is_some(),
+        _ => !model && !crate::relations::automated(sender),
     }
 }
 
@@ -722,21 +738,30 @@ mod tests {
     #[test]
     fn needs_reply_follows_the_sorting() {
         let sorted = |category: &str, at: i64| c6_api::Triage { category: category.into(), at, request: Some(1), ..Default::default() };
-        let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender);
-        // Sorted: what it was sorted as, whoever sent it.
-        assert!(needs(Some(sorted("needs_you", 100)), "no-reply@bank.example"));
-        assert!(needs(Some(sorted("first_contact", 100)), "pat@new.example"));
-        for c in ["notification", "newsletter", "noise", "pitch", "fyi", "yours"] {
-            assert!(!needs(Some(sorted(c, 100)), "orders@shop.example"), "{c}");
+        for model in [true, false] {
+            let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender, model);
+            // Sorted: what it was sorted as, whoever sent it.
+            assert!(needs(Some(sorted("needs_you", 100)), "no-reply@bank.example"));
+            assert!(needs(Some(sorted("first_contact", 100)), "pat@new.example"));
+            for c in ["notification", "newsletter", "noise", "pitch", "fyi", "yours"] {
+                assert!(!needs(Some(sorted(c, 100)), "orders@shop.example"), "{c}");
+            }
+            // What needs you, its request settled in the Brief (done,
+            // dropped, snoozed): not now.
+            assert!(!needs(Some(c6_api::Triage { request: None, ..sorted("needs_you", 100) }), "ana@acme.com"));
         }
-        // Not sorted yet (or sorted before its latest message): a person's,
-        // not an automated sender's.
+        // With a model, only what it sorted: as sorted, though before its
+        // latest message (it's sorted again soon); not what isn't yet.
+        let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender, true);
+        assert!(!needs(None, "ana@acme.com"));
+        assert!(!needs(Some(sorted("notification", 50)), "ana@acme.com"));
+        assert!(needs(Some(sorted("needs_you", 50)), "ana@acme.com"));
+        // With none, what isn't sorted (or was before its latest message):
+        // a person's, not an automated sender's.
+        let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender, false);
         assert!(needs(None, "ana@acme.com"));
         assert!(!needs(None, "no-reply@bank.example"));
         assert!(needs(Some(sorted("notification", 50)), "ana@acme.com"));
         assert!(!needs(Some(sorted("needs_you", 50)), "notifications@github.com"));
-        // What needs you, its request settled in the Brief (done, dropped,
-        // snoozed): not now.
-        assert!(!needs(Some(c6_api::Triage { request: None, ..sorted("needs_you", 100) }), "ana@acme.com"));
     }
 }

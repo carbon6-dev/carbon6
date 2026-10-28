@@ -783,8 +783,10 @@ pub(crate) async fn sorted_as(m: &c6_memex::Memex, thread: &str, category: &str)
 
 /// "Needs reply" (Mail's view, the Activity page) follows the sorting:
 /// mail straight to you that the model sorted as a notification doesn't
-/// need a reply, mail that needs you does; mail not sorted yet does,
-/// unless an automated sender wrote it.
+/// need a reply, mail that needs you does. With a model, that's all (what
+/// isn't sorted yet waits for it); with none, mail not sorted does too,
+/// unless an automated sender wrote it. Either way, only what's as recent
+/// as what's sorted.
 #[tokio::test]
 async fn needs_reply_follows_the_sorting() {
     let head_dir = tempfile::tempdir().unwrap();
@@ -829,6 +831,8 @@ async fn needs_reply_follows_the_sorting() {
     mail(&m, "n3", "n3", ("no-reply@bank.example", "Bank"), me, "Transfer confirmed", "Your $40 went through.", None, &["INBOX"], 3 * HOUR)
         .await;
     mail(&m, "n4", "n4", ("dan@other.org", "Dan"), me, "Coffee", "Coffee next week?", None, &["INBOX"], 4 * HOUR).await;
+    // Older than what's sorted: never sorted, so never shown.
+    mail(&m, "n5", "n5", ("erin@other.org", "Erin"), me, "Visit", "Can we visit in May?", None, &["INBOX"], 20 * 24 * HOUR).await;
     sorted_as(&m, "n1", "notification").await;
     sorted_as(&m, "n2", "needs_you").await;
 
@@ -837,13 +841,21 @@ async fn needs_reply_follows_the_sorting() {
         assert!(r.status().is_success());
         r.json().await.unwrap()
     };
-    let threads: Vec<MailThread> = serde_json::from_value(rpc("memex.mail.threads", json!({"view": "needs_reply"})).await).unwrap();
-    let subjects: Vec<&str> = threads.iter().map(|t| t.subject.as_str()).collect();
-    assert_eq!(subjects, ["Contract", "Coffee"], "not the shipping notice nor the bank's");
-    // The last two weren't sorted.
-    for t in ["n3", "n4"] {
+    let shown = async || -> Vec<String> {
+        let v = rpc("memex.mail.threads", json!({"view": "needs_reply"})).await;
+        serde_json::from_value::<Vec<MailThread>>(v).unwrap().into_iter().map(|t| t.subject).collect()
+    };
+    assert_eq!(shown().await, ["Contract"], "only what the model sorted as needing you");
+    // The rest weren't sorted.
+    for t in ["n3", "n4", "n5"] {
         assert_eq!(rpc("memex.triage.get", json!({"target": format!("thread:acct:{t}")})).await, Value::Null, "{t}");
     }
+    // No model: what isn't sorted needs a reply, unless an automated
+    // sender wrote it; not what's older.
+    let r = http.put(format!("{api}/settings/memex")).json(&json!({"calls_per_day": 100})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    eventually("the memex has no model", async || m.understanding().is_none().then_some(())).await;
+    assert_eq!(shown().await, ["Contract", "Coffee"], "not the shipping notice nor the bank's");
     head.shutdown().await.unwrap();
 }
 

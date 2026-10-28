@@ -132,7 +132,7 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 |---|---|
 | understand.rs loop, budget, prompts | triage, requests, drafts run in it |
 | commitments table | "you owe" and "waiting on" (now from chat too, with due dates) |
-| needs_reply / waiting views (rules) | needs_reply follows triage's category once a thread is sorted (needs you, a first contact), the rules until then (and no automated senders) |
+| needs_reply / waiting views (rules) | needs_reply follows triage's category (needs you, a first contact, its request open), over the same 14 days triage sorts. With an understanding model, only what's sorted so (what isn't yet waits for its sorting); with none, the rules for what isn't sorted (and no automated senders) |
 | Inbox page's "Needs reply" | shows the brief's top requests instead |
 | mail and chat operations (send, post, undo) | sending a draft |
 | notifier | urgent requests, briefs |
