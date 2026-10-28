@@ -153,10 +153,13 @@ pub async fn put(m: &Memex, p: &Value) -> anyhow::Result<Value> {
 }
 
 /// Unread messages of a conversation `c` (an alias), and those of them
-/// that need you (mention you, or in a DM or group), as SQL.
+/// that need you (mention you, or in a DM or group), as SQL. `+` drops the
+/// text affinity of `c`'s columns, which would keep SQLite from looking the
+/// messages up in `items_chat`: it then went through every chat message
+/// newer than what was read, for each conversation (36 s for 133,000).
 fn counts() -> (String, String) {
     let base = format!(
-        "SELECT COUNT(*) FROM items i WHERE i.kind = 'chat' AND {w} = c.workspace AND {ch} = c.channel \
+        "SELECT COUNT(*) FROM items i WHERE i.kind = 'chat' AND {w} = +c.workspace AND {ch} = +c.channel \
          AND c.read_ts IS NOT NULL AND i.created_at > {read} AND {top} AND {theirs}",
         w = "json_extract(i.meta, '$.workspace')",
         ch = "json_extract(i.meta, '$.channel')",
@@ -172,8 +175,13 @@ fn counts() -> (String, String) {
 /// recently active first, with what's unread, your prefs, and a DM's
 /// person.
 pub async fn channels(m: &Memex) -> anyhow::Result<Value> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(channels_sql())).fetch_all(&m.store.pool).await?;
+    Ok(json!(rows.iter().map(conversation).collect::<Vec<_>>()))
+}
+
+fn channels_sql() -> String {
     let (unread, mentions) = counts();
-    let sql = format!(
+    format!(
         "SELECT c.*, {unread} AS unread, {mentions} AS mentions, \
            COALESCE(p.starred, 0) AS starred, COALESCE(p.muted, 0) AS muted, COALESCE(p.hidden, 0) AS hidden, COALESCE(p.section, '') AS section, \
            u.name AS user_name, u.avatar AS user_avatar, u.status AS user_status, u.bot AS user_bot \
@@ -181,9 +189,7 @@ pub async fn channels(m: &Memex) -> anyhow::Result<Value> {
          LEFT JOIN chat_prefs p ON p.workspace = c.workspace AND p.channel = c.channel \
          LEFT JOIN chat_people u ON u.workspace = c.workspace AND u.id = c.user \
          ORDER BY c.last_at DESC"
-    );
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_all(&m.store.pool).await?;
-    Ok(json!(rows.iter().map(conversation).collect::<Vec<_>>()))
+    )
 }
 
 fn conversation(r: &sqlx::sqlite::SqliteRow) -> Value {
@@ -668,5 +674,24 @@ pub async fn method(m: &Memex, method: &str, params: &Value, allowed: &[String])
             m.app_call(&a, op, Value::Object(input), &by).await
         }
         other => anyhow::bail!("the memex has no method {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The conversations' unread and mention counts look each one's
+    /// messages up in `items_chat`, not every chat message newer than what
+    /// was read (past the head's 30 s for a workspace of 133,000).
+    #[tokio::test]
+    async fn counts_look_messages_up_by_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("memex.db")).await.unwrap();
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {}", channels_sql()))).fetch_all(&store.pool).await.unwrap();
+        let plan: Vec<String> = rows.iter().map(|r| r.get::<String, _>("detail")).collect();
+        let messages: Vec<&String> = plan.iter().filter(|d| d.starts_with("SEARCH i ") || d.starts_with("SCAN i")).collect();
+        assert_eq!(messages.len(), 2, "unread, then mentions: {plan:?}");
+        assert!(messages.iter().all(|d| d.contains("USING INDEX items_chat (")), "{plan:?}");
     }
 }
