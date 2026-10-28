@@ -650,16 +650,26 @@ async fn google_mail_calendar_contacts() {
     // waited to be read): the sync reads the last 30 days' labels again,
     // once. Alice's lunch went to spam meanwhile, and the sync's record
     // is as an older kit left it.
+    // The run that moved Carol stores its record after her mail: an edit
+    // made in between is refused as stale, so it reads again.
     let checked = |r: &c6_api::Record| r.fields["key"].as_str().is_some_and(|k| k.starts_with("mail:"));
     let q = c6_api::RecordQuery::default();
-    let rec = c6_head::collections::query(&head.state, "home", "gmail_sync", &q).await.unwrap().records.into_iter().find(checked).unwrap();
-    assert_eq!(rec.fields["checked"], 1, "{:?}", rec.fields);
-    let mut fields = rec.fields.clone();
-    for k in ["checked", "check_page", "check_queue"] {
-        fields.as_object_mut().unwrap().remove(k);
-    }
-    let older = c6_api::RecordIn { fields, version: Some(rec.version), ..Default::default() };
-    c6_head::collections::put(&head.state, "home", "gmail_sync", Some(&rec.id), &older, "app:gmail test").await.unwrap();
+    eventually("the sync's record made older", async || {
+        let rec =
+            c6_head::collections::query(&head.state, "home", "gmail_sync", &q).await.unwrap().records.into_iter().find(checked).unwrap();
+        assert_eq!(rec.fields["checked"], 1, "{:?}", rec.fields);
+        let mut fields = rec.fields.clone();
+        for k in ["checked", "check_page", "check_queue"] {
+            fields.as_object_mut().unwrap().remove(k);
+        }
+        let older = c6_api::RecordIn { fields, version: Some(rec.version), ..Default::default() };
+        match c6_head::collections::put(&head.state, "home", "gmail_sync", Some(&rec.id), &older, "app:gmail test").await {
+            Ok(_) => Some(()),
+            Err(e) if e.to_string().contains("changed since you read it") => None,
+            Err(e) => panic!("{e:#}"),
+        }
+    })
+    .await;
     g.lock().unwrap().messages.get_mut("m1").unwrap().1 = vec!["SPAM".into()];
     assert!(threads("inbox").await.contains(&"t1".to_owned()));
     rpc("memex.google_sync", json!({})).await;
