@@ -557,6 +557,10 @@ pub struct AppPackage {
     /// them, and act through its operations (docs/knowledge.md §6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feeds: Vec<String>,
+    /// Where its accounts' conversations open on the service's own web,
+    /// for "Open in <service>" (a mail app's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<AppLinks>,
     /// The labels its claims use, what each means, and the shared label
     /// it maps to (docs/apps.md §9.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -564,6 +568,29 @@ pub struct AppPackage {
     /// A kit's environment and tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<KitPart>,
+}
+
+/// Where an app's conversations open on its service's web (`links`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppLinks {
+    /// The service's name, as "Open in Gmail" says it.
+    pub service: String,
+    /// A mail thread's address (https), with `{account}` (the account's
+    /// address), `{thread}`, `{message}` (the mailbox's ids for the latest
+    /// message's thread and itself) and `{message_id}` (its Message-ID)
+    /// filled in.
+    #[serde(default)]
+    pub thread: String,
+}
+
+/// Where a conversation opens on its service's own web.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Link {
+    /// "Gmail", "Slack".
+    pub service: String,
+    pub url: String,
 }
 
 /// What a package asks for. For a realm: secrets to set, a worker of its
@@ -4355,6 +4382,10 @@ pub struct MailMessage {
     pub attachments: Vec<MailAttachment>,
     pub labels: Vec<String>,
     pub unread: bool,
+    /// Its thread on the mailbox's web, as the account's app says (none:
+    /// imported mail, or an app without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -275,7 +275,9 @@ pub async fn feeding(st: &HeadState, realm: &str) -> anyhow::Result<Value> {
             continue;
         }
         for a in accounts(st, realm, &i.name).await? {
-            out.push(json!({"id": a.id, "email": a.account, "name": a.name, "app": i.name, "feeds": i.package.feeds}));
+            out.push(
+                json!({"id": a.id, "email": a.account, "name": a.name, "app": i.name, "feeds": i.package.feeds, "links": i.package.links}),
+            );
         }
     }
     Ok(Value::Array(out))

@@ -456,6 +456,7 @@ pub(crate) fn Thread(
                 Err(e) => view! { <MailError e /> }.into_any(),
                 Ok(list) => {
                     let subject = list.last().map(|m| m.subject.clone()).unwrap_or_default();
+                    let link = list.last().and_then(|m| m.link.clone());
                     let last = list.last().cloned();
                     // Who the people writing are to you (their cards), the latest first.
                     let mut senders: Vec<String> = Vec::new();
@@ -466,7 +467,10 @@ pub(crate) fn Thread(
                         }
                     }
                     view! {
-                        <h1 class="text-lg font-semibold">{subject}</h1>
+                        <div class="flex flex-wrap items-baseline justify-between gap-x-2">
+                            <h1 class="min-w-0 text-lg font-semibold">{subject}</h1>
+                            {link.map(|link| view! { <crate::util::OpenIn link /> })}
+                        </div>
                         {senders.into_iter().take(2).map(|a| view! { <crate::understanding::Cards params=serde_json::json!({"address": a}) /> }).collect_view()}
                         {list.into_iter().map(|m| view! { <Message m /> }).collect_view()}
                         {last.map(|m| {

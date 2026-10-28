@@ -415,6 +415,34 @@ pub async fn threads(
     Ok(out)
 }
 
+/// A thread's address on its mailbox's web, as the account's app declares
+/// it (`links`): none for imported mail, an app without one, or one that
+/// isn't https.
+fn link(m: &Memex, account: &str, thread: &str, message: &str, message_id: &str) -> Option<api::Link> {
+    let a = m.accounts().into_iter().find(|a| a.id == account)?;
+    let l = a.links?;
+    if !l.thread.starts_with("https://") {
+        return None;
+    }
+    let url = [
+        ("{account}", a.email.as_str()),
+        ("{thread}", thread),
+        ("{message}", message),
+        ("{message_id}", message_id.trim_matches(['<', '>'])),
+    ]
+    .iter()
+    .fold(l.thread.clone(), |u, (k, v)| u.replace(k, &encode(v)));
+    Some(api::Link { service: l.service, url })
+}
+
+/// `s` as part of an address: unreserved characters as they are, the rest
+/// percent-encoded.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
+}
+
 /// Whether a thread whose latest message (at `latest`, from `sender`) is
 /// someone else's to you needs your reply: as it was sorted, when that
 /// sorting saw the message (it needs you, or is a real first contact, and
@@ -489,6 +517,7 @@ pub async fn thread(m: &Memex, account: &str, thread_id: &str) -> anyhow::Result
             attachments,
             labels: serde_json::from_str(&r.get::<String, _>("labels")).unwrap_or_default(),
             unread: r.get::<i64, _>("unread") != 0,
+            link: link(m, account, thread_id, &r.get::<String, _>("gmail_id"), &r.get::<String, _>("rfc_id")),
         });
     }
     Ok(out)

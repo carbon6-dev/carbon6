@@ -386,6 +386,9 @@ async fn google_mail_calendar_contacts() {
     }
     let thread = rpc("memex.mail.thread", json!({"account": "me@example.com", "thread_id": "t3"})).await;
     assert_eq!(thread.as_array().unwrap().len(), 2);
+    // Where it opens in Gmail, under its account (the gmail app's links).
+    let gmail = json!({"service": "Gmail", "url": "https://mail.google.com/mail/?authuser=me%40example.com#all/t3"});
+    assert_eq!(thread[1]["link"], gmail, "{thread}");
     assert!(thread[1]["text"].as_str().unwrap().contains("will read"));
 
     // People: one person by both addresses (from the contact), and an
@@ -574,6 +577,7 @@ async fn google_mail_calendar_contacts() {
     assert_eq!((threads.as_array().unwrap().len(), t["count"].as_u64(), t["unread"].as_bool()), (1, Some(2), Some(true)), "{threads}");
     assert_eq!(t["account"], "import:mbox:archive");
     let msgs = rpc("memex.mail.thread", json!({"account": t["account"], "thread_id": t["thread_id"]})).await;
+    assert!(msgs.as_array().unwrap().iter().all(|m| m["link"].is_null()), "imported mail opens nowhere else: {msgs}");
     assert_eq!(msgs.as_array().unwrap().len(), 2, "{msgs}");
     let modified_before = g.lock().unwrap().modified.len();
     rpc("memex.mail.modify", json!({"account": t["account"], "thread_id": t["thread_id"], "remove": ["UNREAD"]})).await;

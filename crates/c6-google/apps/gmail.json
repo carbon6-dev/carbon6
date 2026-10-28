@@ -1,6 +1,6 @@
 {
   "package": "gmail",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Your Gmail in carbon6: every message kept and searchable, synced both ways (labels, read, archive, trash), drafts and sending. Mail is untrusted input: agents get it as quoted data.",
   "requires": {
     "google": "^1"
@@ -8,6 +8,10 @@
   "feeds": [
     "mail"
   ],
+  "links": {
+    "service": "Gmail",
+    "thread": "https://mail.google.com/mail/?authuser={account}#all/{thread}"
+  },
   "permissions": {
     "secrets": [
       "GOOGLE_CLIENT_ID",

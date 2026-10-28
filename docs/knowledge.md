@@ -253,6 +253,7 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - the apps **gmail**, **google-calendar** and **google-contacts**, which require it. Each has:
     - the OAuth provider `google` (the client in home's secrets `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`);
     - `feeds` (`mail`, `calendar`, `contacts`: a new manifest field naming the knowledge store's stores its accounts feed);
+    - gmail's `links` (since 1.1.0): where a thread opens on the service's web, for Mail's "Open in Gmail", `{"service": "Gmail", "thread": "https://mail.google.com/mail/?authuser={account}#all/{thread}"}`. The memex fills in the account's address and the thread's (or `{message}`'s, `{message_id}`'s) ids it already keeps, when the thread is read, so mail synced before has it too; imported mail, an app without `links`, or a link that isn't https gets none. The core knows no service's addresses. An install of gmail 1.0.0 gets it once you upgrade it (Settings → Apps → Upgrade…);
     - an internal collection where its syncs are (`gmail_sync`, `calendar_sync`, `contacts_sync`);
     - a schedule trigger that runs its sync tool with no agent (every 2, 3 and 10 minutes);
     - kit operations: gmail's `modify`, `send` and `draft`; the calendar's `create`, `update`, `delete` and `rsvp`; the contacts' `create`.

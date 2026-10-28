@@ -69,6 +69,15 @@ pub const INPUT: &str = "w-full rounded-md border border-zinc-300 bg-white px-2 
 pub const BUTTON: &str = "rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300";
 pub const BUTTON_QUIET: &str = "rounded-md px-3 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800";
 
+/// "Open in Gmail": a conversation on its service's own web, in a new tab.
+#[component]
+pub fn OpenIn(link: c6_api::Link) -> impl IntoView {
+    view! {
+        <a class="inline-flex items-center rounded-md px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {} ↗", link.service)}</a>
+    }
+}
+
 #[component]
 pub fn ErrorBox(message: String) -> impl IntoView {
     view! {
