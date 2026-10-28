@@ -762,7 +762,8 @@ async fn keep(r: &mut Run, a: &Account, team: &mut Value, c: &Conversation, m: &
     for f in files {
         let mime = f["mimetype"].as_str().unwrap_or("");
         let size = f["size"].as_u64().unwrap_or(0);
-        if READABLE.contains(&mime) && size <= MAX_FILE && f["url_private_download"].is_string() {
+        let queued = queue.iter().any(|q| q["id"] == f["id"]);
+        if READABLE.contains(&mime) && size <= MAX_FILE && f["url_private_download"].is_string() && !queued {
             queue.push(json!({"id": f["id"], "name": f["name"], "mime": mime, "size": size, "url": f["url_private_download"], "created": f["created"]}));
         }
     }
@@ -774,9 +775,12 @@ async fn keep(r: &mut Run, a: &Account, team: &mut Value, c: &Conversation, m: &
 /// become documents the extract kit reads.
 async fn files_waiting(r: &mut Run, a: &Account, team: &mut Value) -> anyhow::Result<()> {
     let mut queue = team["files_queue"].as_array().cloned().unwrap_or_default();
+    // Queued twice by earlier versions: once is enough.
+    let mut seen = std::collections::HashSet::new();
+    queue.retain(|f| seen.insert(f["id"].to_string()));
     while let Some(f) = queue.first().cloned() {
         let size = f["size"].as_u64().unwrap_or(0);
-        if r.budget < 2 || r.file_bytes + size > crate::FILE_BYTES {
+        if r.budget < 2 || !fits(r.file_bytes, size) {
             break;
         }
         let id = f["id"].as_str().unwrap_or_default().to_owned();
@@ -803,6 +807,14 @@ async fn files_waiting(r: &mut Run, a: &Account, team: &mut Value) -> anyhow::Re
     }
     team["files_queue"] = json!(queue);
     Ok(())
+}
+
+/// Whether a file of `size` is downloaded in a run that has downloaded
+/// `so_far`: within the run's share, or alone when it is bigger than the
+/// share (otherwise it, and every file queued after it, would wait for
+/// ever).
+fn fits(so_far: u64, size: u64) -> bool {
+    so_far == 0 || so_far + size <= crate::FILE_BYTES
 }
 
 /// A conversation as the records know it (for an operation's message).
@@ -928,6 +940,15 @@ mod tests {
         assert_eq!(person_key("T1", "U1", &u), "person:ana@acme.com");
         assert_eq!(person_key("T1", "U2", &u), "slack-user:T1/U2");
         assert_eq!(ts_ms("1700000000.123456"), 1_700_000_000_123);
+    }
+
+    /// A file bigger than a run's share is downloaded on its own run.
+    #[test]
+    fn a_big_file_does_not_hold_up_the_queue() {
+        let share = crate::FILE_BYTES;
+        assert!(fits(0, share + 6_000_000), "alone, though bigger than the share");
+        assert!(!fits(1, share + 6_000_000), "not after another");
+        assert!(fits(share - 10, 10) && !fits(share - 10, 11));
     }
 
     /// Keeping up with more conversations than a run can look at: the
