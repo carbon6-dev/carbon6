@@ -51,6 +51,7 @@ async fn the_assistant_reads_within_its_scope() {
         from: (ana.0.into(), ana.1.into()),
         to: vec![("me@mine.io".into(), String::new())],
         subject: "Pilot".into(),
+        // Its words, not just the number: ids and timestamps hold digits too.
         text: "The pilot code is 4417.".into(),
         ..Default::default()
     };
@@ -141,19 +142,19 @@ async fn the_assistant_reads_within_its_scope() {
     let r = converse(&widened).await;
     assert!(r[0].1 && r[0].0.contains("email is outside"), "mail.thread: {:?}", r[0]);
     assert!(r[1].1 && r[1].0.contains("chat is outside"), "chat.messages: {:?}", r[1]);
-    assert!(!r[2].1 && r[2].0.contains("runs the pilot") && !r[2].0.contains("4417"), "memex.search: {:?}", r[2]);
+    assert!(!r[2].1 && r[2].0.contains("runs the pilot") && !r[2].0.contains("code is 4417"), "memex.search: {:?}", r[2]);
     assert!(!r[3].1 && r[3].0.contains("the deck") && !r[3].0.contains("pilot code"), "memex.commitments: {:?}", r[3]);
     assert!(!r[4].1, "memex.summarize: {:?}", r[4]);
-    assert!(summarized().contains("runs the pilot") && !summarized().contains("4417"), "{}", summarized());
+    assert!(summarized().contains("runs the pilot") && !summarized().contains("code is 4417"), "{}", summarized());
     assert!(r[5].1 && r[5].0.contains("email is outside"), "a scope it asks for: {:?}", r[5]);
 
     // A scope rule lets mail and chat in.
     put("settings/memex_scopes", json!([{"name": "assistant reads mail", "applies_to": ["assistant"], "kinds": ["email", "chat"]}])).await;
     let r = converse(&calls).await;
-    assert!(!r[0].1 && r[0].0.contains("4417"), "mail.thread: {:?}", r[0]);
+    assert!(!r[0].1 && r[0].0.contains("code is 4417"), "mail.thread: {:?}", r[0]);
     assert!(!r[1].1 && r[1].0.contains("Wednesday"), "chat.messages: {:?}", r[1]);
-    assert!(!r[2].1 && r[2].0.contains("4417"), "memex.search: {:?}", r[2]);
+    assert!(!r[2].1 && r[2].0.contains("code is 4417"), "memex.search: {:?}", r[2]);
     assert!(!r[3].1 && r[3].0.contains("pilot code"), "memex.commitments: {:?}", r[3]);
-    assert!(summarized().contains("4417"), "{}", summarized());
+    assert!(summarized().contains("code is 4417"), "{}", summarized());
     head.shutdown().await.unwrap();
 }
