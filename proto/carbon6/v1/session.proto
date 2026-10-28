@@ -551,6 +551,10 @@ message CredentialRequest {
   // The provider refused the last grant (HTTP 401): sign in again rather
   // than hand out the stored token (ChatGPT's, refreshed now).
   bool refresh = 3;
+  // The session asking (a subagent asks as its root session): the head
+  // gives a worker only its live sessions' connections and secrets, as
+  // their realms allow. Empty from older workers (and the head's own).
+  string session_id = 4;
 }
 
 message CredentialGrant {

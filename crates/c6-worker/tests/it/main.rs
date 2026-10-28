@@ -56,6 +56,7 @@ mod updates;
 mod usage;
 mod views;
 mod websearch;
+mod worker_access;
 mod workflows;
 
 /// Opens the worker in `state`. A worker just stopped there may still be

@@ -1556,7 +1556,21 @@ impl Actor {
                 .await
                 .map(drop)
             } else {
-                run_session_turn(turn, &cfg, &model.connection_id, &link, &tools, &session_tools, &sink, &mut conv, &inbox, &c, sub).await
+                run_session_turn(
+                    turn,
+                    &cfg,
+                    &on_behalf_of,
+                    &model.connection_id,
+                    &link,
+                    &tools,
+                    &session_tools,
+                    &sink,
+                    &mut conv,
+                    &inbox,
+                    &c,
+                    sub,
+                )
+                .await
             };
             match result {
                 Ok(()) => Some(conv),
@@ -1575,6 +1589,8 @@ impl Actor {
 async fn run_session_turn(
     turn: u64,
     cfg: &TurnConfig,
+    // Whose model calls these are (a subagent's root session).
+    session_id: &str,
     connection_id: &str,
     link: &Arc<HeadLink>,
     tools: &[Arc<dyn Tool>],
@@ -1602,9 +1618,10 @@ async fn run_session_turn(
 
     // Credentials are checked up front (a missing sign-in says so at once),
     // then fetched for every call, so a long turn outlives its token.
+    let checked = link.session_credential(session_id, connection_id).await;
     let client: Arc<dyn c6_llm::ModelClient> =
-        match link.credential(connection_id).await.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
-            Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), connection_id)),
+        match checked.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
+            Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), session_id, connection_id)),
             Err(e) => {
                 sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
                 sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e:#}") })).await?;
@@ -1707,7 +1724,7 @@ async fn fetch_secrets(link: &HeadLink, session_id: &str, names: &[String]) -> (
     let mut values = Vec::new();
     let mut errors = Vec::new();
     for name in names {
-        match link.credential(&format!("secret:{name}@{session_id}")).await {
+        match link.session_credential(session_id, &format!("secret:{name}@{session_id}")).await {
             Ok(g) => values.push((name.clone(), g.bearer)),
             Err(e) => errors.push(format!("{name}: {e:#}")),
         }
