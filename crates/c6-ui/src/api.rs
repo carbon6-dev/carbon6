@@ -967,6 +967,12 @@ pub async fn set_colour(id: String, colour: String) -> Result<Session, String> {
     send_json(Request::put(&format!("/api/v1/sessions/{id}/colour")), &c6_api::SetColour { colour }).await
 }
 
+/// The connection, model and effort a session's subagents run on from now
+/// on (an empty model: the session's own).
+pub async fn set_subagent_model(id: String, req: c6_api::SetSubagentModel) -> Result<Session, String> {
+    send_json(Request::put(&format!("/api/v1/sessions/{id}/subagent-model")), &req).await
+}
+
 pub async fn set_labels(id: String, labels: Vec<String>) -> Result<Session, String> {
     send_json(Request::put(&format!("/api/v1/sessions/{id}/labels")), &c6_api::SetLabels { labels }).await
 }

@@ -42,6 +42,9 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             agent: s.agent.clone(),
             description: s.description.clone(),
             background_task_id: s.background_task_id.clone(),
+            connection_id: s.model.as_ref().map(|m| m.connection_id.clone()).unwrap_or_default(),
+            model: s.model.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
+            effort: s.model.as_ref().map(|m| m.effort.clone()).unwrap_or_default(),
         },
         Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn },
         Kind::Assistant(a) => api::EventKind::Assistant {
@@ -141,6 +144,10 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 context_window: m.context_window,
             }
         }
+        Kind::SubagentModelSet(m) => {
+            let spec = m.model.clone().unwrap_or_default();
+            api::EventKind::SubagentModelSet { connection_id: spec.connection_id, model: spec.model, effort: spec.effort }
+        }
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
 }
@@ -197,6 +204,9 @@ pub fn session(r: &SessionRow) -> api::Session {
         observed: r.observed,
         instance: r.instance.clone(),
         colour: r.colour.clone(),
+        subagent_connection_id: r.subagent_connection_id.clone(),
+        subagent_model: r.subagent_model.clone(),
+        subagent_effort: r.subagent_effort.clone(),
     }
 }
 

@@ -451,8 +451,13 @@ pub struct SessionRow {
     pub ssh_target: String,
     /// Tool calls waiting for approval.
     pub awaiting: i64,
-    /// The model for subagents, from a routing rule; empty: `model`.
+    /// The model for subagents, from a routing rule or picked in the
+    /// session; empty: `model`.
     pub subagent_model: String,
+    /// With `subagent_model`: the connection subagents run on (empty: the
+    /// session's) and their effort.
+    pub subagent_connection_id: String,
+    pub subagent_effort: String,
     /// The realm it runs in (docs/os.md §3).
     pub realm: String,
     /// Subagents: the named agent; empty for a general-purpose one.
@@ -531,7 +536,8 @@ impl Store {
         };
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour, subagent_connection_id, subagent_effort) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -553,6 +559,8 @@ impl Store {
         .bind(&s.root_id)
         .bind(&s.instance)
         .bind(&colour)
+        .bind(&s.subagent_connection_id)
+        .bind(&s.subagent_effort)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -721,6 +729,18 @@ impl Store {
 
     pub async fn set_session_colour(&self, id: &str, colour: &str) -> anyhow::Result<bool> {
         let r = sqlx::query("UPDATE sessions SET colour = ? WHERE id = ?").bind(colour).bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// The default for a session's subagents (all empty: its own model).
+    pub async fn set_subagent_model(&self, id: &str, connection_id: &str, model: &str, effort: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE sessions SET subagent_connection_id = ?, subagent_model = ?, subagent_effort = ? WHERE id = ?")
+            .bind(connection_id)
+            .bind(model)
+            .bind(effort)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(r.rows_affected() > 0)
     }
 
@@ -938,6 +958,17 @@ impl Store {
                         .execute(&mut *tx)
                         .await?;
                 }
+                Some(Kind::SubagentModelSet(m)) => {
+                    done.push(m.command_id.clone());
+                    let spec = m.model.clone().unwrap_or_default();
+                    sqlx::query("UPDATE sessions SET subagent_connection_id = ?, subagent_model = ?, subagent_effort = ? WHERE id = ?")
+                        .bind(&spec.connection_id)
+                        .bind(&spec.model)
+                        .bind(&spec.effort)
+                        .bind(session_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 Some(Kind::ModelSwitched(m)) => {
                     let spec = m.model.clone().unwrap_or_default();
                     sqlx::query("UPDATE sessions SET connection_id = ?, model = ?, effort = ? WHERE id = ?")
@@ -1024,6 +1055,15 @@ async fn create_subagent_session(
     .await?;
     let Some(parent) = parent else { return Ok(false) };
     let now = c6_core::now_ms();
+    // It runs on its own connection, model and effort (a subagent may run on
+    // another connection than its parent's); a log from before subagents
+    // named them: its parent's.
+    let own = s.model.as_ref().filter(|m| !m.connection_id.is_empty());
+    let connection_id = own.map_or_else(|| parent.get::<String, _>("connection_id"), |m| m.connection_id.clone());
+    let effort = match own {
+        Some(m) => Some(m.effort.clone()).filter(|e| !e.is_empty()),
+        None => parent.get::<Option<String>, _>("effort"),
+    };
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
          labels, worker_name, ssh_target, realm, agent, root_id, observed, instance, colour) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1032,11 +1072,11 @@ async fn create_subagent_session(
     .bind(worker_id.to_string())
     .bind(if s.title.is_empty() { "Subagent" } else { &s.title })
     .bind(&s.cwd)
-    .bind(parent.get::<String, _>("connection_id"))
+    .bind(connection_id)
     .bind(s.model.as_ref().map(|m| m.model.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| parent.get::<String, _>("model")))
     .bind(now)
     .bind(now)
-    .bind(parent.get::<Option<String>, _>("effort"))
+    .bind(effort)
     .bind(&s.parent_session_id)
     .bind(&s.parent_call_id)
     .bind(parent.get::<String, _>("labels"))

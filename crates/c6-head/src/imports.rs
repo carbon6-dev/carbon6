@@ -129,6 +129,8 @@ pub async fn append(st: &HeadState, from: WorkerId, p: &Value) -> anyhow::Result
             ssh_target: String::new(),
             awaiting: 0,
             subagent_model: String::new(),
+            subagent_connection_id: String::new(),
+            subagent_effort: String::new(),
             realm: realm_for(&rules, &ms("cwd"), &ms("home")),
             agent: String::new(),
             end_reason: String::new(),

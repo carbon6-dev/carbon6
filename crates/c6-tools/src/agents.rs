@@ -15,13 +15,17 @@ use crate::{Concurrency, Tool, ToolCtx, ToolOutput};
 pub trait Subagents: Send + Sync {
     /// Returns the subagent's final answer. `agent`: a named agent's
     /// instructions, tools and model; `None` for a general-purpose one.
-    /// `background`: the background task it runs as, if it does.
+    /// `background`: the background task it runs as, if it does. `choice`:
+    /// the connection, model and effort the call asks for (empty: the
+    /// agent's, else the session's default for subagents).
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         parent_call_id: &str,
         description: &str,
         prompt: &str,
         agent: Option<&AgentDef>,
+        choice: &ModelChoice,
         background: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<String, String>;
@@ -45,6 +49,36 @@ pub trait Subagents: Send + Sync {
 
     /// What the subagent `to` has done so far.
     async fn peek(&self, to: &str) -> Result<String, String>;
+}
+
+/// The connection, model and effort a `Task` call asks its subagent to run
+/// on; each empty: decided by the runtime.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelChoice {
+    /// A connection's name or id.
+    pub connection: String,
+    /// A model id, or `<connection>/<model>`.
+    pub model: String,
+    pub effort: String,
+}
+
+impl ModelChoice {
+    pub fn from_input(input: &Value) -> Self {
+        let s = |k: &str| input[k].as_str().unwrap_or_default().trim().to_owned();
+        Self { connection: s("connection"), model: s("model"), effort: s("effort") }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.connection.is_empty() && self.model.is_empty() && self.effort.is_empty()
+    }
+}
+
+/// A connection subagents may run on, as `Task` lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectionInfo {
+    pub name: String,
+    pub kind: String,
+    pub default_model: String,
 }
 
 /// A named subagent (from the head's settings): its instructions, the tools
@@ -82,20 +116,34 @@ impl AgentDef {
 pub struct Task {
     claude: bool,
     agents: Arc<Vec<AgentDef>>,
+    connections: Arc<Vec<ConnectionInfo>>,
+    /// Offer `run_in_background` (not where nothing could deliver its
+    /// notice, e.g. to Claude Code over MCP).
+    background: bool,
 }
 
 impl Task {
     pub fn generic() -> Self {
-        Self { claude: false, agents: Arc::default() }
+        Self { claude: false, agents: Arc::default(), connections: Arc::default(), background: true }
     }
 
     pub fn claude() -> Self {
-        Self { claude: true, agents: Arc::default() }
+        Self { claude: true, ..Self::generic() }
     }
 
     /// The same tool, offering these named agents too.
     pub fn with_agents(claude: bool, agents: Vec<AgentDef>) -> Self {
-        Self { claude, agents: Arc::new(agents) }
+        Self { claude, agents: Arc::new(agents), ..Self::generic() }
+    }
+
+    /// The same tool, offering these connections for subagents to run on.
+    pub fn with_connections(self, connections: Vec<ConnectionInfo>) -> Self {
+        Self { connections: Arc::new(connections), ..self }
+    }
+
+    /// The same tool, without `run_in_background`.
+    pub fn foreground_only(self) -> Self {
+        Self { background: false, ..self }
     }
 
     pub fn is_task(name: &str) -> bool {
@@ -114,8 +162,24 @@ impl Tool for Task {
         let mut properties = json!({
             "description": {"type": "string", "description": "A short (3-5 word) description of the task"},
             "prompt": {"type": "string", "description": "The complete task for the subagent"},
-            "run_in_background": {"type": "boolean", "description": "Start it in the background and continue; its report arrives as a notice when it finishes (stop it with the kill tool)"}
+            "model": {"type": "string", "description": "The model to run it on, when the user asks for one (a model id, or connection/model); omit for the default"},
+            "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Its reasoning effort, when the user asks for one; omit for the default"}
         });
+        if self.background {
+            properties["run_in_background"] = json!({"type": "boolean", "description": "Start it in the background and continue; its report arrives as a notice when it finishes (stop it with the kill tool)"});
+        }
+        if !self.connections.is_empty() {
+            description.push_str(
+                "\n\nIt runs on the session's default model for subagents unless the user asks for another connection or model; \
+                 then set connection (and model, else the connection's default) as they said. Connections:\n",
+            );
+            for c in self.connections.iter() {
+                let default = if c.default_model.is_empty() { String::new() } else { format!(", default model {}", c.default_model) };
+                description.push_str(&format!("- {} ({}{default})\n", c.name, c.kind));
+            }
+            let names: Vec<&str> = self.connections.iter().map(|c| c.name.as_str()).collect();
+            properties["connection"] = json!({"type": "string", "enum": names, "description": "The connection to run it on, when the user asks for one; omit for the default"});
+        }
         if !self.agents.is_empty() {
             description.push_str("\n\nSpecialized agents (set subagent_type; omit it, or use general-purpose, for a general one):\n");
             for a in self.agents.iter() {
@@ -152,19 +216,20 @@ impl Tool for Task {
                 }
             },
         };
-        if input["run_in_background"].as_bool() == Some(true) {
+        let choice = ModelChoice::from_input(&input);
+        if self.background && input["run_in_background"].as_bool() == Some(true) {
             let (id, cancel) = ctx.session.background.start_agent(description, true);
             let (session, call_id, description, prompt, agent, task) =
                 (ctx.session.clone(), ctx.call_id.clone(), description.to_owned(), prompt.to_owned(), agent.cloned(), id.clone());
             tokio::spawn(async move {
-                let result = agents.run(&call_id, &description, &prompt, agent.as_ref(), Some(&task), cancel).await;
+                let result = agents.run(&call_id, &description, &prompt, agent.as_ref(), &choice, Some(&task), cancel).await;
                 session.background.finish_agent(&task, result);
             });
             return ToolOutput::ok(format!(
                 "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
             ));
         }
-        match agents.run(&ctx.call_id, description, prompt, agent, None, ctx.cancel.clone()).await {
+        match agents.run(&ctx.call_id, description, prompt, agent, &choice, None, ctx.cancel.clone()).await {
             Ok(answer) => ToolOutput::limited(answer, false),
             // What it did and how it ended.
             Err(e) => ToolOutput::err(e),
@@ -177,15 +242,21 @@ impl Tool for Task {
 /// of one that is running.
 pub struct SendMessage {
     claude: bool,
+    background: bool,
 }
 
 impl SendMessage {
     pub fn generic() -> Self {
-        Self { claude: false }
+        Self { claude: false, background: true }
     }
 
     pub fn claude() -> Self {
-        Self { claude: true }
+        Self { claude: true, background: true }
+    }
+
+    /// The same tool, without `run_in_background`.
+    pub fn foreground_only(self) -> Self {
+        Self { background: false, ..self }
     }
 
     pub fn is_send(name: &str) -> bool {
@@ -204,11 +275,17 @@ impl Tool for SendMessage {
                           notice, with run_in_background); one that is running sees it at its next step and its report comes \
                           when it finishes."
                 .into(),
-            parameters: json!({"type": "object", "properties": {
-                "to": {"type": "string", "description": "The subagent's id (from Task's result or notice), or its background task id"},
-                "message": {"type": "string", "description": "What to tell it"},
-                "run_in_background": {"type": "boolean", "description": "Continue it in the background; its report arrives as a notice"}
-            }, "required": ["to", "message"], "additionalProperties": false}),
+            parameters: {
+                let mut p = json!({"type": "object", "properties": {
+                    "to": {"type": "string", "description": "The subagent's id (from Task's result or notice), or its background task id"},
+                    "message": {"type": "string", "description": "What to tell it"},
+                    "run_in_background": {"type": "boolean", "description": "Continue it in the background; its report arrives as a notice"}
+                }, "required": ["to", "message"], "additionalProperties": false});
+                if !self.background {
+                    p["properties"].as_object_mut().unwrap().remove("run_in_background");
+                }
+                p
+            },
         }
     }
 
@@ -234,7 +311,7 @@ impl Tool for SendMessage {
                 Err(e) => ToolOutput::err(e),
             };
         }
-        if input["run_in_background"].as_bool() == Some(true) {
+        if self.background && input["run_in_background"].as_bool() == Some(true) {
             let (id, cancel) = ctx.session.background.start_agent(&format!("continue {to}"), true);
             let (session, call_id, to, message, task) =
                 (ctx.session.clone(), ctx.call_id.clone(), to.to_owned(), message.to_owned(), id.clone());
@@ -346,5 +423,22 @@ mod tests {
         let spec = Task::with_agents(true, vec![r]).spec();
         assert!(spec.description.contains("- code-reviewer: Reviews code"));
         assert_eq!(spec.parameters["properties"]["subagent_type"]["enum"], json!(["general-purpose", "code-reviewer"]));
+        assert!(spec.parameters["properties"].get("connection").is_none());
+    }
+
+    #[test]
+    fn connections_to_run_on() {
+        let c = |name: &str, kind: &str, model: &str| ConnectionInfo { name: name.into(), kind: kind.into(), default_model: model.into() };
+        let spec = Task::claude().with_connections(vec![c("work", "anthropic", "claude-sonnet-5-5"), c("gpt", "chatgpt", "")]).spec();
+        assert!(spec.description.contains("- work (anthropic, default model claude-sonnet-5-5)"));
+        assert!(spec.description.contains("- gpt (chatgpt)"));
+        assert_eq!(spec.parameters["properties"]["connection"]["enum"], json!(["work", "gpt"]));
+        assert!(spec.parameters["properties"]["run_in_background"].is_object());
+        let fg = Task::claude().foreground_only().spec();
+        assert!(fg.parameters["properties"].get("run_in_background").is_none());
+        assert!(SendMessage::claude().foreground_only().spec().parameters["properties"].get("run_in_background").is_none());
+        let choice = ModelChoice::from_input(&json!({"connection": " gpt ", "model": "gpt-6.1-sol", "effort": "high"}));
+        assert_eq!(choice, ModelChoice { connection: "gpt".into(), model: "gpt-6.1-sol".into(), effort: "high".into() });
+        assert!(ModelChoice::from_input(&json!({})).is_empty());
     }
 }
