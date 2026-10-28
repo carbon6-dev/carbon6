@@ -9,10 +9,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub mod enrollment;
-#[cfg(feature = "upgrade")]
-pub mod upgrade;
 #[cfg(feature = "update")]
 pub mod update;
+#[cfg(feature = "upgrade")]
+pub mod upgrade;
 
 /// Wire protocol version. The head accepts `PROTOCOL_VERSION` and
 /// `PROTOCOL_VERSION - 1`.

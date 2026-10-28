@@ -530,7 +530,9 @@ impl SessionChrome {
 #[component]
 pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option<Callback<()>>) -> impl IntoView {
     let live = api::live();
-    let SessionChrome { id, detail, status, started, model_label, events, tab, details, find_open, like_this, root, force_open, col, .. } = chrome;
+    let SessionChrome {
+        id, detail, status, started, model_label, events, tab, details, find_open, like_this, root, force_open, col, ..
+    } = chrome;
     let popover = on_act.is_some();
     let act = move || {
         if let Some(f) = on_act {

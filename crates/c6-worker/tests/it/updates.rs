@@ -208,11 +208,9 @@ async fn the_edge_channel_offers_builds_of_main() {
         )
         .route(
             "/dl/{dir}/{name}",
-            axum::routing::get(
-                |State(f): State<Files>, Path((d, n)): Path<(String, String)>| async move {
-                    f.lock().unwrap().get(&format!("{d}/{n}")).cloned().ok_or(axum::http::StatusCode::NOT_FOUND)
-                },
-            ),
+            axum::routing::get(|State(f): State<Files>, Path((d, n)): Path<(String, String)>| async move {
+                f.lock().unwrap().get(&format!("{d}/{n}")).cloned().ok_or(axum::http::StatusCode::NOT_FOUND)
+            }),
         )
         .with_state(files.clone());
     tokio::spawn(async move { axum::serve(listener, app).await });
