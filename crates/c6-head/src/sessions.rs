@@ -1423,6 +1423,10 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
             return grant;
         }
     };
+    // A pool's calls are spread in the head (pools.rs): it has no credentials.
+    if conn.kind == crate::pools::KIND {
+        return refused(grant, worker_name, &req.session_id, format!("{} is a pool, which only what runs in the head uses", conn.name));
+    }
     if let Some(w) = worker_id {
         let asked = if req.session_id.is_empty() {
             warn!(worker = %worker_name, connection = %conn.id, "this worker doesn't say which session asks for credentials: update it");

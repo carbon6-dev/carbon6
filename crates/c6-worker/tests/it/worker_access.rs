@@ -133,6 +133,10 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     // The head's own (the knowledge store, the assistant): as before.
     let req = CredentialRequest { connection_id: home_only.clone(), ..Default::default() };
     assert_eq!(c6_head::sessions::credential_for(st, None, "head", req).await.bearer, "key-home-only");
+    // A pool (docs/pools.md) has no credentials of its own.
+    let pool =
+        api.ok(M::POST, "connections", json!({"kind": "pool", "name": "p", "members": [{"connection_id": shared, "slots": 1}]})).await;
+    assert!(ask(st, a, &mine, pool["id"].as_str().unwrap()).await.error.contains("is a pool"));
     head.shutdown().await.unwrap();
 }
 
