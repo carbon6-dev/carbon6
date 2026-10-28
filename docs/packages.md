@@ -112,7 +112,8 @@ What requiring means depends on the role of what's required:
 - **`kit_shell {kit, command}`** runs a command in a kit whose permissions include `shell`.
 - **`template_start {realm, template, input}`** starts a template:
   - in the session's own realm, or in another realm whose app exports it to this one (the grant made when the requiring app was installed);
-  - the started sessions run in that realm, and the caller gets their ids.
+  - the started sessions run in that realm, and the caller gets their ids;
+  - they run on the caller's worker. A template that names other workers, hosts or SSH targets runs there only with your grant (`grant_request`: kind `workers`, mode `start`, scope `{template}`); without one, it is refused.
 
 ## 7. The registry and the UI
 

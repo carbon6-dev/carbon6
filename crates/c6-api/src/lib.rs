@@ -1308,12 +1308,15 @@ pub struct Grant {
     pub id: String,
     pub from_realm: String,
     pub to_realm: String,
-    /// collection, memex or operations.
+    /// collection, memex, operations, or workers (within a realm too: a
+    /// session starting a template beyond its own worker).
     pub kind: String,
     /// collection: {"collection": name, "where": {filter}}; memex: {"kinds": […]}
-    /// (empty: every kind but spam); operations: {"methods": ["memex.mail.draft", …]}.
+    /// (empty: every kind but spam); operations: {"methods": ["memex.mail.draft", …]};
+    /// workers: {"template": name}.
     pub scope: serde_json::Value,
-    /// read, append or snapshot (collections); read (memex); call (operations).
+    /// read, append or snapshot (collections); read (memex); call (operations);
+    /// start (workers).
     pub mode: String,
     /// active, requested, revoked or denied.
     pub state: String,

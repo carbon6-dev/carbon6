@@ -160,3 +160,69 @@ async fn an_older_worker_still_gets_what_its_sessions_use() {
     assert_eq!(older(&format!("secret:DEPLOY_KEY@{s}")).await.bearer, "dk-1");
     head.shutdown().await.unwrap();
 }
+
+/// What the head sends a worker.
+type Inbox = tokio::sync::mpsc::Receiver<Result<c6_proto::HeadMsg, tonic::Status>>;
+
+/// A live connection for a worker in the head's registry: the guard that
+/// takes its answers, and what the head sends it.
+fn attach<'a>(st: &'a HeadState, id: WorkerId, since: i64, caps: &[&str]) -> (c6_head::registry::ConnGuard<'a>, Inbox) {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    (st.registry.attach(id, since, tx, caps.iter().map(|c| c.to_string()).collect(), "worker"), rx)
+}
+
+async fn worker_of(st: &HeadState, session: &Value) -> String {
+    st.store.session(session.as_str().unwrap()).await.unwrap().unwrap().worker_name
+}
+
+#[tokio::test]
+async fn templates_from_a_session_run_on_its_worker() {
+    let (head, _dir) = head().await;
+    let (st, api) = (&head.state, Api::of(&head));
+    use reqwest::Method as M;
+    api.ok(M::POST, "realms", json!({"id": "mach5-agents"})).await;
+    let (a, b) = (worker(st, "a", &[]).await, worker(st, "b", &[]).await);
+    let (ga, _ra) = attach(st, a, 1, &[]);
+    let (gb, _rb) = attach(st, b, 2, &[]);
+    let m = connection(&api, "m", &[]).await;
+    api.ok(
+        M::PUT,
+        "settings/templates",
+        json!([{"name": "anywhere", "workers": ["*"], "model": "m", "prompt": "x"},
+               {"name": "on-b", "workers": ["b"], "model": "m", "prompt": "x"}]),
+    )
+    .await;
+    let caller = session(&api, a, &m, "home").await;
+    let start =
+        |template: &str| c6_head::fabric::handle(st, a, "session.template_start", json!({"session_id": caller, "template": template}));
+
+    // Every worker, from a session on a: only a.
+    let run = start("anywhere").await.unwrap();
+    let started = run["sessions"].as_array().unwrap();
+    assert_eq!(started.len(), 1, "{run}");
+    assert_eq!(worker_of(st, &started[0]).await, "a");
+    // Naming b: refused, until you grant it.
+    let e = start("on-b").await.unwrap_err().to_string();
+    assert!(e.contains("grant_request"), "{e}");
+    let g = c6_api::GrantIn {
+        from_realm: "home".into(),
+        to_realm: "home".into(),
+        kind: "workers".into(),
+        mode: "start".into(),
+        scope: json!({"template": "on-b"}),
+        ..Default::default()
+    };
+    c6_head::grants::create(st, &g, "you", "active").await.unwrap();
+    let run = start("on-b").await.unwrap();
+    assert_eq!(worker_of(st, &run["sessions"][0]).await, "b");
+
+    // Any run: only workers that serve its realm.
+    api.ok(M::PUT, &format!("workers/{}/realms", b.0), json!({"realms": ["mach5-agents"]})).await;
+    let run = c6_head::templates::run(st, "anywhere", "", &[], "home").await.unwrap();
+    assert_eq!(run.sessions.len(), 1, "{:?}", run.errors);
+    assert_eq!(run.sessions[0].worker_id, a.0);
+    let e = c6_head::templates::run(st, "on-b", "", &[], "home").await.unwrap_err().to_string();
+    assert!(e.contains("not available to realm home"), "{e}");
+    drop((ga, gb));
+    head.shutdown().await.unwrap();
+}

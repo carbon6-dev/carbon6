@@ -280,12 +280,14 @@ simple_tool!(
     "Asks the user to let this realm use another realm's data, without stopping: the request comes to them as a decision, and \
      its answer arrives as a message. kind collection with mode read (its records; scope {collection, where?}), append (add \
      records) or snapshot (a copy once); kind memex with mode read (its knowledge; scope {kinds?}); kind operations with mode \
-     call (scope {methods: [\"memex.mail.draft\", …]}). Once allowed, give realm on records_* calls to reach the collection; \
-     memex searches include the granted knowledge, and granted operations run in the realm that owns them.",
+     call (scope {methods: [\"memex.mail.draft\", …]}); kind workers with mode start (scope {template}; from_realm: the \
+     template's, this realm's too) to start a template on the other workers, hosts or SSH targets it names, where \
+     template_start otherwise runs only on this session's worker. Once allowed, give realm on records_* calls to reach the \
+     collection; memex searches include the granted knowledge, and granted operations run in the realm that owns them.",
     json!({"type": "object", "properties": {
         "from_realm": {"type": "string", "description": "The realm whose data you need"},
-        "kind": {"type": "string", "enum": ["collection", "memex", "operations"]},
-        "mode": {"type": "string", "enum": ["read", "append", "snapshot", "call"]},
+        "kind": {"type": "string", "enum": ["collection", "memex", "operations", "workers"]},
+        "mode": {"type": "string", "enum": ["read", "append", "snapshot", "call", "start"]},
         "scope": {"type": "object"},
         "why": {"type": "string", "description": "What you need it for, for the user"}
     }, "required": ["from_realm", "kind", "mode", "scope", "why"], "additionalProperties": false}),

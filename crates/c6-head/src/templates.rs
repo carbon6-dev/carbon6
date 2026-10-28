@@ -112,6 +112,37 @@ pub async fn run_as(
     realm: &str,
     instance: Option<&str>,
 ) -> anyhow::Result<api::TemplateRun> {
+    start(st, name, input, labels, realm, instance, None).await
+}
+
+/// Starts a template for a session (`session.template_start`): on the
+/// session's worker. One that names other workers, hosts or SSH targets
+/// runs there only with your grant (kind `workers`, mode `start`).
+pub async fn run_for_session(
+    st: &HeadState,
+    name: &str,
+    input: &str,
+    labels: &[String],
+    realm: &str,
+    session: &crate::store::SessionRow,
+) -> anyhow::Result<api::TemplateRun> {
+    start(st, name, input, labels, realm, None, Some(session)).await
+}
+
+/// Whether a worker runs sessions (not the head or the memex) for `realm`.
+fn serves(w: &api::Worker, realm: &str) -> bool {
+    !matches!(w.role.as_str(), "head" | "memex") && crate::realms::serves(&w.realms, realm)
+}
+
+async fn start(
+    st: &HeadState,
+    name: &str,
+    input: &str,
+    labels: &[String],
+    realm: &str,
+    instance: Option<&str>,
+    from: Option<&crate::store::SessionRow>,
+) -> anyhow::Result<api::TemplateRun> {
     let (t, layer) = templates_in(st, realm, instance)
         .await?
         .into_iter()
@@ -125,10 +156,12 @@ pub async fn run_as(
     if !t.enabled {
         return Err(bad_request(format!("template {name:?} is switched off")));
     }
-    // Workers: by name, `*` for every online one, or the online one.
-    let all = crate::api::workers_snapshot(st).await?;
+    // Workers that serve the realm: by name, `*` for every online one, or
+    // the online one.
+    let snapshot = crate::api::workers_snapshot(st).await?;
+    let all: Vec<api::Worker> = snapshot.iter().filter(|w| serves(w, realm)).cloned().collect();
     let online: Vec<&api::Worker> = all.iter().filter(|w| w.status == api::WorkerStatus::Online).collect();
-    let workers: Vec<&api::Worker> = if t.workers.is_empty() {
+    let mut workers: Vec<&api::Worker> = if t.workers.is_empty() {
         online.first().copied().into_iter().collect()
     } else if t.workers.iter().any(|w| w == "*") {
         online.clone()
@@ -137,11 +170,31 @@ pub async fn run_as(
         for n in &t.workers {
             match all.iter().find(|w| &w.name == n && w.status != api::WorkerStatus::Revoked) {
                 Some(w) => v.push(w),
+                None if snapshot.iter().any(|w| &w.name == n) => {
+                    return Err(bad_request(format!("template {name:?}: worker {n:?} is not available to realm {realm}")));
+                }
                 None => return Err(bad_request(format!("template {name:?}: no worker named {n:?}"))),
             }
         }
         v
     };
+    // From a session: its own worker, unless you let its realm reach further.
+    if let Some(s) = from {
+        let own = all
+            .iter()
+            .find(|w| w.id.to_string() == s.worker_id)
+            .ok_or_else(|| bad_request(format!("template {name:?}: {} is not available to realm {realm}", s.worker_name)))?;
+        let elsewhere = !t.hosts.is_empty() || !t.ssh.is_empty() || t.workers.iter().any(|w| w != "*" && *w != own.name);
+        let by = format!("session:{}", s.id);
+        if !elsewhere {
+            workers = vec![own];
+        } else if !crate::grants::may_reach(st, realm, &s.realm, name, &by).await {
+            return Err(bad_request(format!(
+                "template {name:?} runs on other workers, hosts or SSH targets; a session starts it only on its own worker unless you \
+                 allow it: ask with grant_request (from_realm {realm}, kind workers, mode start, scope {{\"template\": {name:?}}})"
+            )));
+        }
+    }
     if workers.is_empty() && t.hosts.is_empty() {
         return Err(bad_request(format!("template {name:?}: no worker is online")));
     }
