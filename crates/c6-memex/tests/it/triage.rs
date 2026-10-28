@@ -714,3 +714,135 @@ async fn a_stalled_answer_lets_go() {
     assert_eq!(s.by, "model");
     head.shutdown().await.unwrap();
 }
+
+/// Your Google account (me@mine.io), as the Google apps keep it, so the
+/// memex knows which mail is to you: the apps installed, the account kept
+/// (the sign-in itself is the providers test's), the memex told.
+pub(crate) async fn my_account(head: &c6_head::Head, api: &str, m: &c6_memex::Memex) {
+    let http = reqwest::Client::new();
+    let installs: Vec<c6_api::Install> = http.post(format!("{api}/google/install")).send().await.unwrap().json().await.unwrap();
+    for i in &installs {
+        let r =
+            http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    }
+    for (app, _) in c6_head::google::APPS {
+        let a = c6_head::providers::Kept {
+            realm: "home",
+            instance: app,
+            provider: "google",
+            account: "me@mine.io",
+            name: "Me",
+            refresh: "rt-1",
+            access: "at-1",
+            expires: c6_core::now_ms() + 3_600_000,
+            scopes: "all",
+        };
+        c6_head::providers::keep(&head.state, &a, None).await.unwrap();
+    }
+    c6_head::memex::reload(&head.state).await;
+    eventually("the memex knows your account", async || m.accounts().iter().any(|a| a.email == "me@mine.io").then_some(())).await;
+}
+
+/// A conversation as the model sorted it, at its latest message; what
+/// needs you (or is a first contact) opens its request, as sorting does.
+pub(crate) async fn sorted_as(m: &c6_memex::Memex, thread: &str, category: &str) {
+    let (at, sender): (i64, String) = sqlx::query_as("SELECT date, from_addr FROM mail WHERE thread_id = ? ORDER BY date DESC LIMIT 1")
+        .bind(thread)
+        .fetch_one(&m.store.pool)
+        .await
+        .unwrap();
+    let t = c6_api::Triage {
+        target: format!("thread:acct:{thread}"),
+        kind: "mail".into(),
+        category: category.into(),
+        reason: "as sorted".into(),
+        by: "model".into(),
+        sender,
+        title: thread.into(),
+        at,
+        ..Default::default()
+    };
+    sqlx::query(
+        "INSERT OR REPLACE INTO triage (target, kind, category, reason, by, sender, title, at, done_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&t.target)
+    .bind(&t.kind)
+    .bind(&t.category)
+    .bind(&t.reason)
+    .bind(&t.by)
+    .bind(&t.sender)
+    .bind(&t.title)
+    .bind(at)
+    .bind(c6_core::now_ms())
+    .execute(&m.store.pool)
+    .await
+    .unwrap();
+    c6_memex::requests::sorted_by_you(m, &t).await.unwrap();
+}
+
+/// "Needs reply" (Mail's view, the Activity page) follows the sorting:
+/// mail straight to you that the model sorted as a notification doesn't
+/// need a reply, mail that needs you does; mail not sorted yet does,
+/// unless an automated sender wrote it.
+#[tokio::test]
+async fn needs_reply_follows_the_sorting() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    my_account(&head, &api, &m).await;
+    // A model that can't answer now: what isn't sorted yet stays so.
+    let r =
+        http.post(format!("{api}/connections")).json(&json!({"name": "down", "base_url": "http://127.0.0.1:9/v1"})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let body = json!({"understanding": {"connection": "down", "model": "reader-1"}, "calls_per_day": 100});
+    let r = http.put(format!("{api}/settings/memex")).json(&body).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    eventually("the memex has its model", async || m.understanding().map(drop)).await;
+
+    let me = "me@mine.io";
+    mail(
+        &m,
+        "n1",
+        "n1",
+        ("orders@shop.example", "Shop"),
+        me,
+        "Your order has shipped",
+        "Order 1182 is on its way.",
+        None,
+        &["INBOX"],
+        HOUR,
+    )
+    .await;
+    mail(&m, "n2", "n2", ("carol@acme.com", "Carol"), me, "Contract", "Can you sign it by Friday?", None, &["INBOX"], 2 * HOUR).await;
+    mail(&m, "n3", "n3", ("no-reply@bank.example", "Bank"), me, "Transfer confirmed", "Your $40 went through.", None, &["INBOX"], 3 * HOUR)
+        .await;
+    mail(&m, "n4", "n4", ("dan@other.org", "Dan"), me, "Coffee", "Coffee next week?", None, &["INBOX"], 4 * HOUR).await;
+    sorted_as(&m, "n1", "notification").await;
+    sorted_as(&m, "n2", "needs_you").await;
+
+    let rpc = async |method: &str, params: Value| -> Value {
+        let r = http.post(format!("{api}/memex/rpc")).json(&json!({"method": method, "params": params})).send().await.unwrap();
+        assert!(r.status().is_success());
+        r.json().await.unwrap()
+    };
+    let threads: Vec<MailThread> = serde_json::from_value(rpc("memex.mail.threads", json!({"view": "needs_reply"})).await).unwrap();
+    let subjects: Vec<&str> = threads.iter().map(|t| t.subject.as_str()).collect();
+    assert_eq!(subjects, ["Contract", "Coffee"], "not the shipping notice nor the bank's");
+    // The last two weren't sorted.
+    for t in ["n3", "n4"] {
+        assert_eq!(rpc("memex.triage.get", json!({"target": format!("thread:acct:{t}")})).await, Value::Null, "{t}");
+    }
+    head.shutdown().await.unwrap();
+}

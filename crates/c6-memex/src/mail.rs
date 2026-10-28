@@ -309,7 +309,7 @@ pub async fn threads(
         "trash" => ("m.trash = 1", None),
         "all" => ("m.trash = 0 AND m.spam = 0", None),
         // The latest message is from someone else, to you directly, in the
-        // inbox, not a list, this month.
+        // inbox, not a list, this month; and as sorted (`needs_reply`).
         "needs_reply" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0 AND m.list = 0", None),
         // The latest message is yours, sent over two days ago, this month.
         "waiting" => ("m.trash = 0 AND m.spam = 0", None),
@@ -354,10 +354,11 @@ pub async fn threads(
             let last_from: String = last.get("from_addr");
             let mine = me.contains(&last_from);
             let date: i64 = r.get("date");
+            let triage = crate::triage::of_thread(m, &acct, &thread).await?;
             let keep = match view {
                 "needs_reply" => {
                     let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
-                    !mine && date > month && to.iter().any(|(a, _)| me.contains(a))
+                    !mine && date > month && to.iter().any(|(a, _)| me.contains(a)) && needs_reply(triage.as_ref(), date, &last_from)
                 }
                 // Yours, unanswered: sent to someone else.
                 "waiting" => {
@@ -384,7 +385,6 @@ pub async fn threads(
                     people.push(label);
                 }
             }
-            let triage = crate::triage::of_thread(m, &acct, &thread).await?;
             out.push(api::MailThread {
                 triage,
                 account: acct,
@@ -408,6 +408,18 @@ pub async fn threads(
         }
     }
     Ok(out)
+}
+
+/// Whether a thread whose latest message (at `latest`, from `sender`) is
+/// someone else's to you needs your reply: as it was sorted, when that
+/// sorting saw the message (it needs you, or is a real first contact),
+/// else (not sorted yet) unless an automated sender wrote it. Shipping
+/// notices and receipts come straight to you without list headers.
+fn needs_reply(sorted: Option<&api::Triage>, latest: i64, sender: &str) -> bool {
+    match sorted {
+        Some(t) if t.at >= latest => matches!(t.category.as_str(), "needs_you" | "first_contact"),
+        _ => !crate::relations::automated(sender),
+    }
 }
 
 /// A thread's messages, with each one's HTML (if any) and attachments.
@@ -670,5 +682,23 @@ mod tests {
     #[test]
     fn markdown() {
         assert_eq!(super::markdown_html("Hi **there**"), "<p>Hi <strong>there</strong></p>\n");
+    }
+
+    #[test]
+    fn needs_reply_follows_the_sorting() {
+        let sorted = |category: &str, at: i64| c6_api::Triage { category: category.into(), at, ..Default::default() };
+        let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender);
+        // Sorted: what it was sorted as, whoever sent it.
+        assert!(needs(Some(sorted("needs_you", 100)), "no-reply@bank.example"));
+        assert!(needs(Some(sorted("first_contact", 100)), "pat@new.example"));
+        for c in ["notification", "newsletter", "noise", "pitch", "fyi", "yours"] {
+            assert!(!needs(Some(sorted(c, 100)), "orders@shop.example"), "{c}");
+        }
+        // Not sorted yet (or sorted before its latest message): a person's,
+        // not an automated sender's.
+        assert!(needs(None, "ana@acme.com"));
+        assert!(!needs(None, "no-reply@bank.example"));
+        assert!(needs(Some(sorted("notification", 50)), "ana@acme.com"));
+        assert!(!needs(Some(sorted("needs_you", 50)), "notifications@github.com"));
     }
 }
