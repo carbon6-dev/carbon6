@@ -590,7 +590,7 @@ async fn transcription(e: c6_llm::pool::Endpoint, model: &str, audio: &[u8]) -> 
         .mime_str("audio/mp4")
         .map_err(|e| LlmError::Config(e.to_string()))?;
     let form = reqwest::multipart::Form::new().text("model", model.to_owned()).text("response_format", "verbose_json").part("file", file);
-    let mut req = reqwest::Client::new().post(&url).bearer_auth(&e.bearer).multipart(form);
+    let mut req = reqwest::Client::new().post(&url).timeout(crate::llm::CALL_LIMITS.total).bearer_auth(&e.bearer).multipart(form);
     for (k, v) in &e.headers {
         req = req.header(k, v);
     }

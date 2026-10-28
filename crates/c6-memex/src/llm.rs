@@ -18,6 +18,12 @@ use crate::Memex;
 /// qwen3 does by default), and its thinking counts toward the output
 /// limit. qwen3.6:35b thought 700 to 3,900 tokens on the memex's prompts.
 pub const THINKING_ROOM: u32 = 8_192;
+/// A model call's limits: 10 minutes in all (connecting, waiting for the
+/// first token, and the whole answer), and 2 minutes' pause between events
+/// once it streams. Slow servers fit: a CPU server loading a model takes
+/// about 80 s to its first token, a long reading call on one about 60 s, and
+/// qwen3.6:35b on a laptop 2 to 6 minutes. Past either, it failed for now.
+pub const CALL_LIMITS: c6_llm::limit::Limits = c6_llm::limit::Limits { total: Duration::from_secs(600), idle: Duration::from_secs(120) };
 /// How long a connection rests after its first failure for now, and at most.
 const REST_FIRST: Duration = Duration::from_secs(10);
 const REST_MAX: Duration = Duration::from_secs(300);
@@ -56,11 +62,13 @@ pub async fn ask(
         realm: m.realm.clone(),
         via: String::new(),
     };
+    let limits = *m.call_limits.lock().unwrap();
     let client: Box<dyn c6_llm::ModelClient> = match m.link.pool(&task.connection_id).await {
-        Some(pool) => Box::new(c6_llm::pool::PoolClient::new(pool, &m.realm, origin)),
+        Some(pool) => Box::new(c6_llm::pool::PoolClient::new(pool, &m.realm, origin).with_limits(limits)),
         None => {
             let grant = m.link.credential(&task.connection_id).await?;
-            c6_llm::activity::track(c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?, origin)
+            let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
+            c6_llm::activity::track(c6_llm::limit::limited(client, limits), origin)
         }
     };
     let effort = task.effort.clone().filter(|e| !e.is_empty());
@@ -74,7 +82,16 @@ pub async fn ask(
         effort,
         web_search: false,
     };
-    let text = match answer(client.as_ref(), &req).await {
+    let answered = tokio::select! {
+        r = answer(client.as_ref(), &req) => r,
+        // Its setting changed (Settings → Memex): the work goes to the new
+        // model at once, nothing rests.
+        () = superseded(m, task) => {
+            let why = format!("{} on this connection is no longer the memex's model", task.model);
+            return Err(c6_llm::LlmError::Unavailable(why).into());
+        }
+    };
+    let text = match answered {
         Ok(t) => {
             m.rests.lock().unwrap().remove(&task.connection_id);
             t
@@ -98,6 +115,20 @@ async fn answer(client: &dyn c6_llm::ModelClient, req: &ModelRequest) -> anyhow:
     }
     let msg = acc.finish(true);
     Ok(msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect())
+}
+
+/// Resolves once `task` is none of the memex's models any more.
+async fn superseded(m: &Memex, task: &Task) {
+    loop {
+        let changed = m.wake.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let t = m.tasks();
+        if ![t.understanding, t.vision, t.transcription].iter().flatten().any(|x| x == task) {
+            return;
+        }
+        changed.await;
+    }
 }
 
 /// The output limit for an answer of up to `answer` tokens: with room to

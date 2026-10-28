@@ -643,3 +643,74 @@ async fn sorting_waits_out_a_model_that_fails_for_now() {
     assert_eq!(asked[5]["max_tokens"], 400 + c6_memex::llm::THINKING_ROOM, "room to think at effort low");
     head.shutdown().await.unwrap();
 }
+
+/// A model that stops answering mid-stream holds no lane: past the pause a
+/// call may take, the call failed for now and is asked again. And while a
+/// call hangs, choosing another model takes over at once.
+#[tokio::test]
+async fn a_stalled_answer_lets_go() {
+    let (a, b, c) = (MockLlm::start().await, MockLlm::start().await, MockLlm::start().await);
+    let answer = |from: &str| Reply::Text(json!({"category": "fyi", "reason": from, "summary": "s", "topics": []}).to_string());
+    // a stalls in the middle of its first answer; then answers. c only stalls.
+    let _stalled = a.push_gated(answer("a"));
+    let _hung = c.push_gated(answer("c"));
+    for _ in 0..20 {
+        a.push(answer("a"));
+        b.push(answer("b"));
+    }
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    for (name, mock) in [("a", &a), ("b", &b), ("c", &c)] {
+        let r = http.post(format!("{api}/connections")).json(&json!({"name": name, "base_url": mock.base_url()})).send().await.unwrap();
+        assert!(r.status().is_success());
+    }
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    let understand_with = async |connection: &str| {
+        let body = json!({"understanding": {"connection": connection, "model": "reader-1"}, "calls_per_day": 100});
+        assert!(http.put(format!("{api}/settings/memex")).json(&body).send().await.unwrap().status().is_success());
+    };
+    let sorted = async |thread: &str| -> Option<Triage> {
+        let v: Value = http
+            .post(format!("{api}/memex/rpc"))
+            .json(&json!({"method": "memex.triage.list", "params": {"limit": 100}}))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        serde_json::from_value::<Vec<Triage>>(v).ok()?.into_iter().find(|t| t.target == format!("thread:acct:{thread}"))
+    };
+
+    // A pause of a second is a stall here.
+    let limits =
+        |idle: u64| c6_llm::limit::Limits { total: std::time::Duration::from_secs(3600), idle: std::time::Duration::from_secs(idle) };
+    m.set_call_limits(limits(1));
+    mail(&m, "p1", "p1", ("pat@northwind.com", "Pat"), "me@mine.io", "Pilot", "A pilot for 40 seats?", None, &["INBOX"], HOUR).await;
+    understand_with("a").await;
+    let s = eventually("sorted once a answers", async || sorted("p1").await).await;
+    assert_eq!((s.by.as_str(), s.reason.as_str()), ("model", "a"), "never the stall: {s:?}");
+    let calls = c6_llm::activity::calls();
+    assert!(calls.iter().any(|c| c.state == "failed" && c.error.contains("stalled")), "the stalled call is shown");
+
+    // c hangs (no stall is short enough to notice now); you choose b instead.
+    m.set_call_limits(limits(3600));
+    mail(&m, "p2", "p2", ("kim@tailspin.com", "Kim"), "me@mine.io", "Lunch", "Lunch next week?", None, &["INBOX"], HOUR).await;
+    understand_with("c").await;
+    eventually("a call hanging on c", async || (c.requests().len() == 1).then_some(())).await;
+    understand_with("b").await;
+    let s = eventually("sorted by b", async || sorted("p2").await.filter(|s| s.reason == "b")).await;
+    assert_eq!(s.by, "model");
+    head.shutdown().await.unwrap();
+}

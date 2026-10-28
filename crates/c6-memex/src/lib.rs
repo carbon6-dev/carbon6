@@ -103,6 +103,8 @@ pub struct Memex {
     claims: Mutex<std::collections::HashSet<String>>,
     /// Connections resting after failing for now, by id (llm.rs).
     pub(crate) rests: Mutex<HashMap<String, llm::Rest>>,
+    /// Each model call's time limits (llm.rs).
+    pub(crate) call_limits: Mutex<c6_llm::limit::Limits>,
 }
 
 /// Work a reading step has taken (`Memex::claim`).
@@ -185,6 +187,7 @@ impl Memex {
             reread: Default::default(),
             claims: Default::default(),
             rests: Default::default(),
+            call_limits: Mutex::new(llm::CALL_LIMITS),
         }))
     }
 
@@ -318,6 +321,11 @@ impl Memex {
     /// Whether another step has `what` now.
     pub(crate) fn claimed(&self, what: &str) -> bool {
         self.claims.lock().unwrap().contains(what)
+    }
+
+    /// Model calls' time limits, instead of `llm::CALL_LIMITS` (tests).
+    pub fn set_call_limits(&self, l: c6_llm::limit::Limits) {
+        *self.call_limits.lock().unwrap() = l;
     }
 
     pub fn tasks(&self) -> Tasks {

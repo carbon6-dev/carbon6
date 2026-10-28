@@ -381,11 +381,17 @@ pub struct PoolClient {
     pool: Arc<Pool>,
     realm: String,
     origin: crate::activity::Origin,
+    limits: Option<crate::limit::Limits>,
 }
 
 impl PoolClient {
     pub fn new(pool: Arc<Pool>, realm: &str, origin: crate::activity::Origin) -> Self {
-        Self { pool, realm: realm.to_owned(), origin }
+        Self { pool, realm: realm.to_owned(), origin, limits: None }
+    }
+
+    /// Each member's call held to `limits`: one that stalls rests.
+    pub fn with_limits(self, limits: crate::limit::Limits) -> Self {
+        Self { limits: Some(limits), ..self }
     }
 }
 
@@ -403,7 +409,11 @@ impl ModelClient for PoolClient {
                 }
             };
             let origin = crate::activity::Origin { connection: slot.member.clone(), via: self.pool.id.clone(), ..self.origin.clone() };
-            let client = crate::activity::track(crate::client_once(&e.kind, &e.base_url, &e.bearer, e.headers)?, origin);
+            let mut client = crate::client_once(&e.kind, &e.base_url, &e.bearer, e.headers)?;
+            if let Some(l) = self.limits {
+                client = crate::limit::limited(client, l);
+            }
+            let client = crate::activity::track(client, origin);
             match client.stream(req).await {
                 Ok(stream) => {
                     info!(pool = %self.pool.id, member = %slot.member, model = %req.model, "a pool member took a call");
