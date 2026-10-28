@@ -506,11 +506,16 @@ pub async fn interrupt(id: String) -> Result<(), String> {
 }
 
 pub async fn archive(id: String) -> Result<(), String> {
+    set_archived(id, true).await
+}
+
+/// Archives a session, or brings it back.
+pub async fn set_archived(id: String, archived: bool) -> Result<(), String> {
     #[derive(Serialize)]
     struct Body {
         archived: bool,
     }
-    empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { archived: true }).map_err(|e| e.to_string())?.send().await).await
+    empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { archived }).map_err(|e| e.to_string())?.send().await).await
 }
 
 pub async fn dismiss_rejected(id: String) -> Result<(), String> {

@@ -245,6 +245,71 @@ impl Feed {
 
 /// A session in a workspace column. `target`: a place to reveal once it
 /// loads (from search).
+/// The header, once it has scrolled away: one line with the title, the
+/// status, and the header's actions in a "⋯" menu, fit for a phone.
+/// Tapping it brings the whole header back (to the top), as scrolling back
+/// up does.
+#[component]
+fn CompactHeader(
+    detail: LocalResource<Result<c6_api::SessionDetail, String>>,
+    status: Memo<SessionStatus>,
+    tab: RwSignal<&'static str>,
+    details: RwSignal<bool>,
+    find_open: RwSignal<bool>,
+    scroller: NodeRef<leptos::html::Div>,
+    col: Option<crate::workspace::ColumnCtx>,
+) -> impl IntoView {
+    let session = move || detail.get().and_then(Result::ok).map(|d| d.session);
+    let to_top = move || {
+        if let Some(el) = scroller.get_untracked() {
+            el.set_scroll_top(0);
+        }
+    };
+    let s = session();
+    let ssh = s.as_ref().is_some_and(|s| s.ssh.is_some());
+    let id = StoredValue::new(s.map(|s| s.id).unwrap_or_default());
+    let go = move |t: &'static str| {
+        Callback::new(move |()| {
+            tab.set(t);
+            to_top();
+        })
+    };
+    let mut items = vec![("Transcript", go("transcript"))];
+    if !ssh {
+        items.extend([("Changes", go("changes")), ("Files", go("files"))]);
+    }
+    items.extend([("Terminal", go("terminal")), ("Config", go("config"))]);
+    items.push(("Details", Callback::new(move |()| details.update(|d| *d = !*d))));
+    items.push((
+        "Find",
+        Callback::new(move |()| {
+            tab.set("transcript");
+            find_open.set(true);
+        }),
+    ));
+    items.push((
+        "Archive",
+        Callback::new(move |()| {
+            spawn_local(async move {
+                if api::archive(id.get_value()).await.is_ok()
+                    && let Some(c) = col
+                {
+                    c.close();
+                }
+            });
+        }),
+    ));
+    view! {
+        <div class="safe-x absolute inset-x-0 top-0 z-20 flex min-h-11 items-center gap-2 border-b border-zinc-200 bg-white/95 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95">
+            <button class="flex min-h-11 min-w-0 flex-1 items-center text-left" title="Show the whole header" on:click=move |_| to_top()>
+                <span class="truncate text-sm font-semibold">{move || session().map(|s| s.title).unwrap_or_default()}</span>
+            </button>
+            {move || view! { <StatusPill status=status.get() /> }}
+            <crate::util::Menu items label="Session actions" />
+        </div>
+    }
+}
+
 #[component]
 pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let live = api::live();
@@ -307,8 +372,17 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             None => reveal_when_rendered(root, anchor, terms, 0),
         }
     }
+    // The header, and whether it has scrolled away (a compact bar stands in).
+    let header = NodeRef::<leptos::html::Div>::new();
+    let collapsed = RwSignal::new(false);
     let on_scroll = Callback::new(move |()| {
         if let Some(el) = scroller.get_untracked() {
+            if let Some(h) = header.get_untracked() {
+                let gone = h.get_bounding_client_rect().bottom() <= el.get_bounding_client_rect().top();
+                if gone != collapsed.get_untracked() {
+                    collapsed.set(gone);
+                }
+            }
             stick.set(el.scroll_height() - el.scroll_top() - el.client_height() < 120);
         }
     });
@@ -368,6 +442,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     running=Signal::derive(running) tab open=details />
             }
         })}
+        {move || collapsed.get().then(|| view! { <CompactHeader detail status tab details find_open scroller col /> })}
         <ScrollBox node_ref=scroller on_scroll>
         <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
@@ -378,7 +453,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let worker_id = s.worker_id;
                         let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
                         view! {
-                            <div class="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
+                            <div node_ref=header class="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
                                 <div class="min-w-0">
                                     <h1 class="truncate text-lg font-semibold">{s.title.clone()}</h1>
                                     <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
