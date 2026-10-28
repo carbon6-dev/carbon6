@@ -146,7 +146,7 @@ They fail only when what they check is broken (docs/testing.md):
 - **Sign-in:** the provider primitive gained `scope_param`, `scope_separator`, `token_path`, `name_field`, and `account_field`/`name_field` as paths into the token's answer when there's no userinfo address. Tokens with no expiry and no refresh token are kept and never renewed. Slack's sign-in comes back to the head's `/auth/oauth/callback`, then to the realm's Settings → Slack.
 - **The client:** Settings → Slack writes the realm's own `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET`; root's apply where a realm has none.
 - **Pace:** each run spends at most 40 requests per workspace.
-  - Conversations with a message in the last week are checked every run; the rest every 15 minutes, in turn.
+  - Conversations with a message in the last day, or threads waiting, are checked every run. The rest are checked in turn, the one checked longest ago first, at most every 5 minutes, leaving a quarter of the budget for the re-read. (Until 1.3.1 the rest went by their last message, so the same few took every turn and a new message in any other quiet conversation never arrived.)
   - The last week of active ones is read again every hour.
   - The import uses what's left, a page at a time (DMs and groups first), and asks to run again at once while it lasts.
   - A thread's replies are read when it's new, and when its latest reply moves, every page of them. Threads the budget doesn't reach wait in the conversation's `pending` and are read first next time, and runs go on at once while any wait.

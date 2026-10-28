@@ -15,8 +15,9 @@ use crate::{Account, Limited, MAX_FILE, Run, now_ms, slack_error};
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
-/// An idle conversation is looked at this often; an active one every run.
-const IDLE_EVERY: i64 = 15 * 60_000;
+/// A conversation with nothing in the last day is due again this long
+/// after it was last looked at; one with something is due every run.
+const IDLE_EVERY: i64 = 5 * 60_000;
 /// Documents the memex reads (the rest keep their name and link).
 const READABLE: [&str; 6] = [
     "application/pdf",
@@ -406,28 +407,28 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
 
     let now = now_ms();
     let chan = |r: &Run, c: &Conversation| r.record(&format!("chan:{}:{}", a.team, c.id));
-    // 1. Keeping up: active conversations every run, the rest in turn.
+    // 1. Keeping up: the conversations of the last day every run, the rest
+    // in turn, the one looked at longest ago first.
     let mut live: Vec<Conversation> = convs.iter().filter(|c| chan(r, c)["latest_ts"].is_string()).cloned().collect();
     // While an import is under way, keeping up takes half the budget at
-    // most (the longest unchecked first), so the import moves on.
+    // most, so the import moves on; otherwise the rest in turn leave a
+    // quarter for the re-read.
     let importing = convs.iter().any(|c| chan(r, c)["import_done"] != true);
     let keep = if importing { r.per_workspace / 2 } else { 0 };
+    let states: Vec<Value> = live.iter().map(|c| chan(r, c)).collect();
+    for (i, hot) in turn(&states, now) {
+        let floor = if hot { keep } else { keep.max(r.per_workspace / 4) };
+        if r.budget < floor.max(2) {
+            break;
+        }
+        conversation(r, a, &mut team, &live[i], Pass::New).await?;
+    }
+    // The re-read: the most recent first, or while importing the one
+    // checked longest ago.
     if importing {
         live.sort_by_key(|c| chan(r, c)["checked_at"].as_i64().unwrap_or(0));
     } else {
         live.sort_by_key(|c| std::cmp::Reverse(chan(r, c)["last_at"].as_i64().unwrap_or(0)));
-    }
-    for c in &live {
-        let s = chan(r, c);
-        let active = s["last_at"].as_i64().unwrap_or(0) > now - WEEK;
-        let waiting = s["pending"].as_object().is_some_and(|p| !p.is_empty());
-        if !active && !waiting && s["checked_at"].as_i64().unwrap_or(0) > now - IDLE_EVERY {
-            continue;
-        }
-        if r.budget < keep.max(2) {
-            break;
-        }
-        conversation(r, a, &mut team, c, Pass::New).await?;
     }
     // 2. The last week again, for edits, deletions, reactions and replies.
     for c in &live {
@@ -459,6 +460,25 @@ async fn workspace(r: &mut Run, a: &Account) -> anyhow::Result<()> {
     }
     r.save(&tkey, team);
     Ok(())
+}
+
+/// The conversations keeping up looks at this run (by their sync
+/// records), in order, and whether each is hot: those with a message in
+/// the last day, or threads waiting, every run; the rest once they were
+/// looked at `IDLE_EVERY` ago. Each group the one looked at longest ago
+/// first, so a budget too small for all of them reaches every one in turn.
+fn turn(states: &[Value], now: i64) -> Vec<(usize, bool)> {
+    let mut due: Vec<(bool, i64, usize)> = states
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let checked = s["checked_at"].as_i64().unwrap_or(0);
+            let hot = s["last_at"].as_i64().unwrap_or(0) > now - DAY || s["pending"].as_object().is_some_and(|p| !p.is_empty());
+            (hot || checked <= now - IDLE_EVERY).then_some((!hot, checked, i))
+        })
+        .collect();
+    due.sort();
+    due.into_iter().map(|(cold, _, i)| (i, !cold)).collect()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -908,5 +928,38 @@ mod tests {
         assert_eq!(person_key("T1", "U1", &u), "person:ana@acme.com");
         assert_eq!(person_key("T1", "U2", &u), "slack-user:T1/U2");
         assert_eq!(ts_ms("1700000000.123456"), 1_700_000_000_123);
+    }
+
+    /// Keeping up with more conversations than a run can look at: the
+    /// recently active ones every run, and every quiet one in turn, however
+    /// long it has been quiet. (Ordering the quiet ones by their last
+    /// message had the same few take every turn, so a new message in any
+    /// other never arrived.)
+    #[test]
+    fn keeping_up_reaches_every_conversation_in_turn() {
+        let mut now = 1_800_000_000_000;
+        // 5 active today; 200 quiet for a month to a year, all just
+        // imported.
+        let mut states: Vec<Value> = (0..205)
+            .map(|i| {
+                let last = if i < 5 { now - 60_000 } else { now - 30 * DAY - i * DAY };
+                json!({"last_at": last, "checked_at": now, "pending": {}})
+            })
+            .collect();
+        // A run every two minutes, looking at 25 conversations.
+        let mut seen = vec![0; states.len()];
+        for _ in 0..30 {
+            now += 2 * 60_000;
+            let looked: Vec<(usize, bool)> = turn(&states, now).into_iter().take(25).collect();
+            assert!((0..5).all(|i| looked.contains(&(i, true))), "the active ones every run: {looked:?}");
+            for (i, _) in looked {
+                states[i]["checked_at"] = json!(now);
+                seen[i] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n >= 2), "every quiet one, more than once in an hour: {seen:?}");
+        // Threads waiting count as active.
+        states[100]["pending"] = json!({"1.0": "x"});
+        assert_eq!(turn(&states, now)[..6].iter().filter(|(_, hot)| *hot).count(), 6);
     }
 }
