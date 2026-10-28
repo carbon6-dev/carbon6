@@ -1727,16 +1727,16 @@ async fn get_google_client(
 ) -> ApiResult<Json<api::GoogleClient>> {
     let realm = realm_for(&st, &caller, &r).await?;
     let mut c = crate::google::get_client(&st, &realm).await?;
-    c.redirect_uri =
-        crate::google::redirect_uri(&st, headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).or(origin_of(&headers).as_deref()))
-            .await;
+    c.redirect_uri = crate::google::redirect_uri(&st, page_origin(&st, &headers).as_deref()).await;
     Ok(Json(c))
 }
 
-/// The page's origin, from Host (GET requests carry no Origin).
-fn origin_of(headers: &HeaderMap) -> Option<String> {
+/// The page's origin, from Host (GET requests carry no Origin): HTTPS when
+/// a proxy says so, or when the head serves its UI over HTTPS itself.
+fn origin_of(st: &HeadState, headers: &HeaderMap) -> Option<String> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
-    let proto = headers.get("x-forwarded-proto").and_then(|p| p.to_str().ok()).unwrap_or("http");
+    let tls = st.ui_urls.get().and_then(|u| u.first()).is_some_and(|u| u.starts_with("https://"));
+    let proto = headers.get("x-forwarded-proto").and_then(|p| p.to_str().ok()).unwrap_or(if tls { "https" } else { "http" });
     Some(format!("{proto}://{host}"))
 }
 
@@ -1766,13 +1766,17 @@ async fn google_connect(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let realm = realm_for(&st, &caller, &r).await?;
-    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
-    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, origin.as_deref()).await?})))
+    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, page_origin(&st, &headers).as_deref()).await?})))
 }
 
-/// A page's origin: what it says, else from Host.
-fn page_origin(headers: &HeaderMap) -> Option<String> {
-    headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(headers))
+/// Where a page is, for the address providers send you back to: the
+/// head's public address (`ui_public_url`, a proxy's) when set, else what
+/// the page says, else from Host.
+fn page_origin(st: &HeadState, headers: &HeaderMap) -> Option<String> {
+    st.public_ui
+        .clone()
+        .or_else(|| headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned))
+        .or_else(|| origin_of(st, headers))
 }
 
 /// Slack (docs/slack.md): a realm's setup, client, app, workspaces.
@@ -1783,7 +1787,7 @@ async fn slack_setup(
     headers: HeaderMap,
 ) -> ApiResult<Json<api::SlackSetup>> {
     let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::slack::setup(&st, &realm, page_origin(&headers).as_deref()).await?))
+    Ok(Json(crate::slack::setup(&st, &realm, page_origin(&st, &headers).as_deref()).await?))
 }
 
 async fn slack_client(
@@ -1813,7 +1817,7 @@ async fn slack_connect(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(serde_json::json!({"authorize_url": crate::slack::connect(&st, &realm, page_origin(&headers).as_deref()).await?})))
+    Ok(Json(serde_json::json!({"authorize_url": crate::slack::connect(&st, &realm, page_origin(&st, &headers).as_deref()).await?})))
 }
 
 async fn slack_sync(
@@ -3308,8 +3312,9 @@ async fn connect_account(
     if caller.realm.is_some() {
         return Err(crate::forbidden("connecting accounts is yours").into());
     }
-    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
-    Ok(Json(serde_json::json!({"authorize_url": crate::providers::connect(&st, &realm, &instance, &provider, origin.as_deref()).await?})))
+    Ok(Json(
+        serde_json::json!({"authorize_url": crate::providers::connect(&st, &realm, &instance, &provider, page_origin(&st, &headers).as_deref()).await?}),
+    ))
 }
 
 async fn remove_account(

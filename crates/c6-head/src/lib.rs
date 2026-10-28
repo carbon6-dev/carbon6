@@ -129,6 +129,9 @@ pub struct HeadState {
     pub worker_url: String,
     /// Where the web UI and API are reached (set once listening).
     pub ui_urls: std::sync::OnceLock<Vec<String>>,
+    /// `ui_public_url`, when a proxy is in front of the head: where
+    /// providers send you back to after signing in.
+    pub public_ui: Option<String>,
     /// Notifications to your channels.
     pub notifier: notify::Notifier,
     /// Workflow runs to drive.
@@ -237,6 +240,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         ui_port: ui_addrs[0].port(),
         worker_url,
         ui_urls: Default::default(),
+        public_ui: public_ui.as_ref().map(|p| p.url.clone()),
         notifier: Default::default(),
         workflows: Default::default(),
         memex_feed: Default::default(),

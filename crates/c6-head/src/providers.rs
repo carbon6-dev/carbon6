@@ -65,7 +65,7 @@ async fn client(st: &HeadState, realm: &str, p: &api::OAuthProvider) -> anyhow::
 }
 
 /// Where providers send you back: the head's address (Settings →
-/// Notifications), else the page's.
+/// Notifications), else its public one (`ui_public_url`), else the page's.
 pub async fn redirect_uri(st: &HeadState, origin: Option<&str>) -> String {
     let base = st.store.setting(crate::notify::PUBLIC_URL).await.ok().flatten().filter(|u| !u.trim().is_empty());
     format!("{}/auth/oauth/callback", base.as_deref().or(origin).unwrap_or("http://localhost:7700").trim_end_matches('/'))
