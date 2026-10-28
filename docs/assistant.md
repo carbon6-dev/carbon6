@@ -71,7 +71,7 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
 
 - **Destructive operations ask first.** `c6_call` on a `destructive` op raises the existing `Approval` event: the op, the input, and a one-line consequence ("revokes worker build-1; its sessions stop"). The call waits on the existing approval endpoint, with the same inbox, notifications and signed approval links. This check lives in the head (the head runs this loop), so it doesn't depend on the worker's policy engine. Your own policies (tool `c6_call`, input regex on the op) still apply on top: `ask` or `deny` for anything else.
 - **Secrets:** see `c6_call`. API tokens, enrollment tokens and login links reach you only. The transcript keeps a redacted copy.
-- **Scope:** by default the assistant's memex scope is the default one, so no mail or photos. A scope rule can widen it; its labels are `assistant`. Mail can't instruct it unless you let mail in. Even then, destructive operations still ask first.
+- **Scope:** by default the assistant's memex scope is the default one, so no mail, chat, calendars or photos. It holds for everything the assistant reads of the memex: its memex tools and the operations it calls (mail, chat, calendar and contacts operations, searches, commitments, the summaries the memex writes for it), however they reach the memex; an operation's own `scope` can only narrow it. A scope rule can widen it; its labels are `assistant`. Mail can't instruct it unless you let mail in. Even then, destructive operations still ask first.
 - **Identity:** it acts as you, with your permissions, and every call is logged as a tool call in its session.
 
 ## 7. Build order

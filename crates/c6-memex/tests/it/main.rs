@@ -1,6 +1,7 @@
 //! The memex's integration tests, in one binary. Tests that set
 //! environment variables (google, media) stay binaries of their own.
 
+mod assistant;
 mod chat;
 mod claims;
 mod docs;

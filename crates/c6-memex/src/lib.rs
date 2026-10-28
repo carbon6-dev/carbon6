@@ -937,7 +937,7 @@ impl Memex {
             // Where the memex's own Google sync was, for moving it to apps.
             "memex.legacy_sync" => Ok(json!(people::legacy_states(&self.store).await?)),
             "memex.move_google" => people::move_to_apps(self, &params["accounts"]).await.map(|n| json!({"moved": n})),
-            "memex.commitments" => Ok(json!(understand::commitments(self, params["status"].as_str().unwrap_or("open")).await?)),
+            "memex.commitments" => Ok(json!(understand::commitments(self, params["status"].as_str().unwrap_or("open"), &allowed).await?)),
             "memex.commitment" => {
                 understand::set_commitment(self, params["id"].as_i64().unwrap_or(0), params["status"].as_str().unwrap_or("")).await?;
                 Ok(json!({}))
@@ -973,7 +973,9 @@ impl Memex {
                 *self.face_index.lock().unwrap() = None;
                 Ok(json!({}))
             }
-            "memex.summarize" => Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default()).await?})),
+            "memex.summarize" => {
+                Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default(), &allowed).await?}))
+            }
             "memex.graph" => {
                 let limit = params["limit"].as_u64().unwrap_or(40).min(150) as u32;
                 let policies: Vec<api::ClaimPolicy> = serde_json::from_value(params["policies"].clone()).unwrap_or_default();

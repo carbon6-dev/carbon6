@@ -613,6 +613,8 @@ impl Tool for Call {
             name: "c6_call".into(),
             description: "Runs a carbon6 operation, as the user. `input` follows the operation's schema (c6_describe). Destructive \
                           operations (deleting, revoking, sending, replacing a list with fewer entries) wait for the user's approval. \
+                          Knowledge (mail, chat, calendars, contacts, photos) is within this conversation's memex scope, as for \
+                          memex_search. \
                           Secrets an operation returns (tokens, codes) are shown to the user directly; you get a note that they were \
                           shown, never the value."
                 .into(),
@@ -635,11 +637,14 @@ impl Tool for Call {
         self.env.unseal(&mut args);
         // Should you be asked first?
         let st = &self.env.st;
+        // What it reads of the memex (mail, chat, calendars, contacts…) is
+        // this conversation's scope, as for its memex tools.
+        let scope = crate::memex::scope_for(st, &self.env.labels).await;
         let mut ask: Option<(String, String)> = None;
         if op.effect == Effect::Destructive {
             ask = Some(("assistant: destructive operations".into(), format!("{}: {}", op.name, op.summary)));
         } else if op.replaces.is_some() {
-            match removed_entries(st, op, &args, &self.env.realm).await {
+            match crate::memex::SCOPE.scope(scope.clone(), removed_entries(st, op, &args, &self.env.realm)).await {
                 Ok(gone) if !gone.is_empty() => {
                     ask = Some(("assistant: removes entries".into(), format!("{} removes {}", op.name, gone.join(", "))));
                 }
@@ -686,7 +691,7 @@ impl Tool for Call {
                 return ToolOutput::err(format!("the user did not approve {name} ({state}); do not try another way to do it"));
             }
         }
-        let result = execute(st, op, args, "assistant", Some(&self.env.realm)).await;
+        let result = crate::memex::SCOPE.scope(scope, execute(st, op, args, "assistant", Some(&self.env.realm))).await;
         match result {
             Ok(mut v) => {
                 // Secrets go to the user, not the model.

@@ -406,7 +406,10 @@ pub async fn status(m: &Memex, s: &mut api::MemexStatus) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn commitments(m: &Memex, status: &str) -> anyhow::Result<Vec<api::Commitment>> {
+/// Commitments read from what the caller may see (`allowed`: those of
+/// items gone with everything).
+pub async fn commitments(m: &Memex, status: &str, allowed: &[String]) -> anyhow::Result<Vec<api::Commitment>> {
+    let everything = api::MEMEX_KINDS.iter().all(|k| allowed.iter().any(|a| a == k));
     let rows = sqlx::query(
         "SELECT c.*, i.title AS title, i.kind AS kind, (SELECT 'thread:' || ml.account || ':' || ml.thread_id FROM mail ml WHERE ml.item_id = c.item_id) AS target \
          FROM commitments c LEFT JOIN items i ON i.id = c.item_id WHERE c.status = ? \
@@ -417,6 +420,7 @@ pub async fn commitments(m: &Memex, status: &str) -> anyhow::Result<Vec<api::Com
     .await?;
     Ok(rows
         .iter()
+        .filter(|r| r.get::<Option<String>, _>("kind").map_or(everything, |k| allowed.contains(&k)))
         .map(|r| api::Commitment {
             id: r.get("id"),
             item_id: r.get("item_id"),
@@ -438,10 +442,11 @@ pub async fn set_commitment(m: &Memex, id: i64, status: &str) -> anyhow::Result<
 
 /// What the memex knows about a thing, summed up by the model and saved as
 /// a note about it (inferred, with its sources).
-pub async fn summarize(m: &Memex, key: &str) -> anyhow::Result<String> {
+pub async fn summarize(m: &Memex, key: &str, allowed: &[String]) -> anyhow::Result<String> {
     let (task, _) = m.understanding().ok_or_else(|| anyhow::anyhow!("choose an understanding model first (Settings → Memex)"))?;
     let thing = m.store.thing(key).await?.ok_or_else(|| anyhow::anyhow!("no thing {key:?}"))?;
-    let kinds: Vec<String> = api::MEMEX_KINDS.iter().filter(|k| **k != "spam").map(|k| k.to_string()).collect();
+    // From what the caller may see.
+    let kinds: Vec<String> = allowed.iter().filter(|k| *k != "spam").cloned().collect();
     // Observed items only: not other summaries.
     let items: Vec<api::MemexHit> =
         m.store.about(Some(&thing.id), &kinds, 40).await?.into_iter().filter(|h| !h.source.starts_with("pipeline")).collect();

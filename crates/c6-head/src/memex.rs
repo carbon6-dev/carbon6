@@ -29,6 +29,13 @@ const BRIEF_TIMEOUT: Duration = Duration::from_secs(4);
 /// Session digests keep the latest turns within this many characters.
 const DIGEST_CHARS: usize = 16_000;
 
+tokio::task_local! {
+    /// The kinds a call being served may see (the assistant's operations,
+    /// as its conversation's scope allows): every memex call made for it
+    /// sees no more, however it reaches the memex.
+    pub static SCOPE: Vec<String>;
+}
+
 /// Wakes the outbox sender.
 #[derive(Default)]
 pub struct Feed {
@@ -110,12 +117,25 @@ pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result
 
 async fn call_within(st: &HeadState, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
     let m = crate::knowledge::get(st).ok_or_else(|| anyhow::anyhow!("the knowledge store is starting"))?;
-    match tokio::time::timeout(timeout, m.handle_method(method, params)).await {
+    match tokio::time::timeout(timeout, m.handle_method(method, scoped(params))).await {
         Ok(Ok(v)) => Ok(v),
         // What it refuses is about the request.
         Ok(Err(e)) => Err(bad_request(format!("memex: {e:#}"))),
         Err(_) => Err(anyhow::anyhow!("memex: {method} took longer than {}s", timeout.as_secs())),
     }
+}
+
+/// `params` within `SCOPE`, when a call is served for one: the kinds both
+/// it and the call's own scope (if any) allow.
+fn scoped(params: Value) -> Value {
+    let Ok(scope) = SCOPE.try_with(Clone::clone) else { return params };
+    let mut params = if params.is_object() { params } else { json!({}) };
+    let kinds: Vec<String> = match params["scope"].as_array() {
+        Some(own) => own.iter().filter_map(Value::as_str).filter(|k| scope.iter().any(|s| s == k)).map(str::to_owned).collect(),
+        None => scope,
+    };
+    params["scope"] = json!(kinds);
+    params
 }
 
 /// Whether the knowledge store is open.
