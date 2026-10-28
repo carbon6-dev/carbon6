@@ -39,18 +39,119 @@ pub fn DecisionLink(class: &'static str) -> impl IntoView {
     }
 }
 
+/// How long a change in the live feed waits before the list loads again.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether you're typing (a field has the focus): a reload waits.
+fn typing() -> bool {
+    document()
+        .active_element()
+        .is_some_and(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.has_attribute("contenteditable"))
+}
+
+/// Loads a list again (`tick`) once sessions change, which may mean its
+/// decisions did (the live feed says only that sessions did): at most once
+/// every 10 seconds, and not while you type.
+fn reload_quietly(tick: RwSignal<u32>) {
+    let live = api::live();
+    let due = StoredValue::new(false);
+    Effect::new(move |seen: Option<()>| {
+        live.sessions.track();
+        if seen.is_some() {
+            later(due, tick);
+        }
+    });
+}
+
+fn later(due: StoredValue<bool>, tick: RwSignal<u32>) {
+    if due.get_value() {
+        return;
+    }
+    due.set_value(true);
+    set_timeout(
+        move || {
+            due.set_value(false);
+            if typing() { later(due, tick) } else { tick.update(|t| *t += 1) }
+        },
+        QUIET,
+    );
+}
+
+/// Decisions as they're shown: kept while the next load comes (so nothing
+/// blanks and the page doesn't jump), each card by its id and version, so
+/// an unchanged card keeps what you typed in it.
+#[component]
+fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<()>, #[prop(optional)] in_session: bool) -> impl IntoView {
+    let shown = RwSignal::new(None::<Result<Vec<Decision>, String>>);
+    Effect::new(move || {
+        if let Some(r) = list.get() {
+            shown.set(Some(r));
+        }
+    });
+    // In order, each group's decisions together under its name.
+    let groups = Memo::new(move |_| {
+        let mut groups: Vec<(String, Vec<Decision>)> = Vec::new();
+        for d in shown.get().and_then(Result::ok).unwrap_or_default() {
+            match groups.iter_mut().find(|(g, _)| *g == d.group) {
+                Some((_, ds)) => ds.push(d),
+                None => groups.push((d.group.clone(), vec![d])),
+            }
+        }
+        groups
+    });
+    // Which of loading, an error, none, or some: what changes the frame.
+    let state = Memo::new(move |_| match shown.get() {
+        None => 0,
+        Some(Err(_)) => 1,
+        Some(Ok(v)) if v.is_empty() => 2,
+        Some(Ok(_)) => 3,
+    });
+    // Within a session: only what waits, under its heading.
+    move || {
+        match state.get() {
+            1 if !in_session => view! { <ErrorBox message=shown.get_untracked().and_then(Result::err).unwrap_or_default() /> }.into_any(),
+            2 if !in_session => view! { <p class="text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
+            3 => view! {
+                <div class=if in_session { "space-y-2" } else { "space-y-4" }>
+                {in_session.then(|| view! { <p class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Waiting for you"</p> })}
+                <For each=move || groups.get() key=|(g, _)| g.clone() let:group>
+                    <div class="space-y-2">
+                        {(!group.0.is_empty()).then(|| {
+                            let g = group.0.clone();
+                            let n = move || groups.with(|gs| gs.iter().find(|(x, _)| *x == g).map_or(0, |(_, ds)| ds.len()));
+                            let name = group.0.clone();
+                            view! { <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">{move || format!("{name} ({})", n())}</h2> }
+                        })}
+                        {
+                            let g = group.0.clone();
+                            view! {
+                                <For each=move || groups.with(|gs| gs.iter().find(|(x, _)| *x == g).map(|(_, ds)| ds.clone()).unwrap_or_default())
+                                    key=|d| (d.id, d.updated_at) let:d>
+                                    <DecisionCard d refresh in_session />
+                                </For>
+                            }
+                        }
+                    </div>
+                </For>
+                </div>
+            }
+            .into_any(),
+            _ => ().into_any(),
+        }
+    }
+}
+
 #[component]
 pub fn DecisionsPage() -> impl IntoView {
-    let live = api::live();
     let state = RwSignal::new("open".to_owned());
     let tick = RwSignal::new(0u32);
     let list = LocalResource::new(move || {
         tick.track();
-        live.sessions.track();
         let s = state.get();
         let realm = api::realm().get();
         async move { api::decisions(s).await.map(|ds| ds.into_iter().filter(|d| realm.is_empty() || d.realm == realm).collect::<Vec<_>>()) }
     });
+    reload_quietly(tick);
     let refresh = Callback::new(move |()| tick.update(|t| *t += 1));
     view! {
         <main class="mx-auto max-w-3xl space-y-4 px-4 py-6">
@@ -66,39 +167,26 @@ pub fn DecisionsPage() -> impl IntoView {
                     <option value="withdrawn">"Withdrawn"</option>
                 </select>
             </div>
-            <Suspense fallback=|| ()>
-                {move || list.get().map(|r| match r {
-                    Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
-                    Ok(v) => {
-                        // Grouped: each group's decisions together, under its name.
-                        let mut groups: Vec<(String, Vec<Decision>)> = Vec::new();
-                        for d in v {
-                            match groups.iter_mut().find(|(g, _)| *g == d.group) {
-                                Some((_, ds)) => ds.push(d),
-                                None => groups.push((d.group.clone(), vec![d])),
-                            }
-                        }
-                        groups.into_iter().map(|(g, ds)| view! {
-                            <div class="space-y-2">
-                                {(!g.is_empty()).then(|| view! { <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("{g} ({})", ds.len())}</h2> })}
-                                {ds.into_iter().map(|d| view! { <DecisionCard d refresh /> }).collect_view()}
-                            </div>
-                        }).collect_view().into_any()
-                    }
-                })}
-            </Suspense>
+            <Cards list refresh />
         </main>
     }
 }
 
 /// A session's open decisions, answered where you are (Decisions lists
-/// them too). Reloads as sessions change, and every 30 seconds.
+/// them too). Reloads as sessions change (at most every 10 seconds), and
+/// every 30 seconds, not while you type.
 #[component]
 pub fn SessionDecisions(session: String) -> impl IntoView {
-    let live = api::live();
     let tick = RwSignal::new(0u32);
-    let handle = set_interval_with_handle(move || tick.update(|t| *t += 1), std::time::Duration::from_secs(30)).ok();
+    let handle = set_interval_with_handle(
+        move || {
+            if !typing() {
+                tick.update(|t| *t += 1)
+            }
+        },
+        std::time::Duration::from_secs(30),
+    )
+    .ok();
     on_cleanup(move || {
         if let Some(h) = handle {
             h.clear();
@@ -107,18 +195,11 @@ pub fn SessionDecisions(session: String) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = LocalResource::new(move || {
         tick.track();
-        live.sessions.track();
         api::session_decisions(session.get_value())
     });
+    reload_quietly(tick);
     let refresh = Callback::new(move |()| tick.update(|t| *t += 1));
-    view! {
-        {move || list.get().and_then(Result::ok).filter(|ds| !ds.is_empty()).map(|ds| view! {
-            <div class="space-y-2">
-                <p class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Waiting for you"</p>
-                {ds.into_iter().map(|d| view! { <DecisionCard d refresh in_session=true /> }).collect_view()}
-            </div>
-        })}
-    }
+    view! { <Cards list refresh in_session=true /> }
 }
 
 #[component]
