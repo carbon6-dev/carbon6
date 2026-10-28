@@ -17,7 +17,8 @@ pub fn SessionsPage() -> impl IntoView {
     let query = RwSignal::new(String::new());
     let status_filter = RwSignal::new(String::new());
     let label_filter = crate::labels::use_filter().0;
-    let grouping = Grouping::load();
+    let grouping = use_grouping();
+    let folded = Folded::load(Folded::PAGE);
 
     view! {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-6">
@@ -72,7 +73,7 @@ pub fn SessionsPage() -> impl IntoView {
                             let msg = if wanted.is_empty() && q.is_empty() { "No sessions yet." } else { "No sessions match." };
                             view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">{msg}</p> }.into_any()
                         } else {
-                            grouped(sessions, &grouping.levels.get(), String::new(), grouping.collapsed, now)
+                            grouped(sessions, &grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now /> }.into_any(), false)
                         }
                     }}
                 </div>
@@ -81,18 +82,16 @@ pub fn SessionsPage() -> impl IntoView {
     }
 }
 
-/// How the list is grouped: label keys, outermost first, kept in the head
-/// (`session_grouping`), and the groups you folded (in this browser).
+/// How sessions are grouped: label keys, outermost first, kept in the head
+/// (`session_grouping`) and shared by the sessions list and the rail.
 #[derive(Clone, Copy)]
-struct Grouping {
+pub struct Grouping {
     levels: RwSignal<Vec<String>>,
-    collapsed: RwSignal<Vec<String>>,
 }
 
 impl Grouping {
-    const FOLDED: &str = "c6.sessions.folded";
-
-    fn load() -> Self {
+    /// Loads it from the head (once, for the page: see [`use_grouping`]).
+    pub fn load() -> Self {
         let levels = RwSignal::new(Vec::new());
         spawn_local(async move {
             if let Ok(v) = api::get_setting("session_grouping").await
@@ -101,24 +100,44 @@ impl Grouping {
                 levels.set(g.levels);
             }
         });
-        let folded = storage_get(Self::FOLDED).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        Grouping { levels, collapsed: RwSignal::new(folded) }
+        Grouping { levels }
     }
 
     fn save(&self, levels: Vec<String>) -> impl std::future::Future<Output = Result<(), String>> + use<> {
         self.levels.set(levels.clone());
         api::put_setting("session_grouping", serde_json::json!({ "levels": levels }))
     }
+}
 
-    fn toggle(collapsed: RwSignal<Vec<String>>, path: &str) {
-        collapsed.update(|c| {
+pub fn use_grouping() -> Grouping {
+    expect_context::<Grouping>()
+}
+
+/// The groups you folded in one view of the list (in this browser).
+#[derive(Clone, Copy)]
+struct Folded {
+    key: &'static str,
+    paths: RwSignal<Vec<String>>,
+}
+
+impl Folded {
+    const PAGE: &str = "c6.sessions.folded";
+    const RAIL: &str = "c6.rail.folded";
+
+    fn load(key: &'static str) -> Self {
+        let folded = storage_get(key).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        Folded { key, paths: RwSignal::new(folded) }
+    }
+
+    fn toggle(&self, path: &str) {
+        self.paths.update(|c| {
             if let Some(i) = c.iter().position(|p| p == path) {
                 c.remove(i);
             } else {
                 c.push(path.to_owned());
             }
         });
-        storage_set(Self::FOLDED, &serde_json::to_string(&collapsed.get_untracked()).unwrap_or_default());
+        storage_set(self.key, &serde_json::to_string(&self.paths.get_untracked()).unwrap_or_default());
     }
 }
 
@@ -130,10 +149,10 @@ fn group_value(s: &Session, key: &str) -> Option<String> {
 }
 
 /// The sessions in nested groups, one level per key: most recently active
-/// group first, sessions without the label last.
-fn grouped(sessions: Vec<Session>, levels: &[String], path: String, collapsed: RwSignal<Vec<String>>, now: RwSignal<i64>) -> AnyView {
+/// group first, sessions without the label last. `compact`: the rail's.
+fn grouped(sessions: Vec<Session>, levels: &[String], path: String, folded: Folded, row: &dyn Fn(Session) -> AnyView, compact: bool) -> AnyView {
     let Some((key, rest)) = levels.split_first() else {
-        return sessions.into_iter().map(|s| view! { <SessionRow s now /> }).collect_view().into_any();
+        return sessions.into_iter().map(row).collect_view().into_any();
     };
     let mut groups: Vec<(Option<String>, Vec<Session>)> = Vec::new();
     for s in sessions {
@@ -154,30 +173,42 @@ fn grouped(sessions: Vec<Session>, levels: &[String], path: String, collapsed: R
                 Some(v) => view! { <span class="font-mono">{v.clone()}</span> }.into_any(),
                 None => view! { <span class="italic">{format!("no {key}")}</span> }.into_any(),
             };
-            let folded = {
+            let is_folded = {
                 let here = here.clone();
-                Memo::new(move |_| collapsed.with(|c| c.contains(&here)))
+                Memo::new(move |_| folded.paths.with(|c| c.contains(&here)))
             };
             let toggle = {
                 let here = here.clone();
-                move |_| Grouping::toggle(collapsed, &here)
+                move |_| folded.toggle(&here)
             };
             let rest = rest.to_vec();
+            // Drawn once; folding hides them.
+            let rows = grouped(list, &rest, here.clone(), folded, row, compact);
+            let (button, body) = if compact {
+                (
+                    "flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60",
+                    "ml-1.5 border-l border-zinc-200 pl-1 dark:border-zinc-800",
+                )
+            } else {
+                (
+                    "flex w-full items-center gap-2 bg-zinc-50 py-1.5 pl-3 pr-4 text-left text-xs text-zinc-600 hover:bg-zinc-100 dark:bg-zinc-900/60 dark:text-zinc-400 dark:hover:bg-zinc-900",
+                    "divide-y divide-zinc-200 border-t border-zinc-200 pl-5 dark:divide-zinc-800 dark:border-zinc-800",
+                )
+            };
             view! {
                 <div>
-                    <button class="flex w-full items-center gap-2 bg-zinc-50 py-1.5 pl-3 pr-4 text-left text-xs text-zinc-600 hover:bg-zinc-100 dark:bg-zinc-900/60 dark:text-zinc-400 dark:hover:bg-zinc-900"
-                        on:click=toggle>
-                        <span class="w-3 shrink-0 text-sm text-zinc-500">{move || if folded.get() { "▸" } else { "▾" }}</span>
-                        <span class="shrink-0 text-zinc-400">{format!("{key}:")}</span>
+                    <button class=button on:click=toggle title=format!("{key}: {}", value.clone().unwrap_or_else(|| format!("no {key}")))>
+                        <span class="w-3 shrink-0 text-sm text-zinc-500">{move || if is_folded.get() { "▸" } else { "▾" }}</span>
+                        {(!compact).then(|| view! { <span class="shrink-0 text-zinc-400">{format!("{key}:")}</span> })}
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
-                        {(running > 0).then(|| view! { <span class="shrink-0 text-blue-600 dark:text-blue-400">{format!("{running} running")}</span> })}
+                        {(running > 0).then(|| view! {
+                            <span class="shrink-0 text-blue-600 dark:text-blue-400">{if compact { format!("· {running}▶") } else { format!("{running} running") }}</span>
+                        })}
                     </button>
-                    <Show when=move || !folded.get()>
-                        <div class="divide-y divide-zinc-200 border-t border-zinc-200 pl-5 dark:divide-zinc-800 dark:border-zinc-800">
-                            {grouped(list.clone(), &rest, here.clone(), collapsed, now)}
-                        </div>
-                    </Show>
+                    <div class=body class:hidden=move || is_folded.get()>
+                        {rows}
+                    </div>
                 </div>
             }
         })
@@ -188,7 +219,7 @@ fn grouped(sessions: Vec<Session>, levels: &[String], path: String, collapsed: R
 /// "Group by": the levels (remove, or move one out a level) and a key to
 /// add, from the labels your sessions have.
 #[component]
-fn GroupBar(grouping: Grouping) -> impl IntoView {
+pub fn GroupBar(grouping: Grouping) -> impl IntoView {
     let live = api::live();
     let error = RwSignal::new(None::<String>);
     let save = move |levels: Vec<String>| {
@@ -284,6 +315,205 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
             <StatusPill status=s.status />
             <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
         </Go>
+    }
+}
+
+/// The rail's sessions: every session (in this realm, with the label
+/// filter's labels), grouped as the sessions list is, one narrow row each.
+/// Hovering a row pops out its details, with its colour and "New like
+/// this"; clicking opens it (⌘-click: a new tile).
+#[component]
+pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
+    let live = api::live();
+    let grouping = use_grouping();
+    let folded = Folded::load(Folded::RAIL);
+    let label_filter = crate::labels::use_filter().0;
+    let query = RwSignal::new(String::new());
+    let hover = Hover::new();
+    let group_at = RwSignal::new(None::<(f64, f64)>);
+    let like_this = RwSignal::new(None::<SessionSeed>);
+    let sessions = Memo::new(move |_| {
+        let (q, wanted, realm) = (query.get().to_lowercase(), label_filter.get(), api::realm().get());
+        live.sessions
+            .get()
+            .into_iter()
+            .filter(|s| crate::labels::matches(s, &wanted) && (realm.is_empty() || s.realm == realm))
+            .filter(|s| {
+                q.is_empty() || s.title.to_lowercase().contains(&q) || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
+            })
+            .collect::<Vec<_>>()
+    });
+    let small = "rounded px-1 font-normal normal-case tracking-normal hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    view! {
+        <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            <button class=crate::activity::FOLD title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
+                {move || if open.get() { "▾" } else { "▸" }}
+            </button>
+            <span class="flex-1 pl-0.5">"Sessions"
+                {move || (!open.get()).then(|| view! { <span class="ml-1.5 rounded-full bg-zinc-200 px-1.5 font-normal tabular-nums dark:bg-zinc-800">{sessions.with(Vec::len)}</span> })}
+            </span>
+            <button class=small title="Group by label keys (shared with the sessions list)"
+                on:click=move |ev| group_at.set(Some(crate::workspace::below(&ev, 288.0)))>
+                {move || match grouping.levels.get().as_slice() {
+                    [] => "group ▾".to_owned(),
+                    levels => format!("{} ▾", levels.join("›")),
+                }}
+            </button>
+            <Go to=View::Sessions class=small title="All sessions, and a new one">"＋"</Go>
+        </div>
+        <crate::workspace::Popover at=group_at class="w-72">
+            <GroupBar grouping />
+        </crate::workspace::Popover>
+        <Show when=move || open.get()>
+        <div class="px-1.5 pb-1">
+            <input class="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs dark:border-zinc-800 dark:bg-zinc-900"
+                placeholder="Filter" prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3" on:scroll=move |_| hover.hide_now()>
+            {move || {
+                let list = sessions.get();
+                if list.is_empty() {
+                    return view! { <p class="px-2 py-2 text-xs text-zinc-500">"No sessions match."</p> }.into_any();
+                }
+                grouped(list, &grouping.levels.get(), String::new(), folded, &move |s| view! { <RailRow s hover /> }.into_any(), true)
+            }}
+        </div>
+        </Show>
+        {move || hover.shown.get().and_then(|(id, x, y)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()).map(|s| view! {
+            <RailCard s x y hover like_this />
+        }))}
+        {move || like_this.get().map(|seed| view! { <NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
+    }
+}
+
+/// Which rail row's details pop out, and where; it stays while the pointer
+/// is on the row or the card, and goes a moment after it leaves both.
+#[derive(Clone, Copy)]
+struct Hover {
+    shown: RwSignal<Option<(String, f64, f64)>>,
+    generation: StoredValue<u64>,
+}
+
+impl Hover {
+    fn new() -> Self {
+        Hover { shown: RwSignal::new(None), generation: StoredValue::new(0) }
+    }
+
+    fn show(&self, id: String, row: &web_sys::Element) {
+        self.keep();
+        let r = row.get_bounding_client_rect();
+        let vh = window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+        // Beside the rail, level with the row, kept on screen.
+        let y = r.top().min(vh - 340.0).max(8.0);
+        let rail = row.closest("aside").ok().flatten().map(|a| a.get_bounding_client_rect().right()).unwrap_or(r.right());
+        self.shown.set(Some((id, rail + 6.0, y)));
+    }
+
+    /// The pointer came back: don't hide.
+    fn keep(&self) {
+        self.generation.update_value(|g| *g += 1);
+    }
+
+    fn hide_soon(&self) {
+        self.generation.update_value(|g| *g += 1);
+        let (me, this) = (self.generation.get_value(), *self);
+        set_timeout(
+            move || {
+                if this.generation.try_get_value() == Some(me) {
+                    this.shown.set(None);
+                }
+            },
+            std::time::Duration::from_millis(250),
+        );
+    }
+
+    fn hide_now(&self) {
+        self.keep();
+        if self.shown.with_untracked(Option::is_some) {
+            self.shown.set(None);
+        }
+    }
+}
+
+#[component]
+fn RailRow(s: Session, hover: Hover) -> impl IntoView {
+    let id = s.id.clone();
+    let colour = crate::colour::of(&s);
+    let state = if s.awaiting_approval {
+        "h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"
+    } else {
+        match s.status {
+            SessionStatus::Running => "h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-blue-500",
+            SessionStatus::Failed => "h-1.5 w-1.5 shrink-0 rounded-full bg-red-500",
+            _ => "hidden",
+        }
+    };
+    view! {
+        <div
+            on:mouseenter=move |ev| {
+                if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
+                    hover.show(id.clone(), &el);
+                }
+            }
+            on:mouseleave=move |_| hover.hide_soon()
+        >
+            <Go to=View::session(s.id.clone()) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-[13px] hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
+                <span class=format!("h-2.5 w-1 shrink-0 rounded-sm {}", crate::colour::solid(colour))></span>
+                <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
+                <span class=state></span>
+            </Go>
+        </div>
+    }
+}
+
+/// A rail row's details: all of its title, its state, where it runs, its
+/// labels and colour, and what you can do with it.
+#[component]
+fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option<SessionSeed>>) -> impl IntoView {
+    let ws = use_workspace();
+    let live = api::live();
+    let now = clock();
+    let worker = live.worker_name(&s.worker_id.to_string());
+    let updated = s.updated_at;
+    let (open_id, tile_id) = (s.id.clone(), s.id.clone());
+    let seed = SessionSeed::from_session(&s);
+    let place = match (&s.ssh, s.cwd.is_empty()) {
+        (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
+        (None, true) => "scratch workspace".to_owned(),
+        (None, false) => c6_api::labels::display_labels(&s.auto_labels).iter().find_map(|l| l.strip_prefix("folder:").map(str::to_owned)).unwrap_or_else(|| s.cwd.clone()),
+    };
+    let act = "rounded-md border border-zinc-200 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
+    view! {
+        <div class="fixed z-40 w-72 space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            style=format!("left:{x}px;top:{y}px")
+            on:mouseenter=move |_| hover.keep()
+            on:mouseleave=move |_| hover.hide_soon()>
+            <div class="flex items-start gap-2">
+                <div class="min-w-0 flex-1 break-words font-medium">{s.title.clone()}</div>
+                <StatusPill status=s.status />
+            </div>
+            {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
+            <div class="space-y-0.5 text-xs text-zinc-500">
+                <div class="truncate">{worker} " · " {s.model.clone()}</div>
+                <div class="break-all font-mono">{place}</div>
+                <div>{move || format!("active {}", ago(now.get() - updated))}</div>
+            </div>
+            {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
+                <div class="flex flex-wrap gap-1">
+                    {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
+                    {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
+                </div>
+            })}
+            <crate::colour::Palette session=s.id.clone() />
+            <div class="flex flex-wrap gap-1.5 pt-1">
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(open_id.clone()), How::Beside) }>"Open"</button>
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::NewTile) }>"New tile"</button>
+                {(!s.observed && s.instance.is_empty()).then(|| view! {
+                    <button class=act title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
+                        on:click=move |_| { hover.hide_now(); like_this.set(Some(seed.clone())) }>"New like this"</button>
+                })}
+            </div>
+        </div>
     }
 }
 

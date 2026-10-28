@@ -8,7 +8,7 @@ use leptos::task::spawn_local;
 
 use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, storage_get, storage_set};
-use crate::workspace::{Go, ScrollBox, Target, View, use_column};
+use crate::workspace::{ColumnCtx, Go, ScrollBox, Target, View, use_column};
 use crate::{api, markdown, sessions};
 
 /// Live-only state, replaced by durable events as they arrive.
@@ -356,6 +356,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
 
     let find_root = root.clone();
+    let meta_root = StoredValue::new(root.clone());
     let details = crate::details::remembered();
     // "New like this": a popup with the new-session form, filled in from
     // this session as it is now (its labels, its current model).
@@ -372,6 +373,37 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         seed.worktree = started.get_untracked().is_some_and(|(_, b)| !b.is_empty());
         like_this.set(Some(seed));
     };
+    let chrome = SessionChrome {
+        token: SessionChrome::next_token(),
+        id: id_stored,
+        detail,
+        status,
+        started,
+        model_label,
+        events,
+        tab,
+        details,
+        find_open,
+        like_this: Callback::new(move |()| open_like_this()),
+        root: meta_root,
+        force_open,
+        col,
+    };
+    // The tile's bar opens this session's header too (☰), wherever you
+    // are in the transcript.
+    if let Some(c) = col {
+        let ws = c.ws;
+        ws.chrome.update(|m| {
+            m.insert(c.col, chrome);
+        });
+        on_cleanup(move || {
+            if ws.chrome.with_untracked(|m| m.get(&c.col).is_some_and(|x| x.token == chrome.token)) {
+                ws.chrome.update(|m| {
+                    m.remove(&c.col);
+                });
+            }
+        });
+    }
     view! {
         <div class="relative flex min-h-0 flex-1 flex-col">
         {move || like_this.get().map(|seed| view! { <sessions::NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
@@ -394,53 +426,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let worker_id = s.worker_id;
                         let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
                         view! {
-                            <div class="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800">
-                                <div class="min-w-0">
-                                    <h1 class="truncate text-lg font-semibold">{s.title.clone()}</h1>
-                                    <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
-                                        <span class="flex items-center gap-1">
-                                            <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
-                                            {d.worker_name.clone()}
-                                        </span>
-                                        {s.ssh.clone().map(|t| view! { <span class="rounded bg-sky-100 px-1 font-mono text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Working on this machine over SSH, through the worker">{format!("⇄ {t}")}</span> })}
-                                        <span class="break-all font-mono">{move || started.get().map(|(c, _)| c).unwrap_or_else(|| s.cwd.clone())}</span>
-                                        {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
-                                            <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
-                                        })}
-                                        <span>{move || { let m = model_label.get(); if m.is_empty() { s.model.clone() } else { m } }}</span>
-                                    </div>
-                                    <crate::labels::SessionLabels session=s.id.clone() labels=s.labels.clone() auto_labels=s.auto_labels.clone() />
-                                </div>
-                                <div class="flex flex-wrap items-center gap-2">
-                                    <crate::fleet::TabButton tab label="Transcript" value="transcript" />
-                                    {s.ssh.is_none().then(|| view! {
-                                        <crate::fleet::TabButton tab label="Changes" value="changes" />
-                                        <crate::fleet::TabButton tab label="Files" value="files" />
-                                    })}
-                                    <crate::fleet::TabButton tab label="Terminal" value="terminal" />
-                                    {move || (events.with(|e| crate::outputs::count(e)) > 0).then(|| view! { <crate::fleet::TabButton tab label="Outputs" value="outputs" /> })}
-                                    <crate::fleet::TabButton tab label="Config" value="config" />
-                                    <button class=move || format!("{BUTTON_QUIET} text-xs {}", if details.get() { "text-zinc-900 dark:text-zinc-100" } else { "text-zinc-500" })
-                                        title="Where it runs, its context, usage and changes" on:click=move |_| details.update(|d| *d = !*d)>"Details"</button>
-                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
-                                        tab.set("transcript");
-                                        find_open.set(true);
-                                    }>"Find"</button>
-                                    {(!s.observed && s.instance.is_empty()).then(|| view! {
-                                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
-                                            title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
-                                            on:click=move |_| open_like_this()>"New like this"</button>
-                                    })}
-                                    <crate::tasks::RunningTasks session=id_stored.get_value() events />
-                                    <SubagentsPill session=id_stored.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.clone() />
-                                    {move || view! { <StatusPill status=status.get() /> }}
-                                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
-                                        spawn_local(async move {
-                                            if api::archive(id_stored.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
-                                        });
-                                    }>"Archive"</button>
-                                </div>
-                            </div>
+                            <SessionMeta chrome />
                             <SessionStats usage />
                             {s.error.clone().map(|e| view! { <ErrorBox message=format!("The session failed to start: {e}") /> })}
                             {move || (!online() && (status.get() == SessionStatus::Running || !queued.with(Vec::is_empty))).then(|| view! {
@@ -506,6 +492,116 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }}
             </Show>
         </div>
+    }
+}
+
+/// What a session pane offers beyond its transcript: its header (where it
+/// runs, its labels, its tabs and actions), shown at the top of the
+/// transcript and, from the tile's bar, as a popover.
+#[derive(Clone, Copy)]
+pub struct SessionChrome {
+    /// Which pane registered it (a pane's view can be replaced in place).
+    token: u64,
+    id: StoredValue<String>,
+    detail: LocalResource<Result<c6_api::SessionDetail, String>>,
+    status: Memo<SessionStatus>,
+    started: Memo<Option<(String, String)>>,
+    model_label: Memo<String>,
+    events: RwSignal<Vec<Event>>,
+    tab: RwSignal<&'static str>,
+    details: RwSignal<bool>,
+    find_open: RwSignal<bool>,
+    like_this: Callback<()>,
+    root: StoredValue<String>,
+    force_open: ForceOpen,
+    col: Option<ColumnCtx>,
+}
+
+impl SessionChrome {
+    fn next_token() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A session's header: its title, where it runs, its labels, and its tabs
+/// and actions. `on_act`: in a popover, called after choosing a tab or an
+/// action (to close it).
+#[component]
+pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option<Callback<()>>) -> impl IntoView {
+    let live = api::live();
+    let SessionChrome { id, detail, status, started, model_label, events, tab, details, find_open, like_this, root, force_open, col, .. } = chrome;
+    let popover = on_act.is_some();
+    let act = move || {
+        if let Some(f) = on_act {
+            f.run(());
+        }
+    };
+    let tabs = move || {
+        let ssh = detail.get().and_then(Result::ok).is_some_and(|d| d.session.ssh.is_some());
+        view! {
+            <span class="contents" on:click=move |_| act()>
+                <crate::fleet::TabButton tab label="Transcript" value="transcript" />
+                {(!ssh).then(|| view! {
+                    <crate::fleet::TabButton tab label="Changes" value="changes" />
+                    <crate::fleet::TabButton tab label="Files" value="files" />
+                })}
+                <crate::fleet::TabButton tab label="Terminal" value="terminal" />
+                {move || (events.with(|e| crate::outputs::count(e)) > 0).then(|| view! { <crate::fleet::TabButton tab label="Outputs" value="outputs" /> })}
+                <crate::fleet::TabButton tab label="Config" value="config" />
+            </span>
+        }
+    };
+    move || {
+        detail.get().and_then(Result::ok).map(|d| {
+            let s = d.session.clone();
+            let worker_id = s.worker_id;
+            let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
+            view! {
+                <div class=if popover { "flex flex-col gap-3" } else { "mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800" }>
+                    <div class="min-w-0">
+                        <h1 class=if popover { "text-base font-semibold" } else { "truncate text-lg font-semibold" }>{s.title.clone()}</h1>
+                        <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
+                            <span class="flex items-center gap-1">
+                                <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
+                                {d.worker_name.clone()}
+                            </span>
+                            {s.ssh.clone().map(|t| view! { <span class="rounded bg-sky-100 px-1 font-mono text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Working on this machine over SSH, through the worker">{format!("⇄ {t}")}</span> })}
+                            <span class="break-all font-mono">{{ let cwd = s.cwd.clone(); move || started.get().map(|(c, _)| c).unwrap_or_else(|| cwd.clone()) }}</span>
+                            {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {
+                                <span class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">{b}</span>
+                            })}
+                            <span>{{ let model = s.model.clone(); move || { let m = model_label.get(); if m.is_empty() { model.clone() } else { m } } }}</span>
+                        </div>
+                        <crate::labels::SessionLabels session=s.id.clone() labels=s.labels.clone() auto_labels=s.auto_labels.clone() />
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        {tabs()}
+                        <button class=move || format!("{BUTTON_QUIET} text-xs {}", if details.get() { "text-zinc-900 dark:text-zinc-100" } else { "text-zinc-500" })
+                            title="Where it runs, its context, usage and changes" on:click=move |_| { details.update(|d| *d = !*d); act() }>"Details"</button>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
+                            tab.set("transcript");
+                            find_open.set(true);
+                            act();
+                        }>"Find"</button>
+                        {(!s.observed && s.instance.is_empty()).then(|| view! {
+                            <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
+                                title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
+                                on:click=move |_| { act(); like_this.run(()) }>"New like this"</button>
+                        })}
+                        <crate::tasks::RunningTasks session=id.get_value() events />
+                        <SubagentsPill session=id.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.get_value() />
+                        {move || view! { <StatusPill status=status.get() /> }}
+                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
+                            act();
+                            spawn_local(async move {
+                                if api::archive(id.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
+                            });
+                        }>"Archive"</button>
+                    </div>
+                </div>
+            }
+        })
     }
 }
 

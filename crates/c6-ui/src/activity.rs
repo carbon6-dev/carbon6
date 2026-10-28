@@ -7,7 +7,7 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::util::{ErrorBox, ago, now_ms};
-use crate::workspace::{Go, How, MAX_TILES, Tracked, View, use_workspace};
+use crate::workspace::{Go, How, Tracked, View, use_workspace};
 
 fn dot(status: SessionStatus, tracked: Tracked) -> &'static str {
     match (status, tracked) {
@@ -31,10 +31,38 @@ fn what(status: SessionStatus, tracked: Tracked) -> &'static str {
     }
 }
 
-/// Running, finished-unseen and pinned sessions, always in view (desktop),
-/// narrowed by the shared label filter (which it shows, with what it hides).
+/// A rail section's ▾/▸.
+pub const FOLD: &str = "w-3 shrink-0 text-left text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100";
+
+/// A rail section folded or open, remembered in this browser.
+fn section_open(key: &'static str) -> RwSignal<bool> {
+    let open = RwSignal::new(crate::util::storage_get(key).as_deref() != Some("0"));
+    Effect::new(move || crate::util::storage_set(key, if open.get() { "1" } else { "0" }));
+    open
+}
+
+/// The rail (desktop): Activity, the running, finished-unseen and pinned
+/// sessions, and below it every session, grouped; each section folds.
+/// Both narrowed by the shared label filter (shown, with what it hides).
 #[component]
 pub fn Dock() -> impl IntoView {
+    let activity = section_open("c6.dock.activity");
+    let sessions = section_open("c6.dock.sessions");
+    let fold = FOLD;
+    view! {
+        <aside class="hidden w-60 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 lg:flex dark:border-zinc-800 dark:bg-zinc-950">
+            <div class=move || if !activity.get() { "flex shrink-0 flex-col" } else if sessions.get() { "flex max-h-[45%] min-h-0 shrink-0 flex-col" } else { "flex min-h-0 flex-1 flex-col" }>
+                <DockActivity open=activity fold />
+            </div>
+            <div class=move || if sessions.get() { "flex min-h-0 flex-1 flex-col border-t border-zinc-200 dark:border-zinc-800" } else { "flex shrink-0 flex-col border-t border-zinc-200 dark:border-zinc-800" }>
+                <crate::sessions::SessionsRail open=sessions />
+            </div>
+        </aside>
+    }
+}
+
+#[component]
+fn DockActivity(open: RwSignal<bool>, fold: &'static str) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let filter = crate::labels::use_filter().0;
@@ -44,11 +72,19 @@ pub fn Dock() -> impl IntoView {
         all.get().into_iter().filter(|(s, _)| crate::labels::matches(s, &f)).collect::<Vec<_>>()
     });
     view! {
-        <aside class="hidden w-56 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 lg:flex dark:border-zinc-800 dark:bg-zinc-950">
-            <div class="flex items-center justify-between px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
-                "Activity"
+            <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                <span class="flex items-center gap-1.5">
+                    <button class=fold title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
+                        {move || if open.get() { "▾" } else { "▸" }}
+                    </button>
+                    "Activity"
+                    {move || (!open.get() && !items.with(Vec::is_empty)).then(|| view! {
+                        <span class="rounded-full bg-zinc-200 px-1.5 font-normal tabular-nums dark:bg-zinc-800">{items.with(Vec::len)}</span>
+                    })}
+                </span>
                 <Go to=View::Mission class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mission control">"⊞ all"</Go>
             </div>
+            <Show when=move || open.get()>
             {move || (!filter.with(Vec::is_empty)).then(|| {
                 let hidden = all.with(Vec::len) - items.with(Vec::len);
                 view! {
@@ -95,7 +131,7 @@ pub fn Dock() -> impl IntoView {
                     }.into_any()
                 }}
             </div>
-        </aside>
+            </Show>
     }
 }
 
@@ -108,6 +144,7 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
     let dismissable = t == Tracked::Attention;
     view! {
         <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
+            <span class=format!("h-6 w-1 shrink-0 rounded-sm {}", crate::colour::solid(crate::colour::of(&s))) title="Its colour"></span>
             <span class=dot(s.status, t)></span>
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘-click: new tile)">
                 <div class="truncate text-sm">{s.title.clone()}</div>
@@ -385,9 +422,7 @@ pub fn MobileBar() -> impl IntoView {
                     on:click=move |_| ws.focus_tile(i)
                 >{label}</button>
             }).collect_view()}
-            {move || (ws.layout.with(|l| l.tiles.len()) < MAX_TILES).then(|| view! {
-                <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
-            })}
+            <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
             <span class="flex-1"></span>
             <button class="relative shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400"
                 title=move || { let (s, h) = counts.get(); crate::labels::attention_title(s, h) }

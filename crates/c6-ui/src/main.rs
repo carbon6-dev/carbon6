@@ -9,6 +9,7 @@ mod brief;
 mod calendar;
 mod chat;
 mod collections;
+mod colour;
 mod contacts;
 mod decisions;
 mod details;
@@ -79,6 +80,7 @@ fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
     provide_context(labels::LabelFilter::restored());
+    provide_context(sessions::Grouping::load());
     // A signed-in browser opening a login link (to sign in again).
     if window().location().pathname().unwrap_or_default().starts_with("/login/") {
         return view! {
@@ -144,11 +146,9 @@ fn Main() -> impl IntoView {
                         <span class="hidden md:contents"><search::SearchBox /></span>
                     }.into_any()
                 }}
-                {move || (tiles() < workspace::MAX_TILES).then(|| view! {
-                    <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                        title="New tile (or ⌘-click any link) · ⌘1–4 switch tiles · ⌘[ ⌘] back and forward"
-                        on:click=move |_| ws.new_tile()>"+ Tile"</button>
-                })}
+                <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    title=move || format!("New tile (or ⌘-click any link): {} open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", tiles())
+                    on:click=move |_| ws.new_tile()>"+ Tile"</button>
                 {(!console).then(|| view! { <notify::NotifyToggle /> })}
                 <ConnBadge connected=live.connected />
             </header>

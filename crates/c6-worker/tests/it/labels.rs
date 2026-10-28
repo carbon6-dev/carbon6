@@ -178,3 +178,58 @@ async fn session_grouping_is_kept() {
     assert_eq!(get().await, json!({"levels": ["repo", "client"]}));
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn sessions_get_colours_you_can_change() {
+    let mock = MockLlm::start().await;
+    let (head_dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let wid = worker.identity.meta.worker_id.0;
+    let conn: Connection =
+        http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap().json().await.unwrap();
+    let start = async || -> Session {
+        http.post(format!("{api}/sessions"))
+            .json(&json!({"worker_id": wid, "cwd": project.path().display().to_string(), "connection_id": conn.id, "model": "m"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    };
+    // Each new session takes the colour its realm's recent ones use least.
+    let (a, b, c) = (start().await, start().await, start().await);
+    assert_eq!([a.colour.as_str(), b.colour.as_str(), c.colour.as_str()], ["sky", "emerald", "amber"]);
+
+    let set = async |id: &str, colour: &str| http.put(format!("{api}/sessions/{id}/colour")).json(&json!({ "colour": colour })).send().await.unwrap();
+    let r = set(&b.id, "rose").await;
+    assert!(r.status().is_success());
+    assert_eq!(r.json::<Session>().await.unwrap().colour, "rose");
+    let listed: Vec<Session> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.id == b.id).unwrap().colour, "rose", "the list shows it");
+    // Emerald is free again: the next session takes it.
+    assert_eq!(start().await.colour, "emerald");
+    assert_eq!(set(&a.id, "beige").await.status(), 400, "only the palette's colours");
+    assert_eq!(set("no-such-session", "teal").await.status(), 404);
+
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}

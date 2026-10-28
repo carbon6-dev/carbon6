@@ -196,6 +196,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         subagents_running: 0,
         observed: r.observed,
         instance: r.instance.clone(),
+        colour: r.colour.clone(),
     }
 }
 
