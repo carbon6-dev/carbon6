@@ -7,6 +7,7 @@ use leptos::task::spawn_local;
 use crate::api;
 use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
+use crate::when::compact as when;
 
 /// Settings: groups of pages, (id, title, what is on it). The id is the
 /// page's address (/settings/<id>); the first page is "models".
@@ -3393,12 +3394,6 @@ const SCHEDULE_PRESETS: &[(&str, &str)] = &[
     ("Mondays at 7:30", "30 7 * * mon"),
     ("Every 15 minutes", "*/15 * * * *"),
 ];
-
-fn when(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    let s: String = d.to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED).into();
-    s
-}
 
 const VIEW_FIELDS: &[Field] = &[
     Field { key: "name", label: "Name", placeholder: "e.g. pipeline (its address: /views/pipeline)", kind: FieldKind::Mono },

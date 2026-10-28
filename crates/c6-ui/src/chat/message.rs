@@ -11,6 +11,7 @@ use wasm_bindgen::JsCast;
 use super::{Chat, Place, text};
 use crate::api;
 use crate::util::ErrorBox;
+use crate::when::{full, heading as day, time};
 
 /// Messages a page.
 const PAGE: u64 = 50;
@@ -26,44 +27,6 @@ struct ListCtl {
 
 fn ts_of(m: &Value) -> String {
     m["meta"]["ts"].as_str().unwrap_or("").to_owned()
-}
-
-fn date(ms: i64) -> js_sys::Date {
-    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64))
-}
-
-fn opts(pairs: &[(&str, &str)]) -> js_sys::Object {
-    let o = js_sys::Object::new();
-    for (k, v) in pairs {
-        let _ = js_sys::Reflect::set(&o, &(*k).into(), &(*v).into());
-    }
-    o
-}
-
-/// "Today", "Yesterday", or "Monday, October 26".
-fn day(ms: i64) -> String {
-    let d = date(ms);
-    let today = js_sys::Date::new_0();
-    let yesterday = date(js_sys::Date::now() as i64 - 86_400_000);
-    if d.to_date_string() == today.to_date_string() {
-        "Today".into()
-    } else if d.to_date_string() == yesterday.to_date_string() {
-        "Yesterday".into()
-    } else {
-        let mut o = vec![("weekday", "long"), ("month", "long"), ("day", "numeric")];
-        if d.get_full_year() != today.get_full_year() {
-            o.push(("year", "numeric"));
-        }
-        String::from(d.to_locale_date_string("default", &opts(&o)))
-    }
-}
-
-fn time(ms: i64) -> String {
-    String::from(date(ms).to_locale_time_string_with_options("default", &opts(&[("hour", "numeric"), ("minute", "2-digit")])))
-}
-
-fn full(ms: i64) -> String {
-    String::from(date(ms).to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED))
 }
 
 /// Whether `m` goes under `prev` without its own name: the same sender,

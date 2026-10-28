@@ -37,6 +37,7 @@ mod understanding;
 mod usage;
 mod util;
 mod views;
+mod when;
 mod workspace;
 
 use leptos::prelude::*;

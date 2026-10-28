@@ -11,6 +11,7 @@ use wasm_bindgen::prelude::*;
 use crate::api;
 use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
+use crate::when::compact as when;
 use crate::workspace::{Go, View};
 
 #[wasm_bindgen]
@@ -41,11 +42,6 @@ fn kind_tone(kind: &str) -> &'static str {
         "output" => "bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300",
         _ => "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
     }
-}
-
-fn when(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    String::from(d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED))
 }
 
 #[component]

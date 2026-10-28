@@ -12,15 +12,6 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox};
 use crate::workspace::{Go, View};
 
-fn day(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    String::from(d.to_locale_date_string("default", &json_options(json!({"weekday": "short", "month": "short", "day": "numeric"}))))
-}
-
-fn json_options(v: Value) -> wasm_bindgen::JsValue {
-    js_sys::JSON::parse(&v.to_string()).unwrap_or(wasm_bindgen::JsValue::UNDEFINED)
-}
-
 /// Tomorrow at 9, or next Monday at 9, in your time.
 fn at_nine(days: u32) -> i64 {
     let d = js_sys::Date::new_0();
@@ -335,7 +326,7 @@ fn Row(r: Request, i: usize, picked: RwSignal<usize>, b: Brief) -> impl IntoView
                 <button class="shrink-0 rounded bg-sky-100 px-1.5 text-[10px] text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Possibly the same ask as another request: merge them"
                     on:click=move |ev| { ev.stop_propagation(); b.merge(other.min(id), other.max(id)); }>"same? merge"</button>
             })}
-            {r.due.map(|d| view! { <span class="shrink-0 text-xs text-amber-700 dark:text-amber-400">{format!("by {}", day(d))}</span> })}
+            {r.due.map(|d| view! { <span class="shrink-0 text-xs text-amber-700 dark:text-amber-400">{format!("by {}", crate::when::compact(d))}</span> })}
             <span class="shrink-0 text-xs text-zinc-400">{channels(&r)}</span>
         </div>
     }
@@ -370,7 +361,7 @@ fn Owed(c: Commitment, b: Brief) -> impl IntoView {
                 let c = c.clone();
                 move || view! {
                     <span class="min-w-0 flex-1 truncate" title=c.item_title.clone()>{c.what.clone()}{(c.who != "me").then(|| format!(" — {}", c.who))}</span>
-                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{day(d)}</span> })}
+                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{crate::when::compact(d)}</span> })}
                 }.into_any()
             })
             body=ViewFn::from(move || view! {
@@ -438,7 +429,7 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                     <p class="text-xs uppercase tracking-wide text-zinc-500">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
                     <h1 class="font-semibold">{r.title.clone()}</h1>
                     <p class="text-sm">{if r.person_name.is_empty() { r.person.clone() } else { format!("{} <{}>", r.person_name, r.person) }}</p>
-                    {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", day(d))}</p> })}
+                    {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", crate::when::full(d))}</p> })}
                     <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
                 </div>
                 // A mail thread shows its senders' cards itself.

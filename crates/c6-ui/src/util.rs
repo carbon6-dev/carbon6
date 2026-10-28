@@ -7,15 +7,8 @@ pub fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
-pub fn ago(ms: i64) -> String {
-    let s = (ms / 1000).max(0);
-    match s {
-        0..=59 => format!("{s}s ago"),
-        60..=3599 => format!("{}m ago", s / 60),
-        3600..=86_399 => format!("{}h ago", s / 3600),
-        _ => format!("{}d ago", s / 86_400),
-    }
-}
+/// How long ago (crate::when, where every page's dates come from).
+pub use crate::when::ago;
 
 /// A signal that ticks every few seconds, for relative times.
 pub fn clock() -> RwSignal<i64> {

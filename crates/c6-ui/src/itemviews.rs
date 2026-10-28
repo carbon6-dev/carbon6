@@ -9,8 +9,8 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::calendar::{DAY, date_of, day_label, hm, midnight};
-use crate::mail::when;
 use crate::util::{BUTTON_QUIET, ErrorBox};
+use crate::when;
 
 /// The view's action buttons for one item.
 #[component]
@@ -105,7 +105,7 @@ pub fn MessagesView(view: ViewDef) -> impl IntoView {
                                         on:click=move |_| chosen.set(Some(t2.clone()))>
                                         <div class="flex justify-between gap-2">
                                             <span class="truncate font-medium">{newest.meta["from"].as_str().unwrap_or("").to_owned()}</span>
-                                            <span class="shrink-0 text-xs text-zinc-500">{when(newest.created_at)}</span>
+                                            <span class="shrink-0 text-xs text-zinc-500">{when::compact(newest.created_at)}</span>
                                         </div>
                                         <div class="truncate">{newest.title.clone()}{(n > 1).then(|| format!(" ({n})"))}</div>
                                     </button>
@@ -127,7 +127,7 @@ pub fn MessagesView(view: ViewDef) -> impl IntoView {
                                             <article class="rounded-md border border-zinc-200 p-3 text-sm dark:border-zinc-800">
                                                 <div class="flex justify-between gap-2 text-xs text-zinc-500">
                                                     <span>{m.meta["from"].as_str().unwrap_or("").to_owned()}</span>
-                                                    <span>{when(m.created_at)}</span>
+                                                    <span>{when::full(m.created_at)}</span>
                                                 </div>
                                                 <h3 class="font-medium">{m.title.clone()}</h3>
                                                 <p class="mt-1 whitespace-pre-wrap">{m.text.clone()}</p>
@@ -244,7 +244,7 @@ pub fn GalleryView(view: ViewDef) -> impl IntoView {
                     <img src=src class="max-h-[60vh] rounded" alt=i.title.clone() />
                     <figcaption class="text-sm">
                         <span class="font-medium">{i.title.clone()}</span>
-                        <span class="ml-2 text-xs text-zinc-500">{when(i.created_at)}</span>
+                        <span class="ml-2 text-xs text-zinc-500">{when::full(i.created_at)}</span>
                         <p class="whitespace-pre-wrap text-zinc-600 dark:text-zinc-400">{i.text.clone()}</p>
                     </figcaption>
                     <div class="flex flex-wrap gap-1">

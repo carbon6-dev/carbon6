@@ -395,7 +395,7 @@ fn ChartView(view: ViewDef) -> impl IntoView {
                     <svg viewBox="0 0 600 160" class="h-40 w-full rounded-md border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
                         {res.buckets.iter().enumerate().map(|(i, (t, v))| {
                             let h = v / max * 140.0;
-                            let title = format!("{}: {}", js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(*t as f64)).to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED), fmt(*v));
+                            let title = format!("{}: {}", crate::when::compact(*t), fmt(*v));
                             view! { <rect x=format!("{:.1}", i as f64 * w + 1.0) y=format!("{:.1}", 150.0 - h) width=format!("{:.1}", (w - 2.0).max(1.0)) height=format!("{h:.1}") class="fill-sky-500"><title>{title}</title></rect> }
                         }).collect_view()}
                     </svg>

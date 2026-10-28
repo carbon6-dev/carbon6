@@ -8,11 +8,7 @@ use serde_json::{Value, json};
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
-
-fn date(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    String::from(d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED))
-}
+use crate::when::compact as date;
 
 /// Suggestions: people who may be the same, faces to name.
 #[component]

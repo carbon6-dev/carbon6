@@ -60,16 +60,6 @@ fn when_near(el: &web_sys::Element, f: impl Fn() + 'static) -> web_sys::Intersec
     o
 }
 
-pub(crate) fn when(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    let today = js_sys::Date::new_0();
-    if d.to_date_string() == today.to_date_string() {
-        String::from(d.to_locale_time_string("default"))
-    } else {
-        String::from(d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED))
-    }
-}
-
 /// Who and what, for a reply.
 #[derive(Clone, Default)]
 pub(crate) struct Draft {
@@ -194,7 +184,7 @@ pub fn MailPage() -> impl IntoView {
                                                         })}
                                                         {t.starred.then(|| view! { <span class="text-amber-500">"★"</span> })}
                                                         {t.attachments.then(|| view! { <span class="text-zinc-400">"📎"</span> })}
-                                                        <span class="shrink-0 text-xs font-normal text-zinc-500">{when(t.date)}</span>
+                                                        <span class="shrink-0 text-xs font-normal text-zinc-500">{crate::when::compact(t.date)}</span>
                                                     </div>
                                                     <div class="truncate text-sm">{t.subject.clone()}</div>
                                                     <div class="truncate text-xs font-normal text-zinc-500">{t.snippet.clone()}</div>
@@ -375,7 +365,7 @@ fn Outbox(refresh: RwSignal<u32>) -> impl IntoView {
                     <span class="min-w-0 flex-1 truncate">{match o.status.as_str() {
                         "failed" => format!("Not sent: {} ({})", o.subject, o.error.clone().unwrap_or_default()),
                         "sending" => format!("Sending {}…", o.subject),
-                        _ if secs > 60 => format!("{} goes out at {}", o.subject, when(o.send_at)),
+                        _ if secs > 60 => format!("{} goes out at {}", o.subject, crate::when::compact(o.send_at)),
                         _ => format!("Sending {} in {secs}s", o.subject),
                     }}</span>
                     {(o.status == "pending").then(|| view! {
@@ -505,7 +495,11 @@ fn reply(account: &str, m: &MailMessage, all: bool) -> Draft {
         to: to.join(", "),
         cc: cc.join(", "),
         subject,
-        body: format!("\n\nOn {}, {} wrote:\n{quoted}", when(m.date), if m.from_name.is_empty() { &m.from } else { &m.from_name }),
+        body: format!(
+            "\n\nOn {}, {} wrote:\n{quoted}",
+            crate::when::quote(m.date),
+            if m.from_name.is_empty() { &m.from } else { &m.from_name }
+        ),
         reply_to: Some(m.item_id.clone()),
     }
 }
@@ -522,7 +516,7 @@ fn Message(m: MailMessage) -> impl IntoView {
                 <span class="font-medium">{if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() }}</span>
                 <span class="text-xs text-zinc-500">{format!("<{}> to {}", m.from, m.to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "))}</span>
                 <span class="flex-1"></span>
-                <span class="text-xs text-zinc-500">{when(m.date)}</span>
+                <span class="text-xs text-zinc-500">{crate::when::full(m.date)}</span>
             </div>
             {match html {
                 Some(h) => view! {

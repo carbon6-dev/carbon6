@@ -164,10 +164,7 @@ pub fn ActivityPage() -> impl IntoView {
                         let w = &r["walk"];
                         if let Some(total) = w["threads"].as_i64().filter(|n| *n > 0) {
                             let read = w["threads_read"].as_i64().unwrap_or(0);
-                            let back = w["oldest_read"].as_i64().and_then(|ms| {
-                                let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-                                d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED).as_string()
-                            });
+                            let back = w["oldest_read"].as_i64().map(crate::when::compact);
                             lines.push(format!(
                                 "{}: read {read} of {total} mail threads ({}%){}; {} relationship cards{}; {} correspondents",
                                 s(&r["realm"]),
