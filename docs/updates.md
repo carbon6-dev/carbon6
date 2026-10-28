@@ -45,11 +45,13 @@ CI's publish job adds two files to every GitHub release:
 
 ## 3. Finding a release (the head)
 
-- **Every 15 minutes (`update_check_secs`), at start, and on demand,** the head asks `GET https://api.github.com/repos/carbon6-dev/carbon6/releases/latest`.
-  - It sends the last `ETag`, so an unchanged answer costs nothing against the rate limit.
-  - It skips drafts and prereleases.
-- **When it finds a newer version than its own,** it downloads `release.json` and its `.sig` and checks the signature against `RELEASE_KEYS`.
+- **Every 15 minutes (`update_check_secs`), at start, and on demand,** the head downloads the latest release's manifest: `GET https://github.com/carbon6-dev/carbon6/releases/latest/download/release.json`.
+  - It downloads release files only, never GitHub's API: a household shares the API's 60 requests an hour without a token, and the head ran into 403s. Downloads aren't counted against it.
+  - It sends the last `ETag`, so an unchanged manifest is a 304 and nothing more is fetched.
+  - `latest` is never a draft or a prerelease. Its version is the signed manifest's (the API's tag, asset list and draft flags are no longer needed: the notes and every file's name and checksum are in the manifest).
+- **When the manifest changed,** it downloads its `.sig` and checks the signature against `RELEASE_KEYS`.
   - A bad or missing signature is logged and shown in Settings → System. Nothing else happens.
+  - A newer release's files are then taken from its own tag (`…/releases/download/v<version>/`), not from `latest`, which moves on with the next release.
 - **It keeps the verified manifest** in the `updates` table (version, manifest, signature, where its files are, state) and shows it in Settings → System → Updates, with its notes.
 - **A newer release replaces an older one** still waiting: the older one's Decision is withdrawn.
 
@@ -59,7 +61,7 @@ For a machine that should run main as it is, not just releases (the developer's 
 
 - **What CI publishes.** Every green commit on main that isn't a release commit replaces one rolling GitHub pre-release, tagged `edge`. It carries that commit's packages (built anyway, docs/releases.md) and a `release.json` signed like a release's, whose notes are the commits since the last release (`packaging/release/edge.sh`). A pre-release is never `releases/latest`, so stable machines never see it.
 - **Its version.** A build between releases is `<release>+git<commit time>.<commit>` (brew's files: `<release>.<commit time>`). Versions compare by release, then commit time (UTC), so an edge build after 0.3.10 sorts after 0.3.10 and before 0.3.11. Each binary knows its exact version, given at build time (`C6_BUILD_VERSION`, set by `make build`), and reports and compares that one (`c6_core::build()`).
-- **The setting.** `channel`: `stable` (the default) or `edge`. On edge the head also looks at the `edge` release and offers whichever is newer, it or the latest release. The mode applies as for releases, so **edge + auto** is continuous deployment: each green commit reaches the machine within a check interval.
+- **The setting.** `channel`: `stable` (the default) or `edge`. On edge the head also downloads the `edge` release's manifest (`…/releases/download/edge/release.json`, with its own ETag; while CI replaces the release it isn't there, which isn't an error) and offers whichever is newer, it or the latest release. The mode applies as for releases, so **edge + auto** is continuous deployment: each green commit reaches the machine within a check interval.
 - **Homebrew installs.** The tap has releases only, so an edge build replaces a Homebrew install's binary in place, as a tarball install would. The pending update records it, and a rollback puts the previous binary back. The next release goes through `brew upgrade` again.
 
 ## 4. When to update (policy)

@@ -48,8 +48,8 @@ pub struct HeadConfig {
     /// machine, to move its knowledge in (docs/knowledge.md §8). Loading a
     /// config file fills in c6m's usual folders; none: don't look.
     pub memex_dirs: Option<Vec<PathBuf>>,
-    /// Where releases are looked for (GitHub's API for the repository;
-    /// docs/updates.md).
+    /// Where releases are looked for: the repository on GitHub, whose
+    /// release files are downloaded (not its API; docs/updates.md).
     pub update_source: String,
     /// Release keys (hex) instead of the ones built in (tests).
     pub update_keys: Vec<String>,
@@ -79,7 +79,7 @@ impl Default for HeadConfig {
             ui_tls_key: None,
             ui_tls_head_ca: false,
             memex_dirs: None,
-            update_source: "https://api.github.com/repos/carbon6-dev/carbon6".into(),
+            update_source: "https://github.com/carbon6-dev/carbon6".into(),
             update_keys: Vec::new(),
             update_exe: None,
             update_check_secs: 15 * 60,
