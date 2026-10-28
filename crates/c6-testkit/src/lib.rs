@@ -4,6 +4,26 @@
 pub mod wait;
 pub use wait::{eventually, have, need, port, within};
 
+/// Raise this test process's soft open-file limit, if possible, before its
+/// parallel tests start. This is only for test harness startup hooks.
+#[cfg(unix)]
+pub fn raise_open_file_limit() {
+    // SAFETY: getrlimit/setrlimit operate on this process's resource limits.
+    unsafe {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) != 0 {
+            return;
+        }
+        let mut limit = limit.assume_init();
+        let desired = 10_240 as libc::rlim_t;
+        if limit.rlim_cur >= desired {
+            return;
+        }
+        limit.rlim_cur = desired.min(limit.rlim_max);
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+    }
+}
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
