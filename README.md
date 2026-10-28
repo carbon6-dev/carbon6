@@ -107,6 +107,8 @@ c6w enroll c6e1.…
 c6w run
 ```
 
+The token holds the address the head advertises (`advertise_host` in `c6h.toml`). A worker on another network that reaches the head some other way (a public name, a port forward) enrolls with `c6w enroll --head <host[:port]> c6e1.…`: it dials that address, still checks the head's certificate against the token's name, and keeps the address for `c6w run`.
+
 ### Command line (`c6`)
 
 `c6` runs sessions headless, for scripts and terminals. It signs in with an API token: create one under **Settings → Sign-in → API tokens** (or with `c6h api-token` on the head), then:
