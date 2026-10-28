@@ -261,6 +261,7 @@ fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
                         <button class=BUTTON_QUIET title="Someone you know: their mail is never a pitch"
                             on:click=move |_| act("memex.triage.mark", json!({"target": target.get_value(), "mark": "known"}))>"Not a pitch"</button>
                     })}
+                    {t.request.map(|id| view! { <RequestActions id refresh=move || { sorted.refetch(); refresh.update(|n| *n += 1) } /> })}
                     <select class=format!("{INPUT} w-auto py-1 text-xs") on:change=move |ev| category.set(event_target_value(&ev))>
                         <option value="">"Sort as…"</option>
                         {["needs_you", "first_contact", "fyi", "newsletter", "notification", "pitch", "noise"].into_iter().map(|c| {
@@ -279,6 +280,32 @@ fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
                 </div>
             }
         })
+    }
+}
+
+/// A thread's open request, settled as in the Brief (the same actions),
+/// with the way there.
+#[component]
+fn RequestActions(id: i64, refresh: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
+    use crate::brief::Settle;
+    let error = RwSignal::new(None::<String>);
+    let act = move |how: Settle| {
+        spawn_local(async move {
+            match crate::brief::settle(id, how).await {
+                Ok(_) => refresh(),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <span class="flex w-full flex-wrap items-center gap-1 sm:w-auto">
+            <span class="text-xs text-zinc-500">"Request:"</span>
+            <button class=BUTTON_QUIET on:click=move |_| act(Settle::Done)>"Done"</button>
+            <button class=BUTTON_QUIET on:click=move |_| act(Settle::Tomorrow)>"Tomorrow"</button>
+            <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(Settle::Drop)>"Drop"</button>
+            <a class=format!("{BUTTON_QUIET} no-underline") href=crate::place::href("/brief")>"Open in the Brief"</a>
+            {move || error.get().map(|e| view! { <span class="w-full text-xs text-red-600">{e}</span> })}
+        </span>
     }
 }
 

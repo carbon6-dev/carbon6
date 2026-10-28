@@ -846,3 +846,64 @@ async fn needs_reply_follows_the_sorting() {
     }
     head.shutdown().await.unwrap();
 }
+
+/// Mail's "Needs you" (and "First contact") is what waits on you in the
+/// Brief: in the inbox, its request open. One done or dropped there leaves
+/// it, so does one snoozed until later (it comes back once its time has
+/// passed), and so does one archived; so does "Needs reply".
+#[tokio::test]
+async fn needs_you_is_what_waits_on_you() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    my_account(&head, &api, &m).await;
+    let me = "me@mine.io";
+    for (i, (from, subject)) in
+        [("ana@acme.com", "Open"), ("bo@acme.com", "Done"), ("cy@acme.com", "Snoozed"), ("di@acme.com", "Archived")].into_iter().enumerate()
+    {
+        let id = format!("q{i}");
+        mail(&m, &id, &id, (from, ""), me, subject, "Can you look at this?", None, &["INBOX"], (i as i64 + 1) * HOUR).await;
+        sorted_as(&m, &id, "needs_you").await;
+    }
+    let rpc = async |method: &str, params: Value| -> Value {
+        let r = http.post(format!("{api}/memex/rpc")).json(&json!({"method": method, "params": params})).send().await.unwrap();
+        assert!(r.status().is_success(), "{method}: {}", r.text().await.unwrap());
+        r.json().await.unwrap()
+    };
+    let shown = async |view: &str| -> Vec<String> {
+        let v = rpc("memex.mail.threads", json!({"view": view})).await;
+        serde_json::from_value::<Vec<MailThread>>(v).unwrap().into_iter().map(|t| t.subject).collect()
+    };
+    let request = async |thread: &str| -> i64 {
+        let t: Triage = serde_json::from_value(rpc("memex.triage.get", json!({"target": format!("thread:acct:{thread}")})).await).unwrap();
+        t.request.expect("its open request")
+    };
+    assert_eq!(shown("triage:needs_you").await, ["Open", "Done", "Snoozed", "Archived"]);
+
+    let (done, snoozed) = (request("q1").await, request("q2").await);
+    rpc("memex.requests.set", json!({"id": done, "status": "done"})).await;
+    let later = c6_core::now_ms() + 3_600_000;
+    rpc("memex.requests.set", json!({"id": snoozed, "status": "snoozed", "until": later})).await;
+    // Archived in Gmail, as its sync keeps it.
+    sqlx::query("UPDATE mail SET inbox = 0 WHERE thread_id = 'q3'").execute(&m.store.pool).await.unwrap();
+    assert_eq!(shown("triage:needs_you").await, ["Open"], "done, snoozed and archived leave");
+    assert_eq!(shown("needs_reply").await, ["Open"]);
+    let t: Value = rpc("memex.triage.get", json!({"target": "thread:acct:q1"})).await;
+    assert!(t["request"].is_null(), "a done request isn't offered: {t}");
+    // The snooze's time has passed: it's back.
+    rpc("memex.requests.set", json!({"id": snoozed, "status": "snoozed", "until": c6_core::now_ms() - 1})).await;
+    assert_eq!(shown("triage:needs_you").await, ["Open", "Snoozed"]);
+    assert_eq!(shown("needs_reply").await, ["Open", "Snoozed"]);
+    head.shutdown().await.unwrap();
+}

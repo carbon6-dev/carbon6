@@ -35,6 +35,18 @@ pub struct Found<'a> {
 /// Open, or snoozed until a time that has passed.
 const OPEN: &str = "(status = 'open' OR (status = 'snoozed' AND until <= ?))";
 
+/// The open request (or one snoozed until a time that has passed) a
+/// conversation is part of, if any: the latest.
+pub async fn open_of(m: &Memex, target: &str) -> anyhow::Result<Option<i64>> {
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT r.id FROM requests r JOIN request_sources s ON s.request_id = r.id WHERE s.target = ? AND {OPEN} ORDER BY r.updated_at DESC LIMIT 1"
+    )))
+    .bind(target)
+    .bind(c6_core::now_ms())
+    .fetch_optional(&m.store.pool)
+    .await?)
+}
+
 /// Keeps a conversation's request up to date with how it was just sorted.
 pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Result<()> {
     let now = c6_core::now_ms();

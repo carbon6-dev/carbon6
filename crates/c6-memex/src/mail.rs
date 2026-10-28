@@ -297,7 +297,9 @@ pub async fn threads(
     let now = c6_core::now_ms();
     let month = now - 30 * 86_400_000;
     // The view's condition on a thread's messages.
-    // As sorted for the brief (docs/brief.md): triage:<category>.
+    // As sorted for the brief (docs/brief.md): triage:<category>. What
+    // needs you (or is a first contact) is what waits on you there: in the
+    // inbox, its request open (not done, dropped, or snoozed till later).
     let sorted = view.strip_prefix("triage:").map(str::to_owned);
     let (cond, label): (&str, Option<String>) = match view {
         "inbox" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0", None),
@@ -323,7 +325,9 @@ pub async fn threads(
         "SELECT m.account AS account, m.thread_id AS thread_id, MAX(m.date) AS date, COUNT(*) AS n, MAX(m.unread) AS unread, MAX(m.starred) AS starred, \
          MAX(m.attachments) AS attachments FROM mail m WHERE {cond} AND (?1 IS NULL OR m.account = ?1) \
          AND (?4 IS NULL OR m.item_id IN (SELECT item_id FROM mail_labels WHERE label = ?4)) \
-         AND (?5 IS NULL OR EXISTS (SELECT 1 FROM triage t WHERE t.target = 'thread:' || m.account || ':' || m.thread_id AND t.category = ?5)) \
+         AND (?5 IS NULL OR EXISTS (SELECT 1 FROM triage t WHERE t.target = 'thread:' || m.account || ':' || m.thread_id AND t.category = ?5 \
+             AND (?5 NOT IN ('needs_you', 'first_contact') OR (m.inbox = 1 AND EXISTS (SELECT 1 FROM request_sources s JOIN requests r \
+             ON r.id = s.request_id WHERE s.target = t.target AND (r.status = 'open' OR (r.status = 'snoozed' AND r.until <= ?6))))))) \
          GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) ORDER BY date DESC LIMIT ?3"
     );
     // Over-fetch for the views that look at each thread's latest message.
@@ -339,6 +343,7 @@ pub async fn threads(
             .bind(fetch as i64)
             .bind(&label)
             .bind(&sorted)
+            .bind(now)
             .fetch_all(&m.store.pool)
             .await?;
         let more = rows.len() as u32 == fetch && fetch > limit;
@@ -412,12 +417,13 @@ pub async fn threads(
 
 /// Whether a thread whose latest message (at `latest`, from `sender`) is
 /// someone else's to you needs your reply: as it was sorted, when that
-/// sorting saw the message (it needs you, or is a real first contact),
-/// else (not sorted yet) unless an automated sender wrote it. Shipping
-/// notices and receipts come straight to you without list headers.
+/// sorting saw the message (it needs you, or is a real first contact, and
+/// its request is open), else (not sorted yet) unless an automated sender
+/// wrote it. Shipping notices and receipts come straight to you without
+/// list headers.
 fn needs_reply(sorted: Option<&api::Triage>, latest: i64, sender: &str) -> bool {
     match sorted {
-        Some(t) if t.at >= latest => matches!(t.category.as_str(), "needs_you" | "first_contact"),
+        Some(t) if t.at >= latest => matches!(t.category.as_str(), "needs_you" | "first_contact") && t.request.is_some(),
         _ => !crate::relations::automated(sender),
     }
 }
@@ -686,7 +692,7 @@ mod tests {
 
     #[test]
     fn needs_reply_follows_the_sorting() {
-        let sorted = |category: &str, at: i64| c6_api::Triage { category: category.into(), at, ..Default::default() };
+        let sorted = |category: &str, at: i64| c6_api::Triage { category: category.into(), at, request: Some(1), ..Default::default() };
         let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender);
         // Sorted: what it was sorted as, whoever sent it.
         assert!(needs(Some(sorted("needs_you", 100)), "no-reply@bank.example"));
@@ -700,5 +706,8 @@ mod tests {
         assert!(!needs(None, "no-reply@bank.example"));
         assert!(needs(Some(sorted("notification", 50)), "ana@acme.com"));
         assert!(!needs(Some(sorted("needs_you", 50)), "notifications@github.com"));
+        // What needs you, its request settled in the Brief (done, dropped,
+        // snoozed): not now.
+        assert!(!needs(Some(c6_api::Triage { request: None, ..sorted("needs_you", 100) }), "ana@acme.com"));
     }
 }

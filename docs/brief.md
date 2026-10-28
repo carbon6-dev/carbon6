@@ -167,6 +167,9 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 - **Settings:** the prompts are `memex.triage`, `memex.triage.pitch` and `memex.triage.signals` (the marks and `phrase:` follow-ups, one per line). They're editable per realm: the memex now reads each realm's own `memex.*` prompts, where before it read home's for all.
 - **Your marks and corrections:** "Cold pitch" and "Not a pitch" mark the sender (by address, or `domain: true` for the whole domain) in the realm's memex. They're listed and removable in Settings → Mail & calendar. "Sort as…" with a note becomes one of the model's examples (the last 20).
 - **In Mail:** the views Needs you, First contact and Cold pitches; each thread's label with its reason; the sorting bar on an open thread.
+  - Needs you and First contact are what waits on you in the Brief: threads in the inbox whose request is open (not done, dropped, or snoozed until later; a snoozed one comes back when its time comes). Needs reply leaves out a sorted thread whose request isn't open, too.
+  - A thread with an open request offers the Brief's actions in its sorting bar: Done, Tomorrow and Drop (the same `memex.requests.set` calls), and the way to the Brief.
+- **API:** a conversation's `Triage.request` (from `memex.triage.get` and `MailThread.triage`) is its open request's id.
 - **API:** `memex.triage.list`, `get`, `counts`, `set`, `mark`, `marks` and `unmark`; `MailThread.triage`.
 - **Not yet:** the pitch filter for Slack Connect strangers (chat counts everyone as known); the brief page and its keys (step 3).
 

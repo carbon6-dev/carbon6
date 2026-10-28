@@ -36,6 +36,29 @@ fn next_monday() -> u32 {
     (8 - today) % 7 + if today == 1 { 7 } else { 0 }
 }
 
+/// How a request is settled: the Brief's actions, Mail's too, so the two
+/// don't drift apart.
+#[derive(Clone, Copy)]
+pub(crate) enum Settle {
+    Done,
+    /// Snoozed until tomorrow at 9.
+    Tomorrow,
+    /// Snoozed until next Monday at 9.
+    NextWeek,
+    Drop,
+}
+
+/// Settles a request (done, dropped, or snoozed until a time).
+pub(crate) async fn settle(id: i64, how: Settle) -> Result<Value, String> {
+    let (status, until) = match how {
+        Settle::Done => ("done", None),
+        Settle::Tomorrow => ("snoozed", Some(at_nine(1))),
+        Settle::NextWeek => ("snoozed", Some(at_nine(next_monday()))),
+        Settle::Drop => ("dropped", None),
+    };
+    api::rpc("memex.requests.set", json!({"id": id, "status": status, "until": until})).await
+}
+
 /// Where a request came from, as icons: ✉ mail, 💬 chat.
 fn channels(r: &Request) -> String {
     let mail = r.sources.iter().any(|s| s.kind == "mail");
@@ -59,11 +82,10 @@ struct Brief {
 }
 
 impl Brief {
-    /// Settles a request (done, dropped, snoozed); an open one gives way to
-    /// the next.
-    fn settle(self, id: i64, status: &'static str, until: Option<i64>) {
+    /// Settles a request; an open one gives way to the next.
+    fn settle(self, id: i64, how: Settle) {
         spawn_local(async move {
-            match api::rpc("memex.requests.set", json!({"id": id, "status": status, "until": until})).await {
+            match settle(id, how).await {
                 Ok(_) => self.gone(id),
                 Err(e) => self.error.set(Some(e)),
             }
@@ -157,7 +179,7 @@ pub fn BriefPage() -> impl IntoView {
             h.clear();
         }
     });
-    let act = move |id: i64, status: &'static str, until: Option<i64>| b.settle(id, status, until);
+    let act = move |id: i64, how: Settle| b.settle(id, how);
     // The keys: J/K move, Enter opens, E done, H snooze to tomorrow, # drop,
     // Esc back to the list.
     let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
@@ -185,17 +207,17 @@ pub fn BriefPage() -> impl IntoView {
             "Escape" => open.set(None),
             "e" => {
                 if let Some(id) = current {
-                    act(id, "done", None);
+                    act(id, Settle::Done);
                 }
             }
             "h" => {
                 if let Some(id) = current {
-                    act(id, "snoozed", Some(at_nine(1)));
+                    act(id, Settle::Tomorrow);
                 }
             }
             "#" => {
                 if let Some(id) = current {
-                    act(id, "dropped", None);
+                    act(id, Settle::Drop);
                 }
             }
             _ => return,
@@ -403,7 +425,7 @@ fn Fyi(t: Triage, b: Brief) -> impl IntoView {
 #[component]
 fn RequestView(r: Request, b: Brief) -> impl IntoView {
     let (id, open) = (r.id, b.open);
-    let act = move |id: i64, status: &'static str, until: Option<i64>| b.settle(id, status, until);
+    let act = move |id: i64, how: Settle| b.settle(id, how);
     let refresh = RwSignal::new(0u32);
     view! {
         <div class="flex flex-col gap-4 lg:flex-row">
@@ -423,10 +445,10 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                 {(r.person.contains('@') && !r.sources.iter().any(|s| s.kind == "mail")).then(|| view! { <crate::understanding::Cards params=json!({"address": r.person.clone()}) /> })}
                 <DraftCard r=r.clone() b />
                 <div class="flex flex-wrap gap-2">
-                    <button class=BUTTON_QUIET on:click=move |_| act(id, "done", None)>"Done (E)"</button>
-                    <button class=BUTTON_QUIET on:click=move |_| act(id, "snoozed", Some(at_nine(1)))>"Tomorrow (H)"</button>
-                    <button class=BUTTON_QUIET on:click=move |_| act(id, "snoozed", Some(at_nine(next_monday())))>"Next week"</button>
-                    <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(id, "dropped", None)>"Drop (#)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::Done)>"Done (E)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::Tomorrow)>"Tomorrow (H)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::NextWeek)>"Next week"</button>
+                    <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(id, Settle::Drop)>"Drop (#)"</button>
                 </div>
                 <p class="text-xs text-zinc-400">"Or answer in a conversation: once you reply, it's done by itself."</p>
             </aside>
