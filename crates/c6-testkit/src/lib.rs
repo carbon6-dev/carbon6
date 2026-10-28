@@ -2,7 +2,7 @@
 //! conditions (docs/testing.md).
 
 pub mod wait;
-pub use wait::{eventually, have, need, port, within};
+pub use wait::{eventually, have, need, port, runnable, within};
 
 /// Raise this test process's soft open-file limit, if possible, before its
 /// parallel tests start. This is only for test harness startup hooks.

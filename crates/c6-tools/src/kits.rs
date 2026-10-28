@@ -788,7 +788,7 @@ exit 0
 
     #[cfg(unix)]
     impl Fake {
-        fn new() -> Self {
+        async fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let (state, work) = (dir.path().join("state"), dir.path().join("work"));
@@ -798,6 +798,8 @@ exit 0
             let rt = dir.path().join("docker");
             std::fs::write(&rt, FAKE.replace("@STATE@", &state.display().to_string())).unwrap();
             std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Till then a sweep could take "Text file busy" for nothing listed.
+            c6_testkit::runnable(&rt, &["version"]).await;
             Fake { rt: rt.display().to_string(), state, work, _dir: dir }
         }
 
@@ -846,7 +848,7 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn a_run_leaves_nothing_behind_however_it_ends() {
-        let f = Fake::new();
+        let f = Fake::new().await;
         let out = f.run("exit 3", 600, None).await.unwrap();
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(f.has(), [], "its command failed");
@@ -884,7 +886,7 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn a_sweep_takes_only_this_workers_leftovers() {
-        let f = Fake::new();
+        let f = Fake::new().await;
         let live = Made::new(&f.rt);
         let (net, proxy) = (format!("c6net-{}", live.id), format!("c6egress-{}", live.id));
         for (kind, name, label) in [
@@ -914,7 +916,7 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn out_of_network_ranges_a_run_sweeps_then_says_why() {
-        let f = Fake::new();
+        let f = Fake::new().await;
         std::fs::write(f.state.join("limit"), "2").unwrap();
         f.put("nets", "c6net-00000000000000a1", MINE);
         f.put("nets", "c6net-00000000000000a2", MINE);

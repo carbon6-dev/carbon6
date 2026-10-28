@@ -36,6 +36,18 @@ pub async fn within<F: Future>(what: &str, fut: F) -> F::Output {
     }
 }
 
+/// Waits until the program at `path`, just written, runs. A process
+/// another test started while it was open for writing holds it so till
+/// that process execs, and running it meanwhile fails ("Text file busy").
+/// It runs it with `args`, so they must ask it for nothing.
+pub async fn runnable(path: &std::path::Path, args: &[&str]) {
+    eventually("a program just written to run", async || {
+        let r = tokio::process::Command::new(path).args(args).output().await;
+        (r.err().map(|e| e.kind()) != Some(std::io::ErrorKind::ExecutableFileBusy)).then_some(())
+    })
+    .await
+}
+
 /// A port for a server that must come back on the same port (a head that
 /// restarts while its workers keep its address). Ports come from a range
 /// below every OS's ephemeral range, so no test binding port 0 is ever given
