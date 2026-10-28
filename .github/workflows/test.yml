@@ -27,7 +27,7 @@ jobs:
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
       # Lints don't depend on the OS: once, on Linux.
-      - name: Every target passes clippy without warnings (and the web UI for wasm), and the tests' lint
+      - name: The code is formatted (cargo fmt), every target passes clippy without warnings (and the web UI for wasm), and the tests' lint
         if: runner.os == 'Linux'
         run: make check
       - name: A git identity, for tests that commit

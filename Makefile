@@ -161,7 +161,8 @@ test: ## Run the test suite
 test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NEXTEST=1 for cargo nextest); it must pass as it does otherwise (docs/testing.md)
 	NEXTEST=$(NEXTEST) scripts/test-under-load.sh $(or $(RUNS),1)
 
-check: ## Clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
+check: ## Check formatting (cargo fmt), clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
+	@cargo fmt --all --check || { echo "check: unformatted code; run cargo fmt --all" >&2; exit 1; }
 	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
 		if cargo clippy --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
 			echo "check: warnings or errors in cargo clippy $$args" >&2; exit 1; \
@@ -194,7 +195,8 @@ site: ## Build the website into dist/site
 site-serve: site ## Build the website and serve it on http://127.0.0.1:8000 (SITE_PORT)
 	python3 -m http.server $(SITE_PORT) --bind 127.0.0.1 --directory dist/site
 
-site-check: ## Test the website's generator and fail on any clippy warning
+site-check: ## Check the website generator's formatting (cargo fmt), test it, and fail on any clippy warning
+	cargo fmt --manifest-path site/Cargo.toml --all --check
 	cargo clippy --locked --manifest-path site/Cargo.toml --all-targets -- -D warnings
 	cargo test --locked --manifest-path site/Cargo.toml
 
