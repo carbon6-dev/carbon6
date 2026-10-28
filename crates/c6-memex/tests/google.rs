@@ -666,8 +666,13 @@ async fn google_mail_calendar_contacts() {
     .await;
     assert!(work.as_array().unwrap().iter().all(|t| t["account"] == work_accounts[0].id.as_str()), "{work}");
     assert_eq!(rpc("memex.mail.threads", json!({"view": "all"})).await.as_array().unwrap().len(), home_threads, "home's mail is apart");
-    let s = work_rpc("memex.google", json!({})).await;
-    assert!(s["sync"].as_array().unwrap().iter().any(|x| x["kind"] == "mail" && x["email"] == "me@work.example"), "{s}");
+    // The batch stores its sync record after its mail: seeing threads
+    // doesn't yet mean the work account's sync status is visible.
+    eventually("the work mailbox's sync status", async || {
+        let s = work_rpc("memex.google", json!({})).await;
+        s["sync"].as_array()?.iter().any(|x| x["kind"] == "mail" && x["email"] == "me@work.example").then_some(())
+    })
+    .await;
     // Archiving there goes through work's gmail app.
     let t = &work[0];
     work_rpc("memex.mail.modify", json!({"account": t["account"], "thread_id": t["thread_id"], "remove": ["INBOX"]})).await;
