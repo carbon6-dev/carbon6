@@ -77,7 +77,8 @@ pub async fn enroll_via(token: &str, head: Option<&str>) -> anyhow::Result<Ident
 fn override_head(token_url: &str, head: &str) -> anyhow::Result<(String, Option<String>)> {
     let uri: tonic::codegen::http::Uri = token_url.parse().context("bad head URL in token")?;
     let domain = uri.host().context("head URL has no host")?.trim_start_matches('[').trim_end_matches(']').to_owned();
-    let given: tonic::codegen::http::uri::Authority = head.parse().with_context(|| format!("bad --head {head:?}; use host or host:port"))?;
+    let given: tonic::codegen::http::uri::Authority =
+        head.parse().with_context(|| format!("bad --head {head:?}; use host or host:port"))?;
     let port = given.port_u16().or_else(|| uri.port_u16());
     let host = given.host();
     let url = match port {
