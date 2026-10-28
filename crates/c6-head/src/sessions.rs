@@ -116,7 +116,7 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         return Err(bad_request(format!("{} is not available to realm {realm}", worker.name)));
     }
     let cwd = req.cwd.trim().to_owned();
-    let (connection_id, model, subagent_model) = {
+    let (connection_id, model, subagent_model, subagent_connection_id, subagent_effort) = {
         let mut route_labels = labels.clone();
         route_labels.extend(api::labels::auto_labels(&worker.name, "", if cwd.starts_with('/') { &cwd } else { "" }, "", "", &ssh));
         if let Some(why) = crate::usage::blocked(st, &route_labels, &realm).await? {
@@ -126,7 +126,7 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         if effort.is_none() {
             effort = check_effort(Some(routed.effort))?;
         }
-        (routed.connection, routed.model, routed.subagent_model)
+        (routed.connection, routed.model, routed.subagent_model, routed.subagent_connection, routed.subagent_effort)
     };
     if let Some(c) = st.store.connection(&connection_id).await?
         && !crate::realms::available(&c.realms, &realm)
@@ -165,6 +165,8 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         ssh_target: ssh.clone(),
         awaiting: 0,
         subagent_model,
+        subagent_connection_id,
+        subagent_effort,
         realm,
         agent: String::new(),
         end_reason: String::new(),
@@ -238,6 +240,8 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         ssh_target: String::new(),
         awaiting: 0,
         subagent_model: String::new(),
+        subagent_connection_id: String::new(),
+        subagent_effort: String::new(),
         realm: realm.clone(),
         agent: String::new(),
         end_reason: String::new(),
@@ -307,6 +311,8 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         ssh_target: parent.ssh_target.clone(),
         awaiting: 0,
         subagent_model: parent.subagent_model.clone(),
+        subagent_connection_id: parent.subagent_connection_id.clone(),
+        subagent_effort: parent.subagent_effort.clone(),
         // A side chat is in its parent's realm.
         realm: parent.realm.clone(),
         agent: String::new(),
@@ -359,6 +365,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
     let memex = crate::memex::ready(st);
     let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    let connections = st.store.connections().await?;
+    let subagent_connections = subagent_connections(&connections, &row.realm);
     let limits = subagent_limits(st, Some(&row.realm)).await?;
     // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
     let base = crate::prompts::get(st, "session.base", &row.realm).await;
@@ -387,6 +395,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         memories_json: crate::memory::for_sessions_of(st, &row.realm, &row.instance).await?,
         policies_json: with_builtin_policies(st, st.store.setting_in(POLICIES, &row.realm, &row.instance).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
+        subagent_target: subagent_target(row, &connections),
+        subagent_connections_json: serde_json::to_string(&subagent_connections)?,
         memex_brief: String::new(),
         memex_tools: memex,
         memex_mail: memex && scope.iter().any(|k| k == "email"),
@@ -397,6 +407,45 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         delegation: None,
         max_subagent_depth: limits.max_depth,
         max_running_subagents: limits.max_running,
+    })
+}
+
+/// The connections subagents in `realm` may run on: those the realm may use,
+/// but not Claude Code (a subagent runs in carbon6's own loop).
+fn subagent_connections(connections: &[crate::store::ConnectionRow], realm: &str) -> Vec<api::SubagentConnection> {
+    connections
+        .iter()
+        .filter(|c| c.kind != "claude_code" && crate::realms::available(&c.realms, realm))
+        .map(|c| api::SubagentConnection {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            kind: c.kind.clone(),
+            default_model: c.default_model.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// The default for a session's subagents, from its row: `None` when they
+/// run on the session's own model.
+fn subagent_target(row: &SessionRow, connections: &[crate::store::ConnectionRow]) -> Option<ModelSpec> {
+    let model = row.subagent_model.trim();
+    let connection_id = row.subagent_connection_id.trim();
+    if model.is_empty() && connection_id.is_empty() {
+        return None;
+    }
+    let connection_id = if connection_id.is_empty() { row.connection_id.as_str() } else { connection_id };
+    let c = connections.iter().find(|c| c.id == connection_id)?;
+    let model = match model {
+        "" if c.id == row.connection_id => row.model.clone(),
+        "" => c.default_model.clone().unwrap_or_default(),
+        m => m.to_owned(),
+    };
+    Some(ModelSpec {
+        connection_id: c.id.clone(),
+        model,
+        max_output_tokens: 0,
+        effort: row.subagent_effort.trim().to_owned(),
+        connection_kind: c.kind.clone(),
     })
 }
 
@@ -586,6 +635,45 @@ pub async fn set_colour(st: &HeadState, session_id: &str, colour: &str) -> anyho
     if !st.store.set_session_colour(session_id, colour).await? {
         return Err(not_found("no such session"));
     }
+    st.registry.bump();
+    let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(crate::convert::session(&row))
+}
+
+/// Sets the default for a session's subagents from now on: its row (for
+/// the UI and a restored spec) and, through a queued command, the worker.
+pub async fn set_subagent_model(st: &HeadState, session_id: &str, req: &api::SetSubagentModel) -> anyhow::Result<api::Session> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.observed {
+        return Err(bad_request("this is Claude Code's own subagent: it is shown here, and Claude Code runs it"));
+    }
+    let model = req.model.trim();
+    let spec = if model.is_empty() {
+        None
+    } else {
+        let effort = check_effort(Some(req.effort.trim().to_owned()))?.unwrap_or_default();
+        let connection_id = if req.connection_id.trim().is_empty() { session.connection_id.as_str() } else { req.connection_id.trim() };
+        let c = st.store.connection(connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+        if c.kind == "claude_code" {
+            return Err(bad_request("subagents run in carbon6's own loop, not on Claude Code: pick an API connection for them"));
+        }
+        if !crate::realms::available(&c.realms, &session.realm) {
+            return Err(bad_request(format!("the connection {} is not available to realm {}", c.name, session.realm)));
+        }
+        Some(ModelSpec { connection_id: c.id, model: model.to_owned(), max_output_tokens: 0, effort, connection_kind: c.kind })
+    };
+    let (c, m, e) = spec.as_ref().map(|s| (s.connection_id.as_str(), s.model.as_str(), s.effort.as_str())).unwrap_or_default();
+    st.store.set_subagent_model(session_id, c, m, e).await?;
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    let id = Uuid::now_v7().to_string();
+    let data = SessionCommand {
+        command_id: id.clone(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::SetSubagentModel(c6_proto::SetSubagentModel { model: spec })),
+    }
+    .encode_to_vec();
+    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: None }).await?;
+    st.registry.deliver(worker_id);
     st.registry.bump();
     let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
     Ok(crate::convert::session(&row))
@@ -858,6 +946,9 @@ struct Routed {
     model: String,
     effort: String,
     subagent_model: String,
+    /// The subagents' connection (an id; empty: the session's) and effort.
+    subagent_connection: String,
+    subagent_effort: String,
 }
 
 /// Fills in what a new session left out. A model given: as is (on the
@@ -901,11 +992,21 @@ async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String],
             ("", rc) => rc.to_owned(),
             (c, _) => c.to_owned(),
         };
+        // A subagent connection that is gone: the session's.
+        let subagent_connection = connections
+            .iter()
+            .find(|c| {
+                !r.subagent_connection.trim().is_empty() && (c.id == r.subagent_connection.trim() || c.name == r.subagent_connection.trim())
+            })
+            .map(|c| c.id.clone())
+            .unwrap_or_default();
         return Ok(Routed {
             connection,
             model: r.model.trim().to_owned(),
             effort: r.effort,
             subagent_model: r.subagent_model.trim().to_owned(),
+            subagent_connection,
+            subagent_effort: r.subagent_effort.trim().to_owned(),
         });
     }
     let connection = match (connection, st.store.latest_model("").await?) {
@@ -938,6 +1039,23 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
             return Err(bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)));
         }
         check_effort(Some(r.effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: {e}", r.name)))?;
+        let sub = r.subagent_connection.trim();
+        if !sub.is_empty() {
+            match connections.iter().find(|c| c.id == sub || c.name == sub) {
+                None => return Err(bad_request(format!("routing rule {:?}: no connection {sub:?} for subagents", r.name))),
+                Some(c) if c.kind == "claude_code" => {
+                    return Err(bad_request(format!(
+                        "routing rule {:?}: subagents run in carbon6's own loop, not on Claude Code; pick an API connection for them",
+                        r.name
+                    )));
+                }
+                Some(_) => {}
+            }
+            if r.subagent_model.trim().is_empty() {
+                return Err(bad_request(format!("routing rule {:?}: a subagent connection needs a subagent model", r.name)));
+            }
+        }
+        check_effort(Some(r.subagent_effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: subagent {e}", r.name)))?;
         check_selector(&r.applies_to)?;
     }
     Ok(())
@@ -1335,6 +1453,14 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
             return grant;
         }
     };
+    // A worker gets a connection only if some realm it serves may use it
+    // (a subagent may pick its connection on the worker).
+    if let Some(worker_id) = worker_id
+        && !worker_may_use(st, worker_id, &conn.realms).await
+    {
+        grant.error = format!("the connection {} is not available to any realm this worker serves", conn.name);
+        return grant;
+    }
     grant.kind = conn.kind.clone();
     grant.base_url = conn.base_url.clone();
     if conn.kind == "chatgpt" {
@@ -1358,6 +1484,23 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
         }
     }
     grant
+}
+
+/// Whether a worker serves a realm a connection kept to `connection_realms`
+/// (JSON; empty: every realm) is available to.
+async fn worker_may_use(st: &HeadState, worker_id: WorkerId, connection_realms: &str) -> bool {
+    let kept: Vec<String> = serde_json::from_str(connection_realms).unwrap_or_default();
+    if kept.is_empty() {
+        return true;
+    }
+    match st.store.worker(worker_id).await {
+        Ok(Some(w)) => {
+            let serves: Vec<String> = serde_json::from_str(&w.realms).unwrap_or_default();
+            serves.is_empty() || serves.iter().any(|r| kept.contains(r))
+        }
+        // The head's own nodes and unknown ones: as before.
+        _ => true,
+    }
 }
 
 /// Current ChatGPT tokens for a connection, refreshed here (never on

@@ -409,7 +409,7 @@ The host inventory (**Settings → Hosts**) lists machines your workers reach ov
 
 Routing rules (**Settings → Model routing**) choose the connection and model for sessions started without one: from the new-session form on **Auto**, `c6 run` without `--model`, and templates or automations that leave the model empty.
 
-- **A rule:** labels it applies to (yours, or `worker:`, `folder:`, `host:`, `template:`; a bare `host:` means any SSH host), a connection (optional), a model, an effort and, optionally, a cheaper model for subagents. A named agent's own model still wins.
+- **A rule:** labels it applies to (yours, or `worker:`, `folder:`, `host:`, `template:`; a bare `host:` means any SSH host), a connection (optional), a model, an effort and, optionally, a connection, model and effort for subagents (any API connection, not Claude Code). A named agent's model, or one a Task call asks for, still wins.
 - **Order:** the first enabled rule that matches wins. A session started on a given connection only takes rules for that connection (or for any).
 - **No match:** the connection of your latest session (if you didn't pick one), its default model, else the model of your latest session on it.
 - **Presets:** Opus with Haiku subagents everywhere, remote hosts on a fast model at low effort, research at high effort, a template on a local model.
@@ -546,7 +546,8 @@ The agent can hand work to a subagent with the Task tool. A subagent is a sessio
 - **Where its report goes.** A report from a turn the agent waited on comes back as the call's result. For a turn you started, the report goes to the agent that started the subagent: at its next step if it's working, or with its next message if it's idle. Tick **Wake the agent that started it** to have it react right away.
 - **Nesting.** Subagents can start subagents of their own. **Settings → Agents → Subagent limits** sets how deep (3 by default) and how many may work at once below one session (16).
 - **Asking about one.** **↳ Ask** works in a subagent's thread too: the side chat sees its conversation and doesn't disturb it.
-- **Claude Code sessions.** Claude Code's own subagents show as threads too, read-only: Claude Code runs and continues them.
+- **Where one runs.** A subagent can run on another connection and model than its session, on any API connection its realm may use. carbon6 runs it itself, whatever the session runs on. Ask for one in your message ("use a subagent on my ChatGPT connection with gpt-6.1-sol at high"), and the agent passes it to Task. Or set the session's default in the **Subagents** row under the message box, or in a routing rule. A named agent can name one as `connection/model`. The thread shows "connection · model".
+- **Claude Code sessions.** Claude Code's own subagents show as threads too, read-only: Claude Code runs and continues them. Claude Code also gets carbon6's Task and SendMessage over MCP (`mcp__carbon6__Task`), so it can hand work to subagents on any other connection.
 
 ### Rewind and edit
 

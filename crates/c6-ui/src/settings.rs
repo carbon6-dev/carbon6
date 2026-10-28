@@ -205,7 +205,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="routes"
                         title="Model routing"
                         noun="rule"
-                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent model, if set, runs the Task tool's subagents (a named agent's own model still wins)."
+                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session)."
                         fields=ROUTE_FIELDS
                         examples=route_examples
                     />
@@ -2528,11 +2528,18 @@ const ROUTE_FIELDS: &[Field] = &[
     Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-5-5", kind: FieldKind::Model },
     Field { key: "effort", label: "Effort", placeholder: "the model's default; or low, medium, high, xhigh, max", kind: FieldKind::Mono },
     Field {
+        key: "subagent_connection",
+        label: "Subagent connection",
+        placeholder: "the session's (not Claude Code: carbon6 runs subagents itself)",
+        kind: FieldKind::Connection,
+    },
+    Field {
         key: "subagent_model",
         label: "Subagent model",
         placeholder: "the session's; or e.g. claude-haiku-4-5",
         kind: FieldKind::Model,
     },
+    Field { key: "subagent_effort", label: "Subagent effort", placeholder: "the model's default; or low … max", kind: FieldKind::Mono },
 ];
 
 fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
@@ -2945,7 +2952,14 @@ fn ListItem(
                         </label>
                     }.into_any()
                 } else if f.kind == FieldKind::Model {
-                    let connection = Signal::derive(move || item.with(|m| m.get("connection").and_then(|v| v.as_str()).unwrap_or("").to_owned()));
+                    // The subagent model lists its own connection's models, once one is picked.
+                    let connection = Signal::derive(move || {
+                        item.with(|m| {
+                            let s = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                            let sub = s("subagent_connection");
+                            if f.key == "subagent_model" && !sub.is_empty() { sub } else { s("connection") }
+                        })
+                    });
                     view! {
                         <label class="space-y-0.5">
                             <span class="text-xs text-zinc-500">{f.label}</span>

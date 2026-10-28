@@ -32,6 +32,9 @@ pub struct SessionManager {
     actors: Arc<Mutex<HashMap<String, Handle>>>,
     /// Delegations running per top-level session (for its limit).
     working: Arc<Mutex<HashMap<String, usize>>>,
+    /// The MCP server that gives Claude Code sessions carbon6's subagents
+    /// (started on first use; `None` if it could not start).
+    bridge: Arc<tokio::sync::OnceCell<Option<Arc<crate::mcp_bridge::Bridge>>>>,
 }
 
 /// One delegation counted against its tree's limit until dropped.
@@ -62,6 +65,9 @@ struct Handle {
     tools: Arc<SessionTools>,
     /// A turn is running.
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// It runs Claude Code, whose tools carbon6 does not run (so its
+    /// subagents do not share them).
+    claude_code: bool,
 }
 
 /// How a delegation's turn ended.
@@ -176,6 +182,12 @@ pub(crate) enum ActorMsg {
     Published(c6_tools::Published),
     /// The agent changed a memory note.
     Memory(c6_tools::MemoryChange),
+    /// The session's default for its subagents changed (`None`: its own
+    /// model).
+    SetSubagentModel {
+        command_id: String,
+        model: Option<ModelSpec>,
+    },
     /// The agent sent you a notification.
     Notice(c6_tools::Notice),
     /// A tool call held for approval, or what became of it.
@@ -205,7 +217,22 @@ impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
         prune_browser_profiles(&state_dir.join("browser"), std::time::Duration::from_secs(30 * 24 * 3600));
-        Self { journal, link, worktrees, state_dir, actors: Arc::default(), working: Arc::default() }
+        Self { journal, link, worktrees, state_dir, actors: Arc::default(), working: Arc::default(), bridge: Arc::default() }
+    }
+
+    /// The MCP server for Claude Code sessions' subagents, started on first
+    /// use.
+    async fn bridge(&self) -> Option<Arc<crate::mcp_bridge::Bridge>> {
+        self.bridge
+            .get_or_init(|| async {
+                crate::mcp_bridge::Bridge::start()
+                    .await
+                    .map(Arc::new)
+                    .inspect_err(|e| warn!("the MCP bridge for Claude Code did not start: {e:#}"))
+                    .ok()
+            })
+            .await
+            .clone()
     }
 
     /// Session ids with a live actor.
@@ -377,6 +404,17 @@ impl SessionManager {
             }
             // Questions are the head's assistant's; worker sessions ask none.
             Some(session_command::Kind::Answer(_)) => Ok(()),
+            Some(session_command::Kind::SetSubagentModel(m)) => {
+                if self.journal.is_applied(&cmd.command_id).await.map_err(internal)? {
+                    return Ok(());
+                }
+                if m.model.as_ref().is_some_and(|m| m.connection_kind == "claude_code") {
+                    return Err("subagents run in carbon6's own loop, not on Claude Code".into());
+                }
+                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+                let _ = actor.send(ActorMsg::SetSubagentModel { command_id: cmd.command_id, model: m.model });
+                Ok(())
+            }
             Some(session_command::Kind::Approve(a)) => {
                 if let Some(actor) = self.live(&cmd.session_id) {
                     let _ = actor.send(ActorMsg::Decide { call_id: a.call_id, allow: a.allow });
@@ -521,26 +559,7 @@ impl SessionManager {
             {
                 prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
             }
-            // Your notes, by their scope; then what the knowledge store
-            // knows about this session's things (it leaves the notes out).
-            prompt.push_str(&memory_section(&spec, &labels));
-            if !spec.memex_brief.trim().is_empty() {
-                prompt.push_str("\n\n# Memex\n\n");
-                prompt.push_str(spec.memex_brief.trim());
-            }
-            let secrets = applicable_secrets(&spec, &labels);
-            if !secrets.is_empty() {
-                prompt.push_str(
-                    "\n\n# Secrets\n\nThese environment variables hold secrets for your shell commands. Use them by name (for example \"$NAME\"), never \
-                     print or echo them, and do not write them into files; their values are hidden from you and replaced by [secret:NAME] in output.\n",
-                );
-                for (name, description) in &secrets {
-                    prompt.push_str(&format!(
-                        "- {name}{}\n",
-                        if description.is_empty() { String::new() } else { format!(": {description}") }
-                    ));
-                }
-            }
+            prompt.push_str(&context_sections(&spec, &labels));
             // When to propose task cards (docs/task-cards.md): an editable prompt.
             if built.tools.iter().any(|t| c6_tools::knowledge::is_task_card(&t.spec().name)) {
                 let guidance = spec_prompt(&spec, "session.task_cards", "");
@@ -711,8 +730,35 @@ impl SessionManager {
 
     /// The shared tool state of a subagent's parent, starting the parent's
     /// actor if needed (after a restart, a subagent may be loaded first).
+    /// None for a Claude Code parent: carbon6 runs none of its tools, so
+    /// its subagents work with hooks, policies and sinks of their own.
     fn parent_tools<'a>(&'a self, parent_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<Arc<SessionTools>>>> {
-        Box::pin(async move { Ok(self.load(parent_id).await?.map(|h| h.tools)) })
+        Box::pin(async move { Ok(self.load(parent_id).await?.filter(|h| !h.claude_code).map(|h| h.tools)) })
+    }
+
+    /// A session's tools in `profile`, built afresh: for a session loaded
+    /// from its log, and for a subagent whose model takes another tool
+    /// profile than its parent's (whose tools it cannot share).
+    pub(crate) async fn session_tool_set(
+        &self,
+        session_id: &str,
+        spec: &CreateSession,
+        started: &SessionStarted,
+        profile: ToolProfile,
+    ) -> BuiltTools {
+        // Secrets go by the tree's top-level session.
+        let on_behalf_of = spec.delegation.as_ref().map_or(session_id, |d| d.root_session_id.as_str());
+        let local = if started.ssh_target.is_empty() {
+            PathBuf::from(&started.cwd)
+        } else {
+            let dir = self.state_dir.join("scratch").join(session_id);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        };
+        let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(spec), &started.ssh_target);
+        let names: Vec<String> = applicable_secrets(spec, &labels).into_iter().map(|(n, _)| n).collect();
+        let (secret_values, _) = fetch_secrets(&self.link, on_behalf_of, &names).await;
+        build_tools(spec, &local, profile, &labels, &secret_values).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -751,11 +797,7 @@ impl SessionManager {
             Some(t) => t,
             None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
             None => {
-                let labels =
-                    session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
-                let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
-                let (secret_values, _) = fetch_secrets(&self.link, &on_behalf_of, &names).await;
-                let built = build_tools(&spec, &local, ToolProfile::parse(&started.tool_profile), &labels, &secret_values).await.tools;
+                let built = self.session_tool_set(session_id, &spec, &started, ToolProfile::parse(&started.tool_profile)).await.tools;
                 // A subagent keeps the tools it started with.
                 match &delegation {
                     Some(_) => built.into_iter().filter(|t| started.tools.contains(&t.spec().name)).collect(),
@@ -864,6 +906,7 @@ impl SessionManager {
                 }
             });
         }
+        let spec_default = spec.clone();
         let actor = Actor {
             spec,
             session_tools,
@@ -884,10 +927,16 @@ impl SessionManager {
             on_behalf_of,
             waiting: Vec::new(),
             manager: self.clone(),
+            subagent_default: Arc::new(Mutex::new(crate::subagent::SubagentDefault::of(&spec_default))),
             running_flag: Arc::default(),
             report: None,
         };
-        let handle = Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone() };
+        let handle = Handle {
+            tx,
+            tools: actor.session_tools.clone(),
+            running: actor.running_flag.clone(),
+            claude_code: actor.started.tool_profile == crate::claude_code::PROFILE,
+        };
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
         Ok(handle)
@@ -912,6 +961,13 @@ fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> C
     }) {
         spec.model = Some(m);
     }
+    // And its subagents' default, as last set.
+    if let Some(m) = events.iter().rev().find_map(|e| match &e.kind {
+        Some(session_event::Kind::SubagentModelSet(m)) => Some(m.model.clone()),
+        _ => None,
+    }) {
+        set_subagent_default(spec, m);
+    }
     let current = spec.model.as_ref().map(key);
     // Start of the current model's run: just after the last event naming
     // another model, at the next event naming this one.
@@ -935,6 +991,13 @@ fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> C
         })
         .unwrap_or(0);
     Conversation { history, context_tokens }
+}
+
+/// Sets a spec's default for its subagents (`None`: the session's own
+/// model).
+fn set_subagent_default(spec: &mut CreateSession, model: Option<ModelSpec>) {
+    spec.subagent_target = model;
+    spec.subagent_model.clear();
 }
 
 /// How the log's last turn ended: its reason, final assistant text and
@@ -1038,6 +1101,9 @@ struct Actor {
     waiting: Vec<(String, tokio::sync::oneshot::Sender<Outcome>)>,
     /// To start subagents.
     manager: SessionManager,
+    /// The default for its subagents (as in `spec`), shared with a running
+    /// turn's subagent runner.
+    subagent_default: crate::subagent::SharedDefault,
     /// Shared with the manager: a turn is running.
     running_flag: Arc<std::sync::atomic::AtomicBool>,
     /// A subagent's inputs since its last report that no call waits on
@@ -1223,6 +1289,16 @@ impl Actor {
                             error!(session = %self.writer.session_id, "recording a memory change: {e:#}");
                             return;
                         }
+                    }
+                    Some(ActorMsg::SetSubagentModel { command_id, model }) => {
+                        let ev = c6_proto::SubagentModelSet { model: model.clone(), command_id };
+                        if let Err(e) = self.writer.append(session_event::Kind::SubagentModelSet(ev)).await {
+                            error!(session = %self.writer.session_id, "recording the subagents' model: {e:#}");
+                            return;
+                        }
+                        set_subagent_default(&mut self.spec, model);
+                        *self.subagent_default.lock().unwrap() = crate::subagent::SubagentDefault::of(&self.spec);
+                        info!(session = %self.writer.session_id, "subagent model set");
                     }
                     Some(ActorMsg::Notice(n)) => {
                         let notice = c6_proto::Notice { title: n.title, message: n.message, priority: n.priority };
@@ -1441,6 +1517,25 @@ impl Actor {
         Ok(())
     }
 
+    /// The tools a Claude Code session gets over MCP: carbon6's `Task` and
+    /// `SendMessage` (no background runs: nothing could deliver their
+    /// notices to Claude Code). None without a connection to run on.
+    fn claude_code_subagent_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let depth = self.spec.delegation.as_ref().map_or(0, |d| d.depth);
+        let connections = task_connections(&self.spec);
+        if connections.is_empty() || !crate::subagent::may_delegate(&self.spec, depth) {
+            return Vec::new();
+        }
+        let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
+        let labels =
+            session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
+        let agents = session_agents(&self.spec, &labels);
+        vec![
+            Arc::new(c6_tools::Task::with_agents(true, agents).with_connections(connections).foreground_only()),
+            Arc::new(c6_tools::SendMessage::claude().foreground_only()),
+        ]
+    }
+
     fn start_turn(&mut self) -> (tokio::task::JoinHandle<Option<Conversation>>, CancellationToken) {
         self.turns += 1;
         let turn = self.turns;
@@ -1467,6 +1562,7 @@ impl Actor {
             started: self.started.clone(),
             log: self.writer.clone(),
             manager: self.manager.clone(),
+            default: self.subagent_default.clone(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -1492,6 +1588,9 @@ impl Actor {
             applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
         };
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
+        // carbon6's subagents, offered to Claude Code over MCP.
+        let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
+        let (manager, journal) = (self.manager.clone(), self.journal.clone());
         // Claude Code's own subagents are mirrored into sessions of their own.
         let observer = crate::claude_code::Observer {
             journal: self.journal.clone(),
@@ -1531,6 +1630,21 @@ impl Actor {
                 }
             }
             let result = if claude_code {
+                let registration = match (bridge_tools.is_empty(), manager.bridge().await) {
+                    (false, Some(bridge)) => {
+                        session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, &[]))));
+                        Some(bridge.register(crate::mcp_bridge::Entry {
+                            session_id: writer.session_id.clone(),
+                            session: session_tools.clone(),
+                            tools: bridge_tools,
+                            cancel: c.clone(),
+                            journal,
+                            matched: Mutex::default(),
+                        }))
+                    }
+                    _ => None,
+                };
+                let mcp_config = registration.as_ref().map(|r| r.mcp_config());
                 let inputs = inbox.lock().unwrap().drain();
                 // Claude Code keeps its own history: a side chat's context
                 // goes in as text with the first question.
@@ -1540,7 +1654,7 @@ impl Actor {
                         c6_agent::transcript_text(&seed)
                     )
                 });
-                crate::claude_code::run_turn(
+                let result = crate::claude_code::run_turn(
                     turn,
                     &writer.session_id,
                     &session_tools.cwd(),
@@ -1549,12 +1663,16 @@ impl Actor {
                     inputs,
                     preamble.as_deref(),
                     claude_settings.as_deref(),
+                    mcp_config.as_deref(),
                     &sink,
                     Some(&observer),
                     &c,
                 )
                 .await
-                .map(drop)
+                .map(drop);
+                drop(registration);
+                session_tools.set_subagents(None);
+                result
             } else {
                 run_session_turn(turn, &cfg, &model.connection_id, &link, &tools, &session_tools, &sink, &mut conv, &inbox, &c, sub).await
             };
@@ -1617,7 +1735,7 @@ async fn run_session_turn(
         return Ok(());
     }
     let mut pending = || inbox.lock().unwrap().drain();
-    session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, cfg, client.clone(), tools))));
+    session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, tools))));
     let result = run_turn(turn, cfg, client.as_ref(), tools, session_tools, sink, conv, &mut pending, cancel).await;
     session_tools.set_subagents(None);
     result?;
@@ -1733,6 +1851,53 @@ fn applicable<T>(items: Vec<T>, name: impl Fn(&T) -> &str, applies_to: impl Fn(&
     items.into_iter().zip(keep).filter_map(|(it, k)| k.then_some(it)).collect()
 }
 
+/// The named agents (from the head's settings) that apply to a session.
+pub(crate) fn session_agents(spec: &CreateSession, labels: &[String]) -> Vec<c6_tools::AgentDef> {
+    #[derive(serde::Deserialize)]
+    struct HeadAgent {
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        tools: String,
+        #[serde(default)]
+        model: String,
+        prompt: String,
+        #[serde(default = "yes")]
+        enabled: bool,
+        #[serde(default)]
+        applies_to: Vec<String>,
+    }
+    let all: Vec<HeadAgent> = serde_json::from_str::<Vec<HeadAgent>>(&spec.agents_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.enabled && !a.prompt.trim().is_empty())
+        .collect();
+    applicable(all, |a| &a.name, |a| &a.applies_to, labels)
+        .into_iter()
+        .map(|a| c6_tools::AgentDef {
+            name: a.name,
+            description: a.description,
+            tools: a.tools.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect(),
+            model: a.model,
+            prompt: a.prompt,
+        })
+        .collect()
+}
+
+/// The connections a session's subagents may run on (from the head).
+pub(crate) fn subagent_connections(spec: &CreateSession) -> Vec<c6_api::SubagentConnection> {
+    serde_json::from_str(&spec.subagent_connections_json).unwrap_or_default()
+}
+
+/// Those connections, as `Task` lists them.
+pub(crate) fn task_connections(spec: &CreateSession) -> Vec<c6_tools::ConnectionInfo> {
+    subagent_connections(spec)
+        .into_iter()
+        .map(|c| c6_tools::ConnectionInfo { name: c.name, kind: c.kind, default_model: c.default_model })
+        .collect()
+}
+
 pub(crate) async fn build_tools(
     spec: &CreateSession,
     cwd: &std::path::Path,
@@ -1809,41 +1974,14 @@ pub(crate) async fn build_tools(
     if let Some(chrome) = c6_tools::browser::find_chrome() {
         tools.push(Arc::new(c6_tools::browser::BrowserTool::new(profile == ToolProfile::Claude, chrome)));
     }
-    // Named agents (from the head's settings) become Task's subagent types.
-    #[derive(serde::Deserialize)]
-    struct HeadAgent {
-        name: String,
-        #[serde(default)]
-        description: String,
-        #[serde(default)]
-        tools: String,
-        #[serde(default)]
-        model: String,
-        prompt: String,
-        #[serde(default = "yes")]
-        enabled: bool,
-        #[serde(default)]
-        applies_to: Vec<String>,
-    }
-    let all: Vec<HeadAgent> = serde_json::from_str::<Vec<HeadAgent>>(&spec.agents_json)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.enabled && !a.prompt.trim().is_empty())
-        .collect();
-    let agents: Vec<c6_tools::AgentDef> = applicable(all, |a| &a.name, |a| &a.applies_to, labels)
-        .into_iter()
-        .map(|a| c6_tools::AgentDef {
-            name: a.name,
-            description: a.description,
-            tools: a.tools.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect(),
-            model: a.model,
-            prompt: a.prompt,
-        })
-        .collect();
-    if !agents.is_empty()
+    // Named agents (from the head's settings) become Task's subagent types,
+    // and it offers the connections subagents may run on.
+    let agents = session_agents(spec, labels);
+    let connections = task_connections(spec);
+    if (!agents.is_empty() || !connections.is_empty())
         && let Some(i) = tools.iter().position(|t| c6_tools::Task::is_task(&t.spec().name))
     {
-        tools[i] = Arc::new(c6_tools::Task::with_agents(profile == ToolProfile::Claude, agents));
+        tools[i] = Arc::new(c6_tools::Task::with_agents(profile == ToolProfile::Claude, agents).with_connections(connections));
     }
 
     #[derive(serde::Deserialize)]
@@ -2012,6 +2150,42 @@ fn prune_browser_profiles(dir: &Path, age: std::time::Duration) {
 /// Where a session's prompt says when to propose task cards; a subagent,
 /// which has no such tools, leaves the section out.
 pub(crate) const TASK_CARDS_HEADING: &str = "\n\n# Task cards\n\n";
+
+/// The system prompt's sections from the head's context: your notes, the
+/// memex brief and the secrets that apply.
+pub(crate) fn context_sections(spec: &CreateSession, labels: &[String]) -> String {
+    let mut prompt = String::new();
+    // Your notes, by their scope; then what the knowledge store
+    // knows about this session's things (it leaves the notes out).
+    prompt.push_str(&memory_section(spec, labels));
+    if !spec.memex_brief.trim().is_empty() {
+        prompt.push_str("\n\n# Memex\n\n");
+        prompt.push_str(spec.memex_brief.trim());
+    }
+    let secrets = applicable_secrets(spec, labels);
+    if !secrets.is_empty() {
+        prompt.push_str(
+            "\n\n# Secrets\n\nThese environment variables hold secrets for your shell commands. Use them by name (for example \"$NAME\"), never \
+             print or echo them, and do not write them into files; their values are hidden from you and replaced by [secret:NAME] in output.\n",
+        );
+        for (name, description) in &secrets {
+            prompt.push_str(&format!("- {name}{}\n", if description.is_empty() { String::new() } else { format!(": {description}") }));
+        }
+    }
+    prompt
+}
+
+/// The heading of the system prompt's skills index.
+pub(crate) const SKILLS_HEADING: &str = "\n\n# Skills\n\n";
+
+/// `prompt` without its skills index (another tool profile names the
+/// skill tool differently).
+pub(crate) fn without_skills(prompt: &str) -> String {
+    let Some(start) = prompt.find(SKILLS_HEADING) else { return prompt.to_owned() };
+    let rest = &prompt[start + SKILLS_HEADING.len()..];
+    let end = rest.find("\n\n# ").map(|i| start + SKILLS_HEADING.len() + i).unwrap_or(prompt.len());
+    format!("{}{}", &prompt[..start], &prompt[end..])
+}
 
 /// `prompt` without its task-cards section.
 pub(crate) fn without_task_cards(prompt: &str) -> String {

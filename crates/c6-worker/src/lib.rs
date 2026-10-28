@@ -11,6 +11,7 @@ pub mod identity;
 pub mod imports;
 pub mod journal;
 pub mod link;
+mod mcp_bridge;
 pub mod mentions;
 pub mod policy;
 pub mod pty;

@@ -180,6 +180,41 @@ pub struct Session {
     /// apart. Picked when it starts; empty for sessions from before colours.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub colour: String,
+    /// The default for its subagents: a connection (empty: the session's),
+    /// a model (empty: the session's) and an effort.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subagent_connection_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subagent_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subagent_effort: String,
+}
+
+/// `PUT /api/v1/sessions/{id}/subagent-model`: the default connection,
+/// model and effort for a session's subagents from now on. An empty model:
+/// they run on the session's own.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetSubagentModel {
+    /// A connection id; empty: the session's.
+    #[serde(default)]
+    pub connection_id: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+/// A connection a session's subagents may run on, as the worker is told
+/// (`CreateSession.subagent_connections_json`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SubagentConnection {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_model: String,
 }
 
 /// The colours a session can have, in the order new sessions take them
@@ -1699,6 +1734,14 @@ pub enum EventKind {
         /// Set when it runs in the background.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         background_task_id: String,
+        /// The connection, model and effort it runs on (empty for logs
+        /// from before subagents could pick them).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        connection_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        model: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        effort: String,
     },
     /// A deliverable the agent published. Its content:
     /// `GET /api/v1/sessions/{id}/outputs/{seq}` (`?download=1` to save).
@@ -1749,6 +1792,16 @@ pub enum EventKind {
         #[serde(default)]
         effort: String,
         context_window: u64,
+    },
+    /// From here on the session's subagents run on this connection and
+    /// model by default (all empty: on the session's own).
+    SubagentModelSet {
+        #[serde(default)]
+        connection_id: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        effort: String,
     },
 }
 
@@ -2768,6 +2821,14 @@ pub struct Route {
     /// A cheaper model for subagents (Task tool); empty: the session's.
     #[serde(default)]
     pub subagent_model: String,
+    /// The connection subagents run on (a name or id); empty: the
+    /// session's. Not Claude Code: subagents run in carbon6's own loop.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subagent_connection: String,
+    /// Subagents' reasoning effort; empty: the model's default (or the
+    /// session's, on its own connection).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subagent_effort: String,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
 }

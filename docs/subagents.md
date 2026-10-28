@@ -262,3 +262,34 @@ As built: all six steps on 2026-10-14.
 5. **Claude Code subagents** are shown read-only.
 6. **Subagents can start subagents.**
 7. **Default limits:** `max_subagent_depth` = 3 and `max_running_subagents` = 16 per tree.
+
+## 14. Where a subagent runs
+
+A subagent may run on another connection and model than its parent: a cheap model for searches, or a GPT model under a Claude session. carbon6 runs it in its own loop whatever the parent runs on (never by starting another CLI), so it works for every main model, Claude Code included.
+
+### Choosing
+
+The connection, model and effort come from the first of these that says, most specific first:
+
+1. **The `Task` call:** `connection` (a name or id from the list in the tool's description), `model` (a model id, or `connection/model`) and `effort`. The model sets them when you ask ("use a subagent on my blacktitan ChatGPT connection with gpt-6.1-sol at high"). A connection without a model runs its default model.
+2. **A named agent's `model`:** an alias (`opus`, `sonnet`, `haiku`) on an Anthropic connection, or `connection/model` on any.
+3. **The session's default for subagents:** picked in the session (the **Subagents** row under the message box; `PUT /sessions/{id}/subagent-model`), else the routing rule's (**Subagent connection**, **Subagent model**, **Subagent effort**).
+4. **The parent's own model.**
+
+The effort carries over only while the subagent stays on the same connection. Its own subagents inherit the session's default.
+
+### What may be used
+
+The head sends each session the connections its realm may use (`CreateSession.subagent_connections_json`), without Claude Code ones, since running a Claude Code connection would start the CLI. The worker refuses anything else with an error that lists the available connections. The parent's own connection is always allowed, unless it is Claude Code. A worker gets a connection's credentials only if some realm it serves may use that connection.
+
+### Tools and prompt
+
+Where the subagent's model takes the parent's tool profile, it shares the parent's tools as before. Otherwise (a GPT subagent under a Claude parent, or any subagent of a Claude Code session) it gets tools of its own in its model's profile, with the same filters: the named agent's tools, the depth limit, no task cards. Its system prompt is the parent's with the skills index renamed for the profile. Under Claude Code, whose prompt is its own, it gets the prompt a carbon6 session would have. `SessionStarted.tool_profile`, `tools` and `context_window` are the subagent's own, so a reload rebuilds the same set.
+
+### Records
+
+`SubagentSpawned.model` and the child's session row (`connection_id`, `model`, `effort`) name where it runs, so the thread header shows "connection · model" and its cost is priced on its own connection. Changing the session's default writes `SubagentModelSet` (applied with its command id, replayed on reload) and updates `sessions.subagent_connection_id`, `subagent_model` and `subagent_effort`. A change made while a turn runs applies to that turn's next `Task` call.
+
+### Claude Code sessions
+
+Claude Code never sees carbon6's tools, so during each of its turns the worker serves `Task` and `SendMessage` to it as a local MCP server: streamable HTTP on 127.0.0.1, behind a secret path that lasts for one turn, passed with `--mcp-config`. Claude Code knows them as `mcp__carbon6__Task` and `mcp__carbon6__SendMessage`. They run foreground only, because nothing could deliver a background notice to Claude Code. The subagent shows as a thread under the call (matched by tool name and arguments in the log), and stopping the turn stops it. Claude Code's own `Task` subagents are still mirrored read-only (§8). A subagent of a Claude Code session gets the head's hooks and policies itself, since carbon6 runs none for its parent.
