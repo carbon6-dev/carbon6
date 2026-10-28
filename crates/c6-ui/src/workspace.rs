@@ -1083,6 +1083,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let colour = Memo::new(move |_| session.get().map(|s| crate::colour::of(&s)));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let details_at = RwSignal::new(None::<(f64, f64)>);
+    let rename_at = RwSignal::new(None::<(f64, f64)>);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
     let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-white/10 dark:hover:text-zinc-100";
     view! {
@@ -1114,6 +1115,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         title="This session's colour: change it" on:click=move |ev| palette_at.set(Some(below(&ev, 180.0)))></button>
                 })}
                 <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-700 dark:text-zinc-200" title=move || title.get()>{title}</span>
+                {move || session.get().filter(|s| s.parent_id.is_none() && !s.observed).map(|_| view! {
+                    <button class=btn title="Rename this session" on:click=move |ev| { ev.stop_propagation(); rename_at.set(Some(below(&ev, 320.0))) }>"✎"</button>
+                })}
                 {move || session.get().map(|s| {
                     let (cls, label) = status_pill(&s);
                     view! {
@@ -1142,6 +1146,13 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             </div>
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::colour::Palette session=id on_pick=move |()| palette_at.set(None) /> })}
+            </Popover>
+            <Popover at=rename_at class="w-[min(22rem,calc(100vw-1rem))] p-3">
+                // Keyed on the id, and the name read untracked: the session changes as it works, and a rebuilt form loses what was typed.
+                {move || shown.get().map(|(_, id)| {
+                    let title = session.get_untracked().map(|s| s.title).unwrap_or_default();
+                    view! { <crate::session::RenameForm session=id title on_done=move |()| rename_at.set(None) /> }
+                })}
             </Popover>
             <Popover at=details_at class="w-[min(35rem,calc(100vw-1rem))] p-3">
                 {move || chrome().map(|c| view! { <crate::session::SessionMeta chrome=c on_act=move |()| details_at.set(None) /> })}

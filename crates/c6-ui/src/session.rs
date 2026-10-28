@@ -529,6 +529,43 @@ impl SessionChrome {
     }
 }
 
+/// A text box to give a session a new name: Enter saves, Escape (or the
+/// Cancel button) leaves it as it was. `on_done` runs after either.
+#[component]
+pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
+    let id = StoredValue::new(session);
+    let draft = RwSignal::new(title.clone());
+    let error = RwSignal::new(None::<String>);
+    let save = Callback::new(move |()| {
+        let name = draft.get_untracked().trim().to_owned();
+        if name.is_empty() || name == title.trim() {
+            return on_done.run(());
+        }
+        spawn_local(async move {
+            match api::rename(id.get_value(), name).await {
+                Ok(()) => on_done.run(()),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    });
+    view! {
+        <div class="space-y-1" on:click=|ev| ev.stop_propagation()>
+            <div class="flex items-center gap-1.5">
+                <input class=format!("{INPUT} min-w-0 flex-1 py-1") prop:value=move || draft.get() autofocus maxlength="120" placeholder="Session name"
+                    on:input=move |ev| draft.set(event_target_value(&ev))
+                    on:keydown=move |ev| match ev.key().as_str() {
+                        "Enter" => save.run(()),
+                        "Escape" => { ev.stop_propagation(); on_done.run(()) }
+                        _ => {}
+                    } />
+                <button class=format!("{BUTTON} py-1 text-xs") on:click=move |_| save.run(())>"Save"</button>
+                <button class=format!("{BUTTON_QUIET} py-1 text-xs text-zinc-500") on:click=move |_| on_done.run(())>"Cancel"</button>
+            </div>
+            {move || error.get().map(|e| view! { <p class="text-[11px] text-red-600">{e}</p> })}
+        </div>
+    }
+}
+
 /// A session's header: its title, where it runs, its labels, and its tabs
 /// and actions. `on_act`: in a popover, called after choosing a tab or an
 /// action (to close it).
@@ -567,7 +604,31 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
             view! {
                 <div class=if popover { "flex flex-col gap-3" } else { "mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800" }>
                     <div class="min-w-0">
-                        <h1 class=if popover { "text-base font-semibold" } else { "truncate text-lg font-semibold" }>{s.title.clone()}</h1>
+                        {{
+                            // The live list has the name after a rename; `detail` was fetched once.
+                            let (sid, fallback) = (s.id.clone(), s.title.clone());
+                            let title = move || live.sessions.with(|ss| ss.iter().find(|x| x.id == sid).map(|x| x.title.clone())).unwrap_or_else(|| fallback.clone());
+                            // The form takes its start from the name once: tracking the list
+                            // would rebuild it (and drop what was typed) on every live update.
+                            let (sid, fallback) = (s.id.clone(), s.title.clone());
+                            let title_now = move || live.sessions.with_untracked(|ss| ss.iter().find(|x| x.id == sid).map(|x| x.title.clone())).unwrap_or_else(|| fallback.clone());
+                            let renamable = s.parent_id.is_none() && !s.observed;
+                            let renaming = RwSignal::new(false);
+                            let rename_id = s.id.clone();
+                            move || if renaming.get() {
+                                view! { <RenameForm session=rename_id.clone() title=title_now() on_done=move |()| renaming.set(false) /> }.into_any()
+                            } else {
+                                view! {
+                                    <div class="flex items-center gap-1.5">
+                                        <h1 class=if popover { "text-base font-semibold" } else { "truncate text-lg font-semibold" }>{title()}</h1>
+                                        {renamable.then(|| view! {
+                                            <button class="shrink-0 rounded px-1 text-xs text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+                                                title="Rename this session" on:click=move |_| renaming.set(true)>"✎"</button>
+                                        })}
+                                    </div>
+                                }.into_any()
+                            }
+                        }}
                         <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
                             <span class="flex items-center gap-1">
                                 <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>

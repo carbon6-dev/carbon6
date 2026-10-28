@@ -927,6 +927,9 @@ async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
     }))
 }
 
+/// The longest name a session can be given.
+const MAX_TITLE: usize = 120;
+
 #[derive(schemars::JsonSchema, serde::Deserialize)]
 pub(crate) struct UpdateSession {
     title: Option<String>,
@@ -935,7 +938,13 @@ pub(crate) struct UpdateSession {
 
 async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Json(req): Json<UpdateSession>) -> ApiResult<StatusCode> {
     let mut found = true;
-    if let Some(t) = req.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    if let Some(t) = req.title.as_deref().map(str::trim) {
+        if t.is_empty() {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, "a session's name can't be empty".into()));
+        }
+        if t.chars().count() > MAX_TITLE {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("a session's name can be at most {MAX_TITLE} characters")));
+        }
         found &= st.store.set_title(&id, t).await?;
     }
     if let Some(a) = req.archived {
