@@ -306,7 +306,9 @@ pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow
     let mut spawned_at: HashMap<String, i64> = HashMap::new();
     let mut read: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &rows {
-        let (Some(parent), Some(_)) = (r.get::<Option<String>, _>("parent_id"), r.get::<Option<String>, _>("parent_call_id")) else { continue };
+        let (Some(parent), Some(_)) = (r.get::<Option<String>, _>("parent_id"), r.get::<Option<String>, _>("parent_call_id")) else {
+            continue;
+        };
         if !read.insert(parent.clone()) {
             continue;
         }

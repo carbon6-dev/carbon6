@@ -87,11 +87,14 @@ pub async fn runtime() -> Option<String> {
             }
         };
         let full = full.display().to_string();
-        let ok = tokio::time::timeout(Duration::from_secs(15), runtime_command(&full).args(["version", "--format", "{{.Server.Version}}"]).output())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .is_some_and(|o| o.status.success());
+        let ok = tokio::time::timeout(
+            Duration::from_secs(15),
+            runtime_command(&full).args(["version", "--format", "{{.Server.Version}}"]).output(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|o| o.status.success());
         if ok {
             let _ = FOUND.set(full.clone());
             return Some(full);
@@ -140,13 +143,20 @@ async fn ensure_images(rt: &str, spec: &Value) -> Result<(), String> {
             }
             tokio::fs::write(&full, data).await.map_err(|e| e.to_string())?;
         }
-        let build = runtime_command(rt).args(["build", "-t", tag, "-f"]).arg(dir.join("Dockerfile.c6kit")).arg(&dir).kill_on_drop(true).output();
+        let build =
+            runtime_command(rt).args(["build", "-t", tag, "-f"]).arg(dir.join("Dockerfile.c6kit")).arg(&dir).kill_on_drop(true).output();
         let out = tokio::time::timeout(BUILD_TIMEOUT, build).await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        let out = out.map_err(|_| format!("building {} took too long", b["name"].as_str().unwrap_or("the kit")))?.map_err(|e| e.to_string())?;
+        let out =
+            out.map_err(|_| format!("building {} took too long", b["name"].as_str().unwrap_or("the kit")))?.map_err(|e| e.to_string())?;
         if !out.status.success() {
             let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-            return Err(format!("building {} {} failed:\n{}", b["name"].as_str().unwrap_or(""), b["version"].as_str().unwrap_or(""), clip(&log)));
+            return Err(format!(
+                "building {} {} failed:\n{}",
+                b["name"].as_str().unwrap_or(""),
+                b["version"].as_str().unwrap_or(""),
+                clip(&log)
+            ));
         }
     }
     Ok(())
@@ -196,7 +206,9 @@ async fn run(ctx: &ToolCtx, rt: &str, spec: &Value, command: Vec<String>) -> Too
     let text = ctx.session.secrets().redact(&clip(&text));
     match out.status.code() {
         Some(0) => ToolOutput::limited(if text.trim().is_empty() { "(done, no output)".into() } else { text }, false),
-        code => ToolOutput::limited(format!("exit status {}\n{text}", code.map(|c| c.to_string()).unwrap_or_else(|| "(killed)".into())), true),
+        code => {
+            ToolOutput::limited(format!("exit status {}\n{text}", code.map(|c| c.to_string()).unwrap_or_else(|| "(killed)".into())), true)
+        }
     }
 }
 
@@ -222,7 +234,12 @@ impl Egress {
     async fn start(rt: &str, hosts: &[String]) -> Result<Self, String> {
         ensure_images(rt, &egress_spec()).await?;
         let id = uuid_like();
-        let e = Egress { rt: rt.to_owned(), net: format!("c6net-{id}"), proxy: format!("c6egress-{id}"), dir: std::env::temp_dir().join(format!("c6egress-{id}")) };
+        let e = Egress {
+            rt: rt.to_owned(),
+            net: format!("c6net-{id}"),
+            proxy: format!("c6egress-{id}"),
+            dir: std::env::temp_dir().join(format!("c6egress-{id}")),
+        };
         tokio::fs::create_dir_all(&e.dir).await.map_err(|x| x.to_string())?;
         let filter: String = hosts.iter().map(|h| format!("^{}$\n", h.replace('.', "\\."))).collect();
         tokio::fs::write(e.dir.join("filter"), filter).await.map_err(|x| x.to_string())?;
@@ -248,13 +265,19 @@ impl Egress {
             e.stop().await;
             return Err(x);
         }
-        if let Err(x) = ok(runtime_command(rt).args(["network", "connect", "bridge", &e.proxy]).output().await, "connecting the egress proxy") {
+        if let Err(x) =
+            ok(runtime_command(rt).args(["network", "connect", "bridge", &e.proxy]).output().await, "connecting the egress proxy")
+        {
             e.stop().await;
             return Err(x);
         }
         // Until it listens.
         for _ in 0..50 {
-            let up = runtime_command(rt).args(["exec", &e.proxy, "nc", "-z", "127.0.0.1", "8888"]).output().await.is_ok_and(|o| o.status.success());
+            let up = runtime_command(rt)
+                .args(["exec", &e.proxy, "nc", "-z", "127.0.0.1", "8888"])
+                .output()
+                .await
+                .is_ok_and(|o| o.status.success());
             if up {
                 return Ok(e);
             }
@@ -495,7 +518,10 @@ impl Tool for KitShell {
             Err(e) => return e,
         };
         if spec["permissions"]["shell"] != true {
-            return ToolOutput::err(format!("{} does not allow a shell; use its tools (kit_run)", spec["name"].as_str().unwrap_or("this kit")));
+            return ToolOutput::err(format!(
+                "{} does not allow a shell; use its tools (kit_run)",
+                spec["name"].as_str().unwrap_or("this kit")
+            ));
         }
         run(ctx, &rt, &spec, vec!["sh".into(), "-c".into(), input["command"].as_str().unwrap_or_default().to_owned()]).await
     }

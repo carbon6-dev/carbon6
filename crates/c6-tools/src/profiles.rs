@@ -8,8 +8,8 @@ use c6_llm::{ToolProfile, ToolSpec};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ApplyPatch, Bash, BashOutput, Concurrency, Edit, Glob, Grep, KillShell, Plan, Read, SendMessage, Task, Tool, ToolCtx, ToolOutput, WebFetch,
-    Write,
+    ApplyPatch, Bash, BashOutput, Concurrency, Edit, Glob, Grep, KillShell, Plan, Read, SendMessage, Task, Tool, ToolCtx, ToolOutput,
+    WebFetch, Write,
 };
 
 pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {

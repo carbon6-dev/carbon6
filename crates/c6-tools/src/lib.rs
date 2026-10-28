@@ -1,8 +1,8 @@
 //! Built-in agent tools and the `Tool` trait.
 
 pub mod agents;
-pub mod apps;
 pub mod api_reference;
+pub mod apps;
 mod background;
 mod bash;
 pub mod browser;
@@ -19,8 +19,8 @@ pub mod profiles;
 pub mod publish;
 pub mod records;
 pub mod remote;
-pub mod templates;
 mod search;
+pub mod templates;
 mod util;
 mod web;
 

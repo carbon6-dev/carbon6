@@ -69,7 +69,9 @@ pub async fn read(st: &HeadState, path: &str) -> anyhow::Result<Value> {
     (&mut f).take(MAX_READ).read_to_end(&mut buf).await?;
     let binary = buf[..buf.len().min(8192)].contains(&0);
     let content = if binary { Value::Null } else { Value::String(String::from_utf8_lossy(&buf).into_owned()) };
-    Ok(json!({"path": path.display().to_string(), "size": meta.len(), "truncated": meta.len() > MAX_READ, "binary": binary, "content": content}))
+    Ok(
+        json!({"path": path.display().to_string(), "size": meta.len(), "truncated": meta.len() > MAX_READ, "binary": binary, "content": content}),
+    )
 }
 
 async fn inside(path: &Path, dir: &Path) -> bool {

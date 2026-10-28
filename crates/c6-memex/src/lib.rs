@@ -209,7 +209,8 @@ impl Memex {
                                 model: c["embedding"]["model"].as_str().unwrap_or_default().to_owned(),
                             }));
                             let home = m.is_home();
-                            let accounts: Vec<people::Account> = serde_json::from_value(c["accounts"][&m.realm].clone()).unwrap_or_default();
+                            let accounts: Vec<people::Account> =
+                                serde_json::from_value(c["accounts"][&m.realm].clone()).unwrap_or_default();
                             *m.accounts.lock().unwrap() = accounts;
                             let tasks = Tasks {
                                 understanding: task_of(&c["understanding"]),
@@ -301,9 +302,7 @@ impl Memex {
     /// the provider, and what changed comes back through its ingest).
     pub async fn app_call(&self, account: &people::Account, operation: &str, input: Value, by: &str) -> anyhow::Result<Value> {
         anyhow::ensure!(!account.app.is_empty(), "no app owns the account {}", account.email);
-        self.link
-            .call("app.call", json!({"realm": self.realm, "app": account.app, "operation": operation, "input": input, "by": by}))
-            .await
+        self.link.call("app.call", json!({"realm": self.realm, "app": account.app, "operation": operation, "input": input, "by": by})).await
     }
 
     /// Takes `what` for this step, unless another has it; given back when
@@ -528,8 +527,11 @@ impl Memex {
         let text = v["text"].as_str().unwrap_or_default().to_owned();
         anyhow::ensure!(!text.trim().is_empty(), "no text in {name} (a scan? images are read in a later step)");
         let folder = p["folder"].as_bool() == Some(true);
-        let (source, external_id) =
-            if folder { ("folder", job.input) } else { (p["source"].as_str().unwrap_or("upload"), p["external_id"].as_str().unwrap_or_default()) };
+        let (source, external_id) = if folder {
+            ("folder", job.input)
+        } else {
+            (p["source"].as_str().unwrap_or("upload"), p["external_id"].as_str().unwrap_or_default())
+        };
         let paper = v["paper"].as_object().filter(|_| v["paper"]["key"].is_string());
         let title = paper
             .and_then(|p| p["title"].as_str())
@@ -815,24 +817,28 @@ impl Memex {
                      AND (? = '' OR source = ?) AND created_at >= ? AND created_at < ? ORDER BY created_at DESC LIMIT ?"
                 };
                 let rows = sqlx::query(sql)
-                .bind(kind)
-                .bind(params["source"].as_str().unwrap_or_default())
-                .bind(params["source"].as_str().unwrap_or_default())
-                .bind(params["from"].as_i64().unwrap_or(i64::MIN))
-                .bind(params["to"].as_i64().unwrap_or(i64::MAX))
-                .bind(params["limit"].as_u64().unwrap_or(100).min(500) as i64)
-                .fetch_all(&self.store.pool)
-                .await?;
+                    .bind(kind)
+                    .bind(params["source"].as_str().unwrap_or_default())
+                    .bind(params["source"].as_str().unwrap_or_default())
+                    .bind(params["from"].as_i64().unwrap_or(i64::MIN))
+                    .bind(params["to"].as_i64().unwrap_or(i64::MAX))
+                    .bind(params["limit"].as_u64().unwrap_or(100).min(500) as i64)
+                    .fetch_all(&self.store.pool)
+                    .await?;
                 use sqlx::Row;
-                Ok(json!(rows.iter().map(|r| api::ViewItem {
-                    id: r.get("id"),
-                    kind: r.get("kind"),
-                    title: r.get("title"),
-                    text: r.get("text"),
-                    created_at: r.get("created_at"),
-                    source: r.get("source"),
-                    meta: serde_json::from_str(&r.get::<String, _>("meta")).unwrap_or_default(),
-                }).collect::<Vec<_>>()))
+                Ok(json!(
+                    rows.iter()
+                        .map(|r| api::ViewItem {
+                            id: r.get("id"),
+                            kind: r.get("kind"),
+                            title: r.get("title"),
+                            text: r.get("text"),
+                            created_at: r.get("created_at"),
+                            source: r.get("source"),
+                            meta: serde_json::from_str(&r.get::<String, _>("meta")).unwrap_or_default(),
+                        })
+                        .collect::<Vec<_>>()
+                ))
             }
             // An item's picture: a photo's thumbnail, else the blob its
             // meta names (`thumb`).
@@ -1090,7 +1096,8 @@ impl Memex {
             "memex.mail.labels" => json!(mail::label_list(self).await?),
             "memex.calendar.calendars" => json!(calendar::calendars(self).await?),
             "memex.calendar.select" => {
-                calendar::select(self, &self.account("calendar", &s("account"))?.id, &s("id"), params["on"].as_bool().unwrap_or(true)).await?;
+                calendar::select(self, &self.account("calendar", &s("account"))?.id, &s("id"), params["on"].as_bool().unwrap_or(true))
+                    .await?;
                 json!({})
             }
             "memex.calendar.events" => {
@@ -1267,8 +1274,13 @@ impl Memex {
         }
         if !text.trim().is_empty() {
             let q = api::MemexQuery { query: text.chars().take(500).collect(), limit: Some(5), ..Default::default() };
-            let hits: Vec<api::MemexHit> =
-                self.search(&q, allowed).await.unwrap_or_default().into_iter().filter(|h| h.source != "memory" && seen.insert(h.id.clone())).collect();
+            let hits: Vec<api::MemexHit> = self
+                .search(&q, allowed)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|h| h.source != "memory" && seen.insert(h.id.clone()))
+                .collect();
             if !hits.is_empty() {
                 let lines: Vec<String> = hits
                     .iter()

@@ -21,8 +21,8 @@ mod labels;
 mod mail;
 mod markdown;
 mod memex;
-mod monitor;
 mod models;
+mod monitor;
 mod notify;
 mod outputs;
 mod photos;
@@ -325,7 +325,11 @@ fn PlaceMenu() -> impl IntoView {
     let name = {
         let here = here.clone();
         move || match &here {
-            Some(r) => places.get().and_then(Result::ok).and_then(|ps| ps.into_iter().find(|p| &p.id == r).map(|p| p.name)).unwrap_or_else(|| r.clone()),
+            Some(r) => places
+                .get()
+                .and_then(Result::ok)
+                .and_then(|ps| ps.into_iter().find(|p| &p.id == r).map(|p| p.name))
+                .unwrap_or_else(|| r.clone()),
             None => "Console".into(),
         }
     };

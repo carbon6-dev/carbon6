@@ -418,10 +418,7 @@ pub fn FilePicker(
     let live = api::live();
     let workers = Memo::new(move |_| {
         live.workers.with(|ws| {
-            ws.iter()
-                .filter(|w| w.status == c6_api::WorkerStatus::Online)
-                .map(|w| (w.id.to_string(), w.name.clone()))
-                .collect::<Vec<_>>()
+            ws.iter().filter(|w| w.status == c6_api::WorkerStatus::Online).map(|w| (w.id.to_string(), w.name.clone())).collect::<Vec<_>>()
         })
     });
     // Where you picked from last time, and the folder you were in there.

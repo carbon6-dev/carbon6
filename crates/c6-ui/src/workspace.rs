@@ -1167,7 +1167,10 @@ mod tests {
     #[test]
     fn up_to_four_tiles_sit_side_by_side() {
         assert_eq!(arrange(&[1]), vec![r(0.0, 0.0, 1.0, 1.0)]);
-        assert_eq!(arrange(&[1, 2, 3]), vec![r(0.0, 0.0, 1.0 / 3.0, 1.0), r(1.0 / 3.0, 0.0, 1.0 / 3.0, 1.0), r(2.0 / 3.0, 0.0, 1.0 / 3.0, 1.0)]);
+        assert_eq!(
+            arrange(&[1, 2, 3]),
+            vec![r(0.0, 0.0, 1.0 / 3.0, 1.0), r(1.0 / 3.0, 0.0, 1.0 / 3.0, 1.0), r(2.0 / 3.0, 0.0, 1.0 / 3.0, 1.0)]
+        );
         assert!(arrange(&[1, 2, 3, 4]).iter().all(|x| x.width == 0.25 && x.height == 1.0));
     }
 
