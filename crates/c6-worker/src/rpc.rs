@@ -21,6 +21,7 @@ const MAX_JOB_OUTPUT: u64 = 44 * 1024 * 1024;
 async fn kit_job(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
+    anyhow::ensure!(worker.runs_kit_jobs(), "this worker doesn't run kit jobs (C6_KIT_JOBS=off)");
     let rt = c6_tools::kits::runtime().await.ok_or_else(|| anyhow!("this worker has no container runtime (Docker or Podman)"))?;
     let spec = &p["spec"];
     c6_tools::kits::build(&rt, spec).await.map_err(|e| anyhow!(e))?;
@@ -467,6 +468,27 @@ mod tests {
     async fn sh(dir: &Path, cmd: &str) {
         let ok = Command::new("sh").arg("-c").arg(cmd).current_dir(dir).status().await.unwrap().success();
         assert!(ok, "{cmd}");
+    }
+
+    /// A worker told not to run the head's kit jobs neither offers them
+    /// (with a container runtime or not) nor runs one it is sent.
+    #[tokio::test]
+    async fn kit_jobs_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::identity::IdentityMeta {
+            worker_id: c6_core::WorkerId(uuid::Uuid::now_v7()),
+            worker_name: "w".into(),
+            head_url: String::new(),
+        };
+        let identity = crate::Identity { meta, key_pem: String::new(), cert_pem: String::new(), ca_pem: String::new() };
+        let worker = Worker::open(dir.path(), identity).await.unwrap();
+        worker.overrides.lock().unwrap().kit_jobs = Some(true);
+        assert_eq!(crate::capabilities(&worker, false, true), vec!["kits"]);
+        assert!(crate::capabilities(&worker, false, false).is_empty());
+        worker.overrides.lock().unwrap().kit_jobs = Some(false);
+        assert_eq!(crate::capabilities(&worker, true, true), vec!["claude_code"]);
+        let e = handle(&worker, "kit.job", json!({"spec": {}, "command": []})).await.unwrap_err();
+        assert!(e.to_string().contains("C6_KIT_JOBS=off"), "{e}");
     }
 
     #[tokio::test]

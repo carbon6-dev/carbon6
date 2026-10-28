@@ -53,6 +53,8 @@ pub struct Overrides {
     pub update_exe: Option<PathBuf>,
     pub update_keys: Option<Vec<String>>,
     pub update_as_version: Option<String>,
+    /// Runs the head's kit jobs (instead of `C6_KIT_JOBS`).
+    pub kit_jobs: Option<bool>,
 }
 
 /// Everything a running worker shares between its connection and sessions.
@@ -130,6 +132,27 @@ impl Worker {
     pub(crate) fn set_channel(&self, c: Option<tonic::transport::Channel>) {
         *self.channel.lock().unwrap() = c;
     }
+
+    /// Whether it runs the head's kit jobs when it has a container runtime
+    /// (docs/knowledge.md §6.2): not with `C6_KIT_JOBS=off`. Its sessions'
+    /// kits run either way.
+    pub fn runs_kit_jobs(&self) -> bool {
+        let env = || !matches!(std::env::var("C6_KIT_JOBS").as_deref(), Ok("off" | "0" | "false" | "no"));
+        self.overrides.lock().unwrap().kit_jobs.unwrap_or_else(env)
+    }
+}
+
+/// What a worker says it can do in its Hello: Claude Code, the head's kit
+/// jobs (a container runtime, `kits`, unless turned off), and its extension's.
+pub(crate) fn capabilities(worker: &Worker, claude_code: bool, runtime: bool) -> Vec<String> {
+    let mut c: Vec<String> = claude_code.then(|| "claude_code".to_owned()).into_iter().collect();
+    if runtime && worker.runs_kit_jobs() {
+        c.push("kits".into());
+    }
+    if let Some(ext) = worker.extension() {
+        c.extend(ext.capabilities());
+    }
+    c
 }
 
 /// Expands a leading `~` to the home directory.

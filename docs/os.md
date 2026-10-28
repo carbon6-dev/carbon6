@@ -68,7 +68,7 @@ Labels keep working as they do today, inside a realm.
 - secrets, policies, budgets and memory notes.
 
 **Shared infrastructure,** like hardware in an OS:
-- **Workers:** each worker is either available to a list of realms, or dedicated to one. A session can only start on a worker its realm may use.
+- **Workers:** each worker is either available to a list of realms, or dedicated to one. A session can only start on a worker its realm may use. Template runs, kit jobs (the knowledge store's reading included) and session imports go only to workers available to their realm; a template started from a session runs on that session's worker unless you grant its realm more (`workers`, `start`).
 - **Model connections and routes:** each is available to a list of realms (all, by default).
 - **What a worker is given:** a worker asks for credentials on behalf of one of its sessions. The head gives a model connection's key only when the session is live and on that worker, its conversation uses the connection (itself, its subagents, or a model switch on its way), and the connection is available to its realm; a secret only as `name@session`, from the session's realm. Each grant and refusal is logged with the worker, session and connection. (A worker older than this doesn't say which session asks: it gets a connection one of its live sessions may use, with a warning to update it.)
 - **The memex service:** one service, with its data partitioned by realm.

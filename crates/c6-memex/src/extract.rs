@@ -39,6 +39,8 @@ pub struct Job {
 pub struct Request {
     pub tool: String,
     pub jobs: Vec<Job>,
+    /// The realm whose files they are: only its workers read them.
+    pub realm: String,
     /// `faces`: the detector and embedder models.
     pub models: Option<(Vec<u8>, Vec<u8>)>,
 }
@@ -291,7 +293,7 @@ async fn step(m: &Memex) -> anyhow::Result<bool> {
         None
     };
     let n = jobs.len();
-    match ex.extract(Request { tool: tool.clone(), jobs, models }).await {
+    match ex.extract(Request { tool: tool.clone(), jobs, realm: m.realm.clone(), models }).await {
         Ok(resp) => {
             for r in &batch {
                 let id = r.get::<i64, _>("id").to_string();
@@ -408,7 +410,7 @@ pub struct Done<'a> {
 pub async fn now(m: &Memex, tool: &str, input: &str, name: &str, index: Option<u64>) -> anyhow::Result<(Value, BTreeMap<String, Vec<u8>>)> {
     let ex = m.extractor().ok_or_else(|| anyhow::anyhow!("nothing here reads files"))?;
     let job = Job { id: "0".into(), name: name.to_owned(), file: file_at(m, input)?, index, sound: false };
-    let mut resp = ex.extract(Request { tool: tool.to_owned(), jobs: vec![job], models: None }).await?;
+    let mut resp = ex.extract(Request { tool: tool.to_owned(), jobs: vec![job], realm: m.realm.clone(), models: None }).await?;
     let v = resp.results.remove("0").ok_or_else(|| anyhow::anyhow!("the kit gave nothing"))?;
     if let Some(e) = v.get("error") {
         anyhow::bail!("{}", e.as_str().unwrap_or("could not read it"));

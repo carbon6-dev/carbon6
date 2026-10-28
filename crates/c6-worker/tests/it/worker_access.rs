@@ -6,7 +6,7 @@
 
 use c6_core::WorkerId;
 use c6_head::{HeadConfig, HeadState};
-use c6_proto::{CredentialGrant, CredentialRequest};
+use c6_proto::{CredentialGrant, CredentialRequest, head_msg};
 use serde_json::{Value, json};
 
 async fn head() -> (c6_head::Head, tempfile::TempDir) {
@@ -248,5 +248,62 @@ async fn imports_come_only_from_enabled_workers_into_their_realms() {
     assert!(e.contains("not available to realm home"), "{e}");
     let id = import(a, "/home/me/work/app").await.unwrap();
     assert_eq!(st.store.session(&id).await.unwrap().unwrap().realm, "work");
+    head.shutdown().await.unwrap();
+}
+
+/// The worker a kit job went to: its RPC, answered as a finished run.
+async fn ran_on(workers: &mut [(&str, &c6_head::registry::ConnGuard<'_>, &mut Inbox)]) -> String {
+    c6_testkit::eventually("a kit job", async || {
+        for (name, guard, rx) in workers.iter_mut() {
+            if let Ok(Ok(c6_proto::HeadMsg { msg: Some(head_msg::Msg::RpcRequest(r)) })) = rx.try_recv() {
+                assert_eq!(r.method, "kit.job");
+                guard.rpc_response(c6_proto::RpcResponse { id: r.id, result_json: br#"{"exit": 0}"#.to_vec(), error: String::new() });
+                return Some(name.to_string());
+            }
+        }
+        None
+    })
+    .await
+}
+
+#[tokio::test]
+async fn kit_jobs_run_only_where_their_realm_is_served() {
+    let (head, _dir) = head().await;
+    let st = &head.state;
+    let api = Api::of(&head);
+    api.ok(reqwest::Method::POST, "realms", json!({"id": "mach5-agents"})).await;
+    let (vm, mac) = (worker(st, "vm", &["mach5-agents"]).await, worker(st, "mac", &[]).await);
+    // The VM connected first.
+    let (gvm, mut rvm) = attach(st, vm, 1, &["kits"]);
+    let (gmac, mut rmac) = attach(st, mac, 2, &["kits"]);
+    let job = |realm: &str, worker: Option<WorkerId>| c6_head::kitjobs::Job {
+        spec: json!({"name": "sync", "tools": [{"name": "run", "command": ["true"]}]}),
+        tool: "run".into(),
+        realm: realm.into(),
+        worker,
+        ..Default::default()
+    };
+    let run = |j| {
+        let st = head.state.clone();
+        tokio::spawn(async move { c6_head::kitjobs::run(&st, j).await.map(|o| o.exit).map_err(|e| e.to_string()) })
+    };
+
+    // Home's job: never the VM, though it connected first.
+    let r = run(job("home", None));
+    assert_eq!(ran_on(&mut [("vm", &gvm, &mut rvm), ("mac", &gmac, &mut rmac)]).await, "mac");
+    assert_eq!(r.await.unwrap(), Ok(Some(0)));
+    // mach5-agents's: the worker kept to it first.
+    let r = run(job("mach5-agents", None));
+    assert_eq!(ran_on(&mut [("vm", &gvm, &mut rvm), ("mac", &gmac, &mut rmac)]).await, "vm");
+    r.await.unwrap().unwrap();
+    // Asked for by name, it must serve the realm too.
+    let e = run(job("home", Some(vm))).await.unwrap().unwrap_err();
+    assert!(e.contains("not available to realm home"), "{e}");
+    // None that serves it: it fails, and goes nowhere else.
+    drop(gmac);
+    let e = run(job("home", None)).await.unwrap().unwrap_err();
+    assert!(e.contains("no worker available to realm home"), "{e}");
+    assert!(rvm.try_recv().is_err());
+    drop(gvm);
     head.shutdown().await.unwrap();
 }
