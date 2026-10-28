@@ -243,7 +243,7 @@ fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
                 <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                     <span class=format!("rounded px-1.5 text-xs font-medium {class}")>{label}</span>
                     <span class="min-w-0 flex-1 text-zinc-600 dark:text-zinc-400">{t.reason.clone()}<span class="text-xs text-zinc-400">{format!(" · by {by}")}</span></span>
-                    {(t.kind == "mail" && t.category != "pitch").then(|| view! {
+                    {(t.kind == "mail" && t.category != "pitch" && t.known == Some(false)).then(|| view! {
                         <button class=BUTTON_QUIET title="Their mail is always a cold pitch"
                             on:click=move |_| act("memex.triage.mark", json!({"target": target.get_value(), "mark": "pitch"}))>"Cold pitch"</button>
                     })}

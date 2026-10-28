@@ -569,6 +569,7 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> api::Triage {
         sender_name: r.get("sender_name"),
         title: r.get("title"),
         at: r.get("at"),
+        known: None,
         request: None,
     }
 }
@@ -616,7 +617,8 @@ pub async fn of_thread(m: &Memex, account: &str, thread: &str) -> anyhow::Result
 /// How a conversation was sorted, with the open request it is part of.
 async fn with_request(m: &Memex, target: &str) -> anyhow::Result<Option<api::Triage>> {
     let r = sqlx::query("SELECT * FROM triage WHERE target = ?").bind(target).fetch_optional(&m.store.pool).await?;
-    let Some(mut t) = r.as_ref().map(row) else { return Ok(None) };
+    let Some(r) = r else { return Ok(None) };
+    let mut t = row(&r);
     t.request = crate::requests::open_of(m, target).await?;
     Ok(Some(t))
 }
@@ -637,7 +639,8 @@ async fn example(m: &Memex, t: &api::Triage, category: &str, note: &str) -> anyh
 
 async fn get(m: &Memex, target: &str) -> anyhow::Result<api::Triage> {
     let r = sqlx::query("SELECT * FROM triage WHERE target = ?").bind(target).fetch_optional(&m.store.pool).await?;
-    r.as_ref().map(row).ok_or_else(|| anyhow::anyhow!("nothing sorted as {target:?}"))
+    let r = r.ok_or_else(|| anyhow::anyhow!("nothing sorted as {target:?}"))?;
+    Ok(row(&r))
 }
 
 /// You sort a conversation yourself (with a note the model learns from).
@@ -725,7 +728,16 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         }
         "memex.triage.counts" => counts(m).await?,
         "memex.triage.status" => status(m).await?,
-        "memex.triage.get" => json!(with_request(m, &s("target")).await?),
+        "memex.triage.get" => {
+            let mut sorting = with_request(m, &s("target")).await?;
+            if let Some(t) = &mut sorting
+                && t.kind == "mail"
+            {
+                let mine: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
+                t.known = Some(mark_of(m, &t.sender).await?.as_deref() == Some("known") || known(m, &t.sender, &mine).await?);
+            }
+            json!(sorting)
+        }
         "memex.triage.set" => json!(set(m, &s("target"), &s("category"), &s("note")).await?),
         "memex.triage.mark" => json!(mark(m, &s("target"), &s("mark"), params["domain"] == true).await?),
         "memex.triage.marks" => marks(m).await?,
@@ -735,4 +747,91 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         }
         other => anyhow::bail!("the memex has no method {other}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sorting_carries_whether_the_sender_is_known_now() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.accounts.lock().unwrap().push(crate::people::Account { email: "me@mine.example".into(), ..Default::default() });
+        let sorted = Sorted::new("fyi", "An update", "model");
+        let senders = [
+            ("ana@company.example", true),
+            ("bo@company.example", true),
+            ("friend@gmail.com", true),
+            ("stranger@gmail.com", false),
+            ("colleague@mine.example", true),
+            ("contact@example.net", true),
+            ("guest@example.net", true),
+            ("unknown@example.org", false),
+        ];
+        for (sender, _) in senders {
+            put(&m, &format!("thread:acct:{sender}"), "mail", &sorted, sender, "", "Update", c6_core::now_ms()).await.unwrap();
+        }
+        assert_eq!(method(&m, "memex.triage.get", &json!({"target": "thread:acct:ana@company.example"})).await.unwrap()["known"], false);
+        let sent = crate::mail::Parsed {
+            message_id: "sent@mine.example".into(),
+            from: ("me@mine.example".into(), "Me".into()),
+            to: vec![("ana@company.example".into(), "Ana".into()), ("friend@gmail.com".into(), "Friend".into())],
+            text: "Here are the notes.".into(),
+            ..Default::default()
+        };
+        let at = crate::mail::Stored {
+            account: "acct",
+            external_id: "sent",
+            thread_id: "sent",
+            source: "test-mail",
+            rfc_id: &sent.message_id,
+            origin: "mirrored",
+            owner: "me@mine.example",
+            message: "sent",
+        };
+        crate::mail::store(&m, &sent, "", &at, &["SENT".into()], c6_core::now_ms()).await.unwrap();
+        crate::contacts::store(
+            &m,
+            "acct",
+            &json!({"resourceName": "people/contact", "emailAddresses": [{"value": "contact@example.net"}]}),
+        )
+        .await
+        .unwrap();
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "acct",
+            "me@mine.example",
+            "primary",
+            &json!({
+                "id": "meeting", "attendees": [{"email": "guest@example.net"}],
+                "start": {"dateTime": "2026-01-02T10:00:00Z"}, "end": {"dateTime": "2026-01-02T11:00:00Z"},
+            }),
+        )
+        .await
+        .unwrap();
+        let all = list(&m, None, Some("mail"), false, 100).await.unwrap();
+        for (sender, expected) in senders {
+            let t: api::Triage =
+                serde_json::from_value(method(&m, "memex.triage.get", &json!({"target": format!("thread:acct:{sender}")})).await.unwrap())
+                    .unwrap();
+            let thread = of_thread(&m, "acct", sender).await.unwrap().unwrap();
+            assert_eq!(thread.known, None, "{sender}");
+            assert!(serde_json::to_value(&thread).unwrap().get("known").is_none(), "{sender}");
+            assert_eq!(t.known, Some(expected), "{sender}");
+            assert_eq!(serde_json::to_value(&t).unwrap()["known"], expected, "{sender}");
+            let listed = all.iter().find(|t| t.sender == sender).unwrap();
+            assert_eq!(listed.known, None, "{sender}");
+            assert!(serde_json::to_value(listed).unwrap().get("known").is_none(), "{sender}");
+        }
+        sqlx::query("INSERT INTO sender_marks (pattern, mark, created_at) VALUES (?, 'known', ?)")
+            .bind("unknown@example.org")
+            .bind(c6_core::now_ms())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(method(&m, "memex.triage.get", &json!({"target": "thread:acct:unknown@example.org"})).await.unwrap()["known"], true);
+    }
 }
