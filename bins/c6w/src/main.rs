@@ -27,6 +27,11 @@ enum Command {
         /// Replace an existing identity.
         #[arg(long)]
         force: bool,
+        /// Reach the head at this `host` or `host:port` instead of the
+        /// address in the token (the head's certificate is still checked
+        /// against the token's name).
+        #[arg(long, value_name = "HOST[:PORT]")]
+        head: Option<String>,
     },
     /// Attach to the head and serve until interrupted.
     Run,
@@ -47,11 +52,11 @@ async fn main() -> anyhow::Result<()> {
     let state_dir = cli.state_dir.unwrap_or_else(identity::default_state_dir);
 
     match cli.command {
-        Command::Enroll { token, force } => {
+        Command::Enroll { token, force, head } => {
             if Identity::exists(&state_dir) && !force {
                 bail!("already enrolled (identity in {}); pass --force to replace it", identity::identity_dir(&state_dir).display());
             }
-            let id = enroll::enroll(&token).await?;
+            let id = enroll::enroll_via(&token, head.as_deref()).await?;
             id.save(&state_dir)?;
             println!("enrolled as {} ({}) with head {}", id.meta.worker_name, id.meta.worker_id, id.meta.head_url);
             println!("start the worker with: c6w run");

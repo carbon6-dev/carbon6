@@ -16,15 +16,30 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use crate::identity::{Identity, IdentityMeta};
 
 pub async fn enroll(token: &str) -> anyhow::Result<Identity> {
-    let token = EnrollmentToken::decode(token)?;
-    let ca_pem = fetch_pinned_ca(&token.url, &token.ca_sha256).await?;
+    enroll_via(token, None).await
+}
 
-    let channel = Endpoint::from_shared(token.url.clone())?
-        .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&ca_pem)))?
+/// Enrolls, dialing `head` (`host` or `host:port`) instead of the token's
+/// address. The certificate is still checked against the token's host name,
+/// which the head always lists, and the CA is pinned by the token's hash.
+pub async fn enroll_via(token: &str, head: Option<&str>) -> anyhow::Result<Identity> {
+    let token = EnrollmentToken::decode(token)?;
+    let (url, tls_domain) = match head {
+        Some(h) => override_head(&token.url, h)?,
+        None => (token.url.clone(), None),
+    };
+    let ca_pem = fetch_pinned_ca(&url, &token.ca_sha256).await?;
+
+    let mut tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&ca_pem));
+    if let Some(d) = &tls_domain {
+        tls = tls.domain_name(d.clone());
+    }
+    let channel = Endpoint::from_shared(url.clone())?
+        .tls_config(tls)?
         .connect_timeout(Duration::from_secs(10))
         .connect()
         .await
-        .with_context(|| format!("connecting to head at {}", token.url))?;
+        .with_context(|| format!("connecting to head at {url}"))?;
 
     let key = rcgen::KeyPair::generate()?;
     let csr = rcgen::CertificateParams::default().serialize_request(&key)?.pem()?;
@@ -48,12 +63,28 @@ pub async fn enroll(token: &str) -> anyhow::Result<Identity> {
         meta: IdentityMeta {
             worker_id: resp.worker_id.parse().context("bad worker id from head")?,
             worker_name: resp.worker_name,
-            head_url: token.url,
+            head_url: url,
+            tls_domain,
         },
         key_pem: key.serialize_pem(),
         cert_pem: resp.cert_pem,
         ca_pem,
     })
+}
+
+/// The URL to dial for `--head host[:port]` (the token's port when none is
+/// given) and the token's host, to check the certificate against.
+fn override_head(token_url: &str, head: &str) -> anyhow::Result<(String, Option<String>)> {
+    let uri: tonic::codegen::http::Uri = token_url.parse().context("bad head URL in token")?;
+    let domain = uri.host().context("head URL has no host")?.trim_start_matches('[').trim_end_matches(']').to_owned();
+    let given: tonic::codegen::http::uri::Authority = head.parse().with_context(|| format!("bad --head {head:?}; use host or host:port"))?;
+    let port = given.port_u16().or_else(|| uri.port_u16());
+    let host = given.host();
+    let url = match port {
+        Some(p) => format!("https://{host}:{p}"),
+        None => format!("https://{host}"),
+    };
+    Ok((url, Some(domain)))
 }
 
 /// Completes a TLS handshake without verification only to read the server's
@@ -127,5 +158,19 @@ impl ServerCertVerifier for CaptureOnly {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::override_head;
+
+    #[test]
+    fn override_keeps_token_port_and_name() {
+        let (url, domain) = override_head("https://10.0.0.5:7701", "203.0.113.9").unwrap();
+        assert_eq!(url, "https://203.0.113.9:7701");
+        assert_eq!(domain.as_deref(), Some("10.0.0.5"));
+        let (url, _) = override_head("https://head.lan:7701", "head.example.com:443").unwrap();
+        assert_eq!(url, "https://head.example.com:443");
     }
 }
