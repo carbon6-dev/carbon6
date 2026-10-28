@@ -26,7 +26,15 @@ pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &P
     let (source, external_id) = (s(&p["source"]), s(&p["external_id"]));
     let (account, message) = (s(&a["account"]), s(&a["message"]));
     let thread = a["thread"].as_str().filter(|t| !t.is_empty()).map(str::to_owned).unwrap_or_else(|| message.clone());
-    let labels: Vec<String> = serde_json::from_value(a["labels"].clone()).unwrap_or_default();
+    // Its labels now: they may have changed while it waited to be read
+    // (moved to spam, archived), after the kit was given it.
+    let now: Option<String> = sqlx::query_scalar("SELECT json_extract(params, '$.attributes.labels') FROM extractions WHERE key = ?")
+        .bind(job.key)
+        .fetch_optional(&m.store.pool)
+        .await?
+        .flatten();
+    let labels: Vec<String> =
+        now.and_then(|l| serde_json::from_str(&l).ok()).or_else(|| serde_json::from_value(a["labels"].clone()).ok()).unwrap_or_default();
     let date = a["received"].as_i64().unwrap_or_else(c6_core::now_ms);
     let owner = m.accounts().into_iter().find(|x| x.id == account).map(|x| x.email).unwrap_or_else(|| account.clone());
     let rfc_id = parsed.message_id.clone();
@@ -67,7 +75,8 @@ pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &P
     };
     let blob = job.input.strip_prefix("head:").unwrap_or_default();
     let item = store(m, parsed, blob, &to, &labels, date).await?;
-    if a["tell"].as_bool() == Some(true) {
+    // Not if it went to spam meanwhile.
+    if a["tell"].as_bool() == Some(true) && !labels.iter().any(|l| l == "SPAM") {
         let r = sqlx::query("SELECT from_addr, from_name, to_json, subject, snippet, thread_id FROM mail WHERE item_id = ?")
             .bind(&item)
             .fetch_one(&m.store.pool)
@@ -306,7 +315,7 @@ pub async fn threads(
     let sorted = view.strip_prefix("triage:").map(str::to_owned);
     let (cond, label): (&str, Option<String>) = match view {
         "inbox" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0", None),
-        "starred" => ("m.starred = 1 AND m.trash = 0", None),
+        "starred" => ("m.starred = 1 AND m.trash = 0 AND m.spam = 0", None),
         "sent" => ("m.sent = 1 AND m.trash = 0", None),
         "drafts" => ("m.draft = 1 AND m.trash = 0", None),
         "archive" => ("m.inbox = 0 AND m.trash = 0 AND m.spam = 0 AND m.sent = 0 AND m.draft = 0", None),
@@ -321,7 +330,7 @@ pub async fn threads(
         "waiting" => ("m.trash = 0 AND m.spam = 0", None),
         v if sorted.is_some() && v.starts_with("triage:") => ("m.trash = 0 AND m.spam = 0", None),
         v => match v.strip_prefix("label:") {
-            Some(l) => ("m.trash = 0", Some(l.to_owned())),
+            Some(l) => ("m.trash = 0 AND m.spam = 0", Some(l.to_owned())),
             None => anyhow::bail!("no mail view {v:?}"),
         },
     };

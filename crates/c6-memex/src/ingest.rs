@@ -270,10 +270,20 @@ async fn one(m: &Memex, item: &api::IngestItem, app: Option<&str>) -> anyhow::Re
 }
 
 /// A mirrored message's labels changed (its app said so, without the
-/// message again).
+/// message again). One still waiting to be read is kept with them.
 async fn relabel(m: &Memex, source: &str, external_id: &str, attrs: &Value) -> anyhow::Result<api::IngestResult> {
-    let id = existing(m, source, external_id).await?.ok_or_else(|| anyhow::anyhow!("no message {external_id} to change"))?;
     let labels: Vec<String> = serde_json::from_value(attrs["labels"].clone()).map_err(|_| anyhow::anyhow!("labels is a list"))?;
+    let waits = sqlx::query("UPDATE extractions SET params = json_set(params, '$.attributes.labels', json(?)) WHERE key = ?")
+        .bind(json!(labels).to_string())
+        .bind(format!("mail:{source}:{external_id}"))
+        .execute(&m.store.pool)
+        .await?
+        .rows_affected()
+        > 0;
+    let Some(id) = existing(m, source, external_id).await? else {
+        anyhow::ensure!(waits, "no message {external_id} to change");
+        return Ok(api::IngestResult { status: "queued".into(), id: None, kind: None, error: None });
+    };
     crate::mail::set_labels(m, &id, &labels).await?;
     Ok(api::IngestResult { status: "updated".into(), id: Some(id), kind: Some("email".into()), error: None })
 }

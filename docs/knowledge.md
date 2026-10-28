@@ -260,7 +260,9 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - A unit test ties the packages' versions to a digest of their source (`kit.digest`).
 - **The kit** talks to Google and keeps nothing:
   - It reads where each sync is (`state/<collection>.json`) and an operation's input (`input.json`).
-  - It writes what changed as typed items in `out/ingest.json`: messages as `message/rfc822` with Gmail's ids and labels as attributes (a label change is the item without its bytes); label names, calendars, events and contacts in Google's own JSON (`application/vnd.c6.*+json`); deletions; the syncs' new records; and `again` while an import is under way.
+  - It writes what changed as typed items in `out/ingest.json`: messages as `message/rfc822` with Gmail's ids and labels as attributes (a label change is the item without its bytes); label names, calendars, events and contacts in Google's own JSON (`application/vnd.c6.*+json`); deletions; the syncs' new records; and `again` while an import or a check is under way.
+  - A label change for a message still waiting to be read (in the extraction queue, or with the kit reading it) is kept with it: the message is stored with its labels as they are then. Before, the memex refused it ("no message … to change"), so mail Gmail moved to spam, or you archived, soon after it came stayed in the inbox.
+  - So mail kept before is right, gmail's sync (google 1.2, gmail 1.2.0) reads the last 30 days' labels again once per account (`checked` in its record), 250 messages a run, with `format=minimal`. Each is a label change as above.
   - A run brings up to 24 MB of messages. The rest of an import page waits in the sync's `queue`, and the trigger runs again at once.
   - An operation's answer goes in `out/result.json`.
 - **New kit primitives:**

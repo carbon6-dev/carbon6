@@ -43,6 +43,8 @@ struct G {
     order: Vec<String>,
     /// Messages added after the import (history).
     added: Vec<String>,
+    /// Messages whose labels changed after the import (history).
+    relabeled: Vec<String>,
     history_id: u64,
     modified: Vec<(String, Value)>,
     sent: Vec<String>,
@@ -95,11 +97,15 @@ async fn google(g: Mock) -> String {
         }))
         .route("/gmail/v1/users/me/history", get(|State(g): State<Mock>| async move {
             let g = g.lock().unwrap();
-            let added: Vec<Value> = g.added.iter().map(|id| {
+            let mut history: Vec<Value> = g.added.iter().map(|id| {
                 let (thread, labels, _, _) = &g.messages[id];
                 json!({"messagesAdded": [{"message": {"id": id, "threadId": thread, "labelIds": labels}}]})
             }).collect();
-            Json(json!({"history": added, "historyId": g.history_id.to_string()}))
+            history.extend(g.relabeled.iter().map(|id| {
+                let (thread, labels, _, _) = &g.messages[id];
+                json!({"labelsAdded": [{"message": {"id": id, "threadId": thread, "labelIds": labels}, "labelIds": ["SPAM"]}]})
+            }));
+            Json(json!({"history": history, "historyId": g.history_id.to_string()}))
         }))
         .route("/gmail/v1/users/me/threads/{id}/modify", post(|State(g): State<Mock>, Path(id): Path<String>, Json(b): Json<Value>| async move {
             let mut g = g.lock().unwrap();
@@ -622,6 +628,45 @@ async fn google_mail_calendar_contacts() {
     assert_eq!(upgraded["item"]["source"], "app:gmail", "{upgraded}");
     let t6 = rpc("memex.mail.threads", json!({"view": "inbox"})).await;
     assert!(t6.as_array().unwrap().iter().any(|t| t["thread_id"] == "t6" && t["account"] != "import:mbox:archive"), "{t6}");
+
+    // Moved to spam in Gmail: it leaves the inbox views.
+    let threads = async |view: &str| -> Vec<String> {
+        let v = rpc("memex.mail.threads", json!({"view": view})).await;
+        v.as_array().unwrap().iter().map(|t| t["thread_id"].as_str().unwrap().to_owned()).collect()
+    };
+    assert!(threads("needs_reply").await.contains(&"t7".to_owned()), "Carol's, before");
+    {
+        let mut s = g.lock().unwrap();
+        s.messages.get_mut("m7").unwrap().1 = vec!["SPAM".into(), "UNREAD".into(), "CATEGORY_PERSONAL".into()];
+        s.relabeled = vec!["m7".into()];
+        s.history_id = 300;
+    }
+    rpc("memex.google_sync", json!({})).await;
+    eventually("Carol's in spam", async || threads("spam").await.contains(&"t7".to_owned()).then_some(())).await;
+    for view in ["inbox", "needs_reply", "all"] {
+        assert!(!threads(view).await.contains(&"t7".to_owned()), "{view}");
+    }
+    // A change lost before google 1.2 (the memex got it while the message
+    // waited to be read): the sync reads the last 30 days' labels again,
+    // once. Alice's lunch went to spam meanwhile, and the sync's record
+    // is as an older kit left it.
+    let checked = |r: &c6_api::Record| r.fields["key"].as_str().is_some_and(|k| k.starts_with("mail:"));
+    let q = c6_api::RecordQuery::default();
+    let rec = c6_head::collections::query(&head.state, "home", "gmail_sync", &q).await.unwrap().records.into_iter().find(checked).unwrap();
+    assert_eq!(rec.fields["checked"], 1, "{:?}", rec.fields);
+    let mut fields = rec.fields.clone();
+    for k in ["checked", "check_page", "check_queue"] {
+        fields.as_object_mut().unwrap().remove(k);
+    }
+    let older = c6_api::RecordIn { fields, version: Some(rec.version), ..Default::default() };
+    c6_head::collections::put(&head.state, "home", "gmail_sync", Some(&rec.id), &older, "app:gmail test").await.unwrap();
+    g.lock().unwrap().messages.get_mut("m1").unwrap().1 = vec!["SPAM".into()];
+    assert!(threads("inbox").await.contains(&"t1".to_owned()));
+    rpc("memex.google_sync", json!({})).await;
+    eventually("Alice's in spam", async || threads("spam").await.contains(&"t1".to_owned()).then_some(())).await;
+    assert!(!threads("inbox").await.contains(&"t1".to_owned()));
+    let rec = c6_head::collections::query(&head.state, "home", "gmail_sync", &q).await.unwrap().records.into_iter().find(checked).unwrap();
+    assert_eq!(rec.fields["checked"], 1, "checked again: {:?}", rec.fields);
 
     // Another realm (a business's): its own Gmail apps, account and mail,
     // apart from home's; your OAuth client is every realm's.

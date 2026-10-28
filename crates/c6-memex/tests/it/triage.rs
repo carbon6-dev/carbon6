@@ -859,6 +859,104 @@ async fn needs_reply_follows_the_sorting() {
     head.shutdown().await.unwrap();
 }
 
+/// The kit, reading only once let (as a worker busy elsewhere, or asleep).
+struct Held {
+    asked: std::sync::atomic::AtomicBool,
+    go: tokio::sync::Semaphore,
+    kit: c6_memex::extract::InProcess,
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Held { asked: Default::default(), go: tokio::sync::Semaphore::new(0), kit: Default::default() }
+    }
+}
+
+#[async_trait::async_trait]
+impl c6_memex::extract::Extractor for Held {
+    async fn extract(&self, req: c6_memex::extract::Request) -> anyhow::Result<c6_memex::extract::Response> {
+        self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(self.go.acquire().await?);
+        c6_memex::extract::Extractor::extract(&self.kit, req).await
+    }
+    async fn walk(&self, worker: &str, root: &str) -> anyhow::Result<(String, Vec<(String, u64, i64)>)> {
+        c6_memex::extract::Extractor::walk(&self.kit, worker, root).await
+    }
+    async fn read(&self, worker: &str, path: &str, max: u64) -> anyhow::Result<Vec<u8>> {
+        c6_memex::extract::Extractor::read(&self.kit, worker, path, max).await
+    }
+}
+
+/// Mail moved to spam in Gmail leaves Mail's inbox views (the inbox,
+/// "Needs reply", what's sorted as needing you): moved once it's kept, or
+/// while it still waited to be read (that change was lost, and it stayed
+/// in the inbox).
+#[tokio::test]
+async fn mail_moved_to_spam_leaves_the_inbox() {
+    let kit = std::sync::Arc::new(Held::default());
+    c6_memex::extract::set_override(kit.clone());
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    my_account(&head, &api, &m).await;
+    use base64::Engine;
+    // As the gmail app's sync gives them: a message, and a label change
+    // (the same item, without its bytes).
+    let message = |id: &str, subject: &str, ago: i64| {
+        let raw = format!(
+            "From: Carol <carol@acme.com>\r\nTo: me@mine.io\r\nSubject: {subject}\r\nMessage-ID: <{id}@test>\r\nContent-Type: text/plain\r\n\r\nCan you look at this?\r\n"
+        );
+        json!({"type": "message/rfc822", "source": {"kind": "app"}, "external_id": format!("acct:{id}"), "data": base64::engine::general_purpose::STANDARD.encode(raw),
+               "attributes": {"account": "acct", "message": id, "thread": id, "labels": ["INBOX", "UNREAD"], "received": c6_core::now_ms() - ago}})
+    };
+    let to_spam = |id: &str| {
+        json!({"type": "message/rfc822", "source": {"kind": "app"}, "external_id": format!("acct:{id}"),
+               "attributes": {"account": "acct", "message": id, "labels": ["SPAM", "UNREAD", "CATEGORY_PERSONAL"]}})
+    };
+    let ingest =
+        async |items: Value| c6_memex::ingest::ingest(&m, json!({"as": "app:gmail", "wait": false, "items": items})).await.unwrap();
+    let shown = async |view: &str| -> Vec<String> {
+        c6_memex::mail::threads(&m, view, None, None, 50).await.unwrap().into_iter().map(|t| t.subject).collect()
+    };
+
+    // Moved while the kit reads it.
+    ingest(json!([message("s2", "Moved", HOUR)])).await;
+    eventually("the kit reading it", async || kit.asked.load(std::sync::atomic::Ordering::Relaxed).then_some(())).await;
+    let r = ingest(json!([to_spam("s2")])).await;
+    assert_eq!(r["results"][0]["status"], "queued", "kept with its new labels once read: {r}");
+    kit.go.add_permits(1);
+    ingest(json!([message("s1", "Kept", 2 * HOUR)])).await;
+    eventually("both read", async || {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail WHERE thread_id IN ('s1', 's2')").fetch_one(&m.store.pool).await.ok()?;
+        (n == 2).then_some(())
+    })
+    .await;
+    assert_eq!(shown("inbox").await, ["Kept"]);
+    assert_eq!(shown("needs_reply").await, ["Kept"]);
+    assert_eq!(shown("spam").await, ["Moved"]);
+
+    // Kept, then moved.
+    sorted_as(&m, "s1", "needs_you").await;
+    assert_eq!(shown("triage:needs_you").await, ["Kept"]);
+    let r = ingest(json!([to_spam("s1")])).await;
+    assert_eq!(r["results"][0]["status"], "updated", "{r}");
+    for view in ["inbox", "needs_reply", "triage:needs_you", "all", "starred", "label:CATEGORY_PERSONAL"] {
+        assert!(shown(view).await.is_empty(), "{view}");
+    }
+    assert_eq!(shown("spam").await, ["Moved", "Kept"]);
+    head.shutdown().await.unwrap();
+}
+
 /// Mail's "Needs you" (and "First contact") is what waits on you in the
 /// Brief: in the inbox, its request open. One done or dropped there leaves
 /// it, so does one snoozed until later (it comes back once its time has

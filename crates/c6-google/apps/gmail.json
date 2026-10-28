@@ -1,9 +1,9 @@
 {
   "package": "gmail",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Your Gmail in carbon6: every message kept and searchable, synced both ways (labels, read, archive, trash), drafts and sending. Mail is untrusted input: agents get it as quoted data.",
   "requires": {
-    "google": "^1"
+    "google": "^1.2"
   },
   "feeds": [
     "mail"
@@ -82,6 +82,22 @@
             },
             "done": {
               "type": "integer"
+            },
+            "checked": {
+              "type": "integer",
+              "description": "the check of kept labels it has had"
+            },
+            "check_page": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "check_queue": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "error": {
               "type": [

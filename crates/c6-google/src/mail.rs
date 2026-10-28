@@ -14,6 +14,13 @@ const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 const IMPORT_PAGE: u32 = 100;
 /// The messages' bytes a run brings at most (the rest wait for the next).
 const BUDGET: usize = 24 * 1024 * 1024;
+/// The check of kept labels an account has had (`checked`): before google
+/// 1.2, a label change the memex got while the message still waited to be
+/// read was lost (mail moved to spam stayed in the inbox), so the last 30
+/// days' labels are read again, once.
+const CHECK: i64 = 1;
+/// Messages whose labels a run reads at most, while checking.
+const CHECK_RUN: usize = 250;
 
 fn b64url_decode(s: &str) -> anyhow::Result<Vec<u8>> {
     // Gmail uses URL-safe base64, sometimes padded.
@@ -80,7 +87,7 @@ pub async fn sync(r: &mut Run) -> anyhow::Result<()> {
         if let Some(e) = &error {
             r.errors.push(format!("{}: mail: {e}", a.email));
         }
-        r.again |= st["phase"] == "import" && error.is_none();
+        r.again |= (st["phase"] == "import" || st["checked"].as_i64() != Some(CHECK)) && error.is_none();
         r.save(&key, st, error);
     }
     Ok(())
@@ -169,6 +176,41 @@ async fn one(r: &mut Run, a: &Account, st: &mut Value, budget: &mut usize) -> an
         st["queue"] = json!(queue);
         if queue.is_empty() && st["page_token"].is_null() {
             st["phase"] = json!("live");
+        }
+    }
+    if st["phase"] == "live" && st["checked"].as_i64() != Some(CHECK) {
+        check(r, a, st).await?;
+    }
+    Ok(())
+}
+
+/// Reads the last 30 days' labels again (`CHECK`), a part a run: what
+/// waits in `check_queue`, then `check_page`'s page of the list.
+async fn check(r: &mut Run, a: &Account, st: &mut Value) -> anyhow::Result<()> {
+    for _ in 0..CHECK_RUN {
+        let Some(id) = st["check_queue"].as_array().and_then(|q| q.first()).and_then(Value::as_str).map(str::to_owned) else {
+            if st["check_queue"].is_array() && st["check_page"].is_null() {
+                st["checked"] = json!(CHECK);
+                st["check_queue"] = json!([]);
+                return Ok(());
+            }
+            let mut q = vec![("maxResults", "500".to_owned()), ("includeSpamTrash", "true".into()), ("q", "newer_than:30d".into())];
+            if let Some(p) = st["check_page"].as_str() {
+                q.push(("pageToken", p.to_owned()));
+            }
+            let list = r.get(a, "/gmail/v1/users/me/messages", &q).await?;
+            let ids: Vec<Value> = list["messages"].as_array().into_iter().flatten().map(|m| m["id"].clone()).collect();
+            st["check_queue"] = json!(ids);
+            st["check_page"] = json!(list["nextPageToken"].as_str());
+            continue;
+        };
+        match r.get(a, &format!("/gmail/v1/users/me/messages/{}", enc(&id)), &[("format", "minimal".into())]).await {
+            Ok(v) => relabel(r, a, &id, labels_of(&v)),
+            Err(e) if status_of(&e) == Some(404) => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(q) = st["check_queue"].as_array_mut() {
+            q.remove(0);
         }
     }
     Ok(())
