@@ -87,6 +87,8 @@ impl Worker {
             anyhow::bail!("another c6w is already running with state directory {}", state_dir.display());
         }
         let journal = Arc::new(journal::Journal::open(&state_dir.join("journal.db")).await?);
+        // What its kit runs make on the container runtime carries its id.
+        c6_tools::kits::set_owner(&identity.meta.worker_id.to_string());
         let link = Arc::new(link::HeadLink::default());
         let sessions = session::SessionManager::new(journal.clone(), link.clone(), state_dir.join("worktrees"));
         sessions.recover().await?;
