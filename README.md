@@ -508,6 +508,10 @@ For a machine you can reach by SSH but don't want to install `c6w` on, start a s
 
 Not every task belongs in a repository. Leave the folder empty when starting a session (or use `c6 run --scratch`), and the worker gives it a scratch workspace of its own, `scratch/<session>` in the worker's state directory. It's where the agent downloads, drafts and builds things for research, documents and one-off jobs.
 
+### New session like this one
+
+**New like this** in a session's header opens the new-session form in a popup, filled in from that session: its worker, folder (or SSH host and folder), connection, current model and effort, labels (so the same agents, skills, hooks and routing apply), realm, and a fresh git worktree if it ran in one. Change anything, optionally type a first message, and **Start session**: the new session starts empty and opens beside it. The popup leaves the main form's remembered choices alone.
+
 ### Secrets
 
 Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is an environment variable (`$GITHUB_TOKEN`) for the agent's shell commands, background commands included, in the sessions it applies to (an "Applies to" label list, like other settings).

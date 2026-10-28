@@ -6,7 +6,7 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::models::ModelInput;
-use crate::util::{BUTTON, ErrorBox, INPUT, StatusPill, ago, clock, storage_get, storage_set};
+use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, ago, clock, storage_get, storage_set};
 use crate::workspace::{Go, How, View, use_column, use_workspace};
 
 #[component]
@@ -287,18 +287,107 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     }
 }
 
+/// What a new session starts from when it is made like another one: where
+/// it runs, its model and its labels (the agents, skills, hooks and
+/// commands that apply follow from those).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionSeed {
+    pub worker_id: String,
+    /// The folder on the worker, or on the SSH host.
+    pub cwd: String,
+    pub ssh: Option<String>,
+    pub connection_id: String,
+    pub model: String,
+    pub effort: String,
+    pub labels: Vec<String>,
+    /// It ran in a git worktree of `cwd`: the new one gets its own.
+    pub worktree: bool,
+    pub realm: String,
+}
+
+impl SessionSeed {
+    pub fn from_session(s: &Session) -> Self {
+        SessionSeed {
+            worker_id: s.worker_id.to_string(),
+            cwd: s.cwd.clone(),
+            ssh: s.ssh.clone(),
+            connection_id: s.connection_id.clone(),
+            model: s.model.clone(),
+            effort: s.effort.clone().unwrap_or_default(),
+            labels: s.labels.clone(),
+            worktree: false,
+            realm: s.realm.clone(),
+        }
+    }
+}
+
 #[component]
 fn NewSession(connections: Vec<Connection>) -> impl IntoView {
+    view! { <SessionForm connections /> }
+}
+
+/// A popup with the new-session form, filled in from `seed`: change what
+/// you like and start it. The new session opens beside the current one.
+#[component]
+pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>) -> impl IntoView {
+    let connections = LocalResource::new(api::connections);
+    let seed = StoredValue::new(seed);
+    view! {
+        <div class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+            on:keydown=move |ev| {
+                // Not the session's Esc, which stops its turn.
+                if ev.key() == "Escape" {
+                    ev.stop_propagation();
+                    on_close.run(());
+                }
+            }>
+            <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
+                <div class="flex items-center gap-2">
+                    <h2 class="flex-1 font-medium">"New session like this one"</h2>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                </div>
+                <p class="text-xs text-zinc-500">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
+                <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+                    {move || connections.get().map(|r| match r {
+                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                        Ok(conns) => view! { <SessionForm connections=conns seed=seed.get_value() on_started=on_close on_cancel=on_close /> }.into_any(),
+                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    })}
+                </Suspense>
+            </div>
+        </div>
+    }
+}
+
+/// The new-session form. With a `seed` it starts from those values instead
+/// of the ones remembered in this browser, and remembers none of its own.
+#[component]
+fn SessionForm(
+    connections: Vec<Connection>,
+    #[prop(optional)] seed: Option<SessionSeed>,
+    /// After the session started (and opened).
+    #[prop(optional, into)]
+    on_started: Option<Callback<()>>,
+    /// Shows a Cancel button.
+    #[prop(optional, into)]
+    on_cancel: Option<Callback<()>>,
+) -> impl IntoView {
     let live = api::live();
     let (ws, col) = (use_workspace(), use_column());
+    let seeded = seed.is_some();
+    let seed = seed.unwrap_or_default();
+    // Radio groups and datalists are per document: each form its own names.
+    static FORMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = FORMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (where_name, recent_id) = (format!("c6-where-{n}"), format!("c6-ssh-recent-{n}"));
 
-    let worker = RwSignal::new(storage_get("c6.worker").unwrap_or_default());
-    let cwd = RwSignal::new(String::new());
+    let worker = RwSignal::new(if seeded { seed.worker_id.clone() } else { storage_get("c6.worker").unwrap_or_default() });
+    let cwd = RwSignal::new(if seeded && seed.ssh.is_none() { seed.cwd.clone() } else { String::new() });
     let picking = RwSignal::new(false);
     // Or on an SSH host, through the worker: the target and a folder there.
-    let remote = RwSignal::new(storage_get("c6.where").as_deref() == Some("ssh"));
-    let ssh = RwSignal::new(String::new());
-    let remote_dir = RwSignal::new(String::new());
+    let remote = RwSignal::new(if seeded { seed.ssh.is_some() } else { storage_get("c6.where").as_deref() == Some("ssh") });
+    let ssh = RwSignal::new(seed.ssh.clone().unwrap_or_default());
+    let remote_dir = RwSignal::new(if seed.ssh.is_some() { seed.cwd.clone() } else { String::new() });
     // Hosts from the inventory, offered by name.
     let inventory = LocalResource::new(api::hosts);
     let recent_ssh = move || -> Vec<String> {
@@ -309,7 +398,11 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online))
     };
     // Empty: "Auto", your routing rules choose the connection and model.
-    let remembered_connection = storage_get("c6.connection").filter(|c| c.is_empty() || connections.iter().any(|x| &x.id == c));
+    // A seed's connection, if it is still there.
+    let seeded_connection = (seeded && connections.iter().any(|x| x.id == seed.connection_id)).then(|| seed.connection_id.clone());
+    let remembered_connection = seeded_connection
+        .clone()
+        .or_else(|| storage_get("c6.connection").filter(|c| c.is_empty() || connections.iter().any(|x| &x.id == c)));
     let connection = RwSignal::new(remembered_connection.clone().unwrap_or_else(|| connections[0].id.clone()));
     let has_routes = RwSignal::new(false);
     spawn_local(async move {
@@ -322,12 +415,14 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         }
     });
     let auto = move || connection.get().is_empty();
-    let model = RwSignal::new(String::new());
-    let effort = RwSignal::new(storage_get("c6.effort").unwrap_or_default());
-    let worktree = RwSignal::new(storage_get("c6.worktree").as_deref() == Some("1"));
+    let model = RwSignal::new(if seeded_connection.is_some() { seed.model.clone() } else { String::new() });
+    let effort = RwSignal::new(if seeded { seed.effort.clone() } else { storage_get("c6.effort").unwrap_or_default() });
+    let worktree =
+        RwSignal::new(if seeded { seed.worktree && seed.ssh.is_none() } else { storage_get("c6.worktree").as_deref() == Some("1") });
     let prompt = RwSignal::new(String::new());
     // Your labels for the session (remembered per folder).
-    let labels = RwSignal::new(String::new());
+    let labels = RwSignal::new(seed.labels.join(", "));
+    let seed_realm = StoredValue::new(seed.realm.clone());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
@@ -336,8 +431,9 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
     let effort_supported = move || conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).is_some_and(|c| c.supports_effort));
 
     // Pick a worker once the fleet loads: the last one used if it is online,
-    // otherwise an online one. A worker the user picks by hand is kept.
-    let chosen_by_hand = RwSignal::new(false);
+    // otherwise an online one. A worker the user picks by hand is kept, and
+    // so is a seed's.
+    let chosen_by_hand = RwSignal::new(seeded);
     Effect::new(move || {
         // The memex is a node, not a worker: it runs no sessions.
         let ws: Vec<c6_api::Worker> = live.workers.get().into_iter().filter(|w| w.role != "memex").collect();
@@ -356,9 +452,12 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
         if let Some(w) = pick {
             worker.set(w.id.to_string());
         }
-    }); // Remember the last directory per worker.
-    Effect::new(move || {
+    }); // Remember the last directory per worker (a seed's folder first).
+    Effect::new(move |first: Option<()>| {
         let w = worker.get();
+        if first.is_none() && seeded {
+            return;
+        }
         let remembered = storage_get(&format!("c6.cwd.{w}")).unwrap_or_default();
         cwd.set(remembered.clone());
         // Forget a remembered folder that no longer exists there.
@@ -370,13 +469,20 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             });
         }
     });
-    Effect::new(move || {
-        let (w, c) = (worker.get(), cwd.get());
-        labels.set(storage_get(&format!("c6.labels.{w}.{c}")).unwrap_or_default());
-    });
-    // Default model per connection.
-    Effect::new(move || {
+    // A seed's labels stay whatever the folder.
+    if !seeded {
+        Effect::new(move || {
+            let (w, c) = (worker.get(), cwd.get());
+            labels.set(storage_get(&format!("c6.labels.{w}.{c}")).unwrap_or_default());
+        });
+    }
+    // Default model per connection (a seed's model for its connection).
+    let keep_model = seeded_connection.is_some();
+    Effect::new(move |first: Option<()>| {
         let c = connection.get();
+        if first.is_none() && keep_model {
+            return;
+        }
         if c.is_empty() {
             model.set(String::new());
             return;
@@ -415,10 +521,9 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked() && !on_ssh,
-            // In the realm you are looking at (else home).
-            realm: Some(crate::api::realm().get_untracked()).filter(|r| !r.is_empty()),
+            // A seed's realm; else the realm you are looking at (else home).
+            realm: if seeded { Some(seed_realm.get_value()) } else { Some(crate::api::realm().get_untracked()) }.filter(|r| !r.is_empty()),
         };
-        storage_set("c6.where", if on_ssh { "ssh" } else { "worker" });
         if on_ssh {
             // Recent targets of this worker, newest first.
             let mut recent = recent_ssh();
@@ -427,29 +532,47 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
             recent.truncate(10);
             storage_set(&format!("c6.ssh.{}", req.worker_id), &recent.join(","));
         }
-        storage_set("c6.worktree", if worktree.get_untracked() { "1" } else { "0" });
-        storage_set("c6.effort", &effort.get_untracked());
-        storage_set("c6.worker", &req.worker_id.to_string());
-        storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
-        storage_set(&format!("c6.labels.{}.{}", req.worker_id, req.cwd), &req.labels.join(", "));
-        storage_set("c6.connection", &req.connection_id);
-        if !req.connection_id.is_empty() {
-            storage_set(&format!("c6.model.{}", req.connection_id), &req.model);
+        // A seeded form leaves the main form's defaults alone.
+        if !seeded {
+            storage_set("c6.where", if on_ssh { "ssh" } else { "worker" });
+            storage_set("c6.worktree", if worktree.get_untracked() { "1" } else { "0" });
+            storage_set("c6.effort", &effort.get_untracked());
+            storage_set("c6.worker", &req.worker_id.to_string());
+            storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
+            storage_set(&format!("c6.labels.{}.{}", req.worker_id, req.cwd), &req.labels.join(", "));
+            storage_set("c6.connection", &req.connection_id);
+            if !req.connection_id.is_empty() {
+                storage_set(&format!("c6.model.{}", req.connection_id), &req.model);
+            }
         }
         pending.set(true);
         spawn_local(async move {
             match api::create_session(req).await {
                 // Beside the form, so another can start right away.
-                Ok(s) => match col {
-                    Some(c) => c.open(View::session(s.id), How::Beside),
-                    None => ws.open(None, View::session(s.id), How::Beside),
-                },
+                Ok(s) => {
+                    match col {
+                        Some(c) => c.open(View::session(s.id), How::Beside),
+                        None => ws.open(None, View::session(s.id), How::Beside),
+                    }
+                    if let Some(f) = on_started {
+                        f.run(());
+                    }
+                }
                 Err(e) => error.set(Some(e)),
             }
             pending.set(false);
         });
     };
     let submit_click = submit;
+    let prompt_box = NodeRef::<leptos::html::Textarea>::new();
+    // In a popup, start typing the first message right away.
+    if on_cancel.is_some() {
+        Effect::new(move || {
+            if let Some(el) = prompt_box.get() {
+                let _ = el.focus();
+            }
+        });
+    }
 
     view! {
         {move || picking.get().then(|| view! {
@@ -460,7 +583,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 on_cancel=Callback::new(move |_| picking.set(false))
             />
         })}
-        <section class="space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50">
+        <section class=if seeded { "space-y-3" } else { "space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50" }>
             <div class="grid gap-3 sm:grid-cols-[1fr_2fr_auto]">
                 <label class="block text-xs text-zinc-500">
                     "Worker"
@@ -473,15 +596,15 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 </label>
                 <div class="block text-xs text-zinc-500 sm:col-span-2">
                     <div class="flex items-center gap-3">
-                        <label class="flex items-center gap-1"><input type="radio" name="c6-where" prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
+                        <label class="flex items-center gap-1"><input type="radio" name=where_name.clone() prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
                         <label class="flex items-center gap-1" title="Work on another machine over SSH, using the worker's keys and ~/.ssh/config">
-                            <input type="radio" name="c6-where" prop:checked=move || remote.get() on:change=move |_| remote.set(true) />"SSH host, through the worker"
+                            <input type="radio" name=where_name prop:checked=move || remote.get() on:change=move |_| remote.set(true) />"SSH host, through the worker"
                         </label>
                     </div>
                     <div class="mt-1 flex gap-2" class:hidden=move || !remote.get()>
-                        <input class=format!("{INPUT} min-w-0 flex-1 font-mono") list="c6-ssh-recent" placeholder="user@host or an ssh_config alias"
+                        <input class=format!("{INPUT} min-w-0 flex-1 font-mono") list=recent_id.clone() placeholder="user@host or an ssh_config alias"
                             prop:value=move || ssh.get() on:input=move |ev| ssh.set(event_target_value(&ev)) />
-                        <datalist id="c6-ssh-recent">
+                        <datalist id=recent_id>
                             {move || inventory.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|h| h.host.enabled).map(|h| {
                                 let label = format!("{} · {}", h.host.target, h.host.labels.join(", "));
                                 view! { <option value=h.host.name.clone() label=label></option> }
@@ -537,7 +660,8 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                 <input class=format!("mt-1 font-mono {INPUT}") placeholder="optional, e.g. client:acme, spike (repo, folder, worker and model are added automatically)"
                     prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
             </label>
-            <textarea class=format!("{INPUT} min-h-24 resize-y") placeholder="What should the agent do? (⌘/Ctrl+Enter to start)"
+            <textarea node_ref=prompt_box class=format!("{INPUT} min-h-24 resize-y")
+                placeholder=if seeded { "First message (optional: leave it empty to start an empty session; ⌘/Ctrl+Enter to start)" } else { "What should the agent do? (⌘/Ctrl+Enter to start)" }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:keydown=move |ev| {
@@ -558,6 +682,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
                     <input type="checkbox" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
                     "New git worktree"
                 </label>
+                {on_cancel.map(|c| view! { <button class=BUTTON_QUIET on:click=move |_| c.run(())>"Cancel"</button> })}
                 <button class=BUTTON disabled=move || pending.get() on:click=move |_| submit_click()>"Start session"</button>
             </div>
         </section>
@@ -649,5 +774,29 @@ fn RunTemplate() -> impl IntoView {
                 </section>
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_takes_where_and_how_a_session_runs() {
+        let s: Session = serde_json::from_value(serde_json::json!({
+            "id": "s1", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "t", "cwd": "/src/app",
+            "connection_id": "anthropic", "model": "claude-x", "status": "idle", "error": null, "effort": "high",
+            "created_at": 0, "updated_at": 0, "last_seq": 0, "labels": ["client:acme"], "auto_labels": ["repo:app"],
+            "ssh": "admin@web1", "realm": "work"
+        }))
+        .unwrap();
+        let seed = SessionSeed::from_session(&s);
+        assert_eq!(seed.worker_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!((seed.cwd.as_str(), seed.ssh.as_deref()), ("/src/app", Some("admin@web1")));
+        assert_eq!((seed.connection_id.as_str(), seed.model.as_str(), seed.effort.as_str()), ("anthropic", "claude-x", "high"));
+        // Only your labels: the automatic ones are made again for the new session.
+        assert_eq!(seed.labels, vec!["client:acme".to_owned()]);
+        assert_eq!(seed.realm, "work");
+        assert!(!seed.worktree);
     }
 }

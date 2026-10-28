@@ -357,8 +357,24 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
     let find_root = root.clone();
     let details = crate::details::remembered();
+    // "New like this": a popup with the new-session form, filled in from
+    // this session as it is now (its labels, its current model).
+    let like_this = RwSignal::new(None::<sessions::SessionSeed>);
+    let open_like_this = move || {
+        let id = id_stored.get_value();
+        let Some(d) = detail.get_untracked().and_then(Result::ok) else { return };
+        let s = live.sessions.with_untracked(|ss| ss.iter().find(|s| s.id == id).cloned()).unwrap_or(d.session);
+        let mut seed = sessions::SessionSeed::from_session(&s);
+        let (c, m, e) = choice.current.get_untracked();
+        if !c.is_empty() {
+            (seed.connection_id, seed.model, seed.effort) = (c, m, e);
+        }
+        seed.worktree = started.get_untracked().is_some_and(|(_, b)| !b.is_empty());
+        like_this.set(Some(seed));
+    };
     view! {
         <div class="relative flex min-h-0 flex-1 flex-col">
+        {move || like_this.get().map(|seed| view! { <sessions::NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
         {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
         {move || details.get().then(|| detail.get().and_then(Result::ok)).flatten().map(|d| {
             let worker_id = d.session.worker_id;
@@ -410,6 +426,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                         tab.set("transcript");
                                         find_open.set(true);
                                     }>"Find"</button>
+                                    {(!s.observed && s.instance.is_empty()).then(|| view! {
+                                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
+                                            title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
+                                            on:click=move |_| open_like_this()>"New like this"</button>
+                                    })}
                                     <crate::tasks::RunningTasks session=id_stored.get_value() events />
                                     <SubagentsPill session=id_stored.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.clone() />
                                     {move || view! { <StatusPill status=status.get() /> }}
