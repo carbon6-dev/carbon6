@@ -307,11 +307,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             None => reveal_when_rendered(root, anchor, terms, 0),
         }
     }
-    let on_scroll = Callback::new(move |()| {
-        if let Some(el) = scroller.get_untracked() {
-            stick.set(el.scroll_height() - el.scroll_top() - el.client_height() < 120);
-        }
-    });
     Effect::new(move || {
         events.track();
         streaming.track();
@@ -416,7 +411,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     running=Signal::derive(running) tab open=details />
             }
         })}
-        <ScrollBox node_ref=scroller on_scroll>
+        <ScrollBox node_ref=scroller follow=stick>
         <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {

@@ -50,8 +50,23 @@ pub fn ModelInput(
         on_set.run(m);
         shown.set(false);
     };
+    // Opened where there's room: up from a box near the bottom of the
+    // window (a session's composer), and no taller than the room there.
+    let wrap = NodeRef::<leptos::html::Div>::new();
+    let room = RwSignal::new((false, 288.0));
+    Effect::new(move || {
+        if shown.get()
+            && let Some(el) = wrap.get_untracked()
+        {
+            let r = el.get_bounding_client_rect();
+            let height = window().inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(800.0);
+            let (below, above) = (height - r.bottom() - 12.0, r.top() - 12.0);
+            let up = below < 288.0 && above > below;
+            room.set((up, if up { above } else { below }.clamp(96.0, 288.0)));
+        }
+    });
     view! {
-        <div class="relative">
+        <div class="relative" node_ref=wrap>
             <div class="flex">
                 <input class=format!("{class} rounded-r-none font-mono") autocomplete="off" placeholder=move || placeholder.get()
                     prop:value=move || value.get() on:input=move |ev| on_set.run(event_target_value(&ev))
@@ -62,7 +77,9 @@ pub fn ModelInput(
                     on:mousedown=move |ev| { ev.prevent_default(); shown.update(|s| *s = !*s); }>"▾"</button>
             </div>
             {move || shown.get().then(|| view! {
-                <div class="absolute z-30 mt-1 max-h-72 w-full min-w-56 overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+                <div class=move || format!("absolute z-30 w-full min-w-56 overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900 {}",
+                        if room.get().0 { "bottom-full mb-1" } else { "mt-1" })
+                    style=move || format!("max-height: {}px", room.get().1)
                     on:mousedown=|ev| ev.prevent_default()>
                     {move || match groups() {
                         None => view! { <p class="px-2 py-1 text-zinc-500">{if list.is_some() { "Test the connection to list its models." } else { "Asking for the models…" }}</p> }.into_any(),

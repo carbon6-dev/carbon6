@@ -19,4 +19,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
-web-sys = { version = "0.3.106", features = ["Window", "Navigator", "Clipboard", "Location", "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Storage", "Document", "Element", "HtmlElement", "MediaQueryList", "Notification", "NotificationOptions", "NotificationPermission", "HtmlDetailsElement", "UrlSearchParams", "History", "File", "FileList", "Blob", "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit", "DomRect", "AddEventListenerOptions"] }
+web-sys = { version = "0.3.106", features = ["Window", "Navigator", "Clipboard", "Location", "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Storage", "Document", "Element", "HtmlElement", "MediaQueryList", "Notification", "NotificationOptions", "NotificationPermission", "HtmlDetailsElement", "UrlSearchParams", "History", "File", "FileList", "Blob", "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit", "DomRect", "AddEventListenerOptions", "ResizeObserver", "WheelEvent", "DragEvent", "DataTransfer"] }

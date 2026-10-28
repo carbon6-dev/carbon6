@@ -22,6 +22,7 @@ use c6_api::{Session, SessionStatus};
 use leptos::html::Div;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
 
 use crate::api::{self, LiveFeed};
 use crate::util::{storage_get, storage_set};
@@ -357,6 +358,10 @@ pub struct Tile {
     pub back: Vec<Vec<Column>>,
     #[serde(default)]
     pub forward: Vec<Vec<Column>>,
+    /// The column of the workspace it sits in (0 the leftmost), placed
+    /// when it opens and moved by dragging its bar.
+    #[serde(default)]
+    pub stack: Option<usize>,
 }
 
 /// How far back a tile remembers.
@@ -412,6 +417,81 @@ impl Layout {
             used: self.next,
             back: Vec::new(),
             forward: Vec::new(),
+            stack: None,
+        }
+    }
+
+    /// Puts tiles without a column in one: a new column while there are
+    /// fewer than [`COLUMNS`], then the column with the fewest (the
+    /// leftmost of those), so they fill left to right and then stack in
+    /// turn. Columns are numbered from 0 without gaps.
+    fn place(&mut self) {
+        for i in 0..self.tiles.len() {
+            if self.tiles[i].stack.is_some() {
+                continue;
+            }
+            let mut count = [0usize; COLUMNS];
+            for t in &self.tiles {
+                if let Some(c) = t.stack.filter(|&c| c < COLUMNS) {
+                    count[c] += 1;
+                }
+            }
+            let used = count.iter().filter(|&&n| n > 0).count();
+            let stack = if used < COLUMNS {
+                count.iter().position(|&n| n == 0).unwrap_or(0)
+            } else {
+                (0..COLUMNS).min_by_key(|&c| (count[c], c)).unwrap_or(0)
+            };
+            self.tiles[i].stack = Some(stack);
+        }
+        let mut stacks: Vec<usize> = self.tiles.iter().filter_map(|t| t.stack).collect();
+        stacks.sort_unstable();
+        stacks.dedup();
+        for t in &mut self.tiles {
+            t.stack = t.stack.and_then(|c| stacks.iter().position(|&x| x == c)).map(|c| c.min(COLUMNS - 1));
+        }
+    }
+
+    /// Moves tile `key` to where it was dropped, keeping focus where it was.
+    fn move_tile(&mut self, key: u64, to: Drop) {
+        let focused = self.tiles.get(self.focus).map(|t| t.key);
+        let Some(from) = self.tiles.iter().position(|t| t.key == key) else { return };
+        let target = match to {
+            Drop::Above(k) | Drop::Below(k) | Drop::LeftOf(k) | Drop::RightOf(k) => k,
+        };
+        if target == key {
+            return;
+        }
+        let Some(target_stack) = self.tile(target).and_then(|t| t.stack) else { return };
+        let columns = self.tiles.iter().filter_map(|t| t.stack).collect::<HashSet<_>>().len();
+        let alone = self.tiles.iter().filter(|t| t.stack == self.tiles[from].stack).count() == 1;
+        let mut tile = self.tiles.remove(from);
+        match to {
+            Drop::Above(_) | Drop::Below(_) => {
+                tile.stack = Some(target_stack);
+                let at = self.tiles.iter().position(|t| t.key == target).unwrap_or(0);
+                let at = if matches!(to, Drop::Below(_)) { at + 1 } else { at };
+                self.tiles.insert(at, tile);
+            }
+            Drop::LeftOf(_) | Drop::RightOf(_) => {
+                // A new column, while there's room for one (a tile alone
+                // in its column just moves its column).
+                if columns >= COLUMNS && !alone {
+                    self.tiles.insert(from, tile);
+                    return;
+                }
+                // Spread the columns out (c to 2c + 1), to make room on
+                // either side of each.
+                for t in &mut self.tiles {
+                    t.stack = t.stack.map(|c| 2 * c + 1);
+                }
+                tile.stack = Some(if matches!(to, Drop::LeftOf(_)) { 2 * target_stack } else { 2 * target_stack + 2 });
+                self.tiles.push(tile);
+            }
+        }
+        self.place();
+        if let Some(i) = focused.and_then(|k| self.tiles.iter().position(|t| t.key == k)) {
+            self.focus = i;
         }
     }
 
@@ -435,6 +515,7 @@ impl Layout {
     fn open_tile(&mut self, view: View) {
         let tile = self.new_tile(view);
         self.tiles.push(tile);
+        self.place();
         self.focus = self.tiles.len() - 1;
         self.touch(self.focus);
     }
@@ -480,6 +561,20 @@ pub enum How {
     Beside,
     /// In a new tile (⌘/Ctrl-click).
     NewTile,
+    /// In a tile of its own: the one already showing it, or a new one (the
+    /// Apps menu).
+    OwnTile,
+}
+
+/// Where a dragged tile was dropped, by the tile it was dropped on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drop {
+    /// In that tile's column, above or below it.
+    Above(u64),
+    Below(u64),
+    /// In a new column, left or right of that tile's.
+    LeftOf(u64),
+    RightOf(u64),
 }
 
 impl How {
@@ -502,6 +597,9 @@ pub struct Workspace {
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
     pub pinned: RwSignal<Vec<String>>,
+    /// The tile being dragged by its bar, and where it would drop.
+    pub dragging: RwSignal<Option<u64>>,
+    pub drop_at: RwSignal<Option<Drop>>,
 }
 
 fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
@@ -514,13 +612,18 @@ impl Workspace {
         let here = View::from_location();
         let layout = match load::<Layout>(LAYOUT_KEY).filter(Layout::valid) {
             None => Layout::new(here.clone()),
-            Some(l) => l,
+            Some(mut l) => {
+                l.place();
+                l
+            }
         };
         let ws = Workspace {
             layout: RwSignal::new(layout),
             chrome: RwSignal::new(HashMap::new()),
             attention: RwSignal::new(load(ATTENTION_KEY).unwrap_or_default()),
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
+            dragging: RwSignal::new(None),
+            drop_at: RwSignal::new(None),
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
@@ -564,7 +667,15 @@ impl Workspace {
                 l.touch(ti);
                 return;
             }
-            if how == How::NewTile {
+            if how == How::OwnTile
+                && let Some(ti) = l.tiles.iter().position(|t| t.columns[0].view == view)
+            {
+                l.tiles[ti].settle();
+                l.focus = ti;
+                l.touch(ti);
+                return;
+            }
+            if how != How::Beside {
                 l.open_tile(view);
                 return;
             }
@@ -656,6 +767,7 @@ impl Workspace {
                 *l = Layout::new(View::home());
             } else {
                 l.tiles.remove(ti);
+                l.place();
                 l.focus = l.focus.min(l.tiles.len() - 1);
             }
         });
@@ -668,9 +780,15 @@ impl Workspace {
                 *l = Layout::new(View::home());
             } else {
                 l.tiles.remove(ti);
+                l.place();
                 l.focus = l.focus.min(l.tiles.len() - 1);
             }
         });
+    }
+
+    /// Moves a dragged tile to where it was dropped.
+    pub fn move_tile(&self, key: u64, to: Drop) {
+        self.layout.update(|l| l.move_tile(key, to));
     }
 
     pub fn new_tile(&self) {
@@ -821,8 +939,10 @@ pub struct ColumnCtx {
     pub visible: Signal<bool>,
     /// The column keyboard shortcuts act on.
     pub active: Signal<bool>,
-    /// Scroll position, kept while the column is folded away.
-    scroll: StoredValue<i32>,
+    /// Scroll position, kept while the column is folded away, and whether
+    /// it was at the end (then it comes back at the end, however much was
+    /// added meanwhile).
+    scroll: StoredValue<(i32, bool)>,
 }
 
 impl ColumnCtx {
@@ -849,14 +969,15 @@ pub fn use_column() -> Option<ColumnCtx> {
 }
 
 /// Opens a view: from inside a column, beside it; from elsewhere, in the
-/// focused tile. ⌘/Ctrl-click opens a new tile; middle-click and "copy
-/// link" use the plain URL.
+/// focused tile, or with `own`, in a tile of its own. ⌘/Ctrl-click opens
+/// a new tile; middle-click and "copy link" use the plain URL.
 #[component]
 pub fn Go(
     to: View,
     #[prop(optional, into)] class: String,
     #[prop(optional, into)] title: String,
     #[prop(optional)] stop: bool,
+    #[prop(optional)] own: bool,
     children: Children,
 ) -> impl IntoView {
     let ws = use_workspace();
@@ -872,7 +993,10 @@ pub fn Go(
             if stop {
                 ev.stop_propagation();
             }
-            let how = How::from_mouse(&ev);
+            let how = match How::from_mouse(&ev) {
+                How::Beside if own => How::OwnTile,
+                how => how,
+            };
             match col {
                 Some(c) => c.open(to.get_value(), how),
                 None => ws.open(None, to.get_value(), how),
@@ -882,12 +1006,18 @@ pub fn Go(
 }
 
 /// A scrolling area that remembers its position while its column is folded
-/// away.
+/// away: where it was, or the end if it was at the end.
+///
+/// With `follow`, it keeps to the end as its content grows, while shown
+/// again after being hidden, and as content renders late, until you
+/// scroll away from the end yourself (wheel, touch, the scroll bar or
+/// keys); back at the end, it follows again.
 #[component]
 pub fn ScrollBox(
     #[prop(optional)] node_ref: Option<NodeRef<Div>>,
     #[prop(optional, into)] class: String,
     #[prop(optional)] on_scroll: Option<Callback<()>>,
+    #[prop(optional)] follow: Option<RwSignal<bool>>,
     children: Children,
 ) -> impl IntoView {
     let col = use_column();
@@ -895,29 +1025,94 @@ pub fn ScrollBox(
     if let Some(c) = col {
         Effect::new(move || {
             if c.visible.get() {
-                let top = c.scroll.get_value();
+                let (top, end) = c.scroll.get_value();
                 request_animation_frame(move || {
-                    if let Some(el) = node.get_untracked()
-                        && top > 0
-                    {
-                        el.set_scroll_top(top);
+                    if let Some(el) = node.get_untracked() {
+                        if end || follow.is_some_and(|f| f.get_untracked()) {
+                            el.set_scroll_top(el.scroll_height());
+                        } else if top > 0 {
+                            el.set_scroll_top(top);
+                        }
                     }
                 });
             }
         });
     }
+    // You moved it (rather than content arriving, or it being hidden).
+    let by_you = StoredValue::new(false);
+    if let Some(follow) = follow {
+        let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
+        Effect::new(move || {
+            let Some(el) = node.get() else { return };
+            let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
+                if let Some(el) = node.get_untracked()
+                    && follow.get_untracked()
+                    && el.client_height() > 0
+                {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            });
+            if let Ok(obs) = web_sys::ResizeObserver::new(to_end.as_ref().unchecked_ref()) {
+                obs.observe(&el);
+                // The content: it grows as events arrive and render.
+                let children = el.children();
+                for i in 0..children.length() {
+                    if let Some(child) = children.item(i) {
+                        obs.observe(&child);
+                    }
+                }
+                observer.set_value(Some(obs));
+            }
+            to_end.forget();
+        });
+        on_cleanup(move || {
+            if let Some(o) = observer.try_get_value().flatten() {
+                o.disconnect();
+            }
+        });
+    }
+    let yours = move || by_you.set_value(true);
     view! {
-        <div node_ref=node class=format!("min-h-0 flex-1 overflow-y-auto {class}") on:scroll=move |_| {
-            if let (Some(c), Some(el)) = (col, node.get_untracked())
+        <div node_ref=node class=format!("min-h-0 flex-1 overflow-y-auto {class}")
+            on:wheel=move |ev: web_sys::WheelEvent| if ev.delta_y() < 0.0 { yours() }
+            on:touchstart=move |_| yours()
+            on:keydown=move |ev: web_sys::KeyboardEvent| if matches!(ev.key().as_str(), "ArrowUp" | "PageUp" | "Home" | " ") { yours() }
+            // The scroll bar: a press on the box itself, not its content.
+            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                if ev.target().is_some_and(|t| node.get_untracked().is_some_and(|el| AsRef::<web_sys::EventTarget>::as_ref(&el) == &t)) {
+                    yours();
+                }
+            }
+            on:scroll=move |_| {
+            let Some(el) = node.get_untracked() else { return };
+            // Hidden: nothing to remember.
+            if el.client_height() == 0 {
+                return;
+            }
+            let end = at_end(&el);
+            if let Some(c) = col
                 && c.visible.get_untracked()
             {
-                c.scroll.set_value(el.scroll_top());
+                c.scroll.set_value((el.scroll_top(), end));
+            }
+            if let Some(f) = follow {
+                if end {
+                    f.set(true);
+                    by_you.set_value(false);
+                } else if by_you.get_value() {
+                    f.set(false);
+                }
             }
             if let Some(f) = on_scroll {
                 f.run(());
             }
         }>{children()}</div>
     }
+}
+
+/// Whether a scrolling area is at (or within a line or two of) its end.
+pub fn at_end(el: &web_sys::Element) -> bool {
+    el.scroll_height() - el.scroll_top() - el.client_height() < 120
 }
 
 /// Where a tile goes, as fractions of the workspace.
@@ -929,20 +1124,19 @@ pub struct Rect {
     pub height: f64,
 }
 
-/// Where each tile goes, given when each was last used (in tile order).
-/// Up to [`COLUMNS`] tiles sit side by side; beyond that tile `i` stacks in
-/// column `i % COLUMNS` (the fifth under the first, …, the ninth makes the
-/// first column three high). A column of two splits evenly; in a column of
-/// three or more, the tile last used there takes half the height and the
-/// others share the rest.
-pub fn arrange(used: &[u64]) -> Vec<Rect> {
-    let n = used.len();
-    let cols = n.clamp(1, COLUMNS);
+/// Where each tile goes, given its column and when it was last used (in
+/// tile order; columns numbered from 0 without gaps). The columns sit side
+/// by side, evenly; a column's tiles stack in tile order. A column of two
+/// splits evenly; in a column of three or more, the tile last used there
+/// takes half the height and the others share the rest.
+pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
+    let n = tiles.len();
+    let cols = tiles.iter().map(|t| t.0 + 1).max().unwrap_or(1);
     let mut out = vec![Rect::default(); n];
-    for c in 0..cols.min(n) {
-        let members: Vec<usize> = (c..n).step_by(cols).collect();
+    for c in 0..cols {
+        let members: Vec<usize> = (0..n).filter(|&i| tiles[i].0 == c).collect();
         let k = members.len();
-        let big = members.iter().copied().max_by_key(|&i| used[i]);
+        let big = members.iter().copied().max_by_key(|&i| tiles[i].1);
         let weight = |i: usize| if k >= 3 && Some(i) == big { (k - 1) as f64 } else { 1.0 };
         let total: f64 = members.iter().map(|&i| weight(i)).sum();
         let mut top = 0.0;
@@ -982,8 +1176,8 @@ pub fn Tiles() -> impl IntoView {
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
     let rects = Memo::new(move |_| {
         ws.layout.with(|l| {
-            let used: Vec<u64> = l.tiles.iter().map(|t| t.used).collect();
-            l.tiles.iter().map(|t| t.key).zip(arrange(&used)).collect::<HashMap<u64, Rect>>()
+            let placed: Vec<(usize, u64)> = l.tiles.iter().map(|t| (t.stack.unwrap_or(0), t.used)).collect();
+            l.tiles.iter().map(|t| t.key).zip(arrange(&placed)).collect::<HashMap<u64, Rect>>()
         })
     });
     // Tiles are cards with room between them, placed by `arrange` (so one
@@ -1086,6 +1280,28 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let rename_at = RwSignal::new(None::<(f64, f64)>);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
     let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-white/10 dark:hover:text-zinc-100";
+    // Another tile dragged over this one: where it would go, by where the
+    // pointer is (the outer fifths make a new column beside this one's).
+    let section = NodeRef::<leptos::html::Section>::new();
+    let zone = move |ev: &web_sys::DragEvent| -> Option<Drop> {
+        let r = section.get_untracked()?.get_bounding_client_rect();
+        let x = (f64::from(ev.client_x()) - r.left()) / r.width().max(1.0);
+        let y = (f64::from(ev.client_y()) - r.top()) / r.height().max(1.0);
+        Some(match () {
+            _ if x < 0.2 => Drop::LeftOf(key),
+            _ if x > 0.8 => Drop::RightOf(key),
+            _ if y < 0.5 => Drop::Above(key),
+            _ => Drop::Below(key),
+        })
+    };
+    let other = move || ws.dragging.get_untracked().filter(|&k| k != key);
+    let hint = move || match ws.drop_at.get() {
+        Some(Drop::Above(k)) if k == key => Some("inset-x-0 top-0 h-1/2"),
+        Some(Drop::Below(k)) if k == key => Some("inset-x-0 bottom-0 h-1/2"),
+        Some(Drop::LeftOf(k)) if k == key => Some("inset-y-0 left-0 w-1/5"),
+        Some(Drop::RightOf(k)) if k == key => Some("inset-y-0 right-0 w-1/5"),
+        _ => None,
+    };
     view! {
         <div
             class=move || format!(
@@ -1099,15 +1315,51 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
                 if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
             )
+            node_ref=section
             on:pointerdown=move |_| ws.focus_tile_key(key)
             on:click=move |_| ws.grow(key)
+            on:dragover=move |ev: web_sys::DragEvent| {
+                if other().is_some() {
+                    ev.prevent_default();
+                    let z = zone(&ev);
+                    if ws.drop_at.get_untracked() != z {
+                        ws.drop_at.set(z);
+                    }
+                }
+            }
+            on:drop=move |ev: web_sys::DragEvent| {
+                if let (Some(k), Some(z)) = (other(), zone(&ev)) {
+                    ev.prevent_default();
+                    ws.move_tile(k, z);
+                }
+                ws.dragging.set(None);
+                ws.drop_at.set(None);
+            }
         >
+            {move || hint().map(|at| view! {
+                <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
+            })}
             // The tile's own bar: its history, its name (and a session's
             // colour and state), and what you can do to the whole tile.
+            // Dragged by its bar to another place or column.
             <div class=move || format!(
-                "flex h-9 shrink-0 items-center gap-1 border-b px-2 text-xs {}",
+                "flex h-9 shrink-0 cursor-grab items-center gap-1 border-b px-2 text-xs active:cursor-grabbing {}",
                 crate::colour::bar(colour.get().unwrap_or_default()),
-            )>
+            )
+                draggable=move || if many.get() { "true" } else { "false" }
+                title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
+                on:dragstart=move |ev: web_sys::DragEvent| {
+                    if let Some(dt) = ev.data_transfer() {
+                        let _ = dt.set_data("text/plain", &format!("tile {key}"));
+                        dt.set_effect_allowed("move");
+                    }
+                    ws.dragging.set(Some(key));
+                }
+                on:dragend=move |_| {
+                    ws.dragging.set(None);
+                    ws.drop_at.set(None);
+                }
+            >
                 <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
                 <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
                 {move || colour.get().map(|c| view! {
@@ -1175,33 +1427,93 @@ mod tests {
         Rect { left, top, width, height }
     }
 
+    /// Tiles placed as they open, as (column, when used) for `arrange`.
+    fn opened(n: usize) -> Layout {
+        let mut l = Layout::new(View::home());
+        for _ in 1..n {
+            l.open_tile(View::home());
+        }
+        l
+    }
+
+    fn placed(l: &Layout) -> Vec<(usize, u64)> {
+        l.tiles.iter().map(|t| (t.stack.unwrap(), t.used)).collect()
+    }
+
+    fn stacks(l: &Layout) -> Vec<usize> {
+        l.tiles.iter().map(|t| t.stack.unwrap()).collect()
+    }
+
     #[test]
     fn up_to_four_tiles_sit_side_by_side() {
-        assert_eq!(arrange(&[1]), vec![r(0.0, 0.0, 1.0, 1.0)]);
+        let mut one = Layout::new(View::home());
+        one.place();
+        assert_eq!(arrange(&placed(&one)), vec![r(0.0, 0.0, 1.0, 1.0)]);
         assert_eq!(
-            arrange(&[1, 2, 3]),
+            arrange(&placed(&opened(3))),
             vec![r(0.0, 0.0, 1.0 / 3.0, 1.0), r(1.0 / 3.0, 0.0, 1.0 / 3.0, 1.0), r(2.0 / 3.0, 0.0, 1.0 / 3.0, 1.0)]
         );
-        assert!(arrange(&[1, 2, 3, 4]).iter().all(|x| x.width == 0.25 && x.height == 1.0));
+        assert!(arrange(&placed(&opened(4))).iter().all(|x| x.width == 0.25 && x.height == 1.0));
     }
 
     #[test]
     fn more_stack_in_the_columns_in_turn() {
         // The fifth halves the first column; the others stay full height.
-        let five = arrange(&[1, 2, 3, 4, 5]);
+        assert_eq!(stacks(&opened(9)), [0, 1, 2, 3, 0, 1, 2, 3, 0]);
+        let five = arrange(&[(0, 1), (1, 2), (2, 3), (3, 4), (0, 5)]);
         assert_eq!((five[0], five[4]), (r(0.0, 0.0, 0.25, 0.5), r(0.0, 0.5, 0.25, 0.5)));
         assert!(five[1..4].iter().all(|x| x.height == 1.0));
-        // The sixth halves the second; by eight, every column is two high.
-        assert_eq!(arrange(&[1, 2, 3, 4, 5, 6])[5], r(0.25, 0.5, 0.25, 0.5));
-        assert!(arrange(&[1, 2, 3, 4, 5, 6, 7, 8]).iter().all(|x| x.height == 0.5));
+        assert!(arrange(&placed(&opened(8))).iter().all(|x| x.height == 0.5));
     }
 
     #[test]
     fn in_a_tall_column_the_last_used_tile_takes_half() {
         // Nine: the first column is three high; tile 4 (in it) was used last.
-        let nine = arrange(&[1, 2, 3, 4, 50, 6, 7, 8, 9]);
+        let used = [1, 2, 3, 4, 50, 6, 7, 8, 9];
+        let tiles: Vec<(usize, u64)> = used.iter().enumerate().map(|(i, &u)| (i % 4, u)).collect();
+        let nine = arrange(&tiles);
         assert_eq!((nine[0], nine[4], nine[8]), (r(0.0, 0.0, 0.25, 0.25), r(0.0, 0.25, 0.25, 0.5), r(0.0, 0.75, 0.25, 0.25)));
         assert!(nine[1..4].iter().chain(&nine[5..8]).all(|x| x.height == 0.5), "columns of two split evenly");
+    }
+
+    #[test]
+    fn a_tile_dragged_to_another_column_or_a_new_one() {
+        let mut l = opened(5);
+        let keys: Vec<u64> = l.tiles.iter().map(|t| t.key).collect();
+        l.focus = 2;
+        // The fifth (under the first) dropped below the third: column 2.
+        l.move_tile(keys[4], Drop::Below(keys[2]));
+        assert_eq!(
+            l.tiles.iter().map(|t| (t.key, t.stack.unwrap())).collect::<Vec<_>>(),
+            [(keys[0], 0), (keys[1], 1), (keys[2], 2), (keys[4], 2), (keys[3], 3)]
+        );
+        assert_eq!(l.tiles[l.focus].key, keys[2], "focus stays on its tile");
+        // Above the first: column 0 again, on top.
+        l.move_tile(keys[4], Drop::Above(keys[0]));
+        assert_eq!(l.tiles[0].key, keys[4]);
+        assert_eq!(stacks(&l), [0, 0, 1, 2, 3]);
+        // Four columns: no room for a fifth beside one.
+        l.move_tile(keys[4], Drop::RightOf(keys[3]));
+        assert_eq!(stacks(&l), [0, 0, 1, 2, 3], "unchanged");
+        // Alone in its column, a tile moves its column; columns stay
+        // numbered without gaps.
+        l.move_tile(keys[1], Drop::LeftOf(keys[4]));
+        assert_eq!(l.tile(keys[1]).unwrap().stack, Some(0));
+        assert_eq!(l.tile(keys[4]).unwrap().stack, Some(1));
+        assert_eq!(l.tile(keys[3]).unwrap().stack, Some(3));
+        // Out of a column of two into a new one, when one is free.
+        let mut l = opened(3);
+        let k: Vec<u64> = l.tiles.iter().map(|t| t.key).collect();
+        l.move_tile(k[2], Drop::Below(k[0]));
+        assert_eq!(stacks(&l), [0, 0, 1]);
+        l.move_tile(k[2], Drop::RightOf(k[1]));
+        assert_eq!(l.tile(k[2]).unwrap().stack, Some(2));
+        assert_eq!(arrange(&placed(&l)).iter().filter(|x| x.height == 1.0).count(), 3);
+        // A tile closed leaves the others where they are.
+        let mut l = opened(5);
+        l.tiles.remove(1);
+        l.place();
+        assert_eq!(stacks(&l), [0, 1, 2, 0]);
     }
 }
 
@@ -1235,7 +1547,7 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
         col,
         visible: Signal::derive(move || pos.get().is_some()),
         active: Signal::derive(move || pos.get().is_some_and(|p| p.active)),
-        scroll: StoredValue::new(0),
+        scroll: StoredValue::new((0, false)),
     };
     provide_context(ctx);
     let label = Signal::derive(move || view.get().map(|v| v.label(&live)).unwrap_or_default());

@@ -198,14 +198,14 @@ fn AppsMenu() -> impl IntoView {
             <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps ▾"</summary>
             <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
-                    {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item>"Mail"</Go> })}
-                    {(f["mail"] == true || f["chat"] == true).then(|| view! { <Go to=View::Brief class=item>"Brief"</Go> })}
-                    {(f["chat"] == true).then(|| view! { <Go to=View::Chat class=item>"Chat"</Go> })}
-                    {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=item>"Calendar"</Go> })}
-                    {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=item>"Contacts"</Go> })}
+                    {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item own=true>"Mail"</Go> })}
+                    {(f["mail"] == true || f["chat"] == true).then(|| view! { <Go to=View::Brief class=item own=true>"Brief"</Go> })}
+                    {(f["chat"] == true).then(|| view! { <Go to=View::Chat class=item own=true>"Chat"</Go> })}
+                    {(f["calendar"] == true).then(|| view! { <Go to=View::Calendar class=item own=true>"Calendar"</Go> })}
+                    {(f["contacts"] == true).then(|| view! { <Go to=View::Contacts class=item own=true>"Contacts"</Go> })}
                 })}
-                <Go to=View::Photos class=item>"Photos"</Go>
-                <Go to=View::Memex class=item>"Memex"</Go>
+                <Go to=View::Photos class=item own=true>"Photos"</Go>
+                <Go to=View::Memex class=item own=true>"Memex"</Go>
             </div>
         </details>
     }
