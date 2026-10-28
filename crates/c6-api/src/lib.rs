@@ -4468,6 +4468,10 @@ pub struct Triage {
     /// The subject, or the conversation's name.
     pub title: String,
     pub at: UnixMs,
+    /// Whether triage knows this mail sender, from your history or mark.
+    /// Only on one conversation's sorting; absent when not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<bool>,
     /// The open request it is part of (docs/brief.md §5), if any: Mail
     /// settles it with the Brief's actions. Only on one conversation's
     /// (`memex.triage.get`, a mail thread's).
