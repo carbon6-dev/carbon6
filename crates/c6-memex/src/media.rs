@@ -398,7 +398,7 @@ const LOOK: &str = api::prompts::LOOK;
 pub async fn look(m: &Memex) -> anyhow::Result<bool> {
     let t = m.tasks();
     let Some(task) = t.vision else { return Ok(false) };
-    if crate::understand::budget_left(m, t.per_day).await? == 0 {
+    if !crate::understand::can_call(m, &task, t.per_day).await? {
         return Ok(false);
     }
     let version = format!("{VISION}@{}", task.model);
@@ -416,6 +416,10 @@ pub async fn look(m: &Memex) -> anyhow::Result<bool> {
     let id: String = r.get("item_id");
     let result = see(m, &task, &version, &r).await;
     if let Err(e) = &result {
+        if crate::llm::waits(m, e).await? {
+            warn!(item = %id, "vision waits: {e:#}");
+            return Ok(false);
+        }
         warn!(item = %id, "vision: {e:#}");
     }
     sqlx::query("UPDATE media SET seen = ?, error = ? WHERE item_id = ?")

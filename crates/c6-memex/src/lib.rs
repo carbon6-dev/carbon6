@@ -101,6 +101,8 @@ pub struct Memex {
     /// What the reading loop's steps are working on now (a conversation, a
     /// request, a card, a thread), so steps side by side never take the same.
     claims: Mutex<std::collections::HashSet<String>>,
+    /// Connections resting after failing for now, by id (llm.rs).
+    pub(crate) rests: Mutex<HashMap<String, llm::Rest>>,
 }
 
 /// Work a reading step has taken (`Memex::claim`).
@@ -182,6 +184,7 @@ impl Memex {
             outcomes: Default::default(),
             reread: Default::default(),
             claims: Default::default(),
+            rests: Default::default(),
         }))
     }
 

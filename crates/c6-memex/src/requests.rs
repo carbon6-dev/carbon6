@@ -85,7 +85,7 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
     let mut maybe = None;
     if let (Some((id, open)), Some(task)) = (theirs.first(), task) {
         let (_, per_day) = m.understanding().unwrap_or((task.clone(), 0));
-        if crate::understand::budget_left(m, per_day).await? > 0 {
+        if crate::understand::can_call(m, task, per_day).await? {
             let new = format!("{title} (in \"{}\", {})", f.title, f.kind);
             let ask = api::prompts::fill(&m.prompt("memex.requests.same", api::prompts::REQUEST_SAME), &[("open", open), ("new", &new)]);
             let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);

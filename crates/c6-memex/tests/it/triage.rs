@@ -572,3 +572,74 @@ async fn mail_and_chat_sorted_for_the_brief() {
 
     head.shutdown().await.unwrap();
 }
+
+/// A model that fails for now (5xx, 429, unreachable) doesn't sort a
+/// conversation: it waits, its call goes back to the day's budget, and it
+/// is sorted once the model answers. With an effort, the answer has room
+/// for the model's thinking.
+#[tokio::test]
+async fn sorting_waits_out_a_model_that_fails_for_now() {
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    let sorted = async || -> Option<Triage> {
+        let v: Value = http
+            .post(format!("{api}/memex/rpc"))
+            .json(&json!({"method": "memex.triage.list", "params": {}}))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        serde_json::from_value::<Vec<Triage>>(v).ok()?.into_iter().find(|t| t.target == "thread:acct:p1")
+    };
+
+    // Busy for every retry of the first call; then the answer.
+    for _ in 0..5 {
+        mock.push_about("pilot for 40 seats", Reply::Retry(503));
+    }
+    mock.push_about("pilot for 40 seats", Reply::Text(json!({"category": "fyi", "reason": "A pilot, later"}).to_string()));
+    mail(
+        &m,
+        "p1",
+        "p1",
+        ("pat@northwind.com", "Pat"),
+        "me@mine.io",
+        "Pilot",
+        "We use your scheduler and want a pilot for 40 seats.",
+        None,
+        &["INBOX"],
+        HOUR,
+    )
+    .await;
+    // One call a day: only the one given back lets it sort.
+    let r = http
+        .put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": "m", "model": "reader-1", "effort": "low"}, "calls_per_day": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    let s = eventually("sorted", async || sorted().await).await;
+    assert_eq!((s.category.as_str(), s.by.as_str()), ("fyi", "model"), "never the failure: {s:?}");
+    let asked = mock.requests();
+    assert_eq!(asked.len(), 6, "five busy, then the answer");
+    assert_eq!(asked[5]["max_tokens"], 400 + c6_memex::llm::THINKING_ROOM, "room to think at effort low");
+    head.shutdown().await.unwrap();
+}

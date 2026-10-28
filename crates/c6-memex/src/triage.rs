@@ -54,7 +54,7 @@ pub async fn step(m: &Memex) -> anyhow::Result<Sorting> {
     }
     let model = m.understanding();
     let can_ask = match &model {
-        Some((_, per_day)) => crate::understand::budget_left(m, *per_day).await? > 0,
+        Some((task, per_day)) => crate::understand::can_call(m, task, *per_day).await?,
         None => false,
     };
     let mut waits = false;
@@ -70,6 +70,10 @@ pub async fn step(m: &Memex) -> anyhow::Result<Sorting> {
             Ok(false) => {
                 waits |= !can_ask;
                 continue;
+            }
+            Err(e) if llm::waits(m, &e).await? => {
+                warn!(target = %t.key, "triage waits: {e:#}");
+                return Ok(Sorting::Waiting);
             }
             Err(e) => {
                 warn!(target = %t.key, "triage: {e:#}");
@@ -187,7 +191,6 @@ async fn settle(
     at: i64,
     task: Option<&crate::llm::Task>,
 ) -> anyhow::Result<bool> {
-    put(m, key, kind, s, sender, sender_name, title, at).await?;
     let f = crate::requests::Found {
         target: key,
         kind,
@@ -201,7 +204,10 @@ async fn settle(
         at,
         urgent: s.urgent,
     };
+    // Its request first: a same-request check that fails for now leaves
+    // it unsorted, to wait.
     crate::requests::follow(m, &f, task).await?;
+    put(m, key, kind, s, sender, sender_name, title, at).await?;
     Ok(true)
 }
 

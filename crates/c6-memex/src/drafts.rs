@@ -23,7 +23,7 @@ const MAX_CONTEXT: usize = 16_000;
 /// budget. Whether it did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some((task, per_day)) = m.understanding() else { return Ok(false) };
-    if crate::understand::budget_left(m, per_day).await? == 0 {
+    if !crate::understand::can_call(m, &task, per_day).await? {
         return Ok(false);
     }
     // Needs you, open, never drafted or drafted before its news; the soonest
@@ -39,6 +39,10 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     // The first no other step is drafting.
     let Some((id, _claim)) = ids.into_iter().find_map(|id| m.claim(&format!("draft:{id}")).map(|c| (id, c))) else { return Ok(false) };
     if let Err(e) = draft(m, &task, id).await {
+        if llm::waits(m, &e).await? {
+            warn!(id, "drafting waits: {e:#}");
+            return Ok(false);
+        }
         warn!(id, "drafting: {e:#}");
         // Not again until the conversation has news.
         sqlx::query("UPDATE requests SET draft = ?, drafted_at = ? WHERE id = ?")

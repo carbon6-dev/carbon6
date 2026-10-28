@@ -77,6 +77,19 @@ pub(crate) async fn budget_left(m: &Memex, per_day: u32) -> anyhow::Result<u32> 
     Ok(per_day.saturating_sub(used as u32))
 }
 
+/// Whether a model call may be made now: the connection isn't resting
+/// after failing for now (llm.rs), and there is budget left today.
+pub(crate) async fn can_call(m: &Memex, task: &Task, per_day: u32) -> anyhow::Result<bool> {
+    Ok(!llm::resting(m, &task.connection_id) && budget_left(m, per_day).await? > 0)
+}
+
+/// Gives a call that failed for now back to today's budget.
+pub(crate) async fn refund_call(m: &Memex) -> anyhow::Result<()> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    sqlx::query("UPDATE model_calls SET calls = MAX(calls - 1, 0) WHERE day = ?").bind(today).execute(&m.store.pool).await?;
+    Ok(())
+}
+
 pub(crate) async fn count_call(m: &Memex) -> anyhow::Result<()> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     sqlx::query("INSERT INTO model_calls (day, calls) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET calls = calls + 1")
@@ -90,7 +103,7 @@ pub(crate) async fn count_call(m: &Memex) -> anyhow::Result<()> {
 /// did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some((task, per_day)) = m.understanding() else { return Ok(false) };
-    if budget_left(m, per_day).await? == 0 {
+    if !can_call(m, &task, per_day).await? {
         return Ok(false);
     }
     let version = version(&task);
@@ -98,6 +111,12 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some(_claim) = m.claim(&format!("read:{target}")) else { return Ok(false) };
     count_call(m).await?;
     let result = read(m, &task, &kind, &items).await;
+    if let Err(e) = &result
+        && llm::waits(m, e).await?
+    {
+        warn!(%target, "understanding waits: {e:#}");
+        return Ok(false);
+    }
     done(m, &target, &version, result).await?;
     Ok(true)
 }
@@ -150,6 +169,11 @@ pub(crate) async fn read_thread(m: &Memex, task: &Task, account: &str, thread: &
         .await?;
     count_call(m).await?;
     let result = read(m, task, "thread", &items).await;
+    if let Err(e) = &result
+        && llm::waits(m, e).await?
+    {
+        return result;
+    }
     done(m, &format!("thread:{account}:{thread}"), &version(task), result).await
 }
 

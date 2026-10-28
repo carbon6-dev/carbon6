@@ -171,13 +171,19 @@ pub enum LlmError {
     /// The request does not fit the model's context window.
     #[error("context window exceeded: {0}")]
     ContextOverflow(String),
+    /// No server can take the call now (a pool's members are all busy,
+    /// resting after failures, or without the model).
+    #[error("no model server available: {0}")]
+    Unavailable(String),
 }
 
 impl LlmError {
+    /// Failed for now only (the server unreachable, timed out, busy or
+    /// failing, or none available): the same call may work later.
     pub fn retryable(&self) -> bool {
         match self {
             LlmError::Http { status, .. } => *status == 408 || *status == 409 || *status == 429 || *status >= 500,
-            LlmError::Network(_) => true,
+            LlmError::Network(_) | LlmError::Unavailable(_) => true,
             _ => false,
         }
     }
