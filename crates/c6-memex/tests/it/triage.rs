@@ -705,9 +705,11 @@ async fn a_stalled_answer_lets_go() {
     assert!(calls.iter().any(|c| c.state == "failed" && c.error.contains("stalled")), "the stalled call is shown");
 
     // c hangs (no stall is short enough to notice now); you choose b instead.
+    // The new mail comes once c is chosen: before, a (reading on after p1)
+    // could sort it first.
     m.set_call_limits(limits(3600));
-    mail(&m, "p2", "p2", ("kim@tailspin.com", "Kim"), "me@mine.io", "Lunch", "Lunch next week?", None, &["INBOX"], HOUR).await;
     understand_with("c").await;
+    mail(&m, "p2", "p2", ("kim@tailspin.com", "Kim"), "me@mine.io", "Lunch", "Lunch next week?", None, &["INBOX"], HOUR).await;
     eventually("a call hanging on c", async || (c.requests().len() == 1).then_some(())).await;
     understand_with("b").await;
     let s = eventually("sorted by b", async || sorted("p2").await.filter(|s| s.reason == "b")).await;
@@ -894,7 +896,6 @@ impl c6_memex::extract::Extractor for Held {
 #[tokio::test]
 async fn mail_moved_to_spam_leaves_the_inbox() {
     let kit = std::sync::Arc::new(Held::default());
-    c6_memex::extract::set_override(kit.clone());
     let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),
@@ -908,6 +909,8 @@ async fn mail_moved_to_spam_leaves_the_inbox() {
     .unwrap();
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    // This store's only: other tests in the process read as they do.
+    m.read_with(kit.clone());
     my_account(&head, &api, &m).await;
     use base64::Engine;
     // As the gmail app's sync gives them: a message, and a label change
