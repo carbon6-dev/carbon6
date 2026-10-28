@@ -21,7 +21,7 @@ Agent sessions run their model calls on workers, so they appear under **Sessions
 
 **What each call shows:**
 - what it is for and what it is about;
-- the connection, the model and its reasoning effort;
+- the connection (for a pool's call, the member that took it and the pool: docs/pools.md), the model and its reasoning effort;
 - its state: waiting (no answer yet), thinking, answering, done, failed, or stopped (its caller gave up on it);
 - how long it took, time to the first token, tokens in and out, and tokens per second;
 - the latest line of its answer.

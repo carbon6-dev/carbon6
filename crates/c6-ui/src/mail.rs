@@ -60,16 +60,6 @@ fn when_near(el: &web_sys::Element, f: impl Fn() + 'static) -> web_sys::Intersec
     o
 }
 
-pub(crate) fn when(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    let today = js_sys::Date::new_0();
-    if d.to_date_string() == today.to_date_string() {
-        String::from(d.to_locale_time_string("default"))
-    } else {
-        String::from(d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED))
-    }
-}
-
 /// Who and what, for a reply.
 #[derive(Clone, Default)]
 pub(crate) struct Draft {
@@ -194,7 +184,7 @@ pub fn MailPage() -> impl IntoView {
                                                         })}
                                                         {t.starred.then(|| view! { <span class="text-amber-500">"★"</span> })}
                                                         {t.attachments.then(|| view! { <span class="text-zinc-400">"📎"</span> })}
-                                                        <span class="shrink-0 text-xs font-normal text-zinc-500">{when(t.date)}</span>
+                                                        <span class="shrink-0 text-xs font-normal text-zinc-500">{crate::when::compact(t.date)}</span>
                                                     </div>
                                                     <div class="truncate text-sm">{t.subject.clone()}</div>
                                                     <div class="truncate text-xs font-normal text-zinc-500">{t.snippet.clone()}</div>
@@ -261,6 +251,7 @@ fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
                         <button class=BUTTON_QUIET title="Someone you know: their mail is never a pitch"
                             on:click=move |_| act("memex.triage.mark", json!({"target": target.get_value(), "mark": "known"}))>"Not a pitch"</button>
                     })}
+                    {t.request.map(|id| view! { <RequestActions id refresh=move || { sorted.refetch(); refresh.update(|n| *n += 1) } /> })}
                     <select class=format!("{INPUT} w-auto py-1 text-xs") on:change=move |ev| category.set(event_target_value(&ev))>
                         <option value="">"Sort as…"</option>
                         {["needs_you", "first_contact", "fyi", "newsletter", "notification", "pitch", "noise"].into_iter().map(|c| {
@@ -279,6 +270,32 @@ fn Sorting(target: String, refresh: RwSignal<u32>) -> impl IntoView {
                 </div>
             }
         })
+    }
+}
+
+/// A thread's open request, settled as in the Brief (the same actions),
+/// with the way there.
+#[component]
+fn RequestActions(id: i64, refresh: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
+    use crate::brief::Settle;
+    let error = RwSignal::new(None::<String>);
+    let act = move |how: Settle| {
+        spawn_local(async move {
+            match crate::brief::settle(id, how).await {
+                Ok(_) => refresh(),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <span class="flex w-full flex-wrap items-center gap-1 sm:w-auto">
+            <span class="text-xs text-zinc-500">"Request:"</span>
+            <button class=BUTTON_QUIET on:click=move |_| act(Settle::Done)>"Done"</button>
+            <button class=BUTTON_QUIET on:click=move |_| act(Settle::Tomorrow)>"Tomorrow"</button>
+            <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(Settle::Drop)>"Drop"</button>
+            <a class=format!("{BUTTON_QUIET} no-underline") href=crate::place::href("/brief")>"Open in the Brief"</a>
+            {move || error.get().map(|e| view! { <span class="w-full text-xs text-red-600">{e}</span> })}
+        </span>
     }
 }
 
@@ -348,7 +365,7 @@ fn Outbox(refresh: RwSignal<u32>) -> impl IntoView {
                     <span class="min-w-0 flex-1 truncate">{match o.status.as_str() {
                         "failed" => format!("Not sent: {} ({})", o.subject, o.error.clone().unwrap_or_default()),
                         "sending" => format!("Sending {}…", o.subject),
-                        _ if secs > 60 => format!("{} goes out at {}", o.subject, when(o.send_at)),
+                        _ if secs > 60 => format!("{} goes out at {}", o.subject, crate::when::compact(o.send_at)),
                         _ => format!("Sending {} in {secs}s", o.subject),
                     }}</span>
                     {(o.status == "pending").then(|| view! {
@@ -429,6 +446,7 @@ pub(crate) fn Thread(
                 Err(e) => view! { <MailError e /> }.into_any(),
                 Ok(list) => {
                     let subject = list.last().map(|m| m.subject.clone()).unwrap_or_default();
+                    let link = list.last().and_then(|m| m.link.clone());
                     let last = list.last().cloned();
                     // Who the people writing are to you (their cards), the latest first.
                     let mut senders: Vec<String> = Vec::new();
@@ -439,7 +457,10 @@ pub(crate) fn Thread(
                         }
                     }
                     view! {
-                        <h1 class="text-lg font-semibold">{subject}</h1>
+                        <div class="flex flex-wrap items-baseline justify-between gap-x-2">
+                            <h1 class="min-w-0 text-lg font-semibold">{subject}</h1>
+                            {link.map(|link| view! { <crate::util::OpenIn link /> })}
+                        </div>
                         {senders.into_iter().take(2).map(|a| view! { <crate::understanding::Cards params=serde_json::json!({"address": a}) /> }).collect_view()}
                         {list.into_iter().map(|m| view! { <Message m /> }).collect_view()}
                         {last.map(|m| {
@@ -474,7 +495,11 @@ fn reply(account: &str, m: &MailMessage, all: bool) -> Draft {
         to: to.join(", "),
         cc: cc.join(", "),
         subject,
-        body: format!("\n\nOn {}, {} wrote:\n{quoted}", when(m.date), if m.from_name.is_empty() { &m.from } else { &m.from_name }),
+        body: format!(
+            "\n\nOn {}, {} wrote:\n{quoted}",
+            crate::when::quote(m.date),
+            if m.from_name.is_empty() { &m.from } else { &m.from_name }
+        ),
         reply_to: Some(m.item_id.clone()),
     }
 }
@@ -491,7 +516,7 @@ fn Message(m: MailMessage) -> impl IntoView {
                 <span class="font-medium">{if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() }}</span>
                 <span class="text-xs text-zinc-500">{format!("<{}> to {}", m.from, m.to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "))}</span>
                 <span class="flex-1"></span>
-                <span class="text-xs text-zinc-500">{when(m.date)}</span>
+                <span class="text-xs text-zinc-500">{crate::when::full(m.date)}</span>
             </div>
             {match html {
                 Some(h) => view! {

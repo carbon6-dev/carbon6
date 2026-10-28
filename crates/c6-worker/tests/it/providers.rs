@@ -162,3 +162,57 @@ async fn apps_sign_in_with_their_providers() {
     assert_eq!(ok(send(M::GET, "apps/home/mailer/accounts", json!({})).await).await, json!([]));
     head.shutdown().await.unwrap();
 }
+
+/// The address a provider sends you back to is the page's, with the scheme
+/// it is served with: a head that serves HTTPS itself shows https to a
+/// page's GET too (which carries no Origin), as its sign-ins send.
+#[tokio::test]
+async fn redirect_addresses_are_https_on_an_https_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ui_tls_head_ca: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let ca = reqwest::Certificate::from_pem(head.state.ui_ca.as_ref().unwrap().cert_pem().as_bytes()).unwrap();
+    let http = reqwest::Client::builder().add_root_certificate(ca).build().unwrap();
+    let origin = format!("https://127.0.0.1:{}", head.ui_addrs[0].port());
+    let get = async |path: &str| -> Value { http.get(format!("{origin}/api/v1/{path}")).send().await.unwrap().json().await.unwrap() };
+    let google = get("google/client").await;
+    assert_eq!(google["redirect_uri"], format!("{origin}/auth/google/callback"), "{google}");
+    let slack = get("slack").await;
+    assert_eq!((&slack["redirect_uri"], &slack["https"]), (&json!(format!("{origin}/auth/oauth/callback")), &json!(true)), "{slack}");
+    head.shutdown().await.unwrap();
+}
+
+/// Behind a proxy (`ui_public_url`), providers send you back to the head's
+/// public address, whichever address the page was opened at.
+#[tokio::test]
+async fn redirect_addresses_are_the_public_url_behind_a_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ui_public_url: Some("https://head.example:8443".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let http = reqwest::Client::new();
+    let origin = format!("http://127.0.0.1:{}", head.ui_addrs[0].port());
+    let get = async |path: &str| -> Value { http.get(format!("{origin}/api/v1/{path}")).send().await.unwrap().json().await.unwrap() };
+    let google = get("google/client").await;
+    assert_eq!(google["redirect_uri"], "https://head.example:8443/auth/google/callback", "{google}");
+    let slack = get("slack").await;
+    assert_eq!(slack["redirect_uri"], "https://head.example:8443/auth/oauth/callback", "{slack}");
+    head.shutdown().await.unwrap();
+}

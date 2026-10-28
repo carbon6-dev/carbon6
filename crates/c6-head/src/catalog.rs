@@ -372,8 +372,9 @@ fn build() -> Vec<Op> {
         op!("workers.terminals.close", "fleet", "DELETE" "/api/v1/workers/{id}/terminals/{tid}", Destructive, Input::None, "Closes a terminal on a worker (its process ends).", choices = &[("id", "workers.list"), ("tid", "workers.terminals.list")]),
 
         // Connections.
-        op!("connections.list", "connections", "GET" "/api/v1/connections", Read, Input::None, "Model connections: name, kind (openai, openai_compat, anthropic, chatgpt, claude_code), base URL, whether a key is set."),
-        op!("connections.create", "connections", "POST" "/api/v1/connections", Write, Input::Body(schema::<api::CreateConnection>), "Adds a connection (API key, or a local OpenAI-compatible server such as Ollama). The key is stored encrypted. For a ChatGPT plan use connections.chatgpt.start."),
+        op!("connections.list", "connections", "GET" "/api/v1/connections", Read, Input::None, "Model connections: name, kind (openai, openai_compat, anthropic, chatgpt, claude_code, pool), base URL, whether a key is set, a pool's members."),
+        op!("connections.create", "connections", "POST" "/api/v1/connections", Write, Input::Body(schema::<api::CreateConnection>), "Adds a connection (API key, or a local OpenAI-compatible server such as Ollama). The key is stored encrypted. For a ChatGPT plan use connections.chatgpt.start. kind pool with members (each a connection and its calls at once) spreads what runs in the head over them (docs/pools.md)."),
+        op!("connections.update", "connections", "PATCH" "/api/v1/connections/{id}", Write, Input::Body(schema::<api::UpdateConnection>), "Renames a connection, or sets a pool's members (all of them).", choices = &[("id", "connections.list")]),
         op!("connections.test", "connections", "POST" "/api/v1/connections/test", Read, Input::Body(schema::<TestConnection>), "Tests a connection (a saved one by id, or the details given) and lists its models."),
         op!("connections.delete", "connections", "DELETE" "/api/v1/connections/{id}", Destructive, Input::None, "Deletes a connection. Sessions using it can no longer call their model.", choices = &[("id", "connections.list")]),
         op!("connections.models", "connections", "GET" "/api/v1/connections/{id}/models", Read, Input::None, "The models a connection offers.", choices = &[("id", "connections.list")]),

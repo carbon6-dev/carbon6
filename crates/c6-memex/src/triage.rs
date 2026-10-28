@@ -21,8 +21,9 @@ use crate::store::clip;
 
 const VERSION: &str = "triage-v1";
 const DAY: i64 = 86_400_000;
-/// Only what's recent is sorted: the brief is about now.
-const WINDOW: i64 = 14 * DAY;
+/// Only what's recent is sorted: the brief is about now (and so is Mail's
+/// "Needs reply").
+pub const WINDOW: i64 = 14 * DAY;
 /// What one call reads of a conversation.
 const MAX_INPUT: usize = 10_000;
 pub const CATEGORIES: [&str; 8] = ["needs_you", "first_contact", "fyi", "newsletter", "notification", "pitch", "noise", "yours"];
@@ -54,7 +55,7 @@ pub async fn step(m: &Memex) -> anyhow::Result<Sorting> {
     }
     let model = m.understanding();
     let can_ask = match &model {
-        Some((_, per_day)) => crate::understand::budget_left(m, *per_day).await? > 0,
+        Some((task, per_day)) => crate::understand::can_call(m, task, *per_day).await?,
         None => false,
     };
     let mut waits = false;
@@ -70,6 +71,10 @@ pub async fn step(m: &Memex) -> anyhow::Result<Sorting> {
             Ok(false) => {
                 waits |= !can_ask;
                 continue;
+            }
+            Err(e) if llm::waits(m, &e).await? => {
+                warn!(target = %t.key, "triage waits: {e:#}");
+                return Ok(Sorting::Waiting);
             }
             Err(e) => {
                 warn!(target = %t.key, "triage: {e:#}");
@@ -187,7 +192,6 @@ async fn settle(
     at: i64,
     task: Option<&crate::llm::Task>,
 ) -> anyhow::Result<bool> {
-    put(m, key, kind, s, sender, sender_name, title, at).await?;
     let f = crate::requests::Found {
         target: key,
         kind,
@@ -201,7 +205,10 @@ async fn settle(
         at,
         urgent: s.urgent,
     };
+    // Its request first: a same-request check that fails for now leaves
+    // it unsorted, to wait.
     crate::requests::follow(m, &f, task).await?;
+    put(m, key, kind, s, sender, sender_name, title, at).await?;
     Ok(true)
 }
 
@@ -562,6 +569,7 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> api::Triage {
         sender_name: r.get("sender_name"),
         title: r.get("title"),
         at: r.get("at"),
+        request: None,
     }
 }
 
@@ -602,11 +610,15 @@ pub async fn status(m: &Memex) -> anyhow::Result<Value> {
 
 /// A thread's sorting, for the mail list.
 pub async fn of_thread(m: &Memex, account: &str, thread: &str) -> anyhow::Result<Option<api::Triage>> {
-    let r = sqlx::query("SELECT * FROM triage WHERE target = ?")
-        .bind(format!("thread:{account}:{thread}"))
-        .fetch_optional(&m.store.pool)
-        .await?;
-    Ok(r.as_ref().map(row))
+    with_request(m, &format!("thread:{account}:{thread}")).await
+}
+
+/// How a conversation was sorted, with the open request it is part of.
+async fn with_request(m: &Memex, target: &str) -> anyhow::Result<Option<api::Triage>> {
+    let r = sqlx::query("SELECT * FROM triage WHERE target = ?").bind(target).fetch_optional(&m.store.pool).await?;
+    let Some(mut t) = r.as_ref().map(row) else { return Ok(None) };
+    t.request = crate::requests::open_of(m, target).await?;
+    Ok(Some(t))
 }
 
 async fn example(m: &Memex, t: &api::Triage, category: &str, note: &str) -> anyhow::Result<()> {
@@ -713,7 +725,7 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         }
         "memex.triage.counts" => counts(m).await?,
         "memex.triage.status" => status(m).await?,
-        "memex.triage.get" => json!(get(m, &s("target")).await.ok()),
+        "memex.triage.get" => json!(with_request(m, &s("target")).await?),
         "memex.triage.set" => json!(set(m, &s("target"), &s("category"), &s("note")).await?),
         "memex.triage.mark" => json!(mark(m, &s("target"), &s("mark"), params["domain"] == true).await?),
         "memex.triage.marks" => marks(m).await?,

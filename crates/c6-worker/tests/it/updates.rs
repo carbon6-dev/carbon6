@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::extract::{Path, State};
 use c6_head::HeadConfig;
@@ -25,27 +26,43 @@ fn tgz(files: &[(&str, &str)]) -> Vec<u8> {
     std::process::Command::new("tar").args(["-czf", "-", "-C"]).arg(d.path()).args(names).output().unwrap().stdout
 }
 
-/// A fake GitHub: the latest release, and its files.
-async fn github(files: HashMap<String, Vec<u8>>) -> String {
+/// Release files a fake GitHub serves, by `<tag>/<name>`.
+type Files = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+
+/// A fake GitHub serving release files as github.com does, with no API:
+/// `<repo>/releases/latest/download/<name>` redirects to the latest
+/// release's (`latest`), and `<repo>/releases/download/<tag>/<name>` is the
+/// file, with an ETag (an unchanged one is 304 to `If-None-Match`). The
+/// repository's address, and how many times it answered 304.
+async fn github(files: Files, latest: &str) -> (String, Arc<AtomicUsize>) {
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let files = Arc::new(files);
-    let names: Vec<String> = files.keys().cloned().collect();
-    let latest = json!({
-        "tag_name": format!("v{V}"), "draft": false, "prerelease": false,
-        "assets": names.iter().map(|n| json!({"name": n, "browser_download_url": format!("{base}/dl/{n}")})).collect::<Vec<_>>(),
-    });
+    let unchanged = Arc::new(AtomicUsize::new(0));
+    let (latest, counted) = (latest.to_owned(), unchanged.clone());
     let app = axum::Router::new()
-        .route("/repos/c6/releases/latest", axum::routing::get(move || async move { axum::Json(latest) }))
         .route(
-            "/dl/{name}",
-            axum::routing::get(|State(f): State<Arc<HashMap<String, Vec<u8>>>>, Path(n): Path<String>| async move {
-                f.get(&n).cloned().ok_or(axum::http::StatusCode::NOT_FOUND)
+            "/c6/releases/latest/download/{name}",
+            axum::routing::get(move |Path(n): Path<String>| async move {
+                (StatusCode::FOUND, [(header::LOCATION, format!("/c6/releases/download/{latest}/{n}"))])
+            }),
+        )
+        .route(
+            "/c6/releases/download/{tag}/{name}",
+            axum::routing::get(move |State(f): State<Files>, Path((t, n)): Path<(String, String)>, h: HeaderMap| async move {
+                let Some(body) = f.lock().unwrap().get(&format!("{t}/{n}")).cloned() else { return StatusCode::NOT_FOUND.into_response() };
+                let etag = format!("\"{}\"", c6_core::update::checksum(&body));
+                if h.get(header::IF_NONE_MATCH).is_some_and(|v| v.as_bytes() == etag.as_bytes()) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    return StatusCode::NOT_MODIFIED.into_response();
+                }
+                ([(header::ETAG, etag)], body).into_response()
             }),
         )
         .with_state(files);
     tokio::spawn(async move { axum::serve(listener, app).await });
-    format!("{base}/repos/c6")
+    (format!("{base}/c6"), unchanged)
 }
 
 #[tokio::test]
@@ -66,7 +83,8 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     let manifest = serde_json::to_vec(&json!({"version": V, "date": "2026-10-17", "notes": "- Faster.", "assets": assets})).unwrap();
     files.insert("release.json.sig".into(), key.sign(&manifest).as_ref().to_vec());
     files.insert("release.json".into(), manifest);
-    let source = github(files).await;
+    let files: Files = Arc::new(std::sync::Mutex::new(files.into_iter().map(|(n, b)| (format!("v{V}/{n}"), b)).collect()));
+    let (source, unchanged) = github(files, &format!("v{V}")).await;
 
     // The binaries being updated (fakes, not this test).
     let bin = tempfile::tempdir().unwrap();
@@ -117,6 +135,11 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     let decisions = get("decisions").await;
     let d = decisions.as_array().unwrap().iter().find(|d| d["title"] == format!("Update carbon6 to {V}?")).expect("a decision").clone();
     assert!(d["document"].as_str().unwrap().contains("Faster."));
+    // Looking again, the release's file is unchanged: GitHub says so (304).
+    let before = unchanged.load(Ordering::SeqCst);
+    let s = post("system/updates/check", json!({})).await;
+    assert_eq!(s["check_error"], "", "{s}");
+    assert!(unchanged.load(Ordering::SeqCst) > before, "a 304");
     post(&format!("decisions/{}/answer", d["id"]), json!({"option": "Update now"})).await;
 
     // The head first: its binary is replaced, and it exits to restart.
@@ -137,8 +160,17 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     assert_eq!((s["machines"][1]["state"].as_str(), s["machines"][1]["method"].as_str()), (Some("restarting"), Some("tarball")), "{s}");
     drop(worker);
 
-    // The new worker attaches, and says the update is done.
-    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    // The new worker attaches, and says the update is done. It opens the
+    // state once the old one's tasks, seeing it stop, have let go of it (a
+    // real worker restarts its process instead).
+    let worker = eventually("the old worker to let go of its state", async || {
+        match Worker::open(state.path(), Identity::load(state.path()).unwrap()).await {
+            Ok(w) => Some(w),
+            Err(e) if e.to_string().contains("already running") => None,
+            Err(e) => panic!("{e:#}"),
+        }
+    })
+    .await;
     // The new version, as it says.
     *worker.overrides.lock().unwrap() = c6_worker::Overrides { update_as_version: Some(V.into()), ..overrides };
     let (tx, _rx) = watch::channel(ConnState::Connecting);
@@ -155,9 +187,6 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     head.shutdown().await.unwrap();
 }
 
-/// Release files a fake GitHub serves, by path.
-type Files = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
-
 /// The edge channel (docs/updates.md): a machine on it is offered the
 /// rolling `edge` pre-release (each green commit on main) when it is newer
 /// than what it runs; a machine on stable never is.
@@ -166,7 +195,6 @@ async fn the_edge_channel_offers_builds_of_main() {
     let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
     let key = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
     let public: String = key.public_key().as_ref().iter().map(|b| format!("{b:02x}")).collect();
-    let edge = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let signed = |version: &str| {
         let m = serde_json::to_vec(&json!({"version": version, "notes": "- Faster tiles.", "assets": {}})).unwrap();
         let sig = key.sign(&m).as_ref().to_vec();
@@ -175,51 +203,13 @@ async fn the_edge_channel_offers_builds_of_main() {
     // A fake GitHub: the latest release is 9.9.8; `edge` is whatever we put there.
     let files: Files = Arc::default();
     let (stable_m, stable_s) = signed("9.9.8");
-    files.lock().unwrap().insert("stable/release.json".into(), stable_m);
-    files.lock().unwrap().insert("stable/release.json.sig".into(), stable_s);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let (b1, b2, e2) = (base.clone(), base.clone(), edge.clone());
-    let app = axum::Router::new()
-        .route(
-            "/repos/c6/releases/latest",
-            axum::routing::get(move || {
-                let b = b1.clone();
-                async move {
-                    axum::Json(json!({"tag_name": "v9.9.8", "draft": false, "prerelease": false, "assets": [
-                        {"name": "release.json", "browser_download_url": format!("{b}/dl/stable/release.json")},
-                        {"name": "release.json.sig", "browser_download_url": format!("{b}/dl/stable/release.json.sig")}]}))
-                }
-            }),
-        )
-        .route(
-            "/repos/c6/releases/tags/edge",
-            axum::routing::get(move || {
-                let (b, e) = (b2.clone(), e2.lock().unwrap().clone());
-                async move {
-                    if e.is_empty() {
-                        return Err(axum::http::StatusCode::NOT_FOUND);
-                    }
-                    Ok(axum::Json(json!({"tag_name": "edge", "draft": false, "prerelease": true, "assets": [
-                        {"name": "release.json", "browser_download_url": format!("{b}/dl/{e}/release.json")},
-                        {"name": "release.json.sig", "browser_download_url": format!("{b}/dl/{e}/release.json.sig")}]})))
-                }
-            }),
-        )
-        .route(
-            "/dl/{dir}/{name}",
-            axum::routing::get(|State(f): State<Files>, Path((d, n)): Path<(String, String)>| async move {
-                f.lock().unwrap().get(&format!("{d}/{n}")).cloned().ok_or(axum::http::StatusCode::NOT_FOUND)
-            }),
-        )
-        .with_state(files.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await });
+    files.lock().unwrap().insert("v9.9.8/release.json".into(), stable_m);
+    files.lock().unwrap().insert("v9.9.8/release.json.sig".into(), stable_s);
+    let (source, _) = github(files.clone(), "v9.9.8").await;
     let publish_edge = |v: &str| {
         let (m, s) = signed(v);
-        let dir = v.replace('+', "_");
-        files.lock().unwrap().insert(format!("{dir}/release.json"), m);
-        files.lock().unwrap().insert(format!("{dir}/release.json.sig"), s);
-        *edge.lock().unwrap() = dir;
+        files.lock().unwrap().insert("edge/release.json".into(), m);
+        files.lock().unwrap().insert("edge/release.json.sig".into(), s);
     };
 
     let head_dir = tempfile::tempdir().unwrap();
@@ -229,7 +219,7 @@ async fn the_edge_channel_offers_builds_of_main() {
         ui_port: 0,
         worker_port: 0,
         auth: false,
-        update_source: format!("{base}/repos/c6"),
+        update_source: source,
         update_keys: vec![public],
         update_as_version: Some("9.9.8".into()),
         ..Default::default()

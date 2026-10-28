@@ -180,7 +180,8 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
 
 ### 13.3 Kit jobs, allow-lists and OAuth providers (steps 3 and 4)
 
-- **Kit jobs** (`kitjobs.rs`): the head runs a kit tool on a worker with no session and no model. Workers with a container runtime say so (capability `kits`) and answer `kit.job`.
+- **Kit jobs** (`kitjobs.rs`): the head runs a kit tool on a worker with no session and no model. Workers with a container runtime say so (capability `kits`) and answer `kit.job`; `C6_KIT_JOBS=off` keeps a worker out of them (its sessions' kits still run).
+  - A job is a realm's (an app's, or the knowledge store's that asked to read a file) and runs only on a worker available to that realm: one kept to it first, else one that serves every realm. With none connected it fails; it never goes elsewhere. A file in a watched folder is read by its folder's worker, which must serve the realm too.
   - The job runs in a folder of its own under the worker's state, with its inputs written there first, in the sandbox the kit's permissions describe.
   - What it leaves in `out/` comes back, up to 64 MB.
   - A first run may build the kit's image; the head allows 35 minutes on top of the run's own limit for that.
@@ -195,6 +196,9 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - Its runs go on an internal container network with no route out. A tinyproxy container sits on that network and on the default bridge, and denies every host but the listed ones (`HTTPS_PROXY` in the run).
   - The proxy image (`c6kit/egress`, from Alpine) is built on first use.
   - Tested on Docker Desktop: the listed host is reached and others are refused.
+  - **Nothing is left behind.** A run's container, network and proxy carry the label `dev.carbon6.kit-run=<worker id>`. They're removed however the run ends: success, failure, its time limit, cancelled, or dropped midway (`Made` in `c6-tools/src/kits.rs`, from Drop). Containers go first, since a network with one still on it can't be removed.
+  - A worker stopped midway, or Docker restarting under a run, leaves them to the **sweep**. When the worker starts, and every 10 minutes, it removes what carries its own label and no live run owns. It never touches anything without the label (an older carbon6's, or anyone else's), nor another worker's.
+  - **Out of network ranges** (Docker's "could not find an available, non-overlapping IPv4 address pool"), a run sweeps and tries once more. Still out, it says why, and that reaches the app's sync status: "Docker has no free network ranges: N carbon6 networks are left behind (c6net-…) that this worker can't remove", with the command that removes the unused ones.
 - **OAuth providers** (`providers.rs`, migration `0044`): a package declares `providers` with `authorize_url`, `token_url`, `scopes`, an optional `userinfo_url` and `account_field`, extra `params`, and the realm secrets that hold your OAuth client (`client_id_secret`, `client_secret_secret`, which must be among the secrets it asks for).
   - You connect accounts from its entry under Settings → System → Packages.
   - The head runs the sign-in at `/auth/oauth/callback` and keeps each account's refresh token encrypted (`oauth_accounts`).
@@ -252,13 +256,16 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
   - the apps **gmail**, **google-calendar** and **google-contacts**, which require it. Each has:
     - the OAuth provider `google` (the client in home's secrets `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`);
     - `feeds` (`mail`, `calendar`, `contacts`: a new manifest field naming the knowledge store's stores its accounts feed);
+    - gmail's `links` (since 1.1.0): where a thread opens on the service's web, for Mail's "Open in Gmail", `{"service": "Gmail", "thread": "https://mail.google.com/mail/?authuser={account}#all/{thread}"}`. The memex fills in the account's address and the thread's (or `{message}`'s, `{message_id}`'s) ids it already keeps, when the thread is read, so mail synced before has it too; imported mail, an app without `links`, or a link that isn't https gets none. The core knows no service's addresses. An install of gmail 1.0.0 gets it once you upgrade it (Settings → Apps → Upgrade…);
     - an internal collection where its syncs are (`gmail_sync`, `calendar_sync`, `contacts_sync`);
     - a schedule trigger that runs its sync tool with no agent (every 2, 3 and 10 minutes);
     - kit operations: gmail's `modify`, `send` and `draft`; the calendar's `create`, `update`, `delete` and `rsvp`; the contacts' `create`.
   - A unit test ties the packages' versions to a digest of their source (`kit.digest`).
 - **The kit** talks to Google and keeps nothing:
   - It reads where each sync is (`state/<collection>.json`) and an operation's input (`input.json`).
-  - It writes what changed as typed items in `out/ingest.json`: messages as `message/rfc822` with Gmail's ids and labels as attributes (a label change is the item without its bytes); label names, calendars, events and contacts in Google's own JSON (`application/vnd.c6.*+json`); deletions; the syncs' new records; and `again` while an import is under way.
+  - It writes what changed as typed items in `out/ingest.json`: messages as `message/rfc822` with Gmail's ids and labels as attributes (a label change is the item without its bytes); label names, calendars, events and contacts in Google's own JSON (`application/vnd.c6.*+json`); deletions; the syncs' new records; and `again` while an import or a check is under way.
+  - A label change for a message still waiting to be read (in the extraction queue, or with the kit reading it) is kept with it: the message is stored with its labels as they are then. Before, the memex refused it ("no message … to change"), so mail Gmail moved to spam, or you archived, soon after it came stayed in the inbox.
+  - So mail kept before is right, gmail's sync (google 1.2, gmail 1.2.0) reads the last 30 days' labels again once per account (`checked` in its record), 250 messages a run, with `format=minimal`. Each is a label change as above.
   - A run brings up to 24 MB of messages. The rest of an import page waits in the sync's `queue`, and the trigger runs again at once.
   - An operation's answer goes in `out/result.json`.
 - **New kit primitives:**

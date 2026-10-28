@@ -147,12 +147,13 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 if realm != own && !crate::grants::may_start(st, &realm, &own, template, &format!("session:{target}")).await {
                     return Err(bad_request(format!("realm {own} may not start {realm}'s template {template:?}; no grant allows it")));
                 }
-                let run = crate::templates::run(
+                let run = crate::templates::run_for_session(
                     st,
                     template,
                     params["input"].as_str().unwrap_or_default(),
                     &[format!("started-by:{target}")],
                     &realm,
+                    &session,
                 )
                 .await?;
                 Ok(

@@ -235,3 +235,36 @@ async fn operations_change_what_apps_own() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+/// A memex operation (`c6 op`) is answered as the API answers it: the
+/// Google apps' status and syncs by the head, ingest's labels checked.
+#[tokio::test]
+async fn memex_operations_run_as_the_api_does() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let op = async |op: &str, input: Value| -> (StatusCode, Value) {
+        let r = http.post(format!("{api}/catalog/call")).json(&json!({"op": op, "input": input})).send().await.unwrap();
+        (r.status(), r.json().await.unwrap_or(Value::Null))
+    };
+    let (s, v) = op("google.status", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["accounts"].is_array(), "{v}");
+    let (s, v) = op("google.sync", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let item = json!({"type": "text/plain", "text": "hi", "source": {"kind": "test"}, "external_id": "1", "labels": ["worker:x"]});
+    let (s, v) = op("memex.ingest", json!({"items": [item]})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("set automatically"), "{v}");
+    head.shutdown().await.unwrap();
+}

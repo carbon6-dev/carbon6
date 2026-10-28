@@ -101,6 +101,34 @@ async fn routes_pick_connection_and_model() {
     let none = add("fresh").await;
     assert_eq!(create(json!({"connection_id": none.id})).await.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // A pool (docs/pools.md) is for what runs in the head: never a session's,
+    // nor a rule's but for the assistant or suggestions.
+    let pool: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"kind": "pool", "name": "both", "members": [{"connection_id": "main", "slots": 2}, {"connection_id": "cheap", "slots": 1}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let r = create(json!({"connection_id": pool.id, "model": "big"})).await;
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("is a pool"));
+    assert_eq!(put(json!([{"name": "x", "connection": "both", "model": "big"}])).await, reqwest::StatusCode::BAD_REQUEST);
+    assert!(put(json!([{"name": "x", "applies_to": ["task:suggest"], "connection": "both", "model": "big"}])).await.is_success());
+    // Nor what subagents run on (they run on the worker).
+    let rule = json!([{"name": "x", "connection": "main", "model": "big", "subagent_connection": "both", "subagent_model": "big"}]);
+    assert_eq!(put(rule).await, reqwest::StatusCode::BAD_REQUEST);
+    let r = http
+        .put(format!("{api}/sessions/{}/subagent-model", s.id))
+        .json(&json!({"connection_id": pool.id, "model": "big"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("is a pool"));
+
     stop.cancel();
     head.shutdown().await.unwrap();
 }

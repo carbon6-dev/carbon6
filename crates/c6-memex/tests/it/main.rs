@@ -11,6 +11,7 @@ unsafe extern "C" fn raise_nofile_before_tests() {
     c6_testkit::raise_open_file_limit();
 }
 
+mod assistant;
 mod chat;
 mod claims;
 mod docs;
@@ -18,6 +19,7 @@ mod fixtures;
 mod knowledge;
 mod memex;
 mod move_in;
+mod pools;
 mod realms;
 mod records;
 mod relations;

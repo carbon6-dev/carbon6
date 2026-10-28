@@ -26,7 +26,7 @@ const RESTART_TIMEOUT_MS: i64 = 10 * 60 * 1000;
 
 /// What the head knows of updating, beyond its database.
 pub struct Updater {
-    /// GitHub's API for the repository (`…/repos/carbon6-dev/carbon6`).
+    /// The repository on GitHub (`https://github.com/carbon6-dev/carbon6`).
     pub source: String,
     /// Release keys (hex); empty: the ones built in.
     pub keys: Vec<String>,
@@ -223,6 +223,8 @@ async fn look_loop(st: std::sync::Arc<HeadState>) {
 }
 
 /// Looks at GitHub for a newer release; returns its version when there is one.
+/// Only release files are downloaded, never GitHub's API, whose 60 requests
+/// an hour a household shares.
 pub async fn check(st: &HeadState) -> anyhow::Result<Option<String>> {
     let r = look(st).await;
     st.updates.checked_at.store(now_ms(), Ordering::SeqCst);
@@ -246,61 +248,45 @@ async fn look(st: &HeadState) -> anyhow::Result<Option<String>> {
 
 /// One of GitHub's releases: the latest (`edge`: false), or the rolling
 /// `edge` pre-release that CI replaces for every green commit on main. Its
-/// signed manifest is kept (and, by the setting, asked about) when it is
-/// newer than this build.
+/// `release.json` is downloaded from the release's files (with the last
+/// ETag, so an unchanged one is a 304), and its signed manifest kept (and,
+/// by the setting, asked about) when it is newer than this build.
 async fn look_at(st: &HeadState, edge: bool) -> anyhow::Result<Option<String>> {
     let u = &st.updates;
-    let (path, etag_key) = if edge { ("releases/tags/edge", ETAG_EDGE) } else { ("releases/latest", ETAG) };
-    let mut req = st
-        .http
-        .get(format!("{}/{path}", u.source.trim_end_matches('/')))
-        .header("User-Agent", format!("carbon6/{}", c6_core::build()))
-        .header("Accept", "application/vnd.github+json");
+    let repo = u.source.trim_end_matches('/');
+    // `latest/download` redirects to the latest release's files: never a
+    // draft or a pre-release.
+    let (files, etag_key) =
+        if edge { (format!("{repo}/releases/download/edge/"), ETAG_EDGE) } else { (format!("{repo}/releases/latest/download/"), ETAG) };
+    let mut req = st.http.get(format!("{files}release.json")).header("User-Agent", format!("carbon6/{}", c6_core::build()));
     if let Some(etag) = st.store.setting(etag_key).await? {
         req = req.header("If-None-Match", etag);
     }
     let resp = req.send().await?;
+    // The edge release is gone while CI replaces it.
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED || (edge && resp.status() == reqwest::StatusCode::NOT_FOUND) {
         return Ok(None);
     }
+    let what = if edge { "the edge build" } else { "the latest release" };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("{what} has no release.json: it won't update to it");
+    }
     if !resp.status().is_success() {
-        anyhow::bail!("GitHub said {}", resp.status());
+        anyhow::bail!("GitHub said {} for {what}'s release.json", resp.status());
     }
     let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let release: Value = resp.json().await?;
-    if release["draft"] == true || (!edge && release["prerelease"] == true) {
-        return Ok(None);
-    }
+    let manifest = resp.bytes().await?.to_vec();
     let remember = async || -> anyhow::Result<()> {
         if let Some(e) = &etag {
             st.store.set_setting(etag_key, e).await?;
         }
         Ok(())
     };
-    // A release says its version in its tag; an edge build only in its manifest.
-    let tagged = release["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_owned();
-    if !edge && (!up::newer(&tagged, ver(st)) || known(st, &tagged).await?) {
-        remember().await?;
-        return Ok(up::newer(&tagged, ver(st)).then_some(tagged));
-    }
-    let url = |name: &str| {
-        release["assets"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|a| a["name"] == name)
-            .and_then(|a| a["browser_download_url"].as_str())
-            .map(str::to_owned)
-    };
-    let what = if edge { "the edge build".to_owned() } else { format!("carbon6 {tagged}") };
-    let (Some(manifest_url), Some(sig_url)) = (url("release.json"), url("release.json.sig")) else {
-        anyhow::bail!("{what} has no signed release.json: it won't update to it");
-    };
-    let manifest = fetch(st, &manifest_url).await?;
-    let sig = fetch(st, &sig_url).await?;
+    let sig =
+        fetch(st, &format!("{files}release.json.sig")).await.map_err(|e| anyhow::anyhow!("{what} has no signed release.json: {e:#}"))?;
     let m = up::verify(&manifest, &sig, &u.keys()).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
-    if !edge && m.version != tagged {
-        anyhow::bail!("{what}'s release.json is for {}", m.version);
+    if !edge && up::is_edge(&m.version) {
+        anyhow::bail!("the latest release's release.json names an edge build ({})", m.version);
     }
     if edge && !up::is_edge(&m.version) {
         anyhow::bail!("the edge build's release.json names a release ({})", m.version);
@@ -311,7 +297,8 @@ async fn look_at(st: &HeadState, edge: bool) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     if !known(st, &version).await? {
-        let base = manifest_url.trim_end_matches("release.json").to_owned();
+        // Its files: a release's under its own tag (`latest` moves on).
+        let base = if edge { files } else { format!("{repo}/releases/download/v{version}/") };
         let now = now_ms();
         sqlx::query(
             "INSERT OR IGNORE INTO updates (version, manifest, signature, base_url, found_at, state, updated_at) VALUES (?, ?, ?, ?, ?, 'available', ?)",

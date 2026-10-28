@@ -12,15 +12,6 @@ use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox};
 use crate::workspace::{Go, View};
 
-fn day(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    String::from(d.to_locale_date_string("default", &json_options(json!({"weekday": "short", "month": "short", "day": "numeric"}))))
-}
-
-fn json_options(v: Value) -> wasm_bindgen::JsValue {
-    js_sys::JSON::parse(&v.to_string()).unwrap_or(wasm_bindgen::JsValue::UNDEFINED)
-}
-
 /// Tomorrow at 9, or next Monday at 9, in your time.
 fn at_nine(days: u32) -> i64 {
     let d = js_sys::Date::new_0();
@@ -34,6 +25,29 @@ fn at_nine(days: u32) -> i64 {
 fn next_monday() -> u32 {
     let today = js_sys::Date::new_0().get_day();
     (8 - today) % 7 + if today == 1 { 7 } else { 0 }
+}
+
+/// How a request is settled: the Brief's actions, Mail's too, so the two
+/// don't drift apart.
+#[derive(Clone, Copy)]
+pub(crate) enum Settle {
+    Done,
+    /// Snoozed until tomorrow at 9.
+    Tomorrow,
+    /// Snoozed until next Monday at 9.
+    NextWeek,
+    Drop,
+}
+
+/// Settles a request (done, dropped, or snoozed until a time).
+pub(crate) async fn settle(id: i64, how: Settle) -> Result<Value, String> {
+    let (status, until) = match how {
+        Settle::Done => ("done", None),
+        Settle::Tomorrow => ("snoozed", Some(at_nine(1))),
+        Settle::NextWeek => ("snoozed", Some(at_nine(next_monday()))),
+        Settle::Drop => ("dropped", None),
+    };
+    api::rpc("memex.requests.set", json!({"id": id, "status": status, "until": until})).await
 }
 
 /// Where a request came from, as icons: ✉ mail, 💬 chat.
@@ -59,11 +73,10 @@ struct Brief {
 }
 
 impl Brief {
-    /// Settles a request (done, dropped, snoozed); an open one gives way to
-    /// the next.
-    fn settle(self, id: i64, status: &'static str, until: Option<i64>) {
+    /// Settles a request; an open one gives way to the next.
+    fn settle(self, id: i64, how: Settle) {
         spawn_local(async move {
-            match api::rpc("memex.requests.set", json!({"id": id, "status": status, "until": until})).await {
+            match settle(id, how).await {
                 Ok(_) => self.gone(id),
                 Err(e) => self.error.set(Some(e)),
             }
@@ -157,7 +170,7 @@ pub fn BriefPage() -> impl IntoView {
             h.clear();
         }
     });
-    let act = move |id: i64, status: &'static str, until: Option<i64>| b.settle(id, status, until);
+    let act = move |id: i64, how: Settle| b.settle(id, how);
     // The keys: J/K move, Enter opens, E done, H snooze to tomorrow, # drop,
     // Esc back to the list.
     let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
@@ -185,17 +198,17 @@ pub fn BriefPage() -> impl IntoView {
             "Escape" => open.set(None),
             "e" => {
                 if let Some(id) = current {
-                    act(id, "done", None);
+                    act(id, Settle::Done);
                 }
             }
             "h" => {
                 if let Some(id) = current {
-                    act(id, "snoozed", Some(at_nine(1)));
+                    act(id, Settle::Tomorrow);
                 }
             }
             "#" => {
                 if let Some(id) = current {
-                    act(id, "dropped", None);
+                    act(id, Settle::Drop);
                 }
             }
             _ => return,
@@ -313,7 +326,7 @@ fn Row(r: Request, i: usize, picked: RwSignal<usize>, b: Brief) -> impl IntoView
                 <button class="shrink-0 rounded bg-sky-100 px-1.5 text-[10px] text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Possibly the same ask as another request: merge them"
                     on:click=move |ev| { ev.stop_propagation(); b.merge(other.min(id), other.max(id)); }>"same? merge"</button>
             })}
-            {r.due.map(|d| view! { <span class="shrink-0 text-xs text-amber-700 dark:text-amber-400">{format!("by {}", day(d))}</span> })}
+            {r.due.map(|d| view! { <span class="shrink-0 text-xs text-amber-700 dark:text-amber-400">{format!("by {}", crate::when::compact(d))}</span> })}
             <span class="shrink-0 text-xs text-zinc-400">{channels(&r)}</span>
         </div>
     }
@@ -348,7 +361,7 @@ fn Owed(c: Commitment, b: Brief) -> impl IntoView {
                 let c = c.clone();
                 move || view! {
                     <span class="min-w-0 flex-1 truncate" title=c.item_title.clone()>{c.what.clone()}{(c.who != "me").then(|| format!(" — {}", c.who))}</span>
-                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{day(d)}</span> })}
+                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{crate::when::compact(d)}</span> })}
                 }.into_any()
             })
             body=ViewFn::from(move || view! {
@@ -403,7 +416,7 @@ fn Fyi(t: Triage, b: Brief) -> impl IntoView {
 #[component]
 fn RequestView(r: Request, b: Brief) -> impl IntoView {
     let (id, open) = (r.id, b.open);
-    let act = move |id: i64, status: &'static str, until: Option<i64>| b.settle(id, status, until);
+    let act = move |id: i64, how: Settle| b.settle(id, how);
     let refresh = RwSignal::new(0u32);
     view! {
         <div class="flex flex-col gap-4 lg:flex-row">
@@ -416,17 +429,17 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                     <p class="text-xs uppercase tracking-wide text-zinc-500">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
                     <h1 class="font-semibold">{r.title.clone()}</h1>
                     <p class="text-sm">{if r.person_name.is_empty() { r.person.clone() } else { format!("{} <{}>", r.person_name, r.person) }}</p>
-                    {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", day(d))}</p> })}
+                    {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", crate::when::full(d))}</p> })}
                     <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
                 </div>
                 // A mail thread shows its senders' cards itself.
                 {(r.person.contains('@') && !r.sources.iter().any(|s| s.kind == "mail")).then(|| view! { <crate::understanding::Cards params=json!({"address": r.person.clone()}) /> })}
                 <DraftCard r=r.clone() b />
                 <div class="flex flex-wrap gap-2">
-                    <button class=BUTTON_QUIET on:click=move |_| act(id, "done", None)>"Done (E)"</button>
-                    <button class=BUTTON_QUIET on:click=move |_| act(id, "snoozed", Some(at_nine(1)))>"Tomorrow (H)"</button>
-                    <button class=BUTTON_QUIET on:click=move |_| act(id, "snoozed", Some(at_nine(next_monday())))>"Next week"</button>
-                    <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(id, "dropped", None)>"Drop (#)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::Done)>"Done (E)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::Tomorrow)>"Tomorrow (H)"</button>
+                    <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::NextWeek)>"Next week"</button>
+                    <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(id, Settle::Drop)>"Drop (#)"</button>
                 </div>
                 <p class="text-xs text-zinc-400">"Or answer in a conversation: once you reply, it's done by itself."</p>
             </aside>

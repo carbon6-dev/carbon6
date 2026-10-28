@@ -76,7 +76,8 @@ pub enum LiveEvent {
 pub struct Connection {
     pub id: String,
     pub name: String,
-    /// `openai_compat` for now.
+    /// `openai_compat`, `openai`, `anthropic`, `chatgpt`, `claude_code`, or
+    /// `pool` (docs/pools.md).
     pub kind: String,
     pub base_url: String,
     pub default_model: Option<String>,
@@ -88,20 +89,48 @@ pub struct Connection {
     /// The realms whose sessions may use it (empty: all).
     #[serde(default)]
     pub realms: Vec<String>,
+    /// A pool's members (docs/pools.md).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<PoolMember>,
+}
+
+/// A pool's member: one of the other connections, and how many calls it
+/// takes at once (docs/pools.md).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PoolMember {
+    /// The connection (its id, or name).
+    pub connection_id: String,
+    /// Calls at once (1 to 64).
+    pub slots: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateConnection {
-    /// `openai_compat` (default), `openai`, `anthropic`, or `claude_code`
-    /// (runs the worker's own signed-in Claude Code). ChatGPT
+    /// `openai_compat` (default), `openai`, `anthropic`, `claude_code`
+    /// (runs the worker's own signed-in Claude Code), or `pool` (other
+    /// connections, for what runs in the head: docs/pools.md). ChatGPT
     /// connections are created by signing in instead.
     #[serde(default)]
     pub kind: Option<String>,
     pub name: String,
+    #[serde(default)]
     pub base_url: String,
     pub api_key: Option<String>,
     pub default_model: Option<String>,
+    /// A pool's members.
+    #[serde(default)]
+    pub members: Vec<PoolMember>,
+}
+
+/// `PATCH /api/v1/connections/{id}`: what changes (what is left out stays).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateConnection {
+    pub name: Option<String>,
+    /// A pool's members, all of them.
+    pub members: Option<Vec<PoolMember>>,
 }
 
 // --- Sessions ---------------------------------------------------------------
@@ -572,6 +601,10 @@ pub struct AppPackage {
     /// them, and act through its operations (docs/knowledge.md §6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feeds: Vec<String>,
+    /// Where its accounts' conversations open on the service's own web,
+    /// for "Open in <service>" (a mail app's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<AppLinks>,
     /// The labels its claims use, what each means, and the shared label
     /// it maps to (docs/apps.md §9.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -579,6 +612,29 @@ pub struct AppPackage {
     /// A kit's environment and tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<KitPart>,
+}
+
+/// Where an app's conversations open on its service's web (`links`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppLinks {
+    /// The service's name, as "Open in Gmail" says it.
+    pub service: String,
+    /// A mail thread's address (https), with `{account}` (the account's
+    /// address), `{thread}`, `{message}` (the mailbox's ids for the latest
+    /// message's thread and itself) and `{message_id}` (its Message-ID)
+    /// filled in.
+    #[serde(default)]
+    pub thread: String,
+}
+
+/// Where a conversation opens on its service's own web.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Link {
+    /// "Gmail", "Slack".
+    pub service: String,
+    pub url: String,
 }
 
 /// What a package asks for. For a realm: secrets to set, a worker of its
@@ -1323,12 +1379,15 @@ pub struct Grant {
     pub id: String,
     pub from_realm: String,
     pub to_realm: String,
-    /// collection, memex or operations.
+    /// collection, memex, operations, or workers (within a realm too: a
+    /// session starting a template beyond its own worker).
     pub kind: String,
     /// collection: {"collection": name, "where": {filter}}; memex: {"kinds": […]}
-    /// (empty: every kind but spam); operations: {"methods": ["memex.mail.draft", …]}.
+    /// (empty: every kind but spam); operations: {"methods": ["memex.mail.draft", …]};
+    /// workers: {"template": name}.
     pub scope: serde_json::Value,
-    /// read, append or snapshot (collections); read (memex); call (operations).
+    /// read, append or snapshot (collections); read (memex); call (operations);
+    /// start (workers).
     pub mode: String,
     /// active, requested, revoked or denied.
     pub state: String,
@@ -4374,6 +4433,11 @@ pub struct Triage {
     /// The subject, or the conversation's name.
     pub title: String,
     pub at: UnixMs,
+    /// The open request it is part of (docs/brief.md §5), if any: Mail
+    /// settles it with the Brief's actions. Only on one conversation's
+    /// (`memex.triage.get`, a mail thread's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -4395,6 +4459,10 @@ pub struct MailMessage {
     pub attachments: Vec<MailAttachment>,
     pub labels: Vec<String>,
     pub unread: bool,
+    /// Its thread on the mailbox's web, as the account's app says (none:
+    /// imported mail, or an app without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

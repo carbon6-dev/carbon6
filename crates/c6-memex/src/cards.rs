@@ -334,7 +334,7 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         warn!("removing bulk senders' cards: {e:#}");
     }
     let Some((task, per_day)) = m.understanding() else { return Ok(false) };
-    if crate::understand::budget_left(m, per_day).await? == 0 {
+    if !crate::understand::can_call(m, &task, per_day).await? {
         return Ok(false);
     }
     let next: Vec<(String, String)> =
@@ -357,6 +357,10 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         .collect();
     let before = get(m, &key).await?;
     if let Err(e) = grow(m, &task, &key, &name, 0, before, ts.clone()).await {
+        if llm::waits(m, &e).await? {
+            warn!(%key, "growing a card waits: {e:#}");
+            return Ok(false);
+        }
         warn!(%key, "growing a card: {e:#}");
         // Not again for these threads: the next news tries again.
         for (account, thread, _, _) in &ts {

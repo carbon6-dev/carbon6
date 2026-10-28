@@ -572,3 +572,451 @@ async fn mail_and_chat_sorted_for_the_brief() {
 
     head.shutdown().await.unwrap();
 }
+
+/// A model that fails for now (5xx, 429, unreachable) doesn't sort a
+/// conversation: it waits, its call goes back to the day's budget, and it
+/// is sorted once the model answers. With an effort, the answer has room
+/// for the model's thinking.
+#[tokio::test]
+async fn sorting_waits_out_a_model_that_fails_for_now() {
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    let sorted = async || -> Option<Triage> {
+        let v: Value = http
+            .post(format!("{api}/memex/rpc"))
+            .json(&json!({"method": "memex.triage.list", "params": {}}))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        serde_json::from_value::<Vec<Triage>>(v).ok()?.into_iter().find(|t| t.target == "thread:acct:p1")
+    };
+
+    // Busy for every retry of the first call; then the answer.
+    for _ in 0..5 {
+        mock.push_about("pilot for 40 seats", Reply::Retry(503));
+    }
+    mock.push_about("pilot for 40 seats", Reply::Text(json!({"category": "fyi", "reason": "A pilot, later"}).to_string()));
+    mail(
+        &m,
+        "p1",
+        "p1",
+        ("pat@northwind.com", "Pat"),
+        "me@mine.io",
+        "Pilot",
+        "We use your scheduler and want a pilot for 40 seats.",
+        None,
+        &["INBOX"],
+        HOUR,
+    )
+    .await;
+    // One call a day: only the one given back lets it sort.
+    let r = http
+        .put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": "m", "model": "reader-1", "effort": "low"}, "calls_per_day": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    let s = eventually("sorted", async || sorted().await).await;
+    assert_eq!((s.category.as_str(), s.by.as_str()), ("fyi", "model"), "never the failure: {s:?}");
+    let asked = mock.requests();
+    assert_eq!(asked.len(), 6, "five busy, then the answer");
+    assert_eq!(asked[5]["max_tokens"], 400 + c6_memex::llm::THINKING_ROOM, "room to think at effort low");
+    head.shutdown().await.unwrap();
+}
+
+/// A model that stops answering mid-stream holds no lane: past the pause a
+/// call may take, the call failed for now and is asked again. And while a
+/// call hangs, choosing another model takes over at once.
+#[tokio::test]
+async fn a_stalled_answer_lets_go() {
+    let (a, b, c) = (MockLlm::start().await, MockLlm::start().await, MockLlm::start().await);
+    let answer = |from: &str| Reply::Text(json!({"category": "fyi", "reason": from, "summary": "s", "topics": []}).to_string());
+    // a stalls in the middle of its first answer; then answers. c only stalls.
+    let _stalled = a.push_gated(answer("a"));
+    let _hung = c.push_gated(answer("c"));
+    for _ in 0..20 {
+        a.push(answer("a"));
+        b.push(answer("b"));
+    }
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    for (name, mock) in [("a", &a), ("b", &b), ("c", &c)] {
+        let r = http.post(format!("{api}/connections")).json(&json!({"name": name, "base_url": mock.base_url()})).send().await.unwrap();
+        assert!(r.status().is_success());
+    }
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    let understand_with = async |connection: &str| {
+        let body = json!({"understanding": {"connection": connection, "model": "reader-1"}, "calls_per_day": 100});
+        assert!(http.put(format!("{api}/settings/memex")).json(&body).send().await.unwrap().status().is_success());
+    };
+    let sorted = async |thread: &str| -> Option<Triage> {
+        let v: Value = http
+            .post(format!("{api}/memex/rpc"))
+            .json(&json!({"method": "memex.triage.list", "params": {"limit": 100}}))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        serde_json::from_value::<Vec<Triage>>(v).ok()?.into_iter().find(|t| t.target == format!("thread:acct:{thread}"))
+    };
+
+    // A pause of a second is a stall here.
+    let limits =
+        |idle: u64| c6_llm::limit::Limits { total: std::time::Duration::from_secs(3600), idle: std::time::Duration::from_secs(idle) };
+    m.set_call_limits(limits(1));
+    mail(&m, "p1", "p1", ("pat@northwind.com", "Pat"), "me@mine.io", "Pilot", "A pilot for 40 seats?", None, &["INBOX"], HOUR).await;
+    understand_with("a").await;
+    let s = eventually("sorted once a answers", async || sorted("p1").await).await;
+    assert_eq!((s.by.as_str(), s.reason.as_str()), ("model", "a"), "never the stall: {s:?}");
+    let calls = c6_llm::activity::calls();
+    assert!(calls.iter().any(|c| c.state == "failed" && c.error.contains("stalled")), "the stalled call is shown");
+
+    // c hangs (no stall is short enough to notice now); you choose b instead.
+    // The new mail comes once c is chosen: before, a (reading on after p1)
+    // could sort it first.
+    m.set_call_limits(limits(3600));
+    understand_with("c").await;
+    mail(&m, "p2", "p2", ("kim@tailspin.com", "Kim"), "me@mine.io", "Lunch", "Lunch next week?", None, &["INBOX"], HOUR).await;
+    eventually("a call hanging on c", async || (c.requests().len() == 1).then_some(())).await;
+    understand_with("b").await;
+    let s = eventually("sorted by b", async || sorted("p2").await.filter(|s| s.reason == "b")).await;
+    assert_eq!(s.by, "model");
+    head.shutdown().await.unwrap();
+}
+
+/// Your Google account (me@mine.io), as the Google apps keep it, so the
+/// memex knows which mail is to you: the apps installed, the account kept
+/// (the sign-in itself is the providers test's), the memex told.
+pub(crate) async fn my_account(head: &c6_head::Head, api: &str, m: &c6_memex::Memex) {
+    let http = reqwest::Client::new();
+    let installs: Vec<c6_api::Install> = http.post(format!("{api}/google/install")).send().await.unwrap().json().await.unwrap();
+    for i in &installs {
+        let r =
+            http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    }
+    for (app, _) in c6_head::google::APPS {
+        let a = c6_head::providers::Kept {
+            realm: "home",
+            instance: app,
+            provider: "google",
+            account: "me@mine.io",
+            name: "Me",
+            refresh: "rt-1",
+            access: "at-1",
+            expires: c6_core::now_ms() + 3_600_000,
+            scopes: "all",
+        };
+        c6_head::providers::keep(&head.state, &a, None).await.unwrap();
+    }
+    c6_head::memex::reload(&head.state).await;
+    eventually("the memex knows your account", async || m.accounts().iter().any(|a| a.email == "me@mine.io").then_some(())).await;
+}
+
+/// A conversation as the model sorted it, at its latest message; what
+/// needs you (or is a first contact) opens its request, as sorting does.
+pub(crate) async fn sorted_as(m: &c6_memex::Memex, thread: &str, category: &str) {
+    let (at, sender): (i64, String) = sqlx::query_as("SELECT date, from_addr FROM mail WHERE thread_id = ? ORDER BY date DESC LIMIT 1")
+        .bind(thread)
+        .fetch_one(&m.store.pool)
+        .await
+        .unwrap();
+    let t = c6_api::Triage {
+        target: format!("thread:acct:{thread}"),
+        kind: "mail".into(),
+        category: category.into(),
+        reason: "as sorted".into(),
+        by: "model".into(),
+        sender,
+        title: thread.into(),
+        at,
+        ..Default::default()
+    };
+    sqlx::query(
+        "INSERT OR REPLACE INTO triage (target, kind, category, reason, by, sender, title, at, done_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&t.target)
+    .bind(&t.kind)
+    .bind(&t.category)
+    .bind(&t.reason)
+    .bind(&t.by)
+    .bind(&t.sender)
+    .bind(&t.title)
+    .bind(at)
+    .bind(c6_core::now_ms())
+    .execute(&m.store.pool)
+    .await
+    .unwrap();
+    c6_memex::requests::sorted_by_you(m, &t).await.unwrap();
+}
+
+/// "Needs reply" (Mail's view, the Activity page) follows the sorting:
+/// mail straight to you that the model sorted as a notification doesn't
+/// need a reply, mail that needs you does. With a model, that's all (what
+/// isn't sorted yet waits for it); with none, mail not sorted does too,
+/// unless an automated sender wrote it. Either way, only what's as recent
+/// as what's sorted.
+#[tokio::test]
+async fn needs_reply_follows_the_sorting() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    my_account(&head, &api, &m).await;
+    // A model that can't answer now: what isn't sorted yet stays so.
+    let r =
+        http.post(format!("{api}/connections")).json(&json!({"name": "down", "base_url": "http://127.0.0.1:9/v1"})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let body = json!({"understanding": {"connection": "down", "model": "reader-1"}, "calls_per_day": 100});
+    let r = http.put(format!("{api}/settings/memex")).json(&body).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    eventually("the memex has its model", async || m.understanding().map(drop)).await;
+
+    let me = "me@mine.io";
+    mail(
+        &m,
+        "n1",
+        "n1",
+        ("orders@shop.example", "Shop"),
+        me,
+        "Your order has shipped",
+        "Order 1182 is on its way.",
+        None,
+        &["INBOX"],
+        HOUR,
+    )
+    .await;
+    mail(&m, "n2", "n2", ("carol@acme.com", "Carol"), me, "Contract", "Can you sign it by Friday?", None, &["INBOX"], 2 * HOUR).await;
+    mail(&m, "n3", "n3", ("no-reply@bank.example", "Bank"), me, "Transfer confirmed", "Your $40 went through.", None, &["INBOX"], 3 * HOUR)
+        .await;
+    mail(&m, "n4", "n4", ("dan@other.org", "Dan"), me, "Coffee", "Coffee next week?", None, &["INBOX"], 4 * HOUR).await;
+    // Older than what's sorted: never sorted, so never shown.
+    mail(&m, "n5", "n5", ("erin@other.org", "Erin"), me, "Visit", "Can we visit in May?", None, &["INBOX"], 20 * 24 * HOUR).await;
+    sorted_as(&m, "n1", "notification").await;
+    sorted_as(&m, "n2", "needs_you").await;
+
+    let rpc = async |method: &str, params: Value| -> Value {
+        let r = http.post(format!("{api}/memex/rpc")).json(&json!({"method": method, "params": params})).send().await.unwrap();
+        assert!(r.status().is_success());
+        r.json().await.unwrap()
+    };
+    let shown = async || -> Vec<String> {
+        let v = rpc("memex.mail.threads", json!({"view": "needs_reply"})).await;
+        serde_json::from_value::<Vec<MailThread>>(v).unwrap().into_iter().map(|t| t.subject).collect()
+    };
+    assert_eq!(shown().await, ["Contract"], "only what the model sorted as needing you");
+    // The rest weren't sorted.
+    for t in ["n3", "n4", "n5"] {
+        assert_eq!(rpc("memex.triage.get", json!({"target": format!("thread:acct:{t}")})).await, Value::Null, "{t}");
+    }
+    // No model: what isn't sorted needs a reply, unless an automated
+    // sender wrote it; not what's older.
+    let r = http.put(format!("{api}/settings/memex")).json(&json!({"calls_per_day": 100})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    eventually("the memex has no model", async || m.understanding().is_none().then_some(())).await;
+    assert_eq!(shown().await, ["Contract", "Coffee"], "not the shipping notice nor the bank's");
+    head.shutdown().await.unwrap();
+}
+
+/// The kit, reading only once let (as a worker busy elsewhere, or asleep).
+struct Held {
+    asked: std::sync::atomic::AtomicBool,
+    go: tokio::sync::Semaphore,
+    kit: c6_memex::extract::InProcess,
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Held { asked: Default::default(), go: tokio::sync::Semaphore::new(0), kit: Default::default() }
+    }
+}
+
+#[async_trait::async_trait]
+impl c6_memex::extract::Extractor for Held {
+    async fn extract(&self, req: c6_memex::extract::Request) -> anyhow::Result<c6_memex::extract::Response> {
+        self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(self.go.acquire().await?);
+        c6_memex::extract::Extractor::extract(&self.kit, req).await
+    }
+    async fn walk(&self, worker: &str, root: &str) -> anyhow::Result<(String, Vec<(String, u64, i64)>)> {
+        c6_memex::extract::Extractor::walk(&self.kit, worker, root).await
+    }
+    async fn read(&self, worker: &str, path: &str, max: u64) -> anyhow::Result<Vec<u8>> {
+        c6_memex::extract::Extractor::read(&self.kit, worker, path, max).await
+    }
+}
+
+/// Mail moved to spam in Gmail leaves Mail's inbox views (the inbox,
+/// "Needs reply", what's sorted as needing you): moved once it's kept, or
+/// while it still waited to be read (that change was lost, and it stayed
+/// in the inbox).
+#[tokio::test]
+async fn mail_moved_to_spam_leaves_the_inbox() {
+    let kit = std::sync::Arc::new(Held::default());
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    // This store's only: other tests in the process read as they do.
+    m.read_with(kit.clone());
+    my_account(&head, &api, &m).await;
+    use base64::Engine;
+    // As the gmail app's sync gives them: a message, and a label change
+    // (the same item, without its bytes).
+    let message = |id: &str, subject: &str, ago: i64| {
+        let raw = format!(
+            "From: Carol <carol@acme.com>\r\nTo: me@mine.io\r\nSubject: {subject}\r\nMessage-ID: <{id}@test>\r\nContent-Type: text/plain\r\n\r\nCan you look at this?\r\n"
+        );
+        json!({"type": "message/rfc822", "source": {"kind": "app"}, "external_id": format!("acct:{id}"), "data": base64::engine::general_purpose::STANDARD.encode(raw),
+               "attributes": {"account": "acct", "message": id, "thread": id, "labels": ["INBOX", "UNREAD"], "received": c6_core::now_ms() - ago}})
+    };
+    let to_spam = |id: &str| {
+        json!({"type": "message/rfc822", "source": {"kind": "app"}, "external_id": format!("acct:{id}"),
+               "attributes": {"account": "acct", "message": id, "labels": ["SPAM", "UNREAD", "CATEGORY_PERSONAL"]}})
+    };
+    let ingest =
+        async |items: Value| c6_memex::ingest::ingest(&m, json!({"as": "app:gmail", "wait": false, "items": items})).await.unwrap();
+    let shown = async |view: &str| -> Vec<String> {
+        c6_memex::mail::threads(&m, view, None, None, 50).await.unwrap().into_iter().map(|t| t.subject).collect()
+    };
+
+    // Moved while the kit reads it.
+    ingest(json!([message("s2", "Moved", HOUR)])).await;
+    eventually("the kit reading it", async || kit.asked.load(std::sync::atomic::Ordering::Relaxed).then_some(())).await;
+    let r = ingest(json!([to_spam("s2")])).await;
+    assert_eq!(r["results"][0]["status"], "queued", "kept with its new labels once read: {r}");
+    kit.go.add_permits(1);
+    ingest(json!([message("s1", "Kept", 2 * HOUR)])).await;
+    eventually("both read", async || {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail WHERE thread_id IN ('s1', 's2')").fetch_one(&m.store.pool).await.ok()?;
+        (n == 2).then_some(())
+    })
+    .await;
+    assert_eq!(shown("inbox").await, ["Kept"]);
+    assert_eq!(shown("needs_reply").await, ["Kept"]);
+    assert_eq!(shown("spam").await, ["Moved"]);
+
+    // Kept, then moved.
+    sorted_as(&m, "s1", "needs_you").await;
+    assert_eq!(shown("triage:needs_you").await, ["Kept"]);
+    let r = ingest(json!([to_spam("s1")])).await;
+    assert_eq!(r["results"][0]["status"], "updated", "{r}");
+    for view in ["inbox", "needs_reply", "triage:needs_you", "all", "starred", "label:CATEGORY_PERSONAL"] {
+        assert!(shown(view).await.is_empty(), "{view}");
+    }
+    assert_eq!(shown("spam").await, ["Moved", "Kept"]);
+    head.shutdown().await.unwrap();
+}
+
+/// Mail's "Needs you" (and "First contact") is what waits on you in the
+/// Brief: in the inbox, its request open. One done or dropped there leaves
+/// it, so does one snoozed until later (it comes back once its time has
+/// passed), and so does one archived; so does "Needs reply".
+#[tokio::test]
+async fn needs_you_is_what_waits_on_you() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let m = c6_head::knowledge::get(&head.state).expect("the head's knowledge store");
+    my_account(&head, &api, &m).await;
+    let me = "me@mine.io";
+    for (i, (from, subject)) in
+        [("ana@acme.com", "Open"), ("bo@acme.com", "Done"), ("cy@acme.com", "Snoozed"), ("di@acme.com", "Archived")].into_iter().enumerate()
+    {
+        let id = format!("q{i}");
+        mail(&m, &id, &id, (from, ""), me, subject, "Can you look at this?", None, &["INBOX"], (i as i64 + 1) * HOUR).await;
+        sorted_as(&m, &id, "needs_you").await;
+    }
+    let rpc = async |method: &str, params: Value| -> Value {
+        let r = http.post(format!("{api}/memex/rpc")).json(&json!({"method": method, "params": params})).send().await.unwrap();
+        assert!(r.status().is_success(), "{method}: {}", r.text().await.unwrap());
+        r.json().await.unwrap()
+    };
+    let shown = async |view: &str| -> Vec<String> {
+        let v = rpc("memex.mail.threads", json!({"view": view})).await;
+        serde_json::from_value::<Vec<MailThread>>(v).unwrap().into_iter().map(|t| t.subject).collect()
+    };
+    let request = async |thread: &str| -> i64 {
+        let t: Triage = serde_json::from_value(rpc("memex.triage.get", json!({"target": format!("thread:acct:{thread}")})).await).unwrap();
+        t.request.expect("its open request")
+    };
+    assert_eq!(shown("triage:needs_you").await, ["Open", "Done", "Snoozed", "Archived"]);
+
+    let (done, snoozed) = (request("q1").await, request("q2").await);
+    rpc("memex.requests.set", json!({"id": done, "status": "done"})).await;
+    let later = c6_core::now_ms() + 3_600_000;
+    rpc("memex.requests.set", json!({"id": snoozed, "status": "snoozed", "until": later})).await;
+    // Archived in Gmail, as its sync keeps it.
+    sqlx::query("UPDATE mail SET inbox = 0 WHERE thread_id = 'q3'").execute(&m.store.pool).await.unwrap();
+    assert_eq!(shown("triage:needs_you").await, ["Open"], "done, snoozed and archived leave");
+    assert_eq!(shown("needs_reply").await, ["Open"]);
+    let t: Value = rpc("memex.triage.get", json!({"target": "thread:acct:q1"})).await;
+    assert!(t["request"].is_null(), "a done request isn't offered: {t}");
+    // The snooze's time has passed: it's back.
+    rpc("memex.requests.set", json!({"id": snoozed, "status": "snoozed", "until": c6_core::now_ms() - 1})).await;
+    assert_eq!(shown("triage:needs_you").await, ["Open", "Snoozed"]);
+    assert_eq!(shown("needs_reply").await, ["Open", "Snoozed"]);
+    head.shutdown().await.unwrap();
+}

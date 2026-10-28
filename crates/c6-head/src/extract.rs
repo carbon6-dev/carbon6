@@ -146,7 +146,7 @@ impl Extractor for KitExtractor {
             Some(w) => Some(worker(&st, w).await?),
             None => None,
         };
-        let job = crate::kitjobs::Job { spec, tool: "extract".into(), inputs, worker, mounts, ..Default::default() };
+        let job = crate::kitjobs::Job { spec, tool: "extract".into(), inputs, realm: req.realm, worker, mounts, ..Default::default() };
         let out = crate::kitjobs::run(&st, job).await?;
         let result: Value = match out.files.get("result.json") {
             Some(r) => serde_json::from_slice(r)?,

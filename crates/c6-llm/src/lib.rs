@@ -4,9 +4,11 @@ mod accumulate;
 pub mod activity;
 pub mod anthropic;
 mod http;
+pub mod limit;
 pub mod models;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod pool;
 mod sse;
 
 use std::time::Duration;
@@ -171,13 +173,19 @@ pub enum LlmError {
     /// The request does not fit the model's context window.
     #[error("context window exceeded: {0}")]
     ContextOverflow(String),
+    /// No server can take the call now (a pool's members are all busy,
+    /// resting after failures, or without the model).
+    #[error("no model server available: {0}")]
+    Unavailable(String),
 }
 
 impl LlmError {
+    /// Failed for now only (the server unreachable, timed out, busy or
+    /// failing, or none available): the same call may work later.
     pub fn retryable(&self) -> bool {
         match self {
             LlmError::Http { status, .. } => *status == 408 || *status == 409 || *status == 429 || *status >= 500,
-            LlmError::Network(_) => true,
+            LlmError::Network(_) | LlmError::Unavailable(_) => true,
             _ => false,
         }
     }
@@ -239,6 +247,21 @@ pub fn client_for(
         Provider::OpenAiChat => Box::new(openai_chat::OpenAiChat::new(base_url, bearer, headers)?),
         Provider::OpenAiResponses => Box::new(openai_responses::OpenAiResponses::new(base_url, bearer, headers, kind == "chatgpt")?),
         Provider::Anthropic => Box::new(anthropic::Anthropic::new(base_url, bearer, headers)?),
+    })
+}
+
+/// `client_for`, giving up after the first failed attempt: a pool member
+/// that fails is passed over for another, not waited on.
+pub fn client_once(
+    kind: &str,
+    base_url: &str,
+    bearer: &str,
+    headers: std::collections::HashMap<String, String>,
+) -> Result<Box<dyn ModelClient>, LlmError> {
+    Ok(match Provider::from_kind(kind).ok_or_else(|| LlmError::Config(format!("unknown connection kind `{kind}`")))? {
+        Provider::OpenAiChat => Box::new(openai_chat::OpenAiChat::new(base_url, bearer, headers)?.once()),
+        Provider::OpenAiResponses => Box::new(openai_responses::OpenAiResponses::new(base_url, bearer, headers, kind == "chatgpt")?.once()),
+        Provider::Anthropic => Box::new(anthropic::Anthropic::new(base_url, bearer, headers)?.once()),
     })
 }
 

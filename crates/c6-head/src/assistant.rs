@@ -18,8 +18,8 @@ use c6_api as api;
 use c6_core::{WorkerId, now_ms};
 use c6_llm::{Message, Provider, Role, ToolSpec, model_info};
 use c6_proto::{
-    CredentialRequest, ErrorEvent, HeadMsg, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionEventBatch,
-    SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
+    ErrorEvent, HeadMsg, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionEventBatch, SessionStarted, TurnEndReason,
+    TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
 use prost::Message as _;
@@ -416,26 +416,16 @@ impl Actor {
                     _ if !blocks.is_empty() => conv.history.push(Message { role: Role::User, blocks }),
                     _ => {}
                 }
-                let grant = crate::sessions::credential(
-                    &st,
-                    sink.head_id,
-                    CredentialRequest { connection_id: connection_id.clone(), ..Default::default() },
-                )
-                .await;
-                let client = if grant.error.is_empty() {
-                    let title = st.store.session(&session_id).await.ok().flatten().map(|r| r.title).filter(|t| !t.is_empty());
-                    let origin = c6_llm::activity::Origin {
-                        what: "assistant".into(),
-                        about: title.unwrap_or_else(|| session_id.clone()),
-                        connection: connection_id.clone(),
-                        realm: env.realm.clone(),
-                    };
-                    c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers)
-                        .map(|c| c6_llm::activity::track(c, origin))
-                        .map_err(|e| e.to_string())
-                } else {
-                    Err(grant.error)
+                let title = st.store.session(&session_id).await.ok().flatten().map(|r| r.title).filter(|t| !t.is_empty());
+                let origin = c6_llm::activity::Origin {
+                    what: "assistant".into(),
+                    about: title.unwrap_or_else(|| session_id.clone()),
+                    connection: connection_id.clone(),
+                    realm: env.realm.clone(),
+                    via: String::new(),
                 };
+                // Through the pool, when its connection is one.
+                let client = crate::pools::client(&st, &connection_id, &env.realm, origin).await.map_err(|e| format!("{e:#}"));
                 let client = match client {
                     Ok(c) => c,
                     Err(e) => {
@@ -623,6 +613,8 @@ impl Tool for Call {
             name: "c6_call".into(),
             description: "Runs a carbon6 operation, as the user. `input` follows the operation's schema (c6_describe). Destructive \
                           operations (deleting, revoking, sending, replacing a list with fewer entries) wait for the user's approval. \
+                          Knowledge (mail, chat, calendars, contacts, photos) is within this conversation's memex scope, as for \
+                          memex_search. \
                           Secrets an operation returns (tokens, codes) are shown to the user directly; you get a note that they were \
                           shown, never the value."
                 .into(),
@@ -645,11 +637,14 @@ impl Tool for Call {
         self.env.unseal(&mut args);
         // Should you be asked first?
         let st = &self.env.st;
+        // What it reads of the memex (mail, chat, calendars, contacts…) is
+        // this conversation's scope, as for its memex tools.
+        let scope = crate::memex::scope_for(st, &self.env.labels).await;
         let mut ask: Option<(String, String)> = None;
         if op.effect == Effect::Destructive {
             ask = Some(("assistant: destructive operations".into(), format!("{}: {}", op.name, op.summary)));
         } else if op.replaces.is_some() {
-            match removed_entries(st, op, &args, &self.env.realm).await {
+            match crate::memex::SCOPE.scope(scope.clone(), removed_entries(st, op, &args, &self.env.realm)).await {
                 Ok(gone) if !gone.is_empty() => {
                     ask = Some(("assistant: removes entries".into(), format!("{} removes {}", op.name, gone.join(", "))));
                 }
@@ -696,7 +691,7 @@ impl Tool for Call {
                 return ToolOutput::err(format!("the user did not approve {name} ({state}); do not try another way to do it"));
             }
         }
-        let result = execute(st, op, args, "assistant", Some(&self.env.realm)).await;
+        let result = crate::memex::SCOPE.scope(scope, execute(st, op, args, "assistant", Some(&self.env.realm))).await;
         match result {
             Ok(mut v) => {
                 // Secrets go to the user, not the model.
@@ -786,11 +781,9 @@ pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str, re
     }
     let realm = realm.filter(|r| *r != crate::realms::ROOT);
     match &op.via {
-        Via::Memex { method } => {
-            args["made_by"] = json!(made_by);
-            // As you, on the realm's knowledge (home's, from root).
-            Ok(crate::memex::call_in(st, realm.unwrap_or(crate::realms::HOME), method, args).await?)
-        }
+        // As you, on the realm's knowledge (home's, from root), as the API
+        // calls it.
+        Via::Memex { method } => crate::memex::call_as(st, realm.unwrap_or(crate::realms::HOME), method, args, made_by).await,
         Via::Http { method, path } => {
             let router = st.assistant.router.get().ok_or_else(|| anyhow::anyhow!("the head is starting"))?.clone();
             let mut uri = (*path).to_owned();

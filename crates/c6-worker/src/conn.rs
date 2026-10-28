@@ -38,6 +38,28 @@ pub enum ConnState {
     Disconnected { reason: String },
 }
 
+/// How often what kit runs left on the container runtime is looked for.
+const SWEEP: Duration = Duration::from_secs(10 * 60);
+
+/// Removes what this worker's kit runs left on the container runtime and
+/// no run owns (c6_tools::kits::sweep): at start, then every few minutes.
+fn sweep_kits(shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        loop {
+            if let Some(rt) = c6_tools::kits::runtime().await {
+                let n = c6_tools::kits::sweep(&rt).await;
+                if n > 0 {
+                    info!(n, "removed what kit runs left on the container runtime");
+                }
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(SWEEP) => {}
+            }
+        }
+    });
+}
+
 /// Why `attach_once` ended.
 enum Ended {
     /// Retry with backoff.
@@ -55,6 +77,7 @@ pub async fn run(worker: Arc<Worker>, state: watch::Sender<ConnState>, shutdown:
     crate::update::on_start(&worker, &shutdown)?;
     // Sessions from Claude Code and Codex, when the head says this worker imports.
     crate::imports::spawn(worker.clone(), shutdown.clone());
+    sweep_kits(shutdown.clone());
     let mut backoff = MIN_BACKOFF;
     loop {
         state.send_replace(ConnState::Connecting);
@@ -102,24 +125,16 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     };
 
     let (tx, rx) = mpsc::channel::<WorkerMsg>(64);
-    let kits = c6_tools::kits::runtime().await.is_some();
+    // It runs kit jobs for the head (docs/knowledge.md §6.2), unless told not to.
+    let offers_kits = worker.runs_kit_jobs();
+    let kits = offers_kits && c6_tools::kits::runtime().await.is_some();
     let hello = Hello {
         protocol_version: c6_core::PROTOCOL_VERSION,
         version: c6_core::build().into(),
         hostname: crate::hostname(),
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
-        capabilities: {
-            let mut c: Vec<String> = crate::claude_code::find_claude().map(|_| "claude_code".to_owned()).into_iter().collect();
-            // It runs kit jobs for the head (docs/knowledge.md §6.2).
-            if kits {
-                c.push("kits".into());
-            }
-            if let Some(ext) = worker.extension() {
-                c.extend(ext.capabilities());
-            }
-            c
-        },
+        capabilities: crate::capabilities(worker, crate::claude_code::find_claude().is_some(), kits),
         sessions: match worker.journal.unacked().await {
             Ok(cursors) => cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq }).collect(),
             Err(e) => return Ended::Retry(e.context("reading journal")),
@@ -196,7 +211,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         tokio::select! {
             _ = shutdown.cancelled() => return Ended::Shutdown,
             _ = tokio::time::sleep_until(deadline.into()) => return Ended::Retry(anyhow::anyhow!("head unresponsive")),
-            _ = look_for_kits.tick(), if !kits => {
+            _ = look_for_kits.tick(), if offers_kits && !kits => {
                 if c6_tools::kits::runtime().await.is_some() {
                     return Ended::Retry(anyhow::anyhow!("a container runtime is here now: attaching again to say so"));
                 }

@@ -91,6 +91,8 @@ pub struct Memex {
     pub scanning: std::sync::atomic::AtomicBool,
     /// What reads files (extract.rs): the head's kit jobs.
     extractor: std::sync::OnceLock<Arc<dyn extract::Extractor>>,
+    /// Reads this store's files before anything else (`read_with`).
+    reader: Mutex<Option<Arc<dyn extract::Extractor>>>,
     /// Wakes the extraction queue; tells waiters jobs finished.
     extract_wake: tokio::sync::Notify,
     extracted: tokio::sync::Notify,
@@ -101,6 +103,10 @@ pub struct Memex {
     /// What the reading loop's steps are working on now (a conversation, a
     /// request, a card, a thread), so steps side by side never take the same.
     claims: Mutex<std::collections::HashSet<String>>,
+    /// Connections resting after failing for now, by id (llm.rs).
+    pub(crate) rests: Mutex<HashMap<String, llm::Rest>>,
+    /// Each model call's time limits (llm.rs).
+    pub(crate) call_limits: Mutex<c6_llm::limit::Limits>,
 }
 
 /// Work a reading step has taken (`Memex::claim`).
@@ -158,7 +164,7 @@ impl Memex {
             realm: realm.to_owned(),
             realms: Default::default(),
             store,
-            embed: embed::Embedder::new(link.clone()),
+            embed: embed::Embedder::new(link.clone(), realm),
             link,
             last_error: Mutex::new(None),
             dir: dir.to_owned(),
@@ -177,11 +183,14 @@ impl Memex {
             media_changed: Default::default(),
             scanning: Default::default(),
             extractor: Default::default(),
+            reader: Default::default(),
             extract_wake: tokio::sync::Notify::new(),
             extracted: tokio::sync::Notify::new(),
             outcomes: Default::default(),
             reread: Default::default(),
             claims: Default::default(),
+            rests: Default::default(),
+            call_limits: Mutex::new(llm::CALL_LIMITS),
         }))
     }
 
@@ -316,6 +325,11 @@ impl Memex {
         self.claims.lock().unwrap().contains(what)
     }
 
+    /// Model calls' time limits, instead of `llm::CALL_LIMITS` (tests).
+    pub fn set_call_limits(&self, l: c6_llm::limit::Limits) {
+        *self.call_limits.lock().unwrap() = l;
+    }
+
     pub fn tasks(&self) -> Tasks {
         self.tasks.lock().unwrap().clone()
     }
@@ -344,8 +358,16 @@ impl Memex {
     }
 
     /// What reads files, if anything does yet.
+    /// Reads this store's files with this, before anything else (tests: a
+    /// kit holding a read, where `extract::set_override` is every store's
+    /// in the process, and the first test's).
+    pub fn read_with(&self, e: Arc<dyn extract::Extractor>) {
+        *self.reader.lock().unwrap() = Some(e);
+        self.extract_wake.notify_one();
+    }
+
     pub fn extractor(&self) -> Option<Arc<dyn extract::Extractor>> {
-        extract::overridden().or_else(|| self.extractor.get().cloned())
+        self.reader.lock().unwrap().clone().or_else(extract::overridden).or_else(|| self.extractor.get().cloned())
     }
 
     /// The face models' files, if there are models.
@@ -932,7 +954,7 @@ impl Memex {
             // Where the memex's own Google sync was, for moving it to apps.
             "memex.legacy_sync" => Ok(json!(people::legacy_states(&self.store).await?)),
             "memex.move_google" => people::move_to_apps(self, &params["accounts"]).await.map(|n| json!({"moved": n})),
-            "memex.commitments" => Ok(json!(understand::commitments(self, params["status"].as_str().unwrap_or("open")).await?)),
+            "memex.commitments" => Ok(json!(understand::commitments(self, params["status"].as_str().unwrap_or("open"), &allowed).await?)),
             "memex.commitment" => {
                 understand::set_commitment(self, params["id"].as_i64().unwrap_or(0), params["status"].as_str().unwrap_or("")).await?;
                 Ok(json!({}))
@@ -968,7 +990,9 @@ impl Memex {
                 *self.face_index.lock().unwrap() = None;
                 Ok(json!({}))
             }
-            "memex.summarize" => Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default()).await?})),
+            "memex.summarize" => {
+                Ok(json!({"summary": understand::summarize(self, params["id"].as_str().unwrap_or_default(), &allowed).await?}))
+            }
             "memex.graph" => {
                 let limit = params["limit"].as_u64().unwrap_or(40).min(150) as u32;
                 let policies: Vec<api::ClaimPolicy> = serde_json::from_value(params["policies"].clone()).unwrap_or_default();

@@ -77,6 +77,19 @@ pub(crate) async fn budget_left(m: &Memex, per_day: u32) -> anyhow::Result<u32> 
     Ok(per_day.saturating_sub(used as u32))
 }
 
+/// Whether a model call may be made now: the connection isn't resting
+/// after failing for now (llm.rs), and there is budget left today.
+pub(crate) async fn can_call(m: &Memex, task: &Task, per_day: u32) -> anyhow::Result<bool> {
+    Ok(!llm::resting(m, &task.connection_id) && budget_left(m, per_day).await? > 0)
+}
+
+/// Gives a call that failed for now back to today's budget.
+pub(crate) async fn refund_call(m: &Memex) -> anyhow::Result<()> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    sqlx::query("UPDATE model_calls SET calls = MAX(calls - 1, 0) WHERE day = ?").bind(today).execute(&m.store.pool).await?;
+    Ok(())
+}
+
 pub(crate) async fn count_call(m: &Memex) -> anyhow::Result<()> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     sqlx::query("INSERT INTO model_calls (day, calls) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET calls = calls + 1")
@@ -90,7 +103,7 @@ pub(crate) async fn count_call(m: &Memex) -> anyhow::Result<()> {
 /// did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some((task, per_day)) = m.understanding() else { return Ok(false) };
-    if budget_left(m, per_day).await? == 0 {
+    if !can_call(m, &task, per_day).await? {
         return Ok(false);
     }
     let version = version(&task);
@@ -98,6 +111,12 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     let Some(_claim) = m.claim(&format!("read:{target}")) else { return Ok(false) };
     count_call(m).await?;
     let result = read(m, &task, &kind, &items).await;
+    if let Err(e) = &result
+        && llm::waits(m, e).await?
+    {
+        warn!(%target, "understanding waits: {e:#}");
+        return Ok(false);
+    }
     done(m, &target, &version, result).await?;
     Ok(true)
 }
@@ -150,6 +169,11 @@ pub(crate) async fn read_thread(m: &Memex, task: &Task, account: &str, thread: &
         .await?;
     count_call(m).await?;
     let result = read(m, task, "thread", &items).await;
+    if let Err(e) = &result
+        && llm::waits(m, e).await?
+    {
+        return result;
+    }
     done(m, &format!("thread:{account}:{thread}"), &version(task), result).await
 }
 
@@ -382,7 +406,10 @@ pub async fn status(m: &Memex, s: &mut api::MemexStatus) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn commitments(m: &Memex, status: &str) -> anyhow::Result<Vec<api::Commitment>> {
+/// Commitments read from what the caller may see (`allowed`: those of
+/// items gone with everything).
+pub async fn commitments(m: &Memex, status: &str, allowed: &[String]) -> anyhow::Result<Vec<api::Commitment>> {
+    let everything = api::MEMEX_KINDS.iter().all(|k| allowed.iter().any(|a| a == k));
     let rows = sqlx::query(
         "SELECT c.*, i.title AS title, i.kind AS kind, (SELECT 'thread:' || ml.account || ':' || ml.thread_id FROM mail ml WHERE ml.item_id = c.item_id) AS target \
          FROM commitments c LEFT JOIN items i ON i.id = c.item_id WHERE c.status = ? \
@@ -393,6 +420,7 @@ pub async fn commitments(m: &Memex, status: &str) -> anyhow::Result<Vec<api::Com
     .await?;
     Ok(rows
         .iter()
+        .filter(|r| r.get::<Option<String>, _>("kind").map_or(everything, |k| allowed.contains(&k)))
         .map(|r| api::Commitment {
             id: r.get("id"),
             item_id: r.get("item_id"),
@@ -414,10 +442,11 @@ pub async fn set_commitment(m: &Memex, id: i64, status: &str) -> anyhow::Result<
 
 /// What the memex knows about a thing, summed up by the model and saved as
 /// a note about it (inferred, with its sources).
-pub async fn summarize(m: &Memex, key: &str) -> anyhow::Result<String> {
+pub async fn summarize(m: &Memex, key: &str, allowed: &[String]) -> anyhow::Result<String> {
     let (task, _) = m.understanding().ok_or_else(|| anyhow::anyhow!("choose an understanding model first (Settings → Memex)"))?;
     let thing = m.store.thing(key).await?.ok_or_else(|| anyhow::anyhow!("no thing {key:?}"))?;
-    let kinds: Vec<String> = api::MEMEX_KINDS.iter().filter(|k| **k != "spam").map(|k| k.to_string()).collect();
+    // From what the caller may see.
+    let kinds: Vec<String> = allowed.iter().filter(|k| *k != "spam").cloned().collect();
     // Observed items only: not other summaries.
     let items: Vec<api::MemexHit> =
         m.store.about(Some(&thing.id), &kinds, 40).await?.into_iter().filter(|h| !h.source.starts_with("pipeline")).collect();

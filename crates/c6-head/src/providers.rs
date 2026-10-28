@@ -65,7 +65,7 @@ async fn client(st: &HeadState, realm: &str, p: &api::OAuthProvider) -> anyhow::
 }
 
 /// Where providers send you back: the head's address (Settings →
-/// Notifications), else the page's.
+/// Notifications), else its public one (`ui_public_url`), else the page's.
 pub async fn redirect_uri(st: &HeadState, origin: Option<&str>) -> String {
     let base = st.store.setting(crate::notify::PUBLIC_URL).await.ok().flatten().filter(|u| !u.trim().is_empty());
     format!("{}/auth/oauth/callback", base.as_deref().or(origin).unwrap_or("http://localhost:7700").trim_end_matches('/'))
@@ -275,7 +275,9 @@ pub async fn feeding(st: &HeadState, realm: &str) -> anyhow::Result<Value> {
             continue;
         }
         for a in accounts(st, realm, &i.name).await? {
-            out.push(json!({"id": a.id, "email": a.account, "name": a.name, "app": i.name, "feeds": i.package.feeds}));
+            out.push(
+                json!({"id": a.id, "email": a.account, "name": a.name, "app": i.name, "feeds": i.package.feeds, "links": i.package.links}),
+            );
         }
     }
     Ok(Value::Array(out))

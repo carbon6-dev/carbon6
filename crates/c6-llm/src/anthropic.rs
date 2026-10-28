@@ -27,6 +27,8 @@ pub struct Anthropic {
     http: reqwest::Client,
     base_url: String,
     headers: HashMap<String, String>,
+    /// Attempts at each request (`http::post_json`).
+    attempts: u32,
 }
 
 impl Anthropic {
@@ -38,7 +40,12 @@ impl Anthropic {
         }
         let base = base_url.trim_end_matches('/');
         let base = base.strip_suffix("/v1").unwrap_or(base).to_owned();
-        Ok(Self { http: http::client()?, base_url: base, headers })
+        Ok(Self { http: http::client()?, base_url: base, headers, attempts: http::MAX_ATTEMPTS })
+    }
+
+    /// Gives up after the first failed attempt.
+    pub fn once(self) -> Self {
+        Self { attempts: 1, ..self }
     }
 
     pub fn request_body(&self, req: &ModelRequest) -> Value {
@@ -131,7 +138,7 @@ fn messages(msgs: &[crate::Message]) -> Vec<Value> {
 impl ModelClient for Anthropic {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
-        let resp = http::post_json(&self.http, &format!("{}/v1/messages", self.base_url), &self.headers, &body).await?;
+        let resp = http::post_json(&self.http, &format!("{}/v1/messages", self.base_url), &self.headers, &body, self.attempts).await?;
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
             loop {

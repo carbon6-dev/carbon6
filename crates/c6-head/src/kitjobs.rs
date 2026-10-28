@@ -31,6 +31,8 @@ pub struct Job {
     pub inputs: BTreeMap<String, Vec<u8>>,
     /// Environment for this run only (access tokens, approved secrets).
     pub env: Vec<(String, String)>,
+    /// The realm whose job it is: it runs only on a worker available to it.
+    pub realm: String,
     /// The worker to run on (default: any that can).
     pub worker: Option<c6_core::WorkerId>,
     /// The worker's own files the run reads: (its path, where under /mnt).
@@ -110,14 +112,7 @@ pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
         let command = command(&job.spec, &job.tool, &job.args)?;
         return f(LocalRun { tool: job.tool, command, inputs: job.inputs, env: job.env }).await;
     }
-    let workers = st.registry.with_capability("kits");
-    let worker = match job.worker {
-        Some(w) if workers.contains(&w) => w,
-        Some(_) => return Err(bad_request("that worker is not connected, or has no container runtime (Docker or Podman)")),
-        None => *workers
-            .first()
-            .ok_or_else(|| bad_request("no worker with a container runtime (Docker or Podman) is connected: kit jobs run on one"))?,
-    };
+    let worker = worker_for(st, &job).await?;
     let cmd = command(&job.spec, &job.tool, &job.args)?;
     let b64 = base64::engine::general_purpose::STANDARD;
     let inputs: serde_json::Map<String, Value> = job.inputs.iter().map(|(k, v)| (k.clone(), json!(b64.encode(v)))).collect();
@@ -135,6 +130,42 @@ pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
         stderr: v["stderr"].as_str().unwrap_or_default().to_owned(),
         files,
     })
+}
+
+/// The worker a job runs on: the one asked for, else a connected one with a
+/// container runtime that is available to the job's realm. None: the job
+/// fails (it never goes elsewhere).
+async fn worker_for(st: &HeadState, job: &Job) -> anyhow::Result<c6_core::WorkerId> {
+    let rows = st.store.workers().await?;
+    let realms = |id: c6_core::WorkerId| -> Vec<String> {
+        rows.iter().find(|r| r.worker_id() == Some(id)).and_then(|r| serde_json::from_str(&r.realms).ok()).unwrap_or_default()
+    };
+    let able: Vec<(c6_core::WorkerId, Vec<String>)> = st
+        .registry
+        .with_capability("kits")
+        .into_iter()
+        .map(|id| (id, realms(id)))
+        .filter(|(_, r)| crate::realms::serves(r, &job.realm))
+        .collect();
+    match job.worker {
+        Some(w) if able.iter().any(|(id, _)| *id == w) => Ok(w),
+        Some(_) => Err(bad_request(format!(
+            "that worker is not connected, has no container runtime (Docker or Podman), or is not available to realm {}",
+            job.realm
+        ))),
+        None => pick(&able, &job.realm).ok_or_else(|| {
+            bad_request(format!(
+                "no worker available to realm {} with a container runtime (Docker or Podman) is connected: kit jobs run on one",
+                job.realm
+            ))
+        }),
+    }
+}
+
+/// Of the workers that may run a realm's job (longest connected first), one
+/// kept to the realm first, else one that serves every realm.
+fn pick(able: &[(c6_core::WorkerId, Vec<String>)], realm: &str) -> Option<c6_core::WorkerId> {
+    able.iter().find(|(_, r)| r.iter().any(|x| x == realm)).or(able.first()).map(|(id, _)| *id)
 }
 
 /// What a run's `out/ingest.json` asks to keep, as the app that ran it
@@ -341,7 +372,7 @@ pub async fn for_instance(
         }
     }
     env.extend(crate::providers::tokens_for(st, realm, instance).await?);
-    let out = run(st, Job { spec, tool: tool.to_owned(), args, inputs, env, ..Default::default() }).await?;
+    let out = run(st, Job { spec, tool: tool.to_owned(), args, inputs, env, realm: realm.to_owned(), ..Default::default() }).await?;
     let mut result = json!({"exit": out.exit, "stdout": out.stdout, "stderr": out.stderr,
         "files": out.files.keys().cloned().collect::<Vec<_>>()});
     if let Some(batch) = out.files.get("ingest.json") {

@@ -152,8 +152,9 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
             </Go>
             {dismissable.then(|| {
                 let id = id.clone();
-                view! { <button class="hidden text-xs text-zinc-400 hover:text-zinc-900 group-hover:inline dark:hover:text-zinc-100" title="Dismiss" on:click=move |_| ws.dismiss(&id)>"✕"</button> }
+                view! { <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" title="Dismiss" aria-label="Dismiss" on:click=move |_| ws.dismiss(&id)>"✕"</button> }
             })}
+            <crate::sessions::SessionMenu id=id.clone() />
         </div>
     }
 }
@@ -363,7 +364,7 @@ fn MissionCard(id: String) -> impl IntoView {
     let open_id = id.clone();
     view! {
         <div class="flex h-48 flex-col rounded-lg border sm:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-            <div class="flex items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
+            <div class="group flex items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
                 {move || session.get().map(|s| view! { <span class=dot(s.status, tracked())></span> })}
                 <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
@@ -371,6 +372,7 @@ fn MissionCard(id: String) -> impl IntoView {
                 <span class="shrink-0 text-[11px] text-zinc-500">
                     {move || session.get().map(|s| format!("{} · {}", live.worker_name(&s.worker_id.to_string()), ago(now_ms() - s.updated_at)))}
                 </span>
+                <crate::sessions::SessionMenu id=open_id.clone() />
             </div>
             <div class="relative min-h-0 flex-1 overflow-hidden px-3 py-2">
                 {move || tool.get().map(|t| view! { <div class="mb-1 truncate font-mono text-[11px] text-blue-600 dark:text-blue-400">{format!("▶ {t}")}</div> })}

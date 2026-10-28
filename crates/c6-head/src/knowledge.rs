@@ -24,11 +24,19 @@ impl c6_worker::link::LocalHead for Local {
     }
 
     async fn credential(&self, connection_id: &str) -> CredentialGrant {
-        let req = CredentialRequest { request_id: 0, connection_id: connection_id.to_owned(), refresh: false };
+        let req = CredentialRequest { request_id: 0, connection_id: connection_id.to_owned(), refresh: false, session_id: String::new() };
         match self.st.upgrade() {
             Some(st) => crate::sessions::credential_for(&st, None, "head", req).await,
             None => CredentialGrant { connection_id: connection_id.to_owned(), error: "the head stopped".into(), ..Default::default() },
         }
+    }
+
+    async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
+        let st = self.st.upgrade()?;
+        crate::pools::get(&st, connection_id).await.unwrap_or_else(|e| {
+            tracing::warn!(connection = %connection_id, "a pool: {e:#}");
+            None
+        })
     }
 }
 

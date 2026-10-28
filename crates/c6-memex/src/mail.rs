@@ -26,7 +26,15 @@ pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &P
     let (source, external_id) = (s(&p["source"]), s(&p["external_id"]));
     let (account, message) = (s(&a["account"]), s(&a["message"]));
     let thread = a["thread"].as_str().filter(|t| !t.is_empty()).map(str::to_owned).unwrap_or_else(|| message.clone());
-    let labels: Vec<String> = serde_json::from_value(a["labels"].clone()).unwrap_or_default();
+    // Its labels now: they may have changed while it waited to be read
+    // (moved to spam, archived), after the kit was given it.
+    let now: Option<String> = sqlx::query_scalar("SELECT json_extract(params, '$.attributes.labels') FROM extractions WHERE key = ?")
+        .bind(job.key)
+        .fetch_optional(&m.store.pool)
+        .await?
+        .flatten();
+    let labels: Vec<String> =
+        now.and_then(|l| serde_json::from_str(&l).ok()).or_else(|| serde_json::from_value(a["labels"].clone()).ok()).unwrap_or_default();
     let date = a["received"].as_i64().unwrap_or_else(c6_core::now_ms);
     let owner = m.accounts().into_iter().find(|x| x.id == account).map(|x| x.email).unwrap_or_else(|| account.clone());
     let rfc_id = parsed.message_id.clone();
@@ -67,7 +75,8 @@ pub async fn store_message(m: &Memex, job: &crate::extract::Done<'_>, parsed: &P
     };
     let blob = job.input.strip_prefix("head:").unwrap_or_default();
     let item = store(m, parsed, blob, &to, &labels, date).await?;
-    if a["tell"].as_bool() == Some(true) {
+    // Not if it went to spam meanwhile.
+    if a["tell"].as_bool() == Some(true) && !labels.iter().any(|l| l == "SPAM") {
         let r = sqlx::query("SELECT from_addr, from_name, to_json, subject, snippet, thread_id FROM mail WHERE item_id = ?")
             .bind(&item)
             .fetch_one(&m.store.pool)
@@ -296,12 +305,17 @@ pub async fn threads(
     let me: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
     let now = c6_core::now_ms();
     let month = now - 30 * 86_400_000;
+    // What needs a reply is as recent as what is sorted, so the two agree.
+    let recent = now - crate::triage::WINDOW;
+    let model = m.understanding().is_some();
     // The view's condition on a thread's messages.
-    // As sorted for the brief (docs/brief.md): triage:<category>.
+    // As sorted for the brief (docs/brief.md): triage:<category>. What
+    // needs you (or is a first contact) is what waits on you there: in the
+    // inbox, its request open (not done, dropped, or snoozed till later).
     let sorted = view.strip_prefix("triage:").map(str::to_owned);
     let (cond, label): (&str, Option<String>) = match view {
         "inbox" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0", None),
-        "starred" => ("m.starred = 1 AND m.trash = 0", None),
+        "starred" => ("m.starred = 1 AND m.trash = 0 AND m.spam = 0", None),
         "sent" => ("m.sent = 1 AND m.trash = 0", None),
         "drafts" => ("m.draft = 1 AND m.trash = 0", None),
         "archive" => ("m.inbox = 0 AND m.trash = 0 AND m.spam = 0 AND m.sent = 0 AND m.draft = 0", None),
@@ -309,13 +323,14 @@ pub async fn threads(
         "trash" => ("m.trash = 1", None),
         "all" => ("m.trash = 0 AND m.spam = 0", None),
         // The latest message is from someone else, to you directly, in the
-        // inbox, not a list, this month.
+        // inbox, not a list, as recent as what is sorted; and as sorted
+        // (`needs_reply`).
         "needs_reply" => ("m.inbox = 1 AND m.trash = 0 AND m.spam = 0 AND m.list = 0", None),
         // The latest message is yours, sent over two days ago, this month.
         "waiting" => ("m.trash = 0 AND m.spam = 0", None),
         v if sorted.is_some() && v.starts_with("triage:") => ("m.trash = 0 AND m.spam = 0", None),
         v => match v.strip_prefix("label:") {
-            Some(l) => ("m.trash = 0", Some(l.to_owned())),
+            Some(l) => ("m.trash = 0 AND m.spam = 0", Some(l.to_owned())),
             None => anyhow::bail!("no mail view {v:?}"),
         },
     };
@@ -323,9 +338,18 @@ pub async fn threads(
         "SELECT m.account AS account, m.thread_id AS thread_id, MAX(m.date) AS date, COUNT(*) AS n, MAX(m.unread) AS unread, MAX(m.starred) AS starred, \
          MAX(m.attachments) AS attachments FROM mail m WHERE {cond} AND (?1 IS NULL OR m.account = ?1) \
          AND (?4 IS NULL OR m.item_id IN (SELECT item_id FROM mail_labels WHERE label = ?4)) \
-         AND (?5 IS NULL OR EXISTS (SELECT 1 FROM triage t WHERE t.target = 'thread:' || m.account || ':' || m.thread_id AND t.category = ?5)) \
-         GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) ORDER BY date DESC LIMIT ?3"
+         AND (?5 IS NULL OR EXISTS (SELECT 1 FROM triage t WHERE t.target = 'thread:' || m.account || ':' || m.thread_id AND t.category = ?5 \
+             AND (?5 NOT IN ('needs_you', 'first_contact') OR (m.inbox = 1 AND EXISTS (SELECT 1 FROM request_sources s JOIN requests r \
+             ON r.id = s.request_id WHERE s.target = t.target AND (r.status = 'open' OR (r.status = 'snoozed' AND r.until <= ?6))))))) \
+         GROUP BY m.account, m.thread_id HAVING (?2 IS NULL OR MAX(m.date) < ?2) AND (?7 IS NULL OR MAX(m.date) > ?7) \
+         ORDER BY date DESC LIMIT ?3"
     );
+    // The views of recent mail read no further back.
+    let since = match view {
+        "needs_reply" => Some(recent),
+        "waiting" => Some(month),
+        _ => None,
+    };
     // Over-fetch for the views that look at each thread's latest message.
     let fetch = if matches!(view, "needs_reply" | "waiting") { limit * 5 } else { limit };
     let mut out = Vec::new();
@@ -339,6 +363,8 @@ pub async fn threads(
             .bind(fetch as i64)
             .bind(&label)
             .bind(&sorted)
+            .bind(now)
+            .bind(since)
             .fetch_all(&m.store.pool)
             .await?;
         let more = rows.len() as u32 == fetch && fetch > limit;
@@ -354,10 +380,14 @@ pub async fn threads(
             let last_from: String = last.get("from_addr");
             let mine = me.contains(&last_from);
             let date: i64 = r.get("date");
+            let triage = crate::triage::of_thread(m, &acct, &thread).await?;
             let keep = match view {
                 "needs_reply" => {
                     let to: Vec<(String, String)> = serde_json::from_str(&last.get::<String, _>("to_json")).unwrap_or_default();
-                    !mine && date > month && to.iter().any(|(a, _)| me.contains(a))
+                    !mine
+                        && date > recent
+                        && to.iter().any(|(a, _)| me.contains(a))
+                        && needs_reply(triage.as_ref(), date, &last_from, model)
                 }
                 // Yours, unanswered: sent to someone else.
                 "waiting" => {
@@ -384,7 +414,6 @@ pub async fn threads(
                     people.push(label);
                 }
             }
-            let triage = crate::triage::of_thread(m, &acct, &thread).await?;
             out.push(api::MailThread {
                 triage,
                 account: acct,
@@ -408,6 +437,48 @@ pub async fn threads(
         }
     }
     Ok(out)
+}
+
+/// A thread's address on its mailbox's web, as the account's app declares
+/// it (`links`): none for imported mail, an app without one, or one that
+/// isn't https.
+fn link(m: &Memex, account: &str, thread: &str, message: &str, message_id: &str) -> Option<api::Link> {
+    let a = m.accounts().into_iter().find(|a| a.id == account)?;
+    let l = a.links?;
+    if !l.thread.starts_with("https://") {
+        return None;
+    }
+    let url = [
+        ("{account}", a.email.as_str()),
+        ("{thread}", thread),
+        ("{message}", message),
+        ("{message_id}", message_id.trim_matches(['<', '>'])),
+    ]
+    .iter()
+    .fold(l.thread.clone(), |u, (k, v)| u.replace(k, &encode(v)));
+    Some(api::Link { service: l.service, url })
+}
+
+/// `s` as part of an address: unreserved characters as they are, the rest
+/// percent-encoded.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
+}
+
+/// Whether a thread whose latest message (at `latest`, from `sender`) is
+/// someone else's to you needs your reply: as it was sorted (it needs you,
+/// or is a real first contact, and its request is open). With a model,
+/// only that: what isn't sorted yet soon is, and a rule can't tell a
+/// person from a support desk or a store's receipts sent straight to you.
+/// With none, a sorting that saw the latest message, else anyone's but an
+/// automated sender's.
+fn needs_reply(sorted: Option<&api::Triage>, latest: i64, sender: &str, model: bool) -> bool {
+    match sorted {
+        Some(t) if model || t.at >= latest => matches!(t.category.as_str(), "needs_you" | "first_contact") && t.request.is_some(),
+        _ => !model && !crate::relations::automated(sender),
+    }
 }
 
 /// A thread's messages, with each one's HTML (if any) and attachments.
@@ -471,6 +542,7 @@ pub async fn thread(m: &Memex, account: &str, thread_id: &str) -> anyhow::Result
             attachments,
             labels: serde_json::from_str(&r.get::<String, _>("labels")).unwrap_or_default(),
             unread: r.get::<i64, _>("unread") != 0,
+            link: link(m, account, thread_id, &r.get::<String, _>("gmail_id"), &r.get::<String, _>("rfc_id")),
         });
     }
     Ok(out)
@@ -670,5 +742,35 @@ mod tests {
     #[test]
     fn markdown() {
         assert_eq!(super::markdown_html("Hi **there**"), "<p>Hi <strong>there</strong></p>\n");
+    }
+
+    #[test]
+    fn needs_reply_follows_the_sorting() {
+        let sorted = |category: &str, at: i64| c6_api::Triage { category: category.into(), at, request: Some(1), ..Default::default() };
+        for model in [true, false] {
+            let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender, model);
+            // Sorted: what it was sorted as, whoever sent it.
+            assert!(needs(Some(sorted("needs_you", 100)), "no-reply@bank.example"));
+            assert!(needs(Some(sorted("first_contact", 100)), "pat@new.example"));
+            for c in ["notification", "newsletter", "noise", "pitch", "fyi", "yours"] {
+                assert!(!needs(Some(sorted(c, 100)), "orders@shop.example"), "{c}");
+            }
+            // What needs you, its request settled in the Brief (done,
+            // dropped, snoozed): not now.
+            assert!(!needs(Some(c6_api::Triage { request: None, ..sorted("needs_you", 100) }), "ana@acme.com"));
+        }
+        // With a model, only what it sorted: as sorted, though before its
+        // latest message (it's sorted again soon); not what isn't yet.
+        let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender, true);
+        assert!(!needs(None, "ana@acme.com"));
+        assert!(!needs(Some(sorted("notification", 50)), "ana@acme.com"));
+        assert!(needs(Some(sorted("needs_you", 50)), "ana@acme.com"));
+        // With none, what isn't sorted (or was before its latest message):
+        // a person's, not an automated sender's.
+        let needs = |t: Option<c6_api::Triage>, sender: &str| super::needs_reply(t.as_ref(), 100, sender, false);
+        assert!(needs(None, "ana@acme.com"));
+        assert!(!needs(None, "no-reply@bank.example"));
+        assert!(needs(Some(sorted("notification", 50)), "ana@acme.com"));
+        assert!(!needs(Some(sorted("needs_you", 50)), "notifications@github.com"));
     }
 }

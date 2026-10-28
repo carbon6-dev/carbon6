@@ -29,6 +29,13 @@ const BRIEF_TIMEOUT: Duration = Duration::from_secs(4);
 /// Session digests keep the latest turns within this many characters.
 const DIGEST_CHARS: usize = 16_000;
 
+tokio::task_local! {
+    /// The kinds a call being served may see (the assistant's operations,
+    /// as its conversation's scope allows): every memex call made for it
+    /// sees no more, however it reaches the memex.
+    pub static SCOPE: Vec<String>;
+}
+
 /// Wakes the outbox sender.
 #[derive(Default)]
 pub struct Feed {
@@ -64,6 +71,43 @@ pub async fn call_in(st: &HeadState, realm: &str, method: &str, params: Value) -
     call(st, method, in_realm(params, realm)).await
 }
 
+/// A memex method called by a person (`made_by`), through the API or an
+/// operation: what the head answers itself (the Google apps' accounts and
+/// syncs), checks (ingest's labels) or adds (the graph's reader policies)
+/// first, and never as an app.
+pub async fn call_as(st: &HeadState, realm: &str, method: &str, params: Value, made_by: &str) -> anyhow::Result<Value> {
+    // Ingest from outside is a batch of typed items, with labels checked as
+    // uploads are; the head's own generic items are not sent through here.
+    if method == "memex.ingest" {
+        let batch: api::MemexIngest =
+            serde_json::from_value(params.clone()).map_err(|e| bad_request(format!("memex.ingest takes {{\"items\": [...]}}: {e}")))?;
+        for item in &batch.items {
+            crate::sessions::check_labels(&item.labels)?;
+        }
+    }
+    // The mail client's accounts and syncs are the Google apps'.
+    match method {
+        "memex.google" => return crate::google::status(st, realm).await,
+        "memex.google_sync" => {
+            let st = st.arc().ok_or_else(|| anyhow::anyhow!("the head stopped"))?;
+            crate::google::sync_now(&st, realm).await?;
+            return Ok(json!({}));
+        }
+        _ => {}
+    }
+    let mut params = if params.is_object() { params } else { json!({}) };
+    params["made_by"] = json!(made_by);
+    // Only the head writes as an app (its kits' output).
+    if let Some(o) = params.as_object_mut() {
+        o.remove("as");
+    }
+    // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
+    if method == "memex.graph" {
+        params["policies"] = json!(crate::claims::policies(st, realm).await);
+    }
+    call_in(st, realm, method, params).await
+}
+
 /// Calls the knowledge store (in the head, docs/knowledge.md).
 pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result<Value> {
     // Ingest and uploads wait a while for what a worker reads (extract.rs).
@@ -73,12 +117,25 @@ pub async fn call(st: &HeadState, method: &str, params: Value) -> anyhow::Result
 
 async fn call_within(st: &HeadState, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
     let m = crate::knowledge::get(st).ok_or_else(|| anyhow::anyhow!("the knowledge store is starting"))?;
-    match tokio::time::timeout(timeout, m.handle_method(method, params)).await {
+    match tokio::time::timeout(timeout, m.handle_method(method, scoped(params))).await {
         Ok(Ok(v)) => Ok(v),
         // What it refuses is about the request.
         Ok(Err(e)) => Err(bad_request(format!("memex: {e:#}"))),
         Err(_) => Err(anyhow::anyhow!("memex: {method} took longer than {}s", timeout.as_secs())),
     }
+}
+
+/// `params` within `SCOPE`, when a call is served for one: the kinds both
+/// it and the call's own scope (if any) allow.
+fn scoped(params: Value) -> Value {
+    let Ok(scope) = SCOPE.try_with(Clone::clone) else { return params };
+    let mut params = if params.is_object() { params } else { json!({}) };
+    let kinds: Vec<String> = match params["scope"].as_array() {
+        Some(own) => own.iter().filter_map(Value::as_str).filter(|k| scope.iter().any(|s| s == k)).map(str::to_owned).collect(),
+        None => scope,
+    };
+    params["scope"] = json!(kinds);
+    params
 }
 
 /// Whether the knowledge store is open.
@@ -200,6 +257,40 @@ pub async fn scopes(st: &HeadState) -> anyhow::Result<Vec<api::MemexScope>> {
     Ok(serde_json::from_str(&st.store.setting(SCOPES).await?.unwrap_or_default()).unwrap_or_default())
 }
 
+/// Why a member of a pool can't serve the memex's `what` model, if it can't.
+fn unfit(what: &str, kind: &str) -> Option<&'static str> {
+    match (what, kind) {
+        ("embedding", "anthropic" | "chatgpt") => Some("has no embedding models (choose OpenAI or OpenAI-compatible members, e.g. Ollama)"),
+        ("transcription", "anthropic" | "chatgpt") => Some("has no /audio/transcriptions (choose OpenAI or OpenAI-compatible members)"),
+        _ => None,
+    }
+}
+
+/// A pool's members, for the memex's `what` model: each must fit it.
+async fn check_pool_members(st: &HeadState, what: &str, pool: &str, members: &[api::PoolMember]) -> anyhow::Result<()> {
+    for m in members {
+        let Some(c) = st.store.connection(&m.connection_id).await? else { continue };
+        if let Some(why) = unfit(what, &c.kind) {
+            return Err(bad_request(format!("{what}: {} in pool {pool} {why}", c.name)));
+        }
+    }
+    Ok(())
+}
+
+/// A pool's new members, for what the memex uses it for.
+pub async fn check_pool_use(st: &HeadState, pool_id: &str, members: &[api::PoolMember]) -> anyhow::Result<()> {
+    let s = settings(st).await?;
+    let Some(pool) = st.store.connection(pool_id).await? else { return Ok(()) };
+    let uses =
+        [("embedding", &s.embedding), ("understanding", &s.understanding), ("vision", &s.vision), ("transcription", &s.transcription)];
+    for (what, m) in uses {
+        if m.as_ref().is_some_and(|m| m.connection == pool.id || m.connection == pool.name) {
+            check_pool_members(st, what, &pool.name, members).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::Result<()> {
     if let Some(m) = &s.embedding {
         let connections = st.store.connections().await?;
@@ -207,6 +298,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
             .iter()
             .find(|c| c.id == m.connection || c.name == m.connection)
             .ok_or_else(|| bad_request(format!("no connection {:?}", m.connection)))?;
+        if c.kind == crate::pools::KIND {
+            check_pool_members(st, "embedding", &c.name, &crate::pools::members(c)).await?;
+        }
         if matches!(c.kind.as_str(), "anthropic" | "claude_code" | "chatgpt") {
             return Err(bad_request(format!(
                 "{} has no embedding models; choose an OpenAI or OpenAI-compatible (e.g. Ollama) connection",
@@ -232,6 +326,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
         }
         if what == "transcription" && matches!(c.kind.as_str(), "anthropic" | "chatgpt") {
             return Err(bad_request("transcription: choose an OpenAI or OpenAI-compatible connection (one with /audio/transcriptions)"));
+        }
+        if c.kind == crate::pools::KIND {
+            check_pool_members(st, what, &c.name, &crate::pools::members(c)).await?;
         }
         if m.model.trim().is_empty() {
             return Err(bad_request(format!("choose a model for {what}")));

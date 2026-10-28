@@ -398,7 +398,7 @@ const LOOK: &str = api::prompts::LOOK;
 pub async fn look(m: &Memex) -> anyhow::Result<bool> {
     let t = m.tasks();
     let Some(task) = t.vision else { return Ok(false) };
-    if crate::understand::budget_left(m, t.per_day).await? == 0 {
+    if !crate::understand::can_call(m, &task, t.per_day).await? {
         return Ok(false);
     }
     let version = format!("{VISION}@{}", task.model);
@@ -416,6 +416,10 @@ pub async fn look(m: &Memex) -> anyhow::Result<bool> {
     let id: String = r.get("item_id");
     let result = see(m, &task, &version, &r).await;
     if let Err(e) = &result {
+        if crate::llm::waits(m, e).await? {
+            warn!(item = %id, "vision waits: {e:#}");
+            return Ok(false);
+        }
         warn!(item = %id, "vision: {e:#}");
     }
     sqlx::query("UPDATE media SET seen = ?, error = ? WHERE item_id = ?")
@@ -552,22 +556,17 @@ pub async fn video_from(m: &Memex, job: &crate::extract::Done<'_>, v: &Value) ->
     Ok(id)
 }
 
-/// Speech to text, with timestamps: an OpenAI-style /audio/transcriptions.
+/// Speech to text, with timestamps: an OpenAI-style /audio/transcriptions
+/// (on a pool's member, when the connection is a pool).
 pub async fn transcribe(m: &Memex, task: &Task, audio: &[u8]) -> anyhow::Result<String> {
-    let grant = m.link.credential(&task.connection_id).await?;
-    let url = format!("{}/audio/transcriptions", grant.base_url.trim_end_matches('/'));
-    let form = reqwest::multipart::Form::new()
-        .text("model", task.model.clone())
-        .text("response_format", "verbose_json")
-        .part("file", reqwest::multipart::Part::bytes(audio.to_vec()).file_name("audio.m4a").mime_str("audio/mp4")?);
-    let mut req = reqwest::Client::new().post(&url).bearer_auth(&grant.bearer).multipart(form);
-    for (k, v) in &grant.headers {
-        req = req.header(k, v);
-    }
-    let resp = req.send().await?;
-    let status = resp.status();
-    let text = resp.text().await?;
-    anyhow::ensure!(status.is_success(), "transcription: {status} {}", crate::store::clip(&text, 300));
+    let text = match m.link.pool(&task.connection_id).await {
+        Some(pool) => pool.run(&task.model, &m.realm, |e| transcription(e, &task.model, audio)).await?,
+        None => {
+            let g = m.link.credential(&task.connection_id).await?;
+            let e = c6_llm::pool::Endpoint { kind: g.kind, base_url: g.base_url, bearer: g.bearer, headers: g.headers };
+            transcription(e, &task.model, audio).await?
+        }
+    };
     let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text": text}));
     let segments = v["segments"].as_array().cloned().unwrap_or_default();
     if segments.is_empty() {
@@ -581,6 +580,31 @@ pub async fn transcribe(m: &Memex, task: &Task, audio: &[u8]) -> anyhow::Result<
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+async fn transcription(e: c6_llm::pool::Endpoint, model: &str, audio: &[u8]) -> Result<String, c6_llm::LlmError> {
+    use c6_llm::LlmError;
+    let url = format!("{}/audio/transcriptions", e.base_url.trim_end_matches('/'));
+    let file = reqwest::multipart::Part::bytes(audio.to_vec())
+        .file_name("audio.m4a")
+        .mime_str("audio/mp4")
+        .map_err(|e| LlmError::Config(e.to_string()))?;
+    let form = reqwest::multipart::Form::new().text("model", model.to_owned()).text("response_format", "verbose_json").part("file", file);
+    let mut req = reqwest::Client::new().post(&url).timeout(crate::llm::CALL_LIMITS.total).bearer_auth(&e.bearer).multipart(form);
+    for (k, v) in &e.headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.map_err(|e| LlmError::Network(format!("transcription: {e}")))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| LlmError::Network(format!("transcription: {e}")))?;
+    if !status.is_success() {
+        return Err(LlmError::Http {
+            status: status.as_u16(),
+            body: format!("transcription: {}", crate::store::clip(&text, 300)),
+            retry_after: None,
+        });
+    }
+    Ok(text)
 }
 
 /// Looks at, listens to and finds faces in media in the background, and

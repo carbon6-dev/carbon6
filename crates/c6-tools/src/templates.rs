@@ -23,8 +23,9 @@ impl Tool for TemplateStart {
         ToolSpec {
             name: if self.claude { "TemplateStart" } else { "template_start" }.into(),
             description: "Starts a template: new sessions that do its work, in this realm or in another realm whose app offers the \
-                          template to this one (an app this realm's app requires). Returns the started sessions' ids; they run on \
-                          their own."
+                          template to this one (an app this realm's app requires). Its sessions run on this session's worker; \
+                          a template naming other workers, hosts or SSH targets needs the user's grant first (grant_request, \
+                          kind workers). Returns the started sessions' ids; they run on their own."
                 .into(),
             parameters: json!({"type": "object", "properties": {
                 "template": {"type": "string"},

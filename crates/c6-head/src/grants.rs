@@ -15,8 +15,13 @@ use tracing::warn;
 use crate::realms::{COMMONS, ROOT};
 use crate::{HeadState, bad_request, not_found};
 
-const MODES: [(&str, &[&str]); 3] =
-    [("collection", &["read", "append", "snapshot"]), ("memex", &["read", "append"]), ("operations", &["call"])];
+const MODES: [(&str, &[&str]); 4] = [
+    ("collection", &["read", "append", "snapshot"]),
+    ("memex", &["read", "append"]),
+    ("operations", &["call"]),
+    // A session starting `from`'s template where it says, not only on its own worker.
+    ("workers", &["start"]),
+];
 
 /// What every realm that reads commons has without a grant row.
 pub const COMMONS_READ: &str = "commons";
@@ -45,7 +50,8 @@ async fn check(st: &HeadState, g: &api::GrantIn) -> anyhow::Result<()> {
             return Err(bad_request(format!("no realm {r:?} that holds data")));
         }
     }
-    if g.from_realm == g.to_realm {
+    // Reaching other workers is a grant within a realm too.
+    if g.from_realm == g.to_realm && g.kind != "workers" {
         return Err(bad_request("a grant is between two realms"));
     }
     if g.to_realm == COMMONS {
@@ -73,6 +79,7 @@ async fn check(st: &HeadState, g: &api::GrantIn) -> anyhow::Result<()> {
         "operations" if g.scope["methods"].as_array().is_none_or(Vec::is_empty) => {
             Err(bad_request("name the operations: {\"methods\": [\"memex.mail.draft\", …]}"))
         }
+        "workers" if g.scope["template"].as_str().is_none_or(str::is_empty) => Err(bad_request("name the template: {\"template\": name}")),
         _ => Ok(()),
     }
 }
@@ -293,6 +300,17 @@ pub async fn may_call(st: &HeadState, from: &str, to: &str, method: &str, by: &s
     true
 }
 
+/// Whether realm `to`'s sessions may start realm `from`'s template where
+/// it says (its workers, hosts and SSH targets), not only on their own
+/// worker; logged on the grant when they may.
+pub async fn may_reach(st: &HeadState, from: &str, to: &str, template: &str, by: &str) -> bool {
+    let Some(g) = in_force(st, Some(from), to, "workers", "start").await.into_iter().find(|g| g.scope["template"] == template) else {
+        return false;
+    };
+    record_use(st, &g.id, by, &format!("template:{template}")).await;
+    true
+}
+
 pub async fn log_memex_read(st: &HeadState, grant: &str, by: &str, what: &str) {
     record_use(st, grant, by, what).await;
 }
@@ -404,6 +422,7 @@ pub fn describe(g: &api::Grant) -> String {
             Some(k) => format!("knowledge ({})", k.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
             None => "knowledge".into(),
         },
+        "workers" => format!("template {} on its workers, hosts and SSH targets", g.scope["template"].as_str().unwrap_or("?")),
         _ => format!(
             "operations {}",
             g.scope["methods"].as_array().map(|m| m.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()

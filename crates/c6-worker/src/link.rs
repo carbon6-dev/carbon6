@@ -26,6 +26,11 @@ const COALESCE: Duration = Duration::from_millis(25);
 pub trait LocalHead: Send + Sync {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
     async fn credential(&self, connection_id: &str) -> CredentialGrant;
+    /// The pool a connection is, if it is one: the head spreads its calls
+    /// over the pool's members.
+    async fn pool(&self, _connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -36,8 +41,9 @@ pub struct HeadLink {
     /// Deltas waiting for the next flush; `Some` while a flush is scheduled.
     ephemeral_buf: Arc<Mutex<Option<Vec<EphemeralEvent>>>>,
     waiters: Mutex<HashMap<u64, oneshot::Sender<CredentialGrant>>>,
-    /// In memory only: credentials are never written to disk on workers.
-    cache: Mutex<HashMap<String, CredentialGrant>>,
+    /// By (session, connection). In memory only: credentials are never
+    /// written to disk on workers.
+    cache: Mutex<HashMap<(String, String), CredentialGrant>>,
     next_request: AtomicU64,
     calls: Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>,
 }
@@ -118,20 +124,36 @@ impl HeadLink {
         }
     }
 
+    /// Credentials for the head's own knowledge store (in this process). A
+    /// worker's sessions ask with `session_credential`.
     pub async fn credential(&self, connection_id: &str) -> anyhow::Result<CredentialGrant> {
-        self.credential_with(connection_id, false).await
+        self.credential_with("", connection_id, false).await
+    }
+
+    /// Credentials on behalf of one of this worker's sessions (a subagent
+    /// asks as its root): the head gives only what the session uses, as its
+    /// realm allows.
+    pub async fn session_credential(&self, session_id: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
+        self.credential_with(session_id, connection_id, false).await
+    }
+
+    /// The pool a connection is, when the head is in this process and it is
+    /// one (pools are only for what runs in the head).
+    pub async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
+        self.local.get()?.pool(connection_id).await
     }
 
     /// New credentials, after the provider refused the ones it had (HTTP
     /// 401): the head signs in again where it can (ChatGPT).
-    pub async fn fresh_credential(&self, connection_id: &str) -> anyhow::Result<CredentialGrant> {
-        self.cache.lock().unwrap().remove(connection_id);
-        self.credential_with(connection_id, true).await
+    pub async fn fresh_credential(&self, session_id: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
+        self.cache.lock().unwrap().remove(&(session_id.to_owned(), connection_id.to_owned()));
+        self.credential_with(session_id, connection_id, true).await
     }
 
-    async fn credential_with(&self, connection_id: &str, refresh: bool) -> anyhow::Result<CredentialGrant> {
+    async fn credential_with(&self, session_id: &str, connection_id: &str, refresh: bool) -> anyhow::Result<CredentialGrant> {
         let now = c6_core::now_ms();
-        let cached = self.cache.lock().unwrap().get(connection_id).cloned();
+        let key = (session_id.to_owned(), connection_id.to_owned());
+        let cached = self.cache.lock().unwrap().get(&key).cloned();
         if let Some(g) = &cached
             && (g.expires_at_ms == 0 || g.expires_at_ms - EXPIRY_MARGIN_MS > now)
         {
@@ -143,7 +165,7 @@ impl HeadLink {
             if !grant.error.is_empty() {
                 bail!("head refused credentials: {}", grant.error);
             }
-            self.cache.lock().unwrap().insert(connection_id.to_owned(), grant.clone());
+            self.cache.lock().unwrap().insert(key, grant.clone());
             return Ok(grant);
         }
         let tx = self.outbound.lock().unwrap().clone();
@@ -157,7 +179,7 @@ impl HeadLink {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
         self.waiters.lock().unwrap().insert(request_id, done);
-        let req = CredentialRequest { request_id, connection_id: connection_id.to_owned(), refresh };
+        let req = CredentialRequest { request_id, connection_id: connection_id.to_owned(), refresh, session_id: session_id.to_owned() };
         tx.send(WorkerMsg { msg: Some(worker_msg::Msg::CredentialRequest(req)) }).await.map_err(|_| anyhow!("head connection closed"))?;
 
         let grant = tokio::time::timeout(CREDENTIAL_TIMEOUT, wait)
@@ -167,13 +189,11 @@ impl HeadLink {
         if !grant.error.is_empty() {
             bail!("head refused credentials: {}", grant.error);
         }
+        self.cache.lock().unwrap().insert(key, grant.clone());
         Ok(grant)
     }
 
     pub(crate) fn on_grant(&self, grant: CredentialGrant) {
-        if grant.error.is_empty() {
-            self.cache.lock().unwrap().insert(grant.connection_id.clone(), grant.clone());
-        }
         if let Some(w) = self.waiters.lock().unwrap().remove(&grant.request_id) {
             let _ = w.send(grant);
         }
@@ -186,14 +206,16 @@ impl HeadLink {
 /// asks the head for new ones and tries once more.
 pub struct LinkedClient {
     link: Arc<HeadLink>,
+    session_id: String,
     connection_id: String,
     /// The client for the last bearer token, kept while the token is.
     current: Mutex<Option<(String, Arc<dyn c6_llm::ModelClient>)>>,
 }
 
 impl LinkedClient {
-    pub fn new(link: Arc<HeadLink>, connection_id: &str) -> Self {
-        Self { link, connection_id: connection_id.to_owned(), current: Mutex::default() }
+    /// For `session_id`'s model calls (its root's, for a subagent).
+    pub fn new(link: Arc<HeadLink>, session_id: &str, connection_id: &str) -> Self {
+        Self { link, session_id: session_id.to_owned(), connection_id: connection_id.to_owned(), current: Mutex::default() }
     }
 
     fn client(&self, g: &CredentialGrant) -> Result<Arc<dyn c6_llm::ModelClient>, c6_llm::LlmError> {
@@ -213,11 +235,11 @@ impl LinkedClient {
 impl c6_llm::ModelClient for LinkedClient {
     async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
         let unreachable = |e: anyhow::Error| c6_llm::LlmError::Network(format!("credentials from the head: {e:#}"));
-        let g = self.link.credential(&self.connection_id).await.map_err(unreachable)?;
+        let g = self.link.session_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
         match self.client(&g)?.stream(req).await {
             Err(c6_llm::LlmError::Http { status: 401, body, .. }) => {
                 tracing::warn!(connection = %self.connection_id, "the provider refused the credentials; asking the head for new ones: {body}");
-                let g = self.link.fresh_credential(&self.connection_id).await.map_err(unreachable)?;
+                let g = self.link.fresh_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
                 self.client(&g)?.stream(req).await
             }
             r => r,
@@ -317,7 +339,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await });
         let head = Arc::new(Head(Default::default(), url));
         let link = Arc::new(HeadLink::local(head.clone()));
-        let client = LinkedClient::new(link, "c1");
+        let client = LinkedClient::new(link, "s1", "c1");
         let req = c6_llm::ModelRequest {
             model: "m".into(),
             system: String::new(),

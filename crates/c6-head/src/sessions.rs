@@ -128,10 +128,11 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         }
         (routed.connection, routed.model, routed.subagent_model, routed.subagent_connection, routed.subagent_effort)
     };
-    if let Some(c) = st.store.connection(&connection_id).await?
-        && !crate::realms::available(&c.realms, &realm)
-    {
-        return Err(bad_request(format!("the connection {} is not available to realm {realm}", c.name)));
+    if let Some(c) = st.store.connection(&connection_id).await? {
+        if !crate::realms::available(&c.realms, &realm) {
+            return Err(bad_request(format!("the connection {} is not available to realm {realm}", c.name)));
+        }
+        crate::pools::not_for_sessions(&c, "a session")?;
     }
     let now = now_ms();
     let prompt = req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
@@ -411,11 +412,12 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
 }
 
 /// The connections subagents in `realm` may run on: those the realm may use,
-/// but not Claude Code (a subagent runs in carbon6's own loop).
+/// but not Claude Code (a subagent runs in carbon6's own loop) or a pool
+/// (only for what runs in the head).
 fn subagent_connections(connections: &[crate::store::ConnectionRow], realm: &str) -> Vec<api::SubagentConnection> {
     connections
         .iter()
-        .filter(|c| c.kind != "claude_code" && crate::realms::available(&c.realms, realm))
+        .filter(|c| c.kind != "claude_code" && c.kind != crate::pools::KIND && crate::realms::available(&c.realms, realm))
         .map(|c| api::SubagentConnection {
             id: c.id.clone(),
             name: c.name.clone(),
@@ -660,6 +662,7 @@ pub async fn set_subagent_model(st: &HeadState, session_id: &str, req: &api::Set
         if !crate::realms::available(&c.realms, &session.realm) {
             return Err(bad_request(format!("the connection {} is not available to realm {}", c.name, session.realm)));
         }
+        crate::pools::not_for_sessions(&c, "subagents")?;
         Some(ModelSpec { connection_id: c.id, model: model.to_owned(), max_output_tokens: 0, effort, connection_kind: c.kind })
     };
     let (c, m, e) = spec.as_ref().map(|s| (s.connection_id.as_str(), s.model.as_str(), s.effort.as_str())).unwrap_or_default();
@@ -878,6 +881,10 @@ async fn model_switch(
 ) -> anyhow::Result<ModelSpec> {
     let effort = check_effort(effort)?;
     let to = st.store.connection(connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
+    crate::pools::not_for_sessions(&to, "a session")?;
+    if !crate::realms::available(&to.realms, &session.realm) {
+        return Err(bad_request(format!("the connection {} is not available to realm {}", to.name, session.realm)));
+    }
     let from = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
     // An imported session has no connection yet: it may take any.
     if !session.connection_id.is_empty() && (to.kind == "claude_code") != (from == "claude_code") {
@@ -965,7 +972,14 @@ async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String],
     if !connection.is_empty() && !connections.iter().any(|c| c.id == connection) {
         return Err(bad_request("no such connection"));
     }
-    let first = || connections.first().map(|c| c.id.clone()).ok_or_else(|| bad_request("add a connection first (Settings → Connections)"));
+    // Not a pool: sessions dial their connection.
+    let first = || {
+        connections
+            .iter()
+            .find(|c| c.kind != crate::pools::KIND)
+            .map(|c| c.id.clone())
+            .ok_or_else(|| bad_request("add a connection first (Settings → Connections)"))
+    };
     if !model.is_empty() {
         let connection = if connection.is_empty() { first()? } else { connection.to_owned() };
         return Ok(Routed { connection, model: model.to_owned(), ..Default::default() });
@@ -1035,8 +1049,16 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
             return Err(bad_request(format!("routing rule {:?}: a model is required", r.name)));
         }
         let want = r.connection.trim();
-        if !want.is_empty() && !connections.iter().any(|c| c.id == want || c.name == want) {
-            return Err(bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)));
+        if !want.is_empty() {
+            let c = connections
+                .iter()
+                .find(|c| c.id == want || c.name == want)
+                .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
+            // A pool only for what runs in the head (the assistant, suggestions).
+            let head_side = r.applies_to.iter().any(|l| l == crate::assistant::LABEL || l == crate::suggestions::ROUTE_LABEL);
+            if !head_side {
+                crate::pools::not_for_sessions(c, &format!("routing rule {:?} (unless it applies to assistant or task:suggest)", r.name))?;
+            }
         }
         check_effort(Some(r.effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: {e}", r.name)))?;
         let sub = r.subagent_connection.trim();
@@ -1049,7 +1071,7 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                         r.name
                     )));
                 }
-                Some(_) => {}
+                Some(c) => crate::pools::not_for_sessions(c, &format!("routing rule {:?}: subagents", r.name))?,
             }
             if r.subagent_model.trim().is_empty() {
                 return Err(bad_request(format!("routing rule {:?}: a subagent connection needs a subagent model", r.name)));
@@ -1371,47 +1393,44 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     Ok(true)
 }
 
-/// A secret's value for a worker, as a credential: `name@session` asks on
-/// behalf of one of the worker's sessions, and the secret must be in that
-/// session's realm; a bare name (an older worker) gets only home's. A
-/// secret scoped to `worker:` labels is only given to those workers.
+/// A secret's value for one of a worker's sessions, as a credential:
+/// `name@session`, from the session's realm (else root's). A secret scoped
+/// to `worker:` labels is only given to those workers.
 async fn secret_credential(
     st: &HeadState,
     worker_id: WorkerId,
     worker_name: &str,
     name: &str,
-    mut grant: CredentialGrant,
+    asking: &str,
+    grant: CredentialGrant,
 ) -> CredentialGrant {
-    let (name, realm) = match name.split_once('@') {
-        Some((name, session_id)) => match st.store.session(session_id).await {
-            Ok(Some(s)) if s.worker_id == worker_id.to_string() => (name, s.realm),
-            _ => {
-                grant.error = "no such session on this worker".into();
-                return grant;
-            }
-        },
-        None => (name, crate::realms::HOME.to_owned()),
+    // Workers before sessions said who asks used a bare name, for home's.
+    let Some((name, session_id)) = name.split_once('@') else {
+        return refused(grant, worker_name, asking, "a secret is asked for as name@session: update this worker");
     };
-    // The session's realm's, else root's.
+    if !asking.is_empty() && asking != session_id {
+        return refused(grant, worker_name, asking, "a session asks only for its own secrets");
+    }
+    let realm = match live_session(st, worker_id, session_id).await {
+        Ok(s) => s.realm,
+        Err(why) => return refused(grant, worker_name, session_id, why),
+    };
     let (blob, applies_to) = match st.store.secret(&realm, name).await {
         Ok(Some((blob, applies_to, _))) => (blob, applies_to),
-        Ok(None) => {
-            grant.error = format!("no secret named {name} in realm {realm} (or root)");
-            return grant;
-        }
+        Ok(None) => return refused(grant, worker_name, session_id, format!("no secret named {name} in realm {realm} (or root)")),
         Err(e) => {
             warn!("loading secret: {e:#}");
-            grant.error = "internal error".into();
-            return grant;
+            return refused(grant, worker_name, session_id, "internal error");
         }
     };
     let worker_scopes: Vec<&String> = applies_to.iter().filter(|l| l.starts_with("worker:")).collect();
     if !worker_scopes.is_empty() && !worker_scopes.iter().any(|l| l.as_str() == format!("worker:{worker_name}")) {
-        grant.error = format!("secret {name} is not for this worker");
-        return grant;
+        return refused(grant, worker_name, session_id, format!("secret {name} is not for this worker"));
     }
+    let mut grant = grant;
     match st.secrets.decrypt(&blob) {
         Ok(v) => {
+            info!(worker = %worker_name, session = %session_id, secret = %name, "secret given");
             grant.kind = "secret".into();
             grant.bearer = v;
             // Short-lived on the worker, so changes reach running sessions.
@@ -1425,13 +1444,106 @@ async fn secret_credential(
     grant
 }
 
+/// A refused credential, logged with who asked for what.
+fn refused(mut grant: CredentialGrant, worker_name: &str, session_id: &str, why: impl Into<String>) -> CredentialGrant {
+    grant.error = why.into();
+    warn!(worker = %worker_name, session = %session_id, connection = %grant.connection_id, "credentials refused: {}", grant.error);
+    grant
+}
+
+/// One of a worker's sessions that can still run. Err: why not.
+async fn live_session(st: &HeadState, worker_id: WorkerId, session_id: &str) -> Result<SessionRow, String> {
+    match st.store.session(session_id).await {
+        Ok(Some(s)) if s.worker_id == worker_id.to_string() && s.status != "failed" => Ok(s),
+        Ok(_) => Err("no such session on this worker".into()),
+        Err(e) => {
+            warn!("loading session: {e:#}");
+            Err("internal error".into())
+        }
+    }
+}
+
+/// The connections a session's tree uses: each session's (its subagents
+/// run on its connection), and those of model switches not yet reported
+/// (the worker asks for the new connection before the head sees the switch).
+async fn connections_used(st: &HeadState, root: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut used: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT connection_id FROM sessions WHERE id = ?1 OR root_id = ?1")
+            .bind(root)
+            .fetch_all(&st.store.pool)
+            .await?
+            .into_iter()
+            .collect();
+    let pending: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT data FROM commands WHERE state = 'pending' AND session_id IN (SELECT id FROM sessions WHERE id = ?1 OR root_id = ?1)",
+    )
+    .bind(root)
+    .fetch_all(&st.store.pool)
+    .await?;
+    for data in pending {
+        if let Ok(SessionCommand { kind: Some(session_command::Kind::Input(UserInput { model: Some(m), .. })), .. }) =
+            SessionCommand::decode(data.as_slice())
+        {
+            used.insert(m.connection_id);
+        }
+    }
+    Ok(used)
+}
+
+/// Whether a worker's session may use a connection: the session is live
+/// and on that worker, its tree uses the connection or its subagents may
+/// run on it (they pick theirs on the worker: `subagent_connections`), and
+/// the connection is available to its realm. Err: why not.
+async fn may_use(st: &HeadState, worker_id: WorkerId, session_id: &str, conn: &crate::store::ConnectionRow) -> Result<(), String> {
+    let s = live_session(st, worker_id, session_id).await?;
+    let used = connections_used(st, s.root_id.as_deref().unwrap_or(&s.id)).await.map_err(|e| {
+        warn!("connections of session {session_id}: {e:#}");
+        "internal error".to_owned()
+    })?;
+    if !used.contains(&conn.id) && subagent_connections(std::slice::from_ref(conn), &s.realm).is_empty() {
+        return Err(format!("session {session_id} does not use the connection {}, and its subagents may not run on it", conn.name));
+    }
+    if !crate::realms::available(&conn.realms, &s.realm) {
+        return Err(format!("the connection {} is not available to realm {}", conn.name, s.realm));
+    }
+    Ok(())
+}
+
+/// For a worker that doesn't say which session asks (older than the head):
+/// one of its sessions that may use the connection. Deprecated, and only
+/// for a worker that serves every realm: one kept to some (an agent VM) is
+/// as new as this and says.
+async fn some_session_may_use(st: &HeadState, worker_id: WorkerId, conn: &crate::store::ConnectionRow) -> Result<String, String> {
+    let realms = st.store.worker(worker_id).await.map_err(|e| format!("{e:#}"))?.map(|w| w.realms).unwrap_or_default();
+    if !serde_json::from_str::<Vec<String>>(&realms).unwrap_or_default().is_empty() {
+        return Err("a worker kept to some realms says which session asks: update it".into());
+    }
+    let roots: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT COALESCE(root_id, id) FROM sessions WHERE worker_id = ?1 AND status != 'failed' \
+         AND (connection_id = ?2 OR id IN (SELECT session_id FROM commands WHERE worker_id = ?1 AND state = 'pending'))",
+    )
+    .bind(worker_id.to_string())
+    .bind(&conn.id)
+    .fetch_all(&st.store.pool)
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    for root in roots {
+        if may_use(st, worker_id, &root, conn).await.is_ok() {
+            return Ok(root);
+        }
+    }
+    Err(format!("no session on this worker may use the connection {}", conn.name))
+}
+
 pub async fn credential(st: &HeadState, worker_id: WorkerId, req: CredentialRequest) -> CredentialGrant {
     let worker_name = st.store.worker(worker_id).await.ok().flatten().map(|w| w.name).unwrap_or_default();
     credential_for(st, Some(worker_id), &worker_name, req).await
 }
 
 /// Credentials for a node (`worker_id`: a fabric node; none: the head's
-/// own knowledge store, docs/knowledge.md).
+/// own knowledge store and assistant, docs/knowledge.md). A worker gets only
+/// a connection some realm it serves may use, and only what the session it
+/// asks for uses or its subagents may run on, as the session's realm allows.
 pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_name: &str, req: CredentialRequest) -> CredentialGrant {
     let mut grant = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id.clone(), ..Default::default() };
     if let Some(name) = req.connection_id.strip_prefix("secret:") {
@@ -1439,27 +1551,37 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
             grant.error = "secrets are for workers' sessions".into();
             return grant;
         };
-        return secret_credential(st, worker_id, worker_name, name, grant).await;
+        return secret_credential(st, worker_id, worker_name, name, &req.session_id, grant).await;
     }
     let conn = match st.store.connection(&req.connection_id).await {
         Ok(Some(c)) => c,
-        Ok(None) => {
-            grant.error = "no such connection".into();
-            return grant;
-        }
+        Ok(None) => return refused(grant, worker_name, &req.session_id, "no such connection"),
         Err(e) => {
             warn!("loading connection: {e:#}");
             grant.error = "internal error".into();
             return grant;
         }
     };
-    // A worker gets a connection only if some realm it serves may use it
-    // (a subagent may pick its connection on the worker).
-    if let Some(worker_id) = worker_id
-        && !worker_may_use(st, worker_id, &conn.realms).await
-    {
-        grant.error = format!("the connection {} is not available to any realm this worker serves", conn.name);
-        return grant;
+    // A pool's calls are spread in the head (pools.rs): it has no credentials.
+    if conn.kind == crate::pools::KIND {
+        return refused(grant, worker_name, &req.session_id, format!("{} is a pool, which only what runs in the head uses", conn.name));
+    }
+    if let Some(w) = worker_id {
+        let asked = if req.session_id.is_empty() {
+            warn!(worker = %worker_name, connection = %conn.id, "this worker doesn't say which session asks for credentials: update it");
+            some_session_may_use(st, w, &conn).await
+        } else {
+            may_use(st, w, &req.session_id, &conn).await.map(|()| req.session_id.clone())
+        };
+        let session = match asked {
+            Ok(session) => session,
+            Err(why) => return refused(grant, worker_name, &req.session_id, why),
+        };
+        if !worker_may_use(st, w, &conn.realms).await {
+            let why = format!("the connection {} is not available to any realm this worker serves", conn.name);
+            return refused(grant, worker_name, &req.session_id, why);
+        }
+        info!(worker = %worker_name, %session, connection = %conn.id, "credentials given");
     }
     grant.kind = conn.kind.clone();
     grant.base_url = conn.base_url.clone();

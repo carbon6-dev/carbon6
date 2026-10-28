@@ -19,6 +19,9 @@ pub struct Account {
     pub app: String,
     #[serde(default)]
     pub feeds: Vec<String>,
+    /// Where its conversations open on the service's web (its app's).
+    #[serde(default)]
+    pub links: Option<c6_api::AppLinks>,
 }
 
 /// Where the memex's own Google sync was (before mail, calendar and

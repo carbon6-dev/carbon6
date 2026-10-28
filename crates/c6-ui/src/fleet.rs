@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::when::ago;
 
 fn now_ms() -> i64 {
     js_sys::Date::now() as i64
@@ -250,16 +251,6 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
                 </button>
             </td>
         </tr>
-    }
-}
-
-fn ago(ms: i64) -> String {
-    let s = (ms / 1000).max(0);
-    match s {
-        0..=59 => format!("{s}s ago"),
-        60..=3599 => format!("{}m ago", s / 60),
-        3600..=86_399 => format!("{}h ago", s / 3600),
-        _ => format!("{}d ago", s / 86_400),
     }
 }
 

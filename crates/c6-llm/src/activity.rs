@@ -29,6 +29,8 @@ pub struct Origin {
     /// The connection's id.
     pub connection: String,
     pub realm: String,
+    /// The pool it went through, if any (`connection` is its member).
+    pub via: String,
 }
 
 /// A model call, ongoing or recent.
@@ -38,6 +40,8 @@ pub struct Call {
     pub what: String,
     pub about: String,
     pub connection: String,
+    /// The pool it went through (its id), if any.
+    pub via: String,
     pub realm: String,
     pub model: String,
     pub effort: String,
@@ -112,6 +116,7 @@ fn start(origin: &Origin, req: &ModelRequest) -> u64 {
         what: origin.what.clone(),
         about: origin.about.clone(),
         connection: origin.connection.clone(),
+        via: origin.via.clone(),
         realm: origin.realm.clone(),
         model: req.model.clone(),
         effort: req.effort.clone().unwrap_or_default(),

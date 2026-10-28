@@ -181,7 +181,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
     - Elsewhere: add `http://<head>:7700/ca.pem` to the system's trusted certificates (Linux: `/usr/local/share/ca-certificates` + `update-ca-certificates`).
     - The CA is name-constrained to the head's names and private IP ranges, so it cannot vouch for any other site.
   - Or set `ui_tls_cert`/`ui_tls_key` to PEM files. With HTTPS on, plain HTTP on the UI port redirects to the HTTPS name. With a wildcard certificate (`*.example.com`), that name is the first of `extra_names` it covers.
-  - Behind a proxy that passes TLS through on 443 (Traefik's TCP passthrough, nginx `stream`) or a port forward, set `ui_public_url` to the address you reach the head by: `https://head.example.com`, or with a port. Login links, the redirect to HTTPS and the addresses the head lists use it, and the head answers to it. For passkeys the head must still terminate TLS itself (`ui_tls_cert`/`ui_tls_key` or `ui_tls_head_ca`), so a proxy that terminates TLS won't do.
+  - Behind a proxy that passes TLS through on 443 (Traefik's TCP passthrough, nginx `stream`) or a port forward, set `ui_public_url` to the address you reach the head by: `https://head.example.com`, or with a port. Login links, the redirect to HTTPS, the addresses the head lists and the address Google, Slack and apps' sign-ins send you back to (unless Settings → Notifications sets one) use it, and the head answers to it. For passkeys the head must still terminate TLS itself (`ui_tls_cert`/`ui_tls_key` or `ui_tls_head_ca`), so a proxy that terminates TLS won't do.
   - Sign-in is on by default; `auth = false` turns it off.
   - Set `otlp_endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
   - MCP servers, slash commands, agents, skills and hooks are configured in the UI (Settings) and stored on the head. Settings is grouped (General, Models, Agents and tools, Automation, Memory and memex, System), with one page per setting.
@@ -310,7 +310,7 @@ carbon6 is a client for your Gmail and Google Workspace accounts (☰ → **Mail
   The head keeps the sign-in encrypted; the apps' syncs get short-lived access tokens only. A head that synced Google itself before moves your accounts, client and everything synced into the apps when it starts, so nothing is fetched again.
 - **Mail:**
   - **Import:** your whole mailbox is imported, newest first and resumable, then kept in sync every two minutes. Labels, read state, archive and drafts sync both ways.
-  - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
+  - **Views:** Inbox, **Needs reply** (someone else wrote last, to you directly, not a list, in the last two weeks; with a model, what it sorted for the Brief as needing you or a real first contact; with none, nothing from an automated sender), **Waiting** (you wrote last, over two days ago), Starred, Sent, Drafts, Archive, Spam, Trash, and your labels.
   - **Reading:** conversations, with HTML sandboxed and remote images off until you allow them.
   - **Writing:** Markdown compose, reply and reply all, attachments, drafts, **send later**, and **undo** (messages wait 10 seconds).
   - **In the graph:** every message is in the memex. Senders and recipients become people (one person across all their addresses), and company domains become organizations.
@@ -415,6 +415,18 @@ Routing rules (**Settings → Model routing**) choose the connection and model f
 - **Order:** the first enabled rule that matches wins. A session started on a given connection only takes rules for that connection (or for any).
 - **No match:** the connection of your latest session (if you didn't pick one), its default model, else the model of your latest session on it.
 - **Presets:** Opus with Haiku subagents everywhere, remote hosts on a fast model at low effort, research at high effort, a template on a local model.
+
+### Pools
+
+A pool is a connection made of other connections, each taking some calls at once. What runs in the head (the memex, the assistant, suggestions) spreads its calls over a pool's members, for example Ollama on your laptop and on your server.
+
+- **Picking:** each call goes to the least busy member with a free slot. With every slot taken, it waits its turn in the head.
+- **Failing over:** a member that fails (unreachable, 429, 5xx) rests, with backoff, and the call goes to another member. Members without the model, or not for the caller's realm, are passed over.
+- **Setting one up:** add each server as a connection, then a connection of kind **Pool** with its members and their calls at once, and choose the pool in **Settings → Memex**. Set the memex's **calls at once** to about the total of the members' slots.
+- **Sessions** don't use pools: their workers dial their own connection.
+- **Seeing it:** **Activity** shows which member took each call.
+
+Details: [docs/pools.md](docs/pools.md).
 
 ### Templates and fleet runs
 

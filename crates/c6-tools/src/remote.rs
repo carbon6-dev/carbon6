@@ -266,6 +266,7 @@ exec sh -c "$*"
         let remote = tempfile::tempdir().unwrap();
         let r = remote.path().canonicalize().unwrap();
         let ssh = fake_ssh(bin.path());
+        c6_testkit::runnable(&ssh, &[]).await;
         // Its home, for the fake ssh (in its environment, not this process's).
         let ssh = {
             let w = bin.path().join("ssh-home");
@@ -274,6 +275,7 @@ exec sh -c "$*"
             std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o755)).unwrap();
             w
         };
+        c6_testkit::runnable(&ssh, &[]).await;
         let host = Arc::new(SshHost::new("me@box", &r.display().to_string()).with_program(&ssh));
         let (home, cwd, system) = host.probe("~").await.unwrap();
         assert_eq!((home.as_str(), cwd.as_str()), (r.to_str().unwrap(), r.to_str().unwrap()), "{system}");

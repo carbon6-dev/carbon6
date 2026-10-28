@@ -24,7 +24,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/workers/{id}", delete(delete_worker))
         .route("/api/v1/connections", get(list_connections).post(create_connection))
         .route("/api/v1/connections/test", post(test_connection))
-        .route("/api/v1/connections/{id}", delete(delete_connection))
+        .route("/api/v1/connections/{id}", delete(delete_connection).patch(update_connection))
         .route("/api/v1/connections/{id}/models", get(connection_models))
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
@@ -385,6 +385,7 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
 
 fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
     api::Connection {
+        members: crate::pools::members(&c),
         supports_effort: c6_llm::supports_effort(&c.kind, &c.base_url),
         id: c.id,
         name: c.name,
@@ -408,13 +409,16 @@ async fn list_connections(State(st): State<Arc<HeadState>>, Extension(caller): E
 
 async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateConnection>) -> ApiResult<Json<api::Connection>> {
     let kind = req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()).unwrap_or("openai_compat");
+    if kind == crate::pools::KIND {
+        return Ok(Json(create_pool(&st, &req).await?));
+    }
     let default_url = match kind {
         "openai_compat" => None,
         "claude_code" => Some("local"),
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com"),
         "chatgpt" => return Err(ApiErr(StatusCode::BAD_REQUEST, "ChatGPT connections are created with Sign in with ChatGPT".into())),
-        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai, anthropic or claude_code".into())),
+        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai, anthropic, claude_code or pool".into())),
     };
     let name = req.name.trim();
     let base_url = Some(req.base_url.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).or(default_url).unwrap_or("");
@@ -438,8 +442,59 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         default_model: req.default_model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
         created_at: now_ms(),
         realms: "[]".into(),
+        members: "[]".into(),
     };
     st.store.insert_connection(&row).await?;
+    Ok(Json(connection_view(row)))
+}
+
+/// A pool (docs/pools.md): other connections, each with its calls at once.
+async fn create_pool(st: &HeadState, req: &api::CreateConnection) -> anyhow::Result<api::Connection> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(crate::bad_request("name is required"));
+    }
+    let id = uuid::Uuid::now_v7().to_string();
+    let members = crate::pools::check_members(st, &id, &req.members).await?;
+    let row = crate::store::ConnectionRow {
+        id,
+        name: name.to_owned(),
+        kind: crate::pools::KIND.into(),
+        base_url: String::new(),
+        api_key: None,
+        default_model: req.default_model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned),
+        created_at: now_ms(),
+        realms: "[]".into(),
+        members: serde_json::to_string(&members)?,
+    };
+    st.store.insert_connection(&row).await?;
+    Ok(connection_view(row))
+}
+
+/// Renames a connection, or sets a pool's members.
+async fn update_connection(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(req): Json<api::UpdateConnection>,
+) -> ApiResult<Json<api::Connection>> {
+    let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
+    let name = req.name.as_deref().map(str::trim).unwrap_or(&c.name).to_owned();
+    if name.is_empty() {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "name is required".into()));
+    }
+    let members = match &req.members {
+        Some(_) if c.kind != crate::pools::KIND => {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{} is not a pool: only pools have members", c.name)));
+        }
+        Some(m) => {
+            let members = crate::pools::check_members(&st, &c.id, m).await?;
+            crate::memex::check_pool_use(&st, &c.id, &members).await?;
+            serde_json::to_string(&members).map_err(anyhow::Error::from)?
+        }
+        None => c.members.clone(),
+    };
+    st.store.update_connection(&id, &name, &members).await?;
+    let row = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
     Ok(Json(connection_view(row)))
 }
 
@@ -516,6 +571,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         default_model: None,
         created_at: now_ms(),
         realms: "[]".into(),
+        members: "[]".into(),
     };
     st.store.insert_connection(&row).await?;
     Ok(connection_view(row))
@@ -565,11 +621,19 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
 /// all model calls for sessions happen on workers.
 async fn connection_models(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<String>>> {
     let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
+    if c.kind == crate::pools::KIND {
+        return Ok(Json(crate::pools::models(&st, &c).await?));
+    }
+    connection_models_of(&st, &c).await.map(Json)
+}
+
+/// A (non-pool) connection's models, from its provider.
+pub(crate) async fn connection_models_of(st: &HeadState, c: &crate::store::ConnectionRow) -> ApiResult<Vec<String>> {
     let key = match c.kind.as_str() {
-        "chatgpt" => crate::sessions::chatgpt_tokens(&st, &c.id).await?.access_token,
+        "chatgpt" => crate::sessions::chatgpt_tokens(st, &c.id).await?.access_token,
         _ => c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default(),
     };
-    list_models(&c.kind, &c.base_url, &key).await.map(Json)
+    list_models(&c.kind, &c.base_url, &key).await
 }
 
 /// Lists a provider's models; this doubles as the connection check, since it
@@ -1681,16 +1745,16 @@ async fn get_google_client(
 ) -> ApiResult<Json<api::GoogleClient>> {
     let realm = realm_for(&st, &caller, &r).await?;
     let mut c = crate::google::get_client(&st, &realm).await?;
-    c.redirect_uri =
-        crate::google::redirect_uri(&st, headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).or(origin_of(&headers).as_deref()))
-            .await;
+    c.redirect_uri = crate::google::redirect_uri(&st, page_origin(&st, &headers).as_deref()).await;
     Ok(Json(c))
 }
 
-/// The page's origin, from Host (GET requests carry no Origin).
-fn origin_of(headers: &HeaderMap) -> Option<String> {
+/// The page's origin, from Host (GET requests carry no Origin): HTTPS when
+/// a proxy says so, or when the head serves its UI over HTTPS itself.
+fn origin_of(st: &HeadState, headers: &HeaderMap) -> Option<String> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
-    let proto = headers.get("x-forwarded-proto").and_then(|p| p.to_str().ok()).unwrap_or("http");
+    let tls = st.ui_urls.get().and_then(|u| u.first()).is_some_and(|u| u.starts_with("https://"));
+    let proto = headers.get("x-forwarded-proto").and_then(|p| p.to_str().ok()).unwrap_or(if tls { "https" } else { "http" });
     Some(format!("{proto}://{host}"))
 }
 
@@ -1720,13 +1784,17 @@ async fn google_connect(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let realm = realm_for(&st, &caller, &r).await?;
-    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
-    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, origin.as_deref()).await?})))
+    Ok(Json(serde_json::json!({"authorize_url": crate::google::connect(&st, &realm, page_origin(&st, &headers).as_deref()).await?})))
 }
 
-/// A page's origin: what it says, else from Host.
-fn page_origin(headers: &HeaderMap) -> Option<String> {
-    headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(headers))
+/// Where a page is, for the address providers send you back to: the
+/// head's public address (`ui_public_url`, a proxy's) when set, else what
+/// the page says, else from Host.
+fn page_origin(st: &HeadState, headers: &HeaderMap) -> Option<String> {
+    st.public_ui
+        .clone()
+        .or_else(|| headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned))
+        .or_else(|| origin_of(st, headers))
 }
 
 /// Slack (docs/slack.md): a realm's setup, client, app, workspaces.
@@ -1737,7 +1805,7 @@ async fn slack_setup(
     headers: HeaderMap,
 ) -> ApiResult<Json<api::SlackSetup>> {
     let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(crate::slack::setup(&st, &realm, page_origin(&headers).as_deref()).await?))
+    Ok(Json(crate::slack::setup(&st, &realm, page_origin(&st, &headers).as_deref()).await?))
 }
 
 async fn slack_client(
@@ -1767,7 +1835,7 @@ async fn slack_connect(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let realm = realm_for(&st, &caller, &r).await?;
-    Ok(Json(serde_json::json!({"authorize_url": crate::slack::connect(&st, &realm, page_origin(&headers).as_deref()).await?})))
+    Ok(Json(serde_json::json!({"authorize_url": crate::slack::connect(&st, &realm, page_origin(&st, &headers).as_deref()).await?})))
 }
 
 async fn slack_sync(
@@ -1967,35 +2035,7 @@ async fn memex_rpc(
     if !ok {
         return Err(crate::bad_request(format!("{} is not callable here", r.method)).into());
     }
-    // Ingest from outside is a batch of typed items, with labels checked as
-    // uploads are; the head's own generic items are not sent through here.
-    if r.method == "memex.ingest" {
-        let batch: api::MemexIngest = serde_json::from_value(r.params.clone())
-            .map_err(|e| crate::bad_request(format!("memex.ingest takes {{\"items\": [...]}}: {e}")))?;
-        for item in &batch.items {
-            crate::sessions::check_labels(&item.labels)?;
-        }
-    }
-    // The mail client's accounts and syncs are the Google apps'.
-    match r.method.as_str() {
-        "memex.google" => return Ok(Json(crate::google::status(&st, &realm).await?)),
-        "memex.google_sync" => {
-            crate::google::sync_now(&st, &realm).await?;
-            return Ok(Json(serde_json::json!({})));
-        }
-        _ => {}
-    }
-    let mut params = if r.params.is_object() { r.params } else { serde_json::json!({}) };
-    params["made_by"] = serde_json::json!("you");
-    // Only the head writes as an app (its kits' output).
-    if let Some(o) = params.as_object_mut() {
-        o.remove("as");
-    }
-    // The graph shows what the realm's reader policies believe (docs/apps.md §9.3).
-    if r.method == "memex.graph" {
-        params["policies"] = serde_json::json!(crate::claims::policies(&st, &realm).await);
-    }
-    Ok(Json(crate::memex::call_in(&st, &realm, &r.method, params).await?))
+    Ok(Json(crate::memex::call_as(&st, &realm, &r.method, r.params, "you").await?))
 }
 
 #[derive(serde::Deserialize)]
@@ -3262,8 +3302,9 @@ async fn connect_account(
     if caller.realm.is_some() {
         return Err(crate::forbidden("connecting accounts is yours").into());
     }
-    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned).or_else(|| origin_of(&headers));
-    Ok(Json(serde_json::json!({"authorize_url": crate::providers::connect(&st, &realm, &instance, &provider, origin.as_deref()).await?})))
+    Ok(Json(
+        serde_json::json!({"authorize_url": crate::providers::connect(&st, &realm, &instance, &provider, page_origin(&st, &headers).as_deref()).await?}),
+    ))
 }
 
 async fn remove_account(

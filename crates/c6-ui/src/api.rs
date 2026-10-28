@@ -440,6 +440,11 @@ pub async fn complete_chatgpt(callback_url: String) -> Result<Connection, String
     send_json(Request::post("/api/v1/connections/chatgpt/complete"), &c6_api::CompleteChatGptSignIn { callback_url }).await
 }
 
+/// Renames a connection, or sets a pool's members.
+pub async fn update_connection(id: String, req: c6_api::UpdateConnection) -> Result<Connection, String> {
+    send_json(Request::patch(&format!("/api/v1/connections/{id}")), &req).await
+}
+
 pub async fn delete_connection(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/connections/{id}")).send().await).await
 }
@@ -501,11 +506,16 @@ pub async fn interrupt(id: String) -> Result<(), String> {
 }
 
 pub async fn archive(id: String) -> Result<(), String> {
+    set_archived(id, true).await
+}
+
+/// Archives a session, or brings it back.
+pub async fn set_archived(id: String, archived: bool) -> Result<(), String> {
     #[derive(Serialize)]
     struct Body {
         archived: bool,
     }
-    empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { archived: true }).map_err(|e| e.to_string())?.send().await).await
+    empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { archived }).map_err(|e| e.to_string())?.send().await).await
 }
 
 pub async fn dismiss_rejected(id: String) -> Result<(), String> {

@@ -296,13 +296,48 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
     }
 }
 
+/// A session's "⋯" in a list (its row, a card, the dock): archive it
+/// without opening it, with Undo rather than a question; and what the list
+/// adds (`dismiss`).
+#[component]
+pub(crate) fn SessionMenu(id: String, #[prop(optional)] dismiss: Option<Callback<()>>) -> impl IntoView {
+    let notice = crate::util::Notice::get();
+    let id = StoredValue::new(id);
+    let archive = Callback::new(move |()| {
+        spawn_local(async move {
+            let sid = id.get_value();
+            match api::set_archived(sid.clone(), true).await {
+                Ok(()) => notice.show(
+                    "Archived",
+                    Some(Callback::new(move |()| {
+                        let sid = sid.clone();
+                        spawn_local(async move {
+                            if let Err(e) = api::set_archived(sid, false).await {
+                                notice.show(format!("Couldn't bring it back: {e}"), None);
+                            }
+                        });
+                    })),
+                ),
+                Err(e) => notice.show(format!("Couldn't archive it: {e}"), None),
+            }
+        });
+    });
+    let mut items = Vec::new();
+    if let Some(d) = dismiss {
+        items.push(("Dismiss", d));
+    }
+    items.push(("Archive", archive));
+    view! { <crate::util::Menu items row=true label="Session actions" /> }
+}
+
 #[component]
 fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let live = api::live();
     let worker = live.worker_name(&s.worker_id.to_string());
     let updated = s.updated_at;
     view! {
-        <Go to=View::session(s.id.clone()) class="flex items-center gap-3 px-4 py-3 hover:bg-zinc-100 dark:hover:bg-zinc-900" title="Open beside this list (⌘-click: new tile)">
+        <div class="group flex items-center gap-1 pr-2 hover:bg-zinc-100 dark:hover:bg-zinc-900">
+        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-3 pl-4" title="Open beside this list (⌘-click: new tile)">
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="truncate text-xs text-zinc-500">
@@ -322,6 +357,8 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
             <StatusPill status=s.status />
             <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
         </Go>
+        <SessionMenu id=s.id.clone() />
+        </div>
     }
 }
 

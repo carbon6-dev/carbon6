@@ -132,7 +132,7 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 |---|---|
 | understand.rs loop, budget, prompts | triage, requests, drafts run in it |
 | commitments table | "you owe" and "waiting on" (now from chat too, with due dates) |
-| needs_reply / waiting views (rules) | replaced by triage's categories |
+| needs_reply / waiting views (rules) | needs_reply follows triage's category (needs you, a first contact, its request open), over the same 14 days triage sorts. With an understanding model, only what's sorted so (what isn't yet waits for its sorting); with none, the rules for what isn't sorted (and no automated senders) |
 | Inbox page's "Needs reply" | shows the brief's top requests instead |
 | mail and chat operations (send, post, undo) | sending a draft |
 | notifier | urgent requests, briefs |
@@ -153,6 +153,10 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 
 - **What's sorted:** mail threads in the inbox, and chat conversations that may be yours (DMs and group DMs, threads you're in, messages mentioning you), with a message in the last 14 days. Each is sorted again when it has news. A conversation is `thread:<account>:<thread>` or `chat:<workspace>:<channel>[:<thread ts>]`, kept in the realm memex's `triage` table (migration 0012).
 - **In the memex's reading loop,** before understanding, newest first, sharing its model and daily budget. What rules settle is sorted even with no model or no budget left. The rest waits.
+- **A model that fails for now** (unreachable, timed out, 429 or 5xx, or a pool with no member free: docs/pools.md) sorts nothing. The conversation waits, the call goes back to the day's budget, and the connection rests (10 seconds, twice as long after each failure in a row, up to 5 minutes) before anything calls it again. Drafts, cards, the same-request check, reading, pages and vision wait the same way. Other failures (another 4xx, an answer with no JSON) are kept as the answer, until the conversation has news.
+- **Time limits:** each model call gets 10 minutes in all (connecting, waiting for the first token and the whole answer) and may pause at most 2 minutes between streamed events. Slow servers fit: a CPU server loading a model takes about 80 s to its first token, a long reading call on one about 60 s, and qwen3.6:35b on a laptop 2 to 6 minutes. A call past either failed for now and waits as above, so a server that stalls mid-answer holds no lane. The Activity page shows it failed, with why.
+- **A new model at once:** changing a model in Settings → Memex stops the calls still running on the old one. Their work goes to the new one without waiting, and nothing rests.
+- **Room to think:** unless a task's effort is none, a model may think before it answers, and its thinking counts toward the output limit. Each answer's limit gets 8,192 more tokens for it (qwen3.6:35b thought 700 to 3,900 tokens on these prompts).
 - **Rules, no model:**
   - you wrote last: `yours`;
   - a list or bulk sender: `newsletter`, or `notification` for automated addresses;
@@ -163,6 +167,9 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 - **Settings:** the prompts are `memex.triage`, `memex.triage.pitch` and `memex.triage.signals` (the marks and `phrase:` follow-ups, one per line). They're editable per realm: the memex now reads each realm's own `memex.*` prompts, where before it read home's for all.
 - **Your marks and corrections:** "Cold pitch" and "Not a pitch" mark the sender (by address, or `domain: true` for the whole domain) in the realm's memex. They're listed and removable in Settings → Mail & calendar. "Sort as…" with a note becomes one of the model's examples (the last 20).
 - **In Mail:** the views Needs you, First contact and Cold pitches; each thread's label with its reason; the sorting bar on an open thread.
+  - Needs you and First contact are what waits on you in the Brief: threads in the inbox whose request is open (not done, dropped, or snoozed until later; a snoozed one comes back when its time comes). Needs reply leaves out a sorted thread whose request isn't open, too.
+  - A thread with an open request offers the Brief's actions in its sorting bar: Done, Tomorrow and Drop (the same `memex.requests.set` calls), and the way to the Brief.
+- **API:** a conversation's `Triage.request` (from `memex.triage.get` and `MailThread.triage`) is its open request's id.
 - **API:** `memex.triage.list`, `get`, `counts`, `set`, `mark`, `marks` and `unmark`; `MailThread.triage`.
 - **Not yet:** the pitch filter for Slack Connect strangers (chat counts everyone as known); the brief page and its keys (step 3).
 

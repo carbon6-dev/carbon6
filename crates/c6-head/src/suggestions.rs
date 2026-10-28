@@ -5,7 +5,7 @@
 use c6_api as api;
 use c6_core::now_ms;
 use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
-use c6_proto::{CredentialRequest, TurnEndReason, content_block, session_event};
+use c6_proto::{TurnEndReason, content_block, session_event};
 use futures::StreamExt;
 use sqlx::Row;
 use tracing::warn;
@@ -199,18 +199,14 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         &[("title", &row.title), ("labels", &labels), ("exchanges", &exchanges(st, &row.id, for_seq as u64).await?)],
     );
     let (connection, model) = model_for(st, row).await?;
-    let grant =
-        crate::sessions::credential_for(st, None, "head", CredentialRequest { connection_id: connection.clone(), ..Default::default() })
-            .await;
-    anyhow::ensure!(grant.error.is_empty(), "{}", grant.error);
-    let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
     let origin = c6_llm::activity::Origin {
         what: "suggestion".into(),
         about: row.title.clone(),
         connection: connection.clone(),
         realm: row.realm.clone(),
+        via: String::new(),
     };
-    let client = c6_llm::activity::track(client, origin);
+    let client = crate::pools::client(st, &connection, &row.realm, origin).await?;
     let req = ModelRequest {
         model: model.clone(),
         system: String::new(),

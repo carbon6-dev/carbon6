@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
+use crate::when::full as day;
 use crate::workspace::{Go, View};
 
 fn month(ms: i64) -> String {
@@ -14,11 +15,6 @@ fn month(ms: i64) -> String {
     let _ = js_sys::Reflect::set(&opts, &"month".into(), &"long".into());
     let _ = js_sys::Reflect::set(&opts, &"year".into(), &"numeric".into());
     String::from(d.to_locale_date_string("default", &opts))
-}
-
-fn day(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    String::from(d.to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED))
 }
 
 #[component]

@@ -2,7 +2,7 @@
 //! conditions (docs/testing.md).
 
 pub mod wait;
-pub use wait::{eventually, have, need, port, within};
+pub use wait::{eventually, have, need, port, runnable, within};
 
 /// Raise this test process's soft open-file limit, if possible, before its
 /// parallel tests start. This is only for test harness startup hooks.
@@ -44,6 +44,9 @@ pub enum Reply {
     /// (name, arguments JSON) per call.
     ToolCalls(Vec<(String, String)>),
     Status(u16),
+    /// A status the client may retry at once (`retry-after: 0`), so its
+    /// retries take no time.
+    Retry(u16),
     /// Half of the text, then the provider's error in the stream (a
     /// response that breaks off).
     Broken(String),
@@ -67,6 +70,7 @@ struct Inner {
 pub struct MockLlm {
     pub addr: SocketAddr,
     inner: Arc<Inner>,
+    server: Arc<tokio::task::AbortHandle>,
 }
 
 impl MockLlm {
@@ -80,8 +84,14 @@ impl MockLlm {
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Self { addr, inner }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }).abort_handle();
+        Self { addr, inner, server: Arc::new(server) }
+    }
+
+    /// Stops listening, as a server that went away: new connections are
+    /// refused.
+    pub fn stop(&self) {
+        self.server.abort();
     }
 
     pub fn base_url(&self) -> String {
@@ -163,6 +173,7 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
     };
     let chunks = match step.reply {
         Reply::Status(code) => return axum::http::StatusCode::from_u16(code).unwrap().into_response(),
+        Reply::Retry(code) => return (axum::http::StatusCode::from_u16(code).unwrap(), [("retry-after", "0")]).into_response(),
         Reply::Text(text) => {
             let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);
             vec![delta(json!({"role": "assistant", "content": &text[..mid]})), delta(json!({"content": &text[mid..]})), finish("stop")]

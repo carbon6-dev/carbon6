@@ -36,6 +36,7 @@ pub mod oauth;
 pub mod operations;
 pub mod packages;
 pub mod pki;
+pub mod pools;
 pub mod prompts;
 pub mod providers;
 pub mod push;
@@ -128,6 +129,9 @@ pub struct HeadState {
     pub worker_url: String,
     /// Where the web UI and API are reached (set once listening).
     pub ui_urls: std::sync::OnceLock<Vec<String>>,
+    /// `ui_public_url`, when a proxy is in front of the head: where
+    /// providers send you back to after signing in.
+    pub public_ui: Option<String>,
     /// Notifications to your channels.
     pub notifier: notify::Notifier,
     /// Workflow runs to drive.
@@ -143,6 +147,17 @@ pub struct HeadState {
     pub memex: std::sync::OnceLock<Arc<c6_memex::Memex>>,
     /// Updating carbon6 from GitHub releases (docs/updates.md).
     pub updates: updates::Updater,
+    /// Pools of connections (docs/pools.md).
+    pub pools: pools::Pools,
+    /// Itself, for what must outlive a borrow (set once it is made).
+    me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
+}
+
+impl HeadState {
+    /// The head, shared (none while it is being made or once it stopped).
+    pub fn arc(&self) -> Option<Arc<HeadState>> {
+        self.me.get()?.upgrade()
+    }
 }
 
 /// A running head.
@@ -234,6 +249,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         ui_port: ui_addrs[0].port(),
         worker_url,
         ui_urls: Default::default(),
+        public_ui: public_ui.as_ref().map(|p| p.url.clone()),
         notifier: Default::default(),
         workflows: Default::default(),
         memex_feed: Default::default(),
@@ -242,7 +258,10 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         data_dir: cfg.data_dir.clone(),
         memex: Default::default(),
         updates: updater,
+        pools: Default::default(),
+        me: Default::default(),
     });
+    let _ = state.me.set(Arc::downgrade(&state));
     updates::after_open(&state).await;
 
     let mut tasks = JoinSet::new();
