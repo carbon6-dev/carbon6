@@ -592,16 +592,20 @@ Hooks are shell commands that run on the worker at set points in every session. 
 
 ### Workspace
 
-The UI is a workspace of up to four **tiles** side by side: framed cards, each with its own bar (‹ › back and forward, its name, ⧉, ✕).
+The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ › back and forward, its name, ⧉, ✕). Up to four sit side by side; more stack in those four columns in turn: the fifth halves the first column (the other three stay full height), the sixth the second, and so on, until the ninth makes the first column three high. In a column of three or more, the tile you last used there takes half the height and the others share the rest (it grows when your click finishes, so what you clicked doesn't move away).
 
 - **Inside a tile:** at most two panes, a list and the item opened from it. Clicking anything inside a tile opens it in that tile's right pane, beside the list, replacing what was there. ‹ and › (⌘[ / ⌘]) step through the tile's own history.
-- **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–4 focus a tile. With four open, a new one replaces the least recently used. A session that is already open is shown where it is instead of opening twice.
+- **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–9 focus a tile. A session that is already open is shown where it is instead of opening twice.
+- **A session's tile** wears the session's colour on its bar, with its state (idle, running, starting, failed, needs approval). Each session gets a colour when it starts (the one its realm's recent sessions use least; side chats and subagents take their parent's); click the dot in the bar (or the palette in the rail's card) to change it. `PUT /api/v1/sessions/{id}/colour`.
+- **⋯ in a session tile's bar** opens the session's header as a popover (where it runs, labels, Transcript / Changes / Files / Terminal / Outputs / Config, Details, Find, New like this, Archive), so it is at hand however far down the transcript you are.
 - **The header's navigation** (Sessions, Decisions, Settings…) replaces what the focused tile shows. Back brings it back.
 - **Activity dock** (left, on wide screens), in sections:
   - **Waiting for you** (amber): a tool call waits for your approval;
   - **Running** (blue);
   - **Finished** (green, red when failed): sessions that ended while not on screen, until you open them. ✕ lets one go, **clear** all of them; the latest 20 are kept;
   - **Pinned** (☆ in a session's header).
+
+  Below it, **Sessions**: every session (with the label filter's labels), one narrow row each in its colour, grouped as the session list is (**group ▾**; the grouping is the same setting) with groups you fold remembered. Hovering a row pops out its full title, state, worker, folder, model, labels and colour, with **Open**, **New tile** and **New like this**. Both sections fold.
 
   **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
 - **Session details:** **Details** in a session's header opens a card at its top right with where it runs (worker, folder, branch, worktree, model), how full its context is (with **Compact now**), its usage, and the lines it changed (**Review** opens Changes). It stays open or closed as you leave it.

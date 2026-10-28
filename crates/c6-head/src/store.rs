@@ -466,6 +466,10 @@ pub struct SessionRow {
     pub observed: bool,
     /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
     pub instance: String,
+    /// Its colour (`c6_api::SESSION_COLOURS`); empty when creating one: a
+    /// top-level session gets the one least used among its realm's recent
+    /// sessions.
+    pub colour: String,
 }
 
 impl SessionRow {
@@ -517,12 +521,17 @@ pub struct Ingested {
 }
 
 impl Store {
-    /// Creates a session and enqueues its commands atomically.
-    pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<()> {
+    /// Creates a session and enqueues its commands atomically. Returns its
+    /// colour (picked here when `s` has none).
+    pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<String> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let colour = match (s.colour.is_empty(), &s.parent_id) {
+            (true, None) => least_used_colour(&mut tx, &s.realm).await?,
+            _ => s.colour.clone(),
+        };
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -543,13 +552,14 @@ impl Store {
         .bind(&s.realm)
         .bind(&s.root_id)
         .bind(&s.instance)
+        .bind(&colour)
         .execute(&mut *tx)
         .await?;
         for c in commands {
             insert_command(&mut tx, c).await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(colour)
     }
 
     pub async fn session(&self, id: &str) -> anyhow::Result<Option<SessionRow>> {
@@ -707,6 +717,11 @@ impl Store {
             .await?
             .rows_affected()
             > 0)
+    }
+
+    pub async fn set_session_colour(&self, id: &str, colour: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE sessions SET colour = ? WHERE id = ?").bind(colour).bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
     }
 
     pub async fn set_session_labels(&self, id: &str, labels: &[String]) -> anyhow::Result<bool> {
@@ -1001,7 +1016,7 @@ async fn create_subagent_session(
         return Ok(false);
     }
     let parent = sqlx::query(
-        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, instance, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
+        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, instance, colour, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
     )
     .bind(&s.parent_session_id)
     .bind(worker_id.to_string())
@@ -1011,7 +1026,7 @@ async fn create_subagent_session(
     let now = c6_core::now_ms();
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name, ssh_target, realm, agent, root_id, observed, instance) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target, realm, agent, root_id, observed, instance, colour) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -1035,9 +1050,30 @@ async fn create_subagent_session(
     .bind(s.tool_profile == "claude_code")
     // And acts as the instance its parent acts as.
     .bind(parent.get::<String, _>("instance"))
+    // And has its colour.
+    .bind(parent.get::<String, _>("colour"))
     .execute(&mut *tx)
     .await?;
     Ok(true)
+}
+
+/// The colour a new top-level session in `realm` takes: the one least used
+/// among the realm's most recently active sessions (so the ones you have
+/// open tell apart), the first such in `SESSION_COLOURS`' order.
+async fn least_used_colour(tx: &mut sqlx::SqliteConnection, realm: &str) -> anyhow::Result<String> {
+    let recent: Vec<String> = sqlx::query_scalar(
+        "SELECT colour FROM sessions WHERE archived = 0 AND parent_id IS NULL AND realm = ? ORDER BY updated_at DESC LIMIT ?",
+    )
+    .bind(realm)
+    .bind(c6_api::SESSION_COLOURS.len() as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(pick_colour(&recent).to_owned())
+}
+
+/// The first of `SESSION_COLOURS` used least often in `taken`.
+pub fn pick_colour(taken: &[String]) -> &'static str {
+    c6_api::SESSION_COLOURS.into_iter().min_by_key(|c| taken.iter().filter(|t| t == c).count()).unwrap_or("sky")
 }
 
 // --- Commands -----------------------------------------------------------------

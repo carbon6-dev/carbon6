@@ -963,6 +963,10 @@ pub async fn commands(session: String) -> Result<Vec<c6_api::CommandInfo>, Strin
 }
 
 /// Replaces the labels you attached to a session.
+pub async fn set_colour(id: String, colour: String) -> Result<Session, String> {
+    send_json(Request::put(&format!("/api/v1/sessions/{id}/colour")), &c6_api::SetColour { colour }).await
+}
+
 pub async fn set_labels(id: String, labels: Vec<String>) -> Result<Session, String> {
     send_json(Request::put(&format!("/api/v1/sessions/{id}/labels")), &c6_api::SetLabels { labels }).await
 }
