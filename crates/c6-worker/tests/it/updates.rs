@@ -160,8 +160,17 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     assert_eq!((s["machines"][1]["state"].as_str(), s["machines"][1]["method"].as_str()), (Some("restarting"), Some("tarball")), "{s}");
     drop(worker);
 
-    // The new worker attaches, and says the update is done.
-    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    // The new worker attaches, and says the update is done. It opens the
+    // state once the old one's tasks, seeing it stop, have let go of it (a
+    // real worker restarts its process instead).
+    let worker = eventually("the old worker to let go of its state", async || {
+        match Worker::open(state.path(), Identity::load(state.path()).unwrap()).await {
+            Ok(w) => Some(w),
+            Err(e) if e.to_string().contains("already running") => None,
+            Err(e) => panic!("{e:#}"),
+        }
+    })
+    .await;
     // The new version, as it says.
     *worker.overrides.lock().unwrap() = c6_worker::Overrides { update_as_version: Some(V.into()), ..overrides };
     let (tx, _rx) = watch::channel(ConnState::Connecting);

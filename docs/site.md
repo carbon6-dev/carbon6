@@ -36,7 +36,7 @@ Pages: `/` (home), `/install/`, `/guide/`, `/docs/` and `/docs/<doc>/`, `/change
 |---|---|
 | `make site` | builds the site into `dist/site` |
 | `make site-serve` | builds it and serves it on <http://127.0.0.1:8000> (`SITE_PORT`) |
-| `make site-check` | clippy (no warnings) and the generator's tests |
+| `make site-check` | formatting (`cargo fmt --check`), clippy (no warnings) and the generator's tests |
 | `make site-publish` | builds it and pushes it to the pages repository (`SITE_REPOSITORY`, `SITE_BRANCH`) |
 
 `make site-publish` pushes with your own SSH key, or with `SITE_TOKEN` over HTTPS when it is set. An unchanged site pushes nothing.

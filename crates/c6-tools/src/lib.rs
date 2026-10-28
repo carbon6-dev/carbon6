@@ -34,7 +34,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-pub use agents::{AgentDef, SendMessage, Skill, SkillTool, Subagents, Task};
+pub use agents::{AgentDef, ConnectionInfo, ModelChoice, SendMessage, Skill, SkillTool, Subagents, Task};
 pub use background::{Background, BashOutput, KillShell, TaskEvent, TaskInfo, TaskKind, TaskSink, TaskState};
 pub use bash::Bash;
 pub use files::{Edit, Read, Write};

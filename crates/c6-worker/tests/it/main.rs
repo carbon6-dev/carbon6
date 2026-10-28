@@ -48,6 +48,7 @@ mod secrets;
 mod series;
 mod session;
 mod side_chat;
+mod subagent_models;
 mod subagents;
 mod suggestions;
 mod task_cards;

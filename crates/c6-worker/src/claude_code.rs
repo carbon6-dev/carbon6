@@ -65,6 +65,8 @@ pub async fn run_turn(
     preamble: Option<&str>,
     // Hooks from the head, as Claude Code settings JSON.
     settings: Option<&str>,
+    // carbon6's subagents as an MCP server (`--mcp-config` JSON).
+    mcp_config: Option<&str>,
     sink: &Arc<dyn EventSink>,
     observer: Option<&Observer>,
     cancel: &CancellationToken,
@@ -84,10 +86,10 @@ pub async fn run_turn(
         Some(bin) => {
             // The carbon6 session id doubles as Claude Code's session id.
             let mut reason =
-                run_process(&bin, turn, session_id, cwd, model, effort, settings, &prompt, turn > 1, sink, observer, cancel).await?;
+                run_process(&bin, turn, session_id, cwd, model, effort, settings, mcp_config, &prompt, turn > 1, sink, observer, cancel).await?;
             if let Outcome::NoConversation = reason {
                 // The first turn never created the conversation (e.g. it failed early).
-                reason = run_process(&bin, turn, session_id, cwd, model, effort, settings, &prompt, false, sink, observer, cancel).await?;
+                reason = run_process(&bin, turn, session_id, cwd, model, effort, settings, mcp_config, &prompt, false, sink, observer, cancel).await?;
             }
             match reason {
                 Outcome::Ended(r) => r,
@@ -114,6 +116,7 @@ async fn run_process(
     model: &str,
     effort: Option<&str>,
     settings: Option<&str>,
+    mcp_config: Option<&str>,
     prompt: &str,
     resume: bool,
     sink: &Arc<dyn EventSink>,
@@ -131,6 +134,10 @@ async fn run_process(
     }
     if let Some(s) = settings {
         cmd.args(["--settings", s]);
+    }
+    if let Some(m) = mcp_config {
+        // A subagent may work for a long time: Claude Code waits for it.
+        cmd.args(["--mcp-config", m]).env("MCP_TOOL_TIMEOUT", "86400000");
     }
     // The prompt goes on stdin so it can never be mistaken for a flag.
     cmd.current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).kill_on_drop(true);
@@ -255,6 +262,7 @@ impl Mapper<'_> {
                 agent: agent.clone(),
                 description: description.clone(),
                 background_task_id: String::new(),
+                model: None,
             }))
             .await?;
         let started = SessionStarted {
@@ -503,7 +511,7 @@ case "$*" in *--dangerously-skip-permissions*) ;; *) echo "missing yolo flag" >&
 case "$*" in *"--resume"*) echo "No conversation found with session ID" >&2; exit 1;; esac
 prompt=$(cat)
 pwd > cwd.txt
-while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; shift; done
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--mcp-config" ] && printf '%s %s' "$2" "$MCP_TOOL_TIMEOUT" > mcp.txt; shift; done
 printf '%s' "$prompt" > prompt.txt
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"s","tools":["Bash"],"model":"claude-opus-5-5"}
@@ -540,6 +548,7 @@ EOF
             inputs,
             None,
             Some(r#"{"hooks":{}}"#),
+            Some(r#"{"mcpServers":{}}"#),
             &sink,
             None,
             &CancellationToken::new(),
@@ -548,6 +557,11 @@ EOF
         .unwrap();
         assert_eq!(reason, TurnEndReason::Completed);
         assert_eq!(std::fs::read_to_string(dir.path().join("settings.txt")).unwrap(), r#"{"hooks":{}}"#, "the head's hooks are passed on");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("mcp.txt")).unwrap(),
+            r#"{"mcpServers":{}} 86400000"#,
+            "carbon6's subagents are offered over MCP, with time to finish"
+        );
         assert_eq!(std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap(), "list files");
 
         let events = vec_sink.0.lock().unwrap().clone();
@@ -632,6 +646,7 @@ JSON
             "0199-main",
             dir.path(),
             "opus",
+            None,
             None,
             None,
             "go",

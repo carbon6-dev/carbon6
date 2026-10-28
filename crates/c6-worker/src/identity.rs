@@ -18,6 +18,10 @@ pub struct IdentityMeta {
     pub worker_id: WorkerId,
     pub worker_name: String,
     pub head_url: String,
+    /// The name to check the head's certificate against when `head_url` was
+    /// overridden at enrollment (`c6w enroll --head`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_domain: Option<String>,
 }
 
 #[derive(Clone)]
@@ -64,9 +68,13 @@ impl Identity {
     }
 
     pub fn tls_config(&self) -> ClientTlsConfig {
-        ClientTlsConfig::new()
+        let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(&self.ca_pem))
-            .identity(TlsIdentity::from_pem(&self.cert_pem, &self.key_pem))
+            .identity(TlsIdentity::from_pem(&self.cert_pem, &self.key_pem));
+        match &self.meta.tls_domain {
+            Some(d) => tls.domain_name(d.clone()),
+            None => tls,
+        }
     }
 }
 

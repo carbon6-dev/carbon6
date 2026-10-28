@@ -479,6 +479,7 @@ mod tests {
             worker_id: c6_core::WorkerId(uuid::Uuid::now_v7()),
             worker_name: "w".into(),
             head_url: String::new(),
+            tls_domain: None,
         };
         let identity = crate::Identity { meta, key_pem: String::new(), cert_pem: String::new(), ca_pem: String::new() };
         let worker = Worker::open(dir.path(), identity).await.unwrap();

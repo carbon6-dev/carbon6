@@ -485,9 +485,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     Some(w) => view! {
                         <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error files wake=w />
                     }.into_any(),
-                    None => view! {
-                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files />
-                    }.into_any(),
+                    None => {
+                        let row = detail.get().and_then(|d| d.ok()).map(|d| d.session);
+                        let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
+                        let subagents = SubagentChoice::follow(events, start, choice.current);
+                        view! {
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files subagents />
+                        }.into_any()
+                    }
                 }
             }}
             </Show>
@@ -1125,6 +1130,69 @@ impl ModelChoice {
     }
 }
 
+/// The picker for a session's subagents (docs/subagents.md §14): it
+/// follows their default, its last change in the log, else the one on the
+/// session's row (`start`). An empty model: the session's own.
+#[derive(Clone, Copy)]
+struct SubagentChoice {
+    connection: RwSignal<String>,
+    model: RwSignal<String>,
+    effort: RwSignal<String>,
+    /// (connection, model, effort) they run on by default now.
+    current: Memo<(String, String, String)>,
+    /// The session's own (connection, model, effort).
+    own: Memo<(String, String, String)>,
+}
+
+impl SubagentChoice {
+    /// `own`: the session's connection, shown while the default names none.
+    fn follow(events: RwSignal<Vec<Event>>, start: (String, String, String), own: Memo<(String, String, String)>) -> Self {
+        let current = Memo::new(move |_| {
+            events.with(|evs| {
+                evs.iter()
+                    .rev()
+                    .find_map(|e| match &e.kind {
+                        EventKind::SubagentModelSet { connection_id, model, effort } => {
+                            Some((connection_id.clone(), model.clone(), effort.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| start.clone())
+            })
+        });
+        let choice = SubagentChoice {
+            connection: RwSignal::new(String::new()),
+            model: RwSignal::new(String::new()),
+            effort: RwSignal::new(String::new()),
+            current,
+            own,
+        };
+        Effect::new(move || {
+            let (c, m, e) = current.get();
+            let (own_c, own_m, _) = own.get();
+            choice.connection.set(if c.is_empty() { own_c } else { c });
+            choice.model.set(if m.is_empty() { own_m } else { m });
+            choice.effort.set(e);
+        });
+        choice
+    }
+
+    /// What to set, if the picker differs from the default now.
+    fn change(&self) -> Option<c6_api::SetSubagentModel> {
+        let (c, m, e) = (self.connection.get(), self.model.get().trim().to_owned(), self.effort.get());
+        // Shown as they run now: the session's own when none is set.
+        let (cc, cm, ce) = match self.current.get() {
+            (_, cm, _) if cm.is_empty() => {
+                let (oc, om, _) = self.own.get();
+                (oc, om, String::new())
+            }
+            (cc, cm, ce) if cc.is_empty() => (self.own.get().0, cm, ce),
+            now => now,
+        };
+        (!m.is_empty() && (c != cc || m != cm || e != ce)).then_some(c6_api::SetSubagentModel { connection_id: c, model: m, effort: e })
+    }
+}
+
 /// Connection select plus a model field that lists the connection's models
 /// and also takes free text.
 #[component]
@@ -1695,6 +1763,20 @@ fn subagent_state(running: bool, end: Option<TurnEndReason>) -> (&'static str, &
     }
 }
 
+/// Where a subagent runs: "connection · model · effort" (a subagent may
+/// run on another connection than its parent's).
+fn runs_on(row: Memo<Option<Session>>, connections: LocalResource<Result<Vec<c6_api::Connection>, String>>) -> String {
+    row.with(|r| {
+        let Some(r) = r else { return String::new() };
+        let model = model_label(&r.model, r.effort.as_deref().unwrap_or_default());
+        let name = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|c| c.id == r.connection_id).map(|c| c.name));
+        match name {
+            Some(n) => format!("{n} · {model}"),
+            None => model,
+        }
+    })
+}
+
 /// Scrolls the element with this id into view.
 fn scroll_to(id: &str) {
     if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
@@ -1734,6 +1816,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
     let busy = Signal::derive(move || waiting.get() || row.with(|r| r.as_ref().is_some_and(|r| r.status == SessionStatus::Running)));
     let live = move || open.get() || busy.get();
     let sid = StoredValue::new(id.clone());
+    let connections = LocalResource::new(api::connections);
     view! {
         <div id=format!("sub-{id}") class="mt-1 border-l-2 border-violet-300 pl-3 dark:border-violet-800">
             {move || if live() {
@@ -1746,7 +1829,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
                         <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
                         {move || row.with(|r| r.as_ref().map(|r| r.agent.clone()).filter(|a| !a.is_empty())).map(|a| view! { <span class="font-mono">{a}</span> })}
                         <span class=format!("shrink-0 {tone}")>{pill}</span>
-                        <span class="ml-auto shrink-0 font-mono">{move || row.with(|r| r.as_ref().map(|r| r.model.clone()).unwrap_or_default())}</span>
+                        <span class="ml-auto shrink-0 font-mono">{move || runs_on(row, connections)}</span>
                     </button>
                 }.into_any()
             }}
@@ -1764,6 +1847,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
     let error = RwSignal::new(None::<String>);
     let wake = RwSignal::new(false);
     let sid = StoredValue::new(id.clone());
+    let connections = LocalResource::new(api::connections);
     let end = Memo::new(move |_| {
         feed.events.with(|evs| {
             evs.iter().rev().find_map(|e| match &e.kind {
@@ -1823,7 +1907,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
                 }
                 parts.join(" · ")
             }}</span>
-            <span class="ml-auto shrink-0 font-mono">{move || row.with(|r| r.as_ref().map(|r| r.model.clone()).unwrap_or_default())}</span>
+            <span class="ml-auto shrink-0 font-mono">{move || runs_on(row, connections)}</span>
             <Go to=View::session(id.clone()) class="shrink-0 text-violet-700 hover:underline dark:text-violet-400" stop=true>"↗"</Go>
         </button>
         {move || if open.get() {
@@ -1914,8 +1998,8 @@ fn tool_kind(name: &str) -> &str {
         "Grep" => "grep",
         "Glob" => "glob",
         "TodoWrite" | "update_plan" => "plan",
-        "Task" => "task",
-        "SendMessage" => "send_message",
+        "Task" | "mcp__carbon6__Task" => "task",
+        "SendMessage" | "mcp__carbon6__SendMessage" => "send_message",
         "WebFetch" => "web_fetch",
         "BashOutput" => "bash_output",
         "KillShell" => "kill_shell",
@@ -2183,7 +2267,11 @@ fn Composer(
     /// A subagent's reply box: whether its report should wake its parent.
     #[prop(optional)]
     wake: Option<RwSignal<bool>>,
+    /// Offer a picker for the model its subagents run on.
+    #[prop(optional)]
+    subagents: Option<SubagentChoice>,
 ) -> impl IntoView {
+    let subagent_id = StoredValue::new(id.clone());
     let text = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
     // What you'd likely type next (docs/suggestions.md): fetched when a turn
@@ -2557,6 +2645,36 @@ fn Composer(
                             m.switch().map(|_| view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> })
                         }}
                     </div>
+                })}
+                {subagents.map(|s| {
+                    let set = move |req: c6_api::SetSubagentModel| {
+                        spawn_local(async move {
+                            if let Err(e) = api::set_subagent_model(subagent_id.get_value(), req).await {
+                                error.set(Some(e));
+                            }
+                        });
+                    };
+                    view! {
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500 sm:flex" class:hidden=move || !model_open.get()
+                        title="The connection and model the Task tool's subagents run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.">
+                        <span>"Subagents"</span>
+                        <ModelPicker connection=s.connection model=s.model effort=s.effort />
+                        {move || s.change().map(|req| view! {
+                            <button class="text-violet-700 hover:underline dark:text-violet-400" on:click=move |_| set(req.clone())>"Set"</button>
+                        })}
+                        {move || {
+                            let (_, m, _) = s.current.get();
+                            if m.is_empty() {
+                                view! { <span>"(the session's model)"</span> }.into_any()
+                            } else {
+                                view! {
+                                    <button class="hover:underline" title="Run them on the session's own model"
+                                        on:click=move |_| set(c6_api::SetSubagentModel::default())>"Use the session's"</button>
+                                }.into_any()
+                            }
+                        }}
+                    </div>
+                    }
                 })}
                 {wake.map(|w| view! {
                     <label class="flex items-center gap-1.5 self-start text-xs text-zinc-500"

@@ -117,6 +117,17 @@ async fn routes_pick_connection_and_model() {
     assert!(r.text().await.unwrap().contains("is a pool"));
     assert_eq!(put(json!([{"name": "x", "connection": "both", "model": "big"}])).await, reqwest::StatusCode::BAD_REQUEST);
     assert!(put(json!([{"name": "x", "applies_to": ["task:suggest"], "connection": "both", "model": "big"}])).await.is_success());
+    // Nor what subagents run on (they run on the worker).
+    let rule = json!([{"name": "x", "connection": "main", "model": "big", "subagent_connection": "both", "subagent_model": "big"}]);
+    assert_eq!(put(rule).await, reqwest::StatusCode::BAD_REQUEST);
+    let r = http
+        .put(format!("{api}/sessions/{}/subagent-model", s.id))
+        .json(&json!({"connection_id": pool.id, "model": "big"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("is a pool"));
 
     stop.cancel();
     head.shutdown().await.unwrap();

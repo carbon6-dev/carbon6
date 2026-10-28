@@ -30,7 +30,17 @@ message SessionEvent {
     Notice notice = 26;
     Question question = 27;
     SubagentSpawned subagent_spawned = 28;
+    SubagentModelSet subagent_model_set = 29;
   }
+}
+
+// The session's default for its subagents changed (you picked one in the
+// session); unset `model`: they run on the session's own model. A Task call
+// or a named agent that asks for its own still wins.
+message SubagentModelSet {
+  ModelSpec model = 1;
+  // The SetSubagentModel command it applies.
+  string command_id = 2;
 }
 
 // A tool call (Task) started a subagent: written to the parent's log before
@@ -43,6 +53,8 @@ message SubagentSpawned {
   string description = 4;
   // Set when it runs in the background (the BackgroundTask's id).
   string background_task_id = 5;
+  // The connection, model and effort it runs on.
+  ModelSpec model = 6;
 }
 
 // The assistant asked you for inputs (a form), and what became of it.
@@ -381,7 +393,14 @@ message SessionCommand {
     StopTask stop_task = 15;
     Approve approve = 16;
     Answer answer = 17;
+    SetSubagentModel set_subagent_model = 18;
   }
+}
+
+// Sets the session's default for its subagents (unset `model`: the
+// session's own model).
+message SetSubagentModel {
+  ModelSpec model = 1;
 }
 
 // Your answers to a question (a form) the assistant asked.
@@ -483,6 +502,15 @@ message CreateSession {
   uint32 max_running_subagents = 24;
   // The session's scope includes chat (Slack): offer the chat tools.
   bool memex_chat = 25;
+  // The default for subagents (connection, model, effort), from a routing
+  // rule or picked in the session; unset: `subagent_model` on the
+  // session's own connection. A named agent's model, or a Task call's,
+  // still wins.
+  ModelSpec subagent_target = 26;
+  // The connections subagents may run on (JSON array of
+  // c6_api::SubagentConnection): those the session's realm may use,
+  // without Claude Code (a subagent runs in carbon6's own loop).
+  string subagent_connections_json = 27;
 }
 
 // What makes a session a subagent: who started it, and as which agent.
