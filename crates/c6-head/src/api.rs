@@ -961,15 +961,40 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
 pub(crate) struct After {
     #[serde(default)]
     after: u64,
+    /// Instead, the events before this one: about `limit` of them, from the
+    /// start of a turn (or back to `at`, if that's earlier).
+    #[serde(default)]
+    before: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    at: Option<u64>,
 }
+
+/// How far back a window looks for the start of a turn, in windows.
+const TURN_LOOKBACK: u64 = 4;
 
 async fn session_events(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
     Query(q): Query<After>,
 ) -> ApiResult<Json<Vec<api::Event>>> {
-    let events = st.store.events_after(&id, q.after, EVENT_PAGE).await?;
-    Ok(Json(events.iter().filter_map(crate::convert::event).collect()))
+    let Some(before) = q.before else {
+        let events = st.store.events_after(&id, q.after, EVENT_PAGE).await?;
+        return Ok(Json(events.iter().filter_map(crate::convert::event).collect()));
+    };
+    let limit = q.limit.unwrap_or(EVENT_PAGE as u64).clamp(1, EVENT_PAGE as u64);
+    let want = before.saturating_sub(limit).min(q.at.unwrap_or(u64::MAX));
+    let from = st.store.turn_start(&id, want, limit * TURN_LOOKBACK).await?;
+    let mut out = Vec::new();
+    let mut last = from.saturating_sub(1);
+    while last + 1 < before {
+        let page = st.store.events_after(&id, last, (before - 1 - last).min(EVENT_PAGE as u64) as i64).await?;
+        let Some(end) = page.last() else { break };
+        last = end.seq;
+        out.extend(page.iter().filter_map(crate::convert::event));
+    }
+    Ok(Json(out))
 }
 
 #[derive(serde::Deserialize)]
@@ -2495,17 +2520,31 @@ async fn dismiss_rejected(State(st): State<Arc<HeadState>>, Path(id): Path<Strin
 async fn session_stream(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
-    Query(q): Query<After>,
+    Query(q): Query<StreamQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| stream_socket(st, id, q.after, socket))
+    ws.on_upgrade(move |socket| stream_socket(st, id, q, socket))
+}
+
+#[derive(serde::Deserialize)]
+struct StreamQuery {
+    #[serde(default)]
+    after: u64,
+    /// From the start: only about the last `tail` events, from the start of
+    /// a turn (a window; see `StreamMsg::Window`).
+    #[serde(default)]
+    tail: Option<u64>,
+    /// With `tail`: a window reaching back to this event, too.
+    #[serde(default)]
+    at: Option<u64>,
 }
 
 /// Durable events after `after` (gap-free, in order), then live updates.
-async fn stream_socket(st: Arc<HeadState>, session_id: String, after: u64, mut socket: WebSocket) {
+/// Or a window: the summary's events before it, then the same from its start.
+async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, mut socket: WebSocket) {
     // Subscribe before reading history so nothing falls between the two.
     let mut live = st.hub.subscribe(&session_id);
-    let mut last = after;
+    let mut last = q.after;
 
     async fn send(socket: &mut WebSocket, msg: &api::StreamMsg) -> bool {
         match serde_json::to_string(msg) {
@@ -2534,6 +2573,26 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, after: u64, mut s
         && !send(&mut socket, &api::StreamMsg::Queue { queued: rows.iter().map(crate::convert::queued).collect() }).await
     {
         return;
+    }
+    if let Some(tail) = q.tail.filter(|_| q.after == 0) {
+        let tail = tail.clamp(1, EVENT_PAGE as u64);
+        let Ok(end) = st.store.last_seq(&session_id).await else { return };
+        let want = (end + 1).saturating_sub(tail).min(q.at.unwrap_or(u64::MAX));
+        let Ok(from) = st.store.turn_start(&session_id, want, tail * TURN_LOOKBACK).await else { return };
+        if !send(&mut socket, &api::StreamMsg::Window { from }).await {
+            return;
+        }
+        while last + 1 < from {
+            let Ok(page) = st.store.events_after(&session_id, last, (from - 1 - last).min(EVENT_PAGE as u64) as i64).await else { return };
+            let Some(end) = page.last() else { break };
+            last = end.seq;
+            for event in page.iter().filter_map(crate::convert::event).filter(|e| e.kind.summary()) {
+                if !send(&mut socket, &api::StreamMsg::Event { event }).await {
+                    return;
+                }
+            }
+        }
+        last = from - 1;
     }
     if !catch_up(&st, &session_id, &mut last, &mut socket).await || !send(&mut socket, &api::StreamMsg::Synced).await {
         return;

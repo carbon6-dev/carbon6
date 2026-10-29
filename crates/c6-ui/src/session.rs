@@ -158,7 +158,29 @@ pub(crate) struct Feed {
     secrets: RwSignal<Vec<SecretCard>>,
     /// The log has been replayed up to where the session was when opened.
     pub(crate) synced: RwSignal<bool>,
+    /// The first event shown: before it, `events` has only the summary's
+    /// (`EventKind::summary`). 1 (or 0): all of it.
+    pub(crate) from: RwSignal<u64>,
+    /// The first event not drawn, after a jump back (to a search hit):
+    /// later ones as you scroll down. None: to the end.
+    pub(crate) to: RwSignal<Option<u64>>,
+    loading: RwSignal<bool>,
+    id: StoredValue<String>,
 }
+
+/// How much of a log to open with.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Window {
+    /// About the last [`TAIL`] events; earlier ones as you scroll up.
+    Tail,
+    /// The tail, and back to this event.
+    At(u64),
+    /// All of it.
+    All,
+}
+
+/// Events in a window, and loaded at a time before it.
+const TAIL: u64 = 300;
 
 #[derive(Clone, Debug, PartialEq)]
 struct SecretCard {
@@ -170,7 +192,7 @@ struct SecretCard {
 
 impl Feed {
     /// Follows the session's stream until the calling scope is cleaned up.
-    pub(crate) fn open(id: String) -> Self {
+    pub(crate) fn open(id: String, window: Window) -> Self {
         let feed = Feed {
             events: RwSignal::new(Vec::new()),
             streaming: RwSignal::new(Streaming::default()),
@@ -178,11 +200,27 @@ impl Feed {
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
+            from: RwSignal::new(0),
+            to: RwSignal::new(None),
+            loading: RwSignal::new(false),
+            id: StoredValue::new(id.clone()),
         };
-        let Feed { events, streaming, queued, activity, secrets, synced } = feed;
+        let Feed { events, streaming, queued, activity, secrets, synced, from, to, .. } = feed;
+        // The replay arrives all at once (not an event at a time, each
+        // drawn and scrolled to).
+        let replay = StoredValue::new(Vec::<Event>::new());
         let handle = api::stream_session(
             id,
             move |msg| match msg {
+                // Replayed turns don't start and stop it again (the log says
+                // whether one is running).
+                StreamMsg::Event { event } if !synced.get_untracked() => {
+                    let last =
+                        replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
+                    if last.is_none_or(|l| l < event.seq) {
+                        replay.update_value(|r| r.push(event));
+                    }
+                }
                 StreamMsg::Event { event } => {
                     streaming.update(|s| match &event.kind {
                         EventKind::Assistant { .. } => {
@@ -207,6 +245,7 @@ impl Feed {
                         }
                     });
                 }
+                StreamMsg::Window { from: f } => from.set(f),
                 StreamMsg::Text { text, .. } => streaming.update(|s| s.text.push_str(&text)),
                 StreamMsg::Thinking { text, .. } => streaming.update(|s| s.thinking.push_str(&text)),
                 StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
@@ -220,13 +259,99 @@ impl Feed {
                     }
                 }
                 StreamMsg::Queue { queued: q } => queued.set(q),
-                StreamMsg::Synced => synced.set(true),
+                StreamMsg::Synced => {
+                    let r = replay.try_update_value(std::mem::take).unwrap_or_default();
+                    // Opened at a place: drawn from there, not to the end.
+                    if let Window::At(at) = window {
+                        to.set(bound(&r, at));
+                    }
+                    if !r.is_empty() {
+                        events.update(|evs| evs.extend(r));
+                    }
+                    synced.set(true);
+                }
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
             },
-            move || events.with_untracked(|e| e.last().map(|e| e.seq).unwrap_or(0)),
+            move || {
+                let last = replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
+                match (last, window) {
+                    (Some(n), _) => format!("after={n}"),
+                    (None, Window::All) => "after=0".into(),
+                    (None, Window::Tail) => format!("after=0&tail={TAIL}"),
+                    (None, Window::At(at)) => format!("after=0&tail={TAIL}&at={at}"),
+                }
+            },
         );
         on_cleanup(move || handle.abort());
         feed
+    }
+
+    /// Whether events before the window are left to load.
+    pub(crate) fn more(&self) -> bool {
+        self.from.get() > 1
+    }
+
+    /// The window starts earlier: about [`TAIL`] events, or back to `at`.
+    /// `then`: once that's drawn.
+    pub(crate) fn older(self, at: Option<u64>, then: impl FnOnce() + 'static) {
+        let before = self.from.get_untracked();
+        if before <= 1 || self.loading.get_untracked() {
+            return;
+        }
+        self.loading.set(true);
+        spawn_local(async move {
+            let page = api::session_events_before(self.id.get_value(), before, TAIL, at).await;
+            self.loading.set(false);
+            let Ok(page) = page else { return };
+            let start = page.first().map_or(1, |e| e.seq);
+            // In place of the summary's events from there.
+            self.events.update(|evs| {
+                let (a, b) = (evs.partition_point(|e| e.seq < start), evs.partition_point(|e| e.seq < before));
+                evs.splice(a..b, page);
+            });
+            // A jump: drawn from there.
+            if let Some(at) = at {
+                self.to.set(self.events.with_untracked(|evs| bound(evs, at)));
+            }
+            self.from.set(start);
+            request_animation_frame(then);
+        });
+    }
+
+    /// Drawn further down: about [`TAIL`] more events.
+    pub(crate) fn later(self) {
+        if let Some(to) = self.to.get_untracked() {
+            self.to.set(self.events.with_untracked(|evs| bound(evs, to)));
+        }
+    }
+
+    /// Back to the end: the last [`TAIL`] events or so.
+    pub(crate) fn latest(self) {
+        self.cut(0);
+        self.to.set(None);
+    }
+
+    /// Back to the last [`TAIL`] events or so (from one of your messages),
+    /// once the window has grown to twice that.
+    pub(crate) fn trim(self) {
+        if self.to.get_untracked().is_none() {
+            self.cut(2 * TAIL);
+        }
+    }
+
+    fn cut(self, over: u64) {
+        let from = self.from.get_untracked();
+        let cut = self.events.with_untracked(|evs| {
+            let shown = &evs[evs.partition_point(|e| e.seq < from.max(1))..];
+            if (shown.len() as u64) < over.max(TAIL + 1) {
+                return None;
+            }
+            let at = shown.len() - TAIL as usize;
+            shown[..=at].iter().rev().find(|e| matches!(e.kind, EventKind::User { .. })).map(|e| e.seq).filter(|&s| s > from)
+        });
+        let Some(cut) = cut else { return };
+        self.events.update(|evs| evs.retain(|e| e.seq >= cut || e.kind.summary()));
+        self.from.set(cut);
     }
 
     /// A turn is in progress (live activity, or an unclosed turn in the log).
@@ -256,7 +381,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         let id = id.clone();
         move || api::session(id.clone())
     });
-    let feed = Feed::open(id.clone());
+    let target = target.unwrap_or_default();
+    // Where it was found: a window reaching back to there, if that's known.
+    let window = match target.at.or_else(|| target.anchor.as_deref().and_then(|a| anchor_seq(a, &id))) {
+        Some(seq) => Window::At(seq),
+        None if target.anchor.is_some() => Window::All,
+        None => Window::Tail,
+    };
+    let feed = Feed::open(id.clone(), window);
     let Feed { events, streaming, queued, activity, .. } = feed;
     let error = RwSignal::new(None::<String>);
 
@@ -272,11 +404,19 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
     // Follow the bottom of the transcript unless the user scrolled up, or
     // came for a particular place (from search).
-    let target = target.unwrap_or_default();
     let scroller = NodeRef::<leptos::html::Div>::new();
     let stick = RwSignal::new(target.anchor.is_none());
     let force_open = ForceOpen(RwSignal::new(target.open.clone()));
     provide_context(force_open);
+    provide_context(Reach(RwSignal::new(HashMap::new())));
+    provide_context(Follow(stick));
+    // Drawn only part way (after a jump back): its last event isn't the
+    // end, so it isn't followed.
+    Effect::new(move || {
+        if feed.to.get().is_some() && stick.get() {
+            stick.set(false);
+        }
+    });
     // Find in session: open when arriving from search (or via Find).
     let find_open = RwSignal::new(!target.q.trim().is_empty());
     let find_q = target.q.clone();
@@ -311,7 +451,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         events.track();
         streaming.track();
         queued.track();
-        if stick.get_untracked() {
+        if stick.get() {
+            // Back at the end: what you scrolled back to goes again.
+            feed.trim();
             request_animation_frame(move || {
                 if let Some(el) = scroller.get_untracked() {
                     el.set_scroll_top(el.scroll_height());
@@ -699,7 +841,7 @@ fn Lineage(session: Session) -> impl IntoView {
             {agent}
             <span>"·"</span>
             {move || chain.get().unwrap_or_default().into_iter().map(|(id, title, call)| {
-                let target = crate::workspace::Target { q: String::new(), anchor: Some(format!("call-{call}")), open: Vec::new() };
+                let target = crate::workspace::Target { q: String::new(), anchor: Some(format!("call-{call}")), open: Vec::new(), at: None };
                 view! {
                     <Go to=View::Session { id, target: Some(target) } class="max-w-60 truncate underline">{title}</Go>
                     <span>"›"</span>
@@ -808,8 +950,46 @@ fn SubagentsPill(session: String, tree: String, events: RwSignal<Vec<Event>>, fo
 /// shown under them (recursively).
 #[component]
 fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoView {
-    let Feed { events, streaming, queued, secrets, .. } = feed;
+    let Feed { events, streaming, queued, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
+    // What's drawn: the window (before it, only the summary's events), to
+    // the end or where a jump stops it.
+    let shown_events = Memo::new(move |_| {
+        let (from, to) = (from.get(), to.get().unwrap_or(u64::MAX));
+        events.with(|evs| evs[evs.partition_point(|e| e.seq < from)..evs.partition_point(|e| e.seq < to)].to_vec())
+    });
+    // Find asking for an event before the window: load back to it.
+    if let Some(Reach(reach)) = use_context::<Reach>() {
+        Effect::new(move || {
+            let Some(seq) = reach.with(|r| r.get(&id.get_value()).copied()) else { return };
+            if seq < from.get() {
+                feed.older(Some(seq), || ());
+            } else if to.get().is_some_and(|t| seq >= t) {
+                to.set(events.with_untracked(|evs| bound(evs, seq)));
+            }
+        });
+    }
+    // Scrolled up to the start of the window: the turns before it, where
+    // you are staying put.
+    let top = NodeRef::<leptos::html::Div>::new();
+    let earlier = move || {
+        let sc = top.get_untracked().and_then(|el| scroll_parent(&el));
+        let height = sc.as_ref().map_or(0, |s| s.scroll_height());
+        feed.older(None, move || {
+            if let Some(sc) = sc {
+                sc.set_scroll_top(sc.scroll_top() + sc.scroll_height() - height);
+            }
+        });
+    };
+    // Only once you've scrolled up (not while it opens at the end).
+    let follow = use_context::<Follow>();
+    let bottom = NodeRef::<leptos::html::Div>::new();
+    on_sight(top, move || {
+        if follow.is_some_and(|Follow(f)| !f.get_untracked()) {
+            earlier();
+        }
+    });
+    on_sight(bottom, move || feed.later());
     let results = Memo::new(move |_| {
         events.with(|evs| {
             evs.iter()
@@ -910,7 +1090,14 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         <div class="space-y-4">
             // Events are append-only: keyed by seq, each renders once, so
             // expanded cards stay open while the turn continues.
-            <For each=move || events.get() key=|e| e.seq let:e>
+            {move || feed.more().then(|| view! {
+                <div node_ref=top class="flex justify-center">
+                    <button class="text-xs text-zinc-500 underline" on:click=move |_| earlier()>
+                        {move || if feed.loading.get() { "Loading earlier messages…" } else { "Earlier messages" }}
+                    </button>
+                </div>
+            })}
+            <For each=move || shown_events.get() key=|e| e.seq let:e>
                 {
                     let seq = e.seq;
                     let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
@@ -984,6 +1171,15 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                     }
                 }
             </For>
+            {move || to.get().is_some().then(|| view! {
+                <div node_ref=bottom class="flex justify-center gap-3">
+                    <button class="text-xs text-zinc-500 underline" on:click=move |_| feed.later()>"Later messages"</button>
+                    <button class="text-xs text-zinc-500 underline" on:click=move |_| {
+                        feed.latest();
+                        if let Some(Follow(f)) = follow { f.set(true) }
+                    }>"Latest ↓"</button>
+                </div>
+            })}
             <crate::decisions::SessionDecisions session=id.get_value() />
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
             {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
@@ -1004,6 +1200,32 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() /> }).collect_view()}
         </div>
     }
+}
+
+/// Calls `f` as the element comes into view (or near it): scrolled to, not
+/// where it is when it's drawn.
+fn on_sight(el: NodeRef<leptos::html::Div>, f: impl Fn() + Clone + 'static) {
+    Effect::new(move || {
+        let Some(el) = el.get() else { return };
+        let f = f.clone();
+        let mut first = true;
+        let cb = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+            let seen =
+                entries.iter().any(|e| wasm_bindgen::JsCast::unchecked_into::<web_sys::IntersectionObserverEntry>(e).is_intersecting());
+            if seen && !std::mem::take(&mut first) {
+                f();
+            }
+            first = false;
+        });
+        let opts = web_sys::IntersectionObserverInit::new();
+        opts.set_root_margin("200px");
+        if let Ok(o) = web_sys::IntersectionObserver::new_with_options(wasm_bindgen::JsCast::unchecked_ref(cb.as_ref()), &opts) {
+            o.observe(&el);
+            let o = send_wrapper::SendWrapper::new(o);
+            on_cleanup(move || o.disconnect());
+        }
+        cb.forget();
+    });
 }
 
 /// Rewind to before a message, or edit it and send it again (a rewind
@@ -1114,7 +1336,7 @@ fn side_chat(s: Session, open_now: bool) -> AnyView {
 
 #[component]
 fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoView {
-    let feed = Feed::open(session.id.clone());
+    let feed = Feed::open(session.id.clone(), Window::Tail);
     let running = Signal::derive(move || feed.running());
     let error = RwSignal::new(None::<String>);
     let id = session.id.clone();
@@ -1382,10 +1604,24 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         async move { if q.trim().is_empty() { Ok(None) } else { api::session_matches(session.get_value(), q).await.map(Some) } }
     });
     let found = Memo::new(move |_| matches.get().and_then(|r| r.ok()).flatten());
+    let (reach, follow) = (use_context::<Reach>(), use_context::<Follow>());
     let go = move |i: usize| {
         let Some(m) = found.get_untracked() else { return };
         let Some(hit) = m.matches.get(i).cloned() else { return };
         current.set(Some(i));
+        // Its transcripts load back to it, if they start after it; you're
+        // looking there now, not at the end.
+        if let Some(Follow(f)) = follow {
+            f.set(false);
+        }
+        if let Some(Reach(r)) = reach {
+            r.update(|r| {
+                r.insert(session.get_value(), hit.at);
+                if let Some(own) = hit.open.last() {
+                    r.insert(own.clone(), hit.seq);
+                }
+            });
+        }
         force_open.0.update(|ids| ids.extend(hit.open.iter().filter(|o| !ids.contains(o)).cloned().collect::<Vec<_>>()));
         reveal_when_rendered(root.get_value(), hit.anchor, serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()), 0);
     };
@@ -1476,6 +1712,41 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
         </div>
     }
 }
+
+/// Where drawing a log from event `at` stops: one of your messages about
+/// [`TAIL`] events on; None: at the end.
+fn bound(evs: &[Event], at: u64) -> Option<u64> {
+    let i = evs.partition_point(|e| e.seq < at) + TAIL as usize;
+    evs.get(i..)?.iter().find(|e| matches!(e.kind, EventKind::User { .. })).map(|e| e.seq)
+}
+
+/// The nearest ancestor that scrolls.
+fn scroll_parent(el: &web_sys::Element) -> Option<web_sys::Element> {
+    let mut at = el.parent_element();
+    while let Some(e) = at {
+        let style = window().get_computed_style(&e).ok().flatten();
+        if style.and_then(|s| s.get_property_value("overflow-y").ok()).is_some_and(|o| o == "auto" || o == "scroll") {
+            return Some(e);
+        }
+        at = e.parent_element();
+    }
+    None
+}
+
+/// The event an anchor of this session names (`e<seq>`, `<session>-e<seq>`).
+fn anchor_seq(anchor: &str, session: &str) -> Option<u64> {
+    let seq = anchor.strip_prefix(session).and_then(|a| a.strip_prefix('-')).unwrap_or(anchor);
+    seq.strip_prefix('e')?.parse().ok()
+}
+
+/// Sessions' transcripts asked to load back to an event (by Find), by
+/// session: each loads its own.
+#[derive(Clone, Copy)]
+struct Reach(RwSignal<HashMap<String, u64>>);
+
+/// The page follows the end of the transcript (you haven't scrolled up).
+#[derive(Clone, Copy)]
+struct Follow(RwSignal<bool>);
 
 /// Reveals a search hit once its element exists (events render in batches).
 fn reveal_when_rendered(root: String, id: String, terms: String, tries: u32) {
@@ -1898,7 +2169,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
 /// last steps (running, not opened) or its whole conversation (opened).
 #[component]
 fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, toggle: Callback<web_sys::MouseEvent>) -> impl IntoView {
-    let feed = Feed::open(id.clone());
+    let feed = Feed::open(id.clone(), Window::Tail);
     let running = Signal::derive(move || feed.running());
     let error = RwSignal::new(None::<String>);
     let wake = RwSignal::new(false);
@@ -2912,5 +3183,43 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
                 <span class="text-xs text-zinc-600 dark:text-zinc-400">{card.note.clone()}</span>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(users: &[u64], n: u64) -> Vec<Event> {
+        (1..=n)
+            .map(|seq| {
+                let kind = if users.contains(&seq) {
+                    serde_json::json!({"type": "user", "command_id": "", "text": "hi"})
+                } else {
+                    serde_json::json!({"type": "turn_started", "turn": seq})
+                };
+                let mut e = serde_json::json!({"seq": seq, "ts": 0});
+                e.as_object_mut().unwrap().extend(kind.as_object().unwrap().clone());
+                serde_json::from_value(e).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_jump_draws_to_a_message_about_a_window_on() {
+        let evs = log(&[1, 200, 400, 650, 1000], 1200);
+        // From 50: at least TAIL on, then the next of your messages.
+        assert_eq!(bound(&evs, 50), Some(400));
+        assert_eq!(bound(&evs, 400), Some(1000));
+        // None after it: to the end.
+        assert_eq!(bound(&evs, 800), None);
+    }
+
+    #[test]
+    fn anchors_name_their_events() {
+        assert_eq!(anchor_seq("s1-e42", "s1"), Some(42));
+        assert_eq!(anchor_seq("e7", "s1"), Some(7));
+        assert_eq!(anchor_seq("call-abc", "s1"), None);
+        assert_eq!(anchor_seq("s2-e42", "s1"), None);
     }
 }

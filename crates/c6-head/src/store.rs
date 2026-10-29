@@ -1036,6 +1036,25 @@ impl Store {
         Ok(out)
     }
 
+    /// Where a window of the log reaching back to event `seq` starts: the
+    /// last of your messages at or before it (so its turn shows whole),
+    /// looking back at most `lookback` events; else `seq`.
+    pub async fn turn_start(&self, session_id: &str, seq: u64, lookback: u64) -> anyhow::Result<u64> {
+        if seq <= 1 {
+            return Ok(1);
+        }
+        let lo = seq.saturating_sub(lookback).max(1);
+        let page = self.events_after(session_id, lo - 1, (seq - lo + 1) as i64).await?;
+        let user = page.iter().rev().find(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::User(_))));
+        Ok(user.map_or(seq, |e| e.seq))
+    }
+
+    pub async fn last_seq(&self, session_id: &str) -> anyhow::Result<u64> {
+        let n: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(seq) FROM events WHERE session_id = ?").bind(session_id).fetch_one(&self.pool).await?;
+        Ok(n.unwrap_or(0) as u64)
+    }
+
     pub async fn events_after(&self, session_id: &str, after: u64, limit: i64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
         use prost::Message;
         let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")

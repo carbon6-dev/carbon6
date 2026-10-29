@@ -110,6 +110,9 @@ pub struct Target {
     pub anchor: Option<String>,
     #[serde(default)]
     pub open: Vec<String>,
+    /// The session's event that shows it, when known.
+    #[serde(default)]
+    pub at: Option<u64>,
 }
 
 fn enc(s: &str) -> String {
@@ -229,6 +232,7 @@ impl View {
                         .get("open")
                         .map(|o| o.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect())
                         .unwrap_or_default(),
+                    at: None,
                 });
                 View::Session { id: (*id).to_owned(), target }
             }

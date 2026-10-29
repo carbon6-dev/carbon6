@@ -132,24 +132,51 @@ async fn task_runs_and_survives_head_outage() {
     let synced = head.state.store.events_after(&session.id, 0, 10_000).await.unwrap();
     assert_eq!(synced, journal, "head log equals the worker journal");
     // The stream replays the log, then says it has (what follows is live).
-    let url = format!("ws://127.0.0.1:{}/api/v1/sessions/{}/stream?after=0", ui_port, session.id);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    let mut replayed = Vec::new();
-    loop {
-        use futures::StreamExt;
-        let msg = c6_testkit::within("the next stream message", ws.next()).await.unwrap().unwrap();
-        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
-        match serde_json::from_str::<c6_api::StreamMsg>(&text).unwrap() {
-            c6_api::StreamMsg::Event { event } => replayed.push(event.seq),
-            c6_api::StreamMsg::Synced => break,
-            _ => {}
-        }
-    }
-    assert_eq!(replayed, synced.iter().map(|e| e.seq).collect::<Vec<_>>());
+    let (window, replayed) = replay(ui_port, &session.id, "after=0").await;
+    assert_eq!(window, None);
+    assert_eq!(replayed.iter().map(|e| e.seq).collect::<Vec<_>>(), synced.iter().map(|e| e.seq).collect::<Vec<_>>());
+
+    // A window: the last turn, from your message (a tail of 3 reaches into
+    // it), and before it only what the summary needs.
+    let all = events(session.id.clone()).await;
+    let second = all.iter().rev().find(|e| matches!(e.kind, EventKind::User { .. })).unwrap().seq;
+    let (window, tail) = replay(ui_port, &session.id, "after=0&tail=3").await;
+    assert_eq!(window, Some(second));
+    let (before, from): (Vec<_>, Vec<_>) = tail.iter().partition(|e| e.seq < second);
+    assert!(before.iter().all(|e| e.kind.summary()), "{before:?}");
+    let summary: Vec<u64> = all.iter().filter(|e| e.seq < second && e.kind.summary()).map(|e| e.seq).collect();
+    assert_eq!(before.iter().map(|e| e.seq).collect::<Vec<_>>(), summary);
+    assert_eq!(from.iter().map(|e| e.seq).collect::<Vec<_>>(), (second..=last).collect::<Vec<_>>());
+    // Or one reaching back to an event: from the turn it's in.
+    let (window, _) = replay(ui_port, &session.id, "after=0&tail=3&at=5").await;
+    assert_eq!(window, Some(3));
+    // Scrolling up: the turn before, whole.
+    let page: Vec<Event> =
+        http.get(format!("{api}/sessions/{}/events?before={second}&limit=3", session.id)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), (3..second).collect::<Vec<_>>());
     eventually("worker to see the acks", async || worker.journal.unacked().await.unwrap().is_empty().then_some(())).await;
 
     stop.cancel();
     head.shutdown().await.unwrap();
+}
+
+/// A session's stream from `query` up to where it says it has caught up:
+/// the window it says it sends, and the events.
+async fn replay(ui_port: u16, session: &str, query: &str) -> (Option<u64>, Vec<Event>) {
+    use futures::StreamExt;
+    let url = format!("ws://127.0.0.1:{ui_port}/api/v1/sessions/{session}/stream?{query}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (mut window, mut events) = (None, Vec::new());
+    loop {
+        let msg = c6_testkit::within("the next stream message", ws.next()).await.unwrap().unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
+        match serde_json::from_str::<c6_api::StreamMsg>(&text).unwrap() {
+            c6_api::StreamMsg::Event { event } => events.push(event),
+            c6_api::StreamMsg::Window { from } => window = Some(from),
+            c6_api::StreamMsg::Synced => return (window, events),
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]

@@ -360,7 +360,15 @@ pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow
             let part = r.get::<i64, _>("part");
             let (mut key, open) = place(&sid, session_id, &parents);
             key.extend([seq, 0, part]);
-            let m = api::SessionMatch { anchor: anchor(&sid, seq as u64, &r.get::<Vec<u8>, _>("data")), open, kind: r.get("kind") };
+            // This session's event that shows it (its own, or where a side chat branches).
+            let at = key.first().copied().unwrap_or(seq).max(0) as u64;
+            let m = api::SessionMatch {
+                anchor: anchor(&sid, seq as u64, &r.get::<Vec<u8>, _>("data")),
+                at,
+                seq: seq as u64,
+                open,
+                kind: r.get("kind"),
+            };
             (key, m)
         })
         .collect();

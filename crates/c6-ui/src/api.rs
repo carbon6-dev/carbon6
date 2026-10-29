@@ -68,11 +68,12 @@ pub fn live() -> LiveFeed {
 
 /// Streams a session's events and live deltas, resuming from the last seen
 /// seq after reconnects. Returns a handle that stops it.
-pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, last_seq: impl Fn() -> u64 + 'static) -> AbortHandle {
+/// `query`: where to (re)start, as the stream's query (`after=…`).
+pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, query: impl Fn() -> String + 'static) -> AbortHandle {
     let (fut, handle) = abortable(async move {
         let mut backoff = 500;
         loop {
-            let url = ws_url(&format!("/api/v1/sessions/{session_id}/stream?after={}", last_seq()));
+            let url = ws_url(&format!("/api/v1/sessions/{session_id}/stream?{}", query()));
             if let Ok(ws) = WebSocket::open(&url) {
                 let (_tx, mut rx) = ws.split();
                 while let Some(Ok(msg)) = rx.next().await {
@@ -459,6 +460,13 @@ pub async fn create_session(req: CreateSession) -> Result<Session, String> {
 
 pub async fn create_side_chat(parent: String, req: c6_api::CreateSideChat) -> Result<Session, String> {
     send_json(Request::post(&format!("/api/v1/sessions/{parent}/side-chats")), &req).await
+}
+
+/// About `limit` events before event `before`, from the start of a turn
+/// (or back to `at`).
+pub async fn session_events_before(id: String, before: u64, limit: u64, at: Option<u64>) -> Result<Vec<c6_api::Event>, String> {
+    let at = at.map(|a| format!("&at={a}")).unwrap_or_default();
+    json(Request::get(&format!("/api/v1/sessions/{id}/events?before={before}&limit={limit}{at}")).send().await).await
 }
 
 pub async fn session(id: String) -> Result<SessionDetail, String> {

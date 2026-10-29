@@ -190,9 +190,13 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
         Some(o) => (o.session_id.clone(), o.side_chats.clone()),
         None => (s.id.clone(), Vec::new()),
     };
-    let at =
-        move |anchor: Option<String>| View::Session { id: page.clone(), target: Some(Target { q: q.clone(), anchor, open: open.clone() }) };
-    let title_view = at(None);
+    // A hit in the page's own session says where it is.
+    let own = open.is_empty();
+    let at = move |anchor: Option<String>, seq: Option<u64>| View::Session {
+        id: page.clone(),
+        target: Some(Target { q: q.clone(), anchor, open: open.clone(), at: seq.filter(|_| own) }),
+    };
+    let title_view = at(None, None);
     let parent = res.open_in.as_ref().map(|o| o.title.clone());
     view! {
         <div class="rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
@@ -209,7 +213,7 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
                 </div>
             </div>
             <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
-                {res.hits.into_iter().map(|h| { let to = at(Some(h.anchor.clone())); view! { <HitRow h to /> } }).collect_view()}
+                {res.hits.into_iter().map(|h| { let to = at(Some(h.anchor.clone()), Some(h.seq)); view! { <HitRow h to /> } }).collect_view()}
             </div>
             {(more > 0).then(|| view! { <p class="px-4 py-1.5 text-xs text-zinc-500">{format!("{more} more match{} in this session", if more == 1 { "" } else { "es" })}</p> })}
         </div>

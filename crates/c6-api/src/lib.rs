@@ -1864,6 +1864,26 @@ pub enum EventKind {
     },
 }
 
+impl EventKind {
+    /// What a window's summary needs from before it (usage, the model,
+    /// turns, outputs, tasks, subagents): small, and no transcript.
+    pub fn summary(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Started { .. }
+                | EventKind::TurnStarted { .. }
+                | EventKind::TurnEnded { .. }
+                | EventKind::Usage { .. }
+                | EventKind::Compaction { .. }
+                | EventKind::ModelSwitched { .. }
+                | EventKind::SubagentModelSet { .. }
+                | EventKind::SubagentSpawned { .. }
+                | EventKind::Output { .. }
+                | EventKind::BackgroundTask { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2191,7 +2211,8 @@ pub struct CatalogCall {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamMsg {
-    /// A durable event, in seq order with no gaps.
+    /// A durable event, in seq order with no gaps (from the window's start,
+    /// when there is a window).
     Event {
         event: Event,
     },
@@ -2229,6 +2250,13 @@ pub enum StreamMsg {
     },
     /// The history asked for has all been sent; what follows is live.
     Synced,
+    /// Asked for a window (`tail`, `at`): the log is sent from event `from`,
+    /// a user message's, so its turns show whole. Before it come only the
+    /// events [`EventKind::summary`] picks, for totals and the current model.
+    /// Sent before any event.
+    Window {
+        from: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3452,6 +3480,13 @@ pub struct SessionMatches {
 pub struct SessionMatch {
     /// The transcript element showing it (see `SearchHit::anchor`).
     pub anchor: String,
+    /// The event of the session searched that shows it (for a side chat's
+    /// or subagent's, the one it branches from): what a window must reach.
+    #[serde(default)]
+    pub at: u64,
+    /// Its event in its own session (the last of `open`, else this one).
+    #[serde(default)]
+    pub seq: u64,
     /// Side chats and subagent threads to expand first, outermost first.
     pub open: Vec<String>,
     pub kind: String,

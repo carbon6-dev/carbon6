@@ -275,7 +275,7 @@ pub fn MissionPage() -> impl IntoView {
 fn MissionCard(id: String) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let feed = crate::session::Feed::open(id.clone());
+    let feed = crate::session::Feed::open(id.clone(), crate::session::Window::Tail);
     let sid = id.clone();
     let session = Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == sid).cloned()));
     let tracked = {
