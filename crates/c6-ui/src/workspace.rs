@@ -514,6 +514,19 @@ impl Layout {
             .find_map(|(ti, t)| t.columns.iter().position(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|ci| (ti, ci)))
     }
 
+    /// A Brief may already be beside Mail, not just first in its tile.
+    fn focus_brief(&mut self) -> bool {
+        let found =
+            self.tiles.iter().enumerate().find_map(|(ti, t)| t.columns.iter().position(|c| c.view == View::Brief).map(|ci| (ti, ci)));
+        let Some((ti, ci)) = found else { return false };
+        let t = &mut self.tiles[ti];
+        t.cursor = ci;
+        t.active = t.columns[ci].key;
+        self.focus = ti;
+        self.touch(ti);
+        true
+    }
+
     /// Opens `view` in a new tile, after the others (left to right, then
     /// stacking down the columns, in the order opened).
     fn open_tile(&mut self, view: View) {
@@ -595,6 +608,8 @@ const PINNED_KEY: &str = "c6.pinned";
 #[derive(Clone, Copy)]
 pub struct Workspace {
     pub layout: RwSignal<Layout>,
+    /// A request to open, consumed by the active Brief. Never part of its view.
+    pub brief_request: RwSignal<Option<i64>>,
     /// What each session pane offers its tile's bar (its details), by pane
     /// key, while it is shown.
     pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
@@ -614,6 +629,14 @@ impl Workspace {
     /// The saved workspace, with the page's URL opened in it.
     pub fn restore() -> Self {
         let here = View::from_location();
+        let request = (here == View::Brief)
+            .then(|| {
+                web_sys::UrlSearchParams::new_with_str(&window().location().search().unwrap_or_default())
+                    .ok()
+                    .and_then(|q| q.get("request"))
+                    .and_then(|v| crate::brief::request_id(&v))
+            })
+            .flatten();
         let layout = match load::<Layout>(LAYOUT_KEY).filter(Layout::valid) {
             None => Layout::new(here.clone()),
             Some(mut l) => {
@@ -623,6 +646,7 @@ impl Workspace {
         };
         let ws = Workspace {
             layout: RwSignal::new(layout),
+            brief_request: RwSignal::new(request),
             chrome: RwSignal::new(HashMap::new()),
             attention: RwSignal::new(load(ATTENTION_KEY).unwrap_or_default()),
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
@@ -631,7 +655,9 @@ impl Workspace {
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
-        if here != View::home() && ws.layout.with_untracked(|l| l.focused_view() != Some(&here)) {
+        if here == View::Brief {
+            ws.open(None, here, How::OwnTile);
+        } else if here != View::home() && ws.layout.with_untracked(|l| l.focused_view() != Some(&here)) {
             ws.open(None, here, How::Beside);
         }
         // Save, and show the focused column in the address bar.
@@ -657,6 +683,9 @@ impl Workspace {
     /// A session already shown somewhere is shown where it is.
     pub fn open(&self, from: Option<(u64, u64)>, view: View, how: How) {
         self.layout.update(|l| {
+            if view == View::Brief && how != How::NewTile && l.focus_brief() {
+                return;
+            }
             let origin = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus);
             if let View::Session { id, target } = &view
                 && let Some((ti, ci)) = l.find_session(id)
@@ -982,11 +1011,12 @@ pub fn Go(
     #[prop(optional, into)] title: String,
     #[prop(optional)] stop: bool,
     #[prop(optional)] own: bool,
+    #[prop(optional)] brief_request: Option<i64>,
     children: Children,
 ) -> impl IntoView {
     let ws = use_workspace();
     let col = use_column();
-    let href = to.href();
+    let href = brief_request.map_or_else(|| to.href(), |id| crate::place::href(&crate::brief::request_path(id)));
     let to = StoredValue::new(to);
     view! {
         <a href=href class=class title=title on:click=move |ev: web_sys::MouseEvent| {
@@ -1004,6 +1034,9 @@ pub fn Go(
             match col {
                 Some(c) => c.open(to.get_value(), how),
                 None => ws.open(None, to.get_value(), how),
+            }
+            if let Some(id) = brief_request {
+                ws.brief_request.set(Some(id));
             }
         }>{children()}</a>
     }
@@ -1426,6 +1459,33 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brief_views_load_without_carrying_selection() {
+        for json in [r#"{"view":"brief"}"#, r#"{"view":"brief","request":42}"#] {
+            let view: View = serde_json::from_str(json).unwrap();
+            assert_eq!(view, View::Brief);
+            assert_eq!(view.path(), "/brief");
+        }
+    }
+
+    #[test]
+    fn opening_the_brief_reuses_its_mounted_column() {
+        let mut layout = Layout::new(View::Mail);
+        assert!(!layout.focus_brief());
+        let key = layout.key();
+        layout.tiles[0].columns.push(Column { key, view: View::Brief });
+        layout.open_tile(View::Calendar);
+        for _ in 0..2 {
+            assert!(layout.focus_brief());
+            assert_eq!(layout.tiles.len(), 2);
+            assert_eq!(layout.focus, 0);
+            assert_eq!(layout.tiles[0].cursor, 1);
+            assert_eq!(layout.tiles[0].active, key);
+            assert_eq!(layout.tiles[0].columns[1].key, key);
+            assert_eq!(layout.tiles[0].columns[1].view, View::Brief);
+        }
+    }
 
     fn r(left: f64, top: f64, width: f64, height: f64) -> Rect {
         Rect { left, top, width, height }
