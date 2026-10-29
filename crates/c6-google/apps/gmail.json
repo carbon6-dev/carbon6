@@ -1,6 +1,6 @@
 {
   "package": "gmail",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Your Gmail in carbon6: every message kept and searchable, synced both ways (labels, read, archive, trash), drafts and sending. Mail is untrusted input: agents get it as quoted data.",
   "requires": {
     "google": "^1.2"
@@ -44,7 +44,7 @@
     "collections": [
       {
         "name": "gmail_sync",
-        "description": "Where each account's mail sync is: its cursor, its import's place, its last trouble.",
+        "description": "Where each account's mail sync is: its history cursor, waiting messages, import and label check, and quota back-off.",
         "schema": {
           "type": "object",
           "required": [
@@ -98,6 +98,58 @@
               "items": {
                 "type": "string"
               }
+            },
+            "fetch_queue": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "tell": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "description": "new messages waiting for their bytes, with whether to tell about them"
+            },
+            "first": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "the queue whose head gets first turn after it did not fit"
+            },
+            "history_more": {
+              "type": "boolean",
+              "description": "history left for the next run"
+            },
+            "history_record": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "a history record partly handled, before the cursor can advance"
+            },
+            "history_offset": {
+              "type": "integer",
+              "description": "changes already handled within that history record"
+            },
+            "import_turn": {
+              "type": "integer",
+              "description": "when this import last took a turn, so accounts take turns"
+            },
+            "retry_at": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "description": "when Google calls may resume after a quota error (ms since the epoch)"
+            },
+            "retry_count": {
+              "type": "integer",
+              "description": "consecutive quota failures, for doubling the wait"
             },
             "error": {
               "type": [
