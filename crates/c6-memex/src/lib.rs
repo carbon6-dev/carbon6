@@ -682,6 +682,15 @@ impl Memex {
     }
 
     pub async fn handle_method(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        use c6_llm::pool::Priority;
+        let priority = match method {
+            "memex.requests.draft" | "memex.summarize" | "memex.relations.write" => Priority::Interactive,
+            _ => Priority::Background,
+        };
+        priority.scope(Box::pin(self.dispatch(method, params))).await
+    }
+
+    async fn dispatch(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         // Every call is for one realm (the head stamps it): another realm's
         // goes to that realm's memex, with its own database, so nothing
         // crosses. Mail, calendars, contacts, photos and folders are home's.
