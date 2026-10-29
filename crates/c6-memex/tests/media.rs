@@ -269,7 +269,13 @@ async fn photos_and_videos() {
     let people = facets["people"].as_array().unwrap();
     let jane = people.iter().find(|p| p["name"] == "Jane Doe").expect("Jane in the photos");
     assert_eq!((jane["n"].as_i64(), jane["label"].as_str()), (Some(3), Some("person:jane@acme.com")));
-    assert!(people.iter().any(|p| p["name"].as_str().unwrap().starts_with("Unnamed person")));
+    // The blue face once: someone unnamed, once its photo has been looked at
+    // (it may come after the third red one).
+    eventually("someone unnamed", async || {
+        let f = rpc("memex.media.facets", json!({})).await;
+        f["people"].as_array()?.iter().any(|p| p["name"].as_str().unwrap_or("").starts_with("Unnamed person")).then_some(())
+    })
+    .await;
     let janes = rpc("memex.media.list", json!({"about": "person:jane@acme.com"})).await;
     assert_eq!(janes.as_array().unwrap().len(), 3);
     let shown = rpc("memex.media.get", json!({"id": janes[0]["id"]})).await;
