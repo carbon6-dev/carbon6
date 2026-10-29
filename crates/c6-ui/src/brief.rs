@@ -532,10 +532,62 @@ fn choices(text: &str) -> Vec<(String, Vec<String>)> {
 #[component]
 fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     let id = r.id;
-    let draft = RwSignal::new(r.draft.clone().filter(|d| d.error.is_none()));
-    let failed = r.draft.as_ref().and_then(|d| d.error.clone());
+    let draft = RwSignal::new(r.draft.clone().filter(|d| !d.text.is_empty()));
+    let failed = RwSignal::new(r.draft.as_ref().and_then(|d| d.error.clone()));
     let text = RwSignal::new(r.draft.as_ref().map(|d| d.text.clone()).unwrap_or_default());
     let busy = RwSignal::new(false);
+    let drafting = RwSignal::new(r.drafting);
+    let polling = RwSignal::new(false);
+    let generation = RwSignal::new(0u64);
+    let apply = move |r: Request| {
+        drafting.set(r.drafting);
+        failed.set(r.draft.as_ref().and_then(|d| d.error.clone()));
+        let next = r.draft.filter(|d| !d.text.is_empty());
+        let old = draft.get_untracked();
+        if let Some(d) = &next
+            && old.as_ref().is_none_or(|old| old.at != d.at || old.text != d.text || old.target != d.target)
+        {
+            text.set(d.text.clone());
+        }
+        if next != old {
+            draft.set(next);
+        }
+    };
+    let refresh = move || {
+        if polling.get_untracked() || busy.get_untracked() {
+            return;
+        }
+        polling.set(true);
+        let at = generation.get_untracked();
+        spawn_local(async move {
+            let result = api::rpc_as::<Request>("memex.requests.get", json!({"id": id})).await;
+            if generation.try_get_untracked() == Some(at) {
+                match result {
+                    Ok(r) => apply(r),
+                    Err(e) => b.error.set(Some(e)),
+                }
+            }
+            polling.try_set(false);
+        });
+    };
+    refresh();
+    // Drafts have no change event. Poll while one runs, or while an automatic
+    // first draft is still on its way. Leave an edited reply alone otherwise.
+    let automatic = r.category == "needs_you";
+    let poll = set_interval_with_handle(
+        move || {
+            if drafting.get_untracked() || (automatic && draft.get_untracked().is_none() && failed.get_untracked().is_none()) {
+                refresh();
+            }
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .ok();
+    on_cleanup(move || {
+        if let Some(poll) = poll {
+            poll.clear();
+        }
+    });
     let to = LocalResource::new(move || {
         let target = draft.get().map(|d| d.target).unwrap_or_default();
         async move {
@@ -546,19 +598,31 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
         }
     });
     let redraft = move || {
+        if busy.get_untracked() || drafting.get_untracked() {
+            return;
+        }
+        generation.update(|n| *n += 1);
         busy.set(true);
+        drafting.set(true);
         spawn_local(async move {
-            match api::rpc_as::<c6_api::RequestDraft>("memex.requests.draft", json!({"id": id})).await {
-                Ok(d) => {
-                    text.set(d.text.clone());
-                    draft.set(Some(d));
+            let result = api::rpc_as::<Request>("memex.requests.draft", json!({"id": id})).await;
+            if generation.try_get_untracked().is_none() {
+                return;
+            }
+            match result {
+                Ok(r) => apply(r),
+                Err(e) => {
+                    drafting.set(false);
+                    b.error.set(Some(e));
                 }
-                Err(e) => b.error.set(Some(e)),
             }
             busy.set(false);
         });
     };
     let send = move || {
+        if busy.get_untracked() || drafting.get_untracked() || !choices(&text.get_untracked()).is_empty() {
+            return;
+        }
         let Some(d) = draft.get_untracked() else { return };
         busy.set(true);
         spawn_local(async move {
@@ -574,12 +638,11 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     };
     view! {
         <div class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+            {move || failed.get().map(|e| view! { <p class="text-sm text-red-600">{format!("Couldn't draft: {e}")}</p> })}
             {move || match draft.get() {
                 None => view! {
-                    <p class="text-sm text-zinc-500">{failed.clone().map(|e| format!("Couldn't draft: {e}")).unwrap_or_else(|| {
-                        if r.category == "needs_you" { "A draft is on its way.".into() } else { "No draft yet.".into() }
-                    })}</p>
-                    <button class=BUTTON disabled=move || busy.get() on:click=move |_| redraft()>{move || if busy.get() { "Drafting…" } else { "Draft a reply" }}</button>
+                    <p class="text-sm text-zinc-500">{move || if automatic && failed.get().is_none() { "A draft is on its way." } else { "No draft yet." }}</p>
+                    <button class=BUTTON disabled=move || busy.get() || drafting.get() on:click=move |_| redraft()>{move || if drafting.get() { "Drafting…" } else { "Draft a reply" }}</button>
                 }.into_any(),
                 Some(d) => view! {
                     <p class="text-xs text-zinc-500">{move || {
@@ -609,8 +672,8 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                         prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
                         on:keydown=move |ev| if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { ev.prevent_default(); send(); } />
                     <div class="flex flex-wrap gap-2">
-                        <button class=BUTTON disabled=move || busy.get() || !choices(&text.get()).is_empty() on:click=move |_| send()>"Send (⌘↵)"</button>
-                        <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| redraft()>{move || if busy.get() { "…" } else { "Draft again" }}</button>
+                        <button class=BUTTON disabled=move || busy.get() || drafting.get() || !choices(&text.get()).is_empty() on:click=move |_| send()>"Send (⌘↵)"</button>
+                        <button class=BUTTON_QUIET disabled=move || busy.get() || drafting.get() on:click=move |_| redraft()>{move || if drafting.get() { "Drafting…" } else { "Draft again" }}</button>
                     </div>
                 }.into_any(),
             }}

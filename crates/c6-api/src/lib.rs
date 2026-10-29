@@ -4372,6 +4372,9 @@ pub struct Request {
     /// The reply drafted for it, if any (docs/brief.md §6).
     #[serde(default)]
     pub draft: Option<RequestDraft>,
+    /// A draft is being written now. Kept in memory, so it cannot survive a restart.
+    #[serde(default)]
+    pub drafting: bool,
     /// When you were told it's urgent.
     #[serde(default)]
     pub notified_at: Option<UnixMs>,
