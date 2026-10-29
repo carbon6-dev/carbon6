@@ -35,7 +35,9 @@ async fn a_request_you_owe_is_work_that_needs_you() {
         person_name: "Ana",
         title: "Send the Q3 numbers",
         at: c6_core::now_ms(),
+        seen_mail: &[],
         urgent: false,
+        invitation: false,
     };
     c6_memex::requests::follow(&m, &found, None).await.unwrap();
     let id = call("memex.requests.list", json!({})).await[0]["id"].as_i64().expect("a request");

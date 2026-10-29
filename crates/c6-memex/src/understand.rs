@@ -384,6 +384,9 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
         } else {
             crate::triage::Sorting::Waiting
         };
+        if let Err(e) = crate::drafts::sweep_answered(&m).await {
+            warn!("calendar requests: {e:#}");
+        }
         let worked = match sorting {
             crate::triage::Sorting::Worked => true,
             crate::triage::Sorting::Waiting => false,

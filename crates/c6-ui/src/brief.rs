@@ -90,7 +90,7 @@ impl Brief {
         self.loading.set(false);
         match request_to_open(result, now) {
             Ok(r) => self.show(Some(r)),
-            Err(note) => self.notice.set(Some(note.into())),
+            Err(note) => self.notice.set(Some(note)),
         }
     }
 
@@ -146,12 +146,16 @@ pub(crate) fn request_path(id: i64) -> String {
     format!("/brief?request={id}")
 }
 
-fn request_to_open(result: Result<Request, String>, now: i64) -> Result<Request, &'static str> {
+fn request_to_open(result: Result<Request, String>, now: i64) -> Result<Request, String> {
     let r = result.map_err(|_| "This request is unavailable.")?;
     if r.status == "open" || (r.status == "snoozed" && r.until.is_some_and(|until| until <= now)) {
         Ok(r)
     } else {
-        Err("This request is no longer open.")
+        Err(if r.closed_by.as_deref() == Some("calendar") && !r.reason.is_empty() {
+            r.reason
+        } else {
+            "This request is no longer open.".into()
+        })
     }
 }
 
@@ -764,7 +768,7 @@ mod tests {
             let request = Request { id: 42, status: status.into(), until, ..Request::default() };
             assert_eq!(request_to_open(Ok(request), 100).is_ok(), available, "{status}, {until:?}");
         }
-        assert_eq!(request_to_open(Err("no request 42".into()), 100), Err("This request is unavailable."));
+        assert_eq!(request_to_open(Err("no request 42".into()), 100), Err("This request is unavailable.".into()));
     }
 
     #[test]
@@ -844,5 +848,14 @@ mod tests {
             assert_eq!(b.unfolded.get_untracked().as_deref(), Some("c:7"));
             assert_eq!(b.tick.get_untracked(), 0);
         });
+    }
+
+    #[test]
+    fn calendar_closed_requests_explain_the_response() {
+        for reason in ["You accepted it in Calendar.", "You declined it in Calendar.", "You answered maybe in Calendar."] {
+            let request =
+                Request { status: "done".into(), closed_by: Some("calendar".into()), reason: reason.into(), ..Request::default() };
+            assert_eq!(request_to_open(Ok(request), 100), Err(reason.into()));
+        }
     }
 }

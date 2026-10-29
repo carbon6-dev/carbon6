@@ -285,11 +285,14 @@ fn date(ms: i64, tz: chrono_tz::Tz) -> String {
         .unwrap_or_default()
 }
 
-fn calendar_mail(row: &sqlx::sqlite::SqliteRow) -> bool {
-    let from: String = row.get("from_addr");
-    let parts: Vec<Value> = serde_json::from_str(&row.get::<String, _>("parts")).unwrap_or_default();
+fn calendar_metadata(from: &str, parts: &str) -> bool {
+    let parts: Vec<Value> = serde_json::from_str(parts).unwrap_or_default();
     from.eq_ignore_ascii_case("calendar-notification@google.com")
         || parts.iter().any(|p| p["name"].as_str().unwrap_or("").to_lowercase().ends_with(".ics") || p["mime"] == "text/calendar")
+}
+
+fn calendar_mail(row: &sqlx::sqlite::SqliteRow) -> bool {
+    calendar_metadata(&row.get::<String, _>("from_addr"), &row.get::<String, _>("parts"))
 }
 
 async fn mail_text(m: &Memex, row: &sqlx::sqlite::SqliteRow) -> String {
@@ -363,7 +366,10 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     .await?;
     // The first no other step is drafting.
     let Some((id, _claim)) = ids.into_iter().find_map(|id| m.claim(&format!("draft:{id}")).map(|c| (id, c))) else { return Ok(false) };
-    if let Err(e) = draft(m, &task, id).await {
+    if close_answered(m, id).await? {
+        return Ok(true);
+    }
+    if let Err(e) = write_draft(m, &task, id).await {
         if llm::waits(m, &e).await? {
             warn!(id, "drafting waits: {e:#}");
             return Ok(false);
@@ -381,6 +387,11 @@ pub(crate) fn task_context(context: &str) -> (&str, &str) {
 
 /// Drafts (again) a request's reply now.
 pub async fn draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<api::RequestDraft> {
+    anyhow::ensure!(!close_answered(m, id).await?, "This invitation was answered in Calendar.");
+    write_draft(m, task, id).await?.ok_or_else(|| anyhow::anyhow!("The request closed while drafting."))
+}
+
+async fn write_draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<Option<api::RequestDraft>> {
     let r = crate::requests::get(m, id).await?;
     let context = context(m, &r).await?;
     let template = m.prompt("memex.requests.draft", api::prompts::REQUEST_DRAFT);
@@ -402,13 +413,7 @@ pub async fn draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<api::
         at: c6_core::now_ms(),
         by: String::new(),
     };
-    sqlx::query("UPDATE requests SET draft = ?, drafted_at = ? WHERE id = ?")
-        .bind(serde_json::to_string(&d)?)
-        .bind(d.at)
-        .bind(id)
-        .execute(&m.store.pool)
-        .await?;
-    Ok(d)
+    Ok(save_draft(m, id, &d).await?.then_some(d))
 }
 
 // Where to answer: one of its conversations (the latest, if the model
@@ -418,6 +423,17 @@ fn draft_target(target: &str, sources: &[api::RequestSource]) -> String {
     let target = target.strip_suffix(" (mail)").or_else(|| target.strip_suffix(" (chat)")).unwrap_or(target);
     let target = target.trim().trim_matches('`').trim();
     sources.iter().find(|s| s.target == target).or_else(|| sources.last()).map(|s| s.target.clone()).unwrap_or_default()
+}
+
+async fn save_draft(m: &Memex, id: i64, d: &api::RequestDraft) -> anyhow::Result<bool> {
+    let saved = sqlx::query("UPDATE requests SET draft = ?, drafted_at = ? WHERE id = ? AND status IN ('open', 'snoozed')")
+        .bind(serde_json::to_string(d)?)
+        .bind(d.at)
+        .bind(id)
+        .execute(&m.store.pool)
+        .await?
+        .rows_affected();
+    Ok(saved != 0)
 }
 
 /// What the model reads to draft: the conversations, recent exchanges with
@@ -731,6 +747,192 @@ fn decoded_event_id(id: &str) -> Option<String> {
     (!event.is_empty() && !rest.trim().is_empty()).then(|| event.to_owned())
 }
 
+struct InvitationEvents {
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+    exact: HashMap<String, Vec<usize>>,
+    by_event: HashMap<String, Vec<usize>>,
+    by_series: HashMap<String, HashSet<String>>,
+}
+
+impl InvitationEvents {
+    async fn load(m: &Memex) -> anyhow::Result<Self> {
+        let stored = sqlx::query(
+            "SELECT account, calendar_id, event_id, my_status, html_link, start, end, all_day, recurrence, recurring_event_id, \
+             summary, organizer, attendees, COALESCE(updated, 0) AS updated, \
+             EXISTS (SELECT 1 FROM calendars c WHERE c.account = events.account AND c.id = events.calendar_id AND c.is_primary = 1) AS is_primary \
+             FROM events WHERE status != 'cancelled'",
+        )
+        .fetch_all(&m.store.pool)
+        .await?;
+        let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_event: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_series: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut rows = Vec::new();
+        for row in stored {
+            // Copies of the invited series aren't conflicts, even on shared calendars.
+            if let Some(series) = row.get::<Option<String>, _>("recurring_event_id") {
+                by_series.entry(series).or_default().insert(row.get("event_id"));
+            }
+            if !row.get::<bool, _>("is_primary") {
+                continue;
+            }
+            let n = rows.len();
+            if let Some(id) = eid(&row.get::<String, _>("html_link")) {
+                exact.entry(id).or_default().push(n);
+            }
+            by_event.entry(row.get("event_id")).or_default().push(n);
+            rows.push(row);
+        }
+        Ok(Self { rows, exact, by_event, by_series })
+    }
+
+    fn find(&self, ids: &HashSet<String>) -> Option<&sqlx::sqlite::SqliteRow> {
+        let mut matches: HashSet<usize> = ids.iter().filter_map(|id| self.exact.get(id)).flatten().copied().collect();
+        // An alias in the invitation's eid can differ from the stored calendar id.
+        if matches.is_empty() {
+            matches = ids.iter().filter_map(|id| decoded_event_id(id)).filter_map(|id| self.by_event.get(&id)).flatten().copied().collect();
+        }
+        // More than one event (or calendar's copy) leaves the link ambiguous.
+        (matches.len() == 1).then(|| &self.rows[*matches.iter().next().unwrap()])
+    }
+}
+
+/// Close only when every incoming message is an invitation to the same answered event.
+async fn answered(m: &Memex, r: &api::Request, events: Option<&InvitationEvents>) -> anyhow::Result<bool> {
+    if r.category != "needs_you"
+        || !(matches!(r.status.as_str(), "open" | "snoozed") || (r.status == "done" && r.closed_by.as_deref() == Some("calendar")))
+    {
+        return Ok(false);
+    }
+    let marked: bool = sqlx::query_scalar("SELECT invitation FROM requests WHERE id = ?").bind(r.id).fetch_one(&m.store.pool).await?;
+    if !marked {
+        return Ok(false);
+    }
+    let sources: Vec<(String, i64, i64, String)> =
+        sqlx::query_as("SELECT target, at, noted_at, seen_mail FROM request_sources WHERE request_id = ? ORDER BY target")
+            .bind(r.id)
+            .fetch_all(&m.store.pool)
+            .await?;
+    if sources.is_empty() {
+        return Ok(false);
+    }
+    let mut loaded = None;
+    let mut matched: Option<crate::requests::CalendarAnswer> = None;
+    for (target, _, _, seen_mail) in &sources {
+        let Some((account, thread)) = target.strip_prefix("thread:").and_then(|s| s.rsplit_once(':')) else {
+            return Ok(false);
+        };
+        let mails = sqlx::query(
+            "SELECT m.item_id, m.date, m.from_addr, m.subject, m.parts, m.text_blob, m.html_blob, i.body FROM mail m JOIN items i ON i.id = m.item_id \
+             WHERE m.account = ? AND m.thread_id = ? AND m.sent = 0 AND m.draft = 0 AND m.trash = 0 ORDER BY m.item_id",
+        )
+        .bind(account)
+        .bind(thread)
+        .fetch_all(&m.store.pool)
+        .await?;
+        // The invitation mark covers exactly the incoming mail triage read.
+        let ids: Vec<String> = mails.iter().map(|mail| mail.get("item_id")).collect();
+        if ids.is_empty() || serde_json::from_str::<Vec<String>>(seen_mail).ok().as_ref() != Some(&ids) {
+            return Ok(false);
+        }
+        for mail in mails {
+            let text = match mail.get::<Option<String>, _>("text_blob") {
+                Some(hash) => {
+                    let Ok(text) = tokio::fs::read_to_string(m.blob_path(&hash)).await else { return Ok(false) };
+                    text
+                }
+                None => String::new(),
+            };
+            if !calendar_metadata(&mail.get::<String, _>("from_addr"), &mail.get::<String, _>("parts")) {
+                return Ok(false);
+            }
+            let html = match mail.get::<Option<String>, _>("html_blob") {
+                Some(hash) => {
+                    let Ok(text) = tokio::fs::read_to_string(m.blob_path(&hash)).await else { return Ok(false) };
+                    text
+                }
+                None => String::new(),
+            };
+            let ids = event_ids(&text, &html, &mail.get::<String, _>("body"));
+            if ids.is_empty() {
+                return Ok(false);
+            }
+            if events.is_none() && loaded.is_none() {
+                loaded = Some(InvitationEvents::load(m).await?);
+            }
+            let Some(event) = events.or(loaded.as_ref()).unwrap().find(&ids) else {
+                return Ok(false);
+            };
+            if ids.iter().any(|id| {
+                events.or(loaded.as_ref()).unwrap().find(&HashSet::from([id.clone()])).is_none_or(|other| {
+                    ["account", "calendar_id", "event_id"].iter().any(|key| other.get::<String, _>(*key) != event.get::<String, _>(*key))
+                })
+            }) {
+                return Ok(false);
+            }
+            let updated: i64 = event.get("updated");
+            // An organizer update mailed after its Calendar timestamp stays open, even if the answer was kept.
+            if updated <= 0 || updated < mail.get::<i64, _>("date") {
+                return Ok(false);
+            }
+            let key = (event.get::<String, _>("account"), event.get::<String, _>("calendar_id"), event.get::<String, _>("event_id"));
+            if matched.as_ref().is_some_and(|old| (&old.account, &old.calendar, &old.event) != (&key.0, &key.1, &key.2)) {
+                return Ok(false);
+            }
+            matched = Some(crate::requests::CalendarAnswer {
+                account: key.0,
+                calendar: key.1,
+                event: key.2,
+                status: event.get("my_status"),
+                updated,
+            });
+        }
+    }
+    let Some(event) = matched else { return Ok(false) };
+    let reason = match event.status.as_str() {
+        "accepted" => "You accepted it in Calendar.",
+        "declined" => "You declined it in Calendar.",
+        "tentative" => "You answered maybe in Calendar.",
+        _ => return Ok(false),
+    };
+    crate::requests::close_calendar(m, r.id, reason, &sources, &event).await
+}
+
+pub(crate) async fn close_answered(m: &Memex, id: i64) -> anyhow::Result<bool> {
+    let r = crate::requests::get(m, id).await?;
+    if r.category != "needs_you" || r.sources.iter().any(|s| !s.target.starts_with("thread:")) {
+        return Ok(false);
+    }
+    answered(m, &r, None).await
+}
+
+/// One event lookup for the whole sweep; a change during it schedules another pass.
+pub(crate) async fn sweep_answered(m: &Memex) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let Some(_claim) = m.claim("calendar:requests") else { return Ok(()) };
+    if !m.calendar_changed.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    let result = async {
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM requests WHERE invitation = 1 AND category = 'needs_you' AND status IN ('open', 'snoozed')")
+                .fetch_all(&m.store.pool)
+                .await?;
+        if !ids.is_empty() {
+            let events = InvitationEvents::load(m).await?;
+            for id in ids {
+                answered(m, &crate::requests::get(m, id).await?, Some(&events)).await?;
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if result.is_err() {
+        m.calendar_changed.store(true, Ordering::Release);
+    }
+    result
+}
+
 async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitation>> {
     let mine: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
     let mut messages = Vec::new();
@@ -764,33 +966,10 @@ async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitati
     if messages.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(
-        "SELECT account, calendar_id, event_id, my_status, html_link, start, end, all_day, recurrence, recurring_event_id, summary, organizer, attendees FROM events WHERE status != 'cancelled'",
-    )
-    .fetch_all(&m.store.pool)
-    .await?;
-    let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut by_event: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut by_series: HashMap<String, HashSet<String>> = HashMap::new();
-    for (n, row) in rows.iter().enumerate() {
-        if let Some(id) = eid(&row.get::<String, _>("html_link")) {
-            exact.entry(id).or_default().push(n);
-        }
-        by_event.entry(row.get("event_id")).or_default().push(n);
-        if let Some(series) = row.get::<Option<String>, _>("recurring_event_id") {
-            by_series.entry(series).or_default().insert(row.get("event_id"));
-        }
-    }
+    let events = InvitationEvents::load(m).await?;
     let mut out = Vec::new();
     for (target, ids) in messages {
-        let mut matches: HashSet<usize> = ids.iter().filter_map(|id| exact.get(id)).flatten().copied().collect();
-        // An alias in the invitation's eid can differ from the stored calendar id.
-        if matches.is_empty() {
-            matches = ids.iter().filter_map(|id| decoded_event_id(id)).filter_map(|id| by_event.get(&id)).flatten().copied().collect();
-        }
-        // More than one event (or calendar's copy) leaves the link ambiguous.
-        if matches.len() == 1 {
-            let event = &rows[*matches.iter().next().unwrap()];
+        if let Some(event) = events.find(&ids) {
             let attendees: Vec<Value> = serde_json::from_str(&event.get::<String, _>("attendees")).unwrap_or_default();
             let optional = attendees.iter().any(|a| {
                 (a["self"] == true || a["email"].as_str().is_some_and(|e| mine.contains(&e.to_lowercase()))) && a["optional"] == true
@@ -808,7 +987,7 @@ async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitati
                 end: event.get("end"),
                 all_day: event.get::<i64, _>("all_day") != 0,
                 recurring: event.get::<String, _>("recurrence") != "[]",
-                instances: by_series.get(&event.get::<String, _>("event_id")).cloned().unwrap_or_default(),
+                instances: events.by_series.get(&event.get::<String, _>("event_id")).cloned().unwrap_or_default(),
             });
         }
     }
@@ -1112,6 +1291,10 @@ mod tests {
     }
 
     async fn message(m: &Memex, text: &str, html: Option<&str>) -> api::Request {
+        sqlx::query("INSERT OR IGNORE INTO calendars (account, id, summary, is_primary) VALUES ('cal-acct', 'primary', '', 1)")
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
         let parsed = Parsed {
             message_id: "invite@example.com".into(),
             from: ("host@example.net".into(), "Host".into()),
@@ -1930,6 +2113,7 @@ mod tests {
         assert_eq!((&*found[0].account, &*found[0].calendar, &*found[0].event), ("cal-acct", "primary", "dinner"));
         assert!(free(&m, &found).await.unwrap().contains("the invitation being answered"));
 
+        crate::calendar::store_calendar(&m, "other-acct", &json!({"id": "other", "primary": true})).await.unwrap();
         crate::calendar::store_event(
             &m,
             "test-calendar",
@@ -1983,7 +2167,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let m = Memex::open(dir.path(), Default::default()).await.unwrap();
             crate::calendar::store_calendar(&m, "elsewhere", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
-            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "timeZone": "America/Los_Angeles"})).await.unwrap();
+            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "America/Los_Angeles"}))
+                .await
+                .unwrap();
             let tz = chrono_tz::America::Los_Angeles;
             let day = chrono::Utc::now().date_naive() + chrono::Duration::days(days);
             let time =
@@ -2219,7 +2405,9 @@ mod tests {
         );
         let moved = start + 8 * day + 30 * 60_000;
         for (calendar, id) in [("primary", "moved"), ("copy", "moved-copy")] {
-            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": calendar, "timeZone": "UTC"})).await.unwrap();
+            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": calendar, "primary": calendar == "primary", "timeZone": "UTC"}))
+                .await
+                .unwrap();
             crate::calendar::store_event(
                 &m,
                 "test-calendar",
@@ -2480,7 +2668,9 @@ mod tests {
                 person_name: "Host",
                 title: "Workshop",
                 at: c6_core::now_ms(),
+                seen_mail: &[],
                 urgent: false,
+                invitation: false,
             },
             None,
         )
@@ -2592,5 +2782,829 @@ mod tests {
             assert_eq!(draft_target("unknown", &sources), sources.last().unwrap().target);
         }
         assert_eq!(draft_target("unknown", &[]), "");
+    }
+    async fn invitation_request(m: &Memex) -> i64 {
+        invitation_request_with(m, true).await
+    }
+
+    async fn invitation_request_with(m: &Memex, invitation: bool) -> i64 {
+        let at = sqlx::query_scalar("SELECT COALESCE(MAX(date), 0) FROM mail WHERE account = 'mail-acct' AND thread_id = 'thread'")
+            .fetch_one(&m.store.pool)
+            .await
+            .unwrap();
+        crate::requests::follow(
+            m,
+            &crate::requests::Found {
+                target: "thread:mail-acct:thread",
+                kind: "mail",
+                category: "needs_you",
+                reason: "Please RSVP",
+                asks: "RSVP to Workshop",
+                due: None,
+                person: "host@example.net",
+                person_name: "Host",
+                title: "Workshop",
+                at,
+                seen_mail: &sqlx::query_scalar("SELECT item_id FROM mail WHERE account = 'mail-acct' AND thread_id = 'thread' AND sent = 0 AND draft = 0 AND trash = 0 ORDER BY item_id")
+                    .fetch_all(&m.store.pool).await.unwrap(),
+                urgent: true,
+                invitation,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query_scalar("SELECT MAX(id) FROM requests").fetch_one(&m.store.pool).await.unwrap()
+    }
+
+    fn notification(url: &str) -> String {
+        format!(
+            "You have been invited to the following event.\nWorkshop\n\nWhen\nFriday afternoon\n\nGuests\nhost@example.net - organizer\nme@example.com\n\nView your event at {url}\nYes - Maybe - No\nInvitation from Google Calendar: {url}"
+        )
+    }
+
+    fn title_notification(url: &str) -> String {
+        format!(
+            r#"Workshop
+Tuesday Nov 3, 2026 ⋅ 5:30pm – 8pm
+Hawaii-Aleutian Standard Time
+
+
+
+Organizer
+Alex Morgan
+host@example.net
+
+Guests
+Sam Rivera
+Jamie Chen
+View all guest info
+{url}
+
+Reply for me@example.com and view more details
+{url}
+Your attendance is optional.
+
+~~//~~
+Invitation from Google Calendar: {url}
+
+You are receiving this email because you are subscribed to calendar
+notifications. To stop receiving these emails, go to
+https://calendar.google.com/calendar/settings
+change "Other notifications".
+
+Forwarding this invitation could allow any recipient to send a response to
+the organizer, be added to the guest list, invite others regardless of
+their own invitation status, or modify your RSVP.
+
+Learn more https://support.google.com/calendar/answer/37135
+"#
+        )
+    }
+
+    async fn response_event(m: &Memex, id: &str, start: i64, status: &str, link: &str, updated: i64) {
+        let time = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339();
+        crate::calendar::store_event(
+            m,
+            "test-calendar",
+            "cal-acct",
+            "me@example.com",
+            "primary",
+            &json!({
+                "id": id, "summary": "Workshop", "start": {"dateTime": time(start)},
+                "end": {"dateTime": time(start + 3_600_000)}, "updated": time(updated), "htmlLink": link,
+                "attendees": [{"email": "me@example.com", "self": true, "responseStatus": status}],
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn fresh_event(m: &Memex, id: &str, start: i64, status: &str, link: &str) {
+        let updated: Option<i64> =
+            sqlx::query_scalar("SELECT updated FROM events WHERE account = 'cal-acct' AND calendar_id = 'primary' AND event_id = ?")
+                .bind(id)
+                .fetch_optional(&m.store.pool)
+                .await
+                .unwrap();
+        response_event(m, id, start, status, link, updated.unwrap_or_else(c6_core::now_ms)).await;
+    }
+
+    #[tokio::test]
+    async fn calendar_responses_close_requests_before_notifications_or_drafts() {
+        c6_llm::install_crypto_provider();
+        for (status, reason) in [
+            ("accepted", "You accepted it in Calendar."),
+            ("declined", "You declined it in Calendar."),
+            ("tentative", "You answered maybe in Calendar."),
+        ] {
+            for (before, current) in [(true, false), (false, false), (true, true), (false, true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+                let url = link("workshop", "me@example.com");
+                calendar_message(&m, &if current { title_notification(&url) } else { notification(&url) }, None).await;
+                if before {
+                    fresh_event(&m, "workshop", c6_core::now_ms() + DAY, status, &url).await;
+                }
+                m.brief_setting.lock().unwrap().urgent = before;
+                let id = invitation_request(&m).await;
+                if !before {
+                    assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+                    if status == "accepted" {
+                        let key = format!("request:{id}");
+                        crate::compose::set(&m, &key, "Looking forward to the workshop.", "session:s1").await.unwrap();
+                        crate::compose::link(&m, &key, "s1").await.unwrap();
+                    }
+                    sweep_answered(&m).await.unwrap();
+                    assert!(!m.calendar_changed.load(std::sync::atomic::Ordering::Acquire));
+                    fresh_event(&m, "workshop", c6_core::now_ms() + DAY, status, &url).await;
+                    assert!(m.calendar_changed.load(std::sync::atomic::Ordering::Acquire));
+                    sweep_answered(&m).await.unwrap();
+                }
+                let r = crate::requests::get(&m, id).await.unwrap();
+                assert_eq!(r.status, "done");
+                assert_eq!(r.closed_by.as_deref(), Some("calendar"));
+                assert_eq!(r.reason, reason);
+                if !before && status == "accepted" {
+                    let kept = crate::compose::get(&m, &format!("request:{id}")).await.unwrap();
+                    assert_eq!(
+                        (kept["text"].as_str(), kept["by"].as_str(), kept["session"].as_str()),
+                        (Some("Looking forward to the workshop."), Some("session:s1"), Some("s1")),
+                    );
+                } else {
+                    assert!(r.draft.is_none());
+                }
+                assert!(r.notified_at.is_none());
+                let task = llm::Task { connection_id: "unused".into(), model: "unused".into(), effort: None };
+                assert!(draft(&m, &task, id).await.unwrap_err().to_string().contains("answered in Calendar"));
+                let calls: i64 =
+                    sqlx::query_scalar("SELECT COALESCE(SUM(calls), 0) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
+                assert_eq!(calls, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_sweep_and_drafting_check_existing_requests() {
+        c6_llm::install_crypto_provider();
+        for path in ["restart", "step", "follow", "draft"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let url = link("workshop", "me@example.com");
+            calendar_message(&m, &notification(&url), None).await;
+            fresh_event(&m, "workshop", c6_core::now_ms() + DAY, "needsAction", &url).await;
+            let id = invitation_request(&m).await;
+            sweep_answered(&m).await.unwrap();
+            fresh_event(&m, "workshop", c6_core::now_ms() + DAY, "needsAction", &url).await;
+            assert!(!m.calendar_changed.load(std::sync::atomic::Ordering::Acquire));
+            fresh_event(&m, "workshop", c6_core::now_ms() + DAY, "accepted", &url).await;
+            let m = if path == "restart" {
+                m.store.pool.close().await;
+                Memex::open(dir.path(), Default::default()).await.unwrap()
+            } else {
+                m
+            };
+            if path == "restart" {
+                assert!(m.calendar_changed.load(std::sync::atomic::Ordering::Acquire));
+                sweep_answered(&m).await.unwrap();
+            } else if path == "follow" {
+                assert_eq!(invitation_request(&m).await, id);
+            } else if path == "draft" {
+                let task = llm::Task { connection_id: "unused".into(), model: "unused".into(), effort: None };
+                assert!(draft(&m, &task, id).await.unwrap_err().to_string().contains("answered in Calendar"));
+            } else {
+                m.set_tasks(crate::Tasks {
+                    understanding: Some(llm::Task { connection_id: "unused".into(), model: "unused".into(), effort: None }),
+                    per_day: 10,
+                    ..Default::default()
+                });
+                assert!(step(&m).await.unwrap());
+            }
+            let r = crate::requests::get(&m, id).await.unwrap();
+            assert_eq!(r.status, "done");
+            assert!(r.draft.is_none());
+            let calls: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(calls), 0) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
+            assert_eq!(calls, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_closure_leaves_mixed_or_uncertain_requests_open() {
+        c6_llm::install_crypto_provider();
+        for case in [
+            "needsAction",
+            "human",
+            "unmarked",
+            "unreadable",
+            "chat",
+            "thread",
+            "ambiguous",
+            "unmatched",
+            "extra link",
+            "two events",
+            "snoozed",
+            "expired",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let url = link("workshop", "me@example.com");
+            let mut text = notification(&url);
+            if case == "extra link" {
+                text.push_str(&format!("\n{}", link("unmatched", "me@example.com")));
+            }
+            calendar_message(&m, &text, None).await;
+            let id = invitation_request(&m).await;
+            if case == "unmarked" {
+                sqlx::query("UPDATE requests SET invitation = 0 WHERE id = ?").bind(id).execute(&m.store.pool).await.unwrap();
+            }
+            if matches!(case, "human" | "thread" | "two events") {
+                let text =
+                    if case == "two events" { notification(&link("dinner", "me@example.com")) } else { "Please send the slides.".into() };
+                kept_mail(
+                    &m,
+                    "question",
+                    if case == "thread" { "other" } else { "thread" },
+                    c6_core::now_ms() - 10 * DAY,
+                    Parsed {
+                        from: ("host@example.net".into(), "Host".into()),
+                        subject: "Question".into(),
+                        text,
+                        attachments: if case == "two events" { vec![json!({"mime":"text/calendar"})] } else { vec![] },
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await;
+                // The human message is older than the drafting context's six-message window.
+                if case == "human" {
+                    for n in 0..7 {
+                        kept_mail(
+                            &m,
+                            &format!("update-{n}"),
+                            "thread",
+                            c6_core::now_ms(),
+                            Parsed {
+                                from: ("host@example.net".into(), "Host".into()),
+                                subject: "Updated invitation".into(),
+                                attachments: vec![json!({"mime":"text/calendar", "name":"attachment"})],
+                                text: notification(&url),
+                                ..Default::default()
+                            },
+                            false,
+                        )
+                        .await;
+                    }
+                }
+            }
+            if matches!(case, "chat" | "thread") {
+                let target = if case == "chat" { "chat:room" } else { "thread:mail-acct:other" };
+                sqlx::query("INSERT INTO request_sources (request_id, target, kind, at, noted_at, seen_mail) VALUES (?, ?, ?, 0, 0, '[]')")
+                    .bind(id)
+                    .bind(target)
+                    .bind(if case == "chat" { "chat" } else { "mail" })
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+            }
+            if matches!(case, "snoozed" | "expired") {
+                sqlx::query("UPDATE requests SET status = 'snoozed', until = ? WHERE id = ?")
+                    .bind(c6_core::now_ms() + if case == "snoozed" { DAY } else { -DAY })
+                    .bind(id)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+            }
+            if case == "unreadable" {
+                sqlx::query("UPDATE mail SET text_blob = 'missing-invented-blob' WHERE thread_id = 'thread'")
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+            }
+            if case != "unmatched" {
+                fresh_event(&m, "workshop", c6_core::now_ms() + DAY, if case == "needsAction" { "needsAction" } else { "accepted" }, &url)
+                    .await;
+            }
+            if case == "ambiguous" {
+                fresh_event(&m, "copy", c6_core::now_ms() + DAY, "accepted", &url).await;
+            }
+            if case == "two events" {
+                fresh_event(&m, "dinner", c6_core::now_ms() + DAY, "accepted", &link("dinner", "me@example.com")).await;
+            }
+            sweep_answered(&m).await.unwrap();
+            let r = crate::requests::get(&m, id).await.unwrap();
+            assert_eq!(r.status, if matches!(case, "expired" | "snoozed") { "done" } else { "open" }, "{case}");
+            assert!(r.draft.is_none(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reinvitations_wait_for_a_current_calendar_answer() {
+        c6_llm::install_crypto_provider();
+        let date = 1_900_000_000_000;
+        for (status, updated) in [("declined", date - 300_000), ("accepted", date - 300_000), ("accepted", 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let url = link("workshop", "me@example.com");
+            response_event(&m, "workshop", date + DAY, status, &url, updated).await;
+            calendar_message(&m, &notification(&url), None).await;
+            sqlx::query("UPDATE mail SET date = ?").bind(date).execute(&m.store.pool).await.unwrap();
+            let id = invitation_request(&m).await;
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+            sweep_answered(&m).await.unwrap();
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+            if status == "declined" {
+                response_event(&m, "workshop", date + DAY, "needsAction", &url, date).await;
+                sweep_answered(&m).await.unwrap();
+                assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+            }
+            // A newer timestamp alone must schedule a sweep, even if the answer is unchanged.
+            assert!(!m.calendar_changed.load(std::sync::atomic::Ordering::Acquire));
+            response_event(&m, "workshop", date + DAY, "accepted", &url, date + 60_000).await;
+            assert!(m.calendar_changed.load(std::sync::atomic::Ordering::Acquire));
+            sweep_answered(&m).await.unwrap();
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().closed_by.as_deref(), Some("calendar"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_freshness_uses_the_latest_message_without_an_allowance() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let date = 1_900_000_000_000;
+        let url = link("workshop", "me@example.com");
+        calendar_message(&m, &notification(&url), None).await;
+        sqlx::query("UPDATE mail SET date = ?").bind(date - DAY).execute(&m.store.pool).await.unwrap();
+        let id = invitation_request(&m).await;
+        kept_mail(
+            &m,
+            "update",
+            "thread",
+            date,
+            Parsed {
+                from: ("host@example.net".into(), "Host".into()),
+                subject: "Updated invitation".into(),
+                attachments: vec![json!({"mime":"text/calendar", "name":"attachment"})],
+                text: notification(&url),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        assert_eq!(invitation_request(&m).await, id);
+        response_event(&m, "workshop", date + DAY, "accepted", &url, date - 1).await;
+        sweep_answered(&m).await.unwrap();
+        assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+        response_event(&m, "workshop", date + DAY, "accepted", &url, date).await;
+        sweep_answered(&m).await.unwrap();
+        assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "done");
+    }
+
+    #[tokio::test]
+    async fn calendar_close_requires_the_sources_and_status_that_were_checked() {
+        c6_llm::install_crypto_provider();
+        for change in ["added", "noted", "at", "seen", "unmarked", "done", "dropped", "unchanged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            calendar_message(&m, &notification(&link("workshop", "me@example.com")), None).await;
+            let id = invitation_request(&m).await;
+            let sources: Vec<(String, i64, i64, String)> =
+                sqlx::query_as("SELECT target, at, noted_at, seen_mail FROM request_sources WHERE request_id = ? ORDER BY target")
+                    .bind(id)
+                    .fetch_all(&m.store.pool)
+                    .await
+                    .unwrap();
+            // These changes happen after reading the sources and before the closing UPDATE.
+            match change {
+                "added" => {
+                    sqlx::query(
+                        "INSERT INTO request_sources (request_id, target, kind, at, noted_at, seen_mail) VALUES (?, 'chat:room', 'chat', 0, 0, '[]')",
+                    )
+                    .bind(id)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+                }
+                "unmarked" => {
+                    sqlx::query("UPDATE requests SET invitation = 0 WHERE id = ?").bind(id).execute(&m.store.pool).await.unwrap();
+                }
+                "at" => {
+                    sqlx::query("UPDATE request_sources SET at = at + 1 WHERE request_id = ?")
+                        .bind(id)
+                        .execute(&m.store.pool)
+                        .await
+                        .unwrap();
+                }
+                "seen" => {
+                    sqlx::query("UPDATE request_sources SET seen_mail = '[]' WHERE request_id = ?")
+                        .bind(id)
+                        .execute(&m.store.pool)
+                        .await
+                        .unwrap();
+                }
+                "noted" => {
+                    sqlx::query("UPDATE request_sources SET noted_at = noted_at + 1 WHERE request_id = ?")
+                        .bind(id)
+                        .execute(&m.store.pool)
+                        .await
+                        .unwrap();
+                }
+                "done" | "dropped" => {
+                    crate::requests::close(&m, id, change, "you").await.unwrap();
+                }
+                _ => {}
+            }
+            let updated = c6_core::now_ms();
+            response_event(&m, "workshop", updated + DAY, "accepted", &link("workshop", "me@example.com"), updated).await;
+            let event = crate::requests::CalendarAnswer {
+                account: "cal-acct".into(),
+                calendar: "primary".into(),
+                event: "workshop".into(),
+                status: "accepted".into(),
+                updated,
+            };
+            let closed = crate::requests::close_calendar(&m, id, "You accepted it in Calendar.", &sources, &event).await.unwrap();
+            assert_eq!(closed, change == "unchanged", "{change}");
+            let r = crate::requests::get(&m, id).await.unwrap();
+            if change == "unchanged" {
+                assert_eq!(r.closed_by.as_deref(), Some("calendar"));
+            } else {
+                assert_eq!(r.reason, "Please RSVP");
+                assert_eq!(r.status, if matches!(change, "done" | "dropped") { change } else { "open" });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_request_does_not_keep_a_late_draft() {
+        c6_llm::install_crypto_provider();
+        for status in ["open", "snoozed", "done", "dropped"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            calendar_message(&m, "Please send the slides.", None).await;
+            let id = invitation_request(&m).await;
+            let old = api::RequestDraft { text: "The previous draft.".into(), at: 10, ..Default::default() };
+            save_draft(&m, id, &old).await.unwrap();
+            crate::requests::set(&m, id, status, Some(c6_core::now_ms() + DAY)).await.unwrap();
+            let late = api::RequestDraft { text: "The late draft.".into(), at: 20, ..Default::default() };
+            let saved = save_draft(&m, id, &late).await;
+            let r = crate::requests::get(&m, id).await.unwrap();
+            if matches!(status, "done" | "dropped") {
+                assert!(!saved.unwrap());
+                assert_eq!(r.draft, Some(old));
+            } else {
+                assert!(saved.unwrap());
+                assert_eq!(r.draft, Some(late));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_close_rechecks_the_event_at_the_write() {
+        c6_llm::install_crypto_provider();
+        for change in ["status", "updated", "deleted", "unchanged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let url = link("workshop", "me@example.com");
+            calendar_message(&m, &notification(&url), None).await;
+            let id = invitation_request(&m).await;
+            let updated = c6_core::now_ms();
+            response_event(&m, "workshop", updated + DAY, "accepted", &url, updated).await;
+            let sources =
+                sqlx::query_as("SELECT target, at, noted_at, seen_mail FROM request_sources WHERE request_id = ? ORDER BY target")
+                    .bind(id)
+                    .fetch_all(&m.store.pool)
+                    .await
+                    .unwrap();
+            let answer = crate::requests::CalendarAnswer {
+                account: "cal-acct".into(),
+                calendar: "primary".into(),
+                event: "workshop".into(),
+                status: "accepted".into(),
+                updated,
+            };
+            match change {
+                "status" => {
+                    sqlx::query("UPDATE events SET my_status = 'needsAction'").execute(&m.store.pool).await.unwrap();
+                }
+                "updated" => {
+                    sqlx::query("UPDATE events SET updated = updated + 1").execute(&m.store.pool).await.unwrap();
+                }
+                "deleted" => {
+                    sqlx::query("DELETE FROM events").execute(&m.store.pool).await.unwrap();
+                }
+                _ => {}
+            }
+            assert_eq!(
+                crate::requests::close_calendar(&m, id, "You accepted it in Calendar.", &sources, &answer).await.unwrap(),
+                change == "unchanged"
+            );
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().status, if change == "unchanged" { "done" } else { "open" });
+        }
+    }
+
+    #[tokio::test]
+    async fn a_calendar_closed_request_must_still_have_only_invitations() {
+        c6_llm::install_crypto_provider();
+        for change in ["chat", "human"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let url = link("workshop", "me@example.com");
+            calendar_message(&m, &notification(&url), None).await;
+            fresh_event(&m, "workshop", c6_core::now_ms() + DAY, "accepted", &url).await;
+            let id = invitation_request(&m).await;
+            assert!(close_answered(&m, id).await.unwrap());
+            if change == "chat" {
+                sqlx::query("INSERT INTO request_sources (request_id, target, kind, at, noted_at, seen_mail) VALUES (?, 'chat:room', 'chat', 0, 0, '[]')")
+                    .bind(id)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+            } else {
+                kept_mail(
+                    &m,
+                    "question",
+                    "thread",
+                    c6_core::now_ms(),
+                    Parsed {
+                        from: ("host@example.net".into(), "Host".into()),
+                        subject: "Question".into(),
+                        text: "Can you bring the projector?".into(),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await;
+            }
+            assert!(!close_answered(&m, id).await.unwrap());
+        }
+    }
+
+    async fn calendar_message(m: &Memex, text: &str, html: Option<&str>) -> api::Request {
+        let r = message(m, text, html).await;
+        sqlx::query("UPDATE mail SET parts = ? WHERE account = 'mail-acct' AND thread_id = 'thread'")
+            .bind(json!([{"mime":"text/calendar","name":"attachment"},{"mime":"application/ics","name":"invite.ics"}]).to_string())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        r
+    }
+
+    #[test]
+    fn calendar_metadata_does_not_depend_on_the_message_layout() {
+        for (sender, parts, expected) in [
+            ("calendar-notification@google.com", "[]", true),
+            ("host@example.net", r#"[{"mime":"text/calendar","name":"attachment"}]"#, true),
+            ("host@example.net", r#"[{"mime":"application/ics","name":"invite.ICS"}]"#, true),
+            ("host@example.net", r#"[{"mime":"text/plain","name":"note.txt"}]"#, false),
+            ("host@example.net", "[]", false),
+            ("host@example.net", "broken json", false),
+        ] {
+            assert_eq!(calendar_metadata(sender, parts), expected, "{sender}: {parts}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_facts_use_only_the_owners_primary_calendar() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id":"shared", "primary":false})).await.unwrap();
+        crate::calendar::store_calendar(&m, "other-acct", &json!({"id":"shared", "primary":true})).await.unwrap();
+        let url = link("workshop", "colleague@example.net");
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "me@example.com",
+            "shared",
+            &json!({
+                "id":"workshop", "summary":"Workshop", "htmlLink":url,
+                "start":{"dateTime":"2030-01-01T17:00:00Z"}, "end":{"dateTime":"2030-01-01T18:00:00Z"},
+                "attendees":[{"email":"colleague@example.net", "self":true, "responseStatus":"accepted", "optional":true}]
+            }),
+        )
+        .await
+        .unwrap();
+        for url in [&url, &link("workshop", "alias@example.net")] {
+            let r = message(&m, url, None).await;
+            assert!(invitations(&m, &r).await.unwrap().is_empty());
+            let text = context(&m, &r).await.unwrap();
+            assert!(!text.contains("## Invitations being answered"), "{text}");
+            assert!(!text.contains("accepted"), "{text}");
+            assert!(!text.contains("Your attendance:"), "{text}");
+        }
+        let r = message(&m, &link("workshop", "alias@example.net"), None).await;
+        event(&m, "workshop", c6_core::now_ms() + DAY, "needsAction", &link("workshop", "me@example.com")).await;
+        let found = invitations(&m, &r).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].calendar, "primary");
+        assert_eq!(found[0].response, "not yet answered");
+        assert!(!found[0].optional);
+    }
+
+    #[tokio::test]
+    async fn calendar_answers_wait_until_triage_has_seen_the_latest_mail() {
+        c6_llm::install_crypto_provider();
+        for invitation in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let date = 1_900_000_000_000;
+            let url = link("workshop", "me@example.com");
+            calendar_message(&m, &notification(&url), None).await;
+            sqlx::query("UPDATE mail SET date = ?").bind(date).execute(&m.store.pool).await.unwrap();
+            let id = invitation_request(&m).await;
+            kept_mail(
+                &m,
+                "new",
+                "thread",
+                date + 60_000,
+                Parsed {
+                    from: ("host@example.net".into(), "Host".into()),
+                    text: if invitation { notification(&url) } else { format!("{url}\nAlso please bring the projector.") },
+                    attachments: vec![json!({"mime":"application/ics", "name":"invite.ics"})],
+                    ..Default::default()
+                },
+                false,
+            )
+            .await;
+            response_event(&m, "workshop", date + DAY, "accepted", &url, date + 120_000).await;
+            // The calendar sweep still runs when there is no model to judge the new mail.
+            sweep_answered(&m).await.unwrap();
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+            assert!(!close_answered(&m, id).await.unwrap());
+            assert_eq!(invitation_request_with(&m, invitation).await, id);
+            let r = crate::requests::get(&m, id).await.unwrap();
+            assert_eq!(r.status, if invitation { "done" } else { "open" });
+            let marked: bool =
+                sqlx::query_scalar("SELECT invitation FROM requests WHERE id = ?").bind(id).fetch_one(&m.store.pool).await.unwrap();
+            assert_eq!(marked, invitation);
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_close_rechecks_incoming_mail_at_the_write() {
+        c6_llm::install_crypto_provider();
+        for change in ["newer", "same time", "older", "late", "trash", "unseen", "removed", "ignored", "other thread", "unchanged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let date = 1_900_000_000_000;
+            let url = link("workshop", "me@example.com");
+            calendar_message(&m, &notification(&url), None).await;
+            sqlx::query("UPDATE mail SET date = ?").bind(date).execute(&m.store.pool).await.unwrap();
+            let pending = pending_mail(&m, &url, date - 1).await;
+            let id = invitation_request(&m).await;
+            if change == "unseen" {
+                sqlx::query("UPDATE request_sources SET seen_mail = '[]' WHERE request_id = ?")
+                    .bind(id)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+            }
+            let sources =
+                sqlx::query_as("SELECT target, at, noted_at, seen_mail FROM request_sources WHERE request_id = ? ORDER BY target")
+                    .bind(id)
+                    .fetch_all(&m.store.pool)
+                    .await
+                    .unwrap();
+            response_event(&m, "workshop", date + DAY, "accepted", &url, date + 120_000).await;
+            let event = crate::requests::CalendarAnswer {
+                account: "cal-acct".into(),
+                calendar: "primary".into(),
+                event: "workshop".into(),
+                status: "accepted".into(),
+                updated: date + 120_000,
+            };
+            // Mail changes after the snapshots were read, without touching the source or event.
+            if matches!(change, "newer" | "same time" | "older" | "other thread") {
+                kept_mail(
+                    &m,
+                    "new",
+                    if change == "other thread" { "other" } else { "thread" },
+                    date + match change {
+                        "older" => -1,
+                        "same time" => 0,
+                        _ => 1,
+                    },
+                    Parsed {
+                        from: ("host@example.net".into(), "Host".into()),
+                        text: format!("{url}\nAlso please bring the projector."),
+                        attachments: vec![json!({"mime":"application/ics", "name":"invite.ics"})],
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await;
+            } else if change == "late" {
+                finish_mail(&m, &pending, date - 1).await;
+            } else if change == "trash" {
+                sqlx::query("UPDATE mail SET trash = 1").execute(&m.store.pool).await.unwrap();
+            } else if change == "removed" {
+                sqlx::query("DELETE FROM mail").execute(&m.store.pool).await.unwrap();
+            } else if change == "ignored" {
+                for flag in ["sent", "draft", "trash"] {
+                    let item = kept_mail(
+                        &m,
+                        flag,
+                        "thread",
+                        date + 1,
+                        Parsed { text: "An ignored message".into(), ..Default::default() },
+                        flag == "sent",
+                    )
+                    .await;
+                    sqlx::query("UPDATE mail SET draft = ?, trash = ? WHERE item_id = ?")
+                        .bind(flag == "draft")
+                        .bind(flag == "trash")
+                        .bind(item)
+                        .execute(&m.store.pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            let closed = crate::requests::close_calendar(&m, id, "You accepted it in Calendar.", &sources, &event).await.unwrap();
+            let expected = matches!(change, "unchanged" | "ignored" | "other thread");
+            assert_eq!(closed, expected, "{change}");
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().status, if expected { "done" } else { "open" }, "{change}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_colleagues_shared_calendar_cannot_close_a_request() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let url = link("workshop", "colleague@example.net");
+        calendar_message(&m, &notification(&link("workshop", "me@example.com")), None).await;
+        let id = invitation_request(&m).await;
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id":"shared", "primary":false})).await.unwrap();
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "me@example.com",
+            "shared",
+            &json!({
+                "id":"workshop", "summary":"Workshop", "htmlLink":url, "updated":chrono::Utc::now().to_rfc3339(),
+                "start":{"dateTime":"2030-01-01T17:00:00Z"}, "end":{"dateTime":"2030-01-01T18:00:00Z"},
+                "attendees":[{"email":"colleague@example.net", "self":true, "responseStatus":"accepted", "optional":true}]
+            }),
+        )
+        .await
+        .unwrap();
+        sweep_answered(&m).await.unwrap();
+        assert!(!close_answered(&m, id).await.unwrap());
+        assert_eq!(crate::requests::get(&m, id).await.unwrap().status, "open");
+    }
+
+    // Stage an item before its mail row, as mail::store does across its two writes.
+    async fn pending_mail(m: &Memex, url: &str, date: i64) -> String {
+        m.store
+            .put(
+                &api::MemexItemIn {
+                    kind: "mail".into(),
+                    source: "test-mail".into(),
+                    external_id: "late".into(),
+                    text: format!("{url}\nAlso bring the projector."),
+                    created_at: Some(date),
+                    ..Default::default()
+                },
+                "test-mail",
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn finish_mail(m: &Memex, item: &str, date: i64) {
+        sqlx::query("INSERT INTO mail (item_id, account, gmail_id, thread_id, date, blob, parts) VALUES (?, 'mail-acct', 'late', 'thread', ?, '', ?)")
+            .bind(item).bind(date).bind(json!([{"mime":"application/ics", "name":"invite.ics"}]).to_string())
+            .execute(&m.store.pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn calendar_answers_require_exactly_the_mail_triage_read() {
+        c6_llm::install_crypto_provider();
+        for change in ["late", "trash", "unseen", "unchanged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            let date = 1_900_000_000_000;
+            let url = link("workshop", "me@example.com");
+            calendar_message(&m, &notification(&url), None).await;
+            sqlx::query("UPDATE mail SET date = ?").bind(date).execute(&m.store.pool).await.unwrap();
+            let pending = pending_mail(&m, &url, date - 1).await;
+            let id = invitation_request(&m).await;
+            match change {
+                "late" => finish_mail(&m, &pending, date - 1).await,
+                "trash" => {
+                    sqlx::query("UPDATE mail SET trash = 1").execute(&m.store.pool).await.unwrap();
+                }
+                "unseen" => {
+                    sqlx::query("UPDATE request_sources SET seen_mail = '[]'").execute(&m.store.pool).await.unwrap();
+                }
+                _ => {}
+            }
+            response_event(&m, "workshop", date + DAY, "accepted", &url, date + 1).await;
+            sweep_answered(&m).await.unwrap();
+            assert_eq!(crate::requests::get(&m, id).await.unwrap().status, if change == "unchanged" { "done" } else { "open" }, "{change}");
+        }
     }
 }
