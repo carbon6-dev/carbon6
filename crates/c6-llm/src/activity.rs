@@ -173,6 +173,7 @@ struct Tracked {
 impl ModelClient for Tracked {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let id = start(&self.origin, req);
+        let guard = Guard(id);
         let stream = match self.inner.stream(req).await {
             Ok(s) => s,
             Err(e) => {
@@ -180,7 +181,6 @@ impl ModelClient for Tracked {
                 return Err(e);
             }
         };
-        let guard = Guard(id);
         Ok(stream
             .map(move |ev| {
                 let _ = &guard;
@@ -274,6 +274,28 @@ mod tests {
         let c = mine();
         assert_eq!((c.state, c.text.as_str(), c.output_tokens, c.effort.as_str()), ("done", "{\"category\": \"needs_you\"}", 9, "none"));
         assert!(c.ended_at.is_some() && c.first_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_call_dropped_before_its_first_response_is_stopped() {
+        struct Waiting;
+        #[async_trait]
+        impl ModelClient for Waiting {
+            async fn stream(&self, _req: &ModelRequest) -> Result<EventStream, LlmError> {
+                futures::future::pending().await
+            }
+        }
+        let origin = Origin { what: "draft".into(), about: "request-before-response".into(), ..Default::default() };
+        let client = track(Box::new(Waiting), origin);
+        let request = req("m");
+        let mut call = Box::pin(client.stream(&request));
+        assert!(futures::poll!(&mut call).is_pending());
+        let mine = || calls().into_iter().find(|c| c.about == "request-before-response").unwrap();
+        assert_eq!(mine().state, "waiting");
+        drop(call);
+        let c = mine();
+        assert_eq!(c.state, "stopped");
+        assert!(c.ended_at.is_some() && c.first_at.is_none());
     }
 
     #[tokio::test]
