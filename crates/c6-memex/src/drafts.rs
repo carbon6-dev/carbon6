@@ -20,6 +20,48 @@ use crate::store::clip;
 
 const MAX_CONTEXT: usize = 16_000;
 
+/// Starts a draft owned by the memex, returning before the model answers.
+/// The same claim covers automatic drafts and repeated clicks.
+pub async fn start(m: &Memex, id: i64) -> anyhow::Result<api::Request> {
+    let claim = m.claim(&format!("draft:{id}"));
+    let mut r = crate::requests::get(m, id).await?;
+    let Some(claim) = claim else { return Ok(r) };
+    let (task, _) = m.drafting().ok_or_else(|| anyhow::anyhow!("choose an understanding or drafting model first (Settings → Memex)"))?;
+    let m = m.this.upgrade().ok_or_else(|| anyhow::anyhow!("the memex is stopping"))?;
+    let priority = c6_llm::pool::Priority::current();
+    tokio::spawn(priority.scope(async move {
+        let _claim = claim;
+        // Deleting a realm closes its store. Stop before doing more work,
+        // including when a model slot or its first response is still awaited.
+        tokio::select! {
+            biased;
+            () = m.store.pool.close_event() => {}
+            () = async {
+                if let Err(e) = draft(&m, &task, id).await {
+                    warn!(id, "drafting: {e:#}");
+                    if let Err(store) = failed(&m, id, &e).await {
+                        warn!(id, "keeping the draft's error: {store:#}");
+                    }
+                }
+            } => {}
+        }
+    }));
+    r.drafting = true;
+    Ok(r)
+}
+
+async fn failed(m: &Memex, id: i64, error: &anyhow::Error) -> anyhow::Result<()> {
+    let mut d = crate::requests::get(m, id).await?.draft.unwrap_or_default();
+    d.error = Some(format!("{error:#}"));
+    sqlx::query("UPDATE requests SET draft = ?, drafted_at = ? WHERE id = ?")
+        .bind(serde_json::to_string(&d)?)
+        .bind(c6_core::now_ms())
+        .bind(id)
+        .execute(&m.store.pool)
+        .await?;
+    Ok(())
+}
+
 /// Writes one more draft, if a request needs one and there's a model and
 /// budget. Whether it did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
@@ -46,12 +88,7 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         }
         warn!(id, "drafting: {e:#}");
         // Not again until the conversation has news.
-        sqlx::query("UPDATE requests SET draft = ?, drafted_at = ? WHERE id = ?")
-            .bind(json!({"error": format!("{e:#}")}).to_string())
-            .bind(c6_core::now_ms())
-            .bind(id)
-            .execute(&m.store.pool)
-            .await?;
+        failed(m, id, &e).await?;
     }
     Ok(true)
 }
@@ -599,6 +636,41 @@ pub async fn send(m: &Memex, id: i64, target: &str, text: &str) -> anyhow::Resul
 mod tests {
     use super::*;
     use crate::mail::{Parsed, Stored};
+
+    #[tokio::test]
+    async fn a_duplicate_does_not_restart_a_draft_that_finishes_during_its_read() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO requests (id, person, title, category, created_at, updated_at) VALUES (1, 'pat@example.test', 'Review the notes', 'first_contact', 1, 1)",
+        )
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+        let first = m.claim("draft:1").unwrap();
+        // Hold every connection so the duplicate's request read must wait.
+        let mut connections = Vec::new();
+        for _ in 0..m.store.pool.options().get_max_connections() {
+            connections.push(m.store.pool.acquire().await.unwrap());
+        }
+        let duplicate = start(&m, 1);
+        tokio::pin!(duplicate);
+        assert!(futures_util::poll!(&mut duplicate).is_pending());
+        let finished = api::RequestDraft { text: "The notes look good.".into(), ..Default::default() };
+        sqlx::query("UPDATE requests SET draft = ? WHERE id = 1")
+            .bind(serde_json::to_string(&finished).unwrap())
+            .execute(&mut *connections[0])
+            .await
+            .unwrap();
+        drop(first);
+        drop(connections);
+        let r = c6_testkit::within("the duplicate reads the finished draft", duplicate).await.unwrap();
+        assert_eq!(r.draft, Some(finished));
+        assert!(!m.claimed("draft:1"), "the duplicate did not take a new claim");
+        let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
+        assert_eq!(calls, 0);
+    }
 
     async fn event(m: &Memex, id: &str, start: i64, status: &str, link: &str) {
         span(m, id, start, start + 3_600_000, status, link).await;

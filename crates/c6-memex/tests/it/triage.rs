@@ -1082,7 +1082,7 @@ async fn requests_use_the_drafting_model_automatically_and_on_demand() {
     put(&settings).await;
     let request = eventually("automatically drafted request", async || {
         let requests = c6_memex::requests::list(&m, "open", 100).await.ok()?;
-        requests.into_iter().find(|r| r.draft.as_ref().is_some_and(|d| d.text == "The pilot works for us."))
+        requests.into_iter().find(|r| !r.drafting && r.draft.as_ref().is_some_and(|d| d.text == "The pilot works for us."))
     })
     .await;
     assert_eq!(reader.requests().len(), 1);
@@ -1100,8 +1100,13 @@ async fn requests_use_the_drafting_model_automatically_and_on_demand() {
         .await
         .unwrap();
     assert!(r.status().is_success());
-    let draft: Value = r.json().await.unwrap();
-    assert_eq!(draft["text"], "Let's start the pilot Monday.");
+    let pending: Request = r.json().await.unwrap();
+    assert!(pending.drafting);
+    eventually("Draft again finished", async || {
+        let r = c6_memex::requests::get(&m, request.id).await.ok()?;
+        (!r.drafting && r.draft?.text == "Let's start the pilot Monday.").then_some(())
+    })
+    .await;
     assert_eq!(writer.requests().len(), 2);
     for body in writer.requests() {
         assert_eq!(body["model"], "writer-1");
@@ -1118,7 +1123,7 @@ async fn requests_use_the_drafting_model_automatically_and_on_demand() {
     put(&settings).await;
     eventually("drafted without understanding", async || {
         let r = c6_memex::requests::get(&m, request.id).await.ok()?;
-        (r.draft?.text == "Monday is confirmed.").then_some(())
+        (!r.drafting && r.draft?.text == "Monday is confirmed.").then_some(())
     })
     .await;
     assert!(m.understanding().is_none());

@@ -211,7 +211,7 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 - **What it answers:** where to answer (one of the request's conversations), the text, and anything to check first. What only you can decide is left as `[[one | other]]`. Failing to draft is kept with the reason and tried again on news.
 - **In the brief:** the draft card shows where it goes (✉ to whom and the subject, or 💬 the thread or conversation), the choices as buttons, and the editable text. Send (⌘↵) works once every choice is made; Draft again is also there.
 - **Sending** (`memex.requests.send`) goes through the mail store's queue (with its undo window) or the Slack app's post, as you. The request is done (`replied`). It doesn't go through the agents' approval policy: your keypress is the approval, and agents can't call it.
-- **API:** `memex.requests.draft` (now), `reply_to` (who and what a reply goes to), `send`; `Request.draft`.
+- **API:** `memex.requests.draft` starts work owned by the memex and returns the request immediately. `Request.drafting` is true until it finishes; repeated calls share the work already running. The Brief polls `memex.requests.get` while drafting, disables Draft again, and updates the card when it lands. A failure is kept in `Request.draft.error` with the previous text intact. The drafting mark is in memory, so it cannot survive a restart. `reply_to` says who and what a reply goes to; `send` sends it.
 - **Not yet:** documents the thread names, found in the memex, as context; a cost line in the brief.
 
 ### 10.5 Timing (step 5)
