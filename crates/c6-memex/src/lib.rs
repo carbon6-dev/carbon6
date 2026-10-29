@@ -49,6 +49,8 @@ const RRF_K: f64 = 60.0;
 const CANDIDATES: u32 = 60;
 
 pub struct Memex {
+    /// Work started by an RPC can keep this memex after the caller leaves.
+    this: std::sync::Weak<Memex>,
     /// The realm whose knowledge this is (docs/os.md §3): home's memex
     /// holds every other realm's, each with its own database.
     pub realm: String,
@@ -103,7 +105,7 @@ pub struct Memex {
     pub(crate) reread: std::sync::atomic::AtomicBool,
     /// What the reading loop's steps are working on now (a conversation, a
     /// request, a card, a thread), so steps side by side never take the same.
-    claims: Mutex<std::collections::HashSet<String>>,
+    claims: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Connections resting after failing for now, by id (llm.rs).
     pub(crate) rests: Mutex<HashMap<String, llm::Rest>>,
     /// Each model call's time limits (llm.rs).
@@ -111,14 +113,14 @@ pub struct Memex {
 }
 
 /// Work a reading step has taken (`Memex::claim`).
-pub(crate) struct Claim<'a> {
-    m: &'a Memex,
+pub(crate) struct Claim {
+    claims: Arc<Mutex<std::collections::HashSet<String>>>,
     what: String,
 }
 
-impl Drop for Claim<'_> {
+impl Drop for Claim {
     fn drop(&mut self) {
-        self.m.claims.lock().unwrap().remove(&self.what);
+        self.claims.lock().unwrap().remove(&self.what);
     }
 }
 
@@ -168,7 +170,8 @@ impl Memex {
     async fn open_in(dir: &Path, link: Arc<HeadLink>, realm: &str) -> anyhow::Result<Arc<Self>> {
         c6_core::create_private_dir(dir)?;
         let store = Store::open(&dir.join("memex.db")).await?;
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|this| Self {
+            this: this.clone(),
             realm: realm.to_owned(),
             realms: Default::default(),
             store,
@@ -325,8 +328,8 @@ impl Memex {
 
     /// Takes `what` for this step, unless another has it; given back when
     /// the claim is dropped.
-    pub(crate) fn claim(&self, what: &str) -> Option<Claim<'_>> {
-        self.claims.lock().unwrap().insert(what.to_owned()).then(|| Claim { m: self, what: what.to_owned() })
+    pub(crate) fn claim(&self, what: &str) -> Option<Claim> {
+        self.claims.lock().unwrap().insert(what.to_owned()).then(|| Claim { claims: self.claims.clone(), what: what.to_owned() })
     }
 
     /// Whether another step has `what` now.

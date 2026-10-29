@@ -278,14 +278,21 @@ async fn request(m: &Memex, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<api::
         sources,
         maybe_same: maybe,
         draft: r.get::<Option<String>, _>("draft").and_then(|d| serde_json::from_str(&d).ok()),
+        drafting: m.claimed(&format!("draft:{id}")),
         notified_at: r.get("notified_at"),
     })
 }
 
 pub async fn get(m: &Memex, id: i64) -> anyhow::Result<api::Request> {
+    // If a draft lands while this is read, poll once more for its new text.
+    let drafting = m.claimed(&format!("draft:{id}"));
     let r = sqlx::query("SELECT * FROM requests WHERE id = ?").bind(id).fetch_optional(&m.store.pool).await?;
     match r {
-        Some(r) => request(m, &r).await,
+        Some(r) => {
+            let mut r = request(m, &r).await?;
+            r.drafting |= drafting;
+            Ok(r)
+        }
         None => anyhow::bail!("no request {id}"),
     }
 }
@@ -369,11 +376,7 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         }
         "memex.requests.set" => json!(set(m, id, params["status"].as_str().unwrap_or_default(), params["until"].as_i64()).await?),
         "memex.requests.merge" => json!(merge(m, params["into"].as_i64().unwrap_or(0), params["from"].as_i64().unwrap_or(0)).await?),
-        "memex.requests.draft" => {
-            let (task, _) =
-                m.drafting().ok_or_else(|| anyhow::anyhow!("choose an understanding or drafting model first (Settings → Memex)"))?;
-            json!(crate::drafts::draft(m, &task, id).await?)
-        }
+        "memex.requests.draft" => json!(crate::drafts::start(m, id).await?),
         "memex.requests.reply_to" => crate::drafts::reply_to(m, params["target"].as_str().unwrap_or_default()).await?,
         "memex.requests.send" => {
             crate::drafts::send(m, id, params["target"].as_str().unwrap_or_default(), params["text"].as_str().unwrap_or_default()).await?

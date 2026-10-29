@@ -16,6 +16,7 @@ mod chat;
 mod claims;
 mod compose;
 mod docs;
+mod drafts;
 mod files;
 mod fixtures;
 mod knowledge;
