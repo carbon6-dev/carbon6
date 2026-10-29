@@ -65,7 +65,10 @@ fn channels(r: &Request) -> String {
 #[derive(Clone, Copy)]
 struct Brief {
     queue: Memo<Vec<Request>>,
-    open: RwSignal<Option<i64>>,
+    open: RwSignal<Option<Request>>,
+    navigation: RwSignal<u64>,
+    loading: RwSignal<bool>,
+    notice: RwSignal<Option<String>>,
     /// The commitment or FYI row unfolded (c:<id>, f:<target>).
     unfolded: RwSignal<Option<String>>,
     tick: RwSignal<u32>,
@@ -73,6 +76,24 @@ struct Brief {
 }
 
 impl Brief {
+    fn show(self, request: Option<Request>) {
+        self.navigation.update(|n| *n += 1);
+        self.loading.set(false);
+        self.notice.set(None);
+        self.open.set(request);
+    }
+
+    fn resolved(self, navigation: u64, result: Result<Request, String>, now: i64) {
+        if self.navigation.try_get_untracked() != Some(navigation) {
+            return;
+        }
+        self.loading.set(false);
+        match request_to_open(result, now) {
+            Ok(r) => self.show(Some(r)),
+            Err(note) => self.notice.set(Some(note.into())),
+        }
+    }
+
     /// Settles a request; an open one gives way to the next.
     fn settle(self, id: i64, how: Settle) {
         spawn_local(async move {
@@ -85,14 +106,12 @@ impl Brief {
 
     /// A request is settled: the next one opens (as Superhuman does).
     fn gone(self, id: i64) {
-        let q = self.queue.get_untracked();
-        let at = q.iter().position(|r| r.id == id).unwrap_or(0);
-        let next = q.iter().skip(at + 1).chain(q.iter().take(at)).find(|r| r.id != id).map(|r| r.id);
-        self.open.update(|o| {
-            if o.is_some() {
-                *o = next;
-            }
-        });
+        if self.open.get_untracked().is_some_and(|r| r.id == id) {
+            let q = self.queue.get_untracked();
+            let at = q.iter().position(|r| r.id == id).map_or(0, |at| at + 1);
+            let next = q.iter().skip(at).chain(q.iter().take(at)).find(|r| r.id != id).cloned();
+            self.show(next);
+        }
         self.tick.update(|t| *t += 1);
     }
 
@@ -116,6 +135,23 @@ impl Brief {
                 Err(e) => self.error.set(Some(e)),
             }
         });
+    }
+}
+
+pub(crate) fn request_id(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
+pub(crate) fn request_path(id: i64) -> String {
+    format!("/brief?request={id}")
+}
+
+fn request_to_open(result: Result<Request, String>, now: i64) -> Result<Request, &'static str> {
+    let r = result.map_err(|_| "This request is unavailable.")?;
+    if r.status == "open" || (r.status == "snoozed" && r.until.is_some_and(|until| until <= now)) {
+        Ok(r)
+    } else {
+        Err("This request is no longer open.")
     }
 }
 
@@ -150,10 +186,30 @@ pub fn BriefPage() -> impl IntoView {
         all
     });
     let picked = RwSignal::new(0usize);
-    let open = RwSignal::new(None::<i64>);
+    let open = RwSignal::new(None::<Request>);
     let error = RwSignal::new(None::<String>);
     let unfolded = RwSignal::new(None::<String>);
-    let b = Brief { queue, open, unfolded, tick, error };
+    let loading = RwSignal::new(false);
+    let notice = RwSignal::new(None::<String>);
+    let b = Brief { queue, open, unfolded, tick, error, navigation: RwSignal::new(0), loading, notice };
+    let column = crate::workspace::use_column();
+    let active = Signal::derive(move || column.is_none_or(|c| c.active.get()));
+    let requested = crate::workspace::use_workspace().brief_request;
+    Effect::new(move || {
+        if !active.get() {
+            return;
+        }
+        let Some(id) = requested.get() else { return };
+        requested.set(None);
+        b.show(None);
+        loading.set(true);
+        let navigation = b.navigation.get_untracked();
+        // The queue is only its first page. A link can name any open request.
+        spawn_local(async move {
+            let result = api::rpc_as::<Request>("memex.requests.get", json!({"id": id})).await;
+            b.resolved(navigation, result, js_sys::Date::now() as i64);
+        });
+    });
     // Fresh while you look: the brief again every half minute, unless you're
     // in a request or a row.
     let refresh = set_interval_with_handle(
@@ -173,29 +229,32 @@ pub fn BriefPage() -> impl IntoView {
     let act = move |id: i64, how: Settle| b.settle(id, how);
     // The keys: J/K move, Enter opens, E done, H snooze to tomorrow, # drop,
     // Esc back to the list.
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         let in_field = ev
             .target()
             .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
             .is_some_and(|el| matches!(el.tag_name().as_str(), "TEXTAREA" | "INPUT" | "SELECT") || el.has_attribute("contenteditable"));
-        if in_field || ev.meta_key() || ev.ctrl_key() || ev.alt_key() {
+        if !active.get_untracked() || in_field || ev.meta_key() || ev.ctrl_key() || ev.alt_key() {
+            return;
+        }
+        if loading.get_untracked() && ev.key() != "Escape" {
             return;
         }
         let q = queue.get_untracked();
-        let current = open.get_untracked().or_else(|| q.get(picked.get_untracked()).map(|r| r.id));
+        let current = open.get_untracked().map(|r| r.id).or_else(|| q.get(picked.get_untracked()).map(|r| r.id));
         match ev.key().as_str() {
             "j" | "ArrowDown" if open.get_untracked().is_none() => picked.update(|p| *p = (*p + 1).min(q.len().saturating_sub(1))),
             "k" | "ArrowUp" if open.get_untracked().is_none() => picked.update(|p| *p = p.saturating_sub(1)),
             "j" => {
                 let at = q.iter().position(|r| Some(r.id) == current).unwrap_or(0);
-                open.set(q.get((at + 1).min(q.len().saturating_sub(1))).map(|r| r.id));
+                b.show(q.get((at + 1).min(q.len().saturating_sub(1))).cloned());
             }
             "k" => {
                 let at = q.iter().position(|r| Some(r.id) == current).unwrap_or(0);
-                open.set(q.get(at.saturating_sub(1)).map(|r| r.id));
+                b.show(q.get(at.saturating_sub(1)).cloned());
             }
-            "Enter" if open.get_untracked().is_none() => open.set(current),
-            "Escape" => open.set(None),
+            "Enter" if open.get_untracked().is_none() => b.show(q.get(picked.get_untracked()).cloned()),
+            "Escape" => b.show(None),
             "e" => {
                 if let Some(id) = current {
                     act(id, Settle::Done);
@@ -215,10 +274,13 @@ pub fn BriefPage() -> impl IntoView {
         }
         ev.prevent_default();
     });
+    on_cleanup(move || keys.remove());
     view! {
         <main class="mx-auto max-w-5xl space-y-5 px-4 py-5">
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {move || match open.get().and_then(|id| queue.get().into_iter().find(|r| r.id == id)) {
+            {move || notice.get().map(|note| view! { <p class="text-sm text-zinc-500">{note}</p> })}
+            {move || loading.get().then(|| view! { <p class="text-sm text-zinc-500">"Opening request…"</p> })}
+            {move || match open.get() {
                 Some(r) => view! { <RequestView r b /> }.into_any(),
                 None => view! {
                     <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -313,12 +375,12 @@ fn Section(title: &'static str, empty: &'static str, children: Children) -> impl
 
 #[component]
 fn Row(r: Request, i: usize, picked: RwSignal<usize>, b: Brief) -> impl IntoView {
-    let open = b.open;
+    let selected = r.clone();
     let id = r.id;
     let maybe = r.maybe_same.first().copied();
     view! {
         <div class=move || format!("flex cursor-pointer flex-wrap items-baseline gap-x-2 px-3 py-2 text-sm sm:flex-nowrap {}", if picked.get() == i { "bg-zinc-100 dark:bg-zinc-900" } else { "hover:bg-zinc-50 dark:hover:bg-zinc-900/50" })
-            on:click=move |_| { picked.set(i); open.set(Some(id)); }>
+            on:click=move |_| { picked.set(i); b.show(Some(selected.clone())); }>
             <span class="shrink-0 text-amber-500">"●"</span>
             <span class="min-w-0 flex-1 truncate font-medium sm:w-36 sm:flex-none">{if r.person_name.is_empty() { r.person.clone() } else { r.person_name.clone() }}</span>
             <span class="order-last w-full truncate pl-4 sm:order-none sm:w-auto sm:min-w-0 sm:flex-1 sm:pl-0" title=r.reason.clone()>{r.title.clone()}</span>
@@ -415,7 +477,7 @@ fn Fyi(t: Triage, b: Brief) -> impl IntoView {
 /// on the right.
 #[component]
 fn RequestView(r: Request, b: Brief) -> impl IntoView {
-    let (id, open) = (r.id, b.open);
+    let id = r.id;
     let act = move |id: i64, how: Settle| b.settle(id, how);
     let refresh = RwSignal::new(0u32);
     view! {
@@ -424,7 +486,7 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                 {r.sources.iter().rev().map(|s| view! { <Source target=s.target.clone() kind=s.kind.clone() title=s.title.clone() refresh /> }).collect_view()}
             </div>
             <aside class="w-full shrink-0 space-y-3 lg:sticky lg:top-0 lg:w-80">
-                <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"← Brief (Esc)"</button>
+                <button class=BUTTON_QUIET on:click=move |_| b.show(None)>"← Brief (Esc)"</button>
                 <div class="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                     <p class="text-xs uppercase tracking-wide text-zinc-500">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
                     <h1 class="font-semibold">{r.title.clone()}</h1>
@@ -567,7 +629,7 @@ fn Source(target: String, kind: String, title: String, refresh: RwSignal<u32>) -
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 })}
                 {move || compose.get().map(|d| view! { <crate::mail::Compose d compose status refresh /> })}
-                {move || open.get().is_some().then(|| view! { <crate::mail::Thread account=account.clone() thread=thread.clone() open compose refresh /> })}
+                {move || open.get().is_some().then(|| view! { <crate::mail::Thread account=account.clone() thread=thread.clone() open compose refresh in_brief=true /> })}
             </section>
         }
         .into_any();
@@ -589,4 +651,114 @@ fn Source(target: String, kind: String, title: String, refresh: RwSignal<u32>) -
         </section>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_links_carry_a_positive_id() {
+        assert_eq!(request_path(42), "/brief?request=42");
+        assert_eq!(request_id("42"), Some(42));
+        for invalid in ["", "0", "-1", "other", "9223372036854775808"] {
+            assert_eq!(request_id(invalid), None);
+        }
+    }
+
+    #[test]
+    fn linked_requests_must_be_open() {
+        for (status, until, available) in [
+            ("open", None, true),
+            ("snoozed", Some(99), true),
+            ("snoozed", Some(100), true),
+            ("snoozed", Some(101), false),
+            ("snoozed", None, false),
+            ("done", None, false),
+            ("dropped", None, false),
+        ] {
+            let request = Request { id: 42, status: status.into(), until, ..Request::default() };
+            assert_eq!(request_to_open(Ok(request), 100).is_ok(), available, "{status}, {until:?}");
+        }
+        assert_eq!(request_to_open(Err("no request 42".into()), 100), Err("This request is unavailable."));
+    }
+
+    #[test]
+    fn settling_advances_only_the_request_still_selected() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let request = |id| Request { id, status: "open".into(), ..Request::default() };
+            let b = Brief {
+                queue: Memo::new(move |_| [1, 3, 2].into_iter().map(request).collect()),
+                open: RwSignal::new(None),
+                navigation: RwSignal::new(0),
+                loading: RwSignal::new(false),
+                notice: RwSignal::new(None),
+                unfolded: RwSignal::new(None),
+                tick: RwSignal::new(0),
+                error: RwSignal::new(None),
+            };
+            b.show(Some(request(1)));
+            // The link to B resolves before A's Done action completes.
+            b.show(None);
+            b.resolved(b.navigation.get_untracked(), Ok(request(2)), 100);
+            b.gone(1);
+            assert_eq!(b.open.get_untracked().unwrap().id, 2);
+            assert_eq!(b.tick.get_untracked(), 1);
+
+            b.show(Some(request(1)));
+            b.gone(1);
+            assert_eq!(b.open.get_untracked().unwrap().id, 3);
+            assert_eq!(b.tick.get_untracked(), 2);
+
+            b.show(None);
+            b.gone(3);
+            assert!(b.open.get_untracked().is_none());
+            assert_eq!(b.tick.get_untracked(), 3);
+        });
+    }
+
+    #[test]
+    fn linked_requests_do_not_depend_on_the_queue_or_leave_invisible_targets() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let b = Brief {
+                queue: Memo::new(|_| (1..=100).map(|id| Request { id, status: "open".into(), ..Request::default() }).collect()),
+                open: RwSignal::new(None),
+                navigation: RwSignal::new(0),
+                loading: RwSignal::new(false),
+                notice: RwSignal::new(None),
+                unfolded: RwSignal::new(Some("c:7".into())),
+                tick: RwSignal::new(0),
+                error: RwSignal::new(None),
+            };
+            b.loading.set(true);
+            b.resolved(0, Ok(Request { id: 101, status: "open".into(), ..Request::default() }), 100);
+            assert_eq!(b.open.get_untracked().unwrap().id, 101);
+            assert!(!b.loading.get_untracked());
+
+            for result in [
+                Err("no request 42".into()),
+                Ok(Request { id: 42, status: "done".into(), ..Request::default() }),
+                Ok(Request { id: 42, status: "snoozed".into(), until: Some(101), ..Request::default() }),
+            ] {
+                b.show(None);
+                b.loading.set(true);
+                b.resolved(b.navigation.get_untracked(), result, 100);
+                assert!(b.open.get_untracked().is_none());
+                assert!(!b.loading.get_untracked());
+                assert!(b.notice.get_untracked().is_some());
+                b.show(b.queue.get_untracked().get(4).cloned());
+                assert_eq!(b.open.get_untracked().unwrap().id, 5);
+                b.show(None);
+            }
+            // Escape or opening a row also cancels an earlier lookup.
+            let navigation = b.navigation.get_untracked();
+            b.show(None);
+            b.resolved(navigation, Ok(Request { id: 101, status: "open".into(), ..Request::default() }), 100);
+            assert!(b.open.get_untracked().is_none());
+            assert_eq!(b.unfolded.get_untracked().as_deref(), Some("c:7"));
+            assert_eq!(b.tick.get_untracked(), 0);
+        });
+    }
 }
