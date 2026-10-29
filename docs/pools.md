@@ -14,7 +14,7 @@ Sessions don't use pools. A session's worker dials its connection itself, so a s
 ## How a pool picks a member
 
 - **Least busy first.** Each member takes some calls at once (its slots). A call goes to the member with a free slot that has the fewest calls in flight for its slots (on a tie, the first listed).
-- **Waiting its turn.** When every slot is taken, the call waits in the head, first come first served, until a slot frees up. It gives up after 10 minutes.
+- **Waiting its turn.** When every slot is taken, interactive calls go before background work, first come first served within each class. Running calls keep their slots. Explicit memex draft, summary and card-writing requests are interactive; automatic drafts and reading stay in the background. A call gives up waiting after 10 minutes.
 - **Failing over.** A member that fails for now rests: it refuses the connection, times out, answers 429 or 5xx, or (for the memex) stalls past its call's time limits (docs/brief.md). The call then goes to another member at once. Its rest is 15 seconds, twice as long after each failure in a row, up to 5 minutes; an answer ends it. A pool's members are tried once each, not retried as a plain connection is.
 - **Passing over.**
   - **The model:** each member's model list (`/models`) is kept for 5 minutes, and members without the model asked for are skipped. `name` and `name:latest` are the same model. A member that can't list its models (no list endpoint) may have any. A member whose list hasn't been fetched because it is resting takes no call for a named model until it is listed.
