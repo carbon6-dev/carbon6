@@ -11,7 +11,7 @@ use c6_api as api;
 use c6_llm::Block;
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 use crate::Memex;
@@ -221,14 +221,19 @@ async fn conversation(m: &Memex, target: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// An event linked from the message being answered, in that mailbox's
-/// calendar. Titles and times cannot establish which event it is.
+/// An event linked from the message being answered. Mail and calendars
+/// can belong to different installs. Titles and times cannot identify it.
 struct Invitation {
     target: String,
     account: String,
     calendar: String,
     event: String,
     response: String,
+    start: i64,
+    end: i64,
+    all_day: bool,
+    recurring: bool,
+    instances: HashSet<String>,
 }
 
 fn response(status: &str) -> &str {
@@ -245,12 +250,15 @@ fn response(status: &str) -> &str {
 /// hosts and parameters. The eid identifies the event and its calendar.
 fn eid(link: &str) -> Option<String> {
     let link = link.replace("&amp;", "&").replace("&#38;", "&").replace("&#x26;", "&");
-    let url = reqwest::Url::parse(&link).ok()?;
+    let mut url = reqwest::Url::parse(&link).ok()?;
     if !matches!(url.scheme(), "https" | "http")
         || !url.host_str().is_some_and(|host| host == "google.com" || host.ends_with(".google.com"))
     {
         return None;
     }
+    // Keep standard base64's '+' through query decoding.
+    let query = url.query()?.replace('+', "%2B");
+    url.set_query(Some(&query));
     let mut values = url.query_pairs().filter(|(name, _)| name == "eid");
     let (_, value) = values.next()?;
     let value = value.trim_end_matches('=');
@@ -287,8 +295,20 @@ fn event_ids(text: &str, html: &str, body: &str) -> HashSet<String> {
     ids
 }
 
+fn decoded_event_id(id: &str) -> Option<String> {
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+    };
+    let id = id.trim_end_matches('=');
+    let bytes = URL_SAFE_NO_PAD.decode(id).or_else(|_| STANDARD_NO_PAD.decode(id)).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let (event, rest) = text.split_once(' ')?;
+    (!event.is_empty() && !rest.trim().is_empty()).then(|| event.to_owned())
+}
+
 async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitation>> {
-    let mut out = Vec::new();
+    let mut messages = Vec::new();
     for source in &r.sources {
         let Some((account, thread)) = source.target.strip_prefix("thread:").and_then(|s| s.rsplit_once(':')) else { continue };
         let mail = sqlx::query(
@@ -313,25 +333,49 @@ async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitati
         if ids.is_empty() {
             continue;
         }
-        let rows = sqlx::query("SELECT calendar_id, event_id, my_status, html_link FROM events WHERE account = ? AND status != 'cancelled' AND html_link != ''")
-            .bind(account)
-            .fetch_all(&m.store.pool)
-            .await?;
-        let matches: Vec<_> = rows
-            .iter()
-            .filter(|e| {
-                let link: String = e.get("html_link");
-                eid(&link).is_some_and(|id| ids.contains(&id))
-            })
-            .collect();
+        messages.push((source.target.clone(), ids));
+    }
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT account, calendar_id, event_id, my_status, html_link, start, end, all_day, recurrence, recurring_event_id FROM events WHERE status != 'cancelled'",
+    )
+    .fetch_all(&m.store.pool)
+    .await?;
+    let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_event: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_series: HashMap<String, HashSet<String>> = HashMap::new();
+    for (n, row) in rows.iter().enumerate() {
+        if let Some(id) = eid(&row.get::<String, _>("html_link")) {
+            exact.entry(id).or_default().push(n);
+        }
+        by_event.entry(row.get("event_id")).or_default().push(n);
+        if let Some(series) = row.get::<Option<String>, _>("recurring_event_id") {
+            by_series.entry(series).or_default().insert(row.get("event_id"));
+        }
+    }
+    let mut out = Vec::new();
+    for (target, ids) in messages {
+        let mut matches: HashSet<usize> = ids.iter().filter_map(|id| exact.get(id)).flatten().copied().collect();
+        // An alias in the invitation's eid can differ from the stored calendar id.
+        if matches.is_empty() {
+            matches = ids.iter().filter_map(|id| decoded_event_id(id)).filter_map(|id| by_event.get(&id)).flatten().copied().collect();
+        }
         // More than one event (or calendar's copy) leaves the link ambiguous.
-        if let [event] = matches.as_slice() {
+        if matches.len() == 1 {
+            let event = &rows[*matches.iter().next().unwrap()];
             out.push(Invitation {
-                target: source.target.clone(),
-                account: account.into(),
+                target,
+                account: event.get("account"),
                 calendar: event.get("calendar_id"),
                 event: event.get("event_id"),
                 response: response(&event.get::<String, _>("my_status")).into(),
+                start: event.get("start"),
+                end: event.get("end"),
+                all_day: event.get::<i64, _>("all_day") != 0,
+                recurring: event.get::<String, _>("recurrence") != "[]",
+                instances: by_series.get(&event.get::<String, _>("event_id")).cloned().unwrap_or_default(),
             });
         }
     }
@@ -351,6 +395,18 @@ async fn free(m: &Memex, invitations: &[Invitation]) -> anyhow::Result<String> {
             .unwrap_or_default()
     };
     let mut out = format!("\n## The owner's calendar, next 7 days ({}; busy times, the rest is free)\n", tz.name());
+    let events = if invitations.is_empty() {
+        None
+    } else {
+        match crate::calendar::events(m, now, until).await {
+            Ok(events) => Some(events),
+            Err(e) => {
+                warn!("draft calendar times could not be checked: {e:#}");
+                out = format!("\n## The owner's calendar, next 7 days ({})\n- the owner's calendar could not be read\n", tz.name());
+                None
+            }
+        }
+    };
     if invitations.is_empty() {
         let busy = crate::calendar::busy(m, now, until).await.unwrap_or_default();
         if busy.is_empty() {
@@ -359,13 +415,14 @@ async fn free(m: &Memex, invitations: &[Invitation]) -> anyhow::Result<String> {
         for (s, e) in busy.iter().take(40) {
             out.push_str(&format!("- busy {} to {}\n", at(*s), at(*e)));
         }
-    } else {
-        let events = crate::calendar::events(m, now, until).await?;
+    } else if let Some(events) = events {
         let mut spans = Vec::new();
         let mut lines = Vec::new();
         for e in events.iter().filter(|e| e.busy && !e.all_day) {
             let span = (e.start.max(now), e.end.min(until));
-            if let Some(i) = invitations.iter().find(|i| i.account == e.account && i.calendar == e.calendar_id && i.event == e.event_id) {
+            if let Some(i) = invitations.iter().find(|i| {
+                i.account == e.account && i.calendar == e.calendar_id && (i.event == e.event_id || i.instances.contains(&e.event_id))
+            }) {
                 lines.push((span, format!(" (the invitation being answered in {}; your response: {})", i.target, i.response)));
             } else {
                 spans.push(span);
@@ -384,12 +441,66 @@ async fn free(m: &Memex, invitations: &[Invitation]) -> anyhow::Result<String> {
         for ((s, e), note) in lines {
             out.push_str(&format!("- busy {} to {}{note}\n", at(s), at(e)));
         }
+    }
+    if !invitations.is_empty() {
         out.push_str("\n## Invitations being answered\n");
         for i in invitations {
             out.push_str(&format!("- {} links to an event already in your calendar; your response: {}\n", i.target, i.response));
+            let (mut start, mut end) = (i.start, i.end);
+            if i.recurring {
+                match crate::calendar::next_occurrence(m, &i.account, &i.calendar, &i.event, now, tz).await {
+                    Ok(Some(span)) => (start, end) = span,
+                    Ok(None) => {
+                        out.push_str("  no remaining occurrence found for this recurring event\n");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("draft invitation time could not be checked: {e:#}");
+                        out.push_str("  the invitation's time could not be checked\n");
+                        continue;
+                    }
+                }
+            }
+            let next = if i.recurring { "; next occurrence of a recurring event" } else { "" };
+            if i.all_day {
+                let date = |ms| chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+                out.push_str(&format!(
+                    "  dates: {} to {} (all day; end date exclusive{next}; overlaps not checked)\n",
+                    date(start),
+                    date(end)
+                ));
+                continue;
+            }
+            out.push_str(&format!("  time: {} to {} ({}{next})\n", at(start), at(end), tz.name()));
+            let spans = match invitation_overlaps(m, i, start, end).await {
+                Ok(spans) => spans,
+                Err(e) => {
+                    warn!("draft invitation overlaps could not be checked: {e:#}");
+                    out.push_str("  overlaps with the invitation could not be checked\n");
+                    continue;
+                }
+            };
+            let overlaps = crate::calendar::merge_busy(spans);
+            if overlaps.is_empty() {
+                out.push_str("  nothing else in your calendar overlaps it\n");
+            } else {
+                out.push_str("  other busy blocks overlapping it:\n");
+                for (s, e) in overlaps {
+                    out.push_str(&format!("  - {} to {}\n", at(s), at(e)));
+                }
+            }
         }
     }
     Ok(out)
+}
+
+async fn invitation_overlaps(m: &Memex, i: &Invitation, start: i64, end: i64) -> anyhow::Result<Vec<(i64, i64)>> {
+    Ok(crate::calendar::events(m, start, end)
+        .await?
+        .into_iter()
+        .filter(|e| e.busy && !e.all_day && e.event_id != i.event && !i.instances.contains(&e.event_id) && e.start < end && e.end > start)
+        .map(|e| (e.start, e.end))
+        .collect())
 }
 
 /// How you write: your last few messages to them, else to anyone.
@@ -489,16 +600,20 @@ mod tests {
     use crate::mail::{Parsed, Stored};
 
     async fn event(m: &Memex, id: &str, start: i64, status: &str, link: &str) {
+        span(m, id, start, start + 3_600_000, status, link).await;
+    }
+
+    async fn span(m: &Memex, id: &str, start: i64, end: i64, status: &str, link: &str) {
         let time = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339();
         crate::calendar::store_event(
             m,
             "test-calendar",
-            "acct",
+            "cal-acct",
             "me@example.com",
             "primary",
             &json!({
                 "id": id, "summary": "Workshop", "start": {"dateTime": time(start)},
-                "end": {"dateTime": time(start + 3_600_000)}, "htmlLink": link,
+                "end": {"dateTime": time(end)}, "htmlLink": link,
                 "attendees": [{"email": "me@example.com", "self": true, "responseStatus": status}],
             }),
         )
@@ -517,7 +632,7 @@ mod tests {
             ..Default::default()
         };
         let at = Stored {
-            account: "acct",
+            account: "mail-acct",
             external_id: "invite",
             thread_id: "thread",
             source: "test-mail",
@@ -528,7 +643,7 @@ mod tests {
         };
         crate::mail::store(m, &parsed, "", &at, &["INBOX".into()], c6_core::now_ms()).await.unwrap();
         api::Request {
-            sources: vec![api::RequestSource { target: "thread:acct:thread".into(), kind: "mail".into(), ..Default::default() }],
+            sources: vec![api::RequestSource { target: "thread:mail-acct:thread".into(), kind: "mail".into(), ..Default::default() }],
             ..Default::default()
         }
     }
@@ -538,7 +653,7 @@ mod tests {
         c6_llm::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let m = Memex::open(dir.path(), Default::default()).await.unwrap();
-        crate::calendar::store_calendar(&m, "acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
         let start = c6_core::now_ms() + 2 * 86_400_000;
         let link = "https://www.google.com/calendar/event?eid=d29ya3Nob3AgbWVAZXhhbXBsZS5jb20=";
         event(&m, "invited", start, "accepted", link).await;
@@ -555,7 +670,7 @@ mod tests {
         assert_eq!(busy.len(), 2, "{text}");
         assert_eq!(busy.iter().filter(|l| l.contains("the invitation being answered")).count(), 1, "{text}");
         assert_eq!(busy.iter().filter(|l| l.contains("your response: accepted")).count(), 1, "{text}");
-        assert!(text.contains("thread:acct:thread links to an event already in your calendar; your response: accepted"), "{text}");
+        assert!(text.contains("thread:mail-acct:thread links to an event already in your calendar; your response: accepted"), "{text}");
 
         for (status, response) in [("declined", "declined"), ("tentative", "tentative"), ("needsAction", "not yet answered")] {
             event(&m, "invited", start, status, link).await;
@@ -573,7 +688,7 @@ mod tests {
         c6_llm::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let m = Memex::open(dir.path(), Default::default()).await.unwrap();
-        crate::calendar::store_calendar(&m, "acct", &json!({"id": "primary", "primary": true})).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true})).await.unwrap();
         let start = c6_core::now_ms() + 2 * 86_400_000;
         let link = "https://www.google.com/calendar/event?eid=d29ya3Nob3AgbWVAZXhhbXBsZS5jb20=";
         event(&m, "invited", start, "accepted", link).await;
@@ -597,13 +712,373 @@ mod tests {
         assert!(super::invitations(&m, &r).await.unwrap().is_empty());
     }
 
+    fn link(event: &str, calendar: &str) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!("https://www.google.com/calendar/event?eid={}", URL_SAFE_NO_PAD.encode(format!("{event} {calendar}")))
+    }
+
+    #[tokio::test]
+    async fn aliases_match_only_a_unique_event_when_no_exact_eid_matches() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true})).await.unwrap();
+        let start = c6_core::now_ms() + 2 * 86_400_000;
+        event(&m, "dinner", start, "accepted", &link("dinner", "owner@example.test")).await;
+        let r = message(&m, &link("dinner", "alias@example.test"), None).await;
+        let found = invitations(&m, &r).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!((&*found[0].account, &*found[0].calendar, &*found[0].event), ("cal-acct", "primary", "dinner"));
+        assert!(free(&m, &found).await.unwrap().contains("the invitation being answered"));
+
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "other-acct",
+            "owner@example.test",
+            "other",
+            &json!({
+                "id": "dinner", "start": {"dateTime": "2030-01-01T00:00:00Z"}, "end": {"dateTime": "2030-01-01T01:00:00Z"},
+                "htmlLink": link("dinner", "other@example.test"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(invitations(&m, &r).await.unwrap().is_empty(), "two calendars' copies are ambiguous");
+        let r = message(&m, &link("dinner", "owner@example.test"), None).await;
+        assert_eq!(invitations(&m, &r).await.unwrap().len(), 1, "an exact eid still identifies one copy");
+
+        // Two exact matches must not fall back to the one matching event id.
+        sqlx::query("DELETE FROM events WHERE account = 'other-acct'").execute(&m.store.pool).await.unwrap();
+        event(&m, "different-id", start, "accepted", &link("dinner", "owner@example.test")).await;
+        assert!(invitations(&m, &r).await.unwrap().is_empty());
+        let r = message(&m, "https://calendar.google.com/calendar/event?eid=not-base64!", None).await;
+        assert!(invitations(&m, &r).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn decoded_eids_accept_both_alphabets_and_optional_padding() {
+        use base64::{
+            Engine,
+            engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+        };
+        for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
+            for id in ["dinner", "event-\u{ffff}"] {
+                assert_eq!(decoded_event_id(&engine.encode(format!("{id} alias@example.test"))), Some(id.into()));
+                let link = format!("https://calendar.google.com/calendar/event?eid={}", engine.encode(format!("{id} alias@example.test")));
+                assert_eq!(decoded_event_id(&eid(&link).unwrap()), Some(id.into()));
+            }
+        }
+        for text in ["", "dinner", " alias@example.test", "dinner "] {
+            assert!(decoded_event_id(&STANDARD.encode(text)).is_none());
+        }
+        assert!(decoded_event_id(&STANDARD.encode([0xff, b' ', b'x'])).is_none());
+        assert!(decoded_event_id("not-base64!").is_none());
+    }
+
+    #[tokio::test]
+    async fn invitation_overlaps_use_its_own_span_and_exclude_copies_and_touching_ends() {
+        use chrono::TimeZone;
+        c6_llm::install_crypto_provider();
+        for days in [2, 10] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            crate::calendar::store_calendar(&m, "elsewhere", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "timeZone": "America/Los_Angeles"})).await.unwrap();
+            let tz = chrono_tz::America::Los_Angeles;
+            let day = chrono::Utc::now().date_naive() + chrono::Duration::days(days);
+            let time =
+                |hour, minute| tz.from_local_datetime(&day.and_hms_opt(hour, minute, 0).unwrap()).single().unwrap().timestamp_millis();
+            let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%a %Y-%m-%d %H:%M").to_string();
+            span(&m, "dinner", time(17, 30), time(20, 0), "accepted", &link("dinner", "owner@example.test")).await;
+            span(&m, "morning", time(6, 0), time(16, 0), "accepted", "").await;
+            span(&m, "touching", time(16, 0), time(17, 30), "accepted", "").await;
+            span(&m, "after", time(20, 0), time(22, 0), "accepted", "").await;
+            span(&m, "declined", time(18, 0), time(19, 0), "declined", "").await;
+            span(&m, "transparent", time(18, 0), time(19, 0), "accepted", "").await;
+            sqlx::query("UPDATE events SET transparent = 1 WHERE event_id = 'transparent'").execute(&m.store.pool).await.unwrap();
+            crate::calendar::store_event(
+                &m,
+                "test-calendar",
+                "cal-acct",
+                "owner@example.test",
+                "primary",
+                &json!({
+                    "id": "all-day", "start": {"date": day.to_string()}, "end": {"date": day.succ_opt().unwrap().to_string()},
+                }),
+            )
+            .await
+            .unwrap();
+            for (calendar, selected, id) in [("copy", true, "dinner"), ("hidden", false, "hidden")] {
+                crate::calendar::store_calendar(&m, "other-acct", &json!({"id": calendar, "selected": selected})).await.unwrap();
+                crate::calendar::store_event(
+                    &m,
+                    "test-calendar",
+                    "other-acct",
+                    "owner@example.test",
+                    calendar,
+                    &json!({
+                        "id": id, "start": {"dateTime": chrono::DateTime::from_timestamp_millis(time(18, 0)).unwrap().to_rfc3339()},
+                        "end": {"dateTime": chrono::DateTime::from_timestamp_millis(time(19, 0)).unwrap().to_rfc3339()},
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            let r = message(&m, &link("dinner", "owner@example.test"), None).await;
+            let prefix = format!(
+                "- thread:mail-acct:thread links to an event already in your calendar; your response: accepted\n  time: {} to {} (UTC)\n",
+                at(time(17, 30)),
+                at(time(20, 0))
+            );
+            let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+            assert_eq!(
+                text.split_once("## Invitations being answered\n").unwrap().1,
+                format!("{prefix}  nothing else in your calendar overlaps it\n")
+            );
+            span(&m, "overlap", time(19, 0), time(21, 0), "accepted", "").await;
+            span(&m, "merged", time(19, 30), time(20, 30), "accepted", "").await;
+            let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+            let overlaps = format!("  other busy blocks overlapping it:\n  - {} to {}\n", at(time(19, 0)), at(time(21, 0)));
+            assert_eq!(text.split_once("## Invitations being answered\n").unwrap().1, format!("{prefix}{overlaps}"));
+            span(&m, "dinner", time(17, 30), time(20, 0), "declined", &link("dinner", "owner@example.test")).await;
+            let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+            assert_eq!(
+                text.split_once("## Invitations being answered\n").unwrap().1,
+                format!("{}{overlaps}", prefix.replace("accepted", "declined"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recurring_invitations_use_the_next_unended_occurrence_and_all_day_ones_keep_dates() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+        let day = 86_400_000;
+        let now = c6_core::now_ms() / 1000 * 1000;
+        span(&m, "series", now - 8 * day, now - 6 * day, "declined", &link("series", "owner@example.test")).await;
+        sqlx::query("UPDATE events SET recurrence = ? WHERE event_id = 'series'")
+            .bind(json!(["RRULE:FREQ=WEEKLY;COUNT=3"]).to_string())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        let r = message(&m, &link("series", "owner@example.test"), None).await;
+        let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%a %Y-%m-%d %H:%M").to_string();
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        assert!(
+            text.contains(&format!("time: {} to {} (UTC; next occurrence of a recurring event)", at(now - day), at(now + day))),
+            "{text}"
+        );
+        assert!(text.contains("nothing else in your calendar overlaps it"), "{text}");
+        event(&m, "other", now, "accepted", "").await;
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        assert!(text.ends_with(&format!("  other busy blocks overlapping it:\n  - {} to {}\n", at(now), at(now + 3_600_000))), "{text}");
+
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "owner@example.test",
+            "primary",
+            &json!({
+                "id": "series", "start": {"date": "2030-04-02"}, "end": {"date": "2030-04-03"},
+                "htmlLink": link("series", "owner@example.test"),
+            }),
+        )
+        .await
+        .unwrap();
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        let section = text.split_once("## Invitations being answered\n").unwrap().1;
+        assert!(section.ends_with("  dates: 2030-04-02 to 2030-04-03 (all day; end date exclusive; overlaps not checked)\n"), "{section}");
+        assert!(!section.contains("overlaps it") && !section.contains("overlapping it"), "{section}");
+    }
+
+    #[tokio::test]
+    async fn odd_recurrences_leave_invitation_facts_in_the_context() {
+        c6_llm::install_crypto_provider();
+        for recurrence in ["not json".to_owned(), json!(["RRULE:FREQ=UNSUPPORTED"]).to_string()] {
+            for days in [2, 10] {
+                let dir = tempfile::tempdir().unwrap();
+                let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+                crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"}))
+                    .await
+                    .unwrap();
+                let start = c6_core::now_ms() / 1000 * 1000 + days * 86_400_000;
+                event(&m, "invited", start, "accepted", &link("invited", "owner@example.test")).await;
+                let r = message(&m, &link("invited", "owner@example.test"), None).await;
+                sqlx::query("UPDATE events SET recurrence = ? WHERE event_id = 'invited'")
+                    .bind(&recurrence)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+                let text = context(&m, &r).await.unwrap();
+                let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%a %Y-%m-%d %H:%M").to_string();
+                if recurrence == "not json" {
+                    assert!(text.contains(&format!(
+                        "your response: accepted\n  time: {} to {} (UTC; next occurrence of a recurring event)\n  nothing else in your calendar overlaps it\n",
+                        at(start), at(start + 3_600_000)
+                    )), "{text}");
+                } else {
+                    assert!(text.contains("your response: accepted\n  the invitation's time could not be checked\n"), "{text}");
+                    assert!(!text.contains("nothing else in your calendar overlaps it"), "{text}");
+                }
+
+                sqlx::query("UPDATE events SET recurrence = '[]' WHERE event_id = 'invited'").execute(&m.store.pool).await.unwrap();
+                event(&m, "unrelated", start, "accepted", "").await;
+                sqlx::query("UPDATE events SET recurrence = ? WHERE event_id = 'unrelated'")
+                    .bind(&recurrence)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+                let text = context(&m, &r).await.unwrap();
+                assert!(text.contains("your response: accepted\n  time: "), "{text}");
+                if recurrence == "not json" {
+                    assert!(
+                        text.contains(&format!("  other busy blocks overlapping it:\n  - {} to {}\n", at(start), at(start + 3_600_000))),
+                        "{text}"
+                    );
+                } else {
+                    assert!(text.contains("  overlaps with the invitation could not be checked\n"), "{text}");
+                }
+                assert!(!text.contains("nothing else in your calendar overlaps it"), "{text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_calendar_does_not_claim_the_owner_is_free() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+        let start = c6_core::now_ms() + 2 * 86_400_000;
+        event(&m, "invited", start, "accepted", &link("invited", "owner@example.test")).await;
+        event(&m, "appointment", start + 2 * 3_600_000, "accepted", "").await;
+        event(&m, "unsupported", start, "accepted", "").await;
+        sqlx::query("UPDATE events SET recurrence = ? WHERE event_id = 'unsupported'")
+            .bind(json!(["RRULE:FREQ=UNSUPPORTED"]).to_string())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        let r = message(&m, &link("invited", "owner@example.test"), None).await;
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        let (calendar, invitation) = text.split_once("\n## Invitations being answered\n").unwrap();
+        assert_eq!(calendar, "\n## The owner's calendar, next 7 days (UTC)\n- the owner's calendar could not be read\n");
+        assert!(!text.contains("the rest is free") && !text.contains("nothing booked"), "{text}");
+        assert!(invitation.contains("your response: accepted\n  time: "), "{text}");
+        assert!(invitation.ends_with("  overlaps with the invitation could not be checked\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn recurring_invitations_follow_cancelled_and_moved_instances() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+        let day = 86_400_000;
+        let start =
+            (chrono::Utc::now().date_naive() + chrono::Duration::days(1)).and_hms_opt(17, 30, 0).unwrap().and_utc().timestamp_millis();
+        let duration = 150 * 60_000;
+        span(&m, "series", start, start + duration, "accepted", &link("series", "owner@example.test")).await;
+        sqlx::query("UPDATE events SET recurrence = ? WHERE event_id = 'series'")
+            .bind(json!(["RRULE:FREQ=WEEKLY;COUNT=3"]).to_string())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        let time = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339();
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "owner@example.test",
+            "primary",
+            &json!({"id": "cancelled", "recurringEventId": "series", "status": "cancelled",
+                "originalStartTime": {"dateTime": time(start)},
+                "start": {"dateTime": time(start)}, "end": {"dateTime": time(start + duration)}}),
+        )
+        .await
+        .unwrap();
+        let r = message(&m, &link("series", "owner@example.test"), None).await;
+        let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%a %Y-%m-%d %H:%M").to_string();
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        assert!(
+            text.contains(&format!(
+                "  time: {} to {} (UTC; next occurrence of a recurring event)\n",
+                at(start + 7 * day),
+                at(start + 7 * day + duration)
+            )),
+            "{text}"
+        );
+        let moved = start + 8 * day + 30 * 60_000;
+        for (calendar, id) in [("primary", "moved"), ("copy", "moved-copy")] {
+            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": calendar, "timeZone": "UTC"})).await.unwrap();
+            crate::calendar::store_event(
+                &m,
+                "test-calendar",
+                "cal-acct",
+                "owner@example.test",
+                calendar,
+                &json!({"id": id, "recurringEventId": "series", "originalStartTime": {"dateTime": time(start + 7 * day)},
+                    "start": {"dateTime": time(moved)}, "end": {"dateTime": time(moved + duration)}}),
+            )
+            .await
+            .unwrap();
+        }
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        assert!(
+            text.ends_with(&format!(
+                "  time: {} to {} (UTC; next occurrence of a recurring event)\n  nothing else in your calendar overlaps it\n",
+                at(moved),
+                at(moved + duration)
+            )),
+            "{text}"
+        );
+        let events = crate::calendar::events(&m, start, start + 10 * day).await.unwrap();
+        assert_eq!(events.iter().map(|e| (e.start, e.end)).collect::<Vec<_>>(), vec![(moved, moved + duration); 2]);
+    }
+
+    #[tokio::test]
+    async fn all_day_weekly_invitations_use_dates_even_in_a_western_time_zone() {
+        use chrono::Datelike;
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "America/New_York"}))
+            .await
+            .unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let monday = today + chrono::Duration::days(14 - i64::from(today.weekday().num_days_from_monday()));
+        let end = monday.succ_opt().unwrap();
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "owner@example.test",
+            "primary",
+            &json!({"id": "series", "start": {"date": monday.to_string()}, "end": {"date": end.to_string()},
+                "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3"], "htmlLink": link("series", "owner@example.test")}),
+        )
+        .await
+        .unwrap();
+        let r = message(&m, &link("series", "owner@example.test"), None).await;
+        let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
+        assert!(
+            text.ends_with(&format!(
+                "  dates: {monday} to {end} (all day; end date exclusive; next occurrence of a recurring event; overlaps not checked)\n"
+            )),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn busy_blocks_are_merged_and_the_invitation_survives_the_limit() {
         c6_llm::install_crypto_provider();
         for adjacent in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let m = Memex::open(dir.path(), Default::default()).await.unwrap();
-            crate::calendar::store_calendar(&m, "acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+            crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
             let hour = 3_600_000;
             let start = c6_core::now_ms() + hour;
             let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%a %Y-%m-%d %H:%M").to_string();
@@ -632,7 +1107,7 @@ mod tests {
             let r = message(&m, link, None).await;
             let text = free(&m, &invitations(&m, &r).await.unwrap()).await.unwrap();
             expected.push(format!(
-                "- busy {} to {} (the invitation being answered in thread:acct:thread; your response: accepted)",
+                "- busy {} to {} (the invitation being answered in thread:mail-acct:thread; your response: accepted)",
                 at(invited),
                 at(invited + hour)
             ));
