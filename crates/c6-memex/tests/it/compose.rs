@@ -66,7 +66,9 @@ async fn a_session_writes_the_draft_you_send() {
         person_name: "Ana",
         title: "Send the Q3 numbers",
         at: c6_core::now_ms(),
+        seen_mail: &[],
         urgent: false,
+        invitation: false,
     };
     c6_memex::requests::follow(&m, &found, None).await.unwrap();
     let requests = call("memex.requests.list", json!({})).await;

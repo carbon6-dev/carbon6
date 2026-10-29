@@ -48,17 +48,18 @@ pub async fn store_calendar(m: &Memex, account: &str, c: &Value) -> anyhow::Resu
 pub async fn store_event(m: &Memex, source: &str, account: &str, email: &str, cal: &str, e: &Value) -> anyhow::Result<()> {
     let id = e["id"].as_str().unwrap_or_default();
     let status = e["status"].as_str().unwrap_or("confirmed");
-    let existing: Option<Option<String>> =
-        sqlx::query_scalar("SELECT item_id FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
-            .bind(account)
-            .bind(cal)
-            .bind(id)
-            .fetch_optional(&m.store.pool)
-            .await?;
+    let existing: Option<(Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT item_id, my_status, COALESCE(updated, 0) FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?",
+    )
+    .bind(account)
+    .bind(cal)
+    .bind(id)
+    .fetch_optional(&m.store.pool)
+    .await?;
     // A cancelled instance of a recurring event stays, to hide that
     // instance; a cancelled event goes.
     if status == "cancelled" && e["recurringEventId"].is_null() {
-        if let Some(Some(item)) = &existing {
+        if let Some((Some(item), _, _)) = &existing {
             m.store.delete(item).await?;
         }
         sqlx::query("DELETE FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
@@ -74,6 +75,7 @@ pub async fn store_event(m: &Memex, source: &str, account: &str, email: &str, ca
     let original = parse_time(&e["originalStartTime"]).map(|(t, _)| t);
     let attendees = e["attendees"].as_array().cloned().unwrap_or_default();
     let my_status = attendees.iter().find(|a| a["self"].as_bool() == Some(true)).and_then(|a| a["responseStatus"].as_str()).unwrap_or("");
+    let updated = e["updated"].as_str().and_then(|u| DateTime::parse_from_rfc3339(u).ok()).map(|d| d.timestamp_millis()).unwrap_or(0);
     let summary = e["summary"].as_str().unwrap_or("(no title)").to_owned();
     let conference = e["hangoutLink"].as_str().or(e["conferenceData"]["entryPoints"][0]["uri"].as_str()).unwrap_or("");
     // The item (not for cancelled instances): searchable, linked to people.
@@ -141,10 +143,14 @@ pub async fn store_event(m: &Memex, source: &str, account: &str, email: &str, ca
     .bind((e["transparency"].as_str() == Some("transparent")) as i64)
     .bind(e["htmlLink"].as_str().unwrap_or(""))
     .bind(conference)
-    .bind(e["updated"].as_str().and_then(|u| DateTime::parse_from_rfc3339(u).ok()).map(|d| d.timestamp_millis()).unwrap_or(0))
+    .bind(updated)
     .bind(item)
     .execute(&m.store.pool)
     .await?;
+    if existing.as_ref().is_none_or(|(_, old, at)| old != my_status || updated > *at) {
+        m.calendar_changed.store(true, std::sync::atomic::Ordering::Release);
+        m.wake.notify_waiters();
+    }
     Ok(())
 }
 
