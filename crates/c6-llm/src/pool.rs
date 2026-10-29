@@ -1,7 +1,8 @@
 //! Pools (docs/pools.md): a connection made of other connections, each
 //! taking some calls at once (its slots). A call goes to the member with a
 //! free slot that is least busy (calls in flight over slots); with every
-//! slot taken it waits its turn, first come first served. A member that
+//! slot taken it waits its turn: interactive calls first, first come first
+//! served within each class. A member that
 //! fails for now rests, twice as long each time in a row, and the call goes
 //! to another. Members without the model asked for, or not for the
 //! caller's realm, are passed over. With none left, the call fails with
@@ -26,6 +27,29 @@ const REST_FIRST: Duration = Duration::from_secs(15);
 const REST_MAX: Duration = Duration::from_secs(300);
 /// The longest a call waits for a slot.
 const MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// The caller's intent, kept through awaits and retries. Background is the
+/// default; a task spawned for a caller must carry its priority explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    #[default]
+    Background,
+    Interactive,
+}
+
+tokio::task_local! {
+    static PRIORITY: Priority;
+}
+
+impl Priority {
+    pub fn current() -> Self {
+        PRIORITY.try_with(|p| *p).unwrap_or_default()
+    }
+
+    pub async fn scope<F: Future>(self, call: F) -> F::Output {
+        PRIORITY.scope(self, call).await
+    }
+}
 
 /// A member: one of carbon6's connections, its calls at once, and the
 /// realms it is for (empty: all).
@@ -72,6 +96,7 @@ impl Seat {
 type Reply = oneshot::Sender<Result<Slot, LlmError>>;
 
 struct Waiter {
+    priority: Priority,
     /// The members that may take it.
     want: Vec<String>,
     tx: Reply,
@@ -199,7 +224,9 @@ impl Pool {
         let (tx, rx) = oneshot::channel();
         let sends = {
             let mut st = self.state.lock().unwrap();
-            st.waiting.push_back(Waiter { want, tx });
+            let priority = Priority::current();
+            let at = st.waiting.iter().position(|w| w.priority < priority).unwrap_or(st.waiting.len());
+            st.waiting.insert(at, Waiter { priority, want, tx });
             self.dispatch(&mut st)
         };
         send(sends);
@@ -319,7 +346,7 @@ impl Pool {
         send(sends);
     }
 
-    /// Gives free slots to waiters, in the order they came; fails those
+    /// Gives free slots to waiters, by priority then arrival; fails those
     /// whose members all rest. What to send, once the lock is let go.
     fn dispatch(self: &Arc<Self>, st: &mut State) -> Vec<(Reply, Result<Slot, LlmError>)> {
         let now = Instant::now();
@@ -499,6 +526,41 @@ mod tests {
         assert_eq!(p.busy(), HashMap::from([("mac".into(), 2), ("mumuzz".into(), 1)]));
         drop((a, b, c));
         assert_eq!(p.busy(), HashMap::from([("mac".into(), 0), ("mumuzz".into(), 0)]));
+    }
+
+    #[tokio::test]
+    async fn interactive_waiters_go_first_without_preempting() {
+        use futures::FutureExt;
+        let p = pool(vec![member("one", 2, &[])], &[]);
+        let held = p.acquire("m", "home").await.unwrap();
+        let other = p.acquire("m", "home").await.unwrap();
+        let b1 = p.acquire("m", "home");
+        let b2 = p.acquire("m", "home");
+        let i1 = Priority::Interactive.scope(p.acquire("m", "home"));
+        let i2 = Priority::Interactive.scope(p.acquire("m", "home"));
+        tokio::pin!(b1, b2, i1, i2);
+        // Polling each future to Pending puts it in the queue, in this order.
+        assert!(futures::poll!(&mut b1).is_pending());
+        assert!(futures::poll!(&mut b2).is_pending());
+        assert!(futures::poll!(&mut i1).is_pending());
+        assert!(futures::poll!(&mut i2).is_pending());
+        assert_eq!(p.busy()["one"], 2);
+        drop(held);
+        assert!(futures::poll!(&mut b1).is_pending());
+        assert!(futures::poll!(&mut b2).is_pending());
+        assert!(futures::poll!(&mut i2).is_pending());
+        let slot = i1.as_mut().now_or_never().expect("the first interactive call has the slot").unwrap();
+        assert_eq!(p.busy()["one"], 2, "the other running call still holds its slot");
+        drop(slot);
+        let slot = i2.as_mut().now_or_never().expect("the second interactive call has the slot").unwrap();
+        assert!(futures::poll!(&mut b1).is_pending());
+        drop(slot);
+        let slot = b1.as_mut().now_or_never().expect("the first background call has the slot").unwrap();
+        assert!(futures::poll!(&mut b2).is_pending());
+        drop(slot);
+        drop(b2.as_mut().now_or_never().expect("the second background call has the slot").unwrap());
+        drop(other);
+        assert_eq!(p.busy()["one"], 0);
     }
 
     #[tokio::test]
