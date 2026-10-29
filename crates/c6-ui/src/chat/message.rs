@@ -265,7 +265,8 @@ pub(crate) fn Message(
     let user = meta["user"].as_str().unwrap_or("").to_owned();
     let person = chat.person(&place.workspace, &user);
     let avatar = person.as_ref().and_then(|p| p["avatar"].as_str().map(str::to_owned));
-    let title = person.as_ref().and_then(|p| p["title"].as_str().filter(|t| !t.is_empty()).map(str::to_owned));
+    let email = person.as_ref().and_then(|p| p["email"].as_str().map(str::to_owned)).unwrap_or_default();
+    let about = person.as_ref().map(super::text::about).unwrap_or_default();
     let mine = meta["from_me"] == true;
     let bot = meta["bot"] == true || person.as_ref().is_some_and(|p| p["bot"] == true);
     let body = m["text"].as_str().unwrap_or("");
@@ -377,7 +378,7 @@ pub(crate) fn Message(
                 {where_}
                 {(!compact).then(|| view! {
                     <div class="flex items-baseline gap-2">
-                        <span class="font-semibold" title=title.unwrap_or_default()>{who.clone()}</span>
+                        <crate::people::Person class="font-semibold" label=who.clone() name=who.clone() address=email.clone() about=about.clone() />
                         {bot.then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[9px] font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"APP"</span> })}
                         <span class="text-[11px] text-zinc-500" title=full(at)>{time(at)}</span>
                     </div>
@@ -394,21 +395,7 @@ pub(crate) fn Message(
                 }}
                 {(!files.is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-2">
-                        {files.iter().map(|f| {
-                            let name = f["name"].as_str().unwrap_or("file").to_owned();
-                            let href = f["url"].as_str().map(str::to_owned).unwrap_or_else(|| url.clone());
-                            let kind = f["mime"].as_str().unwrap_or("").split('/').next_back().unwrap_or("").to_uppercase();
-                            let size = f["size"].as_u64().map(|s| if s > 1 << 20 { format!("{:.1} MB", s as f64 / 1048576.0) } else { format!("{} KB", s.div_ceil(1024)) }).unwrap_or_default();
-                            view! {
-                                <a href=href target="_blank" rel="noopener" class="flex max-w-xs items-center gap-2 rounded-md border border-zinc-200 px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
-                                    <span class="text-lg">"📄"</span>
-                                    <span class="min-w-0">
-                                        <span class="block truncate text-xs font-medium">{name}</span>
-                                        <span class="block text-[10px] text-zinc-500">{format!("{kind} {size}")}</span>
-                                    </span>
-                                </a>
-                            }
-                        }).collect_view()}
+                        {files.iter().map(|f| view! { <File f=f.clone() workspace=place.workspace.clone() fallback=url.clone() /> }).collect_view()}
                     </div>
                 })}
                 {(!reactions.is_empty()).then(|| {
@@ -449,6 +436,35 @@ pub(crate) fn Message(
                 view! { <EmojiPicker pick=Callback::new(move |n: String| { react(n, false); picker.set(false); }) close=picker /> }
             })}
         </div>
+    }
+}
+
+/// A message's file: a picture shown (kept by the sync, docs/conversations.md
+/// §2.2), else a file to open in Slack.
+#[component]
+fn File(f: Value, workspace: String, fallback: String) -> impl IntoView {
+    let name = f["name"].as_str().unwrap_or("file").to_owned();
+    let mime = f["mime"].as_str().unwrap_or("").to_owned();
+    let size = f["size"].as_u64().unwrap_or(0);
+    let slack = f["url"].as_str().map(str::to_owned).unwrap_or(fallback);
+    let picture = mime.starts_with("image/") && !mime.contains("svg");
+    // Not downloaded (yet): the file in Slack.
+    let missing = RwSignal::new(!picture || f["id"].as_str().is_none());
+    let kept = crate::api::memex_file(&format!("{workspace}/file/{}", f["id"].as_str().unwrap_or("")));
+    let (full, chip) = (kept.clone(), (name.clone(), mime.clone(), slack.clone()));
+    move || {
+        if missing.get() {
+            let (name, mime, href) = chip.clone();
+            view! { <crate::mail::FileChip name mime size href /> }.into_any()
+        } else {
+            view! {
+                <a href=full.clone() target="_blank" rel="noopener" title=name.clone() class="block overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-700">
+                    <img src=kept.clone() alt=name.clone() loading="lazy" class="max-h-[360px] max-w-sm bg-zinc-50 object-contain dark:bg-zinc-800"
+                        on:error=move |_| missing.set(true) />
+                </a>
+            }
+            .into_any()
+        }
     }
 }
 

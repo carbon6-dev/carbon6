@@ -3,6 +3,7 @@
 //! (yours stand out) and #channels.
 
 use leptos::prelude::*;
+use serde_json::Value;
 
 /// Common emoji by their Slack names (custom ones show as `:name:`).
 pub const EMOJI: &[(&str, &str)] = &[
@@ -397,12 +398,20 @@ pub fn status(s: &str) -> String {
     }
 }
 
+/// A chat person's title and status, one line.
+pub fn about(p: &Value) -> String {
+    [p["title"].as_str(), p["status"].as_str()].into_iter().flatten().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ")
+}
+
 /// What a message's text can point at.
 #[derive(Clone, Default)]
 pub struct Known {
     /// Your name (mentions of you stand out).
     pub me: String,
     pub people: Vec<String>,
+    /// Each person's name, address and title or status (their card from a
+    /// mention).
+    pub details: Vec<(String, String, String)>,
     /// Channel names (without #) and their ids.
     pub channels: Vec<(String, String)>,
 }
@@ -524,7 +533,7 @@ fn inline(s: &str, k: &Known) -> Vec<Part> {
     out
 }
 
-fn view_of(parts: Vec<Part>, open: Callback<String>) -> AnyView {
+fn view_of(parts: Vec<Part>, open: Callback<String>, details: &[(String, String, String)]) -> AnyView {
     parts
         .into_iter()
         .map(|p| match p {
@@ -541,15 +550,20 @@ fn view_of(parts: Vec<Part>, open: Callback<String>) -> AnyView {
                 } else {
                     "rounded bg-sky-100 px-0.5 text-sky-800 dark:bg-sky-900/50 dark:text-sky-200"
                 };
-                view! { <span class=cls>{format!("@{n}")}</span> }.into_any()
+                match details.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(&n)).cloned() {
+                    Some((name, address, about)) => {
+                        view! { <crate::people::Person class=cls label=format!("@{n}") name address about /> }.into_any()
+                    }
+                    None => view! { <span class=cls>{format!("@{n}")}</span> }.into_any(),
+                }
             }
             Part::Channel(n, id) => view! {
                 <button class="rounded bg-sky-100 px-0.5 text-sky-800 hover:underline dark:bg-sky-900/50 dark:text-sky-200" on:click=move |_| open.run(id.clone())>{format!("#{n}")}</button>
             }
             .into_any(),
-            Part::Bold(p) => view! { <b>{view_of(p, open)}</b> }.into_any(),
-            Part::Italic(p) => view! { <i>{view_of(p, open)}</i> }.into_any(),
-            Part::Strike(p) => view! { <s>{view_of(p, open)}</s> }.into_any(),
+            Part::Bold(p) => view! { <b>{view_of(p, open, details)}</b> }.into_any(),
+            Part::Italic(p) => view! { <i>{view_of(p, open, details)}</i> }.into_any(),
+            Part::Strike(p) => view! { <s>{view_of(p, open, details)}</s> }.into_any(),
         })
         .collect_view()
         .into_any()
@@ -597,7 +611,7 @@ pub fn render(text: &str, k: &Known, open: Callback<String>) -> AnyView {
             if s.is_empty() {
                 continue;
             }
-            let inner = view_of(inline(&s, k), open);
+            let inner = view_of(inline(&s, k), open, &k.details);
             blocks.push(if q {
                 view! { <blockquote class="my-0.5 whitespace-pre-wrap border-l-4 border-zinc-300 pl-2 text-zinc-600 dark:border-zinc-600 dark:text-zinc-400">{inner}</blockquote> }.into_any()
             } else {
@@ -631,8 +645,12 @@ mod tests {
 
     #[test]
     fn slack_markup() {
-        let k =
-            Known { me: "Me Myself".into(), people: vec!["Ana Lima".into(), "Ana".into()], channels: vec![("eng".into(), "C1".into())] };
+        let k = Known {
+            me: "Me Myself".into(),
+            people: vec!["Ana Lima".into(), "Ana".into()],
+            channels: vec![("eng".into(), "C1".into())],
+            ..Default::default()
+        };
         let s = |t: &str| shape(&inline(t, &k));
         assert_eq!(s("hi @Ana Lima and @Me Myself, see #eng"), "hi [@Ana Lima] and [@Me Myself me], see [#eng C1]");
         assert_eq!(s("*bold _both_* and ~gone~ :tada: `x*y*`"), "[b bold [i both]] and [s gone] 🎉 [code x*y*]");

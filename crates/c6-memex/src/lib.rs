@@ -7,6 +7,7 @@ pub mod calendar;
 pub mod cards;
 pub mod chat;
 pub mod claims;
+pub mod compose;
 pub mod contacts;
 pub mod embed;
 mod explore;
@@ -807,6 +808,14 @@ impl Memex {
                     .unwrap_or_default();
                 Ok(json!({"id": id, "kind": kind, "title": title, "status": r.status}))
             }
+            // A file by its source's id (a chat's picture or document).
+            "memex.file" => match ingest::file_bytes(self, params["external_id"].as_str().unwrap_or_default(), &allowed).await? {
+                Some((name, mime, data)) => {
+                    use base64::Engine;
+                    Ok(json!({"name": name, "mime": mime, "data": base64::engine::general_purpose::STANDARD.encode(data)}))
+                }
+                None => anyhow::bail!("no file {:?}", params["external_id"]),
+            },
             "memex.content" => {
                 use base64::Engine;
                 let id = params["id"].as_str().unwrap_or_default();
@@ -927,6 +936,10 @@ impl Memex {
             m if m.starts_with("memex.requests.") => {
                 anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
                 requests::method(self, m, &params).await
+            }
+            m if m.starts_with("memex.compose.") || m.starts_with("memex.drafts.") => {
+                anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
+                compose::method(self, m, &params).await
             }
             m if m.starts_with("memex.relations.") => {
                 anyhow::ensure!(allowed.iter().any(|k| k == "email" || k == "chat"), "mail and chat are outside what this caller may see");
@@ -1106,6 +1119,13 @@ impl Memex {
             "memex.mail.attachment" => {
                 let (name, mime, data) = mail::attachment(self, &s("item_id"), params["index"].as_u64().unwrap_or(0) as usize).await?;
                 json!({"name": name, "mime": mime, "data": base64::engine::general_purpose::STANDARD.encode(data)})
+            }
+            "memex.mail.inline" => {
+                let images = mail::inline(self, &s("item_id")).await?;
+                json!(images
+                    .into_iter()
+                    .map(|(cid, mime, data)| json!({"cid": cid, "mime": mime, "data": base64::engine::general_purpose::STANDARD.encode(data)}))
+                    .collect::<Vec<_>>())
             }
             "memex.mail.draft" => {
                 let d: api::MailDraft = serde_json::from_value(params)?;

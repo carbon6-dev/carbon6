@@ -1,6 +1,6 @@
 {
   "package": "c6-extract",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Reads what carbon6's knowledge store keeps but never parses itself: mail, PDF, Word and HTML documents, photos (EXIF, thumbnails, faces) and videos (keyframes, sound).",
   "permissions": {
     "files": "session",

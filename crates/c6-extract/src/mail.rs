@@ -43,7 +43,14 @@ pub fn message(raw: &[u8]) -> anyhow::Result<(Value, Option<String>)> {
     let attachments: Vec<Value> = msg
         .attachments()
         .enumerate()
-        .map(|(i, a)| json!({"index": i, "name": a.attachment_name().unwrap_or("attachment"), "size": a.contents().len(), "mime": mime_of(a)}))
+        .map(|(i, a)| {
+            let mut v =
+                json!({"index": i, "name": a.attachment_name().unwrap_or("attachment"), "size": a.contents().len(), "mime": mime_of(a)});
+            if let Some(cid) = cid_of(a) {
+                v["cid"] = json!(cid);
+            }
+            v
+        })
         .collect();
     let v = json!({
         "message_id": msg.message_id().map(|m| m.trim()).filter(|m| !m.is_empty()),
@@ -63,6 +70,26 @@ pub fn message(raw: &[u8]) -> anyhow::Result<(Value, Option<String>)> {
         "attachments": attachments,
     });
     Ok((v, html))
+}
+
+/// An attachment's Content-ID, as `cid:` URLs name it (without <>).
+fn cid_of(a: &mail_parser::MessagePart) -> Option<String> {
+    use mail_parser::MimeHeaders;
+    a.content_id().map(|c| c.trim().trim_start_matches('<').trim_end_matches('>').to_owned()).filter(|c| !c.is_empty())
+}
+
+/// The pictures a message's HTML can show in place (`cid:`): (cid, mime,
+/// bytes) of each image attachment with a Content-ID.
+pub fn inline(raw: &[u8]) -> anyhow::Result<Vec<(String, String, Vec<u8>)>> {
+    let msg = parse(raw)?;
+    Ok(msg
+        .attachments()
+        .filter_map(|a| {
+            let mime = mime_of(a);
+            (mime.starts_with("image/") && !mime.contains("svg")).then_some(())?;
+            Some((cid_of(a)?, mime, a.contents().to_vec()))
+        })
+        .collect())
 }
 
 /// A message's nth attachment: (name, mime, bytes).
@@ -93,5 +120,20 @@ In-Reply-To: <m0@example.com>\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\nList-Id
         assert_eq!((v["date"].as_i64(), v["list"].as_bool()), (Some(1704103200), Some(true)));
         assert!(v["text"].as_str().unwrap().starts_with("Shall we meet?") && html.is_none());
         assert!(message(b"just text").is_err());
+    }
+
+    #[test]
+    fn pictures_shown_in_place() {
+        let raw = b"From: a@example.com\r\nSubject: Logo\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/html\r\n\r\n<p><img src=\"cid:logo@x\"></p>\r\n\
+--b\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=logo.png\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=a.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n\
+--b--\r\n";
+        let (v, _) = message(raw).unwrap();
+        let a = v["attachments"].as_array().unwrap();
+        assert_eq!((a[0]["cid"].as_str(), a[1].get("cid")), (Some("logo@x"), None));
+        let pics = inline(raw).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!((pics[0].0.as_str(), pics[0].1.as_str(), &pics[0].2[..4]), ("logo@x", "image/png", &[0x89, b'P', b'N', b'G'][..]));
     }
 }

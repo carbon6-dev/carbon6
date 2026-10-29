@@ -133,3 +133,5 @@ All five steps landed together (2026-10-27).
 - File uploads (`files:write`), pins (`pins:read`), bookmarks (`bookmarks:read`), custom emoji (`emoji:read`): each needs a scope, and so a new manifest and connecting again.
 - Presence (a call per person), huddles, canvases, lists, workflows, scheduled messages, reminders.
 - Notifications outside the page.
+
+See also [conversations.md](conversations.md): people's cards from their names, pictures shown in messages (slack 1.4.0), and a session from the composer that can rewrite your reply.

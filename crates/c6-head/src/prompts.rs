@@ -138,6 +138,11 @@ pub const DEFAULTS: &[Prompt] = &[
         description: "How a reply is drafted for a request that needs you: voice, facts only, choices as [[a | b]] for what only you decide. Placeholders: {{request}}, {{context}}.",
         default: text::REQUEST_DRAFT,
     },
+    Prompt {
+        name: "memex.compose.session",
+        description: "The first message of a session started from a reply box (Work on it in a session). Placeholders: {{context}} (the conversation, people, request and draft), {{for}} (the box, for the draft tool).",
+        default: text::COMPOSE_SESSION,
+    },
     Prompt { name: "memex.page.system", description: "The system prompt for writing a system's page.", default: text::PAGE_SYSTEM },
     Prompt {
         name: "memex.page",

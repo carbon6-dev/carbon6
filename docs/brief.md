@@ -231,6 +231,10 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
   - `chat.received` and `commitment.due` events;
   - snoozing until there's no reply ("H if no reply").
 
+### 10.6 Sessions on a reply (docs/conversations.md)
+
+- A request's draft card has **Work on it in a session**: an agent session with the request's whole context, which can rewrite the draft (the `draft` tool) for you to read and send here. So do Mail's compose and Chat's composer. Names open cards; attachments show as a client shows them.
+
 ## 11. Open questions
 
 - **Gmail too?** Should a pitch also be labelled and archived in Gmail (so your phone matches), as a rule you approve once? Default: carbon6 only.

@@ -90,6 +90,7 @@ pub async fn draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<api::
         note: v["note"].as_str().unwrap_or("").trim().to_owned(),
         error: None,
         at: c6_core::now_ms(),
+        by: String::new(),
     };
     sqlx::query("UPDATE requests SET draft = ?, drafted_at = ? WHERE id = ?")
         .bind(serde_json::to_string(&d)?)
@@ -106,7 +107,7 @@ fn date(ms: i64) -> String {
 
 /// What the model reads to draft: the conversations, recent exchanges with
 /// the person, what's open between you, when you're free, your voice.
-async fn context(m: &Memex, r: &api::Request) -> anyhow::Result<String> {
+pub(crate) async fn context(m: &Memex, r: &api::Request) -> anyhow::Result<String> {
     let mut out = String::from("## The request's conversations (answer in one of them, by its target)\n");
     for s in &r.sources {
         out.push_str(&format!("\n### target: {} ({})\n", s.target, s.kind));
@@ -159,7 +160,7 @@ async fn context(m: &Memex, r: &api::Request) -> anyhow::Result<String> {
 }
 
 /// A conversation's last messages, as the model reads them.
-async fn conversation(m: &Memex, target: &str) -> anyhow::Result<String> {
+pub(crate) async fn conversation(m: &Memex, target: &str) -> anyhow::Result<String> {
     let mut out = String::new();
     if let Some(rest) = target.strip_prefix("thread:") {
         let (account, thread) = rest.rsplit_once(':').unwrap_or_default();

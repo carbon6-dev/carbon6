@@ -119,6 +119,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/memex/face/{id}", get(memex_face))
         .route("/api/v1/memex/rpc", post(memex_rpc).layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)))
         .route("/api/v1/mail/attachment", get(mail_attachment))
+        .route("/api/v1/memex/file", get(memex_file))
         .route("/api/v1/memex/trails", get(memex_trails).post(memex_trail_append))
         .route("/api/v1/memex/trails/{id}", get(memex_trail).patch(memex_trail_update).delete(memex_trail_delete))
         .route("/api/v1/memex/trails/{id}/steps/{step}", delete(memex_trail_remove_step))
@@ -2042,7 +2043,7 @@ async fn memex_rpc(
         Some(x) if !x.trim().is_empty() => realm_for(&st, &caller, &asked).await?,
         _ => caller.memex_realm().to_owned(),
     };
-    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests.", "memex.relations."]
+    let ok = ["memex.mail.", "memex.calendar.", "memex.contacts.", "memex.knowledge.", "memex.chat.", "memex.triage.", "memex.requests.", "memex.relations.", "memex.drafts.", "memex.compose."]
         .iter()
         .any(|p| r.method.starts_with(p))
         // What apps' kits say about chat is theirs to write.
@@ -2088,14 +2089,42 @@ async fn mail_attachment(
     Extension(caller): Extension<Caller>,
     Query(q): Query<AttachmentQuery>,
 ) -> ApiResult<Response> {
-    use base64::Engine;
     let realm = match &q.realm {
         Some(r) if !r.trim().is_empty() => realm_for(&st, &caller, &api::InRealm { realm: q.realm.clone() }).await?,
         _ => caller.memex_realm().to_owned(),
     };
     let v = crate::memex::call_in(&st, &realm, "memex.mail.attachment", serde_json::json!({"item_id": q.item, "index": q.index})).await?;
+    file_response(&v)
+}
+
+#[derive(serde::Deserialize)]
+struct FileQuery {
+    external_id: String,
+    #[serde(default)]
+    realm: Option<String>,
+}
+
+/// A file an app kept, by its source's id (a chat's picture or document):
+/// served as mail attachments are.
+async fn memex_file(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<FileQuery>,
+) -> ApiResult<Response> {
+    let realm = match &q.realm {
+        Some(r) if !r.trim().is_empty() => realm_for(&st, &caller, &api::InRealm { realm: q.realm.clone() }).await?,
+        _ => caller.memex_realm().to_owned(),
+    };
+    let v = crate::memex::call_in(&st, &realm, "memex.file", serde_json::json!({"external_id": q.external_id})).await?;
+    file_response(&v)
+}
+
+/// A file's bytes (`data`, base64) as a response: nosniff, sandboxed, and
+/// a download unless it is a picture or a PDF.
+fn file_response(v: &serde_json::Value) -> ApiResult<Response> {
+    use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(anyhow::Error::from)?;
-    let name = v["name"].as_str().unwrap_or("attachment").replace(['"', '\\', '\n', '\r'], "_");
+    let name = v["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("attachment").replace(['"', '\\', '\n', '\r'], "_");
     let mime = v["mime"].as_str().unwrap_or("application/octet-stream").to_owned();
     let inline = mime.starts_with("image/") && !mime.contains("svg") || mime == "application/pdf";
     let disposition = format!("{}; filename=\"{name}\"", if inline { "inline" } else { "attachment" });

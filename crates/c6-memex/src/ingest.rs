@@ -30,6 +30,9 @@ pub const CONTACT: &str = "application/vnd.c6.contact+json";
 /// only the head sends it, never a token.
 pub const ITEM_TYPE: &str = "application/vnd.c6.item+json";
 
+/// Pictures an app keeps for showing (a chat's): files, not items.
+const PICTURE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
 const DOC_TYPES: [(&str, &str); 6] = [
     ("application/pdf", "pdf"),
     ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
@@ -80,6 +83,14 @@ pub fn types() -> Vec<api::IngestType> {
             attributes: json!({"type": "object"}),
             identity: "the account and the contact's resource name (apps only)".into(),
             limit: 1024 * 1024,
+            produces: vec![],
+        },
+        api::IngestType {
+            name: "file".into(),
+            types: PICTURE_TYPES.iter().map(|t| t.to_string()).collect(),
+            attributes: json!({"type": "object", "properties": {"name": {"type": "string", "maxLength": 300}}}),
+            identity: "the source and its id (apps only): a picture kept for showing, not searched".into(),
+            limit: 10 * 1024 * 1024,
             produces: vec![],
         },
         api::IngestType {
@@ -254,6 +265,7 @@ async fn one(m: &Memex, item: &api::IngestItem, app: Option<&str>) -> anyhow::Re
     anyhow::ensure!(data.len() as u64 <= handler.limit, "larger than {} MB", handler.limit >> 20);
     let (r, key) = match handler.name.as_str() {
         "mail" => (mail(m, &source, external_id, &data, &item.attributes, app.is_some()).await?, format!("mail:{source}:{external_id}")),
+        "file" => (file(m, &source, external_id, item.attributes["name"].as_str().unwrap_or(""), &mime, &data).await?, String::new()),
         "mail-labels" | "calendar" | "event" | "contact" => {
             let v: Value = serde_json::from_slice(&data).map_err(|e| anyhow::anyhow!("not JSON: {e}"))?;
             (kept(m, &handler.name, &source, &v).await?, String::new())
@@ -267,6 +279,47 @@ async fn one(m: &Memex, item: &api::IngestItem, app: Option<&str>) -> anyhow::Re
     };
     let waits = r.status == "queued";
     Ok((r, waits.then_some(key)))
+}
+
+/// A picture an app keeps for showing: its bytes and a row, no item.
+async fn file(m: &Memex, source: &str, external_id: &str, name: &str, mime: &str, data: &[u8]) -> anyhow::Result<api::IngestResult> {
+    let blob = m.put_blob(data).await?;
+    sqlx::query("INSERT OR REPLACE INTO kept_files (source, external_id, blob, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(source)
+        .bind(external_id)
+        .bind(&blob)
+        .bind(mime)
+        .bind(name)
+        .bind(data.len() as i64)
+        .bind(c6_core::now_ms())
+        .execute(&m.store.pool)
+        .await?;
+    Ok(api::IngestResult { status: "kept".into(), id: None, kind: None, error: None })
+}
+
+/// A file by its source's id: a kept file, else an item's (a document an
+/// app downloaded). (name, mime, bytes).
+pub async fn file_bytes(m: &Memex, external_id: &str, kinds: &[String]) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT name, mime, blob FROM kept_files WHERE external_id = ? ORDER BY created_at DESC LIMIT 1")
+            .bind(external_id)
+            .fetch_optional(&m.store.pool)
+            .await?;
+    if let Some((name, mime, blob)) = row {
+        return Ok(Some((name, mime, tokio::fs::read(m.blob_path(&blob)).await?)));
+    }
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM items WHERE external_id = ? LIMIT 1").bind(external_id).fetch_optional(&m.store.pool).await?;
+    let Some(item) = (match id {
+        Some(id) => m.store.item(&id, kinds).await?,
+        None => None,
+    }) else {
+        return Ok(None);
+    };
+    let Some(blob) = item.meta["blob"].as_str() else { return Ok(None) };
+    let name = item.meta["name"].as_str().unwrap_or(&item.title).to_owned();
+    let mime = item.meta["mime"].as_str().unwrap_or("application/octet-stream").to_owned();
+    Ok(Some((name, mime, tokio::fs::read(m.blob_path(blob)).await?)))
 }
 
 /// A mirrored message's labels changed (its app said so, without the

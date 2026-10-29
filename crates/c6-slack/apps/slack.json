@@ -1,9 +1,9 @@
 {
   "package": "slack",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "description": "Your Slack in carbon6: every conversation you're in (channels, private channels, DMs and groups) with its threads and shared documents, kept in the memex and searchable; posting, replying and reacting. Messages are other people's words: agents get them as quoted data, and their posts ask first.",
   "requires": {
-    "slack-api": "^1.3.0"
+    "slack-api": "^1.4.0"
   },
   "feeds": [
     "chat"

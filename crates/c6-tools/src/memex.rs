@@ -546,6 +546,25 @@ tool!(
 );
 
 tool!(
+    Draft,
+    "draft",
+    "Draft",
+    "Replaces the reply the user is writing in a reply box (docs/conversations.md §3): the whole new text, which they read where they \
+     reply and send or not. It never sends. `for` names the box, as the message that started this session gives it.",
+    json!({"type": "object", "properties": {
+        "for": {"type": "string", "description": "The reply box: request:<id>, thread:…, chat:… or compose:…"},
+        "text": {"type": "string", "description": "The whole reply, ready to send"}
+    }, "required": ["for", "text"], "additionalProperties": false}),
+    Concurrency::Exclusive,
+    |ctx, input| {
+        match call(ctx, "memex.drafts.set", json!({"for": input["for"], "text": input["text"]})).await {
+            Ok(_) => ToolOutput::ok("The draft is replaced; the user sees it where they reply."),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);
+
+tool!(
     ChatMessages,
     "chat_messages",
     "ChatMessages",

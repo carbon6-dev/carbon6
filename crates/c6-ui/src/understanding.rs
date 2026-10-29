@@ -179,22 +179,7 @@ pub fn Cards(#[prop(into)] params: serde_json::Value) -> impl IntoView {
     view! {
         {move || cards.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).filter(|a| !a.is_empty()).map(|a| view! {
             <div class="space-y-1.5">
-                {a.into_iter().map(|c| {
-                    let f = |k: &str| c["card"][k].as_str().unwrap_or("").to_owned();
-                    view! {
-                        <div class="space-y-0.5 rounded-md border border-zinc-200 p-2 text-sm dark:border-zinc-800">
-                            <p>
-                                <span class="font-medium">{c["name"].as_str().unwrap_or("").to_owned()}</span>
-                                <span class="ml-1.5 rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">{f("relationship").replace('_', " ")}</span>
-                                {(!f("role").is_empty()).then(|| view! { <span class="ml-1.5 text-xs text-zinc-500">{f("role")}</span> })}
-                            </p>
-                            {(!f("story").is_empty()).then(|| view! { <p>{f("story")}</p> })}
-                            {(!f("open").is_empty()).then(|| view! { <p class="text-xs"><span class="text-zinc-500">"Open: "</span>{f("open")}</p> })}
-                            {(!f("how").is_empty()).then(|| view! { <p class="text-xs"><span class="text-zinc-500">"You: "</span>{f("how")}</p> })}
-                            <p class="text-[11px] text-zinc-400">{format!("From {} thread{} with you, the model's reading", c["threads"].as_i64().unwrap_or(0), if c["threads"] == 1 { "" } else { "s" })}</p>
-                        </div>
-                    }
-                }).collect_view()}
+                {a.into_iter().map(crate::people::card).collect_view()}
             </div>
         })}
     }

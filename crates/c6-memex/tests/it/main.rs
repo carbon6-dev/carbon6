@@ -14,7 +14,9 @@ unsafe extern "C" fn raise_nofile_before_tests() {
 mod assistant;
 mod chat;
 mod claims;
+mod compose;
 mod docs;
+mod files;
 mod fixtures;
 mod knowledge;
 mod memex;

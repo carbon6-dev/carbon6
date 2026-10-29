@@ -179,7 +179,13 @@ impl Chat {
                 .filter_map(|c| Some((c["channel_name"].as_str()?.trim_start_matches('#').to_owned(), c["channel"].as_str()?.to_owned())))
                 .collect()
         });
-        text::Known { me, people, channels }
+        let details = self.people.with(|p| {
+            p.iter()
+                .filter(|x| x["workspace"] == workspace)
+                .filter_map(|x| Some((x["name"].as_str()?.to_owned(), x["email"].as_str().unwrap_or("").to_owned(), text::about(x))))
+                .collect()
+        });
+        text::Known { me, people, details, channels }
     }
 
     /// The workspaces, in the order their conversations were last active.

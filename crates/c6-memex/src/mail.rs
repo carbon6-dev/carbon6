@@ -526,6 +526,7 @@ pub async fn thread(m: &Memex, account: &str, thread_id: &str) -> anyhow::Result
                 name: a["name"].as_str().unwrap_or("attachment").to_owned(),
                 mime: a["mime"].as_str().unwrap_or_default().to_owned(),
                 size: a["size"].as_u64().unwrap_or(0),
+                cid: a["cid"].as_str().map(str::to_owned),
             })
             .collect();
         out.push(api::MailMessage {
@@ -559,6 +560,26 @@ pub async fn attachment(m: &Memex, item_id: &str, index: usize) -> anyhow::Resul
     let (v, mut files) = crate::extract::now(m, "attachment", &format!("head:{blob}"), "", Some(index as u64)).await?;
     let data = files.remove("data").ok_or_else(|| anyhow::anyhow!("no attachment {index}"))?;
     Ok((v["name"].as_str().unwrap_or("attachment").to_owned(), v["mime"].as_str().unwrap_or("application/octet-stream").to_owned(), data))
+}
+
+/// The pictures a message's HTML shows in place (`cid:`): its image
+/// attachments with a Content-ID, read from the message now.
+pub async fn inline(m: &Memex, item_id: &str) -> anyhow::Result<Vec<(String, String, Vec<u8>)>> {
+    let blob: String = sqlx::query_scalar("SELECT blob FROM mail WHERE item_id = ?")
+        .bind(item_id)
+        .fetch_optional(&m.store.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no such message"))?;
+    let (v, mut files) = crate::extract::now(m, "inline", &format!("head:{blob}"), "", None).await?;
+    Ok(v["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| {
+            let data = files.remove(i["file"].as_str()?)?;
+            Some((i["cid"].as_str()?.to_owned(), i["mime"].as_str().unwrap_or("image/png").to_owned(), data))
+        })
+        .collect())
 }
 
 /// Adds and removes labels on a thread: through the mail app that owns

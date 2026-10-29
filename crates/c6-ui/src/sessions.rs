@@ -638,6 +638,39 @@ pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>)
     }
 }
 
+/// The new-session form in a popup, with your usual choices and a first
+/// message written for you (docs/conversations.md §3.2).
+#[component]
+pub fn SessionDialog(
+    #[prop(into)] title: String,
+    #[prop(into)] note: String,
+    first_message: String,
+    #[prop(into)] on_session: Callback<Session>,
+    #[prop(into)] on_close: Callback<()>,
+) -> impl IntoView {
+    let connections = LocalResource::new(api::connections);
+    let first = StoredValue::new(first_message);
+    view! {
+        <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
+            <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 text-left shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
+                <div class="flex items-center gap-2">
+                    <h2 class="flex-1 font-medium">{title}</h2>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                </div>
+                <p class="text-xs text-zinc-500">{note}</p>
+                <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+                    {move || connections.get().map(|r| match r {
+                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                        Ok(conns) => view! { <SessionForm connections=conns first_message=first.get_value() on_session on_started=on_close on_cancel=on_close /> }.into_any(),
+                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                    })}
+                </Suspense>
+            </div>
+        </div>
+    }
+}
+
 /// The new-session form. With a `seed` it starts from those values instead
 /// of the ones remembered in this browser, and remembers none of its own.
 #[component]
@@ -650,6 +683,12 @@ fn SessionForm(
     /// Shows a Cancel button.
     #[prop(optional, into)]
     on_cancel: Option<Callback<()>>,
+    /// The first message, written for you (still yours to change).
+    #[prop(optional, into)]
+    first_message: Option<String>,
+    /// With the session it started.
+    #[prop(optional, into)]
+    on_session: Option<Callback<Session>>,
 ) -> impl IntoView {
     let live = api::live();
     let (ws, col) = (use_workspace(), use_column());
@@ -698,7 +737,7 @@ fn SessionForm(
     let effort = RwSignal::new(if seeded { seed.effort.clone() } else { storage_get("c6.effort").unwrap_or_default() });
     let worktree =
         RwSignal::new(if seeded { seed.worktree && seed.ssh.is_none() } else { storage_get("c6.worktree").as_deref() == Some("1") });
-    let prompt = RwSignal::new(String::new());
+    let prompt = RwSignal::new(first_message.unwrap_or_default());
     // Your labels for the session (remembered per folder).
     let labels = RwSignal::new(seed.labels.join(", "));
     let seed_realm = StoredValue::new(seed.realm.clone());
@@ -829,6 +868,9 @@ fn SessionForm(
             match api::create_session(req).await {
                 // Beside the form, so another can start right away.
                 Ok(s) => {
+                    if let Some(f) = on_session {
+                        f.run(s.clone());
+                    }
                     match col {
                         Some(c) => c.open(View::session(s.id), How::Beside),
                         None => ws.open(None, View::session(s.id), How::Beside),

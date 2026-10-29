@@ -87,6 +87,11 @@ fn completing(text: &str, caret: usize) -> Option<(char, String, usize)> {
 pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView {
     let chat = Chat::get();
     let key = format!("c6.chat.draft.{}.{}.{}", place.workspace, place.channel, thread_ts.clone().unwrap_or_default());
+    // Its reply box (docs/conversations.md §3).
+    let target = StoredValue::new(match &thread_ts {
+        Some(t) => format!("chat:{}:{}:{t}", place.workspace, place.channel),
+        None => format!("chat:{}:{}", place.workspace, place.channel),
+    });
     let text = RwSignal::new(storage_get(&key).unwrap_or_default());
     let pending = RwSignal::new(None::<(String, u32)>);
     let error = RwSignal::new(None::<String>);
@@ -196,6 +201,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                 return;
             }
             text.set(String::new());
+            crate::compose::forget(target.get_value());
             let (place, thread_ts) = (place.clone(), thread_ts.clone());
             let id = js_sys::Math::random().to_bits() as u32;
             let also = broadcast.get_untracked();
@@ -334,6 +340,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                             {format!("Also send to {channel_name}")}
                         </label>
                     })}
+                    <crate::compose::WorkInSession key=target.get_value() current=text set=Callback::new(move |t: String| text.set(t)) />
                     <span class="flex-1"></span>
                     {(!in_thread).then(|| view! { <span>"Enter to send · Shift+Enter for a new line · ↑ to edit your last"</span> })}
                     <button class="rounded bg-sky-700 px-2 py-0.5 text-white disabled:opacity-40" disabled=move || text.get().trim().is_empty() on:click=move |_| s2()>"Send"</button>

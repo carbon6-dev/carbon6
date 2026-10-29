@@ -747,6 +747,11 @@ pub async fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::
 }
 
 /// A mail attachment's address, in the realm you look at.
+/// A file an app kept (a chat's picture), by its source's id.
+pub fn memex_file(external_id: &str) -> String {
+    format!("/api/v1/memex/file?external_id={}{}", enc(external_id), in_realm('&'))
+}
+
 pub fn mail_attachment(item: &str, index: u32) -> String {
     format!("/api/v1/mail/attachment?item={}&index={index}{}", enc(item), in_realm('&'))
 }

@@ -4434,6 +4434,9 @@ pub struct RequestDraft {
     pub error: Option<String>,
     #[serde(default)]
     pub at: UnixMs,
+    /// Who wrote it, when not the drafting model: `session:<id>`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -4511,6 +4514,10 @@ pub struct MailAttachment {
     pub name: String,
     pub mime: String,
     pub size: u64,
+    /// Its Content-ID: a picture the message's HTML shows in place
+    /// (`cid:`). Mail read before the extract kit 1.1.0 has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
 }
 
 /// A message to send or keep as a draft (`POST /api/v1/mail/send`,

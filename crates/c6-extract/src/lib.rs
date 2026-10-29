@@ -82,6 +82,15 @@ fn one(tool: &str, job: &Value, dir: &Path, model: Option<&dyn faces::FaceModel>
             }
             Ok(v)
         }
+        "inline" => {
+            let mut images = Vec::new();
+            for (i, (cid, mime, data)) in mail::inline(&read(path)?)?.into_iter().enumerate() {
+                let file = format!("inline-{i}");
+                write(dir, &file, &data)?;
+                images.push(json!({"cid": cid, "mime": mime, "file": file}));
+            }
+            Ok(json!({"images": images}))
+        }
         "attachment" => {
             let (name, mime, data) = mail::attachment(&read(path)?, job["index"].as_u64().unwrap_or(0) as usize)?;
             write(dir, "data", &data)?;

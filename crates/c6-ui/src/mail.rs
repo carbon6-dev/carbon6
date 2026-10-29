@@ -63,6 +63,9 @@ fn when_near(el: &web_sys::Element, f: impl Fn() + 'static) -> web_sys::Intersec
 /// Who and what, for a reply.
 #[derive(Clone, Default)]
 pub(crate) struct Draft {
+    /// Its reply box (docs/conversations.md §3): the thread it answers, else
+    /// a new message's own.
+    key: String,
     account: String,
     to: String,
     cc: String,
@@ -472,8 +475,8 @@ pub(crate) fn Thread(
                             let a2 = account.clone();
                             view! {
                                 <div class="flex gap-2">
-                                    <button class=BUTTON on:click=move |_| compose.set(Some(reply(&a2, &m1, false)))>"Reply"</button>
-                                    <button class=BUTTON_QUIET on:click=move |_| compose.set(Some(reply(&account, &m2, true)))>"Reply all"</button>
+                                    <button class=BUTTON on:click=move |_| compose.set(Some(reply(&a2, &th.get_value(), &m1, false)))>"Reply"</button>
+                                    <button class=BUTTON_QUIET on:click=move |_| compose.set(Some(reply(&account, &th.get_value(), &m2, true)))>"Reply all"</button>
                                 </div>
                             }
                         })}
@@ -484,7 +487,7 @@ pub(crate) fn Thread(
     }
 }
 
-fn reply(account: &str, m: &MailMessage, all: bool) -> Draft {
+fn reply(account: &str, thread: &str, m: &MailMessage, all: bool) -> Draft {
     let subject = if m.subject.to_lowercase().starts_with("re:") { m.subject.clone() } else { format!("Re: {}", m.subject) };
     let mut to = vec![m.from.clone()];
     let mut cc = Vec::new();
@@ -494,6 +497,7 @@ fn reply(account: &str, m: &MailMessage, all: bool) -> Draft {
     }
     let quoted: String = m.text.lines().map(|l| format!("> {l}\n")).collect();
     Draft {
+        key: format!("thread:{account}:{thread}"),
         account: account.to_owned(),
         to: to.join(", "),
         cc: cc.join(", "),
@@ -513,6 +517,20 @@ extern "C" {
     fn theme_is_dark() -> bool;
 }
 
+/// To or cc: each a name to click for their card.
+fn people(list: Vec<(String, String)>) -> impl IntoView {
+    list.into_iter()
+        .enumerate()
+        .map(|(i, (a, n))| {
+            let shown = if n.is_empty() { a.clone() } else { n };
+            view! {
+                {(i > 0).then_some(", ")}
+                <crate::people::Person label=shown.clone() name=shown address=a />
+            }
+        })
+        .collect_view()
+}
+
 #[component]
 fn Message(m: MailMessage) -> impl IntoView {
     let images = RwSignal::new(false);
@@ -528,11 +546,54 @@ fn Message(m: MailMessage) -> impl IntoView {
     on_cleanup(move || theme.remove());
     let item = m.item_id.clone();
     let has_html = html.is_some();
+    // Pictures the HTML shows in place (cid:), as data: URLs: the frame
+    // still loads nothing from the network.
+    let wants_inline = html.as_deref().is_some_and(|h| h.contains("cid:"));
+    let inline_item = item.clone();
+    let inline = LocalResource::new(move || {
+        let id = inline_item.clone();
+        async move {
+            if !wants_inline {
+                return Vec::new();
+            }
+            api::rpc("memex.mail.inline", json!({"item_id": id}))
+                .await
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|i| {
+                    Some((i["cid"].as_str()?.to_owned(), format!("data:{};base64,{}", i["mime"].as_str()?, i["data"].as_str()?)))
+                })
+                .collect::<Vec<_>>()
+        }
+    });
+    let with_inline = move |h: &str| {
+        let mut h = h.to_owned();
+        for (cid, url) in inline.get().unwrap_or_default() {
+            h = h.replace(&format!("cid:{cid}"), &url);
+        }
+        h
+    };
+    // Shown in place: not listed again below.
+    let attachments: Vec<_> = m
+        .attachments
+        .iter()
+        .filter(|a| !a.cid.as_ref().is_some_and(|c| html.as_deref().is_some_and(|h| h.contains(&format!("cid:{c}")))))
+        .cloned()
+        .collect();
+    let (pictures, files): (Vec<_>, Vec<_>) =
+        attachments.into_iter().partition(|a| a.mime.starts_with("image/") && !a.mime.contains("svg"));
     view! {
         <article class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
             <div class="flex flex-wrap items-baseline gap-2 text-sm">
-                <span class="font-medium">{if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() }}</span>
-                <span class="text-xs text-zinc-500">{format!("<{}> to {}", m.from, m.to.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "))}</span>
+                <crate::people::Person class="font-medium" label=if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() }
+                    name=if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() } address=m.from.clone() />
+                <span class="text-xs text-zinc-500">
+                    {format!("<{}> to ", m.from)}
+                    {people(m.to.clone())}
+                    {(!m.cc.is_empty()).then(|| { let cc = m.cc.clone(); view! { " · cc " {people(cc)} } })}
+                </span>
                 <span class="flex-1"></span>
                 <span class="text-xs text-zinc-500">{crate::when::full(m.date)}</span>
             </div>
@@ -544,7 +605,7 @@ fn Message(m: MailMessage) -> impl IntoView {
                         <iframe class="h-96 w-full rounded border border-zinc-100 bg-white dark:border-zinc-800" sandbox="allow-popups allow-popups-to-escape-sandbox"
                             style=move || if dark.get() { "color-scheme: dark; background-color: Canvas" } else { "color-scheme: light; background-color: white" }
                             srcdoc=move || format!("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data: {}\"><base target=\"_blank\">{}",
-                                if images.get() { "https: http:" } else { "" }, crate::mail_html::themed(&h, dark.get()))></iframe>
+                                if images.get() { "https: http:" } else { "" }, crate::mail_html::themed(&with_inline(&h), dark.get()))></iframe>
                         {move || (!images.get()).then(|| view! {
                             <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| images.set(true)>"Show images (lets the sender see you opened it)"</button>
                         })}
@@ -552,17 +613,63 @@ fn Message(m: MailMessage) -> impl IntoView {
                 }.into_any(),
                 None => view! { <pre class="whitespace-pre-wrap font-sans text-sm">{m.text.clone()}</pre> }.into_any(),
             }}
-            {(!m.attachments.is_empty()).then(|| view! {
-                <div class="flex flex-wrap gap-2 text-xs">
-                    {m.attachments.iter().map(|a| view! {
-                        <a class="rounded bg-zinc-100 px-2 py-1 hover:underline dark:bg-zinc-800" target="_blank" rel="noopener"
-                            href=api::mail_attachment(&item, a.index)>{format!("📎 {} ({} KB)", a.name, a.size / 1024)}</a>
+            {(!pictures.is_empty()).then(|| view! {
+                <div class="flex flex-wrap gap-2">
+                    {pictures.iter().map(|a| {
+                        let (url, full) = (api::mail_attachment(&item, a.index), api::mail_attachment(&item, a.index));
+                        view! {
+                            <a href=full target="_blank" rel="noopener" title=format!("{} ({})", a.name, size(a.size))
+                                class="block overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-700">
+                                <img src=url alt=a.name.clone() loading="lazy" class="h-36 max-w-60 bg-zinc-50 object-contain dark:bg-zinc-800" />
+                            </a>
+                        }
                     }).collect_view()}
+                </div>
+            })}
+            {(!files.is_empty()).then(|| view! {
+                <div class="flex flex-wrap gap-2">
+                    {files.iter().map(|a| view! { <FileChip name=a.name.clone() mime=a.mime.clone() size=a.size href=api::mail_attachment(&item, a.index) /> }).collect_view()}
                 </div>
             })}
             {(!has_html && m.text.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">"(no text)"</p> })}
         </article>
     }
+}
+
+/// A file to open (a PDF, in a new tab) or download: its kind, name and size.
+#[component]
+pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> impl IntoView {
+    let (icon, kind) = file_kind(&mime, &name);
+    view! {
+        <a href=href target="_blank" rel="noopener"
+            class="flex max-w-xs items-center gap-2 rounded-md border border-zinc-200 px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
+            <span class="text-lg">{icon}</span>
+            <span class="min-w-0">
+                <span class="block truncate text-xs font-medium">{name}</span>
+                <span class="block text-[10px] text-zinc-500">{format!("{kind} · {}", self::size(size))}</span>
+            </span>
+        </a>
+    }
+}
+
+/// An icon and a short name for a file's kind.
+pub(crate) fn file_kind(mime: &str, name: &str) -> (&'static str, String) {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_uppercase()).unwrap_or_default();
+    match mime {
+        "application/pdf" => ("📕", "PDF".into()),
+        m if m.starts_with("image/") => ("🖼", ext),
+        m if m.starts_with("video/") => ("🎞", ext),
+        m if m.starts_with("audio/") => ("🎵", ext),
+        m if m.contains("spreadsheet") || m.contains("excel") || m == "text/csv" => ("📊", ext),
+        m if m.contains("presentation") || m.contains("powerpoint") => ("📽", ext),
+        m if m.contains("zip") || m.contains("compressed") || m.contains("tar") => ("🗜", ext),
+        _ => ("📄", if ext.is_empty() { "File".into() } else { ext }),
+    }
+}
+
+/// "230 KB", "1.4 MB".
+pub(crate) fn size(n: u64) -> String {
+    if n >= 1 << 20 { format!("{:.1} MB", n as f64 / 1048576.0) } else { format!("{} KB", n.div_ceil(1024).max(1)) }
 }
 
 #[component]
@@ -577,6 +684,8 @@ pub(crate) fn Compose(
         (RwSignal::new(d.account), RwSignal::new(d.to), RwSignal::new(d.cc), RwSignal::new(d.subject), RwSignal::new(d.body));
     let later = RwSignal::new(String::new());
     let reply_to = StoredValue::new(d.reply_to);
+    // A new message's box is its own.
+    let key = StoredValue::new(if d.key.is_empty() { format!("compose:{}", js_sys::Date::now() as u64) } else { d.key });
     let draft = move || {
         let split = |s: String| s.split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect::<Vec<_>>();
         let send_at = js_sys::Date::parse(&later.get_untracked());
@@ -588,6 +697,7 @@ pub(crate) fn Compose(
         spawn_local(async move {
             match api::rpc("memex.mail.send", d).await {
                 Ok(_) => {
+                    crate::compose::forget(key.get_value());
                     compose.set(None);
                     status.set(None);
                     refresh.update(|n| *n += 1);
@@ -621,8 +731,12 @@ pub(crate) fn Compose(
                 <input class=format!("{INPUT} py-1 text-sm sm:col-span-2") placeholder="Subject" prop:value=move || subject.get() on:input=move |ev| subject.set(event_target_value(&ev)) />
             </div>
             <textarea class=format!("{INPUT} min-h-48 text-sm") placeholder="Write (Markdown)" prop:value=move || body.get() on:input=move |ev| body.set(event_target_value(&ev))></textarea>
-            <div class="flex justify-end gap-2">
-                <button class=BUTTON_QUIET on:click=move |_| compose.set(None)>"Discard"</button>
+            <div class="flex flex-wrap items-center justify-end gap-2">
+                <span class="mr-auto">
+                    <crate::compose::WorkInSession key=key.get_value() current=body set=Callback::new(move |t: String| body.set(t))
+                        to=Signal::derive(move || to.get().split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect::<Vec<_>>()) />
+                </span>
+                <button class=BUTTON_QUIET on:click=move |_| { crate::compose::forget(key.get_value()); compose.set(None); }>"Discard"</button>
                 <button class=BUTTON_QUIET on:click=save>"Save draft"</button>
                 <button class=BUTTON on:click=send>{move || if later.get().trim().is_empty() { "Send" } else { "Send later" }}</button>
             </div>

@@ -490,7 +490,10 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                 <div class="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                     <p class="text-xs uppercase tracking-wide text-zinc-500">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
                     <h1 class="font-semibold">{r.title.clone()}</h1>
-                    <p class="text-sm">{if r.person_name.is_empty() { r.person.clone() } else { format!("{} <{}>", r.person_name, r.person) }}</p>
+                    <p class="text-sm">
+                        <crate::people::Person label=if r.person_name.is_empty() { r.person.clone() } else { format!("{} <{}>", r.person_name, r.person) }
+                            name=if r.person_name.is_empty() { r.person.clone() } else { r.person_name.clone() } address=r.person.clone() />
+                    </p>
                     {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", crate::when::full(d))}</p> })}
                     <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
                 </div>
@@ -560,7 +563,10 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
         busy.set(true);
         spawn_local(async move {
             match api::rpc("memex.requests.send", json!({"id": id, "target": d.target, "text": text.get_untracked()})).await {
-                Ok(_) => b.gone(id),
+                Ok(_) => {
+                    crate::compose::forget(format!("request:{id}"));
+                    b.gone(id)
+                }
                 Err(e) => b.error.set(Some(e)),
             }
             busy.set(false);
@@ -608,6 +614,17 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                     </div>
                 }.into_any(),
             }}
+            <crate::compose::WorkInSession key=format!("request:{id}") current=text set=Callback::new(move |t: String| {
+                text.set(t);
+                // Not drafted before: the session's draft, with where it goes.
+                if draft.get_untracked().is_none() {
+                    spawn_local(async move {
+                        if let Ok(r) = api::rpc_as::<c6_api::Request>("memex.requests.get", json!({"id": id})).await {
+                            draft.set(r.draft.filter(|d| d.error.is_none()));
+                        }
+                    });
+                }
+            }) />
         </div>
     }
 }

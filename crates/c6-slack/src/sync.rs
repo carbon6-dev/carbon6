@@ -27,6 +27,12 @@ const READABLE: [&str; 6] = [
     "text/html",
     "text/x-rst",
 ];
+/// Pictures kept to show in messages, not read (docs/conversations.md §2.2).
+const PICTURES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+/// The largest original kept when Slack has no thumbnail.
+const PICTURE_MAX: u64 = 10 * 1024 * 1024;
+/// A thumbnail's size, for the run's share, before it is downloaded.
+const THUMB_GUESS: u64 = 256 * 1024;
 /// What the records were made by: a conversation from an earlier one is
 /// read again whole (2: the names of people from other organizations, and
 /// every thread's replies; 3: which messages are yours, and which mention
@@ -762,9 +768,15 @@ async fn keep(r: &mut Run, a: &Account, team: &mut Value, c: &Conversation, m: &
     for f in files {
         let mime = f["mimetype"].as_str().unwrap_or("");
         let size = f["size"].as_u64().unwrap_or(0);
-        let queued = queue.iter().any(|q| q["id"] == f["id"]);
-        if READABLE.contains(&mime) && size <= MAX_FILE && f["url_private_download"].is_string() && !queued {
+        if queue.iter().any(|q| q["id"] == f["id"]) {
+            continue;
+        }
+        if READABLE.contains(&mime) && size <= MAX_FILE && f["url_private_download"].is_string() {
             queue.push(json!({"id": f["id"], "name": f["name"], "mime": mime, "size": size, "url": f["url_private_download"], "created": f["created"]}));
+        } else if let Some((url, size)) = picture(&f) {
+            queue.push(
+                json!({"id": f["id"], "name": f["name"], "mime": mime, "size": size, "url": url, "created": f["created"], "picture": true}),
+            );
         }
     }
     team["files_queue"] = json!(queue);
@@ -787,15 +799,16 @@ async fn files_waiting(r: &mut Run, a: &Account, team: &mut Value) -> anyhow::Re
         match r.download(a, f["url"].as_str().unwrap_or_default()).await {
             Ok(bytes) => {
                 r.file_bytes += bytes.len() as u64;
+                // A picture as it came (a thumbnail may be another format).
+                let sniffed = if f["picture"] == true { sniff(&bytes) } else { None };
+                let mime = sniffed.unwrap_or(f["mime"].as_str().unwrap_or_default()).to_owned();
                 let path = format!("files/{}/{id}", a.team);
                 r.files.insert(path.clone(), bytes);
                 let mut attributes = json!({"name": f["name"]});
                 if let Some(t) = f["created"].as_i64() {
                     attributes["created"] = json!(t * 1000);
                 }
-                r.items.push(
-                    json!({"type": f["mime"], "file": path, "external_id": format!("{}/file/{id}", a.team), "attributes": attributes}),
-                );
+                r.items.push(json!({"type": mime, "file": path, "external_id": format!("{}/file/{id}", a.team), "attributes": attributes}));
             }
             Err(e) if e.downcast_ref::<Limited>().is_some() => {
                 team["files_queue"] = json!(queue);
@@ -807,6 +820,35 @@ async fn files_waiting(r: &mut Run, a: &Account, team: &mut Value) -> anyhow::Re
     }
     team["files_queue"] = json!(queue);
     Ok(())
+}
+
+/// A picture to show in a message (docs/conversations.md §2.2): Slack's
+/// 720-pixel version, else a smaller one, else the original up to
+/// PICTURE_MAX. (url, size to count: a thumbnail's is a guess.)
+fn picture(f: &Value) -> Option<(String, u64)> {
+    let mime = f["mimetype"].as_str().unwrap_or("");
+    if !PICTURES.contains(&mime) {
+        return None;
+    }
+    let size = f["size"].as_u64().unwrap_or(0);
+    for t in ["thumb_720", "thumb_480", "thumb_360"] {
+        if let Some(u) = f[t].as_str() {
+            return Some((u.to_owned(), size.min(THUMB_GUESS)));
+        }
+    }
+    let url = f["url_private_download"].as_str().filter(|_| size <= PICTURE_MAX)?;
+    Some((url.to_owned(), size))
+}
+
+/// A picture's type by its first bytes.
+fn sniff(b: &[u8]) -> Option<&'static str> {
+    match b {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
 }
 
 /// Whether a file of `size` is downloaded in a run that has downloaded
@@ -949,6 +991,26 @@ mod tests {
         assert!(fits(0, share + 6_000_000), "alone, though bigger than the share");
         assert!(!fits(1, share + 6_000_000), "not after another");
         assert!(fits(share - 10, 10) && !fits(share - 10, 11));
+    }
+
+    /// Pictures come as Slack's clients show them: the 720-pixel version,
+    /// else a smaller one, else the original when it isn't too big; their
+    /// type is what came.
+    #[test]
+    fn pictures_to_show() {
+        let f = |extra: Value| {
+            let mut f = json!({"mimetype": "image/png", "size": 5_000_000, "url_private_download": "https://files.slack.com/o.png"});
+            f.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            f
+        };
+        let thumbs = f(json!({"thumb_720": "https://files.slack.com/t720.png", "thumb_360": "https://files.slack.com/t360.png"}));
+        assert_eq!(picture(&thumbs), Some(("https://files.slack.com/t720.png".into(), THUMB_GUESS)));
+        assert_eq!(picture(&f(json!({}))), Some(("https://files.slack.com/o.png".into(), 5_000_000)));
+        assert_eq!(picture(&f(json!({"size": PICTURE_MAX + 1}))), None, "too big, and no thumbnail");
+        assert_eq!(picture(&f(json!({"mimetype": "image/svg+xml"}))), None);
+        assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff(b"%PDF"), None);
     }
 
     /// Keeping up with more conversations than a run can look at: the
