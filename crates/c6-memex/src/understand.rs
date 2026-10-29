@@ -339,7 +339,7 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
         // The rest also calls only in a pass that began with a model and
         // budget: one raised after sorting looked (with nothing waiting yet)
         // is the next pass's, so sorting, then drafts, see it first.
-        let could = match m.understanding() {
+        let could = match m.drafting() {
             Some((_, per_day)) => budget_left(&m, per_day).await.is_ok_and(|n| n > 0),
             None => false,
         };

@@ -286,11 +286,15 @@ impl Pool {
             .filter(|s| mine.contains(&s.member.id))
             .filter(|s| match &s.models {
                 Some((_, Some(models))) => has_model(models, model),
-                _ => true,
+                Some((_, None)) => true,
+                None => model.is_empty(),
             })
             .map(|s| s.member.id.clone())
             .collect();
         if want.is_empty() {
+            if st.seats.iter().any(|s| mine.contains(&s.member.id) && s.models.is_none() && s.resting(Instant::now())) {
+                return Err(LlmError::Unavailable(format!("members of pool {} that might have the model {model} are resting", self.id)));
+            }
             return Err(LlmError::Unavailable(format!("no member of pool {} has the model {model}", self.id)));
         }
         Ok(want)
@@ -556,6 +560,36 @@ mod tests {
         assert!(matches!(p.acquire("qwen3.6:35b", "other").await, Err(LlmError::Unavailable(m)) if m.contains("qwen3.6:35b")));
         let home_only = pool(vec![member("mac", 1, &["home"])], &[]);
         assert!(matches!(home_only.acquire("m", "mach5-agents").await, Err(LlmError::Unavailable(m)) if m.contains("realm mach5-agents")));
+    }
+
+    #[tokio::test]
+    async fn a_resting_unlisted_member_cannot_take_a_waiting_named_model_call() {
+        let p = pool(vec![member("mac", 1, &[]), member("restarting", 1, &[])], &[("mac", &["qwen3.8:27b"])]);
+        {
+            let mut st = p.state.lock().unwrap();
+            let seat = st.seat("restarting").unwrap();
+            seat.models = None;
+            rest(seat);
+        }
+        let first = p.acquire("qwen3.8:27b", "home").await.unwrap();
+        let waiting = p.acquire("qwen3.8:27b", "home");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        let sends = {
+            let mut st = p.state.lock().unwrap();
+            st.seat("restarting").unwrap().rest = None;
+            p.dispatch(&mut st)
+        };
+        assert!(sends.is_empty(), "ending its rest does not prove it has the model");
+        drop(first);
+        assert_eq!(waiting.await.unwrap().member, "mac");
+
+        p.set_members(vec![member("restarting", 1, &[])]);
+        rest(p.state.lock().unwrap().seat("restarting").unwrap());
+        let error = p.acquire("qwen3.8:27b", "home").await.err().expect("its models are still unknown");
+        assert!(matches!(&error, LlmError::Unavailable(why) if why.contains("qwen3.8:27b") && why.contains("resting")));
+        assert!(error.retryable());
+        assert_eq!(p.candidates("", "home").await.unwrap(), ["restarting"]);
     }
 
     #[tokio::test]

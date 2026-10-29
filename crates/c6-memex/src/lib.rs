@@ -125,11 +125,18 @@ impl Drop for Claim<'_> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tasks {
     pub understanding: Option<llm::Task>,
+    pub drafting: Option<llm::Task>,
     pub vision: Option<llm::Task>,
     pub transcription: Option<llm::Task>,
     pub per_day: u32,
     /// Model calls side by side (at least 1).
     pub at_once: u32,
+}
+
+impl Tasks {
+    fn drafting(&self) -> Option<llm::Task> {
+        self.drafting.as_ref().or(self.understanding.as_ref()).cloned()
+    }
 }
 
 fn task_of(v: &Value) -> Option<llm::Task> {
@@ -224,6 +231,7 @@ impl Memex {
                             *m.accounts.lock().unwrap() = accounts;
                             let tasks = Tasks {
                                 understanding: task_of(&c["understanding"]),
+                                drafting: task_of(&c["drafting"]),
                                 vision: task_of(&c["vision"]),
                                 transcription: task_of(&c["transcription"]),
                                 per_day: c["calls_per_day"].as_u64().unwrap_or(500) as u32,
@@ -414,6 +422,12 @@ impl Memex {
     pub fn understanding(&self) -> Option<(llm::Task, u32)> {
         let t = self.tasks();
         t.understanding.map(|u| (u, t.per_day))
+    }
+
+    /// The drafting model and day's budget; falls back to understanding.
+    pub fn drafting(&self) -> Option<(llm::Task, u32)> {
+        let t = self.tasks();
+        t.drafting().map(|d| (d, t.per_day))
     }
 
     pub fn accounts(&self) -> Vec<people::Account> {
@@ -1381,5 +1395,24 @@ fn mime_of(name: &str) -> &'static str {
         "md" | "markdown" => "text/markdown",
         "html" | "htm" => "text/html",
         _ => "text/plain",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drafting_falls_back_to_understanding() {
+        let reader = llm::Task { connection_id: "local".into(), model: "reader".into(), effort: Some("none".into()) };
+        let writer = llm::Task { connection_id: "local".into(), model: "writer".into(), effort: Some("high".into()) };
+        let mut tasks = Tasks::default();
+        assert_eq!(tasks.drafting(), None);
+        tasks.understanding = Some(reader.clone());
+        assert_eq!(tasks.drafting(), Some(reader));
+        tasks.drafting = Some(writer.clone());
+        assert_eq!(tasks.drafting(), Some(writer.clone()));
+        tasks.understanding = None;
+        assert_eq!(tasks.drafting(), Some(writer));
     }
 }

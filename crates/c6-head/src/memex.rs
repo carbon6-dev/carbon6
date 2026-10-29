@@ -281,8 +281,13 @@ async fn check_pool_members(st: &HeadState, what: &str, pool: &str, members: &[a
 pub async fn check_pool_use(st: &HeadState, pool_id: &str, members: &[api::PoolMember]) -> anyhow::Result<()> {
     let s = settings(st).await?;
     let Some(pool) = st.store.connection(pool_id).await? else { return Ok(()) };
-    let uses =
-        [("embedding", &s.embedding), ("understanding", &s.understanding), ("vision", &s.vision), ("transcription", &s.transcription)];
+    let uses = [
+        ("embedding", &s.embedding),
+        ("understanding", &s.understanding),
+        ("drafting", &s.drafting),
+        ("vision", &s.vision),
+        ("transcription", &s.transcription),
+    ];
     for (what, m) in uses {
         if m.as_ref().is_some_and(|m| m.connection == pool.id || m.connection == pool.name) {
             check_pool_members(st, what, &pool.name, members).await?;
@@ -312,7 +317,9 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
         }
     }
     let connections = st.store.connections().await?;
-    for (what, m) in [("understanding", &s.understanding), ("vision", &s.vision), ("transcription", &s.transcription)] {
+    for (what, m) in
+        [("understanding", &s.understanding), ("drafting", &s.drafting), ("vision", &s.vision), ("transcription", &s.transcription)]
+    {
         let Some(m) = m else { continue };
         let c = connections
             .iter()
@@ -378,8 +385,8 @@ pub const MAX_AT_ONCE: u32 = 8;
 pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
     let s = settings(st).await?;
     let connections = st.store.connections().await?;
-    // Understanding sorts and drafts many times a day: by default it doesn't
-    // reason (a thinking model would spend a minute on each); vision a little.
+    // Understanding reads many times a day without reasoning by default;
+    // drafting and vision reason a little.
     let task_with = |m: &Option<api::MemexModel>, effort: &str| {
         m.as_ref().and_then(|m| {
             connections.iter().find(|c| c.id == m.connection || c.name == m.connection).map(|c| {
@@ -397,6 +404,7 @@ pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
         "accounts": accounts_by_realm(st).await,
         "contacts_auto": s.contacts_auto.unwrap_or(false),
         "understanding": task_with(&s.understanding, "none"),
+        "drafting": task_with(&s.drafting, "low"),
         "prompts": crate::prompts::for_memex(st, crate::realms::HOME).await,
         "realm_prompts": crate::prompts::for_memex_realms(st).await,
         "brief": briefs(st).await,

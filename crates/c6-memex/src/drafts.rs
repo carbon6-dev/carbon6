@@ -23,7 +23,7 @@ const MAX_CONTEXT: usize = 16_000;
 /// Writes one more draft, if a request needs one and there's a model and
 /// budget. Whether it did.
 pub async fn step(m: &Memex) -> anyhow::Result<bool> {
-    let Some((task, per_day)) = m.understanding() else { return Ok(false) };
+    let Some((task, per_day)) = m.drafting() else { return Ok(false) };
     if !crate::understand::can_call(m, &task, per_day).await? {
         return Ok(false);
     }

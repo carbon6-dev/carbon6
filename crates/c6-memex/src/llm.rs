@@ -1,4 +1,4 @@
-//! Asking a model (the understanding task's, or the vision task's), once,
+//! Asking a memex task's model, once,
 //! through one of carbon6's connections.
 //!
 //! A call that fails for now (the server unreachable, timed out, busy or
@@ -27,6 +27,8 @@ pub const CALL_LIMITS: c6_llm::limit::Limits = c6_llm::limit::Limits { total: Du
 /// How long a connection rests after its first failure for now, and at most.
 const REST_FIRST: Duration = Duration::from_secs(10);
 const REST_MAX: Duration = Duration::from_secs(300);
+/// The call label passed by drafts.rs.
+const DRAFT: &str = "draft";
 
 /// A connection resting after failures for now: until when, and how many in a row.
 #[derive(Clone, Copy, Debug)]
@@ -86,10 +88,7 @@ pub async fn ask(
         r = answer(client.as_ref(), &req) => r,
         // Its setting changed (Settings → Memex): the work goes to the new
         // model at once, nothing rests.
-        () = superseded(m, task) => {
-            let why = format!("{} on this connection is no longer the memex's model", task.model);
-            return Err(c6_llm::LlmError::Unavailable(why).into());
-        }
+        why = superseded(m, task, what == DRAFT) => return Err(why.into()),
     };
     let text = match answered {
         Ok(t) => {
@@ -117,15 +116,20 @@ async fn answer(client: &dyn c6_llm::ModelClient, req: &ModelRequest) -> anyhow:
     Ok(msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect())
 }
 
-/// Resolves once `task` is none of the memex's models any more.
-async fn superseded(m: &Memex, task: &Task) {
+/// Resolves once this call's task is no longer current.
+async fn superseded(m: &Memex, task: &Task, draft: bool) -> c6_llm::LlmError {
     loop {
         let changed = m.wake.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
         let t = m.tasks();
-        if ![t.understanding, t.vision, t.transcription].iter().flatten().any(|x| x == task) {
-            return;
+        let current = if draft {
+            t.drafting().as_ref() == Some(task)
+        } else {
+            [t.understanding, t.drafting, t.vision, t.transcription].iter().flatten().any(|x| x == task)
+        };
+        if !current {
+            return c6_llm::LlmError::Unavailable(format!("{} on this connection is no longer the model for this call", task.model));
         }
         changed.await;
     }
@@ -177,6 +181,27 @@ pub fn json_of(text: &str) -> anyhow::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_new_drafting_model_supersedes_only_the_fallback_draft() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = super::Memex::open(dir.path(), Default::default()).await.unwrap();
+        let reader = super::Task { connection_id: "local".into(), model: "reader".into(), effort: Some("none".into()) };
+        let writer = super::Task { model: "writer".into(), effort: Some("high".into()), ..reader.clone() };
+        m.set_tasks(crate::Tasks { understanding: Some(reader.clone()), ..Default::default() });
+        let draft = super::superseded(&m, &reader, true);
+        let reading = super::superseded(&m, &reader, false);
+        tokio::pin!(draft, reading);
+        assert!(futures_util::poll!(draft.as_mut()).is_pending());
+        assert!(futures_util::poll!(reading.as_mut()).is_pending());
+
+        m.set_tasks(crate::Tasks { drafting: Some(writer), ..m.tasks() });
+        let error: anyhow::Error = c6_testkit::within("the fallback draft cancelled", draft).await.into();
+        assert!(matches!(error.downcast_ref::<c6_llm::LlmError>(), Some(c6_llm::LlmError::Unavailable(_))));
+        assert!(super::transient(&error));
+        assert!(futures_util::poll!(reading.as_mut()).is_pending());
+    }
+
     #[test]
     fn room_to_think_unless_effort_is_none() {
         assert_eq!(super::output_limit(400, Some("none")), 400);

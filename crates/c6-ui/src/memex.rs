@@ -486,9 +486,9 @@ pub fn MemexSettings() -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let (conn, model, chars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let (auto, approve) = (RwSignal::new(false), RwSignal::new(true));
-    // Model tasks: (connection, model, effort) for understanding, vision,
+    // Model tasks: (connection, model, effort) for understanding, drafting, vision,
     // transcription.
-    let tasks: [ModelTask; 3] = ["understanding", "vision", "transcription"]
+    let tasks: [ModelTask; 4] = ["understanding", "drafting", "vision", "transcription"]
         .map(|k| (k, RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new())));
     let per_day = RwSignal::new(String::new());
     let at_once = RwSignal::new(String::new());
@@ -587,8 +587,10 @@ pub fn MemexSettings() -> impl IntoView {
                     "Agents' mail and calendar invitations wait for my approval"
                 </label>
                 {tasks.into_iter().map(|(k, c, m, e)| {
+                    let inherited = Signal::derive(move || k == "drafting" && c.get().is_empty());
                     let (title, hint) = match k {
                         "understanding" => ("Understanding", "e.g. claude-haiku-4-5, gpt-5-mini, qwen3:8b"),
+                        "drafting" => ("Drafting", "e.g. claude-sonnet-4-5, gpt-5, qwen3.8:27b"),
                         "vision" => ("Vision (photos)", "e.g. claude-haiku-4-5, gpt-5-mini, qwen2.5vl"),
                         _ => ("Transcription (videos)", "e.g. whisper-1, gpt-4o-mini-transcribe"),
                     };
@@ -596,7 +598,7 @@ pub fn MemexSettings() -> impl IntoView {
                         <label class="space-y-0.5">
                             <span class="text-xs text-zinc-500">{format!("{title}: connection")}</span>
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=move || c.get() on:change=move |ev| c.set(event_target_value(&ev))>
-                                <option value="">"None (off)"</option>
+                                <option value="">{if k == "drafting" { "Same as understanding" } else { "None (off)" }}</option>
                                 {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
                                     .filter(|x| x.kind != "claude_code" && (k != "transcription" || !matches!(x.kind.as_str(), "anthropic" | "chatgpt")))
                                     .map(|x| view! { <option value=x.name.clone()>{x.name.clone()}</option> }).collect_view()}
@@ -604,20 +606,20 @@ pub fn MemexSettings() -> impl IntoView {
                         </label>
                         <label class=if k == "transcription" { "space-y-0.5 sm:col-span-2" } else { "space-y-0.5" }>
                             <span class="text-xs text-zinc-500">{format!("{title}: model")}</span>
-                            <ModelInput connection=c value=m on_set=move |v| m.set(v) class=format!("{INPUT} py-1 text-xs") placeholder=hint />
+                            <ModelInput connection=c value=m on_set=move |v| m.set(v) class=format!("{INPUT} py-1 text-xs") placeholder=hint disabled=inherited />
                         </label>
                         {(k != "transcription").then(|| view! {
                             <label class="space-y-0.5">
                                 <span class="text-xs text-zinc-500">{format!("{title}: reasoning")}</span>
-                                <select class=format!("{INPUT} py-1 text-sm") prop:value=move || e.get() on:change=move |ev| e.set(event_target_value(&ev))>
-                                    <option value="">{if k == "understanding" { "Default (none: fastest)" } else { "Default (low)" }}</option>
+                                <select class=format!("{INPUT} py-1 text-sm") prop:disabled=move || inherited.get() prop:value=move || if inherited.get() { String::new() } else { e.get() } on:change=move |ev| e.set(event_target_value(&ev))>
+                                    <option value="">{move || if inherited.get() { "Same as understanding" } else if k == "understanding" { "Default (none: fastest)" } else { "Default (low)" }}</option>
                                     {["none", "low", "medium", "high"].map(|o| view! { <option value=o>{o}</option> })}
                                 </select>
                             </label>
                         })}
                     }
                 }).collect_view()}
-                <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first, and sorts and drafts for the brief. Without reasoning a local thinking model (Qwen, gpt-oss) takes seconds a conversation instead of a minute. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
+                <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first, and sorts for the brief. Without reasoning a local thinking model (Qwen, gpt-oss) takes seconds a conversation instead of a minute. Drafting writes the replies waiting on requests that need you, using the understanding model by default. A stronger model or reasoning here makes better drafts at a few calls a day, within the same daily budget. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
                 {files.into_iter().map(|(k, f)| {
                     let (title, hint) = match k {
                         "places_file" => ("Places (GeoNames file)", "e.g. ~/memex/cities1000.txt"),

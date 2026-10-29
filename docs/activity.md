@@ -26,7 +26,7 @@ Agent sessions run their model calls on workers, so they appear under **Sessions
 - how long it took, time to the first token, tokens in and out, and tokens per second;
 - the latest line of its answer.
 
-Click a call to see its prompt, its thinking and its answer. A call still going on is followed as it streams. Each is capped: the prompt at 20,000 characters (its start and end), the thinking and the answer at 8,000.
+Click a call to see its prompt, its thinking and its answer. A call still going on is followed as it streams. Each is capped: the prompt at 20,000 characters (its start and end), the thinking at 16,000 and the answer at 8,000.
 
 Above the list, calls in flight are counted by connection, and those still waiting for a first token are counted separately. A local server answers one call at a time, so the waiting count is its queue.
 

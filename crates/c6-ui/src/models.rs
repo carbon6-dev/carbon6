@@ -22,13 +22,14 @@ pub fn ModelInput(
     #[prop(into)] on_set: Callback<String>,
     #[prop(optional, into)] placeholder: Signal<String>,
     #[prop(optional, into)] class: String,
+    #[prop(optional, into)] disabled: Signal<bool>,
     #[prop(optional)] list: Option<Listed>,
 ) -> impl IntoView {
     let shown = RwSignal::new(false);
     let connections = LocalResource::new(api::connections);
     // Asked for when the list is first shown, and again for another connection.
     let offered = LocalResource::new(move || {
-        let (c, open) = (connection.get(), shown.get());
+        let (c, open) = (connection.get(), shown.get() && !disabled.get());
         let all = connections.get().and_then(Result::ok);
         async move {
             let all = all.filter(|_| open && list.is_none())?;
@@ -69,14 +70,16 @@ pub fn ModelInput(
         <div class="relative" node_ref=wrap>
             <div class="flex">
                 <input class=format!("{class} rounded-r-none font-mono") autocomplete="off" placeholder=move || placeholder.get()
+                    prop:disabled=move || disabled.get()
                     prop:value=move || value.get() on:input=move |ev| on_set.run(event_target_value(&ev))
                     on:focus=move |_| shown.set(true) on:blur=move |_| shown.set(false)
                     on:keydown=move |ev| if ev.key() == "Escape" { shown.set(false) } />
                 <button type="button" tabindex="-1" title="Every model the connection offers"
+                    prop:disabled=move || disabled.get()
                     class="rounded-r-md border border-l-0 border-zinc-300 px-2 text-xs text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                     on:mousedown=move |ev| { ev.prevent_default(); shown.update(|s| *s = !*s); }>"▾"</button>
             </div>
-            {move || shown.get().then(|| view! {
+            {move || (shown.get() && !disabled.get()).then(|| view! {
                 <div class=move || format!("absolute z-30 w-full min-w-56 overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900 {}",
                         if room.get().0 { "bottom-full mb-1" } else { "mt-1" })
                     style=move || format!("max-height: {}px", room.get().1)

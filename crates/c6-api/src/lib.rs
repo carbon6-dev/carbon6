@@ -3816,7 +3816,7 @@ pub struct MemexModel {
     pub connection: String,
     pub model: String,
     /// How much the model reasons: none, low, medium or high (default: none
-    /// for understanding, which sorts and drafts; low for vision).
+    /// for understanding; low for drafting and vision).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 }
@@ -3845,7 +3845,12 @@ pub struct MemexSettings {
     /// topics, commitments, claims. None: no understanding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub understanding: Option<MemexModel>,
-    /// Model calls a day for understanding and vision (default 500).
+    /// Writes replies drafted for requests that need you; none: the
+    /// understanding model as it is, with its reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drafting: Option<MemexModel>,
+    /// Model calls a day: one budget shared by understanding, drafting and
+    /// vision (default 500).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls_per_day: Option<u32>,
     /// How many model calls understanding makes side by side (1 to 8,
