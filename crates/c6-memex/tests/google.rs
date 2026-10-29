@@ -288,6 +288,15 @@ async fn google_mail_calendar_contacts() {
             http.post(format!("{api}/decisions/{}/answer", i.decision.unwrap())).json(&json!({"option": "Install"})).send().await.unwrap();
         assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     }
+    // This test requests each mail sync itself, and later rewinds its
+    // record. A scheduled run must not race those changes.
+    for a in c6_head::triggers::list(&head.state, &c6_head::realms::Caller::root()).await.unwrap() {
+        if a.owner == "gmail" && a.action == "kit" {
+            c6_head::triggers::update(&head.state, &a.id, c6_api::AutomationEdit { enabled: Some(false), ..Default::default() })
+                .await
+                .unwrap();
+        }
+    }
     // One sign-in for the three, through your OAuth client.
     assert_eq!(
         http.post(format!("{api}/google/connect")).send().await.unwrap().status(),
@@ -354,6 +363,14 @@ async fn google_mail_calendar_contacts() {
             assert!(r.status().is_success(), "{}", r.text().await.unwrap());
             r.json::<Value>().await.unwrap()
         }
+    };
+    let mail_idle = async || {
+        eventually("the previous mail sync round finished", async || {
+            let activity = c6_head::activity::get(&head.state).await.unwrap();
+            let mail = activity["connectors"].as_array()?.iter().find(|c| c["realm"] == "home" && c["app"] == "gmail")?;
+            (!mail["round"]["ended_at"].is_null()).then_some(())
+        })
+        .await;
     };
 
     // The apps' syncs (every few minutes; now): imported (both pages),
@@ -597,6 +614,7 @@ async fn google_mail_calendar_contacts() {
         .unwrap();
     assert_eq!(legacy.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    mail_idle().await;
     let before = mock.requests().len();
     mock.push(Reply::Text("Triaged.".into()));
     {
@@ -630,6 +648,7 @@ async fn google_mail_calendar_contacts() {
     assert!(t6.as_array().unwrap().iter().any(|t| t["thread_id"] == "t6" && t["account"] != "import:mbox:archive"), "{t6}");
 
     // Moved to spam in Gmail: it leaves the inbox views.
+    mail_idle().await;
     let threads = async |view: &str| -> Vec<String> {
         let v = rpc("memex.mail.threads", json!({"view": view})).await;
         v.as_array().unwrap().iter().map(|t| t["thread_id"].as_str().unwrap().to_owned()).collect()
@@ -650,8 +669,10 @@ async fn google_mail_calendar_contacts() {
     // waited to be read): the sync reads the last 30 days' labels again,
     // once. Alice's lunch went to spam meanwhile, and the sync's record
     // is as an older kit left it.
-    // The run that moved Carol stores its record after her mail: an edit
-    // made in between is refused as stale, so it reads again.
+    // Items arrive before the record is saved. Wait for the whole round:
+    // an older batch could otherwise overwrite the reset below, and a
+    // manual sync requested during that round would be ignored.
+    mail_idle().await;
     let checked = |r: &c6_api::Record| r.fields["key"].as_str().is_some_and(|k| k.starts_with("mail:"));
     let q = c6_api::RecordQuery::default();
     eventually("the sync's record made older", async || {
@@ -675,8 +696,13 @@ async fn google_mail_calendar_contacts() {
     rpc("memex.google_sync", json!({})).await;
     eventually("Alice's in spam", async || threads("spam").await.contains(&"t1".to_owned()).then_some(())).await;
     assert!(!threads("inbox").await.contains(&"t1".to_owned()));
-    let rec = c6_head::collections::query(&head.state, "home", "gmail_sync", &q).await.unwrap().records.into_iter().find(checked).unwrap();
-    assert_eq!(rec.fields["checked"], 1, "checked again: {:?}", rec.fields);
+    // The repaired labels arrive before the batch saves its sync record.
+    eventually("the label check's record saved", async || {
+        let rec =
+            c6_head::collections::query(&head.state, "home", "gmail_sync", &q).await.unwrap().records.into_iter().find(checked).unwrap();
+        (rec.fields["checked"] == 1).then_some(())
+    })
+    .await;
 
     // Another realm (a business's): its own Gmail apps, account and mail,
     // apart from home's; your OAuth client is every realm's.

@@ -52,6 +52,32 @@ impl Env {
 pub struct ApiError {
     pub status: u16,
     pub message: String,
+    pub rate_limit: bool,
+    /// Retry-After, as an absolute time in milliseconds.
+    pub retry_at: Option<i64>,
+}
+
+impl ApiError {
+    pub(crate) fn response(status: u16, text: &str, retry_after: Option<&str>, now: i64) -> Self {
+        let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let e = &v["error"];
+        let message: String = e["message"].as_str().unwrap_or(text).chars().take(300).collect();
+        let reason = e["errors"].as_array().into_iter().flatten().any(|e| {
+            matches!(e["reason"].as_str(), Some("rateLimitExceeded" | "userRateLimitExceeded" | "quotaExceeded" | "dailyLimitExceeded"))
+        }) || e["details"].as_array().into_iter().flatten().any(|e| e["reason"] == "RATE_LIMIT_EXCEEDED")
+            || e["status"] == "RESOURCE_EXHAUSTED";
+        let rate_limit = status == 429
+            || (status == 403
+                && (reason
+                    || ["Quota exceeded", "Rate Limit Exceeded", "User-rate limit exceeded"].iter().any(|s| message.starts_with(s))));
+        let retry_at = retry_after.and_then(|s| {
+            s.parse::<i64>()
+                .ok()
+                .map(|seconds| now.saturating_add(seconds.max(0).saturating_mul(1000)))
+                .or_else(|| chrono::DateTime::parse_from_rfc2822(s).ok().map(|d| d.timestamp_millis()))
+        });
+        Self { status, message, rate_limit, retry_at }
+    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -153,11 +179,10 @@ impl Run {
         }
         let resp = req.send().await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let text = resp.text().await?;
         if !status.is_success() {
-            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let message = v["error"]["message"].as_str().unwrap_or(&text).chars().take(300).collect();
-            return Err(ApiError { status: status.as_u16(), message }.into());
+            return Err(ApiError::response(status.as_u16(), &text, retry_after.as_deref(), chrono::Utc::now().timestamp_millis()).into());
         }
         Ok(if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text)? })
     }

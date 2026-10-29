@@ -13,7 +13,7 @@ use crate::Worker;
 
 /// What a kit job returns, at most (its files, together, sent back as
 /// base64 in one message).
-const MAX_JOB_OUTPUT: u64 = 44 * 1024 * 1024;
+pub const MAX_JOB_OUTPUT: u64 = 44 * 1024 * 1024;
 
 /// A kit tool run the head asks for, with no session (docs/knowledge.md
 /// §6.2): in a folder of its own under the worker's state, with `inputs`

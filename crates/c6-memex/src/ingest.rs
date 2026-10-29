@@ -16,7 +16,7 @@ const MAX_ITEMS: usize = 500;
 /// How long a call waits for what the kit reads.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The largest message.
-const MAIL_LIMIT: u64 = 25 * 1024 * 1024;
+pub const MAIL_LIMIT: u64 = 25 * 1024 * 1024;
 
 /// What only an app's mail, calendar and contacts sync writes: a mail
 /// account's label names, a calendar, an event and a contact, in the
