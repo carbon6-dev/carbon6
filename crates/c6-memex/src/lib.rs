@@ -86,6 +86,8 @@ pub struct Memex {
     /// The face models' files (detector, embedder), and each person's faces.
     face_paths: Mutex<Option<(String, String)>>,
     pub(crate) face_index: Mutex<Option<faces::Index>>,
+    /// Calendar responses changed: check marked requests, also once at startup.
+    pub(crate) calendar_changed: std::sync::atomic::AtomicBool,
     /// Photos or videos came or went: make events again.
     pub media_changed: std::sync::atomic::AtomicBool,
     /// A folder scan is under way (events wait for it).
@@ -181,6 +183,7 @@ impl Memex {
             places: Mutex::default(),
             face_paths: Mutex::default(),
             face_index: Mutex::default(),
+            calendar_changed: std::sync::atomic::AtomicBool::new(true),
             media_changed: Default::default(),
             scanning: Default::default(),
             extractor: Default::default(),

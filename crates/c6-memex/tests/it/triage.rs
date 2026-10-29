@@ -428,6 +428,9 @@ async fn mail_and_chat_sorted_for_the_brief() {
         json!({"category": "needs_you", "reason": "Ana is waiting on the redlines", "asks": "Approve the redlines"}).to_string(),
     ));
     mock.push(Reply::Text(json!({"same": true, "sure": true}).to_string()));
+    let mail_seen: String =
+        sqlx::query_scalar("SELECT seen_mail FROM request_sources WHERE request_id = ?").bind(ana).fetch_one(&m.store.pool).await.unwrap();
+    assert!(!serde_json::from_str::<Vec<String>>(&mail_seen).unwrap().is_empty());
     m.store.put(&ana_chat("k3", "D7", "dm", "Did you see my email about the redlines?", HOUR / 4), "test-slack").await.unwrap();
     budget(18).await;
     let joined = eventually("joined", async || {
@@ -436,6 +439,14 @@ async fn mail_and_chat_sorted_for_the_brief() {
     })
     .await;
     assert_eq!(joined.sources[1].target, "chat:T1:D7");
+    let joined_seen: Vec<(String, String)> =
+        sqlx::query_as("SELECT target, seen_mail FROM request_sources WHERE request_id = ? ORDER BY target")
+            .bind(ana)
+            .fetch_all(&m.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(joined_seen[1].1, mail_seen);
+    assert_eq!(joined_seen[0].1, "[]");
     // Another ask the model isn't sure about: two requests, marked as
     // possibly one; you merge them.
     mock.push(Reply::Text(
@@ -448,7 +459,21 @@ async fn mail_and_chat_sorted_for_the_brief() {
         open("open").await.into_iter().find(|r| r.title == "Review the Q4 budget" && r.maybe_same == [ana])
     })
     .await;
+    let before_merge: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT target, seen_mail, noted_at FROM request_sources WHERE request_id IN (?, ?) ORDER BY target")
+            .bind(ana)
+            .bind(maybe.id)
+            .fetch_all(&m.store.pool)
+            .await
+            .unwrap();
     let merged: Request = serde_json::from_value(rpc("memex.requests.merge", json!({"into": ana, "from": maybe.id})).await).unwrap();
+    let after_merge: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT target, seen_mail, noted_at FROM request_sources WHERE request_id = ? ORDER BY target")
+            .bind(ana)
+            .fetch_all(&m.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(after_merge, before_merge);
     assert_eq!(merged.sources.len(), 3);
     assert!(open("open").await.iter().all(|r| r.id != maybe.id));
 
@@ -1019,4 +1044,546 @@ async fn needs_you_is_what_waits_on_you() {
     assert_eq!(shown("triage:needs_you").await, ["Open", "Snoozed"]);
     assert_eq!(shown("needs_reply").await, ["Open", "Snoozed"]);
     head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unanswered_invitations_still_draft_but_calendar_answers_stop_them() {
+    let mock = MockLlm::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let connection: c6_api::Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "draft-model", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Only the explicit draft may call; today's background budget is already spent.
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    sqlx::query("INSERT INTO model_calls (day, calls) VALUES (?, 1)")
+        .bind(chrono::Utc::now().format("%Y-%m-%d").to_string())
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    http.put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": connection.id, "model": "mock-1"}, "calls_per_day": 1}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    eventually("the drafting model to be configured", async || m.tasks().understanding).await;
+    let url = "https://calendar.google.com/calendar/event?eid=d29ya3Nob3AgbWVAZXhhbXBsZS5jb20";
+    mail(
+        &m,
+        "invite",
+        "invite",
+        ("host@example.net", "Host"),
+        "me@mine.io",
+        "Invitation: Workshop",
+        &format!("You have been invited to the following event.\nWorkshop\nWhen\nFriday afternoon\nInvitation from Google Calendar: {url}"),
+        None,
+        &["INBOX"],
+        0,
+    )
+    .await;
+    sqlx::query("UPDATE mail SET parts = ? WHERE thread_id = 'invite'")
+        .bind(json!([{"mime":"text/calendar","name":"attachment"},{"mime":"application/ics","name":"invite.ics"}]).to_string())
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    c6_memex::calendar::store_calendar(&m, "calendar-acct", &json!({"id": "primary", "primary": true})).await.unwrap();
+    let mut event = json!({"id": "workshop", "summary": "Workshop", "htmlLink": url, "updated": chrono::Utc::now().to_rfc3339(),
+        "start": {"dateTime": "2030-11-01T17:30:00Z"}, "end": {"dateTime": "2030-11-01T20:00:00Z"},
+        "attendees": [{"email": "me@mine.io", "self": true, "responseStatus": "needsAction"}]});
+    c6_memex::calendar::store_event(&m, "test-calendar", "calendar-acct", "me@mine.io", "primary", &event).await.unwrap();
+    c6_memex::requests::follow(
+        &m,
+        &c6_memex::requests::Found {
+            target: "thread:acct:invite",
+            kind: "mail",
+            category: "needs_you",
+            reason: "RSVP",
+            asks: "RSVP to Workshop",
+            due: None,
+            person: "host@example.net",
+            person_name: "Host",
+            title: "Workshop",
+            at: c6_core::now_ms(),
+            seen_mail: &sqlx::query_scalar("SELECT item_id FROM mail WHERE account = 'acct' AND thread_id = 'invite' AND sent = 0 AND draft = 0 AND trash = 0 ORDER BY item_id")
+                .fetch_all(&m.store.pool).await.unwrap(),
+            urgent: false,
+            invitation: true,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let id = c6_memex::requests::open_of(&m, "thread:acct:invite").await.unwrap().unwrap();
+    mock.push(Reply::Text(json!({"text": "Thanks for inviting me. I will check and reply.", "target": "thread:acct:invite"}).to_string()));
+    c6_memex::requests::method(&m, "memex.requests.draft", &json!({"id": id})).await.unwrap();
+    eventually("the draft to be stored", async || {
+        let request = c6_memex::requests::get(&m, id).await.unwrap();
+        (request.draft.as_ref().is_some_and(|d| d.text == "Thanks for inviting me. I will check and reply.")
+            && serde_json::to_value(&request).unwrap()["drafting"] != true)
+            .then_some(())
+    })
+    .await;
+    assert_eq!(c6_memex::requests::get(&m, id).await.unwrap().status, "open");
+    assert_eq!(mock.requests().len(), 1);
+    event["attendees"][0]["responseStatus"] = json!("accepted");
+    c6_memex::calendar::store_event(&m, "test-calendar", "calendar-acct", "me@mine.io", "primary", &event).await.unwrap();
+    eventually("the understanding loop to close an answered invitation without a model budget", async || {
+        (c6_memex::requests::get(&m, id).await.unwrap().closed_by.as_deref() == Some("calendar")).then_some(())
+    })
+    .await;
+    match c6_memex::requests::method(&m, "memex.requests.draft", &json!({"id": id})).await {
+        Err(error) => assert!(error.to_string().contains("Calendar")),
+        Ok(_) => {
+            eventually("the Calendar answer to be recorded on the draft", async || {
+                c6_memex::requests::get(&m, id)
+                    .await
+                    .unwrap()
+                    .draft
+                    .and_then(|draft| draft.error)
+                    .filter(|error| error.contains("Calendar"))
+            })
+            .await;
+        }
+    };
+    assert_eq!(mock.requests().len(), 1);
+    head.shutdown().await.unwrap();
+}
+
+async fn request_race_head() -> (tempfile::TempDir, c6_head::Head, MockLlm, c6_api::Connection) {
+    let mock = MockLlm::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let connection = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/api/v1/connections", head.ui_addrs[0].port()))
+        .json(&json!({"name": "request-races", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Keep the test's files until its head has shut down.
+    (dir, head, mock, connection)
+}
+
+async fn request_race_model(head: &c6_head::Head, connection: &c6_api::Connection, budget: u32) -> c6_memex::llm::Task {
+    reqwest::Client::new()
+        .put(format!("http://127.0.0.1:{}/api/v1/settings/memex", head.ui_addrs[0].port()))
+        .json(&json!({"understanding": {"connection": connection.id, "model": "mock-1"}, "calls_per_day": budget, "calls_at_once": 1}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    eventually("the request model to be configured", async || m.tasks().understanding.filter(|t| t.connection_id == connection.id)).await
+}
+
+#[tokio::test]
+async fn a_join_waiting_on_the_model_cannot_attach_to_a_closed_request() {
+    let (_dir, head, mock, connection) = request_race_head().await;
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    let found = c6_memex::requests::Found {
+        target: "thread:acct:invitation",
+        kind: "mail",
+        category: "needs_you",
+        reason: "Please RSVP",
+        asks: "RSVP to Workshop",
+        due: None,
+        person: "host@example.net",
+        person_name: "Host",
+        title: "Workshop",
+        at: c6_core::now_ms(),
+        seen_mail: &[],
+        urgent: false,
+        invitation: true,
+    };
+    c6_memex::requests::follow(&m, &found, None).await.unwrap();
+    let id = c6_memex::requests::open_of(&m, found.target).await.unwrap().unwrap();
+    // This request already has a draft, and there is no unread mail to sort.
+    sqlx::query("UPDATE requests SET drafted_at = ? WHERE id = ?").bind(i64::MAX).bind(id).execute(&m.store.pool).await.unwrap();
+    let task = request_race_model(&head, &connection, 1).await;
+    let gate = mock.push_gated(Reply::Text(json!({"same": true, "sure": true}).to_string()));
+    let pending = {
+        let m = m.clone();
+        tokio::spawn(async move {
+            let chat = c6_memex::requests::Found { target: "chat:room", kind: "chat", ..found };
+            c6_memex::requests::follow(&m, &chat, Some(&task)).await.unwrap();
+        })
+    };
+    eventually("the join to wait for the model", async || (mock.requests().len() == 1).then_some(())).await;
+    sqlx::query("UPDATE requests SET status = 'done', closed_by = 'calendar', reason = 'You accepted it in Calendar.' WHERE id = ?")
+        .bind(id)
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    gate.notify_one();
+    c6_testkit::within("the join to finish", pending).await.unwrap();
+    let closed = c6_memex::requests::get(&m, id).await.unwrap();
+    assert_eq!(closed.status, "done");
+    assert_eq!(closed.reason, "You accepted it in Calendar.");
+    assert_eq!(closed.sources.len(), 1);
+    assert_eq!(closed.sources[0].target, "thread:acct:invitation");
+    let joined = c6_memex::requests::open_of(&m, "chat:room").await.unwrap().unwrap();
+    assert_ne!(joined, id);
+    assert_eq!(c6_memex::requests::get(&m, joined).await.unwrap().sources.len(), 1);
+    assert_eq!(mock.requests().len(), 1);
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_automatic_draft_finishing_after_close_keeps_the_old_draft() {
+    let (_dir, head, mock, connection) = request_race_head().await;
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    for (target, title, due) in [("chat:first", "Please review the notes", Some(1)), ("chat:second", "Please review the slides", None)] {
+        c6_memex::requests::follow(
+            &m,
+            &c6_memex::requests::Found {
+                target,
+                kind: "chat",
+                category: "needs_you",
+                reason: "Please review",
+                asks: title,
+                due,
+                person: "host@example.net",
+                person_name: "Host",
+                title,
+                at: c6_core::now_ms(),
+                seen_mail: &[],
+                urgent: false,
+                invitation: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let first = c6_memex::requests::open_of(&m, "chat:first").await.unwrap().unwrap();
+    let second = c6_memex::requests::open_of(&m, "chat:second").await.unwrap().unwrap();
+    let old = c6_api::RequestDraft { text: "The original draft.".into(), at: 1, ..Default::default() };
+    sqlx::query("UPDATE requests SET draft = ?, drafted_at = 1 WHERE id = ?")
+        .bind(serde_json::to_string(&old).unwrap())
+        .bind(first)
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    let gate = mock.push_gated(Reply::Text(json!({"text": "The late replacement.", "target": "chat:first"}).to_string()));
+    mock.push(Reply::Text(json!({"text": "Here are the slides.", "target": "chat:second"}).to_string()));
+    request_race_model(&head, &connection, 2).await;
+    eventually("the automatic draft to reach the model", async || (mock.requests().len() == 1).then_some(())).await;
+    c6_memex::requests::set(&m, first, "done", None).await.unwrap();
+    gate.notify_one();
+    // With one lane, the next draft is proof that the first step, including its error path, finished.
+    eventually("the next automatic draft to finish", async || {
+        c6_memex::requests::get(&m, second).await.unwrap().draft.filter(|d| d.text == "Here are the slides.")
+    })
+    .await;
+    assert_eq!(c6_memex::requests::get(&m, first).await.unwrap().draft, Some(old));
+    assert_eq!(mock.requests().len(), 2);
+    let calls = c6_llm::activity::calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.connection == connection.id && c.what == "draft" && c.about == "Please review the notes" && c.state == "done")
+    );
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn triage_marks_invitation_requests_and_a_join_can_clear_the_mark() {
+    let (_dir, head, mock, connection) = request_race_head().await;
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    sqlx::query("INSERT INTO sender_marks (pattern, mark, created_at) VALUES ('host@example.net', 'known', 0)")
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    mock.push(Reply::Text(json!({"category":"needs_you", "asks":"RSVP to Workshop", "invitation":true}).to_string()));
+    mail(
+        &m,
+        "invite",
+        "invite",
+        ("host@example.net", "Host"),
+        "me@mine.io",
+        "Workshop",
+        "Please RSVP to the workshop.",
+        None,
+        &["INBOX"],
+        0,
+    )
+    .await;
+    request_race_model(&head, &connection, 1).await;
+    let id = eventually("the invitation request", async || c6_memex::requests::open_of(&m, "thread:acct:invite").await.unwrap()).await;
+    let marked = async || {
+        sqlx::query_scalar::<_, bool>("SELECT invitation FROM requests WHERE id = ?").bind(id).fetch_one(&m.store.pool).await.unwrap()
+    };
+    assert!(marked().await);
+    mock.push(Reply::Text(json!({"category":"needs_you", "asks":"Bring the projector to the workshop", "invitation":false}).to_string()));
+    mock.push(Reply::Text(json!({"same":true,"sure":true}).to_string()));
+    mail(
+        &m,
+        "question",
+        "question",
+        ("host@example.net", "Host"),
+        "me@mine.io",
+        "Workshop equipment",
+        "Can you also bring the projector?",
+        None,
+        &["INBOX"],
+        0,
+    )
+    .await;
+    request_race_model(&head, &connection, 3).await;
+    eventually("the question to join", async || (c6_memex::requests::get(&m, id).await.unwrap().sources.len() == 2).then_some(())).await;
+    assert!(!marked().await);
+    mock.push(Reply::Text(json!({"category":"needs_you", "asks":"RSVP to the updated Workshop", "invitation":true}).to_string()));
+    mail(
+        &m,
+        "update",
+        "invite",
+        ("host@example.net", "Host"),
+        "me@mine.io",
+        "Workshop update",
+        "Please RSVP to the new time.",
+        None,
+        &["INBOX"],
+        0,
+    )
+    .await;
+    request_race_model(&head, &connection, 4).await;
+    eventually("the invitation update to be sorted", async || {
+        (c6_memex::requests::get(&m, id).await.unwrap().title == "RSVP to the updated Workshop").then_some(())
+    })
+    .await;
+    assert!(!marked().await, "an invitation update cannot restore a cleared mark");
+    assert_eq!(mock.requests().len(), 4);
+    let before_merge: Vec<(String, String)> =
+        sqlx::query_as("SELECT target, seen_mail FROM request_sources WHERE request_id = ? ORDER BY target")
+            .bind(id)
+            .fetch_all(&m.store.pool)
+            .await
+            .unwrap();
+    assert!(before_merge.iter().all(|(_, seen)| !serde_json::from_str::<Vec<String>>(seen).unwrap().is_empty()));
+    c6_memex::requests::follow(
+        &m,
+        &c6_memex::requests::Found {
+            target: "chat:merge",
+            kind: "chat",
+            category: "needs_you",
+            reason: "Workshop plans",
+            asks: "Plan the workshop",
+            due: None,
+            person: "",
+            person_name: "",
+            title: "Plans",
+            at: c6_core::now_ms(),
+            seen_mail: &[],
+            urgent: false,
+            invitation: false,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let into = c6_memex::requests::open_of(&m, "chat:merge").await.unwrap().unwrap();
+    c6_memex::requests::merge(&m, into, id).await.unwrap();
+    let after_merge: Vec<(String, String)> =
+        sqlx::query_as("SELECT target, seen_mail FROM request_sources WHERE request_id = ? AND kind = 'mail' ORDER BY target")
+            .bind(into)
+            .fetch_all(&m.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(after_merge, before_merge);
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn triage_keeps_the_mail_set_it_read_before_the_model_call() {
+    let (_dir, head, mock, connection) = request_race_head().await;
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    sqlx::query("INSERT INTO sender_marks (pattern, mark, created_at) VALUES ('host@example.net', 'known', 0)")
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    let url = "https://calendar.google.com/calendar/event?eid=workshop";
+    mail(&m, "invite", "invite", ("host@example.net", "Host"), "me@mine.io", "Workshop", url, None, &["INBOX"], HOUR).await;
+    let parts = json!([{"mime":"application/ics", "name":"invite.ics"}]).to_string();
+    sqlx::query("UPDATE mail SET parts = ?").bind(&parts).execute(&m.store.pool).await.unwrap();
+    let expected: Vec<String> = sqlx::query_scalar("SELECT item_id FROM mail ORDER BY item_id").fetch_all(&m.store.pool).await.unwrap();
+    let date = c6_core::now_ms() - 2 * HOUR;
+    let pending = m
+        .store
+        .put(
+            &c6_api::MemexItemIn {
+                kind: "mail".into(),
+                source: "test-mail".into(),
+                external_id: "late".into(),
+                text: format!("{url}\nAlso bring the projector."),
+                created_at: Some(date),
+                ..Default::default()
+            },
+            "test-mail",
+        )
+        .await
+        .unwrap();
+    let gate = mock.push_gated(Reply::Text(json!({"category":"needs_you", "asks":"RSVP to Workshop", "invitation":true}).to_string()));
+    request_race_model(&head, &connection, 1).await;
+    eventually("triage to read the thread and wait for the model", async || (mock.requests().len() == 1).then_some(())).await;
+    sqlx::query(
+        "INSERT INTO mail (item_id, account, gmail_id, thread_id, date, blob, parts) VALUES (?, 'acct', 'late', 'invite', ?, '', ?)",
+    )
+    .bind(&pending)
+    .bind(date)
+    .bind(&parts)
+    .execute(&m.store.pool)
+    .await
+    .unwrap();
+    c6_memex::calendar::store_calendar(&m, "calendar-acct", &json!({"id":"primary", "primary":true})).await.unwrap();
+    c6_memex::calendar::store_event(
+        &m,
+        "test-calendar",
+        "calendar-acct",
+        "me@mine.io",
+        "primary",
+        &json!({
+            "id":"workshop", "summary":"Workshop", "htmlLink":url, "updated":chrono::Utc::now().to_rfc3339(),
+            "start":{"dateTime":"2030-01-01T17:00:00Z"}, "end":{"dateTime":"2030-01-01T18:00:00Z"},
+            "attendees":[{"email":"me@mine.io", "self":true, "responseStatus":"accepted"}]
+        }),
+    )
+    .await
+    .unwrap();
+    gate.notify_one();
+    eventually("triage to finish following its result", async || {
+        sqlx::query_scalar::<_, i64>("SELECT done_at FROM triage WHERE target = 'thread:acct:invite'")
+            .fetch_optional(&m.store.pool)
+            .await
+            .unwrap()
+    })
+    .await;
+    let (id, seen): (i64, String) = sqlx::query_as("SELECT request_id, seen_mail FROM request_sources WHERE target = 'thread:acct:invite'")
+        .fetch_one(&m.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Vec<String>>(&seen).unwrap(), expected);
+    assert_eq!(c6_memex::requests::get(&m, id).await.unwrap().status, "open");
+    assert_eq!(mock.requests().len(), 1);
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn calendar_closure_requires_whole_messages_in_the_sorting_prompt() {
+    for (case, count) in [("oldest", 7), ("long", 1), ("total", 6), ("short", 6)] {
+        let (_dir, head, mock, connection) = request_race_head().await;
+        let m = c6_head::knowledge::get(&head.state).unwrap();
+        sqlx::query("INSERT INTO sender_marks (pattern, mark, created_at) VALUES ('host@example.net', 'known', 0)")
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        let url = "https://calendar.google.com/calendar/event?eid=workshop";
+        for n in 0..count {
+            let text = match case {
+                "oldest" if n == 0 => format!("{url}\nAlso bring the projector."),
+                "long" => format!("{url}\n{}Also bring the projector.", "Please RSVP. ".repeat(250)),
+                "total" => format!("{url}\n{}", "Please RSVP. ".repeat(170)),
+                _ => format!("{url}\nPlease RSVP to Workshop."),
+            };
+            mail(
+                &m,
+                &format!("invite-{n}"),
+                "invite",
+                ("host@example.net", "Host"),
+                "me@mine.io",
+                "Workshop",
+                &text,
+                None,
+                &["INBOX"],
+                HOUR + (count - n) * 1000,
+            )
+            .await;
+        }
+        sqlx::query("UPDATE mail SET parts = ?")
+            .bind(json!([{"mime":"application/ics", "name":"invite.ics"}]).to_string())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        c6_memex::calendar::store_calendar(&m, "calendar-acct", &json!({"id":"primary", "primary":true})).await.unwrap();
+        c6_memex::calendar::store_event(
+            &m,
+            "test-calendar",
+            "calendar-acct",
+            "me@mine.io",
+            "primary",
+            &json!({
+                "id":"workshop", "summary":"Workshop", "htmlLink":url, "updated":chrono::Utc::now().to_rfc3339(),
+                "start":{"dateTime":"2030-01-01T17:00:00Z"}, "end":{"dateTime":"2030-01-01T18:00:00Z"},
+                "attendees":[{"email":"me@mine.io", "self":true, "responseStatus":"accepted"}]
+            }),
+        )
+        .await
+        .unwrap();
+        mock.push(Reply::Text(json!({"category":"needs_you", "asks":"RSVP to Workshop", "invitation":true}).to_string()));
+        request_race_model(&head, &connection, 1).await;
+        eventually("triage to finish following the invitation mark", async || {
+            sqlx::query_scalar::<_, i64>("SELECT done_at FROM triage WHERE target = 'thread:acct:invite'")
+                .fetch_optional(&m.store.pool)
+                .await
+                .unwrap()
+        })
+        .await;
+        let (id, seen): (i64, String) =
+            sqlx::query_as("SELECT request_id, seen_mail FROM request_sources WHERE target = 'thread:acct:invite'")
+                .fetch_one(&m.store.pool)
+                .await
+                .unwrap();
+        let seen: Vec<String> = serde_json::from_str(&seen).unwrap();
+        match case {
+            "oldest" => {
+                let oldest: String =
+                    sqlx::query_scalar("SELECT item_id FROM mail ORDER BY date LIMIT 1").fetch_one(&m.store.pool).await.unwrap();
+                assert_eq!(seen.len(), 6);
+                assert!(!seen.contains(&oldest));
+            }
+            "long" => assert!(seen.is_empty()),
+            "total" => assert!(seen.len() < 6),
+            _ => assert_eq!(seen.len(), 6),
+        }
+        assert_eq!(c6_memex::requests::get(&m, id).await.unwrap().status, if case == "short" { "done" } else { "open" }, "{case}");
+        assert_eq!(mock.requests().len(), 1);
+        if matches!(case, "oldest" | "long") {
+            assert!(!mock.requests()[0]["messages"].to_string().contains("Also bring the projector."));
+        }
+        head.shutdown().await.unwrap();
+    }
 }

@@ -28,8 +28,11 @@ pub struct Found<'a> {
     pub person_name: &'a str,
     pub title: &'a str,
     pub at: i64,
+    /// Incoming mail item ids from the rows triage read; empty for chat.
+    pub seen_mail: &'a [String],
     /// Urgent by your rule: you're told at once.
     pub urgent: bool,
+    pub invitation: bool,
 }
 
 /// Open, or snoozed until a time that has passed.
@@ -69,8 +72,10 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
         return Ok(());
     }
     let title = if f.asks.trim().is_empty() { format!("Reply about \"{}\"", f.title) } else { clip(f.asks.trim(), 200) };
-    if let Some(id) = mine.first() {
-        sqlx::query("UPDATE requests SET title = ?, due = COALESCE(?, due), reason = ?, category = ?, updated_at = ? WHERE id = ?")
+    if let Some(id) = mine.first()
+        && source(m, *id, f).await?
+    {
+        sqlx::query("UPDATE requests SET title = ?, due = COALESCE(?, due), reason = ?, category = ?, updated_at = ? WHERE id = ? AND status IN ('open', 'snoozed')")
             .bind(&title)
             .bind(f.due)
             .bind(f.reason)
@@ -79,7 +84,9 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
             .bind(id)
             .execute(&m.store.pool)
             .await?;
-        source(m, *id, f).await?;
+        if crate::drafts::close_answered(m, *id).await? {
+            return Ok(());
+        }
         return urgent(m, *id, f).await;
     }
     // The same person's other open requests: is this one of them?
@@ -104,14 +111,18 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
             crate::understand::count_call(m).await?;
             let v = llm::json_of(&llm::ask(m, task, "same request?", &new, &system, vec![Block::Text(ask)], 200).await?)?;
             match (v["same"] == true, v["sure"] == true) {
-                (true, true) => {
-                    sqlx::query("UPDATE requests SET due = COALESCE(due, ?), updated_at = ? WHERE id = ?")
-                        .bind(f.due)
-                        .bind(now)
-                        .bind(id)
-                        .execute(&m.store.pool)
-                        .await?;
-                    source(m, *id, f).await?;
+                (true, true) if source(m, *id, f).await? => {
+                    sqlx::query(
+                        "UPDATE requests SET due = COALESCE(due, ?), updated_at = ? WHERE id = ? AND status IN ('open', 'snoozed')",
+                    )
+                    .bind(f.due)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&m.store.pool)
+                    .await?;
+                    if crate::drafts::close_answered(m, *id).await? {
+                        return Ok(());
+                    }
                     return urgent(m, *id, f).await;
                 }
                 (true, false) => maybe = Some(*id),
@@ -120,7 +131,7 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
         }
     }
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO requests (person, person_name, title, due, category, reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO requests (person, person_name, title, due, category, reason, created_at, updated_at, invitation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(f.person)
     .bind(f.person_name)
@@ -130,9 +141,13 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
     .bind(f.reason)
     .bind(now)
     .bind(now)
+    .bind(f.invitation)
     .fetch_one(&m.store.pool)
     .await?;
     source(m, id, f).await?;
+    if crate::drafts::close_answered(m, id).await? {
+        return Ok(());
+    }
     if let Some(other) = maybe {
         sqlx::query("INSERT OR IGNORE INTO request_maybe (a, b) VALUES (?, ?)").bind(other).bind(id).execute(&m.store.pool).await?;
     }
@@ -167,22 +182,32 @@ async fn urgent(m: &Memex, id: i64, f: &Found<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn source(m: &Memex, id: i64, f: &Found<'_>) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO request_sources (request_id, target, kind, at, noted_at) VALUES (?, ?, ?, ?, ?) \
-         ON CONFLICT DO UPDATE SET at = excluded.at, noted_at = excluded.noted_at",
+async fn source(m: &Memex, id: i64, f: &Found<'_>) -> anyhow::Result<bool> {
+    let mut seen_mail = if f.kind == "mail" { f.seen_mail.to_vec() } else { Vec::new() };
+    seen_mail.sort();
+    let mut tx = m.store.pool.begin().await?;
+    let added = sqlx::query(
+        "INSERT INTO request_sources (request_id, target, kind, at, noted_at, seen_mail) SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+         WHERE EXISTS (SELECT 1 FROM requests WHERE id = ?1 AND status IN ('open', 'snoozed')) \
+         ON CONFLICT DO UPDATE SET at = excluded.at, noted_at = excluded.noted_at, seen_mail = excluded.seen_mail",
     )
     .bind(id)
     .bind(f.target)
     .bind(f.kind)
     .bind(f.at)
     .bind(c6_core::now_ms())
-    .execute(&m.store.pool)
-    .await?;
-    Ok(())
+    .bind(serde_json::to_string(&seen_mail)?)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if added != 0 {
+        sqlx::query("UPDATE requests SET invitation = invitation AND ? WHERE id = ?").bind(f.invitation).bind(id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(added != 0)
 }
 
-async fn close(m: &Memex, id: i64, status: &str, by: &str) -> anyhow::Result<()> {
+pub(crate) async fn close(m: &Memex, id: i64, status: &str, by: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE requests SET status = ?, closed_by = ?, until = NULL, updated_at = ? WHERE id = ?")
         .bind(status)
         .bind(by)
@@ -190,6 +215,71 @@ async fn close(m: &Memex, id: i64, status: &str, by: &str) -> anyhow::Result<()>
         .bind(id)
         .execute(&m.store.pool)
         .await?;
+    unpair(m, id).await
+}
+
+pub(crate) struct CalendarAnswer {
+    pub account: String,
+    pub calendar: String,
+    pub event: String,
+    pub status: String,
+    pub updated: i64,
+}
+
+// Already closed by Calendar still needs the same source and event checks;
+// rechecking it leaves its original closing time alone.
+pub(crate) async fn close_calendar(
+    m: &Memex,
+    id: i64,
+    reason: &str,
+    sources: &[(String, i64, i64, String)],
+    event: &CalendarAnswer,
+) -> anyhow::Result<bool> {
+    let Some(threads): Option<Vec<_>> = sources
+        .iter()
+        .map(|(target, _, _, _)| {
+            let (account, thread) = target.strip_prefix("thread:")?.rsplit_once(':')?;
+            Some((target, account, thread))
+        })
+        .collect()
+    else {
+        return Ok(false);
+    };
+    if threads.is_empty() {
+        return Ok(false);
+    }
+    let closed = sqlx::query(
+        "UPDATE requests SET status = 'done', closed_by = 'calendar', reason = ?2, until = NULL, updated_at = CASE WHEN status = 'done' THEN updated_at ELSE ?3 END \
+         WHERE id = ?1 AND category = 'needs_you' AND invitation = 1 \
+         AND (status IN ('open', 'snoozed') OR (status = 'done' AND closed_by = 'calendar')) \
+         AND ?4 = (SELECT json_group_array(json_array(target, at, noted_at, seen_mail)) FROM \
+             (SELECT target, at, noted_at, seen_mail FROM request_sources WHERE request_id = ?1 ORDER BY target)) \
+         AND NOT EXISTS (SELECT 1 FROM request_sources s JOIN json_each(?10) t ON s.target = json_extract(t.value, '$[0]') \
+             WHERE s.request_id = ?1 AND (s.seen_mail = '[]' OR s.seen_mail != (SELECT json_group_array(item_id) FROM \
+                 (SELECT item_id FROM mail WHERE account = json_extract(t.value, '$[1]') AND thread_id = json_extract(t.value, '$[2]') \
+                  AND sent = 0 AND draft = 0 AND trash = 0 ORDER BY item_id)))) \
+         AND EXISTS (SELECT 1 FROM events WHERE account = ?5 AND calendar_id = ?6 AND event_id = ?7 AND my_status = ?8 AND updated = ?9)",
+    )
+    .bind(id)
+    .bind(reason)
+    .bind(c6_core::now_ms())
+    .bind(serde_json::to_string(sources)?)
+    .bind(&event.account)
+    .bind(&event.calendar)
+    .bind(&event.event)
+    .bind(&event.status)
+    .bind(event.updated)
+    .bind(serde_json::to_string(&threads)?)
+    .execute(&m.store.pool)
+    .await?
+    .rows_affected();
+    if closed != 0 {
+        unpair(m, id).await?;
+    }
+    Ok(closed != 0)
+}
+
+async fn unpair(m: &Memex, id: i64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM request_maybe WHERE a = ?1 OR b = ?1").bind(id).execute(&m.store.pool).await?;
     Ok(())
 }
@@ -293,18 +383,25 @@ pub async fn merge(m: &Memex, into: i64, from: i64) -> anyhow::Result<api::Reque
     anyhow::ensure!(into != from, "a request is already itself");
     get(m, into).await?;
     get(m, from).await?;
+    let mut tx = m.store.pool.begin().await?;
+    sqlx::query("UPDATE requests SET invitation = invitation AND (SELECT invitation FROM requests WHERE id = ?) WHERE id = ?")
+        .bind(from)
+        .bind(into)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO request_sources (request_id, target, kind, at, noted_at) SELECT ?, target, kind, at, noted_at \
+        "INSERT OR IGNORE INTO request_sources (request_id, target, kind, at, noted_at, seen_mail) SELECT ?, target, kind, at, noted_at, seen_mail \
          FROM request_sources WHERE request_id = ?",
     )
     .bind(into)
     .bind(from)
-    .execute(&m.store.pool)
+    .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM request_sources WHERE request_id = ?").bind(from).execute(&m.store.pool).await?;
-    sqlx::query("DELETE FROM request_maybe WHERE a = ?1 OR b = ?1").bind(from).execute(&m.store.pool).await?;
-    sqlx::query("DELETE FROM requests WHERE id = ?").bind(from).execute(&m.store.pool).await?;
-    sqlx::query("UPDATE requests SET updated_at = ? WHERE id = ?").bind(c6_core::now_ms()).bind(into).execute(&m.store.pool).await?;
+    sqlx::query("DELETE FROM request_sources WHERE request_id = ?").bind(from).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM request_maybe WHERE a = ?1 OR b = ?1").bind(from).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM requests WHERE id = ?").bind(from).execute(&mut *tx).await?;
+    sqlx::query("UPDATE requests SET updated_at = ? WHERE id = ?").bind(c6_core::now_ms()).bind(into).execute(&mut *tx).await?;
+    tx.commit().await?;
     get(m, into).await
 }
 
@@ -321,7 +418,9 @@ pub async fn sorted_by_you(m: &Memex, t: &api::Triage) -> anyhow::Result<()> {
         person_name: &t.sender_name,
         title: &t.title,
         at: t.at,
+        seen_mail: &[],
         urgent: false,
+        invitation: false,
     };
     follow(m, &f, None).await
 }

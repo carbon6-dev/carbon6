@@ -98,7 +98,7 @@ A new memex table, per realm:
 | reason | why it's here, one line |
 
 - **Same ask, two channels:** a new message from a person with an open request is compared with it (the model, with both texts); a match joins it as another source. Unsure: two requests marked "possibly the same" (one key merges). Never silently hidden.
-- **Closing:** you send, mark done, or the thread shows it handled (they withdrew; the meeting got booked) — the triage step notices on the next message.
+- **Closing:** you send, mark done, or the thread shows it handled (they withdrew; the meeting got booked) — the triage step notices on the next message. A request triage marked as only an invitation also closes when Calendar records your answer; the reason says whether you accepted, declined or answered maybe.
 - Requests are memex data like commitments: agents in a session whose memex scope allows can read them (`requests` tool), and the brief is built from them.
 
 ## 6. Drafts
@@ -189,6 +189,9 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
   - else a new one.
 - **The same person** across mail and chat: Slack messages carry the sender's address (`user_email`), so a request is joined by address.
 - **Closing:** a conversation sorted again as `yours` (you answered) closes its requests as done (`replied`). Sorted as FYI, newsletter and the like means `settled`. Marking a sender as a pitch drops theirs. You can set a request done, dropped, snoozed until a time, or open again.
+- **Calendar answers:** triage's `invitation` mark (migration 0025) is true only when the sole ask is to accept, decline or RSVP. A new request takes that value; an updated or joining conversation ANDs its value with the request's, so false stays false. Earlier requests default to false.
+  A marked needs-you request, open or snoozed, closes as `calendar` only if every source is mail and every incoming, non-draft, non-trashed message has Calendar metadata (the Calendar sender, a `text/calendar` part or an `.ics` file). Each thread’s incoming message ids must exactly match its non-empty `request_sources.seen_mail`, the sorted ids returned by triage’s message query. Added or trashed mail leaves it open until triage reads the changed set, regardless of message dates or when the item was stored. `noted_at` still records when the source was followed, for news since a draft. Their event links must all resolve to the same unique local event on a primary calendar, answered accepted, declined or tentative, with a nonzero Calendar `updated` at least as recent as every message. Missing or unreadable data leaves it open. There is no invitation-layout parsing. An organizer update whose mail arrives after its Calendar timestamp stays open even if it kept the answer.
+  This is checked before urgent notifications and before drafting, and swept after triage and before drafting in the understanding loop, regardless of model budget. A flag starts set and is set again by a changed Calendar response or newer event timestamp; each sweep indexes events once. The closing write rechecks the mark, source timestamps, each source’s stored incoming message set against the current thread, and event, and a model draft finishing after closure is not saved. A Brief link to the closed request shows its Calendar reason; reply-box session drafts and links remain available.
 - **Sorting a conversation yourself** (Sort as… needs you) opens a request with no model call.
 - **Kept** in the realm memex's `requests`, `request_sources` and `request_maybe` (migration 0013).
 - **API:** `memex.requests.list` (open by default, the soonest due first), `get`, `set` and `merge`. Agents get the `requests` tool in sessions whose memex scope includes mail or chat.

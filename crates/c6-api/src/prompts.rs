@@ -49,10 +49,11 @@ with once, or a company they deal with about something else.\n\
 - newsletter: a publication or bulk mailing the owner may have subscribed to.\n\
 - notification: automated (receipts, alerts, account and calendar notices, app notifications).\n\
 - noise: nothing of value (spam, scams).\n\
+Set invitation true only when the only ask is to answer a calendar invitation (accept, decline or RSVP).\n\
 The owner's corrections of earlier ones (follow them):\n{{examples}}\n\
 JSON: {\"category\": one of the above, \"reason\": why, in at most 12 words, written for the owner, \"asks\": for needs_you, \
 what they need from the owner in one short line (\"Approve the contract redlines\"), else \"\", \"due\": \"YYYY-MM-DD\" when \
-they need it by a date, else null, \"urgent\": true only for needs_you that is urgent by the owner's rule: {{urgent}}}";
+they need it by a date, else null, \"invitation\": true or false, \"urgent\": true only for needs_you that is urgent by the owner's rule: {{urgent}}}";
 
 /// A person's or organization's card (docs/relationships.md §2.3).
 /// `{{who}}`, `{{history}}`, `{{threads}}`, `{{previous}}`.

@@ -4360,7 +4360,7 @@ pub struct Request {
     /// Snoozed: when it comes back.
     pub until: Option<UnixMs>,
     pub reason: String,
-    /// What closed it: you, replied, settled, pitch.
+    /// What closed it: you, replied, settled, pitch, calendar.
     pub closed_by: Option<String>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
