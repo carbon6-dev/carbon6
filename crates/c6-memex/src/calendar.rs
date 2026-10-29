@@ -202,24 +202,71 @@ pub async fn events(m: &Memex, from: i64, to: i64) -> anyhow::Result<Vec<api::Ca
     .fetch_all(&m.store.pool)
     .await?;
     for r in &masters {
-        let (acct, cal, id): (String, String, String) = (r.get("account"), r.get("calendar_id"), r.get("event_id"));
-        let exceptions: Vec<i64> = sqlx::query_scalar("SELECT original_start FROM events WHERE account = ? AND calendar_id = ? AND recurring_event_id = ? AND original_start IS NOT NULL")
-            .bind(&acct)
-            .bind(&cal)
-            .bind(&id)
-            .fetch_all(&m.store.pool)
-            .await?;
-        let (start, end): (i64, i64) = (r.get("start"), r.get("end"));
-        let lines: Vec<String> = serde_json::from_str(&r.get::<String, _>("recurrence")).unwrap_or_default();
-        let tz: String = r.get("time_zone");
-        for s in expand(start, &tz, &lines, from - (end - start), to)? {
-            if !exceptions.contains(&s) {
-                out.push(row_event(r, s, s + (end - start), true));
-            }
+        for (start, end) in occurrences(m, r, from, to).await? {
+            out.push(row_event(r, start, end, true));
         }
     }
     out.sort_by_key(|e| e.start);
     Ok(out)
+}
+
+/// Expanded occurrences, with changed and cancelled starts removed.
+async fn occurrences(m: &Memex, r: &sqlx::sqlite::SqliteRow, from: i64, to: i64) -> anyhow::Result<Vec<(i64, i64)>> {
+    let exceptions: Vec<i64> = sqlx::query_scalar(
+        "SELECT original_start FROM events WHERE account = ? AND calendar_id = ? AND recurring_event_id = ? AND original_start IS NOT NULL",
+    )
+    .bind(r.get::<String, _>("account"))
+    .bind(r.get::<String, _>("calendar_id"))
+    .bind(r.get::<String, _>("event_id"))
+    .fetch_all(&m.store.pool)
+    .await?;
+    let (start, end): (i64, i64) = (r.get("start"), r.get("end"));
+    let lines: Vec<String> = serde_json::from_str(&r.get::<String, _>("recurrence")).unwrap_or_default();
+    let tz: String = r.get("time_zone");
+    // Without recurrence lines, keep the stored first occurrence.
+    let starts = if lines.is_empty() {
+        (start < to && end >= from).then_some(start).into_iter().collect()
+    } else {
+        expand(start, &tz, &lines, from - (end - start), to)?
+    };
+    Ok(starts.into_iter().filter(|s| !exceptions.contains(s)).map(|s| (s, s + (end - start))).collect())
+}
+
+/// The next unended occurrence, including moved instances.
+pub(crate) async fn next_occurrence(
+    m: &Memex,
+    account: &str,
+    calendar: &str,
+    event: &str,
+    now: i64,
+    tz: chrono_tz::Tz,
+) -> anyhow::Result<Option<(i64, i64)>> {
+    let r = sqlx::query("SELECT * FROM events WHERE account = ? AND calendar_id = ? AND event_id = ?")
+        .bind(account)
+        .bind(calendar)
+        .bind(event)
+        .fetch_one(&m.store.pool)
+        .await?;
+    let cutoff = if r.get::<i64, _>("all_day") != 0 {
+        // All-day times are date placeholders, so use today's date in the primary zone.
+        let today = DateTime::from_timestamp_millis(now).ok_or_else(|| anyhow::anyhow!("bad time"))?.with_timezone(&tz).date_naive();
+        today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
+    } else {
+        now
+    };
+    let through = DateTime::parse_from_rfc3339("9999-12-31T23:59:59Z")?.timestamp_millis();
+    let mut spans = occurrences(m, &r, cutoff + 1, through).await?;
+    let changed = sqlx::query(
+        "SELECT start, end FROM events WHERE account = ? AND calendar_id = ? AND recurring_event_id = ? AND status != 'cancelled' AND end > ?",
+    )
+    .bind(account)
+    .bind(calendar)
+    .bind(event)
+    .bind(cutoff)
+    .fetch_all(&m.store.pool)
+    .await?;
+    spans.extend(changed.iter().map(|r| (r.get("start"), r.get("end"))));
+    Ok(spans.into_iter().min())
 }
 
 /// The starts of a recurring event within [from, to), from its first
@@ -323,6 +370,92 @@ async fn one(m: &Memex, account: &str, cal: &str, id: &str) -> anyhow::Result<ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_recurrence_keeps_other_events_visible() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "UTC"})).await.unwrap();
+        for (id, start, end) in
+            [("malformed", "2030-04-01T09:00:00Z", "2030-04-01T10:00:00Z"), ("valid", "2030-04-01T11:00:00Z", "2030-04-01T12:00:00Z")]
+        {
+            store_event(
+                &m,
+                "test-calendar",
+                "cal-acct",
+                "owner@example.test",
+                "primary",
+                &json!({
+                    "id": id, "start": {"dateTime": start}, "end": {"dateTime": end},
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE events SET recurrence = 'not json' WHERE event_id = 'malformed'").execute(&m.store.pool).await.unwrap();
+        let start = Utc.with_ymd_and_hms(2030, 4, 1, 0, 0, 0).unwrap().timestamp_millis();
+        let got = events(&m, start, start + 86_400_000).await.unwrap();
+        assert_eq!(
+            got.iter().map(|e| (e.event_id.as_str(), e.start, e.end)).collect::<Vec<_>>(),
+            vec![("malformed", start + 9 * 3_600_000, start + 10 * 3_600_000), ("valid", start + 11 * 3_600_000, start + 12 * 3_600_000)]
+        );
+        assert_eq!(busy(&m, start, start + 86_400_000).await.unwrap().len(), 2);
+        assert!(events(&m, start + 86_400_000, start + 14 * 86_400_000).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_day_occurrences_last_until_local_midnight() {
+        c6_llm::install_crypto_provider();
+        for tz in [chrono_tz::America::New_York, chrono_tz::Pacific::Honolulu] {
+            let dir = tempfile::tempdir().unwrap();
+            let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+            store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": tz.name()})).await.unwrap();
+            store_event(
+                &m,
+                "test-calendar",
+                "cal-acct",
+                "owner@example.test",
+                "primary",
+                &json!({
+                    "id": "series", "start": {"date": "2030-04-01"}, "end": {"date": "2030-04-02"},
+                    "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=3"],
+                }),
+            )
+            .await
+            .unwrap();
+            let start = Utc.with_ymd_and_hms(2030, 4, 1, 0, 0, 0).unwrap().timestamp_millis();
+            let day = 86_400_000;
+            let evening = tz.with_ymd_and_hms(2030, 4, 1, 20, 30, 0).unwrap().timestamp_millis();
+            assert!(evening > start + day);
+            assert_eq!(next_occurrence(&m, "cal-acct", "primary", "series", evening, tz).await.unwrap(), Some((start, start + day)));
+
+            store_event(
+                &m,
+                "test-calendar",
+                "cal-acct",
+                "owner@example.test",
+                "primary",
+                &json!({
+                    "id": "changed", "recurringEventId": "series", "originalStartTime": {"date": "2030-04-01"},
+                    "start": {"date": "2030-04-01"}, "end": {"date": "2030-04-02"},
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(next_occurrence(&m, "cal-acct", "primary", "series", evening, tz).await.unwrap(), Some((start, start + day)));
+            let midnight = tz.with_ymd_and_hms(2030, 4, 2, 0, 0, 0).unwrap().timestamp_millis();
+            let next = Some((start + 7 * day, start + 8 * day));
+            assert_eq!(next_occurrence(&m, "cal-acct", "primary", "series", midnight, tz).await.unwrap(), next);
+
+            sqlx::query("UPDATE events SET all_day = 0").execute(&m.store.pool).await.unwrap();
+            assert_eq!(
+                next_occurrence(&m, "cal-acct", "primary", "series", evening, tz).await.unwrap(),
+                next,
+                "timed events still use the instant"
+            );
+        }
+    }
 
     #[test]
     fn weekly_expansion() {
