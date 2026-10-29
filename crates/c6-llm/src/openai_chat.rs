@@ -125,6 +125,12 @@ impl OpenAiChat {
     }
 }
 
+/// Whether a 400/422 rejects reasoning_effort or the think setting Ollama maps it to.
+fn rejects_reasoning(why: &str) -> bool {
+    let why = why.to_lowercase();
+    why.contains("reasoning") || why.contains("think")
+}
+
 #[async_trait]
 impl ModelClient for OpenAiChat {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
@@ -136,7 +142,7 @@ impl ModelClient for OpenAiChat {
         let url = format!("{}/chat/completions", self.base_url);
         let resp = match http::post_json(&self.http, &url, &headers, &body, self.attempts).await {
             Err(LlmError::Http { status: 400 | 422, body: why, .. })
-                if body.get("reasoning_effort").is_some() && why.to_lowercase().contains("reasoning") =>
+                if body.get("reasoning_effort").is_some() && rejects_reasoning(&why) =>
             {
                 let mut body = body.clone();
                 if let Some(o) = body.as_object_mut() {
@@ -380,6 +386,38 @@ fn parse_models(text: &str) -> Result<Vec<String>, LlmError> {
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn reasoning_rejections_include_ollama_thinking_errors() {
+        for why in [
+            "Unknown parameter: reasoning_effort",
+            r#""qwen" does not support thinking"#,
+            r#"think value "high" is not supported for this model"#,
+            "Thinking is not supported",
+        ] {
+            assert!(rejects_reasoning(why), "{why}");
+        }
+        assert!(!rejects_reasoning("model not found"));
+        assert!(!rejects_reasoning("max_tokens is too large"));
+    }
+
+    #[test]
+    fn request_sends_high_effort_and_output_limit() {
+        let c = OpenAiChat::new("http://localhost:1/v1", "", HashMap::new()).unwrap();
+        let req = ModelRequest {
+            model: "qwen3.8:27b".into(),
+            system: "Draft a reply.".into(),
+            messages: vec![Message::user_text("Can we meet tomorrow?")],
+            tools: vec![],
+            max_output_tokens: Some(9692),
+            cache_key: None,
+            effort: Some("high".into()),
+            web_search: false,
+        };
+        let body = c.request_body(&req);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["max_tokens"], 9692);
+    }
 
     #[test]
     fn model_lists() {

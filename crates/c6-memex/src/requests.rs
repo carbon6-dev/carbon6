@@ -370,7 +370,8 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         "memex.requests.set" => json!(set(m, id, params["status"].as_str().unwrap_or_default(), params["until"].as_i64()).await?),
         "memex.requests.merge" => json!(merge(m, params["into"].as_i64().unwrap_or(0), params["from"].as_i64().unwrap_or(0)).await?),
         "memex.requests.draft" => {
-            let (task, _) = m.understanding().ok_or_else(|| anyhow::anyhow!("choose an understanding model first (Settings → Memex)"))?;
+            let (task, _) =
+                m.drafting().ok_or_else(|| anyhow::anyhow!("choose an understanding or drafting model first (Settings → Memex)"))?;
             json!(crate::drafts::draft(m, &task, id).await?)
         }
         "memex.requests.reply_to" => crate::drafts::reply_to(m, params["target"].as_str().unwrap_or_default()).await?,

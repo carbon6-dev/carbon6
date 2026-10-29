@@ -103,6 +103,7 @@ A new memex table, per realm:
 
 ## 6. Drafts
 
+- Which model drafts: the drafting model in Settings → Memex, else the understanding model, within the same daily budget.
 - Written with: the thread(s); the person's recent mail and chat with you; open commitments both ways; your calendar (for scheduling, a real free slot); files the thread names, found in the memex; and your **voice**: a few of your recent replies to this person (else to anyone), so it sounds like you.
 - Where only you can decide, the draft offers choices ("approve 3 and 7; on 5: keep 2x / accept 1x") rather than guessing.
 - Kept with the request, not in Gmail's Drafts, until you edit or send; sending goes through the mail or Slack app's operation, as from the Mail page (undo window). It doesn't go through the agents' approval policy, because your keypress is the approval.
@@ -200,7 +201,7 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 
 ### 10.4 Drafts (step 4)
 
-- **Drafted in the memex's reading loop,** after triage and before understanding, within the same daily budget: an open request that needs you and has no draft, or whose conversations have news since it was drafted (`request_sources.noted_at`). Soonest due first, then the newest. First contacts are drafted when you ask.
+- **Drafted in the memex's reading loop,** after triage and before understanding, with the drafting model (else understanding), within the same daily budget: an open request that needs you and has no draft, or whose conversations have news since it was drafted (`request_sources.noted_at`). Soonest due first, then the newest. First contacts are drafted when you ask.
 - **What the model reads** (`memex.requests.draft`):
   - each conversation's last messages, by target;
   - other recent mail with the person;

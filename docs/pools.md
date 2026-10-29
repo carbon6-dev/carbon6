@@ -5,7 +5,7 @@ A **pool** is a connection made of other connections. What runs in the head and 
 ## What uses a pool
 
 Pools are for what runs in the head, which calls models itself:
-- the memex: understanding (sorting, drafts, cards, reading, pages), vision, embeddings and transcription (**Settings → Memex**);
+- the memex: understanding (sorting, cards, reading, pages), drafting, vision, embeddings and transcription (**Settings → Memex**);
 - the assistant (**Settings → Assistant**, or a routing rule for `assistant`);
 - session suggestions (a routing rule for `task:suggest`).
 
@@ -17,7 +17,7 @@ Sessions don't use pools. A session's worker dials its connection itself, so a s
 - **Waiting its turn.** When every slot is taken, the call waits in the head, first come first served, until a slot frees up. It gives up after 10 minutes.
 - **Failing over.** A member that fails for now rests: it refuses the connection, times out, answers 429 or 5xx, or (for the memex) stalls past its call's time limits (docs/brief.md). The call then goes to another member at once. Its rest is 15 seconds, twice as long after each failure in a row, up to 5 minutes; an answer ends it. A pool's members are tried once each, not retried as a plain connection is.
 - **Passing over.**
-  - **The model:** each member's model list (`/models`) is kept for 5 minutes, and members without the model asked for are skipped. `name` and `name:latest` are the same model. A member with no model list may have any.
+  - **The model:** each member's model list (`/models`) is kept for 5 minutes, and members without the model asked for are skipped. `name` and `name:latest` are the same model. A member that can't list its models (no list endpoint) may have any. A member whose list hasn't been fetched because it is resting takes no call for a named model until it is listed.
   - **The realm:** a member's own realms (**Console → Connections**) apply too: a member that isn't for the caller's realm is skipped.
 - **None left.** With no member to take the call, it fails "for now". The memex then waits and asks again later (docs/brief.md), as it does when a model is unreachable.
 

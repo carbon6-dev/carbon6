@@ -15,8 +15,9 @@ use crate::{Block, EventStream, LlmError, ModelClient, ModelEvent, ModelRequest}
 
 /// How many calls are kept (the oldest finished ones go first).
 const KEEP: usize = 200;
-/// How much of a prompt, its thinking and its answer is kept.
+/// How much of a prompt, thinking and text is kept, each with its own cap.
 const PROMPT_CHARS: usize = 20_000;
+const THINKING_CHARS: usize = 16_000;
 const OUTPUT_CHARS: usize = 8_000;
 
 /// What a call is for.
@@ -188,7 +189,7 @@ impl ModelClient for Tracked {
                     Ok(ModelEvent::ThinkingDelta(t)) => update(id, |c| {
                         c.first_at.get_or_insert_with(now_ms);
                         c.state = "thinking";
-                        push_capped(&mut c.thinking, t, OUTPUT_CHARS);
+                        push_capped(&mut c.thinking, t, THINKING_CHARS);
                     }),
                     Ok(ModelEvent::TextDelta(t)) => update(id, |c| {
                         c.first_at.get_or_insert_with(now_ms);
@@ -274,6 +275,28 @@ mod tests {
         let c = mine();
         assert_eq!((c.state, c.text.as_str(), c.output_tokens, c.effort.as_str()), ("done", "{\"category\": \"needs_you\"}", 9, "none"));
         assert!(c.ended_at.is_some() && c.first_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn thinking_and_text_have_separate_caps() {
+        let events = vec![
+            ModelEvent::ThinkingDelta("t".repeat(11_000)),
+            ModelEvent::TextDelta("a".repeat(9_000)),
+            ModelEvent::ThinkingDelta("t".repeat(6_000)),
+            ModelEvent::Done { stop_reason: "stop".into() },
+        ];
+        let origin = Origin { what: "draft".into(), about: "request-caps".into(), ..Default::default() };
+        let client = track(Box::new(Canned(events)), origin);
+        let mut s = client.stream(&req("m")).await.unwrap();
+        s.next().await.unwrap().unwrap();
+        let mine = || calls().into_iter().find(|c| c.about == "request-caps").unwrap();
+        assert_eq!(mine().thinking, "t".repeat(11_000));
+        while let Some(ev) = s.next().await {
+            ev.unwrap();
+        }
+        let c = mine();
+        assert_eq!(c.thinking, "t".repeat(16_000));
+        assert_eq!(c.text, "a".repeat(8_000));
     }
 
     #[tokio::test]

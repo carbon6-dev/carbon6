@@ -1020,3 +1020,101 @@ async fn needs_you_is_what_waits_on_you() {
     assert_eq!(shown("needs_reply").await, ["Open", "Snoozed"]);
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn requests_use_the_drafting_model_automatically_and_on_demand() {
+    let (reader, writer) = (MockLlm::start().await, MockLlm::start().await);
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    for (name, mock) in [("reader", &reader), ("writer", &writer)] {
+        let r = http.post(format!("{api}/connections")).json(&json!({"name": name, "base_url": mock.base_url()})).send().await.unwrap();
+        assert!(r.status().is_success());
+    }
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    let put = async |settings: &Value| {
+        let r = http.put(format!("{api}/settings/memex")).json(settings).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    };
+    reader.push(Reply::Text(json!({"category": "needs_you", "reason": "Pat asks for a pilot", "asks": "Approve a pilot"}).to_string()));
+    writer.push(Reply::Text(json!({"target": "thread:acct:p1", "text": "The pilot works for us."}).to_string()));
+    mail(&m, "p1", "p1", ("pat@mine.io", "Pat"), "me@mine.io", "Pilot", "Can you approve a pilot for 40 seats?", None, &["INBOX"], HOUR)
+        .await;
+    sqlx::query("INSERT INTO sender_marks (pattern, mark, created_at) VALUES ('pat@mine.io', 'known', ?)")
+        .bind(c6_core::now_ms())
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    let mut settings = json!({
+        "understanding": {"connection": "reader", "model": "reader-1"},
+        "drafting": {"connection": "writer", "model": "writer-1"},
+        "calls_per_day": 1
+    });
+    put(&settings).await;
+    let saved: Value = http.get(format!("{api}/settings/memex")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(saved["drafting"], settings["drafting"]);
+    let config = c6_head::memex::config(&head.state).await.unwrap();
+    assert_eq!(config["drafting"]["model"], "writer-1");
+    assert_eq!(config["drafting"]["effort"], "low");
+    assert_eq!(config["understanding"]["effort"], "none");
+
+    eventually("request sorted before drafting", async || c6_memex::requests::list(&m, "open", 100).await.ok()?.into_iter().next()).await;
+    settings["calls_per_day"] = json!(2);
+    settings["drafting"]["effort"] = json!("high");
+    put(&settings).await;
+    let request = eventually("automatically drafted request", async || {
+        let requests = c6_memex::requests::list(&m, "open", 100).await.ok()?;
+        requests.into_iter().find(|r| r.draft.as_ref().is_some_and(|d| d.text == "The pilot works for us."))
+    })
+    .await;
+    assert_eq!(reader.requests().len(), 1);
+    assert_eq!(reader.requests()[0]["model"], "reader-1");
+    assert_eq!(reader.requests()[0]["reasoning_effort"], "none");
+    assert_eq!(writer.requests().len(), 1);
+    let calls: i64 = sqlx::query_scalar("SELECT SUM(calls) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
+    assert_eq!(calls, 2, "sorting and drafting share the budget");
+
+    writer.push(Reply::Text(json!({"target": "thread:acct:p1", "text": "Let's start the pilot Monday."}).to_string()));
+    let r = http
+        .post(format!("{api}/memex/rpc"))
+        .json(&json!({"method": "memex.requests.draft", "params": {"id": request.id}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let draft: Value = r.json().await.unwrap();
+    assert_eq!(draft["text"], "Let's start the pilot Monday.");
+    assert_eq!(writer.requests().len(), 2);
+    for body in writer.requests() {
+        assert_eq!(body["model"], "writer-1");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body["max_tokens"].as_u64().unwrap() >= 1500 + 8192);
+    }
+    let calls: i64 = sqlx::query_scalar("SELECT SUM(calls) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
+    assert_eq!(calls, 3, "Draft again counts against the same budget");
+
+    settings["understanding"] = Value::Null;
+    settings["calls_per_day"] = json!(4);
+    writer.push(Reply::Text(json!({"target": "thread:acct:p1", "text": "Monday is confirmed."}).to_string()));
+    sqlx::query("UPDATE requests SET drafted_at = NULL WHERE id = ?").bind(request.id).execute(&m.store.pool).await.unwrap();
+    put(&settings).await;
+    eventually("drafted without understanding", async || {
+        let r = c6_memex::requests::get(&m, request.id).await.ok()?;
+        (r.draft?.text == "Monday is confirmed.").then_some(())
+    })
+    .await;
+    assert!(m.understanding().is_none());
+    assert_eq!(reader.requests().len(), 1);
+    assert_eq!(writer.requests().len(), 3);
+    head.shutdown().await.unwrap();
+}
