@@ -29,19 +29,14 @@ pub async fn context(m: &Memex, key: &str, draft: &str, to: &[String]) -> anyhow
     match request_of(key) {
         Some(id) => {
             let r = crate::requests::get(m, id).await?;
-            let due = r
-                .due
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|d| format!(", by {}", d.format("%Y-%m-%d")))
-                .unwrap_or_default();
-            out.push_str(&format!("## What they need\n{} (from {} <{}>{due}). {}\n\n", r.title, r.person_name, r.person, r.reason));
-            // The request's conversations, who they are, what's open, when
-            // you're free, your voice: what its draft was written from.
-            out.push_str(&crate::drafts::context(m, &r).await?);
+            // Use the draft's cleaned request line once, under the reply box's heading.
+            let context = crate::drafts::context(m, &r).await?;
+            let (request, context) = crate::drafts::task_context(&context);
+            out.push_str(&format!("## What they need\n{request}. {}\n{context}", crate::drafts::clean(&r.reason)));
             people.clear();
         }
         None if key.starts_with("thread:") || key.starts_with("chat:") => {
-            out.push_str(&format!("## The conversation\n{}", crate::drafts::conversation(m, key).await?));
+            out.push_str(&crate::drafts::conversation_context(m, key).await?);
             people.extend(participants(m, key).await?);
         }
         None => {}
@@ -54,7 +49,7 @@ pub async fn context(m: &Memex, key: &str, draft: &str, to: &[String]) -> anyhow
         }
     }
     if !cards.is_empty() {
-        out.push_str(&format!("\n## Who they are to me\n{cards}"));
+        out.push_str(&format!("\n## Who they are to me\n{}", crate::drafts::clean(&cards)));
     }
     let draft = if draft.trim().is_empty() { "(none yet)".to_owned() } else { clip(draft, 8000) };
     out.push_str(&format!("\n## My draft so far\n{draft}\n"));

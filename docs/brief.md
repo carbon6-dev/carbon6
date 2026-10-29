@@ -104,7 +104,15 @@ A new memex table, per realm:
 ## 6. Drafts
 
 - Which model drafts: the drafting model in Settings → Memex, else the understanding model, within the same daily budget.
-- Written with: the thread(s); the person's recent mail and chat with you; open commitments both ways; your calendar (for scheduling, a real free slot); files the thread names, found in the memex; and your **voice**: a few of your recent replies to this person (else to anyone), so it sounds like you.
+- Written with: the request's conversations, the person's relationship cards, other mail with them from the last 180 days, current commitments between you, your calendar, and your **voice**: up to three of your sent messages to this person (else to anyone), plus recent chat samples.
+- Conversations keep their text, including raw invitations, quotes, signatures and forwarded content. Each mail includes To/Cc recipients, kept whole within a 300-character line with a count of any omitted recipients. Message dates and calendar facts use the primary calendar's zone; dates written inside a message are left as written.
+- Event links matched to the local calendar add a separate invitation section with the event's title, time, organizer, response and overlapping busy blocks. Optional attendance is stated only when the owner's Calendar attendee has `optional: true`; no attendance line is inferred from mail. Each event has one summary, even when several messages link to it. An accepted, declined or tentative RSVP is already answered, even if the request still asks for it.
+- Other mail excludes the request's threads, subjects starting with `Fwd:` or `Fw:`, and Calendar mail identified by sender or attachment metadata. Snippets are cleaned and clipped to 120 characters; bodies are not classified by their layout or wording. Each mail-history pass takes the newest 2,000 rows in its date window using the date index before checking recipients or eligibility, then reads at most 100 matching bodies.
+- Voice searches sent mail from the last 365 days, first to this person and then, if none is found, to anyone. It skips `Fwd:`/`Fw:` subjects and empty samples, caps each sample at 350 characters (300 for chat), and applies the same privacy cleaning. It does not parse quotes, signatures, forwarded-message markers or automatic-mail wording, or require a minimum word count.
+- Commitments must be yours or the person's, on mail directly between you (in To, not just Cc). Items due more than 30 days ago are omitted. Undated commitments are aged by their source item's date, not when they were extracted, and omitted after 90 days.
+- Every section loses URL queries and fragments (including encoded ones and URL-bearing HTML attributes), invisible fillers and repeated blank lines before it reaches the model or the draft call's Activity title.
+- Context has separate character budgets: request 500, conversations 5,500, invitation/calendar-response facts 2,500, weekly calendar 3,500, relationship cards 700, commitments 1,000, other mail 1,000, voice 1,300; 16,000 total. Extra history cannot displace the conversations or calendar. Conversations share their budget evenly, give newest messages space first and render in date order.
+- `memex.requests.draft.system` defines the reply writer's job; `memex.requests.draft` defines the task and JSON answer. Both are editable prompts.
 - Where only you can decide, the draft offers choices ("approve 3 and 7; on 5: keep 2x / accept 1x") rather than guessing.
 - Kept with the request, not in Gmail's Drafts, until you edit or send; sending goes through the mail or Slack app's operation, as from the Mail page (undo window). It doesn't go through the agents' approval policy, because your keypress is the approval.
 - Re-drafted when the thread moves on.
@@ -203,12 +211,13 @@ The memex reads prompts from home only today (prompts::for_memex); it will read 
 
 - **Drafted in the memex's reading loop,** after triage and before understanding, with the drafting model (else understanding), within the same daily budget: an open request that needs you and has no draft, or whose conversations have news since it was drafted (`request_sources.noted_at`). Soonest due first, then the newest. First contacts are drafted when you ask.
 - **What the model reads** (`memex.requests.draft`):
-  - each conversation's last messages, by target;
-  - other recent mail with the person;
-  - open commitments between you;
+  - each conversation's last messages, by target, with dates in the primary calendar's zone and mail recipients; invitation text, quotes and signatures stay;
+  - other mail with the person from the last 180 days, excluding `Fwd:`/`Fw:` subjects, Calendar metadata and the request's own threads;
+  - current commitments between you (§6);
   - the next 7 days' busy times in your primary calendar's time zone;
-  - your voice: your last few mails to them (else anyone's) and Slack messages.
-- **What it answers:** where to answer (one of the request's conversations), the text, and anything to check first. What only you can decide is left as `[[one | other]]`. Failing to draft is kept with the reason and tried again on news.
+  - matched events' times, overlaps and responses, with optional attendance only when Calendar records it;
+  - your voice: bounded samples of sent mail to them (else to anyone) and Slack messages, skipping `Fwd:`/`Fw:` mail subjects. All context uses the privacy cleaning and section budgets in §6.
+- **What it answers:** where to answer (one of the request's conversations), the text, and anything to check first. A copied `(mail)`/`(chat)` suffix or backticks around the target are accepted; an unknown target falls back to the last source. What only you can decide is left as `[[one | other]]`. Failing to draft is kept with the reason and tried again on news.
 - **In the brief:** the draft card shows where it goes (✉ to whom and the subject, or 💬 the thread or conversation), the choices as buttons, and the editable text. Send (⌘↵) works once every choice is made; Draft again is also there.
 - **Sending** (`memex.requests.send`) goes through the mail store's queue (with its undo window) or the Slack app's post, as you. The request is done (`replied`). It doesn't go through the agents' approval policy: your keypress is the approval, and agents can't call it.
 - **API:** `memex.requests.draft` starts work owned by the memex and returns the request immediately. `Request.drafting` is true until it finishes; repeated calls share the work already running. The Brief polls `memex.requests.get` while drafting, disables Draft again, and updates the card when it lands. A failure is kept in `Request.draft.error` with the previous text intact. The drafting mark is in memory, so it cannot survive a restart. `reply_to` says who and what a reply goes to; `send` sends it.

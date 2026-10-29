@@ -9,6 +9,7 @@
 
 use c6_api as api;
 use c6_llm::Block;
+use futures_util::TryStreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,287 @@ use crate::llm;
 use crate::store::clip;
 
 const MAX_CONTEXT: usize = 16_000;
+const REQUEST_CONTEXT: usize = 500;
+const CONVERSATION_CONTEXT: usize = 5500;
+const INVITATION_CONTEXT: usize = 2500;
+const CALENDAR_CONTEXT: usize = 3500;
+const CARD_CONTEXT: usize = 700;
+const COMMITMENT_CONTEXT: usize = 1000;
+const RECENT_CONTEXT: usize = 1000;
+const VOICE_CONTEXT: usize = 1300;
+const OVERDUE_DAYS: i64 = 30;
+const UNDATED_DAYS: i64 = 90;
+const RECENT_DAYS: i64 = 180;
+const VOICE_DAYS: i64 = 365;
+const MAIL_WINDOW: i64 = 2000;
+const MAIL_CANDIDATES: i64 = 100;
+const VOICE_SAMPLE: usize = 350;
+const DAY: i64 = 86_400_000;
+
+// Bound the indexed date walk before any eligibility or recipient checks.
+const MAIL_HISTORY: &str = "WITH candidates AS MATERIALIZED (\
+    SELECT * FROM mail INDEXED BY mail_date WHERE date >= ?2 ORDER BY date DESC LIMIT ?4), \
+    matching AS MATERIALIZED (SELECT * FROM candidates WHERE (?5 = 0 OR sent = 1) \
+    AND trash = 0 AND spam = 0 AND draft = 0 \
+    AND lower(ltrim(subject)) NOT LIKE 'fwd:%' AND lower(ltrim(subject)) NOT LIKE 'fw:%' \
+    AND (?1 = '' OR (?5 = 0 AND lower(from_addr) = ?1) OR \
+    EXISTS (SELECT 1 FROM json_each(to_json) WHERE lower(json_extract(value, '$[0]')) = ?1)) \
+    ORDER BY date DESC LIMIT ?3) \
+    SELECT m.*, i.body FROM matching m JOIN items i ON i.id = m.item_id ORDER BY m.date DESC";
+
+fn absolute_link(text: &str) -> bool {
+    let n = text.bytes().take_while(u8::is_ascii_alphabetic).count();
+    text.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("www."))
+        || (text.as_bytes().get(n) == Some(&b':')
+            && matches!(text[..n].to_ascii_lowercase().as_str(), "http" | "https" | "mailto" | "ftp" | "ftps")
+            && text[n + 1..].chars().next().is_some_and(|c| !c.is_whitespace()))
+}
+
+// Unmatched brackets end a path; a query consumes the rest of its run so its tokens cannot escape.
+fn link_extent(text: &str) -> usize {
+    let (mut round, mut square) = (0, 0);
+    let mut end = text.len();
+    for (n, c) in text.char_indices() {
+        if matches!(c, '?' | '#')
+            || (c == '%' && text.get(n..n + 3).is_some_and(|s| s.eq_ignore_ascii_case("%3f") || s.eq_ignore_ascii_case("%23")))
+        {
+            return text.find(char::is_whitespace).unwrap_or(text.len());
+        }
+        if c.is_whitespace() || "<>\"".contains(c) || (c == ')' && round == 0) || (c == ']' && square == 0) {
+            end = n;
+            break;
+        }
+        match c {
+            '(' => round += 1,
+            ')' => round -= 1,
+            '[' => square += 1,
+            ']' => square -= 1,
+            _ => {}
+        }
+    }
+    if text[end..].chars().next().is_none_or(char::is_whitespace) {
+        end = text[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '\'']).len();
+    }
+    end
+}
+
+fn clean_link(text: &str, limit: usize) -> String {
+    let start = limit - text[..limit].trim_start().len();
+    let end = start + link_extent(&text[start..]).min(limit - start);
+    format!("{}{}{}", &text[..start], cut_link(&text[start..end]), &text[end..limit])
+}
+
+fn cut_link(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let cut = [text.find('?'), text.find('#'), lower.find("%3f"), lower.find("%23")].into_iter().flatten().min().unwrap_or(text.len());
+    let path = &text[..cut];
+    let www = path.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("www."));
+    let parse = if www { format!("https://{path}") } else { path.to_owned() };
+    if absolute_link(path)
+        && let Ok(mut url) = reqwest::Url::parse(&parse)
+    {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        if www { url.as_str().strip_prefix("https://").unwrap_or(url.as_str()).to_owned() } else { url.to_string() }
+    } else {
+        path.to_owned()
+    }
+}
+
+fn link_list(mut text: &str, mut limit: usize, srcset: bool) -> String {
+    let mut out = String::new();
+    while limit > 0 {
+        let space = limit - text[..limit].trim_start().len();
+        out.push_str(&text[..space]);
+        text = &text[space..];
+        limit -= space;
+        let end = text[..limit].find(char::is_whitespace).unwrap_or(limit);
+        let token = &text[..end];
+        out.push_str(&clean_link(text, end));
+        text = &text[end..];
+        limit -= end;
+        if srcset && !token.ends_with(',') {
+            let end = text[..limit].find(',').map_or(limit, |n| n + 1);
+            out.push_str(&text[..end]);
+            text = &text[end..];
+            limit -= end;
+        }
+    }
+    out
+}
+
+// Consume a URL-bearing attribute as a whole, including query-only values.
+fn link_attribute(text: &str) -> Option<(usize, String)> {
+    let n = text.find(|c: char| c.is_whitespace() || "=<>/\"'".contains(c)).unwrap_or(text.len());
+    let name = text[..n].to_ascii_lowercase();
+    if !["src", "href", "url"].iter().any(|part| name.contains(part))
+        && !matches!(name.as_str(), "action" | "formaction" | "poster" | "cite" | "background" | "data" | "ping")
+    {
+        return None;
+    }
+    let rest = text[n..].trim_start().strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next().filter(|c| matches!(c, '\'' | '"'));
+    let value = if quote.is_some() { &rest[1..] } else { rest };
+    let end = if let Some(quote) = quote {
+        value.find(quote).unwrap_or(value.len())
+    } else {
+        value.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(value.len())
+    };
+    let prefix = text.len() - value.len();
+    let closing = usize::from(quote.is_some() && end < value.len());
+    // A quoted value ends only at its closing quote, even inside a query.
+    let cleaned = if quote.is_some() {
+        format!("{}{}", cut_link(&value[..end]), &value[end..end + closing])
+    } else if name.contains("srcset") {
+        link_list(value, end + closing, true)
+    } else if name == "ping" {
+        link_list(value, end + closing, false)
+    } else {
+        clean_link(value, end + closing)
+    };
+    Some((prefix + end + closing, format!("{}{cleaned}", &text[..prefix])))
+}
+
+/// Text crosses into a draft here, including text derived from HTML.
+pub(crate) fn clean(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .filter(|c| {
+            !matches!(*c,
+                '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' |
+                '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' |
+                '\u{2800}' | '\u{3164}' | '\u{feff}' | '\u{ffa0}' | '\u{e0000}'..='\u{e007f}'
+            )
+        })
+        .collect();
+    let mut out = String::new();
+    let mut rest = text.as_str();
+    let mut in_tag = false;
+    let mut quote = None;
+    while !rest.is_empty() {
+        let boundary = out.chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric() && !"+-.".contains(c));
+        if in_tag
+            && quote.is_none()
+            && out.chars().next_back().is_some_and(char::is_whitespace)
+            && let Some((end, attribute)) = link_attribute(rest)
+        {
+            out.push_str(&attribute);
+            rest = &rest[end..];
+            continue;
+        }
+        let linked = !in_tag && (out.ends_with("](") || (boundary && rest.starts_with('/')));
+        if (boundary && absolute_link(rest)) || linked {
+            let delimiter = quote.or_else(|| out.ends_with('<').then_some('>'));
+            let end = delimiter.map_or_else(|| link_extent(rest), |c| rest.find(c).unwrap_or(rest.len()));
+            if end == 0 {
+                let c = rest.chars().next().unwrap();
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+                continue;
+            }
+            out.push_str(&cut_link(&rest[..end]));
+            rest = &rest[end..];
+        } else {
+            let c = rest.chars().next().unwrap();
+            if in_tag {
+                if quote == Some(c) {
+                    quote = None;
+                } else if quote.is_none() && matches!(c, '\'' | '"') {
+                    quote = Some(c);
+                } else if quote.is_none() && c == '>' {
+                    in_tag = false;
+                }
+            } else if c == '<' {
+                in_tag = true;
+            }
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    let mut lines = Vec::new();
+    let mut blank = false;
+    for line in out.lines() {
+        if !line.trim().is_empty() || !blank {
+            lines.push(line.trim_end());
+        }
+        blank = line.trim().is_empty();
+    }
+    let mut text = lines.join("\n");
+    if out.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+// Messages arrive newest first; spend their share before rendering in date order.
+fn conversations(header: &str, groups: &[(String, Vec<String>)], budget: usize) -> String {
+    let mut out = clean(header);
+    let share = budget.saturating_sub(out.chars().count()) / groups.len().max(1);
+    for (heading, messages) in groups {
+        let heading: String = clean(heading).chars().take(share).collect();
+        let mut left = share - heading.chars().count();
+        let mut kept = Vec::new();
+        for message in messages {
+            if left < 2 {
+                break;
+            }
+            let text = clean(message);
+            let text = if text.chars().count() > left { format!("{}…\n", text.chars().take(left - 2).collect::<String>()) } else { text };
+            left -= text.chars().count();
+            kept.push(text);
+        }
+        out.push_str(&heading);
+        for message in kept.iter().rev() {
+            out.push_str(message);
+        }
+    }
+    out
+}
+
+fn assemble(sections: [(String, usize); 8], threads: &[(String, Vec<String>)]) -> String {
+    let mut out = String::new();
+    for (index, (text, budget)) in sections.into_iter().enumerate() {
+        let text = if index == 1 { conversations(&text, threads, budget) } else { clean(&text) };
+        let text = if out.ends_with("\n\n") { text.trim_start_matches('\n') } else { &text };
+        if text.chars().count() > budget {
+            out.extend(text.chars().take(budget - 2));
+            out.push_str("…\n");
+        } else {
+            out.push_str(text);
+        }
+    }
+    debug_assert!(out.chars().count() <= MAX_CONTEXT);
+    out
+}
+
+async fn zone(m: &Memex) -> anyhow::Result<chrono_tz::Tz> {
+    let zone: Option<String> =
+        sqlx::query_scalar("SELECT time_zone FROM calendars WHERE is_primary = 1 LIMIT 1").fetch_optional(&m.store.pool).await?;
+    Ok(zone.as_deref().and_then(|z| z.parse().ok()).unwrap_or(chrono_tz::UTC))
+}
+
+fn date(ms: i64, tz: chrono_tz::Tz) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| format!("{} ({})", d.with_timezone(&tz).format("%Y-%m-%d %H:%M"), tz.name()))
+        .unwrap_or_default()
+}
+
+fn calendar_mail(row: &sqlx::sqlite::SqliteRow) -> bool {
+    let from: String = row.get("from_addr");
+    let parts: Vec<Value> = serde_json::from_str(&row.get::<String, _>("parts")).unwrap_or_default();
+    from.eq_ignore_ascii_case("calendar-notification@google.com")
+        || parts.iter().any(|p| p["name"].as_str().unwrap_or("").to_lowercase().ends_with(".ics") || p["mime"] == "text/calendar")
+}
+
+async fn mail_text(m: &Memex, row: &sqlx::sqlite::SqliteRow) -> String {
+    if let Some(hash) = row.get::<Option<String>, _>("text_blob")
+        && let Ok(text) = tokio::fs::read_to_string(m.blob_path(&hash)).await
+    {
+        return text;
+    }
+    let body: String = row.get("body");
+    body.split_once("\n\n").map_or(body.as_str(), |(_, b)| b).to_owned()
+}
 
 /// Starts a draft owned by the memex, returning before the model answers.
 /// The same claim covers automatic drafts and repeated clicks.
@@ -93,32 +375,23 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn task_context(context: &str) -> (&str, &str) {
+    context.strip_prefix("## Request\n").unwrap_or(context).split_once('\n').unwrap_or(("", context))
+}
+
 /// Drafts (again) a request's reply now.
 pub async fn draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<api::RequestDraft> {
     let r = crate::requests::get(m, id).await?;
     let context = context(m, &r).await?;
     let template = m.prompt("memex.requests.draft", api::prompts::REQUEST_DRAFT);
-    let request = format!(
-        "{} (from {} <{}>{})",
-        r.title,
-        r.person_name,
-        r.person,
-        r.due.and_then(chrono::DateTime::from_timestamp_millis).map(|d| format!(", by {}", d.format("%Y-%m-%d"))).unwrap_or_default()
-    );
-    let prompt = api::prompts::fill(&template, &[("request", &request), ("context", &clip(&context, MAX_CONTEXT))]);
-    let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
+    let (request, context) = task_context(&context);
+    let prompt = api::prompts::fill(&template, &[("request", request), ("context", context)]);
+    let system = m.prompt("memex.requests.draft.system", api::prompts::REQUEST_DRAFT_SYSTEM);
     crate::understand::count_call(m).await?;
-    let v = llm::json_of(&llm::ask(m, task, "draft", &r.title, &system, vec![Block::Text(prompt)], 1500).await?)?;
+    let v = llm::json_of(&llm::ask(m, task, "draft", &clip(&clean(&r.title), 120), &system, vec![Block::Text(prompt)], 1500).await?)?;
     let text = v["text"].as_str().unwrap_or("").trim().to_owned();
     anyhow::ensure!(!text.is_empty(), "the model wrote no draft");
-    // Where to answer: one of its conversations (the latest, if the model
-    // named none of them).
-    let target = v["target"]
-        .as_str()
-        .filter(|t| r.sources.iter().any(|s| s.target == *t))
-        .map(str::to_owned)
-        .or_else(|| r.sources.last().map(|s| s.target.clone()))
-        .unwrap_or_default();
+    let target = draft_target(v["target"].as_str().unwrap_or(""), &r.sources);
     let kind = if target.starts_with("chat:") { "chat" } else { "mail" };
     let d = api::RequestDraft {
         target,
@@ -138,88 +411,198 @@ pub async fn draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<api::
     Ok(d)
 }
 
-fn date(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()
+// Where to answer: one of its conversations (the latest, if the model
+// named none of them). It may copy the kind along with the heading's target.
+fn draft_target(target: &str, sources: &[api::RequestSource]) -> String {
+    let target = target.trim().trim_matches('`').trim();
+    let target = target.strip_suffix(" (mail)").or_else(|| target.strip_suffix(" (chat)")).unwrap_or(target);
+    let target = target.trim().trim_matches('`').trim();
+    sources.iter().find(|s| s.target == target).or_else(|| sources.last()).map(|s| s.target.clone()).unwrap_or_default()
 }
 
 /// What the model reads to draft: the conversations, recent exchanges with
 /// the person, what's open between you, when you're free, your voice.
 pub(crate) async fn context(m: &Memex, r: &api::Request) -> anyhow::Result<String> {
-    let mut out = String::from("## The request's conversations (answer in one of them, by its target)\n");
+    let tz = zone(m).await?;
+    let now = c6_core::now_ms();
+    let invitations = invitations(m, r).await?;
+    let request = format!(
+        "{} (from {} <{}>{})",
+        r.title,
+        r.person_name,
+        r.person,
+        r.due.map(|d| format!(", by {}", date(d, tz))).unwrap_or_default()
+    )
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let request = format!("## Request\n{request}\n\n");
+    let conversations = String::from("## The request's conversations (answer in one of them, by its target)\n");
+    let mut threads = Vec::new();
     for s in &r.sources {
-        out.push_str(&format!("\n### target: {} ({})\n", s.target, s.kind));
-        out.push_str(&conversation(m, &s.target).await?);
+        threads.push((format!("\n### target: {} ({})\n", s.target, s.kind), conversation(m, &s.target, tz).await?));
     }
     let person = r.person.to_lowercase();
+    let mut cards = String::new();
+    let mut recent = String::new();
     if person.contains('@') {
-        // Who they are to the owner.
-        let cards = crate::cards::of(m, &person).await?;
-        if !cards.is_empty() {
-            out.push_str("\n## Who they are to you\n");
-            for c in &cards {
-                out.push_str(&format!("- {}\n", crate::cards::text(c)));
+        for c in crate::cards::of(m, &person).await? {
+            if cards.is_empty() {
+                cards.push_str("\n## Who they are to you\n");
             }
+            cards.push_str(&format!("- {}\n", crate::cards::text(&c)));
         }
-        // Other threads with them lately.
-        let threads: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT subject, snippet, MAX(date) FROM mail WHERE (from_addr = ?1 OR to_json LIKE ?2) AND trash = 0 AND spam = 0 \
-             GROUP BY account, thread_id ORDER BY MAX(date) DESC LIMIT 6",
-        )
-        .bind(&person)
-        .bind(format!("%\"{person}\"%"))
-        .fetch_all(&m.store.pool)
-        .await?;
-        if !threads.is_empty() {
-            out.push_str("\n## Other recent mail with them\n");
-            for (subject, snippet, at) in threads {
-                out.push_str(&format!("- {} ({}): {}\n", subject, date(at), clip(&snippet, 200)));
+        let mut rows = sqlx::query(MAIL_HISTORY)
+            .bind(&person)
+            .bind(now - RECENT_DAYS * DAY)
+            .bind(MAIL_CANDIDATES)
+            .bind(MAIL_WINDOW)
+            .bind(false)
+            .fetch(&m.store.pool);
+        let mut seen: HashSet<String> = r.sources.iter().map(|s| s.target.clone()).collect();
+        let mut count = 0;
+        while let Some(row) = rows.try_next().await? {
+            let target = format!("thread:{}:{}", row.get::<String, _>("account"), row.get::<String, _>("thread_id"));
+            if seen.contains(&target) {
+                continue;
+            }
+            let body = mail_text(m, &row).await;
+            let subject: String = row.get("subject");
+            if calendar_mail(&row) {
+                continue;
+            }
+            seen.insert(target);
+            if recent.is_empty() {
+                recent.push_str("\n## Other recent mail with them\n");
+            }
+            recent.push_str(&format!("- {subject} ({}): {}\n", date(row.get("date"), tz), clip(&clean(&body), 120)));
+            count += 1;
+            if count == 6 {
+                break;
             }
         }
     }
-    let open: Vec<(String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT who, what, due FROM commitments WHERE status = 'open' AND (lower(who) = ?1 OR item_id IN \
-         (SELECT item_id FROM mail WHERE from_addr = ?1 OR to_json LIKE ?2)) ORDER BY due IS NULL, due LIMIT 10",
+    let mine: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).filter(|a| !a.is_empty()).collect();
+    // There is no "owed to whom" field; direct mail is the provenance we have.
+    let open = sqlx::query(
+        "WITH own(address) AS (SELECT value FROM json_each(?2)), \
+         direct(item_id) AS (SELECT item_id FROM mail WHERE (lower(from_addr) = ?1 AND \
+         EXISTS (SELECT 1 FROM json_each(to_json) WHERE lower(json_extract(value, '$[0]')) IN (SELECT address FROM own))) OR \
+         ((sent = 1 OR lower(from_addr) IN (SELECT address FROM own)) AND \
+         EXISTS (SELECT 1 FROM json_each(to_json) WHERE lower(json_extract(value, '$[0]')) = ?1))) \
+         SELECT who, what, due FROM commitments c JOIN items i ON i.id = c.item_id WHERE c.status = 'open' \
+         AND ((due IS NOT NULL AND due >= ?3) OR (due IS NULL AND i.created_at >= ?4)) \
+         AND (lower(who) = ?1 OR lower(who) IN ('me', 'the owner') OR lower(who) IN (SELECT address FROM own)) \
+         AND c.item_id IN (SELECT item_id FROM direct) ORDER BY due IS NULL, due, c.id LIMIT 10",
     )
     .bind(&person)
-    .bind(format!("%\"{person}\"%"))
+    .bind(json!(mine).to_string())
+    .bind(now - OVERDUE_DAYS * DAY)
+    .bind(now - UNDATED_DAYS * DAY)
     .fetch_all(&m.store.pool)
     .await?;
-    if !open.is_empty() {
-        out.push_str("\n## Open between you\n");
-        for (who, what, due) in open {
-            let who = if who == "me" { "the owner".to_owned() } else { who };
-            out.push_str(&format!("- {who}: {what}{}\n", due.map(|d| format!(" (due {})", date(d))).unwrap_or_default()));
+    let mut commitments = String::new();
+    for row in open {
+        if commitments.is_empty() {
+            commitments.push_str("\n## Open between you\n");
         }
+        let who: String = row.get("who");
+        let who = if matches!(who.to_lowercase().as_str(), "me" | "the owner") || mine.contains(&who.to_lowercase()) {
+            "the owner"
+        } else {
+            &who
+        };
+        let due: Option<i64> = row.get("due");
+        commitments.push_str(&format!(
+            "- {who}: {}{}\n",
+            row.get::<String, _>("what"),
+            due.map(|d| format!(" (due {})", date(d, tz))).unwrap_or_default()
+        ));
     }
-    out.push_str(&free(m, &invitations(m, r).await?).await?);
-    out.push_str(&voice(m, &person).await?);
+    let calendar = free(m, &invitations).await?;
+    let (calendar, facts) = match calendar.split_once("\n## Invitations being answered\n") {
+        Some((calendar, facts)) => (calendar.to_owned(), format!("\n## Invitations being answered\n{facts}")),
+        None => (calendar, String::new()),
+    };
+    Ok(assemble(
+        [
+            (request, REQUEST_CONTEXT),
+            (conversations, CONVERSATION_CONTEXT),
+            (cards, CARD_CONTEXT),
+            (recent, RECENT_CONTEXT),
+            (commitments, COMMITMENT_CONTEXT),
+            (calendar, CALENDAR_CONTEXT),
+            (facts, INVITATION_CONTEXT),
+            (voice(m, &person).await?, VOICE_CONTEXT),
+        ],
+        &threads,
+    ))
+}
+
+/// A reply box reads the same messages and invitation facts as a draft.
+pub(crate) async fn conversation_context(m: &Memex, target: &str) -> anyhow::Result<String> {
+    let tz = zone(m).await?;
+    let r = api::Request { sources: vec![api::RequestSource { target: target.to_owned(), ..Default::default() }], ..Default::default() };
+    let invitations = invitations(m, &r).await?;
+    let messages = conversation(m, target, tz).await?;
+    let mut out = conversations("## The conversation\n", &[(String::new(), messages)], CONVERSATION_CONTEXT);
+    if !invitations.is_empty()
+        && let Some((_, facts)) = free(m, &invitations).await?.split_once("\n## Invitations being answered\n")
+    {
+        out.push('\n');
+        out.push_str(&clip(&clean(&format!("## Invitations being answered\n{facts}")), INVITATION_CONTEXT - 1));
+    }
     Ok(out)
 }
 
 /// A conversation's last messages, as the model reads them.
-pub(crate) async fn conversation(m: &Memex, target: &str) -> anyhow::Result<String> {
-    let mut out = String::new();
+async fn conversation(m: &Memex, target: &str, tz: chrono_tz::Tz) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
     if let Some(rest) = target.strip_prefix("thread:") {
         let (account, thread) = rest.rsplit_once(':').unwrap_or_default();
         let rows = sqlx::query(
-            "SELECT m.from_addr, m.from_name, m.subject, m.date, m.sent, i.body FROM mail m JOIN items i ON i.id = m.item_id \
+            "SELECT m.*, i.body FROM mail m JOIN items i ON i.id = m.item_id \
              WHERE m.account = ? AND m.thread_id = ? AND m.draft = 0 AND m.trash = 0 ORDER BY m.date DESC LIMIT 6",
         )
         .bind(account)
         .bind(thread)
         .fetch_all(&m.store.pool)
         .await?;
-        for r in rows.iter().rev() {
+        for r in &rows {
             let who = if r.get::<i64, _>("sent") == 1 {
                 "the owner".to_owned()
             } else {
                 format!("{} <{}>", r.get::<String, _>("from_name"), r.get::<String, _>("from_addr"))
             };
-            out.push_str(&format!(
-                "--- {who}, {} — {}\n{}\n",
-                date(r.get("date")),
+            let mut recipients = String::new();
+            for (label, column) in [("To", "to_json"), ("Cc", "cc_json")] {
+                let addresses: Vec<(String, String)> = serde_json::from_str(&r.get::<String, _>(column)).unwrap_or_default();
+                if addresses.is_empty() {
+                    continue;
+                }
+                let mut line = format!("{label}: ");
+                for (n, (address, name)) in addresses.iter().enumerate() {
+                    let name = name.replace(['<', '>'], "");
+                    let recipient = if name.trim().is_empty() { address.clone() } else { format!("{} <{address}>", name.trim()) };
+                    let separator = if n == 0 { "" } else { ", " };
+                    let remaining = addresses.len() - n - 1;
+                    let suffix = if remaining == 0 { String::new() } else { format!(", and {remaining} more") };
+                    if line.chars().count() + separator.len() + recipient.chars().count() + suffix.len() > 300 {
+                        line.push_str(&format!("{separator}and {} more", addresses.len() - n));
+                        break;
+                    }
+                    line.push_str(separator);
+                    line.push_str(&recipient);
+                }
+                recipients.push_str(&line);
+                recipients.push('\n');
+            }
+            let body = mail_text(m, r).await;
+            out.push(format!(
+                "--- {who}, {} — {}\n{recipients}{}\n",
+                date(r.get("date"), tz),
                 r.get::<String, _>("subject"),
-                clip(&r.get::<String, _>("body"), 3000)
+                clip(&body, 3000)
             ));
         }
         return Ok(out);
@@ -249,12 +632,12 @@ pub(crate) async fn conversation(m: &Memex, target: &str) -> anyhow::Result<Stri
         .bind(parts.get(2).copied().unwrap_or_default())
         .fetch_all(&m.store.pool)
         .await?;
-    for r in rows.iter().rev() {
+    for r in &rows {
         let meta: Value = serde_json::from_str(&r.get::<String, _>("meta")).unwrap_or_default();
         let who = if meta["from_me"] == true { "the owner".to_owned() } else { meta["user_name"].as_str().unwrap_or("someone").to_owned() };
         let body: String = r.get("body");
         let said = body.split_once(": ").map_or(body.as_str(), |(_, t)| t);
-        out.push_str(&format!("--- {who}, {}: {}\n", date(r.get("created_at")), clip(said, 1500)));
+        out.push(format!("--- {who}, {}: {}\n", date(r.get("created_at"), tz), clip(said, 1500)));
     }
     Ok(out)
 }
@@ -263,6 +646,9 @@ pub(crate) async fn conversation(m: &Memex, target: &str) -> anyhow::Result<Stri
 /// can belong to different installs. Titles and times cannot identify it.
 struct Invitation {
     target: String,
+    title: String,
+    organizer: String,
+    optional: bool,
     account: String,
     calendar: String,
     event: String,
@@ -346,38 +732,40 @@ fn decoded_event_id(id: &str) -> Option<String> {
 }
 
 async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitation>> {
+    let mine: Vec<String> = m.accounts().iter().map(|a| a.email.to_lowercase()).collect();
     let mut messages = Vec::new();
     for source in &r.sources {
         let Some((account, thread)) = source.target.strip_prefix("thread:").and_then(|s| s.rsplit_once(':')) else { continue };
-        let mail = sqlx::query(
+        let mails = sqlx::query(
             "SELECT m.text_blob, m.html_blob, i.body FROM mail m JOIN items i ON i.id = m.item_id \
-             WHERE m.account = ? AND m.thread_id = ? AND m.sent = 0 AND m.draft = 0 AND m.trash = 0 ORDER BY m.date DESC LIMIT 1",
+             WHERE m.account = ? AND m.thread_id = ? AND m.sent = 0 AND m.draft = 0 AND m.trash = 0 ORDER BY m.date DESC LIMIT 6",
         )
         .bind(account)
         .bind(thread)
-        .fetch_optional(&m.store.pool)
+        .fetch_all(&m.store.pool)
         .await?;
-        let Some(mail) = mail else { continue };
-        let read = |hash: Option<String>| async move {
-            match hash {
-                Some(h) => tokio::fs::read_to_string(m.blob_path(&h)).await.unwrap_or_default(),
-                None => String::new(),
+        for mail in mails {
+            let read = |hash: Option<String>| async move {
+                match hash {
+                    Some(h) => tokio::fs::read_to_string(m.blob_path(&h)).await.unwrap_or_default(),
+                    None => String::new(),
+                }
+            };
+            let text = read(mail.get("text_blob")).await;
+            let html = read(mail.get("html_blob")).await;
+            let body: String = mail.get("body");
+            let ids = event_ids(&text, &html, &body);
+            if ids.is_empty() {
+                continue;
             }
-        };
-        let text = read(mail.get("text_blob")).await;
-        let html = read(mail.get("html_blob")).await;
-        let body: String = mail.get("body");
-        let ids = event_ids(&text, &html, &body);
-        if ids.is_empty() {
-            continue;
+            messages.push((source.target.clone(), ids));
         }
-        messages.push((source.target.clone(), ids));
     }
     if messages.is_empty() {
         return Ok(Vec::new());
     }
     let rows = sqlx::query(
-        "SELECT account, calendar_id, event_id, my_status, html_link, start, end, all_day, recurrence, recurring_event_id FROM events WHERE status != 'cancelled'",
+        "SELECT account, calendar_id, event_id, my_status, html_link, start, end, all_day, recurrence, recurring_event_id, summary, organizer, attendees FROM events WHERE status != 'cancelled'",
     )
     .fetch_all(&m.store.pool)
     .await?;
@@ -403,8 +791,15 @@ async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitati
         // More than one event (or calendar's copy) leaves the link ambiguous.
         if matches.len() == 1 {
             let event = &rows[*matches.iter().next().unwrap()];
+            let attendees: Vec<Value> = serde_json::from_str(&event.get::<String, _>("attendees")).unwrap_or_default();
+            let optional = attendees.iter().any(|a| {
+                (a["self"] == true || a["email"].as_str().is_some_and(|e| mine.contains(&e.to_lowercase()))) && a["optional"] == true
+            });
             out.push(Invitation {
                 target,
+                optional,
+                title: event.get("summary"),
+                organizer: event.get("organizer"),
                 account: event.get("account"),
                 calendar: event.get("calendar_id"),
                 event: event.get("event_id"),
@@ -418,6 +813,19 @@ async fn invitations(m: &Memex, r: &api::Request) -> anyhow::Result<Vec<Invitati
         }
     }
     Ok(out)
+}
+
+fn invitation_facts(i: &Invitation) -> String {
+    let mut out =
+        format!("Calendar invitation: {}\nOrganizer: {}\n", i.title, if i.organizer.is_empty() { "not recorded" } else { &i.organizer });
+    if i.optional {
+        out.push_str("Your attendance: optional\n");
+    }
+    out.push_str(&format!("Your response: {}\n", i.response));
+    if matches!(i.response.as_str(), "accepted" | "declined" | "tentative") {
+        out.push_str("The owner has already answered this invitation in Calendar.\n");
+    }
+    out
 }
 
 /// When you're busy over the next week, in your calendar's time zone.
@@ -482,8 +890,15 @@ async fn free(m: &Memex, invitations: &[Invitation]) -> anyhow::Result<String> {
     }
     if !invitations.is_empty() {
         out.push_str("\n## Invitations being answered\n");
+        let mut seen = HashSet::new();
         for i in invitations {
+            if !seen.insert((&i.account, &i.calendar, &i.event)) {
+                continue;
+            }
             out.push_str(&format!("- {} links to an event already in your calendar; your response: {}\n", i.target, i.response));
+            for line in invitation_facts(i).lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
             let (mut start, mut end) = (i.start, i.end);
             if i.recurring {
                 match crate::calendar::next_occurrence(m, &i.account, &i.calendar, &i.event, now, tz).await {
@@ -543,37 +958,39 @@ async fn invitation_overlaps(m: &Memex, i: &Invitation, start: i64, end: i64) ->
 
 /// How you write: your last few messages to them, else to anyone.
 async fn voice(m: &Memex, person: &str) -> anyhow::Result<String> {
-    let mut rows: Vec<String> = sqlx::query_scalar(
-        "SELECT i.body FROM mail m JOIN items i ON i.id = m.item_id WHERE m.sent = 1 AND m.to_json LIKE ? ORDER BY m.date DESC LIMIT 3",
-    )
-    .bind(format!("%\"{person}\"%"))
-    .fetch_all(&m.store.pool)
-    .await?;
-    if rows.is_empty() {
-        rows =
-            sqlx::query_scalar("SELECT i.body FROM mail m JOIN items i ON i.id = m.item_id WHERE m.sent = 1 ORDER BY m.date DESC LIMIT 3")
-                .fetch_all(&m.store.pool)
-                .await?;
+    let mut samples = Vec::new();
+    for to in [person, ""] {
+        let mut rows = sqlx::query(MAIL_HISTORY)
+            .bind(to)
+            .bind(c6_core::now_ms() - VOICE_DAYS * DAY)
+            .bind(MAIL_CANDIDATES)
+            .bind(MAIL_WINDOW)
+            .bind(true)
+            .fetch(&m.store.pool);
+        while let Some(row) = rows.try_next().await? {
+            let body = mail_text(m, &row).await;
+            if body.trim().is_empty() {
+                continue;
+            }
+            samples.push(format!("---\n{}\n", clip(&clean(&body), VOICE_SAMPLE)));
+            if samples.len() == 3 {
+                break;
+            }
+        }
+        if !samples.is_empty() || to.is_empty() {
+            break;
+        }
     }
     let chat: Vec<String> = sqlx::query_scalar(
         "SELECT body FROM items WHERE kind = 'chat' AND json_extract(meta, '$.from_me') = 1 ORDER BY created_at DESC LIMIT 5",
     )
     .fetch_all(&m.store.pool)
     .await?;
-    if rows.is_empty() && chat.is_empty() {
-        return Ok(String::new());
+    for body in chat {
+        let said = body.split_once(": ").map_or(body.as_str(), |(_, t)| t);
+        samples.push(format!("--- (chat) {}\n", clip(&clean(said), 300)));
     }
-    let mut out = String::from("\n## How the owner writes (their recent messages)\n");
-    for b in rows {
-        // Without the headers and the quoted thread.
-        let body = b.splitn(4, '\n').last().unwrap_or("");
-        let mine: Vec<&str> = body.lines().take_while(|l| !l.starts_with('>') && !l.starts_with("On ")).collect();
-        out.push_str(&format!("---\n{}\n", clip(mine.join("\n").trim(), 800)));
-    }
-    for c in chat {
-        out.push_str(&format!("--- (chat) {}\n", clip(c.split_once(": ").map_or(c.as_str(), |(_, t)| t), 300)));
-    }
-    Ok(out)
+    Ok(if samples.is_empty() { String::new() } else { format!("\n## How the owner writes (their recent messages)\n{}", samples.concat()) })
 }
 
 /// Who and what a reply in a conversation goes to: the mail it answers
@@ -719,6 +1136,715 @@ mod tests {
             sources: vec![api::RequestSource { target: "thread:mail-acct:thread".into(), kind: "mail".into(), ..Default::default() }],
             ..Default::default()
         }
+    }
+
+    async fn kept_mail(m: &Memex, id: &str, thread: &str, at: i64, parsed: Parsed, sent: bool) -> String {
+        let stored = Stored {
+            account: "mail-acct",
+            external_id: id,
+            thread_id: thread,
+            source: "test-mail",
+            rfc_id: id,
+            origin: "mirrored",
+            owner: "me@example.com",
+            message: id,
+        };
+        crate::mail::store(m, &parsed, "", &stored, &[if sent { "SENT" } else { "INBOX" }.into()], at).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn context_keeps_messages_and_calendar_facts_with_private_links_removed() {
+        use chrono::TimeZone;
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.accounts.lock().unwrap().push(crate::people::Account { email: "me@example.com".into(), ..Default::default() });
+        let tz = chrono_tz::Pacific::Honolulu;
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": tz.name()})).await.unwrap();
+        let day = chrono::Utc::now().with_timezone(&tz).date_naive();
+        let at = |days, hour, minute| {
+            tz.from_local_datetime(&(day + chrono::Duration::days(days)).and_hms_opt(hour, minute, 0).unwrap())
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        };
+        let start = at(2, 17, 30);
+        let end = at(2, 20, 0);
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "me@example.com",
+            "primary",
+            &json!({
+                "id": "dinner", "summary": "Dinner by the bay", "organizer": {"email": "host@example.net"},
+                "start": {"dateTime": chrono::DateTime::from_timestamp_millis(start).unwrap().to_rfc3339()},
+                "end": {"dateTime": chrono::DateTime::from_timestamp_millis(end).unwrap().to_rfc3339()},
+                "attendees": [{"email": "me@example.com", "self": true, "optional": true, "responseStatus": "accepted"}],
+                "htmlLink": link("dinner", "me@example.com"),
+            }),
+        )
+        .await
+        .unwrap();
+        let url = format!(
+            "https://calendar.google.com/calendar/event?action=VIEW&eid={}&tok=invitation-secret&ctz=Pacific/Honolulu",
+            eid(&link("dinner", "me@example.com")).unwrap()
+        );
+        let body = format!(
+            "You have been invited to the following event.\n\nDinner by the bay\n\nWhen\nSaturday 03:30–06:00 UTC\n\nWhere\nHarbor House\n\nGuests\nhost@example.net - organizer\nme@example.com - optional\n\nView your event at {url}\nYes - Maybe - No\n\nInvitation from Google Calendar: {url}\nYou are receiving this email because you are subscribed to calendar notifications.\nForwarding this invitation could allow any recipient to send a response to the organizer.\nLearn more at https://support.google.com/calendar?answer=123\n"
+        );
+        let incoming = |subject: &str, body: &str| Parsed {
+            from: ("host@example.net".into(), "Host".into()),
+            to: vec![("me@example.com".into(), "Me".into())],
+            subject: subject.into(),
+            text: body.into(),
+            ..Default::default()
+        };
+        let outgoing = |subject: &str, body: &str| Parsed {
+            from: ("me@example.com".into(), "Me".into()),
+            to: vec![("host@example.net".into(), "Host".into())],
+            subject: subject.into(),
+            text: body.into(),
+            ..Default::default()
+        };
+        let invitation = kept_mail(
+            &m,
+            "invite",
+            "invitation",
+            at(0, 8, 0),
+            Parsed {
+                attachments: vec![json!({"name": "invite.ics", "mime": "text/calendar"})],
+                ..incoming("Invitation: Dinner by the bay", &body)
+            },
+            false,
+        )
+        .await;
+        for (n, subject, body) in [
+            (0, "Fw: Payment receipt", "FORWARDED RECEIPT https://invoice.example.test/pay?auth_token=invoice-secret"),
+            (1, "fWD: Offers", "FORWARDED MARKETING\u{034f}\u{00ad} invisible spacer sale"),
+            (2, "Receipt", "AUTO GENERATED This is an automatically generated message about your payment."),
+            (
+                3,
+                "Re: Dinner",
+                "Thanks for inviting us. We are looking forward to dinner together.\n\nOn Monday, Host <host@example.net> wrote:\n> QUOTED EARLIER MESSAGE\n\n-- \nPRIVATE SIGNATURE\nSent from my phone",
+            ),
+        ] {
+            kept_mail(&m, &format!("voice-{n}"), &format!("voice-{n}"), at(-200 - n, 10, 0), outgoing(subject, body), true).await;
+        }
+        let recent = kept_mail(
+            &m,
+            "recent",
+            "ordinary",
+            at(-1, 9, 0),
+            incoming(
+                "Harbor directions",
+                "Meet us beside the blue gate. Can you bring chairs? Map: www.harbor.example.test/map?auth_token=map-secret#pin\u{034f}\u{00ad}",
+            ),
+            false,
+        )
+        .await;
+        let old = kept_mail(&m, "old", "old-thread", at(-190, 10, 0), incoming("OLD THREAD", "OLD MAIL TEXT"), false).await;
+        kept_mail(
+            &m,
+            "forward",
+            "forward-thread",
+            at(-1, 10, 0),
+            incoming("Fwd: Receipt", "OTHER FORWARD https://invoice.example.test/pay?auth_token=forward-secret"),
+            false,
+        )
+        .await;
+        kept_mail(
+            &m,
+            "calendar",
+            "calendar-thread",
+            at(-1, 11, 0),
+            Parsed {
+                attachments: vec![json!({"name": "invite.ics", "mime": "text/calendar"})],
+                ..incoming("CALENDAR NOTIFICATION", "The event has changed.")
+            },
+            false,
+        )
+        .await;
+        let copied = kept_mail(
+            &m,
+            "copied",
+            "copied-thread",
+            at(-1, 12, 0),
+            Parsed {
+                from: ("third@example.test".into(), "Third".into()),
+                to: vec![("me@example.com".into(), "Me".into())],
+                cc: vec![("host@example.net".into(), "Host".into())],
+                subject: "Third party work".into(),
+                text: "Please send the third party report.".into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let owner_copied = kept_mail(
+            &m,
+            "owner-copied",
+            "owner-copied",
+            at(-1, 13, 0),
+            Parsed {
+                to: vec![("third@example.test".into(), "Third".into())],
+                cc: vec![("me@example.com".into(), "Me".into())],
+                ..incoming("A separate plan", "Please arrange that with the other guest.")
+            },
+            false,
+        )
+        .await;
+        for (who, what, due, created, item) in [
+            ("host@example.net", "Bring the seating plan", Some(at(1, 12, 0)), at(0, 7, 0), &invitation),
+            (
+                "me@example.com",
+                "Bring dessert https://menu.example.test/options?auth_token=menu-secret\u{034f}\u{00ad}",
+                Some(at(1, 13, 0)),
+                at(0, 7, 0),
+                &recent,
+            ),
+            ("host@example.net", "STALE COMMITMENT", Some(at(-1000, 12, 0)), at(-1001, 7, 0), &invitation),
+            ("host@example.net", "OLD UNDATED COMMITMENT", None, at(-100, 7, 0), &old),
+            ("host@example.net", "PERSON OWES THIRD PARTY", Some(at(1, 12, 0)), at(0, 7, 0), &copied),
+            ("host@example.net", "PERSON ON OWNER CC MAIL", Some(at(1, 12, 0)), at(0, 7, 0), &owner_copied),
+            ("me@example.com", "OWNER ON OWNER CC MAIL", Some(at(1, 12, 0)), at(0, 7, 0), &owner_copied),
+            ("third@example.test", "THIRD PARTY COMMITMENT", Some(at(1, 12, 0)), at(0, 7, 0), &copied),
+            ("me@example.com", "OWNER COMMITMENT ON COPIED MAIL", Some(at(1, 12, 0)), at(0, 7, 0), &copied),
+        ] {
+            sqlx::query("INSERT INTO commitments (item_id, who, what, due, made_by, created_at) VALUES (?, ?, ?, ?, 'test', ?)")
+                .bind(item)
+                .bind(who)
+                .bind(what)
+                .bind(due)
+                .bind(created)
+                .execute(&m.store.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO cards (key, name, card, threads, model, updated_at) VALUES ('person:host@example.net', 'Host', ?, 1, 'test', 0)")
+            .bind(json!({"relationship": "Dinner friend\u{034f}", "story": "Plans at https://host.example.test/plans?auth_token=card-secret#details"}).to_string())
+            .execute(&m.store.pool).await.unwrap();
+        let request = api::Request {
+            title: format!(
+                "RSVP to dinner? <img src=\"image.png?auth_token=secret\"> <a href = 'pay?auth_token=secret'>Pay</a> https://r.test/https%3A%2F%2Fx.test%2F%3Ftok%3Dsecret {url}\u{034f}"
+            ),
+            person: "host@example.net".into(),
+            person_name: "Host".into(),
+            sources: vec![api::RequestSource { target: "thread:mail-acct:invitation".into(), kind: "mail".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let text = context(&m, &request).await.unwrap();
+        let (activity_title, _) = task_context(&text);
+        assert!(activity_title.contains("RSVP to dinner?"));
+        assert!(!clip(activity_title, 120).contains("secret"));
+        assert!(!activity_title.contains("auth_token"));
+        assert!(!activity_title.contains("%3F"));
+        for wanted in [
+            "You are receiving this email",
+            "Forwarding this invitation",
+            "Learn more",
+            "Yes - Maybe - No",
+            "AUTO GENERATED",
+            "QUOTED EARLIER",
+            "PRIVATE SIGNATURE",
+            "Sent from my",
+            "UTC",
+            "Calendar invitation: Dinner by the bay",
+            "Organizer: host@example.net",
+            "Your attendance: optional",
+            "Your response: accepted",
+            "already answered this invitation in Calendar",
+            "nothing else in your calendar overlaps it",
+            "Thanks for inviting us. We are looking forward to dinner together.",
+            "Bring the seating plan",
+            "the owner: Bring dessert",
+            "Harbor directions",
+            "Can you bring chairs?",
+            "www.harbor.example.test/map",
+            "https://host.example.test/plans",
+        ] {
+            assert!(text.contains(wanted), "missing {wanted}: {text}");
+        }
+        for absent in [
+            "tok=",
+            "auth_token",
+            "secret",
+            "\u{034f}",
+            "\u{00ad}",
+            "FORWARDED",
+            "STALE COMMITMENT",
+            "OLD UNDATED",
+            "THIRD PARTY COMMITMENT",
+            "PERSON OWES THIRD PARTY",
+            "PERSON ON OWNER CC MAIL",
+            "OWNER ON OWNER CC MAIL",
+            "OWNER COMMITMENT ON COPIED MAIL",
+            "me@example.com:",
+            "OLD THREAD",
+            "OLD MAIL TEXT",
+            "OTHER FORWARD",
+            "CALENDAR NOTIFICATION",
+            "\n\n\n",
+        ] {
+            assert!(!text.contains(absent), "unexpected {absent}: {text}");
+        }
+        let other = text.split_once("## Other recent mail with them\n").unwrap().1.split("\n## ").next().unwrap();
+        assert!(!other.contains("Dinner by the bay"), "{other}");
+        assert!(text.chars().count() <= MAX_CONTEXT);
+        println!("INVENTED CONTEXT START\n{text}INVENTED CONTEXT END");
+    }
+
+    #[tokio::test]
+    async fn unmatched_invitations_and_forwarded_text_keep_everything_but_link_tokens() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let body = "You have been invited to the following event.\n\nA new workshop\nWhen\nFriday afternoon\nWhere\nThe library\nView your event at https://calendar.google.com/calendar/event?eid=unmatched&tok=secret\nYes - Maybe - No\nInvitation from Google Calendar\nYou are receiving this email because you use Calendar.\nForwarding this invitation could allow other people to reply.\nLearn more";
+        let r = message(&m, body, None).await;
+        let text = context(&m, &r).await.unwrap();
+        assert!(text.contains("A new workshop\nWhen\nFriday afternoon\nWhere\nThe library"), "{text}");
+        assert!(text.contains("could allow") && text.contains("receiving this email") && text.contains("Yes - Maybe"), "{text}");
+        assert!(!text.contains("secret") && !text.contains("tok="), "{text}");
+        let r = message(&m, "Please check this invoice.\n---------- Forwarded message ---------\nInvoice amount: 42.\nhttps://invoice.example.test/pay?auth_token=secret", None).await;
+        let text = context(&m, &r).await.unwrap();
+        assert!(text.contains("Invoice amount: 42."), "{text}");
+        assert!(!text.contains("auth_token") && !text.contains("secret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn voice_uses_short_replies_before_falling_back_to_anyone() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        for (id, to, body) in
+            [("short", "host@example.net", "Thanks!"), ("other", "other@example.test", "Here are my own words about the next steps.")]
+        {
+            kept_mail(
+                &m,
+                id,
+                id,
+                c6_core::now_ms(),
+                Parsed {
+                    subject: "Re: Next steps".into(),
+                    from: ("me@example.com".into(), "Me".into()),
+                    to: vec![(to.into(), String::new())],
+                    text: body.into(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await;
+        }
+        let text = voice(&m, "host@example.net").await.unwrap();
+        assert!(text.contains("Thanks!"));
+        assert!(!text.contains("Here are my own words about the next steps."));
+        sqlx::query("DELETE FROM mail WHERE gmail_id = 'short'").execute(&m.store.pool).await.unwrap();
+        assert!(voice(&m, "host@example.net").await.unwrap().contains("Here are my own words about the next steps."));
+        sqlx::query("DELETE FROM mail WHERE gmail_id = 'other'").execute(&m.store.pool).await.unwrap();
+        assert!(voice(&m, "host@example.net").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optional_attendance_comes_only_from_calendar() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.accounts.lock().unwrap().push(crate::people::Account { email: "me@example.com".into(), ..Default::default() });
+        let url = link("workshop", "me@example.com");
+        event(&m, "workshop", c6_core::now_ms() + DAY, "accepted", &url).await;
+        let r = message(&m, &format!("Your attendance is optional.\n{url}"), None).await;
+        for (attendees, optional) in [
+            (json!([]), false),
+            (json!([{"self":true}]), false),
+            (json!([{"self":true, "optional":false}]), false),
+            (json!([{"self":true, "optional":true}]), true),
+            (json!([{"email":"ME@example.com", "optional":true}]), true),
+            (json!([{"email":"other@example.net", "optional":true}]), false),
+        ] {
+            sqlx::query("UPDATE events SET attendees = ?").bind(attendees.to_string()).execute(&m.store.pool).await.unwrap();
+            let text = context(&m, &r).await.unwrap();
+            assert_eq!(text.contains("Your attendance: optional"), optional, "{text}");
+            assert_eq!(text.contains("Your attendance:"), optional, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn event_links_keep_human_prose_and_summarize_updates_once() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let now = c6_core::now_ms();
+        let url = link("workshop", "me@example.com");
+        event(&m, "workshop", now + DAY, "accepted", &url).await;
+        let mut r = message(&m, &format!("Please send the slides for this workshop. {url}"), None).await;
+        for n in 0..2 {
+            kept_mail(
+                &m,
+                &format!("update-{n}"),
+                if n == 0 { "thread" } else { "other" },
+                now + n,
+                Parsed {
+                    from: ("host@example.net".into(), "Host".into()),
+                    subject: "Updated invitation".into(),
+                    text: format!("You have been invited to the following event.\nWorkshop\nInvitation from Google Calendar: {url}"),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await;
+        }
+        r.sources.push(api::RequestSource { target: "thread:mail-acct:other".into(), kind: "mail".into(), ..Default::default() });
+        let text = context(&m, &r).await.unwrap();
+        assert!(text.contains("Please send the slides for this workshop."), "{text}");
+        assert_eq!(text.matches("You have been invited to the following event.").count(), 2, "{text}");
+        assert_eq!(text.matches("Calendar invitation: Workshop").count(), 1, "{text}");
+        assert_eq!(text.matches("links to an event already in your calendar").count(), 1, "{text}");
+        assert_eq!(text.matches("nothing else in your calendar overlaps it").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn invitation_facts_survive_newer_long_messages() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let now = c6_core::now_ms();
+        let url = link("workshop", "me@example.com");
+        event(&m, "workshop", now + DAY, "accepted", &url).await;
+        sqlx::query("UPDATE events SET organizer = 'host@example.net', attendees = ?")
+            .bind(json!([{"self": true, "optional": true}]).to_string())
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        let r =
+            message(&m, &format!("You have been invited to the following event.\nWorkshop\nInvitation from Google Calendar {url}"), None)
+                .await;
+        sqlx::query("UPDATE mail SET date = ?").bind(now).execute(&m.store.pool).await.unwrap();
+        for n in 1..=2 {
+            kept_mail(
+                &m,
+                &format!("long-{n}"),
+                "thread",
+                now + n * 1000,
+                Parsed {
+                    from: ("host@example.net".into(), "Host".into()),
+                    subject: "Further details".into(),
+                    text: "More details. ".repeat(240),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await;
+        }
+        let text = context(&m, &r).await.unwrap();
+        let (conversation, facts) = text.split_once("## Invitations being answered\n").unwrap();
+        assert!(!conversation.contains("You have been invited to the following event."), "{text}");
+        for fact in [
+            "Calendar invitation: Workshop",
+            "Organizer: host@example.net",
+            "Your attendance: optional",
+            "Your response: accepted",
+            "  time: ",
+            "nothing else in your calendar overlaps it",
+        ] {
+            assert!(facts.contains(fact), "missing {fact}: {text}");
+        }
+        assert!(text.chars().count() <= MAX_CONTEXT);
+    }
+
+    #[tokio::test]
+    async fn history_bounds_the_index_walk_before_matching_recipients() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let now = c6_core::now_ms();
+        kept_mail(
+            &m,
+            "older",
+            "older",
+            now - 1000,
+            Parsed {
+                from: ("me@example.com".into(), "Me".into()),
+                to: vec![("host@example.net".into(), "Host".into())],
+                subject: "Older qualifying mail".into(),
+                text: "Here are my own words about our plans.".into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?1) \
+            INSERT INTO mail (item_id, account, gmail_id, thread_id, date, from_addr, to_json, blob) \
+            SELECT 'other-' || x, 'mail-acct', 'other-' || x, 'other', ?2 + x, 'stranger@example.test', '[]', '' FROM n",
+        )
+        .bind(MAIL_WINDOW)
+        .bind(now)
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+        for sent in [false, true] {
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {MAIL_HISTORY}")))
+                .bind("host@example.net")
+                .bind(now - VOICE_DAYS * DAY)
+                .bind(MAIL_CANDIDATES)
+                .bind(MAIL_WINDOW)
+                .bind(sent)
+                .fetch_all(&m.store.pool)
+                .await
+                .unwrap();
+            let plan: Vec<String> = rows.iter().map(|r| r.get("detail")).collect();
+            assert!(plan.iter().any(|line| line == "MATERIALIZE candidates"), "{plan:#?}");
+            assert!(plan.iter().any(|line| line.starts_with("SEARCH mail USING INDEX mail_date (date>?")), "{plan:#?}");
+            assert!(!plan.iter().any(|line| line.starts_with("SCAN mail")), "{plan:#?}");
+            println!("MAIL HISTORY PLAN sent={sent}: {plan:#?}");
+            let found = sqlx::query(MAIL_HISTORY)
+                .bind("host@example.net")
+                .bind(now - VOICE_DAYS * DAY)
+                .bind(MAIL_CANDIDATES)
+                .bind(MAIL_WINDOW)
+                .bind(sent)
+                .fetch_all(&m.store.pool)
+                .await
+                .unwrap();
+            assert!(found.is_empty(), "recipient matching must not reach the 2001st row");
+        }
+        sqlx::query("DELETE FROM mail WHERE gmail_id = 'other-1'").execute(&m.store.pool).await.unwrap();
+        let r = api::Request { person: "host@example.net".into(), ..Default::default() };
+        let text = context(&m, &r).await.unwrap();
+        assert!(text.contains("## Other recent mail"), "{text}");
+        assert!(text.contains("## How the owner writes"), "{text}");
+        assert!(text.contains("Here are my own words about our plans."), "{text}");
+    }
+
+    #[tokio::test]
+    async fn conversation_budget_keeps_the_latest_message_in_date_order() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let now = c6_core::now_ms();
+        for (n, body) in
+            [(0, "Oldest material. ".repeat(400)), (1, "Middle material. ".repeat(400)), (2, "Please send the final slides?".into())]
+        {
+            kept_mail(
+                &m,
+                &format!("message-{n}"),
+                "long",
+                now + n,
+                Parsed {
+                    from: ("host@example.net".into(), "Host".into()),
+                    subject: format!("Message {n}"),
+                    text: body,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await;
+        }
+        let r = api::Request {
+            sources: vec![api::RequestSource { target: "thread:mail-acct:long".into(), kind: "mail".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let text = context(&m, &r).await.unwrap();
+        let oldest = text.find("Oldest material.").unwrap();
+        let middle = text.find("Middle material.").unwrap();
+        let latest = text.find("Please send the final slides?").unwrap();
+        assert!(oldest < middle && middle < latest, "{text}");
+        assert!(text.chars().count() <= MAX_CONTEXT);
+    }
+
+    #[tokio::test]
+    async fn mail_history_limits_candidates_before_reading_bodies() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let now = c6_core::now_ms();
+        let mail = |body: &str| Parsed {
+            from: ("me@example.com".into(), "Me".into()),
+            to: vec![("host@example.net".into(), "Host".into())],
+            subject: "Next steps".into(),
+            text: body.into(),
+            ..Default::default()
+        };
+        kept_mail(&m, "qualifying", "qualifying", now - 1000, mail("Here are my own words about our next steps."), true).await;
+        for n in 0..MAIL_CANDIDATES {
+            // Empty samples and the request's own thread use all the candidate slots.
+            kept_mail(&m, &format!("empty-{n}"), "empty", now + n, mail(""), true).await;
+        }
+        let r = api::Request {
+            person: "host@example.net".into(),
+            sources: vec![api::RequestSource { target: "thread:mail-acct:empty".into(), kind: "mail".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let text = context(&m, &r).await.unwrap();
+        assert!(!text.contains("## Other recent mail"), "{text}");
+        assert!(!text.contains("## How the owner writes"), "{text}");
+        sqlx::query("DELETE FROM mail WHERE gmail_id = 'empty-0'").execute(&m.store.pool).await.unwrap();
+        // Cheap filters don't consume the candidate budget.
+        for n in 0..MAIL_CANDIDATES {
+            kept_mail(
+                &m,
+                &format!("forward-{n}"),
+                "forward",
+                now + n,
+                Parsed { subject: "fWd: Receipt".into(), ..mail("Forwarded receipt") },
+                true,
+            )
+            .await;
+        }
+        let text = context(&m, &r).await.unwrap();
+        assert!(text.contains("## Other recent mail"), "{text}");
+        assert!(text.contains("## How the owner writes"), "{text}");
+        assert!(text.contains("Here are my own words about our next steps."), "{text}");
+        sqlx::query("UPDATE mail SET date = ? WHERE gmail_id = 'qualifying'").bind(now - 366 * DAY).execute(&m.store.pool).await.unwrap();
+        let text = context(&m, &r).await.unwrap();
+        assert!(!text.contains("## Other recent mail"), "{text}");
+        assert!(!text.contains("## How the owner writes"), "{text}");
+    }
+
+    #[test]
+    fn link_boundaries_keep_prose_and_balanced_paths() {
+        assert_eq!(clean("https://x.test/p?name=one)&auth_token=SECRET"), "https://x.test/p");
+        assert_eq!(clean("(see https://x.test/p?q=1) and more"), "(see https://x.test/p and more");
+        assert_eq!(clean("https://en.wikipedia.org/wiki/Foo_(bar)"), "https://en.wikipedia.org/wiki/Foo_(bar)");
+        for query in ["?", "#", "%3F", "%23"] {
+            assert_eq!(clean(&format!("https://x.test/p{query}name=one]&auth_token=SECRET next")), "https://x.test/p next");
+        }
+        for (text, expected) in [
+            ("See [plan](https://x.test/p?token=secret)—bring chairs.", "See [plan](https://x.test/p chairs."),
+            ("[plan](https://x.test/p)?", "[plan](https://x.test/p)?"),
+            ("https://en.wikipedia.org/wiki/Function_(mathematics)?oldid=123", "https://en.wikipedia.org/wiki/Function_(mathematics)"),
+            ("(see https://x.test/p?t=1)", "(see https://x.test/p"),
+            ("https://x.test/p?q=[1]&t=2.", "https://x.test/p"),
+            ("Is it https://x.test/p?", "Is it https://x.test/p"),
+            (r#"<a href="https://x.test/p?name=O'Reilly&amp;auth_token=secret">"#, r#"<a href="https://x.test/p">"#),
+            (r#"<a href="https://x.test/p?name=one)&amp;auth_token=secret">"#, r#"<a href="https://x.test/p">"#),
+            ("<https://x.test/p?name=O'Reilly&auth_token=secret>", "<https://x.test/p>"),
+            ("<https://x.test/p?name=one)&auth_token=secret> after", "<https://x.test/p> after"),
+            (r#"<input value='https://x.test/p?name=O"Reilly&auth_token=secret'>"#, "<input value='https://x.test/p'>"),
+            (r#"<img data-src="image.png%23name=one)&auth_token=secret">"#, r#"<img data-src="image.png">"#),
+            (r#"<a href="https://x.test/p?name=one) more&auth_token=secret">after"#, r#"<a href="https://x.test/p">after"#),
+            ("[plan](https://x.test/a_(b[c])?q=[1])—bring chairs.", "[plan](https://x.test/a_(b[c]) chairs."),
+            ("[see https://x.test/p?t=1]—bring chairs.", "[see https://x.test/p chairs."),
+            ("[plan](/a_(b)?token=secret)—bring chairs.", "[plan](/a_(b) chairs."),
+            ("https://x.test/a_(b) https://x.test/c[d]", "https://x.test/a_(b) https://x.test/c[d]"),
+            ("https://x.test/p?q=(one(two))&t=2: next", "https://x.test/p next"),
+            ("https://x.test/p?q=secret;!? next", "https://x.test/p next"),
+            ("https://x.test/p?q=secret.) next", "https://x.test/p next"),
+            (r#"<img data-src="image.png?auth_token=secret">"#, r#"<img data-src="image.png">"#),
+            (r#"<a href="https://x.test/a_(b)?token=secret">"#, r#"<a href="https://x.test/a_(b)">"#),
+            (r#"<a href="?">"#, r#"<a href="">"#),
+            ("<a href=https://x.test/p?>", "<a href=https://x.test/p>"),
+            ("<img srcset=https://x.test/p?>", "<img srcset=https://x.test/p>"),
+            (r#"<a href="  https://x.test/p?token=secret">"#, r#"<a href="  https://x.test/p">"#),
+            (r#"<img data-srcset="a_(b).png?t=1 1x, c[d].png?t=2 2x">"#, r#"<img data-srcset="a_(b).png">"#),
+        ] {
+            assert_eq!(clean(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn context_urls_keep_only_their_location() {
+        for suffix in [
+            "?filter[name]=a&auth_token=secret",
+            "?filter={name}&auth_token=secret",
+            "?filter=(name)&auth_token=secret",
+            "%23access_token%3Dsecret",
+            "%3fauth_token%3dsecret",
+        ] {
+            assert_eq!(clean(&format!("https://x.test/p{suffix}")), "https://x.test/p");
+        }
+        assert_eq!(clean("https://r.test/https%3A%2F%2Fx.test%2F%23access_token%3Dsecret"), "https://r.test/https%3A%2F%2Fx.test%2F");
+        assert_eq!(clean("See (https://x.test/p?filter[name]=a&auth_token=secret)."), "See (https://x.test/p");
+        for attr in [
+            "href",
+            "src",
+            "data-src",
+            "data-href",
+            "data-url",
+            "data_src",
+            "xlink:href",
+            "photo_url",
+            "imageSrc",
+            "action",
+            "formaction",
+            "poster",
+            "cite",
+            "background",
+            "data",
+        ] {
+            for value in ["?auth_token=secret", "#secret", "%3Fauth_token=secret", "%23secret", "p?filter[name]=a&auth_token=secret"] {
+                let path = if value.starts_with('p') { "p" } else { "" };
+                assert_eq!(clean(&format!("<a {attr} = \"{value}\">")), format!("<a {attr} = \"{path}\">"));
+            }
+        }
+        assert_eq!(clean(r#"<a HREF=?auth_token=secret>link</a>"#), r#"<a HREF=>link</a>"#);
+        assert_eq!(
+            clean(r#"<input value="C#developer" title="Who?Me" data-note="use href=?secret" alt="/Why?Me">"#),
+            r#"<input value="C#developer" title="Who?Me" data-note="use href=?secret" alt="/Why?Me">"#
+        );
+        assert_eq!(clean(r#"<input value="https://x.test/p?filter[name]=a&secret=1">"#), r#"<input value="https://x.test/p">"#);
+        assert_eq!(clean(r#"<img srcset="one.png?secret=1 1x, two.png%23secret 2x, three.png?secret=3 3x">"#), r#"<img srcset="one.png">"#);
+        assert_eq!(clean(r#"<img srcset="one.png?secret=1, two.png?secret=2">"#), r#"<img srcset="one.png">"#);
+        assert_eq!(clean(r#"<a ping="?secret=1 /two#secret https://x.test/three?secret=3">"#), r#"<a ping="">"#);
+
+        assert_eq!(clean("Re:lunch? Time:17:30 Note:see"), "Re:lunch? Time:17:30 Note:see");
+        assert_eq!(
+            clean(r#"<p title = "Re:lunch? Time:17:30 Note:see">Lunch?</p> x=Ready?"#),
+            r#"<p title = "Re:lunch? Time:17:30 Note:see">Lunch?</p> x=Ready?"#
+        );
+        assert_eq!(clean("https://r.test/https%3A%2F%2Fx.test%2F%3Ftok%3Dsecret"), "https://r.test/https%3A%2F%2Fx.test%2F");
+        assert_eq!(clean("https://r.test/go%3ftok%3dsecret"), "https://r.test/go");
+        assert_eq!(
+            clean(
+                r#"<img src="image.png?auth_token=secret"> <a href = "pay?auth_token=secret">Pay</a> <img data-src = 'image.png?auth_token=secret'>"#
+            ),
+            r#"<img src="image.png"> <a href = "pay">Pay</a> <img data-src = 'image.png'>"#
+        );
+        assert_eq!(clean("<a href=''>empty</a>"), "<a href=''>empty</a>");
+        assert_eq!(clean("mailto:person@example.test?subject=secret"), "mailto:person@example.test");
+        assert_eq!(
+            clean("[invoice](/pay?auth_token=secret#part) <a HREF='pay?token=secret'>Pay</a> /map#secret"),
+            "[invoice](/pay <a HREF='pay'>Pay</a> /map"
+        );
+        assert_eq!(
+            clean(
+                "[invoice](https://pay.example.test/invoice?auth_token=secret#part) <a href=\"https://calendar.google.com/calendar/event?eid=abc&amp;tok=secret\">event</a> www.example.test/map?token=secret#place"
+            ),
+            "[invoice](https://pay.example.test/invoice <a href=\"https://calendar.google.com/calendar/event\">event</a> www.example.test/map"
+        );
+        assert_eq!(
+            clean("HTTPS://x.example/a?token=(secret)&next=private https://x.example/b#secret ftp://x.example/c?secret=1"),
+            "https://x.example/a https://x.example/b ftp://x.example/c"
+        );
+    }
+
+    #[test]
+    fn context_characters_and_blank_lines_are_cleaned() {
+        assert_eq!(clean("A\u{e0061}B"), "AB");
+        let fillers =
+            "\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}\u{034f}\u{00ad}\u{180e}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{2800}\u{17b4}\u{17b5}";
+        assert_eq!(clean(&format!("a{fillers}b\n\n \n\nlast\n")), "ab\n\nlast\n");
+    }
+
+    #[test]
+    fn section_budgets_keep_conversations_invitations_and_calendar() {
+        let text = assemble(
+            [
+                ("## Request\nReply\n\n".into(), REQUEST_CONTEXT),
+                ("## Conversation\nKeep the conversation\n".into(), CONVERSATION_CONTEXT),
+                ("Card noise ".repeat(MAX_CONTEXT), CARD_CONTEXT),
+                ("Mail noise ".repeat(MAX_CONTEXT), RECENT_CONTEXT),
+                ("Commitment noise ".repeat(MAX_CONTEXT), COMMITMENT_CONTEXT),
+                ("\n## Calendar\nKeep the calendar\n".into(), CALENDAR_CONTEXT),
+                ("\n## Invitations\nKeep the invitation facts\n".into(), INVITATION_CONTEXT),
+                ("Voice noise ".repeat(MAX_CONTEXT), VOICE_CONTEXT),
+            ],
+            &[],
+        );
+        for kept in ["Keep the conversation", "Keep the calendar", "Keep the invitation facts"] {
+            assert!(text.contains(kept));
+        }
+        assert!(text.chars().count() <= MAX_CONTEXT);
     }
 
     #[tokio::test]
@@ -900,7 +2026,7 @@ mod tests {
             }
             let r = message(&m, &link("dinner", "owner@example.test"), None).await;
             let prefix = format!(
-                "- thread:mail-acct:thread links to an event already in your calendar; your response: accepted\n  time: {} to {} (UTC)\n",
+                "- thread:mail-acct:thread links to an event already in your calendar; your response: accepted\n  Calendar invitation: Workshop\n  Organizer: not recorded\n  Your response: accepted\n  The owner has already answered this invitation in Calendar.\n  time: {} to {} (UTC)\n",
                 at(time(17, 30)),
                 at(time(20, 0))
             );
@@ -989,12 +2115,19 @@ mod tests {
                 let text = context(&m, &r).await.unwrap();
                 let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%a %Y-%m-%d %H:%M").to_string();
                 if recurrence == "not json" {
-                    assert!(text.contains(&format!(
-                        "your response: accepted\n  time: {} to {} (UTC; next occurrence of a recurring event)\n  nothing else in your calendar overlaps it\n",
-                        at(start), at(start + 3_600_000)
-                    )), "{text}");
+                    assert!(
+                        text.contains(&format!(
+                            "  time: {} to {} (UTC; next occurrence of a recurring event)\n  nothing else in your calendar overlaps it\n",
+                            at(start),
+                            at(start + 3_600_000)
+                        )),
+                        "{text}"
+                    );
                 } else {
-                    assert!(text.contains("your response: accepted\n  the invitation's time could not be checked\n"), "{text}");
+                    assert!(
+                        text.contains("your response: accepted") && text.contains("  the invitation's time could not be checked\n"),
+                        "{text}"
+                    );
                     assert!(!text.contains("nothing else in your calendar overlaps it"), "{text}");
                 }
 
@@ -1006,7 +2139,7 @@ mod tests {
                     .await
                     .unwrap();
                 let text = context(&m, &r).await.unwrap();
-                assert!(text.contains("your response: accepted\n  time: "), "{text}");
+                assert!(text.contains("your response: accepted") && text.contains("  time: "), "{text}");
                 if recurrence == "not json" {
                     assert!(
                         text.contains(&format!("  other busy blocks overlapping it:\n  - {} to {}\n", at(start), at(start + 3_600_000))),
@@ -1040,7 +2173,7 @@ mod tests {
         let (calendar, invitation) = text.split_once("\n## Invitations being answered\n").unwrap();
         assert_eq!(calendar, "\n## The owner's calendar, next 7 days (UTC)\n- the owner's calendar could not be read\n");
         assert!(!text.contains("the rest is free") && !text.contains("nothing booked"), "{text}");
-        assert!(invitation.contains("your response: accepted\n  time: "), "{text}");
+        assert!(invitation.contains("your response: accepted") && invitation.contains("  time: "), "{text}");
         assert!(invitation.ends_with("  overlaps with the invitation could not be checked\n"), "{text}");
     }
 
@@ -1249,5 +2382,215 @@ mod tests {
         }
         assert!(!links_to("Workshop", "", link));
         assert!(!links_to("", "", ""));
+    }
+
+    #[test]
+    fn apostrophes_inside_links_do_not_expose_queries() {
+        for (text, expected) in [
+            ("https://x.test/p?name=O'Reilly&auth_token=secret", "https://x.test/p"),
+            ("See [text](https://x.test/p?name=O'Reilly&auth_token=secret).", "See [text](https://x.test/p"),
+            ("See 'https://x.test/p?name=O'Reilly&auth_token=secret'.", "See 'https://x.test/p"),
+            ("https://x.test/O'Reilly", "https://x.test/O'Reilly"),
+        ] {
+            assert_eq!(clean(text), expected);
+        }
+    }
+    #[tokio::test]
+    async fn reply_boxes_share_cleaned_messages_and_invitation_facts() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        crate::calendar::store_calendar(&m, "cal-acct", &json!({"id": "primary", "primary": true, "timeZone": "Pacific/Honolulu"}))
+            .await
+            .unwrap();
+        let url = "https://calendar.google.com/calendar/event?eid=d29ya3Nob3AgbWVAZXhhbXBsZS5jb20&tok=invite-secret&ctz=Pacific/Honolulu";
+        crate::calendar::store_event(
+            &m,
+            "test-calendar",
+            "cal-acct",
+            "me@example.com",
+            "primary",
+            &json!({
+                "id": "workshop", "summary": "Workshop", "htmlLink": url,
+                "start": {"dateTime": "2030-11-01T17:30:00Z"}, "end": {"dateTime": "2030-11-01T18:30:00Z"},
+                "organizer": {"email": "host@example.net"},
+                "attendees": [{"email": "me@example.com", "self": true, "optional": true, "responseStatus": "accepted"}],
+            }),
+        )
+        .await
+        .unwrap();
+        message(&m, &format!(
+            "You have been invited to the following event.\nWorkshop\nWhen\nFriday afternoon\nGuests\nhost@example.net - organizer\nView your event at {url}\nInvitation from Google Calendar: {url}\nYou are receiving this email because you use Calendar."
+        ), None).await;
+        kept_mail(
+            &m,
+            "directions",
+            "thread",
+            c6_core::now_ms() + 1,
+            Parsed {
+                from: ("host@example.net".into(), "Host".into()),
+                to: vec![
+                    ("bob@example.net".into(), "Bob".into()),
+                    ("jane@example.net".into(), "Doe, <Jane>".into()),
+                    ("guest@example.net".into(), String::new()),
+                ],
+                cc: vec![("me@example.com".into(), "Me".into())],
+                subject: "Directions".into(),
+                text: "Please read the route at https://host.example.net/route?auth_token=route-secret#turns\u{034f}\u{00ad}".into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        kept_mail(
+            &m,
+            "plan",
+            "thread",
+            c6_core::now_ms() + 2,
+            Parsed {
+                from: ("host@example.net".into(), "Host".into()),
+                to: (0..12).map(|n| (format!("person{n}@example.net"), format!("User {n}"))).collect(),
+                subject: "Shared plan".into(),
+                text: "[plan](/plan?token=secret)".into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO cards (key, name, card, threads, model, updated_at) VALUES ('person:host@example.net', 'Host', ?, 1, 'test', 0)",
+        )
+        .bind(
+            json!({"relationship": "Workshop friend\u{034f}", "story": "Plans at https://host.example.net/plans?auth_token=card-secret"})
+                .to_string(),
+        )
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+        crate::requests::follow(
+            &m,
+            &crate::requests::Found {
+                target: "thread:mail-acct:thread",
+                kind: "mail",
+                category: "needs_you",
+                reason: "Decision details https://host.example.net/decision?auth_token=reason-secret\u{00ad}",
+                asks: "Review the invitation https://host.example.net/request?auth_token=title-secret\u{034f}",
+                due: None,
+                person: "host@example.net",
+                person_name: "Host",
+                title: "Workshop",
+                at: c6_core::now_ms(),
+                urgent: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let id = crate::requests::open_of(&m, "thread:mail-acct:thread").await.unwrap().unwrap();
+        let own = "My link https://mine.example.net/reply?token=keep-this#here\u{034f}";
+        for key in ["thread:mail-acct:thread".to_owned(), format!("request:{id}")] {
+            let prompt = crate::compose::context(&m, &key, own, &[]).await.unwrap();
+            let (context, draft) = prompt.split_once("## My draft so far\n").unwrap();
+            for wanted in [
+                "To: Bob <bob@example.net>, Doe, Jane <jane@example.net>, guest@example.net\nCc: Me <me@example.com>\nPlease read the route at https://host.example.net/route",
+                "[plan](/plan",
+                "You have been invited to the following event.\nWorkshop\nWhen\nFriday afternoon",
+                "You are receiving this email because you use Calendar.",
+                "## Invitations being answered",
+                "Calendar invitation: Workshop",
+                "Organizer: host@example.net",
+                "Your attendance: optional",
+                "Your response: accepted",
+                "2030-11-01 07:30",
+                "Pacific/Honolulu",
+                "nothing else in your calendar overlaps it",
+                "Workshop friend",
+                "https://host.example.net/plans",
+            ] {
+                assert!(context.contains(wanted), "{key}: missing {wanted}: {context}");
+            }
+            for absent in ["tok=", "token", "-secret", "?", "\u{034f}", "\u{00ad}"] {
+                assert!(!context.contains(absent), "{key}: contains {absent}: {context}");
+            }
+            let plan = context.split_once("— Shared plan\n").unwrap().1.split_once("[plan]").unwrap().0;
+            let to = plan.lines().next().unwrap();
+            assert!(to.contains("and ") && to.ends_with(" more"), "{to}");
+            assert!(to.chars().count() <= 300, "{to}");
+            assert_eq!(to.matches('<').count(), to.matches('>').count(), "{to}");
+            assert!(!plan.contains("Cc:"), "{plan}");
+            assert!(draft.starts_with(&format!("{own}\n")), "the owner's draft stays verbatim");
+            if key.starts_with("request:") {
+                assert_eq!(context.matches("## What they need").count(), 1);
+                assert_eq!(context.matches("Review the invitation").count(), 1);
+                assert!(context.contains("Decision details https://host.example.net/decision"));
+                assert!(!context.contains("## Request"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn undated_commitments_use_the_source_date() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.accounts.lock().unwrap().push(crate::people::Account { email: "me@example.com".into(), ..Default::default() });
+        let now = c6_core::now_ms();
+        for (id, days, due, what) in [
+            ("old", 200, None, "Old undated promise"),
+            ("recent", 10, None, "Recent undated promise"),
+            ("dated", 200, Some(now + DAY), "Still due soon"),
+        ] {
+            let item = kept_mail(
+                &m,
+                id,
+                id,
+                now - days * DAY,
+                Parsed {
+                    from: ("host@example.net".into(), "Host".into()),
+                    to: vec![("me@example.com".into(), "Me".into())],
+                    subject: "Plans".into(),
+                    text: "Here are the plans we discussed.".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO commitments (item_id, who, what, due, made_by, created_at) VALUES (?, 'host@example.net', ?, ?, 'test', ?)",
+            )
+            .bind(item)
+            .bind(what)
+            .bind(due)
+            .bind(now)
+            .execute(&m.store.pool)
+            .await
+            .unwrap();
+        }
+        let r = api::Request { person: "host@example.net".into(), ..Default::default() };
+        let text = context(&m, &r).await.unwrap();
+        let open = text.split_once("## Open between you\n").unwrap().1.split("\n## ").next().unwrap();
+        assert!(open.contains("Recent undated promise"), "{open}");
+        assert!(open.contains("Still due soon"), "{open}");
+        assert!(!open.contains("Old undated promise"), "{open}");
+    }
+
+    #[test]
+    fn draft_targets_can_include_the_headings_kind() {
+        let mail = api::RequestSource { target: "thread:mail-acct:thread".into(), kind: "mail".into(), ..Default::default() };
+        let chat = api::RequestSource { target: "chat:workspace:channel:thread".into(), kind: "chat".into(), ..Default::default() };
+        for sources in [[mail.clone(), chat.clone()], [chat, mail]] {
+            for source in &sources {
+                for target in [
+                    source.target.clone(),
+                    format!("  {} ({})  ", source.target, source.kind),
+                    format!(" `{} ({})` ", source.target, source.kind),
+                    format!("`{}` ({})", source.target, source.kind),
+                ] {
+                    assert_eq!(draft_target(&target, &sources), source.target, "{target}");
+                }
+            }
+            assert_eq!(draft_target("unknown", &sources), sources.last().unwrap().target);
+        }
+        assert_eq!(draft_target("unknown", &[]), "");
     }
 }

@@ -154,6 +154,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::REQUEST_SAME,
     },
     Prompt {
+        name: "memex.requests.draft.system",
+        description: "The system prompt of the memex's reply writer.",
+        default: text::REQUEST_DRAFT_SYSTEM,
+    },
+    Prompt {
         name: "memex.requests.draft",
         description: "How a reply is drafted for a request that needs you: voice, facts only, choices as [[a | b]] for what only you decide. Placeholders: {{request}}, {{context}}.",
         default: text::REQUEST_DRAFT,
