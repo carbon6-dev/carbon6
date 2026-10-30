@@ -121,36 +121,74 @@ impl OpenAiChat {
         if let Some(e) = &req.effort {
             body["reasoning_effort"] = e.clone().into();
         }
+        if req.json {
+            body["response_format"] = json!({"type": "json_object"});
+        }
         body
     }
 }
 
-/// Whether a 400/422 rejects reasoning_effort or the think setting Ollama maps it to.
-fn rejects_reasoning(why: &str) -> bool {
-    let why = why.to_lowercase();
-    why.contains("reasoning") || why.contains("think")
+/// Removes one rejected option, using locations before names or concepts.
+fn remove_rejected(body: &mut Value, why: &str) -> bool {
+    const OPTIONAL: &[(&str, &[&str])] = &[("response_format", &["json"]), ("reasoning_effort", &["reasoning", "think"])];
+    let Some(fields) = body.as_object_mut() else { return false };
+    let why = if let Ok(mut error) = serde_json::from_str::<Value>(why) {
+        without_input(&mut error);
+        let locations = [error.get("param"), error.pointer("/error/param")]
+            .into_iter()
+            .flatten()
+            .chain(error["detail"].as_array().into_iter().flatten().flat_map(|d| d["loc"].as_array().into_iter().flatten()));
+        for location in locations.filter_map(Value::as_str) {
+            if OPTIONAL.iter().any(|(field, _)| *field == location) && fields.remove(location).is_some() {
+                return true;
+            }
+        }
+        error.to_string()
+    } else {
+        why.to_owned()
+    }
+    .to_lowercase();
+    for exact in [true, false] {
+        for (field, words) in OPTIONAL {
+            let mentioned = if exact { why.contains(field) } else { words.iter().any(|word| why.contains(word)) };
+            if mentioned && fields.remove(*field).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Leaves the error's explanation, without echoed request input.
+fn without_input(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.remove("input");
+            fields.remove("input_value");
+            for value in fields.values_mut() {
+                without_input(value);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(without_input),
+        _ => {}
+    }
 }
 
 #[async_trait]
 impl ModelClient for OpenAiChat {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
-        let body = self.request_body(req);
+        let mut body = self.request_body(req);
         let mut headers = self.headers.clone();
         if !self.bearer.is_empty() {
             headers.insert("authorization".into(), format!("Bearer {}", self.bearer));
         }
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = match http::post_json(&self.http, &url, &headers, &body, self.attempts).await {
-            Err(LlmError::Http { status: 400 | 422, body: why, .. })
-                if body.get("reasoning_effort").is_some() && rejects_reasoning(&why) =>
-            {
-                let mut body = body.clone();
-                if let Some(o) = body.as_object_mut() {
-                    o.remove("reasoning_effort");
-                }
-                http::post_json(&self.http, &url, &headers, &body, self.attempts).await?
+        let resp = loop {
+            match http::post_json(&self.http, &url, &headers, &body, self.attempts).await {
+                // Each retry removes one field, so at most two retries.
+                Err(LlmError::Http { status: 400 | 422, body: ref why, .. }) if remove_rejected(&mut body, why) => {}
+                r => break r?,
             }
-            r => r?,
         };
 
         let state = StreamState::new(resp.bytes_stream().boxed());
@@ -388,21 +426,175 @@ mod tests {
     use crate::{Accumulator, Message, ToolSpec};
 
     #[test]
-    fn reasoning_rejections_include_ollama_thinking_errors() {
-        for why in [
-            "Unknown parameter: reasoning_effort",
-            r#""qwen" does not support thinking"#,
-            r#"think value "high" is not supported for this model"#,
-            "Thinking is not supported",
+    fn optional_field_rejections_include_ollama_thinking_and_json_errors() {
+        let body = json!({"reasoning_effort": "high", "response_format": {"type": "json_object"}, "model": "m"});
+        for (why, field) in [
+            ("Unknown parameter: reasoning_effort", "reasoning_effort"),
+            (r#""qwen" does not support thinking"#, "reasoning_effort"),
+            (r#"think value "high" is not supported for this model"#, "reasoning_effort"),
+            ("Thinking is not supported", "reasoning_effort"),
+            ("Unknown parameter: response_format", "response_format"),
+            ("JSON mode is not supported", "response_format"),
         ] {
-            assert!(rejects_reasoning(why), "{why}");
+            let mut got = body.clone();
+            assert!(remove_rejected(&mut got, why), "{why}");
+            let mut expected = body.clone();
+            expected.as_object_mut().unwrap().remove(field);
+            assert_eq!(got, expected);
+            assert!(!remove_rejected(&mut got, why), "already removed");
         }
-        assert!(!rejects_reasoning("model not found"));
-        assert!(!rejects_reasoning("max_tokens is too large"));
+        let mut got = body.clone();
+        assert!(!remove_rejected(&mut got, "model not found"));
+        assert!(!remove_rejected(&mut got, "max_tokens is too large"));
+        assert_eq!(got, body);
+        assert!(remove_rejected(&mut got, "reasoning and json are unsupported"));
+        assert_eq!(got, json!({"model": "m", "reasoning_effort": "high"}));
+        assert!(remove_rejected(&mut got, "reasoning and json are unsupported"));
+        assert_eq!(got, json!({"model": "m"}));
     }
 
     #[test]
-    fn request_sends_high_effort_and_output_limit() {
+    fn exact_option_names_take_priority_over_concepts() {
+        let body = json!({"reasoning_effort": "none", "response_format": {"type": "json_object"}});
+        for (why, field) in [
+            ("response_format is not supported with reasoning", "response_format"),
+            ("reasoning_effort is not supported with JSON", "reasoning_effort"),
+            ("response_format and reasoning_effort are not supported", "response_format"),
+        ] {
+            let mut got = body.clone();
+            assert!(remove_rejected(&mut got, why));
+            let mut expected = body.clone();
+            expected.as_object_mut().unwrap().remove(field);
+            assert_eq!(got, expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn structured_locations_take_priority_over_echoed_input() {
+        let body = json!({"reasoning_effort": "none", "response_format": {"type": "json_object"}});
+        for error in [
+            json!({"param": "reasoning_effort", "message": "JSON is not supported", "input": body}),
+            json!({"error": {"param": "reasoning_effort", "message": "JSON is not supported", "input_value": body}}),
+            json!({"detail": [{"loc": ["body", "reasoning_effort"], "msg": "JSON is not supported", "input": body}]}),
+        ] {
+            let mut got = body.clone();
+            assert!(remove_rejected(&mut got, &error.to_string()));
+            assert_eq!(got, json!({"response_format": {"type": "json_object"}}));
+        }
+        let mut got = body.clone();
+        let error = json!({"detail": [{"msg": "does not support thinking", "context": {"input_value": body}}]});
+        assert!(remove_rejected(&mut got, &error.to_string()));
+        assert_eq!(got, json!({"response_format": {"type": "json_object"}}));
+    }
+
+    fn json_request(effort: &str) -> ModelRequest {
+        ModelRequest {
+            model: "mock-1".into(),
+            system: "Return JSON.".into(),
+            messages: vec![Message::user_text("Read this.")],
+            tools: vec![],
+            max_output_tokens: Some(1000),
+            cache_key: None,
+            effort: Some(effort.into()),
+            web_search: false,
+            json: true,
+        }
+    }
+
+    async fn after_rejections(errors: &[(u16, &str)], effort: &str) -> Vec<Value> {
+        use c6_testkit::{MockLlm, Reply, within};
+
+        crate::install_crypto_provider();
+        let mock = MockLlm::start().await;
+        for (status, why) in errors {
+            mock.push(Reply::Error(*status, (*why).into()));
+        }
+        mock.push(Reply::Text(r#"{"summary":"Read."}"#.into()));
+        let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap().once();
+        let req = json_request(effort);
+        within("the answer after rejected options", async {
+            let mut stream = client.stream(&req).await.unwrap();
+            let mut acc = Accumulator::default();
+            while let Some(event) = stream.next().await {
+                acc.push(&event.unwrap());
+            }
+            assert_eq!(acc.finish(true).blocks, vec![Block::Text(r#"{"summary":"Read."}"#.into())]);
+        })
+        .await;
+        mock.requests()
+    }
+
+    #[tokio::test]
+    async fn a_server_rejecting_json_is_asked_again_without_it() {
+        let requests = after_rejections(&[(400, "response_format is not supported")], "high").await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["response_format"], json!({"type": "json_object"}));
+        let mut expected = requests[0].clone();
+        expected.as_object_mut().unwrap().remove("response_format");
+        assert_eq!(requests[1], expected);
+        assert_eq!(requests[1]["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn a_server_rejecting_both_options_is_asked_without_each_in_turn() {
+        let requests = after_rejections(&[(400, "does not support thinking"), (422, "JSON mode is not supported")], "high").await;
+        assert_eq!(requests.len(), 3);
+        let mut expected = requests[0].clone();
+        assert_eq!(expected["reasoning_effort"], "high");
+        assert_eq!(expected["response_format"], json!({"type": "json_object"}));
+        expected.as_object_mut().unwrap().remove("reasoning_effort");
+        assert_eq!(requests[1], expected);
+        expected.as_object_mut().unwrap().remove("response_format");
+        assert_eq!(requests[2], expected);
+    }
+
+    #[tokio::test]
+    async fn an_echoed_request_keeps_reasoning_when_json_is_rejected() {
+        let why = json!({"detail": [{"loc": ["body", "response_format"], "msg": "unsupported",
+            "input": {"reasoning_effort": "none", "response_format": {"type": "json_object"}}}]})
+        .to_string();
+        let requests = after_rejections(&[(422, &why)], "none").await;
+        assert_eq!(requests.len(), 2);
+        let mut expected = requests[0].clone();
+        expected.as_object_mut().unwrap().remove("response_format");
+        assert_eq!(requests[1], expected);
+        assert_eq!(requests[1]["reasoning_effort"], "none");
+    }
+
+    #[tokio::test]
+    async fn an_echoed_reasoning_rejection_keeps_json() {
+        let why = json!({"detail": [{"loc": ["body", "reasoning_effort"], "msg": "unsupported",
+            "input": {"reasoning_effort": "none", "response_format": {"type": "json_object"}}}]})
+        .to_string();
+        let requests = after_rejections(&[(422, &why)], "none").await;
+        assert_eq!(requests.len(), 2);
+        let mut expected = requests[0].clone();
+        expected.as_object_mut().unwrap().remove("reasoning_effort");
+        assert_eq!(requests[1], expected);
+        assert_eq!(requests[1]["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_rejection_is_returned_without_retrying() {
+        use c6_testkit::{MockLlm, Reply, within};
+
+        crate::install_crypto_provider();
+        let mock = MockLlm::start().await;
+        let echoed = json!({"detail": [{"loc": ["body", "model"], "msg": "model not found",
+            "input": {"reasoning_effort": "none", "response_format": {"type": "json_object"}},
+            "context": {"input_value": {"reasoning_effort": "none", "response_format": {"type": "json_object"}}}}]})
+        .to_string();
+        let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap().once();
+        for (n, (code, why)) in [(400, "model not found"), (422, echoed.as_str())].into_iter().enumerate() {
+            mock.push(Reply::Error(code, why.into()));
+            let result = within("the unrelated rejection", client.stream(&json_request("none"))).await;
+            assert!(matches!(result, Err(LlmError::Http { status, body, .. }) if status == code && body == why));
+            assert_eq!(mock.requests().len(), n + 1);
+        }
+    }
+
+    #[test]
+    fn request_sends_effort_output_limit_and_only_requested_json() {
         let c = OpenAiChat::new("http://localhost:1/v1", "", HashMap::new()).unwrap();
         let req = ModelRequest {
             model: "qwen3.8:27b".into(),
@@ -413,8 +605,14 @@ mod tests {
             cache_key: None,
             effort: Some("high".into()),
             web_search: false,
+            json: false,
         };
         let body = c.request_body(&req);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["max_tokens"], 9692);
+        assert!(body.get("response_format").is_none());
+        let body = c.request_body(&ModelRequest { json: true, ..req });
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["max_tokens"], 9692);
     }
@@ -493,6 +691,7 @@ mod tests {
             cache_key: Some("k".into()),
             effort: None,
             web_search: false,
+            json: false,
         };
         let body = c.request_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -522,6 +721,7 @@ mod tests {
             cache_key: None,
             effort: None,
             web_search: false,
+            json: false,
         };
         let body = c.request_body(&req);
         assert_eq!(body["messages"][2], json!({"role": "assistant", "content": ""}));

@@ -110,7 +110,8 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
             let ask = api::prompts::fill(&m.prompt("memex.requests.same", api::prompts::REQUEST_SAME), &[("open", open), ("new", &new)]);
             let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
             crate::understand::count_call(m).await?;
-            let v = llm::json_of(&llm::ask(m, task, "same request?", &new, &system, vec![Block::Text(ask)], 200).await?)?;
+            let v =
+                llm::json_of(&llm::ask(m, task, "same request?", &new, &system, vec![Block::Text(ask)], llm::Output::Json(200)).await?)?;
             match (v["same"] == true, v["sure"] == true) {
                 (true, true) if source(m, *id, f).await? => {
                     sqlx::query(

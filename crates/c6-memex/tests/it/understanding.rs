@@ -147,6 +147,7 @@ async fn understanding_review_graph() {
     assert_eq!(mock.requests().len(), 2);
     let first = &mock.requests()[0];
     assert_eq!(first["model"], "reader-1");
+    assert_eq!(first["response_format"], json!({"type": "json_object"}));
     assert!(first.to_string().contains("credit-based flow control"), "the paper first: {first}");
 
     // The paper: a summary, topics and claims, all inferred.
@@ -211,6 +212,7 @@ async fn understanding_review_graph() {
     mock.push(Reply::Text(json!({"summary": "Jane Doe wrote a paper on backpressure [p]."}).to_string()));
     let s = rpc("memex.summarize", json!({"id": "person:jane@acme.com"})).await;
     assert_eq!(s["summary"], "Jane Doe wrote a paper on backpressure [p].");
+    assert_eq!(mock.requests().last().unwrap()["response_format"], json!({"type": "json_object"}));
     let note: (String, String) =
         sqlx::query_as("SELECT kind, meta FROM items WHERE source LIKE 'pipeline:summary%'").fetch_one(&m.store.pool).await.unwrap();
     assert_eq!(note.0, "note");

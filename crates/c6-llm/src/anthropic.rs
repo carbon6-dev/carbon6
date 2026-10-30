@@ -494,6 +494,7 @@ mod tests {
                 cache_key: None,
                 effort: Some("none".into()),
                 web_search: false,
+                json: false,
             };
             let b = c.request_body(&req);
             assert_eq!(b["thinking"], json!({"type": "disabled"}), "{model}");
@@ -525,8 +526,10 @@ mod tests {
             cache_key: None,
             effort: None,
             web_search: true,
+            json: false,
         };
         let b = c.request_body(&req);
+        assert_eq!(c.request_body(&ModelRequest { json: true, ..req.clone() }), b);
         assert_eq!(b["thinking"], json!({"type": "adaptive", "display": "summarized"}));
         assert_eq!(b["output_config"]["effort"], "high");
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");

@@ -339,7 +339,9 @@ async fn read(m: &Memex, task: &Task, kind: &str, items: &[String]) -> anyhow::R
         .fetch_optional(&m.store.pool)
         .await?
         .unwrap_or_default();
-    let answer = llm::ask(m, task, "understanding", &format!("{kind}: {title}"), &system, vec![Block::Text(prompt)], 3000).await?;
+    let answer =
+        llm::ask(m, task, "understanding", &format!("{kind}: {title}"), &system, vec![Block::Text(prompt)], llm::Output::Json(3000))
+            .await?;
     let v = llm::json_of(&answer)?;
     apply(m, task, kind, items, &v).await
 }
@@ -604,7 +606,7 @@ pub async fn summarize(m: &Memex, key: &str, allowed: &[String]) -> anyhow::Resu
     let records = clip(&text, MAX_INPUT);
     let prompt = api::prompts::fill(&template, &[("name", &thing.name), ("kind", &thing.kind), ("records", &records)]);
     let system = m.prompt("memex.understand.system", SYSTEM);
-    let answer = llm::ask(m, &task, "summary", &thing.name, &system, vec![Block::Text(prompt)], 4000).await?;
+    let answer = llm::ask(m, &task, "summary", &thing.name, &system, vec![Block::Text(prompt)], llm::Output::Json(4000)).await?;
     let summary = llm::json_of(&answer).ok().and_then(|v| v["summary"].as_str().map(str::to_owned)).unwrap_or(answer);
     let item = api::MemexItemIn {
         kind: "note".into(),

@@ -1113,6 +1113,7 @@ async fn requests_use_the_drafting_model_automatically_and_on_demand() {
     assert_eq!(reader.requests().len(), 1);
     assert_eq!(reader.requests()[0]["model"], "reader-1");
     assert_eq!(reader.requests()[0]["reasoning_effort"], "none");
+    assert_eq!(reader.requests()[0]["response_format"], json!({"type": "json_object"}));
     assert_eq!(writer.requests().len(), 1);
     let calls: i64 = sqlx::query_scalar("SELECT SUM(calls) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
     assert_eq!(calls, 2, "sorting and drafting share the budget");
@@ -1136,6 +1137,7 @@ async fn requests_use_the_drafting_model_automatically_and_on_demand() {
     for body in writer.requests() {
         assert_eq!(body["model"], "writer-1");
         assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
         assert!(body["max_tokens"].as_u64().unwrap() >= 1500 + 8192);
     }
     let calls: i64 = sqlx::query_scalar("SELECT SUM(calls) FROM model_calls").fetch_one(&m.store.pool).await.unwrap();
@@ -1370,6 +1372,7 @@ async fn a_join_waiting_on_the_model_cannot_attach_to_a_closed_request() {
     let joined = c6_memex::requests::open_of(&m, "chat:room").await.unwrap().unwrap();
     assert_ne!(joined, id);
     assert_eq!(c6_memex::requests::get(&m, joined).await.unwrap().sources.len(), 1);
+    assert_eq!(mock.requests()[0]["response_format"], json!({"type": "json_object"}));
     assert_eq!(mock.requests().len(), 1);
     head.shutdown().await.unwrap();
 }

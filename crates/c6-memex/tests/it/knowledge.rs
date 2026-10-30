@@ -227,3 +227,100 @@ async fn turn_ended(http: &reqwest::Client, api: &str, id: &str) -> bool {
     };
     ev.last().is_some_and(|e| e["type"] == "turn_ended")
 }
+
+#[tokio::test]
+async fn vision_asks_for_json_and_system_pages_for_markdown() {
+    crate::extract_here();
+    let mock = MockLlm::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    http.post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    c6_memex::knowledge::record(
+        &m,
+        &json!({
+            "claim": "Argo runs CI.", "about": ["ci:argo"], "status": "inferred"
+        }),
+    )
+    .await
+    .unwrap();
+    mock.push(Reply::Text("# CI\n\nArgo runs CI.".into()));
+    http.put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": "m", "model": "mock-1"}, "calls_per_day": 1}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let page = eventually("the system page written", async || {
+        let v = c6_memex::knowledge::page(&m, "ci:argo").await.ok()?;
+        (v["page"] == "# CI\n\nArgo runs CI.").then_some(v)
+    })
+    .await;
+    assert_eq!(page["facts"].as_array().unwrap().len(), 1);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("response_format").is_none());
+
+    let mut image = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1).write_to(&mut image, image::ImageFormat::Jpeg).unwrap();
+    let thumb = m.put_blob(image.get_ref()).await.unwrap();
+    let id = m
+        .store
+        .put(
+            &c6_api::MemexItemIn {
+                kind: "photo".into(),
+                source: "test".into(),
+                external_id: "pixel".into(),
+                title: "A pixel".into(),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media (item_id, path, kind, thumb) VALUES (?, '', 'photo', ?)")
+        .bind(&id)
+        .bind(&thumb)
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+    mock.push(Reply::Text(json!({"caption": "A black pixel.", "objects": []}).to_string()));
+    http.put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": "m", "model": "mock-1"},
+            "vision": {"connection": "m", "model": "mock-1"}, "calls_per_day": 2}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    eventually("the photo captioned", async || {
+        let seen: Option<String> =
+            sqlx::query_scalar("SELECT seen FROM media WHERE item_id = ?").bind(&id).fetch_one(&m.store.pool).await.ok()?;
+        (seen.as_deref() == Some("vision-v1@mock-1")).then_some(())
+    })
+    .await;
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = ?").bind(&id).fetch_one(&m.store.pool).await.unwrap();
+    assert_eq!(title, "A black pixel.");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["response_format"], json!({"type": "json_object"}));
+    head.shutdown().await.unwrap();
+}

@@ -198,7 +198,7 @@ async fn grow(
     );
     let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
     crate::understand::count_call(m).await?;
-    let answer = llm::ask(m, task, "card", &label, &system, vec![Block::Text(prompt)], 800).await?;
+    let answer = llm::ask(m, task, "card", &label, &system, vec![Block::Text(prompt)], llm::Output::Json(800)).await?;
     let v = llm::json_of(&answer)?;
     let card = json!({
         "relationship": v["relationship"].as_str().unwrap_or("other").trim().to_lowercase(),

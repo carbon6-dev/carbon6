@@ -217,6 +217,7 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         cache_key: None,
         effort: Some("low".into()),
         web_search: false,
+        json: false,
     };
     let mut stream = client.stream(&req).await?;
     let mut acc = Accumulator::default();

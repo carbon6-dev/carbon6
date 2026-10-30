@@ -93,6 +93,7 @@ mod tests {
             cache_key: None,
             effort: None,
             web_search: false,
+            json: false,
         }
     }
 
