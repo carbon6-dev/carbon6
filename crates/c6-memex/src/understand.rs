@@ -8,6 +8,7 @@
 
 use c6_api as api;
 use c6_llm::Block;
+use futures_util::TryStreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tracing::{info, warn};
@@ -29,31 +30,45 @@ fn version(task: &Task) -> String {
 
 /// What to read next: (target, kind, item ids it covers).
 async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String, Vec<String>)>> {
+    let at_once = m.tasks().at_once;
     // Email: by thread, the most recent first (and again when a thread has
     // news since it was read); not lists or spam.
-    let thread = sqlx::query(
+    let mut rows = sqlx::query(
         "SELECT m.account, m.thread_id, m.date AS d FROM mail m JOIN items i ON i.id = m.item_id \
          WHERE m.spam = 0 AND m.trash = 0 AND m.list = 0 AND m.draft = 0 AND NOT (lower(m.from_addr) LIKE '%noreply%' \
          OR lower(m.from_addr) LIKE '%no-reply%' OR lower(m.from_addr) LIKE '%donotreply%' OR lower(m.from_addr) LIKE '%do-not-reply%' \
          OR lower(m.from_addr) LIKE 'notification%' OR lower(m.from_addr) LIKE 'mailer-daemon%') AND NOT EXISTS (SELECT 1 FROM enrich e \
          WHERE e.target = 'thread:' || m.account || ':' || m.thread_id AND e.version = ? AND e.done_at >= i.added_at) \
-         ORDER BY m.date DESC LIMIT 40",
+         ORDER BY m.date DESC",
     )
     .bind(version)
-    .fetch_all(&m.store.pool)
-    .await?;
+    .fetch(&m.store.pool);
+    // Stop the date walk after enough distinct threads, not messages.
+    let mut seen = std::collections::HashSet::new();
+    let mut threads = Vec::new();
+    while let Some(row) = rows.try_next().await? {
+        if seen.insert((row.get::<String, _>("account"), row.get::<String, _>("thread_id"))) {
+            threads.push(row);
+            if threads.len() >= window(at_once, 40) as usize {
+                break;
+            }
+        }
+    }
+    drop(rows);
     // The newest one no other step is reading.
-    let thread = thread.into_iter().find(|t| {
+    let thread = threads.into_iter().find(|t| {
         let key = format!("thread:{}:{}", t.get::<String, _>("account"), t.get::<String, _>("thread_id"));
         !m.claimed(&format!("read:{key}"))
     });
     let item = sqlx::query(
         "SELECT id, kind, created_at FROM items i WHERE kind IN ('session', 'document', 'paper', 'web') \
-         AND NOT EXISTS (SELECT 1 FROM enrich e WHERE e.target = 'item:' || i.id AND e.version = ?) ORDER BY created_at DESC LIMIT 1",
+         AND NOT EXISTS (SELECT 1 FROM enrich e WHERE e.target = 'item:' || i.id AND e.version = ?) ORDER BY created_at DESC LIMIT ?",
     )
     .bind(version)
-    .fetch_optional(&m.store.pool)
+    .bind(window(at_once, 10))
+    .fetch_all(&m.store.pool)
     .await?;
+    let item = item.into_iter().find(|i| !m.claimed(&format!("read:item:{}", i.get::<String, _>("id"))));
     // Whichever is newer.
     let thread_at = thread.as_ref().map(|r| r.get::<i64, _>("d")).unwrap_or(i64::MIN);
     let item_at = item.as_ref().map(|r| r.get::<i64, _>("created_at")).unwrap_or(i64::MIN);
@@ -304,15 +319,53 @@ pub(crate) async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], 
 }
 
 /// The most reading steps side by side (Settings → Memex: calls at once).
-pub const MAX_AT_ONCE: u32 = 8;
+pub const MAX_AT_ONCE: u32 = 64;
+
+/// Candidates for every lane, with room to pass over claimed work.
+pub(crate) fn window(at_once: u32, floor: u32) -> i64 {
+    i64::from(floor.max(at_once.clamp(1, MAX_AT_ONCE) + 8))
+}
 
 /// Reads in the background while there is work and budget: as many lanes
 /// as calls at once. With more than one, the first lane only sorts new mail
 /// and drafts, so new mail never waits behind the walk.
 pub fn spawn(m: std::sync::Arc<Memex>) {
-    for lane in 0..MAX_AT_ONCE {
-        let m = m.clone();
-        tokio::spawn(async move { run(m, lane).await });
+    tokio::spawn(lanes(m, run));
+}
+
+async fn lanes<F>(m: std::sync::Arc<Memex>, start: impl Fn(std::sync::Arc<Memex>, u32) -> F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut running = tokio::task::JoinSet::new();
+    let mut ids = [None; MAX_AT_ONCE as usize];
+    let mut resting = [false; MAX_AT_ONCE as usize];
+    loop {
+        let wake = m.wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        for lane in 0..m.tasks().at_once.clamp(1, MAX_AT_ONCE) {
+            if ids[lane as usize].is_none() && !resting[lane as usize] {
+                ids[lane as usize] = Some(running.spawn(start(m.clone(), lane)).id());
+            }
+        }
+        tokio::select! {
+            _ = wake => resting.fill(false),
+            Some(result) = running.join_next_with_id() => {
+                let failed = result.is_err();
+                let id = match result {
+                    Ok((id, ())) => id,
+                    Err(e) => {
+                        warn!("reading lane: {e}");
+                        e.id()
+                    }
+                };
+                // Only a joined task frees its index, even if the setting rose again.
+                let lane = ids.iter().position(|slot| *slot == Some(id)).unwrap();
+                ids[lane] = None;
+                resting[lane] = failed;
+            }
+        }
     }
 }
 
@@ -320,10 +373,12 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
     let mut done = 0u64;
     let mut suggested: Option<std::time::Instant> = None;
     loop {
-        let at_once = m.tasks().at_once.max(1);
+        let wake = m.wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        let at_once = m.tasks().at_once.clamp(1, MAX_AT_ONCE);
         if lane >= at_once {
-            m.wake.notified().await;
-            continue;
+            return;
         }
         if lane == 0 && suggested.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(600)) {
             if let Err(e) = crate::commitments::maintain(&m, c6_core::now_ms()).await {
@@ -385,7 +440,7 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         } else {
             tokio::select! {
-                _ = m.wake.notified() => {}
+                _ = wake => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
             }
         }
@@ -501,5 +556,125 @@ mod budget_tests {
         assert_eq!(budget_left(&m, 5).await.unwrap(), 3);
         let days: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_calls WHERE day LIKE 'p:%'").fetch_one(&m.store.pool).await.unwrap();
         assert_eq!(days, 2, "one new day, beside the old one");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use c6_testkit::within;
+
+    #[test]
+    fn candidate_windows_cover_every_lane() {
+        for at_once in 1..=MAX_AT_ONCE {
+            for floor in [10, 40] {
+                assert!(window(at_once, floor) >= i64::from(floor));
+                assert!(window(at_once, floor) >= i64::from(at_once + 8));
+            }
+        }
+        assert_eq!(window(0, 10), 10);
+        assert_eq!(window(1, 40), 40);
+        assert_eq!(window(u32::MAX, 10), 72);
+    }
+
+    #[tokio::test]
+    async fn items_pass_over_claimed_work() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.set_tasks(crate::Tasks { at_once: 12, ..Default::default() });
+        let mut claims = Vec::new();
+        let mut last = String::new();
+        for i in 0..12 {
+            let id = m
+                .store
+                .put(
+                    &api::MemexItemIn {
+                        kind: "document".into(),
+                        source: "test".into(),
+                        external_id: i.to_string(),
+                        title: format!("Document {i}"),
+                        text: "Notes.".into(),
+                        created_at: Some(100 - i),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+            last = format!("item:{id}");
+            if i < 11 {
+                claims.push(m.claim(&format!("read:{last}")).unwrap());
+            }
+        }
+        assert_eq!(next(&m, "test").await.unwrap().unwrap().0, last);
+    }
+
+    #[tokio::test]
+    async fn lanes_follow_live_settings_without_overlapping_indices() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.set_tasks(crate::Tasks { at_once: 1, ..Default::default() });
+        let (events, mut recv) = tokio::sync::mpsc::unbounded_channel();
+        let supervisor = tokio::spawn(lanes(m.clone(), move |m, lane| {
+            let events = events.clone();
+            async move {
+                events.send((lane, true)).unwrap();
+                run(m, lane).await;
+                events.send((lane, false)).unwrap();
+            }
+        }));
+        assert_eq!(within("lane zero starts", recv.recv()).await, Some((0, true)));
+        let mut active = std::collections::HashSet::from([0]);
+        for at_once in [4, 1, 4] {
+            m.set_tasks(crate::Tasks { at_once, ..Default::default() });
+            for _ in 0..3 {
+                let (lane, started) = within("lanes follow the setting", recv.recv()).await.unwrap();
+                assert_ne!(lane, 0, "lane zero stays running");
+                assert_eq!(started, at_once == 4);
+                if started {
+                    assert!(active.insert(lane), "a lane starts only once");
+                } else {
+                    assert!(active.remove(&lane));
+                }
+            }
+            assert_eq!(active, (0..at_once).collect());
+        }
+        supervisor.abort();
+        assert!(supervisor.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panicked_lane_waits_for_a_wake_before_restarting() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.set_tasks(crate::Tasks { at_once: 2, ..Default::default() });
+        let starts = [const { std::cell::Cell::new(0) }; 2];
+        let (events, mut recv) = tokio::sync::mpsc::unbounded_channel();
+        let supervisor = lanes(m.clone(), |_, lane| {
+            let count = &starts[lane as usize];
+            count.set(count.get() + 1);
+            let panic = lane == 1 && count.get() == 1;
+            let events = events.clone();
+            async move {
+                if panic {
+                    events.send(()).unwrap();
+                    panic!("test lane");
+                }
+                std::future::pending::<()>().await;
+            }
+        });
+        let supervisor = tokio::task::unconstrained(supervisor);
+        tokio::pin!(supervisor);
+        assert!(futures_util::poll!(supervisor.as_mut()).is_pending());
+        within("lane one panics", recv.recv()).await.unwrap();
+        assert!(futures_util::poll!(supervisor.as_mut()).is_pending());
+        assert_eq!(starts.each_ref().map(|n| n.get()), [1, 1]);
+
+        m.wake.notify_waiters();
+        assert!(futures_util::poll!(supervisor.as_mut()).is_pending());
+        assert_eq!(starts.each_ref().map(|n| n.get()), [1, 2]);
     }
 }

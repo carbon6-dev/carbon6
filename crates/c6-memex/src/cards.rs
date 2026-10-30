@@ -337,8 +337,10 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
     if !crate::understand::can_call(m, &task, per_day).await? {
         return Ok(false);
     }
-    let next: Vec<(String, String)> =
-        sqlx::query_as("SELECT key, MAX(name) FROM card_news GROUP BY key ORDER BY MAX(at) DESC LIMIT 10").fetch_all(&m.store.pool).await?;
+    let next: Vec<(String, String)> = sqlx::query_as("SELECT key, MAX(name) FROM card_news GROUP BY key ORDER BY MAX(at) DESC LIMIT ?")
+        .bind(crate::understand::window(m.tasks().at_once, 10))
+        .fetch_all(&m.store.pool)
+        .await?;
     // The first no other step is writing.
     let Some((key, name, _claim)) = next.into_iter().find_map(|(k, n)| m.claim(&format!("card:{k}")).map(|c| (k, n, c))) else {
         return Ok(false);

@@ -82,7 +82,7 @@ Both the walk and the cards keep their place, so a restart continues where it le
 
 ## 5. Calls at once
 
-Each realm's loop makes one model call at a time by default. A local server answers one at a time unless it's told otherwise (`OLLAMA_NUM_PARALLEL`). **Calls at once** (Settings → Memex, 1 to 8) lets the loop run that many steps side by side, and sorting new mail always keeps one of them for itself.
+Each realm's loop makes one model call at a time by default. A local server answers one at a time unless it's told otherwise (`OLLAMA_NUM_PARALLEL`). **Calls at once** (Settings → Memex, 1 to 64) lets the loop run that many steps side by side, and sorting new mail always keeps one of them for itself.
 
 ## 6. Cost, on a local model at about 5 s a call
 
@@ -179,3 +179,9 @@ The daily call budget (Settings → Memex) still applies. With a local model, se
 ### 8.6 No cards for bulk senders (2026-10-27)
 
 A person gets a card when you wrote to them, or when they have more than one thread that isn't bulk mail. Bulk mail means a bulk-sending subdomain, or at least half of their messages carrying mailing-list headers. Automated addresses never get one. The same rule applies to sorting's on-the-spot cards and to the walk's card news (`cards::worth_a_card`). Live mail showed why: newsletters and event mailers, with many threads each, were getting cards. Cards written before the rule are removed once, with their news (`cards::prune`, recorded in `memex_once`).
+
+### 8.7 More lanes for larger pools (2026-10-29)
+
+- **Calls at once** now goes to 64, still defaulting to 1. Lanes start as needed and end when above the setting; a lane's index stays occupied until it ends. Lane 0 still keeps new mail out of the walk's queue.
+- **Candidates:** reading walks the date index until it has enough distinct threads, so long threads don't fill the window. Threads, items and card news get at least *calls at once* + 8 candidates (at least 40 threads, 10 items or cards), and pass over claimed work.
+- **Database:** up to 136 connections, two per lane plus eight for other users. Connections open on demand and retire after ten minutes idle.
