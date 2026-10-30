@@ -55,10 +55,15 @@ impl Anthropic {
             "model": req.model,
             "max_tokens": max_tokens,
             "stream": true,
-            "system": [{"type": "text", "text": req.system, "cache_control": {"type": "ephemeral"}}],
             "cache_control": {"type": "ephemeral"},
             "messages": messages(&req.messages),
         });
+        // An empty system prompt is no block: Anthropic refuses cache_control
+        // on an empty text block (calls that are all in the message, such as
+        // suggestions and work's).
+        if !req.system.is_empty() {
+            body["system"] = json!([{"type": "text", "text": req.system, "cache_control": {"type": "ephemeral"}}]);
+        }
         let mut tools: Vec<Value> = req
             .tools
             .iter()
@@ -526,6 +531,10 @@ mod tests {
         assert_eq!(b["output_config"]["effort"], "high");
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(b["cache_control"]["type"], "ephemeral");
+        // No system prompt: no system block (an empty one with
+        // cache_control is refused).
+        let b = c.request_body(&ModelRequest { system: String::new(), ..req.clone() });
+        assert!(b.get("system").is_none(), "{b}");
         assert_eq!(b["tools"][0]["eager_input_streaming"], true);
         assert_eq!(b["tools"][1], json!({"type": "web_search_20260209", "name": "web_search"}));
         let asst = &b["messages"][1]["content"];

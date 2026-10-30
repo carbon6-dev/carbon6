@@ -1042,7 +1042,10 @@ pub async fn propose(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<Work
     };
     let template = crate::prompts::get(st, "work.propose", &realm).await;
     let prompt = api::prompts::fill(&template, &[("things", &things.join("\n"))]);
-    let v = ask(st, &realm, model, "work: what's open", "what's open", prompt).await?;
+    // You asked: what the model said goes back to you, not "internal error".
+    let v = ask(st, &realm, model, "work: what's open", "what's open", prompt)
+        .await
+        .map_err(|e| bad_request(format!("the model couldn't group what's open: {e:#}")))?;
     let mut used = HashSet::new();
     let mut out = Vec::new();
     for w in v["work"].as_array().into_iter().flatten() {
