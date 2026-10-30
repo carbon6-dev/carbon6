@@ -146,17 +146,13 @@ pub(crate) fn request_path(id: i64) -> String {
     format!("/brief?request={id}")
 }
 
+fn closed_reason(r: Request) -> String {
+    if r.closed_by.as_deref() == Some("calendar") && !r.reason.is_empty() { r.reason } else { "This request is no longer open.".into() }
+}
+
 fn request_to_open(result: Result<Request, String>, now: i64) -> Result<Request, String> {
     let r = result.map_err(|_| "This request is unavailable.")?;
-    if r.status == "open" || (r.status == "snoozed" && r.until.is_some_and(|until| until <= now)) {
-        Ok(r)
-    } else {
-        Err(if r.closed_by.as_deref() == Some("calendar") && !r.reason.is_empty() {
-            r.reason
-        } else {
-            "This request is no longer open.".into()
-        })
-    }
+    if r.status == "open" || (r.status == "snoozed" && r.until.is_some_and(|until| until <= now)) { Ok(r) } else { Err(closed_reason(r)) }
 }
 
 #[component]
@@ -546,8 +542,14 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     let busy = RwSignal::new(false);
     let drafting = RwSignal::new(r.drafting);
     let polling = RwSignal::new(false);
+    let closed = RwSignal::new(None::<String>);
     let generation = RwSignal::new(0u64);
     let apply = move |r: Request| {
+        if !matches!(r.status.as_str(), "open" | "snoozed") {
+            closed.set(Some(closed_reason(r)));
+            drafting.set(false);
+            return;
+        }
         drafting.set(r.drafting);
         failed.set(r.draft.as_ref().and_then(|d| d.error.clone()));
         let next = r.draft.filter(|d| !d.text.is_empty());
@@ -562,7 +564,7 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
         }
     };
     let refresh = move || {
-        if polling.get_untracked() || busy.get_untracked() {
+        if closed.get_untracked().is_some() || polling.get_untracked() || busy.get_untracked() {
             return;
         }
         polling.set(true);
@@ -591,6 +593,13 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
         std::time::Duration::from_secs(2),
     )
     .ok();
+    Effect::new(move || {
+        if closed.get().is_some()
+            && let Some(poll) = poll
+        {
+            poll.clear();
+        }
+    });
     on_cleanup(move || {
         if let Some(poll) = poll {
             poll.clear();
@@ -646,6 +655,9 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     };
     view! {
         <div class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+            <Show when=move || closed.get().is_none() fallback=move || view! {
+                <p class="text-sm text-zinc-500">{move || closed.get()}</p>
+            }>
             {move || failed.get().map(|e| view! { <p class="text-sm text-red-600">{format!("Couldn't draft: {e}")}</p> })}
             {move || match draft.get() {
                 None => view! {
@@ -685,7 +697,7 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                     </div>
                 }.into_any(),
             }}
-            <crate::compose::WorkInSession key=format!("request:{id}") about current=text set=Callback::new(move |t: String| {
+            <crate::compose::WorkInSession key=format!("request:{id}") about=about.clone() current=text set=Callback::new(move |t: String| {
                 text.set(t);
                 // Not drafted before: the session's draft, with where it goes.
                 if draft.get_untracked().is_none() {
@@ -696,6 +708,7 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                     });
                 }
             }) />
+            </Show>
         </div>
     }
 }
