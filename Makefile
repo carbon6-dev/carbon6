@@ -155,8 +155,8 @@ build: ui ## Build release binaries (c6h, c6w, c6) into target/release, knowing 
 print-version: ## Print the exact version the packages of HEAD get (what `build` stamps into the binaries)
 	@echo $(DEB_VERSION)
 
-test: ## Run the test suite
-	cargo test
+test: ## Run the test suite: every test at once with cargo nextest when it's installed (brew install cargo-nextest), else cargo test
+	@if cargo nextest --version >/dev/null 2>&1; then cargo nextest run --workspace --no-fail-fast; else cargo test; fi
 
 test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NEXTEST=1 for cargo nextest); it must pass as it does otherwise (docs/testing.md)
 	NEXTEST=$(NEXTEST) scripts/test-under-load.sh $(or $(RUNS),1)

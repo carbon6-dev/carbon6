@@ -85,7 +85,7 @@ make docker-token      # an enrollment token from that head
 
 ```bash
 make build             # web UI, then release c6h and c6w into target/release
-make test
+make test              # every test at once with cargo nextest (brew install cargo-nextest), else cargo test
 make check             # the code must be formatted (cargo fmt), and every target, and the web UI for wasm, must build and pass clippy without warnings (CI runs it too)
 ```
 

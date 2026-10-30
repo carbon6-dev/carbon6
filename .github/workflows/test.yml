@@ -32,19 +32,14 @@ jobs:
         run: make check
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
-      # On Linux, nextest runs every test binary at once (each test its own
-      # process). macOS stays on cargo test: a process there pays a few
-      # seconds loading the system's certificates, once per test with nextest.
-      - if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
+      # nextest runs every test at once (each test its own process), where
+      # cargo test runs one test binary after another, mostly waiting.
+      - uses: taiki-e/install-action@v2
         with:
           tool: nextest
       # nextest doesn't run doc tests; the workspace has none (`cargo test
       # --doc` would only recompile the libraries for two minutes to find so).
-      - if: runner.os == 'Linux'
-        run: cargo nextest run --locked --workspace --no-fail-fast
-      - if: runner.os != 'Linux'
-        run: cargo test --locked
+      - run: cargo nextest run --locked --workspace --no-fail-fast
 
   under-load:
     # The same suite with every core kept busy (docs/testing.md): a test
