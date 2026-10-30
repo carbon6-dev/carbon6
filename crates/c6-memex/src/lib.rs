@@ -7,6 +7,7 @@ pub mod calendar;
 pub mod cards;
 pub mod chat;
 pub mod claims;
+mod commitments;
 pub mod compose;
 pub mod contacts;
 pub mod embed;

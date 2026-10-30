@@ -233,7 +233,8 @@ async fn read(m: &Memex, task: &Task, kind: &str, items: &[String]) -> anyhow::R
         _ => m.prompt("memex.understand.other", api::prompts::UNDERSTAND_OTHER),
     };
     let owner: Vec<String> = m.accounts().iter().map(|a| a.email.clone()).collect();
-    let prompt = format!("{}\n\n{text}", api::prompts::fill(&ask, &[("owner", &owner.join(", "))]));
+    let (last, today) = crate::commitments::dates(m, items, c6_core::now_ms()).await?;
+    let prompt = format!("{}\n\n{text}", api::prompts::fill(&ask, &[("owner", &owner.join(", ")), ("last", &last), ("today", &today)]));
     let system = m.prompt("memex.understand.system", SYSTEM);
     let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
         .bind(items.first())
@@ -246,7 +247,7 @@ async fn read(m: &Memex, task: &Task, kind: &str, items: &[String]) -> anyhow::R
 }
 
 /// Records what the model said, replacing what this pipeline said before.
-async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], v: &Value) -> anyhow::Result<()> {
+pub(crate) async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], v: &Value) -> anyhow::Result<()> {
     let made_by = version(task);
     let summary = v["summary"].as_str().unwrap_or("").trim().to_owned();
     for id in items {
@@ -255,11 +256,6 @@ async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], v: &Value) 
         sqlx::query("DELETE FROM links WHERE src_item = ? AND made_by LIKE 'understand-%' AND made_by != ?")
             .bind(id)
             .bind(&made_by)
-            .execute(&m.store.pool)
-            .await?;
-        // What you have marked done or dropped stays.
-        sqlx::query("DELETE FROM commitments WHERE item_id = ? AND made_by LIKE 'understand-%' AND status = 'open'")
-            .bind(id)
             .execute(&m.store.pool)
             .await?;
     }
@@ -302,38 +298,8 @@ async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], v: &Value) 
         };
         m.store.link_inferred(&last, rel, &thing, 0.7, &made_by, Some(text)).await?;
     }
-    if matches!(kind, "thread" | "session") {
-        for c in v["commitments"].as_array().into_iter().flatten() {
-            let what = c["what"].as_str().unwrap_or("").trim();
-            if what.is_empty() {
-                continue;
-            }
-            let known: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM commitments WHERE item_id IN (SELECT value FROM json_each(?)) AND lower(what) = lower(?)",
-            )
-            .bind(serde_json::to_string(items)?)
-            .bind(what)
-            .fetch_optional(&m.store.pool)
-            .await?;
-            if known.is_some() {
-                continue;
-            }
-            let due = c["due"]
-                .as_str()
-                .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                .and_then(|d| d.and_hms_opt(17, 0, 0))
-                .map(|d| d.and_utc().timestamp_millis());
-            sqlx::query("INSERT INTO commitments (item_id, who, what, due, made_by, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-                .bind(&last)
-                .bind(c["who"].as_str().unwrap_or("me").trim().to_lowercase())
-                .bind(what)
-                .bind(due)
-                .bind(&made_by)
-                .bind(c6_core::now_ms())
-                .execute(&m.store.pool)
-                .await?;
-        }
-    }
+    let commitments = if matches!(kind, "thread" | "session") { &v["commitments"] } else { &json!([]) };
+    crate::commitments::save(m, items, commitments, &made_by, c6_core::now_ms()).await?;
     Ok(())
 }
 
@@ -360,6 +326,9 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
             continue;
         }
         if lane == 0 && suggested.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(600)) {
+            if let Err(e) = crate::commitments::maintain(&m, c6_core::now_ms()).await {
+                warn!("maintaining commitments: {e:#}");
+            }
             if let Err(e) = crate::review::suggest(&m.store).await {
                 warn!("suggesting merges: {e:#}");
             }
@@ -440,11 +409,12 @@ pub async fn status(m: &Memex, s: &mut api::MemexStatus) -> anyhow::Result<()> {
 /// Commitments read from what the caller may see (`allowed`: those of
 /// items gone with everything).
 pub async fn commitments(m: &Memex, status: &str, allowed: &[String]) -> anyhow::Result<Vec<api::Commitment>> {
+    crate::commitments::status(status)?;
     let everything = api::MEMEX_KINDS.iter().all(|k| allowed.iter().any(|a| a == k));
     let rows = sqlx::query(
         "SELECT c.*, i.title AS title, i.kind AS kind, (SELECT 'thread:' || ml.account || ':' || ml.thread_id FROM mail ml WHERE ml.item_id = c.item_id) AS target \
          FROM commitments c LEFT JOIN items i ON i.id = c.item_id WHERE c.status = ? \
-         ORDER BY c.due IS NULL, c.due, c.created_at DESC LIMIT 200",
+         ORDER BY CASE WHEN c.status = 'open' THEN c.due IS NULL END, CASE WHEN c.status = 'open' THEN c.due END, c.said_at DESC, c.id DESC LIMIT 200",
     )
     .bind(status)
     .fetch_all(&m.store.pool)
@@ -459,6 +429,7 @@ pub async fn commitments(m: &Memex, status: &str, allowed: &[String]) -> anyhow:
             who: r.get("who"),
             what: r.get("what"),
             due: r.get("due"),
+            said_at: r.get("said_at"),
             status: r.get("status"),
             target: r.get::<Option<String>, _>("target").unwrap_or_default(),
         })
@@ -466,9 +437,7 @@ pub async fn commitments(m: &Memex, status: &str, allowed: &[String]) -> anyhow:
 }
 
 pub async fn set_commitment(m: &Memex, id: i64, status: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(matches!(status, "open" | "done" | "dropped"), "a commitment is open, done or dropped");
-    sqlx::query("UPDATE commitments SET status = ? WHERE id = ?").bind(status).bind(id).execute(&m.store.pool).await?;
-    Ok(())
+    crate::commitments::set(m, id, status, c6_core::now_ms()).await
 }
 
 /// What the memex knows about a thing, summed up by the model and saved as

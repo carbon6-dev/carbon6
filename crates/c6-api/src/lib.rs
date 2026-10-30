@@ -3771,7 +3771,10 @@ pub struct Commitment {
     pub what: String,
     #[serde(default)]
     pub due: Option<UnixMs>,
-    /// open, done or dropped.
+    /// When the source item was written.
+    #[serde(default)]
+    pub said_at: UnixMs,
+    /// open, done, dropped or expired.
     pub status: String,
     /// The mail thread it was read from (thread:<account>:<thread>), if mail.
     #[serde(default)]

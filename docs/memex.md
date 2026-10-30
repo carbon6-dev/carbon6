@@ -350,11 +350,13 @@ Jobs live in a durable queue in the memex database, each with a priority, a budg
 - **What comes back**, as JSON:
   - a summary (`items.summary`);
   - topics (`topic:<slug>` things, linked `about`);
-  - for threads and sessions, commitments: who, what, and by when;
+  - for threads and sessions, commitments: who, what, by when, and when it was said (`said_at`: the date of the message or session it was read from, not of the read). A thread's prompt gives its last message's date and today's, and asks only for what is still open at the end of the thread. The owner's addresses (also as `Name <address>`) and whole name, as their connected accounts give it, are saved as "me";
   - for papers, claims: `claim:<hash>` things linked as `claims`, `uses_method` or `has_limitation`, with the sentence kept as evidence.
 - **Everything is inferred:** `basis = inferred`, `made_by = understand-v1@<model>`.
   - Changing the model re-reads everything and replaces the old model's links.
-  - Commitments you marked done or dropped are kept.
+  - A commitment is open, done, dropped or expired. An open one the model read expires when the later of when it was said and when it was due is more than 60 days ago: as it is saved, and by a pass at start and every ten minutes, without model calls. Open ones list overdue first, then soonest due, then undated ones newest first; the others newest first.
+  - What you set by hand stays (`decided_at`): a re-read replaces only open commitments you haven't set, and one you reopen isn't expired again. A re-read doesn't add a commitment the thread already has, unless the one it has expired and the thread has newer mail.
+  - Commitments read before `said_at` (migration 0026) take their source's date, or the read's when the source is gone, and the first pass expires the old ones, including ones reopened before the migration because those decisions weren't recorded. Their owner's addresses and name are saved as "me" once, when the head has sent the accounts.
 - **Inputs are observed items only.**
   - A model never reads another model's output.
   - "Summarize what I know" about a thing reads the items about it, then saves a note marked inferred, listing its sources.

@@ -104,9 +104,10 @@ pub fn Commitments(open: RwSignal<Option<String>>) -> impl IntoView {
         let s = status.get();
         async move { api::rpc_as::<Vec<Commitment>>("memex.commitments", json!({"status": s})).await }
     });
+    let error = RwSignal::new(None::<String>);
     let set = move |id: i64, to: &'static str| {
         spawn_local(async move {
-            let _ = api::rpc("memex.commitment", json!({"id": id, "status": to})).await;
+            error.set(api::rpc("memex.commitment", json!({"id": id, "status": to})).await.err());
             tick.update(|t| *t += 1);
         });
     };
@@ -118,8 +119,10 @@ pub fn Commitments(open: RwSignal<Option<String>>) -> impl IntoView {
                     <option value="open">"Open"</option>
                     <option value="done">"Done"</option>
                     <option value="dropped">"Dropped"</option>
+                    <option value="expired">"Expired"</option>
                 </select>
             </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <Suspense fallback=|| ()>
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
