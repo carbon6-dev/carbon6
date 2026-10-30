@@ -294,3 +294,200 @@ async fn eleven_reads_run_side_by_side_past_long_threads() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn failed_reads_retry_after_unread_work_and_stop_after_three_tries() {
+    crate::extract_here();
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    let budget = async |n| {
+        let r = http
+            .put(format!("{api}/settings/memex"))
+            .json(&json!({"understanding": {"connection": "m", "model": "reader-1"}, "calls_per_day": n}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        eventually("the reading budget loaded", async || (m.tasks().per_day == n).then_some(())).await;
+    };
+    let status = async || -> c6_api::MemexStatus { http.get(format!("{api}/memex/status")).send().await.unwrap().json().await.unwrap() };
+    let progress = async || m.handle_method("memex.relations.progress", json!({})).await.unwrap();
+    for (i, thread) in ["bad-thread", "recover-thread", "older-thread"].into_iter().enumerate() {
+        let from = format!("p{i}@firm{i}.com");
+        mail(&m, thread, thread, (&from, "P"), "me@mine.io", thread, "Notes.", false, (30 + i as i64) * DAY).await;
+    }
+    let document = m
+        .store
+        .put(
+            &c6_api::MemexItemIn {
+                kind: "document".into(),
+                source: "test".into(),
+                external_id: "retry-document".into(),
+                title: "retry-document".into(),
+                text: "Notes.".into(),
+                created_at: Some(c6_core::now_ms() - 33 * DAY),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+    let broken = || Reply::Text("{broken}".into());
+    let answer = |summary| Reply::Text(json!({"summary": summary, "topics": ["Recovery"], "commitments": []}).to_string());
+    mock.push(broken());
+    let gate = mock.push_gated(broken());
+    mock.push(answer("Older notes."));
+    mock.push(broken());
+    mock.push(broken());
+    mock.push(broken());
+    mock.push(answer("Recovered thread."));
+    mock.push(answer("Recovered document."));
+    budget(8).await;
+    eventually("the second unread thread started", async || (mock.requests().len() == 2).then_some(())).await;
+    let pending = status().await;
+    let pending_walk = progress().await;
+    gate.notify_one();
+    assert_eq!((pending.understood, pending.understanding_failed), (0, 0));
+    assert_eq!((pending_walk["threads_read"].as_i64(), pending_walk["threads_failed"].as_i64()), (Some(0), Some(0)));
+
+    eventually("two threads and a document read, one thread exhausted", async || {
+        let s = status().await;
+        (s.understood == 3 && s.understanding_failed == 1 && s.calls_today == 8).then_some(())
+    })
+    .await;
+    let walk = progress().await;
+    assert_eq!((walk["threads_read"].as_i64(), walk["threads_failed"].as_i64()), (Some(2), Some(1)));
+    let asked = mock.requests();
+    for (request, title) in asked.iter().zip([
+        "bad-thread",
+        "recover-thread",
+        "older-thread",
+        "retry-document",
+        "bad-thread",
+        "bad-thread",
+        "recover-thread",
+        "retry-document",
+    ]) {
+        assert!(request["messages"].to_string().contains(title), "expected {title}: {request}");
+    }
+    assert_eq!(asked.len(), 8);
+    assert_eq!(asked.iter().filter(|r| r["messages"].to_string().contains("bad-thread")).count(), 3);
+    let recovered: (String, String, i64, Option<String>) = sqlx::query_as(
+        "SELECT i.id, i.summary, e.tries, e.error FROM items i JOIN mail m ON m.item_id = i.id \
+         JOIN enrich e ON e.target = 'thread:' || m.account || ':' || m.thread_id WHERE m.thread_id = 'recover-thread'",
+    )
+    .fetch_one(&m.store.pool)
+    .await
+    .unwrap();
+    assert_eq!((recovered.1.as_str(), recovered.2, recovered.3), ("Recovered thread.", 0, None));
+    let topic: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM links l JOIN things t ON t.id = l.dst_thing WHERE l.src_item = ? AND t.kind = 'topic' AND t.name = 'Recovery')"
+    ).bind(&recovered.0).fetch_one(&m.store.pool).await.unwrap();
+    assert!(topic);
+    let doc: (String, i64, Option<String>) =
+        sqlx::query_as("SELECT i.summary, e.tries, e.error FROM items i JOIN enrich e ON e.target = 'item:' || i.id WHERE i.id = ?")
+            .bind(&document)
+            .fetch_one(&m.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(doc, ("Recovered document.".into(), 0, None));
+
+    // Budget remains, but waking and taking another step finds no fourth try.
+    budget(9).await;
+    m.wake.notify_waiters();
+    assert!(!c6_memex::understand::step(&m).await.unwrap());
+    assert_eq!(mock.requests().len(), 8);
+    mock.push(broken());
+    mail(&m, "new-mail", "bad-thread", ("p0@firm0.com", "P"), "me@mine.io", "bad-thread", "More notes.", false, 29 * DAY).await;
+    m.wake.notify_waiters();
+    eventually("new mail starts the failure count over", async || {
+        let tries: i64 =
+            sqlx::query_scalar("SELECT tries FROM enrich WHERE target = 'thread:acct:bad-thread'").fetch_one(&m.store.pool).await.unwrap();
+        (tries == 1 && status().await.calls_today == 9).then_some(())
+    })
+    .await;
+    assert_eq!(mock.requests().len(), 9);
+    let s = status().await;
+    assert_eq!((s.understood, s.understanding_failed), (3, 0));
+    assert_eq!(progress().await["threads_failed"], 0);
+}
+
+#[tokio::test]
+async fn mail_arriving_during_a_third_read_starts_over() {
+    crate::extract_here();
+    let mock = MockLlm::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    http.post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    let budget = async |n| {
+        http.put(format!("{api}/settings/memex"))
+            .json(&json!({"understanding": {"connection": "m", "model": "reader-1"}, "calls_per_day": n}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    };
+    mail(&m, "old", "notes", ("pat@firm.com", "Pat"), "me@mine.io", "Notes", "Original notes.", false, 30 * DAY).await;
+    sqlx::query("UPDATE items SET added_at = 10").execute(&m.store.pool).await.unwrap();
+    sqlx::query("INSERT INTO enrich (target, version, done_at, error, tries) VALUES ('thread:acct:notes', 'understand-v1@reader-1', 10, 'no JSON', 2)")
+        .execute(&m.store.pool).await.unwrap();
+    let gate = mock.push_gated(Reply::Text("{broken}".into()));
+    mock.push(Reply::Text("{broken again}".into()));
+    budget(1).await;
+    eventually("the third try held at the model", async || (mock.requests().len() == 1).then_some(())).await;
+    mail(&m, "new", "notes", ("pat@firm.com", "Pat"), "me@mine.io", "Notes", "Additional notes.", false, 29 * DAY).await;
+    let newest: i64 = sqlx::query_scalar("SELECT MAX(added_at) FROM items").fetch_one(&m.store.pool).await.unwrap();
+    gate.notify_one();
+    let recorded = async || -> (i64, i64) {
+        sqlx::query_as("SELECT done_at, tries FROM enrich WHERE target = 'thread:acct:notes'").fetch_one(&m.store.pool).await.unwrap()
+    };
+    let exhausted = eventually("the held read recorded its third failure", async || {
+        let row = recorded().await;
+        (row.1 == 3).then_some(row)
+    })
+    .await;
+    assert_eq!(exhausted.0, 10, "only the original message was read");
+    assert!(newest > exhausted.0);
+    budget(2).await;
+    eventually("new mail starts the failure count over", async || (recorded().await == (newest, 1)).then_some(())).await;
+    let asked = mock.requests();
+    assert_eq!(asked.len(), 2);
+    assert!(!asked[0]["messages"].to_string().contains("Additional notes."));
+    assert!(asked[1]["messages"].to_string().contains("Original notes."));
+    assert!(asked[1]["messages"].to_string().contains("Additional notes."));
+    head.shutdown().await.unwrap();
+}

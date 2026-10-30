@@ -76,7 +76,7 @@ The reading loop's order is:
 3. card updates for people marked for an update, the most recently active first;
 4. reading, which walks back through time newest first.
 
-Automated senders' threads (no-reply addresses, notifications, receipts) are skipped by reading; they're sorted, but not summarized. Progress shows on the Activity page: threads read, threads left, cards, and the oldest month reached.
+Automated senders' threads (no-reply addresses, notifications, receipts) are skipped by reading; they're sorted, but not summarized. After unread work, failed reads get up to two more tries. Progress shows on the Activity page: threads read, threads left, threads that couldn't be read after three tries, cards, and the oldest month reached. Pending retries count as neither read nor failed for good.
 
 Both the walk and the cards keep their place, so a restart continues where it left off.
 
@@ -185,3 +185,7 @@ A person gets a card when you wrote to them, or when they have more than one thr
 - **Calls at once** now goes to 64, still defaulting to 1. Lanes start as needed and end when above the setting; a lane's index stays occupied until it ends. Lane 0 still keeps new mail out of the walk's queue.
 - **Candidates:** reading walks the date index until it has enough distinct threads, so long threads don't fill the window. Threads, items and card news get at least *calls at once* + 8 candidates (at least 40 threads, 10 items or cards), and pass over claimed work.
 - **Database:** up to 136 connections, two per lane plus eight for other users. Connections open on demand and retire after ten minutes idle.
+
+### 8.8 Retrying failed reads (2026-10-29)
+
+Malformed JSON left 61 reads (0.4%) failed in a live mailbox; another answer often works. The walk retries failed threads and items after unread work, newest first, up to three tries per content and model. It skips claimed work and targets no longer readable. Success clears the failure count; new mail or a new model starts it over. Status and Activity show successful reads and failures after all three tries separately; pending retries count as neither.

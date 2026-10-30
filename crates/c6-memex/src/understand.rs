@@ -28,21 +28,35 @@ fn version(task: &Task) -> String {
     format!("{VERSION}@{}", task.model)
 }
 
-/// What to read next: (target, kind, item ids it covers).
-async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String, Vec<String>)>> {
+const READABLE: &str = "m.spam = 0 AND m.trash = 0 AND m.list = 0 AND m.draft = 0 AND NOT (lower(m.from_addr) LIKE '%noreply%' \
+    OR lower(m.from_addr) LIKE '%no-reply%' OR lower(m.from_addr) LIKE '%donotreply%' OR lower(m.from_addr) LIKE '%do-not-reply%' \
+    OR lower(m.from_addr) LIKE 'notification%' OR lower(m.from_addr) LIKE 'mailer-daemon%')";
+
+struct Reading {
+    target: String,
+    kind: String,
+}
+
+async fn thread_items(m: &Memex, account: &str, thread: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT item_id FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
+        .bind(account)
+        .bind(thread)
+        .fetch_all(&m.store.pool)
+        .await?)
+}
+
+/// What to read next, unread work before failed reads.
+async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<Reading>> {
     let at_once = m.tasks().at_once;
     // Email: by thread, the most recent first (and again when a thread has
     // news since it was read); not lists or spam.
-    let mut rows = sqlx::query(
+    let sql = format!(
         "SELECT m.account, m.thread_id, m.date AS d FROM mail m JOIN items i ON i.id = m.item_id \
-         WHERE m.spam = 0 AND m.trash = 0 AND m.list = 0 AND m.draft = 0 AND NOT (lower(m.from_addr) LIKE '%noreply%' \
-         OR lower(m.from_addr) LIKE '%no-reply%' OR lower(m.from_addr) LIKE '%donotreply%' OR lower(m.from_addr) LIKE '%do-not-reply%' \
-         OR lower(m.from_addr) LIKE 'notification%' OR lower(m.from_addr) LIKE 'mailer-daemon%') AND NOT EXISTS (SELECT 1 FROM enrich e \
+         WHERE {READABLE} AND NOT EXISTS (SELECT 1 FROM enrich e \
          WHERE e.target = 'thread:' || m.account || ':' || m.thread_id AND e.version = ? AND e.done_at >= i.added_at) \
-         ORDER BY m.date DESC",
-    )
-    .bind(version)
-    .fetch(&m.store.pool);
+         ORDER BY m.date DESC"
+    );
+    let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(version).fetch(&m.store.pool);
     // Stop the date walk after enough distinct threads, not messages.
     let mut seen = std::collections::HashSet::new();
     let mut threads = Vec::new();
@@ -74,14 +88,74 @@ async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String
     let item_at = item.as_ref().map(|r| r.get::<i64, _>("created_at")).unwrap_or(i64::MIN);
     if let Some(t) = thread.filter(|_| thread_at >= item_at) {
         let (account, thread_id): (String, String) = (t.get("account"), t.get("thread_id"));
-        let items: Vec<String> = sqlx::query_scalar("SELECT item_id FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
-            .bind(&account)
-            .bind(&thread_id)
-            .fetch_all(&m.store.pool)
-            .await?;
-        return Ok(Some((format!("thread:{account}:{thread_id}"), "thread".into(), items)));
+        return Ok(Some(Reading { target: format!("thread:{account}:{thread_id}"), kind: "thread".into() }));
     }
-    Ok(item.map(|r| (format!("item:{}", r.get::<String, _>("id")), r.get::<String, _>("kind"), vec![r.get("id")])))
+    if let Some(r) = item {
+        return Ok(Some(Reading { target: format!("item:{}", r.get::<String, _>("id")), kind: r.get("kind") }));
+    }
+    retry(m, version).await
+}
+
+/// The newest failed target that still exists and is readable.
+async fn retry(m: &Memex, version: &str) -> anyhow::Result<Option<Reading>> {
+    let targets: Vec<String> = sqlx::query_scalar("SELECT target FROM enrich WHERE version = ? AND error IS NOT NULL AND tries < 3")
+        .bind(version)
+        .fetch_all(&m.store.pool)
+        .await?;
+    let sql =
+        format!("SELECT MAX(m.date) FROM mail m JOIN items i ON i.id = m.item_id WHERE m.account = ? AND m.thread_id = ? AND {READABLE}");
+    let mut newest: Option<(String, String, i64)> = None;
+    for target in targets {
+        if m.claimed(&format!("read:{target}")) {
+            continue;
+        }
+        let found: Option<(String, i64)> = if let Some(id) = target.strip_prefix("item:") {
+            sqlx::query_as("SELECT kind, created_at FROM items WHERE id = ?").bind(id).fetch_optional(&m.store.pool).await?
+        } else if let Some((account, thread)) = target.strip_prefix("thread:").and_then(|t| t.rsplit_once(':')) {
+            let at: Option<i64> =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str())).bind(account).bind(thread).fetch_one(&m.store.pool).await?;
+            at.map(|at| ("thread".into(), at))
+        } else {
+            None
+        };
+        if let Some((kind, at)) = found
+            && newest.as_ref().is_none_or(|n| at > n.2)
+        {
+            newest = Some((target, kind, at));
+        }
+    }
+    let Some((target, kind, _)) = newest else { return Ok(None) };
+    Ok(Some(Reading { target, kind }))
+}
+
+impl Reading {
+    /// The current items, once this target is claimed.
+    async fn items(&self, m: &Memex) -> anyhow::Result<Vec<String>> {
+        if let Some(id) = self.target.strip_prefix("item:") {
+            Ok(vec![id.to_owned()])
+        } else {
+            let (account, thread) = self.target.strip_prefix("thread:").unwrap().rsplit_once(':').unwrap();
+            thread_items(m, account, thread).await
+        }
+    }
+}
+
+/// After claiming: a fresh read, a retry, or nothing if another lane finished it.
+async fn retrying(m: &Memex, target: &str, version: &str, items: &[String]) -> anyhow::Result<Option<bool>> {
+    let previous: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT error, tries FROM enrich WHERE target = ? AND version = ? AND done_at >= \
+         (SELECT COALESCE(MAX(added_at), 0) FROM items WHERE id IN (SELECT value FROM json_each(?)))",
+    )
+    .bind(target)
+    .bind(version)
+    .bind(serde_json::to_string(items)?)
+    .fetch_optional(&m.store.pool)
+    .await?;
+    Ok(match previous {
+        None => Some(false),
+        Some((Some(_), tries)) if tries < 3 => Some(true),
+        _ => None,
+    })
 }
 
 /// How long the budget's day lasts. A day starts with its first call and
@@ -155,8 +229,11 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let version = version(&task);
-    let Some((target, kind, items)) = next(m, &version).await? else { return Ok(false) };
-    let Some(_claim) = m.claim(&format!("read:{target}")) else { return Ok(false) };
+    let Some(reading) = next(m, &version).await? else { return Ok(false) };
+    let Some(_claim) = m.claim(&format!("read:{}", reading.target)) else { return Ok(false) };
+    let items = reading.items(m).await?;
+    let Reading { target, kind } = reading;
+    let Some(retry) = retrying(m, &target, &version, &items).await? else { return Ok(false) };
     count_call(m).await?;
     let result = read(m, &task, &kind, &items).await;
     if let Err(e) = &result
@@ -165,23 +242,30 @@ pub async fn step(m: &Memex) -> anyhow::Result<bool> {
         warn!(%target, "understanding waits: {e:#}");
         return Ok(false);
     }
-    done(m, &target, &version, result).await?;
+    done(m, &target, &version, &items, retry, result).await?;
     Ok(true)
 }
 
-/// Records that a target was read (or why it couldn't be).
-async fn done(m: &Memex, target: &str, version: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
+/// Records the newest content read (or why it couldn't be read).
+async fn done(m: &Memex, target: &str, version: &str, items: &[String], retry: bool, result: anyhow::Result<()>) -> anyhow::Result<()> {
     let error = result.as_ref().err().map(|e| format!("{e:#}"));
     if let Some(e) = &error {
         warn!(%target, "understanding: {e}");
     }
-    sqlx::query("INSERT OR REPLACE INTO enrich (target, version, done_at, error) VALUES (?, ?, ?, ?)")
-        .bind(target)
-        .bind(version)
-        .bind(c6_core::now_ms())
-        .bind(&error)
-        .execute(&m.store.pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO enrich (target, version, done_at, error, tries) VALUES (?, ?, \
+         (SELECT COALESCE(MAX(added_at), 0) FROM items WHERE id IN (SELECT value FROM json_each(?))), ?, ?) \
+         ON CONFLICT(target) DO UPDATE SET version = excluded.version, done_at = excluded.done_at, error = excluded.error, \
+         tries = CASE WHEN excluded.error IS NULL THEN 0 WHEN ? AND enrich.version = excluded.version THEN enrich.tries + 1 ELSE 1 END",
+    )
+    .bind(target)
+    .bind(version)
+    .bind(serde_json::to_string(items)?)
+    .bind(&error)
+    .bind(i64::from(error.is_some()))
+    .bind(retry)
+    .execute(&m.store.pool)
+    .await?;
     // Its people's cards have news.
     if error.is_none()
         && let Some((account, thread)) = target.strip_prefix("thread:").and_then(|t| t.rsplit_once(':'))
@@ -210,11 +294,10 @@ pub(crate) async fn read_already(m: &Memex, task: &Task, account: &str, thread: 
 pub(crate) async fn read_thread(m: &Memex, task: &Task, account: &str, thread: &str) -> anyhow::Result<()> {
     // Being read by another step: it will be read.
     let Some(_claim) = m.claim(&format!("read:thread:{account}:{thread}")) else { return Ok(()) };
-    let items: Vec<String> = sqlx::query_scalar("SELECT item_id FROM mail WHERE account = ? AND thread_id = ? ORDER BY date")
-        .bind(account)
-        .bind(thread)
-        .fetch_all(&m.store.pool)
-        .await?;
+    let items = thread_items(m, account, thread).await?;
+    let target = format!("thread:{account}:{thread}");
+    let version = version(task);
+    let Some(retry) = retrying(m, &target, &version, &items).await? else { return Ok(()) };
     count_call(m).await?;
     let result = read(m, task, "thread", &items).await;
     if let Err(e) = &result
@@ -222,7 +305,7 @@ pub(crate) async fn read_thread(m: &Memex, task: &Task, account: &str, thread: &
     {
         return result;
     }
-    done(m, &format!("thread:{account}:{thread}"), &version(task), result).await
+    done(m, &target, &version, &items, retry, result).await
 }
 
 /// The text a model reads for these items.
@@ -453,9 +536,15 @@ pub async fn status(m: &Memex, s: &mut api::MemexStatus) -> anyhow::Result<()> {
     s.calls_per_day = t.per_day as u64;
     s.calls_today = calls_used(m).await? as u64;
     if let Some(u) = &t.understanding {
-        s.understood =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM enrich WHERE version = ?").bind(version(u)).fetch_one(&m.store.pool).await?
-                as u64;
+        s.understood = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM enrich WHERE version = ? AND error IS NULL")
+            .bind(version(u))
+            .fetch_one(&m.store.pool)
+            .await? as u64;
+        s.understanding_failed =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM enrich WHERE version = ? AND error IS NOT NULL AND tries >= 3")
+                .bind(version(u))
+                .fetch_one(&m.store.pool)
+                .await? as u64;
     }
     s.review = crate::review::open_count(&m.store).await?;
     Ok(())
@@ -564,6 +653,172 @@ mod tests {
     use super::*;
     use c6_testkit::within;
 
+    #[tokio::test]
+    async fn failed_reads_count_content_and_model_changes() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let id = m
+            .store
+            .put(
+                &api::MemexItemIn {
+                    kind: "document".into(),
+                    source: "test".into(),
+                    title: "Notes".into(),
+                    text: "Notes.".into(),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        let target = format!("item:{id}");
+        let items = vec![id];
+        let tries = async || -> (i64, Option<String>) {
+            sqlx::query_as("SELECT tries, error FROM enrich WHERE target = ?").bind(&target).fetch_one(&m.store.pool).await.unwrap()
+        };
+        for (retry, expected) in [(false, 1), (true, 2), (true, 3)] {
+            assert_eq!(retrying(&m, &target, "v1", &items).await.unwrap(), Some(retry));
+            done(&m, &target, "v1", &items, retry, Err(anyhow::anyhow!("no JSON"))).await.unwrap();
+            assert_eq!(tries().await, (expected, Some("no JSON".into())));
+        }
+        assert_eq!(retrying(&m, &target, "v1", &items).await.unwrap(), None, "even a stale selection gets no fourth try");
+        assert_eq!(retrying(&m, &target, "v2", &items).await.unwrap(), Some(false));
+        done(&m, &target, "v2", &items, false, Err(anyhow::anyhow!("new model"))).await.unwrap();
+        assert_eq!(tries().await.0, 1);
+        done(&m, &target, "v2", &items, true, Err(anyhow::anyhow!("again"))).await.unwrap();
+        assert_eq!(tries().await.0, 2);
+        sqlx::query("UPDATE enrich SET done_at = 9").execute(&m.store.pool).await.unwrap();
+        sqlx::query("UPDATE items SET added_at = 10").execute(&m.store.pool).await.unwrap();
+        assert_eq!(retrying(&m, &target, "v2", &items).await.unwrap(), Some(false));
+        done(&m, &target, "v2", &items, false, Err(anyhow::anyhow!("new content"))).await.unwrap();
+        assert_eq!(tries().await.0, 1);
+        done(&m, &target, "v2", &items, true, Ok(())).await.unwrap();
+        assert_eq!(tries().await, (0, None));
+        assert_eq!(retrying(&m, &target, "v2", &items).await.unwrap(), None);
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT done_at FROM enrich WHERE target = ?").bind(&target).fetch_one(&m.store.pool).await.unwrap();
+        assert_eq!(watermark, 10, "the item's content, not the completion time");
+    }
+
+    #[tokio::test]
+    async fn stale_selections_read_current_items_without_resetting_tries() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let mail = async |n: i64| {
+            let id = m
+                .store
+                .put(
+                    &api::MemexItemIn {
+                        kind: "email".into(),
+                        source: "test".into(),
+                        external_id: n.to_string(),
+                        title: "Notes".into(),
+                        text: format!("Message {n}."),
+                        created_at: Some(n),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE items SET added_at = ? WHERE id = ?").bind(n).bind(&id).execute(&m.store.pool).await.unwrap();
+            sqlx::query("INSERT INTO mail (item_id, account, gmail_id, thread_id, date, from_addr, blob) VALUES (?, 'a', ?, 't', ?, 'pat@example.com', '')")
+                .bind(&id).bind(n.to_string()).bind(n).execute(&m.store.pool).await.unwrap();
+            id
+        };
+        let first = mail(1).await;
+        let unread = next(&m, "test").await.unwrap().unwrap();
+        done(&m, &unread.target, "test", std::slice::from_ref(&first), false, Err(anyhow::anyhow!("no JSON"))).await.unwrap();
+        let failed = retry(&m, "test").await.unwrap().unwrap();
+        let second = mail(2).await;
+
+        // Another lane reads the new mail before either selection claims it.
+        let claim = m.claim("read:thread:a:t").unwrap();
+        let items = thread_items(&m, "a", "t").await.unwrap();
+        assert_eq!(retrying(&m, &unread.target, "test", &items).await.unwrap(), Some(false));
+        done(&m, &unread.target, "test", &items, false, Err(anyhow::anyhow!("no JSON"))).await.unwrap();
+        drop(claim);
+
+        for (reading, tries) in [(unread, 2), (failed, 3)] {
+            let _claim = m.claim(&format!("read:{}", reading.target)).unwrap();
+            let items = reading.items(&m).await.unwrap();
+            assert_eq!(items, [first.clone(), second.clone()]);
+            assert!(input(&m, &reading.kind, &items).await.unwrap().contains("Message 2."));
+            let retry = retrying(&m, &reading.target, "test", &items).await.unwrap().unwrap();
+            assert!(retry);
+            done(&m, &reading.target, "test", &items, retry, Err(anyhow::anyhow!("no JSON"))).await.unwrap();
+            let recorded: (i64, i64) = sqlx::query_as("SELECT done_at, tries FROM enrich WHERE target = ?")
+                .bind(&reading.target)
+                .fetch_one(&m.store.pool)
+                .await
+                .unwrap();
+            assert_eq!(recorded, (2, tries));
+        }
+        assert!(next(&m, "test").await.unwrap().is_none(), "no fourth try for the same content");
+    }
+
+    #[tokio::test]
+    async fn retries_skip_claimed_missing_and_unreadable_targets() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let mut ids = Vec::new();
+        for (kind, at) in [("document", 1), ("email", 2)] {
+            ids.push(
+                m.store
+                    .put(
+                        &api::MemexItemIn {
+                            kind: kind.into(),
+                            source: "test".into(),
+                            title: kind.into(),
+                            text: "Notes.".into(),
+                            created_at: Some(at),
+                            ..Default::default()
+                        },
+                        "test",
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        sqlx::query("INSERT INTO mail (item_id, account, gmail_id, thread_id, date, from_addr, blob) VALUES (?, 'a', 'msg', 't', 2, 'pat@example.com', '')")
+            .bind(&ids[1]).execute(&m.store.pool).await.unwrap();
+        let item = format!("item:{}", ids[0]);
+        for (target, items) in [(item.as_str(), &ids[..1]), ("thread:a:t", &ids[1..]), ("item:gone", &[]), ("thread:a:gone", &[])] {
+            done(&m, target, "test", items, false, Err(anyhow::anyhow!("no JSON"))).await.unwrap();
+        }
+        assert_eq!(next(&m, "test").await.unwrap().unwrap().target, "thread:a:t");
+        assert_eq!(retry(&m, "test").await.unwrap().unwrap().target, "thread:a:t");
+        assert!(retry(&m, "other model").await.unwrap().is_none());
+        let thread_claim = m.claim("read:thread:a:t").unwrap();
+        assert_eq!(retry(&m, "test").await.unwrap().unwrap().target, item);
+        let item_claim = m.claim(&format!("read:{item}")).unwrap();
+        assert!(retry(&m, "test").await.unwrap().is_none());
+        drop(thread_claim);
+        for field in ["spam", "trash", "list", "draft"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE mail SET {field} = 1"))).execute(&m.store.pool).await.unwrap();
+            assert!(retry(&m, "test").await.unwrap().is_none(), "{field}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE mail SET {field} = 0"))).execute(&m.store.pool).await.unwrap();
+        }
+        for sender in [
+            "noreply@x.test",
+            "no-reply@x.test",
+            "donotreply@x.test",
+            "do-not-reply@x.test",
+            "notifications@x.test",
+            "mailer-daemon@x.test",
+        ] {
+            sqlx::query("UPDATE mail SET from_addr = ?").bind(sender).execute(&m.store.pool).await.unwrap();
+            assert!(retry(&m, "test").await.unwrap().is_none(), "{sender}");
+        }
+        sqlx::query("DELETE FROM mail").execute(&m.store.pool).await.unwrap();
+        sqlx::query("DELETE FROM items WHERE id = ?").bind(&ids[0]).execute(&m.store.pool).await.unwrap();
+        drop(item_claim);
+        assert!(next(&m, "test").await.unwrap().is_none());
+    }
+
     #[test]
     fn candidate_windows_cover_every_lane() {
         for at_once in 1..=MAX_AT_ONCE {
@@ -607,7 +862,7 @@ mod tests {
                 claims.push(m.claim(&format!("read:{last}")).unwrap());
             }
         }
-        assert_eq!(next(&m, "test").await.unwrap().unwrap().0, last);
+        assert_eq!(next(&m, "test").await.unwrap().unwrap().target, last);
     }
 
     #[tokio::test]

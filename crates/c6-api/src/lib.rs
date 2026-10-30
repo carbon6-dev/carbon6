@@ -3735,9 +3735,12 @@ pub struct MemexStatus {
     /// Waiting to be sent to the memex.
     #[serde(default)]
     pub outbox: u64,
-    /// Items and threads the understanding model has read (this version).
+    /// Items and threads successfully read by the understanding model (this version).
     #[serde(default)]
     pub understood: u64,
+    /// Items and threads that failed all three reads by this version.
+    #[serde(default)]
+    pub understanding_failed: u64,
     /// Model calls in the current day (24 hours from its first call), and
     /// the day's budget.
     #[serde(default)]

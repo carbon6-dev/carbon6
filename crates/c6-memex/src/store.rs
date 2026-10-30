@@ -31,6 +31,12 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub const UPGRADES: c6_core::upgrade::Plan = c6_core::upgrade::Plan {
     checks: &[
         c6_core::upgrade::Check {
+            version: 27,
+            name: "failed reads keep two more tries",
+            before: "SELECT count(*) FROM before.enrich WHERE error IS NOT NULL",
+            after: "SELECT count(*) FROM enrich WHERE error IS NOT NULL AND tries = 1",
+        },
+        c6_core::upgrade::Check {
             version: 8,
             name: "every link is a claim with an owner",
             before: "SELECT count(*) FROM before.links",
@@ -897,6 +903,30 @@ fn from_blob(b: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_reads_get_two_more_tries_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memex.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+            .await
+            .unwrap();
+        MIGRATOR.run_to(25, &pool).await.unwrap();
+        sqlx::query("INSERT INTO enrich (target, version, done_at, error) VALUES ('item:bad', 'test', 1, 'no JSON'), ('item:good', 'test', 1, NULL)")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let (store, report) = Store::open_reporting(&path).await.unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.from_version, Some(25));
+        assert!(report.applied.iter().any(|(v, _)| *v == 27));
+        assert!(report.checks.iter().any(|c| c.name == "failed reads keep two more tries" && c.ok));
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT target, tries FROM enrich ORDER BY target").fetch_all(&store.pool).await.unwrap();
+        assert_eq!(rows, [("item:bad".into(), 1), ("item:good".into(), 0)]);
+    }
 
     #[test]
     fn chunks_at_paragraphs() {
