@@ -118,15 +118,19 @@ async fn work_follows_what_belongs_to_it() {
     assert_eq!(guessed["model"], "small", "the routing rule's model");
     // Its turn ends: your move, and the note says where things stand.
     idle(a.id.clone(), 1).await;
-    let w = eventually("the note", async || {
+    // The note written after the turn ended (one may also have been written
+    // while it ran, from the guess): it read the session's answer.
+    let w = eventually("the note after the turn", async || {
+        let read_it = mock.requests().iter().any(|r| {
+            let m = r["messages"].to_string();
+            m.contains(NOTE) && m.contains("Fixed the off-by-one")
+        });
         let w = item(w.id.clone()).await;
-        (w.fields.note.as_ref().is_some_and(|n| n.next == "Fix the footer") && !c6_head::work::writing()).then_some(w)
+        (read_it && w.fields.note.as_ref().is_some_and(|n| n.next == "Fix the footer") && !c6_head::work::writing()).then_some(w)
     })
     .await;
     assert_eq!(w.state, "needs_you", "{}", w.why);
     assert!(w.why.contains("finished its turn"), "{}", w.why);
-    let asked = mock.requests().into_iter().rev().find(|r| r["messages"].to_string().contains(NOTE)).unwrap().to_string();
-    assert!(asked.contains("Fixed the off-by-one"), "the note reads the session: {asked}");
 
     // 2. One you start in that work joins it without a guess; its agent
     // attaches the pull request it opened, waiting for review.

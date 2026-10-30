@@ -244,15 +244,23 @@ async fn the_edge_channel_offers_builds_of_main() {
     let s = check().await;
     assert_eq!(s["check_error"], "", "{s}");
     assert_eq!(versions(&s), vec!["9.9.8+git20261023120000.aaaaaaa"], "{s}");
-    let decisions: Vec<Value> = http.get(format!("{api}/decisions")).send().await.unwrap().json().await.unwrap();
-    assert!(decisions.iter().any(|d| d["title"] == "Update carbon6 to 9.9.8+git20261023120000.aaaaaaa?"), "{decisions:?}");
+    // Asked about by whichever check found it: the setting's change woke
+    // the head's own, which may still be asking.
+    eventually("the question about the edge build", async || {
+        let decisions: Vec<Value> = http.get(format!("{api}/decisions")).send().await.ok()?.json().await.ok()?;
+        decisions.iter().any(|d| d["title"] == "Update carbon6 to 9.9.8+git20261023120000.aaaaaaa?").then_some(())
+    })
+    .await;
 
     // A later commit's build replaces it (its question goes, the new one asks).
+    // (The head's own check may find it first; either replaces it.)
     publish_edge("9.9.8+git20261023130000.bbbbbbb");
-    let s = check().await;
-    let rel = |v: &str| s["releases"].as_array().unwrap().iter().find(|r| r["version"] == v).cloned().unwrap();
-    assert_eq!(rel("9.9.8+git20261023130000.bbbbbbb")["state"], "available", "{s}");
-    assert_eq!(rel("9.9.8+git20261023120000.aaaaaaa")["state"], "skipped", "{s}");
+    eventually("the later build to replace it", async || {
+        let s = check().await;
+        let state = |v: &str| s["releases"].as_array()?.iter().find(|r| r["version"] == v).map(|r| r["state"].clone());
+        (state("9.9.8+git20261023130000.bbbbbbb")? == "available" && state("9.9.8+git20261023120000.aaaaaaa")? == "skipped").then_some(())
+    })
+    .await;
 
     head.shutdown().await.unwrap();
 }
