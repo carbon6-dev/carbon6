@@ -98,18 +98,7 @@ pub struct AgentDef {
 impl AgentDef {
     /// Whether it may use the tool called `name` (in any profile's naming).
     pub fn allows(&self, name: &str) -> bool {
-        fn canonical(n: &str) -> String {
-            let n = n.to_ascii_lowercase().replace(['_', '-'], "");
-            match n.as_str() {
-                "readfile" => "read".into(),
-                "shell" => "bash".into(),
-                "applypatch" | "multiedit" => "edit".into(),
-                "updateplan" => "todowrite".into(),
-                "loadskill" => "skill".into(),
-                _ => n,
-            }
-        }
-        self.tools.is_empty() || self.tools.iter().any(|t| canonical(t) == canonical(name))
+        crate::tool_allowed(&self.tools, name)
     }
 }
 

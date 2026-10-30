@@ -412,6 +412,7 @@ The host inventory (**Settings → Hosts**) lists machines your workers reach ov
 Routing rules (**Settings → Model routing**) choose the connection and model for sessions started without one: from the new-session form on **Auto**, `c6 run` without `--model`, and templates or automations that leave the model empty.
 
 - **A rule:** labels it applies to (yours, or `worker:`, `folder:`, `host:`, `template:`; a bare `host:` means any SSH host), a connection (optional), a model, an effort and, optionally, a connection, model and effort for subagents (any API connection, not Claude Code). A named agent's model, or one a Task call asks for, still wins.
+- **Tools:** optionally choose the tools its sessions get (names such as `read` or `memex_search`, in any profile's naming, or `mcp__<server>__<tool>`; empty: all). A session keeps its starting list; its side chats and subagents get no more. Claude Code sessions and the assistant keep their own tools. See [tool lists](docs/subagents.md#tool-lists-from-routing-rules).
 - **Order:** the first enabled rule that matches wins. A session started on a given connection only takes rules for that connection (or for any).
 - **No match:** the connection of your latest session (if you didn't pick one), its default model, else the model of your latest session on it.
 - **Presets:** Opus with Haiku subagents everywhere, remote hosts on a fast model at low effort, research at high effort, a template on a local model.

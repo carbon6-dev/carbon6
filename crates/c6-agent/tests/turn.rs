@@ -424,7 +424,7 @@ async fn a_prefix_with_no_summary_room_fails_without_dropping_history() {
             .unwrap();
         assert!(error.contains("the system prompt and tools take about") && error.contains("of qwen3.8:27b's 16384 tokens"), "{error}");
         assert!(error.contains("no room to compact this conversation"), "{error}");
-        assert!(error.contains("fewer tools or a larger context window"), "{error}");
+        assert!(error.contains("give the session fewer tools (a routing rule's tool list) or a larger context window"), "{error}");
     }
 }
 

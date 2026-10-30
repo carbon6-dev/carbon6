@@ -143,6 +143,7 @@ pub async fn append(st: &HeadState, from: WorkerId, p: &Value) -> anyhow::Result
             subagent_model: String::new(),
             subagent_connection_id: String::new(),
             subagent_effort: String::new(),
+            tools: "[]".into(),
             realm,
             agent: String::new(),
             end_reason: String::new(),

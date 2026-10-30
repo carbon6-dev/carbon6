@@ -574,6 +574,7 @@ impl SessionManager {
             cwd: cwd.display().to_string(),
             system_prompt,
             tools,
+            hosted_search_off: !c6_tools::tool_allowed(&spec.tools, "web_search"),
             tool_profile: profile.clone(),
             worktree_branch,
             repo_root,
@@ -1761,7 +1762,7 @@ impl Actor {
                 .filter(|e| !e.is_empty())
                 .or_else(|| (model.connection_kind != "claude_code").then_some(info.default_effort).flatten().map(str::to_owned)),
             context_window: info.context_window,
-            web_search: provider != Provider::OpenAiChat,
+            web_search: hosted_web_search(provider, &self.started),
             compact: compact_prompts(&self.spec),
         };
         let mut conv = self.conv.take().expect("no turn is running");
@@ -2011,15 +2012,15 @@ pub(crate) async fn own_runtime(
     let names: Vec<String> = applicable_secrets(spec, labels).into_iter().map(|(n, _)| n).collect();
     let (secret_values, _) = fetch_secrets(link, session_id, &names).await;
     let built = build_tools(spec, local, profile, labels, &secret_values).await;
-    let mut prompt = system_prompt;
+    let mut prompt = prompt_for_tools(spec, &system_prompt, &built.tools, profile);
     if let Some(h) = crate::hooks::HookRunner::new(session_id, local, &spec.hooks_json, labels)
         && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": source})).await.context
     {
         prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
     }
-    prompt.push_str(&context_sections(spec, labels));
+    prompt.push_str(&context_sections(spec, labels, &built.tools));
     // When to propose task cards (docs/task-cards.md): an editable prompt.
-    if built.tools.iter().any(|t| c6_tools::knowledge::is_task_card(&t.spec().name)) {
+    if has_tool(&built.tools, "task_propose") && has_tool(&built.tools, "task_withdraw") {
         let guidance = spec_prompt(spec, "session.task_cards", "");
         if !guidance.trim().is_empty() {
             prompt.push_str(TASK_CARDS_HEADING);
@@ -2040,7 +2041,7 @@ fn yes() -> bool {
 /// The memory section of a new session's system prompt: the notes whose
 /// scope matches its labels (most specific first, newest first, within a
 /// budget), and how to keep them current.
-pub(crate) fn memory_section(spec: &CreateSession, labels: &[String]) -> String {
+pub(crate) fn memory_section(spec: &CreateSession, labels: &[String], tools: &[Arc<dyn Tool>]) -> String {
     const BUDGET: usize = 8000;
     #[derive(serde::Deserialize)]
     struct Note {
@@ -2058,13 +2059,30 @@ pub(crate) fn memory_section(spec: &CreateSession, labels: &[String]) -> String 
         .collect();
     notes.sort_by_key(|n| (n.scope.is_empty(), std::cmp::Reverse(n.updated_at)));
     let shown: Vec<String> = c6_api::labels::display_labels(labels);
-    let mut s = format!(
-        "\n\n# Memory\n\nNotes kept across sessions. They may be out of date: trust what you observe, and keep them current. When you learn \
+    let remember = has_tool(tools, "remember");
+    let forget = has_tool(tools, "forget");
+    let mut s = if remember && forget {
+        format!(
+            "\n\n# Memory\n\nNotes kept across sessions. They may be out of date: trust what you observe, and keep them current. When you learn \
          something durable (how a machine or project is set up, where things are, the user's preferences), save it with the remember \
          tool, scoped to one of this session's labels ({}) or to every session; correct a note by passing its id as replaces, and \
          remove wrong ones with forget.\n",
-        shown.join(", ")
-    );
+            shown.join(", ")
+        )
+    } else {
+        let mut s = "\n\n# Memory\n\nNotes kept across sessions. They may be out of date: trust what you observe.".to_owned();
+        if remember {
+            s.push_str(&format!(
+                " When you learn something durable, save it with the remember tool, scoped to one of this session's labels ({}) or to every session; correct a note by passing its id as replaces.",
+                shown.join(", ")
+            ));
+        }
+        if forget {
+            s.push_str(" Remove wrong notes with forget.");
+        }
+        s.push('\n');
+        s
+    };
     if notes.is_empty() {
         s.push_str("\n(No notes yet.)\n");
     }
@@ -2181,15 +2199,14 @@ pub(crate) fn task_connections(spec: &CreateSession) -> Vec<c6_tools::Connection
         .collect()
 }
 
-pub(crate) async fn build_tools(
+/// Built-in tools, before MCP discovery and the session's tool list.
+fn builtin_tools(
     spec: &CreateSession,
-    cwd: &std::path::Path,
     profile: ToolProfile,
     labels: &[String],
-    secrets: &[(String, String)],
-) -> BuiltTools {
+    chrome: Option<PathBuf>,
+) -> (Vec<Arc<dyn Tool>>, Vec<Skill>) {
     let mut tools = c6_tools::tools_for(profile);
-    let mut errors = Vec::new();
     // Deliverables for the Outputs panel; memory across sessions.
     tools.push(Arc::new(c6_tools::Publish::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::Remember::new(profile == ToolProfile::Claude)));
@@ -2257,7 +2274,7 @@ pub(crate) async fn build_tools(
     }
     // A browser, where this machine has one (it runs here, also for SSH
     // sessions).
-    if let Some(chrome) = c6_tools::browser::find_chrome() {
+    if let Some(chrome) = chrome {
         tools.push(Arc::new(c6_tools::browser::BrowserTool::new(profile == ToolProfile::Claude, chrome)));
     }
     // Named agents (from the head's settings) become Task's subagent types,
@@ -2300,6 +2317,36 @@ pub(crate) async fn build_tools(
         tools.push(Arc::new(c6_tools::WebSearch::new(profile == ToolProfile::Claude, search)));
     }
 
+    (tools, skills)
+}
+
+/// Every built-in name in a profile, including tools needing optional
+/// services. Uses the runtime's assembly without starting those services.
+pub fn builtin_tool_names(profile: ToolProfile) -> Vec<String> {
+    let spec = CreateSession {
+        memex_tools: true,
+        memex_mail: true,
+        memex_chat: true,
+        memex_calendar: true,
+        skills_json: r#"[{"name":"catalog","body":""}]"#.into(),
+        web_search_json: r#"{"provider":"catalog","always":true}"#.into(),
+        ..Default::default()
+    };
+    let (tools, _) = builtin_tools(&spec, profile, &[], Some(PathBuf::new()));
+    let mut names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
+    names.sort();
+    names
+}
+
+pub(crate) async fn build_tools(
+    spec: &CreateSession,
+    cwd: &std::path::Path,
+    profile: ToolProfile,
+    labels: &[String],
+    secrets: &[(String, String)],
+) -> BuiltTools {
+    let (mut tools, mut skills) = builtin_tools(spec, profile, labels, c6_tools::browser::find_chrome());
+    let mut errors = Vec::new();
     // MCP servers that apply here, with ${SECRET} references filled in.
     let mut servers: Vec<c6_mcp::ServerConfig> = Vec::new();
     for s in serde_json::from_str::<Vec<c6_mcp::ServerConfig>>(&spec.mcp_servers_json).unwrap_or_default() {
@@ -2321,6 +2368,10 @@ pub(crate) async fn build_tools(
         let (set, errs) = c6_mcp::McpSet::connect(&servers, cwd).await;
         errors.extend(errs.into_iter().map(|e| format!("MCP server unavailable: {e}")));
         tools.extend(set.tools().await);
+    }
+    tools.retain(|t| c6_tools::tool_allowed(&spec.tools, &t.spec().name));
+    if !tools.iter().any(|t| t.spec().name == SkillTool::tool_name(profile == ToolProfile::Claude)) {
+        skills.clear();
     }
     BuiltTools { tools, skills, errors }
 }
@@ -2439,26 +2490,69 @@ pub(crate) const TASK_CARDS_HEADING: &str = "\n\n# Task cards\n\n";
 
 /// The system prompt's sections from the head's context: your notes, the
 /// memex brief and the secrets that apply.
-pub(crate) fn context_sections(spec: &CreateSession, labels: &[String]) -> String {
+pub(crate) fn context_sections(spec: &CreateSession, labels: &[String], tools: &[Arc<dyn Tool>]) -> String {
     let mut prompt = String::new();
     // Your notes, by their scope; then what the knowledge store
     // knows about this session's things (it leaves the notes out).
-    prompt.push_str(&memory_section(spec, labels));
+    prompt.push_str(&memory_section(spec, labels, tools));
     if !spec.memex_brief.trim().is_empty() {
         prompt.push_str("\n\n# Memex\n\n");
-        prompt.push_str(spec.memex_brief.trim());
+        let mut brief = spec.memex_brief.trim().to_owned();
+        if !spec.tools.is_empty() {
+            for (names, sentence) in [
+                (
+                    &["knowledge_record", "knowledge_verify", "todo_add"][..],
+                    " Record what you learn with knowledge_record and re-checks with knowledge_verify; never stop to ask the user about it (todo_add raises a question for later).",
+                ),
+                (
+                    &["memex_get", "memex_search"][..],
+                    "Items are cited by [id]; memex_get fetches one in full and memex_search finds more. ",
+                ),
+            ] {
+                if !names.iter().all(|name| has_tool(tools, name)) {
+                    brief = brief.replace(sentence, "");
+                }
+            }
+        }
+        prompt.push_str(&brief);
     }
     let secrets = applicable_secrets(spec, labels);
-    if !secrets.is_empty() {
-        prompt.push_str(
-            "\n\n# Secrets\n\nThese environment variables hold secrets for your shell commands. Use them by name (for example \"$NAME\"), never \
+    let shell = has_tool(tools, "bash");
+    if !secrets.is_empty() && (shell || has_tool(tools, "browser")) {
+        if shell {
+            prompt.push_str(
+                "\n\n# Secrets\n\nThese environment variables hold secrets for your shell commands. Use them by name (for example \"$NAME\"), never \
              print or echo them, and do not write them into files; their values are hidden from you and replaced by [secret:NAME] in output.\n",
-        );
+            );
+        } else {
+            prompt.push_str(
+                "\n\n# Secrets\n\nThese secrets are available to the browser. To type one, use the browser's type action with its secret field \
+                 set to the name. Values stay hidden from you and are redacted from tool output.\n",
+            );
+        }
         for (name, description) in &secrets {
             prompt.push_str(&format!("- {name}{}\n", if description.is_empty() { String::new() } else { format!(": {description}") }));
         }
     }
     prompt
+}
+
+pub(crate) fn has_tool(tools: &[Arc<dyn Tool>], name: &str) -> bool {
+    tools.iter().any(|t| c6_tools::tool_allowed(&[name.to_owned()], &t.spec().name))
+}
+
+/// Older records have no denial, so keep their hosted search.
+fn hosted_web_search(provider: Provider, started: &SessionStarted) -> bool {
+    provider != Provider::OpenAiChat && !started.hosted_search_off
+}
+
+/// Keep unrestricted sessions' prompt bytes, including older profile
+/// wording. A tool list only removes the stock tool-dependent sentences.
+pub(crate) fn prompt_for_tools(spec: &CreateSession, prompt: &str, tools: &[Arc<dyn Tool>], profile: ToolProfile) -> String {
+    if spec.tools.is_empty() {
+        return prompt.to_owned();
+    }
+    c6_agent::base_prompt_for_tools(prompt, &tools.iter().map(|t| t.spec().name).collect::<Vec<_>>(), profile)
 }
 
 /// The heading of the system prompt's skills index.
@@ -2496,6 +2590,330 @@ pub(crate) fn compact_prompts(spec: &CreateSession) -> c6_agent::CompactPrompts 
         why_full: spec_prompt(spec, "session.compact.full", c6_agent::COMPACT_WHY),
         why_asked: spec_prompt(spec, "session.compact.asked", c6_agent::COMPACT_WHY_ASKED),
         instructions: spec_prompt(spec, "session.compact", c6_agent::COMPACT_PROMPT),
+    }
+}
+
+#[cfg(test)]
+mod route_tool_tests {
+    use super::*;
+    use prost::Message;
+
+    fn spec() -> CreateSession {
+        CreateSession {
+            base_prompt: c6_agent::BASE_PROMPT.into(),
+            memex_tools: true,
+            skills_json: r#"[{"name":"one","description":"A skill","body":"Instructions"}]"#.into(),
+            memories_json: r#"[{"id":"n1","text":"A useful note"}]"#.into(),
+            secrets_json: r#"[{"name":"TOKEN","description":"A secret"}]"#.into(),
+            memex_brief: "Known facts.".into(),
+            prompts_json: r#"{"session.task_cards":"Propose useful work."}"#.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_obeys_the_saved_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let manager = SessionManager::new(journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+        for kind in ["anthropic", "openai", "openai_compat"] {
+            let provider = Provider::from_kind(kind).unwrap();
+            for (i, names) in [vec![], vec!["Read"], vec!["web_search"], vec!["WebSearch"]].into_iter().enumerate() {
+                let spec = CreateSession {
+                    model: Some(ModelSpec { connection_kind: kind.into(), model: "claude-sonnet-5-5".into(), ..Default::default() }),
+                    cwd: dir.path().display().to_string(),
+                    tools: names.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                };
+                let id = format!("{kind}-{i}");
+                manager.create(&id, &id, spec).await.unwrap();
+                let (_, events) = journal.load_session(&id).await.unwrap().unwrap();
+                let Some(session_event::Kind::Started(started)) = &events[0].kind else { panic!("no SessionStarted") };
+                assert_eq!(started.hosted_search_off, i == 1);
+                assert_eq!(hosted_web_search(provider, started), kind != "openai_compat" && i != 1);
+                assert!(
+                    !started.tools.iter().any(|t| c6_tools::tool_allowed(std::slice::from_ref(t), "web_search")),
+                    "no function search configured"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn secrets_guidance_supports_browser_without_changing_shell_bytes() {
+        let spec = spec();
+        let browser: Arc<dyn Tool> = Arc::new(c6_tools::browser::BrowserTool::new(false, PathBuf::new()));
+        let shell: Arc<dyn Tool> = Arc::new(c6_tools::Bash);
+        let shell_prompt = context_sections(&spec, &[], std::slice::from_ref(&shell));
+        assert!(shell_prompt.contains("These environment variables hold secrets for your shell commands."));
+        assert_eq!(context_sections(&spec, &[], &[shell, browser.clone()]), shell_prompt);
+        let prompt = context_sections(&spec, &[], &[browser]);
+        assert!(prompt.contains("# Secrets") && prompt.contains("TOKEN: A secret"));
+        assert!(prompt.contains("browser's type action with its secret field set to the name"));
+        assert!(!prompt.contains("shell commands") && !prompt.contains("environment variables"));
+        assert!(!context_sections(&spec, &[], &[]).contains("# Secrets"));
+    }
+
+    #[tokio::test]
+    async fn tool_lists_filter_generic_claude_and_codex_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec =
+            CreateSession { tools: ["Read", "Bash", "Edit", "TodoWrite", "Skill", "MemexSearch"].map(str::to_owned).to_vec(), ..spec() };
+        for (profile, expected) in [
+            (ToolProfile::Generic, vec!["bash", "edit", "load_skill", "memex_search", "read", "update_plan"]),
+            (ToolProfile::Claude, vec!["Bash", "Edit", "MemexSearch", "Read", "Skill", "TodoWrite"]),
+            (ToolProfile::Codex, vec!["apply_patch", "load_skill", "memex_search", "shell", "update_plan"]),
+        ] {
+            let built = build_tools(&spec, dir.path(), profile, &[], &[]).await;
+            let mut names: Vec<String> = built.tools.iter().map(|t| t.spec().name).collect();
+            names.sort();
+            assert_eq!(names, expected, "{profile:?}");
+            assert_eq!(built.skills.len(), 1);
+            assert!(built.errors.is_empty(), "{:?}", built.errors);
+        }
+        let unavailable = CreateSession { tools: vec!["mcp__missing__tool".into()], ..spec };
+        let built = build_tools(&unavailable, dir.path(), ToolProfile::Generic, &[], &[]).await;
+        assert!(built.tools.is_empty() && built.skills.is_empty(), "an unavailable list must not fall back to all tools");
+    }
+
+    #[tokio::test]
+    async fn tool_lists_filter_discovered_mcp_tools_by_full_name() {
+        use axum::response::IntoResponse;
+        use serde_json::{Value, json};
+
+        async fn handle(axum::Json(message): axum::Json<Value>) -> axum::response::Response {
+            let Some(id) = message.get("id") else { return axum::http::StatusCode::ACCEPTED.into_response() };
+            let result = match message["method"].as_str().unwrap_or_default() {
+                "initialize" => {
+                    json!({"protocolVersion": message["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}})
+                }
+                "tools/list" => {
+                    let tools = ["echo", "e_cho", "other"]
+                        .map(|name| json!({"name": name, "description": "A test tool", "inputSchema": {"type": "object"}}));
+                    json!({"tools": tools})
+                }
+                _ => json!({}),
+            };
+            axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/mcp", axum::routing::post(handle));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        for (name, count) in [("mcp__Mail__echo", 1), ("mcp__mail__echo", 0)] {
+            let spec = CreateSession {
+                tools: vec![name.into()],
+                mcp_servers_json: json!([{"name": "Mail", "transport": "http", "url": format!("http://{addr}/mcp")}]).to_string(),
+                ..Default::default()
+            };
+            let built = build_tools(&spec, dir.path(), ToolProfile::Generic, &[], &[]).await;
+            assert!(built.errors.is_empty(), "{:?}", built.errors);
+            assert_eq!(built.tools.len(), count);
+            if count == 1 {
+                assert_eq!(built.tools[0].spec().name, name);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_lists_keep_unrestricted_prompt_bytes_and_omit_unavailable_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec();
+        let system = build_system_prompt(&spec.base_prompt, dir.path(), "2026-10-30");
+        let expected = format!(
+            "{system}\n\n# Memory\n\nNotes kept across sessions. They may be out of date: trust what you observe, and keep them current. When you learn \
+             something durable (how a machine or project is set up, where things are, the user's preferences), save it with the remember \
+             tool, scoped to one of this session's labels () or to every session; correct a note by passing its id as replaces, and \
+             remove wrong ones with forget.\n- [n1] (all) A useful note\n\n\n# Memex\n\nKnown facts.\n\n# Secrets\n\n\
+             These environment variables hold secrets for your shell commands. Use them by name (for example \"$NAME\"), never \
+             print or echo them, and do not write them into files; their values are hidden from you and replaced by [secret:NAME] in output.\n\
+             - TOKEN: A secret\n{TASK_CARDS_HEADING}Propose useful work.\n\n# Skills\n\n\
+             These skills hold instructions for specific kinds of work. When one applies, load it with the load_skill tool before starting.\n\
+             - one: A skill\n"
+        );
+        let link = HeadLink::default();
+        let built = own_runtime(&link, "s", &spec, dir.path(), &[], system.clone(), "startup").await;
+        assert_eq!(built.prompt, expected);
+        let all = CreateSession { tools: builtin_tool_names(ToolProfile::Generic), ..spec.clone() };
+        let built = own_runtime(&link, "s", &all, dir.path(), &[], system.clone(), "startup").await;
+        assert_eq!(built.prompt, expected, "keeping the tools preserves every prompt byte");
+
+        let limited = CreateSession { tools: vec!["read".into()], ..spec };
+        let built = own_runtime(&link, "s", &limited, dir.path(), &[], system, "startup").await;
+        for absent in ["You have tools to", "- Use the dedicated tools", "remember", "forget", "# Secrets", "# Skills", "# Task cards"] {
+            assert!(!built.prompt.contains(absent), "{absent}: {}", built.prompt);
+        }
+        assert!(built.prompt.contains("[n1] (all) A useful note") && built.prompt.contains("Known facts."));
+    }
+
+    #[tokio::test]
+    async fn memory_guidance_keeps_only_the_available_memory_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["remember", "forget"] {
+            let spec = CreateSession { tools: vec![name.into()], ..spec() };
+            let built = build_tools(&spec, dir.path(), ToolProfile::Generic, &[], &[]).await;
+            let prompt = context_sections(&spec, &[], &built.tools);
+            assert_eq!(prompt.contains("remember"), name == "remember");
+            assert_eq!(prompt.contains("forget"), name == "forget");
+            assert!(prompt.contains("A useful note"));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_lists_filter_tool_guidance_in_a_real_memex_brief() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = c6_head::start(c6_head::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        c6_head::memex::call_in(
+            &head.state,
+            "home",
+            "memex.knowledge.record",
+            serde_json::json!({
+                "claim": "CI runs on Argo", "about": ["ci:argo"], "status": "inferred"
+            }),
+        )
+        .await
+        .unwrap();
+        let labels = vec!["ci:argo".into()];
+        let brief = c6_testkit::eventually("a brief with the fact", async || {
+            let brief = c6_head::memex::brief(&head.state, "home", &labels, "").await;
+            brief.contains("CI runs on Argo").then_some(brief)
+        })
+        .await;
+        assert!(brief.contains(c6_api::prompts::BRIEF_KNOWLEDGE) && brief.contains("memex_get fetches one in full"));
+        let mut spec = CreateSession { memex_brief: brief.clone(), ..spec() };
+        for names in [
+            vec![],
+            vec!["Read"],
+            vec!["MemexGet"],
+            vec!["MemexSearch"],
+            vec!["MemexGet", "MemexSearch"],
+            vec!["KnowledgeRecord", "KnowledgeVerify"],
+            vec!["KnowledgeRecord", "KnowledgeVerify", "TodoAdd"],
+            vec!["MemexGet", "MemexSearch", "KnowledgeRecord", "KnowledgeVerify", "TodoAdd"],
+        ] {
+            spec.tools = names.iter().map(|name| (*name).to_owned()).collect();
+            let built = build_tools(&spec, dir.path(), ToolProfile::Generic, &labels, &[]).await;
+            let prompt = context_sections(&spec, &labels, &built.tools);
+            let lookup = names.is_empty() || (names.contains(&"MemexGet") && names.contains(&"MemexSearch"));
+            let record = names.is_empty() || ["KnowledgeRecord", "KnowledgeVerify", "TodoAdd"].iter().all(|name| names.contains(name));
+            for name in ["memex_get", "memex_search"] {
+                assert_eq!(prompt.contains(name), lookup, "{names:?}: {prompt}");
+            }
+            for name in ["knowledge_record", "knowledge_verify", "todo_add"] {
+                assert_eq!(prompt.contains(name), record, "{names:?}: {prompt}");
+            }
+            assert!(prompt.contains("CI runs on Argo"));
+            if lookup && record {
+                assert!(prompt.contains(&brief), "keeping the tools preserves the brief's bytes");
+            }
+        }
+        spec.tools = vec!["Read".into()];
+        spec.memex_brief = format!("Custom instructions: use memex_get if needed.\n\n{brief}");
+        let built = build_tools(&spec, dir.path(), ToolProfile::Generic, &labels, &[]).await;
+        let prompt = context_sections(&spec, &labels, &built.tools);
+        assert!(prompt.contains("Custom instructions: use memex_get if needed."));
+        assert_eq!(prompt.matches("memex_get").count(), 1);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_lists_omit_stock_guidance_for_partly_available_tool_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = CreateSession { memex_brief: format!("{}\n\nA useful fact.", c6_api::prompts::BRIEF_KNOWLEDGE), ..spec() };
+        let base = format!("{}\n\n{}", spec.base_prompt, c6_head::prompts::SIDE_CHAT_NOTE);
+        let system = build_system_prompt(&base, dir.path(), "2026-10-30");
+        let link = HeadLink::default();
+        for tool in ["read", "task_propose", "task_withdraw"] {
+            let limited = CreateSession { tools: vec![tool.into()], ..spec.clone() };
+            let built = own_runtime(&link, "s", &limited, dir.path(), &[], system.clone(), "startup").await;
+            for absent in ["knowledge_record", "knowledge_verify", "todo_add", "run read-only commands", "# Task cards"] {
+                assert!(!built.prompt.contains(absent), "{absent}: {}", built.prompt);
+            }
+            assert!(built.prompt.contains("A useful fact.") && built.prompt.contains("do not change files unless the user asks you to."));
+        }
+        let all = CreateSession { tools: builtin_tool_names(ToolProfile::Generic), ..spec };
+        let built = own_runtime(&link, "s", &all, dir.path(), &[], system.clone(), "startup").await;
+        assert!(built.prompt.starts_with(&system) && built.prompt.contains(c6_api::prompts::BRIEF_KNOWLEDGE));
+        assert!(built.prompt.contains("# Task cards"));
+    }
+
+    // Representative pre-28 fields, with no tool-list field. Prost uses
+    // the same unknown-field decoding for gRPC and the journal's blobs.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OlderSpec {
+        #[prost(message, optional, tag = "1")]
+        model: Option<ModelSpec>,
+        #[prost(string, tag = "2")]
+        cwd: String,
+        #[prost(string, tag = "3")]
+        base_prompt: String,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OlderRestore {
+        #[prost(message, optional, tag = "1")]
+        spec: Option<OlderSpec>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OlderCommand {
+        #[prost(message, optional, tag = "10")]
+        create: Option<OlderSpec>,
+        #[prost(message, optional, tag = "13")]
+        restore: Option<OlderRestore>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OlderHeadMsg {
+        #[prost(message, optional, tag = "4")]
+        command: Option<OlderCommand>,
+    }
+
+    #[tokio::test]
+    async fn older_workers_ignore_tool_lists_on_create_restore_and_journal_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = CreateSession { cwd: dir.path().display().to_string(), tools: vec!["read".into()], ..spec() };
+        for kind in [
+            session_command::Kind::Create(spec.clone()),
+            session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec.clone()), events: Vec::new() }),
+        ] {
+            let wire = c6_proto::HeadMsg {
+                msg: Some(c6_proto::head_msg::Msg::Command(SessionCommand { kind: Some(kind), ..Default::default() })),
+            }
+            .encode_to_vec();
+            let old = OlderHeadMsg::decode(wire.as_slice()).unwrap().command.unwrap();
+            let old = old.create.or_else(|| old.restore.unwrap().spec).unwrap();
+            assert_eq!(old.cwd, spec.cwd);
+            let decoded = CreateSession::decode(old.encode_to_vec().as_slice()).unwrap();
+            assert!(decoded.tools.is_empty(), "the older schema discards field 28");
+            let built = build_tools(&decoded, dir.path(), ToolProfile::Generic, &[], &[]).await;
+            assert!(has_tool(&built.tools, "write") && has_tool(&built.tools, "task"), "an older worker still sends all tools");
+        }
+
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let started = SessionEvent { seq: 1, kind: Some(session_event::Kind::Started(SessionStarted::default())), ..Default::default() };
+        journal.create_session("new", &spec, &started).await.unwrap();
+        journal.import("restored", &spec, &[started]).await.unwrap();
+        let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.path().join("journal.db").display())).await.unwrap();
+        for id in ["new", "restored"] {
+            let blob: Vec<u8> = sqlx::query_scalar("SELECT spec FROM sessions WHERE id = ?").bind(id).fetch_one(&db).await.unwrap();
+            assert_eq!(CreateSession::decode(blob.as_slice()).unwrap().tools, spec.tools);
+            let old = OlderSpec::decode(blob.as_slice()).unwrap();
+            assert_eq!(old.cwd, spec.cwd);
+            assert!(CreateSession::decode(old.encode_to_vec().as_slice()).unwrap().tools.is_empty());
+        }
+        db.close().await;
     }
 }
 
@@ -2720,6 +3138,20 @@ mod handoff_tests {
             (started.tool_profile.as_str(), started.tools.as_slice(), started.system_prompt.as_str()),
             ("generic", &["bash".to_owned()][..], "carbon6 prompt")
         );
+    }
+
+    #[test]
+    fn handoffs_and_model_switches_keep_the_hosted_search_denial() {
+        let mut events = log();
+        events.push(switched(13, model("m", "gpt-x", "openai_compat"), Some(into_own())));
+        events.push(switched(14, model("n", "claude-sonnet-5-5", "anthropic"), None));
+        for off in [false, true] {
+            let mut started = SessionStarted { hosted_search_off: off, ..Default::default() };
+            apply_handoff(&mut started, &into_claude("conv-1"));
+            assert_eq!(started.hosted_search_off, off);
+            let started = runtime_of(started, &events);
+            assert_eq!(started.hosted_search_off, off);
+        }
     }
 
     #[test]

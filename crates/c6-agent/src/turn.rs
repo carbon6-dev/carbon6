@@ -210,7 +210,7 @@ impl Turn<'_> {
         let prefix = self.estimate_request(&[], &self.specs);
         format!(
             "the system prompt and tools take about {prefix} of {}'s {} tokens, leaving no room to compact this conversation: \
-             give the session fewer tools or a larger context window",
+             give the session fewer tools (a routing rule's tool list) or a larger context window",
             self.cfg.model, self.cfg.context_window
         )
     }

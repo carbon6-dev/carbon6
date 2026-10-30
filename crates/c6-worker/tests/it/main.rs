@@ -41,6 +41,7 @@ mod push;
 mod realm_pages;
 mod realms;
 mod rewind;
+mod route_tools;
 mod routing;
 mod runs;
 mod scratch;

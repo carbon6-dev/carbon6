@@ -460,6 +460,7 @@ Skills, agents, commands, templates, workflows, hooks and MCP servers keep worki
 - **Placeholders** are `{{name}}` (`c6_api::prompts::fill`).
 - **How each reaches its model:**
   - **sessions:** the head sends the base prompt as the session's realm has it. It sends the worker's own prompts (compaction, subagent) in the spec's `prompts_json`.
+    A routing rule's `tools` list can omit tools from the model. For these sessions, prompt assembly removes the exact stock base-prompt sentences about unavailable tools and gates generated memory, secrets, skills and task-card guidance on the tools present. The stored `session.base` stays as edited; custom instructions remain the author's responsibility. No list preserves the existing prompt bytes (see [tool lists](subagents.md#tool-lists-from-routing-rules)).
   - **the memex:** it gets its prompts with its configuration. Editing one tells it to reload.
 - **Settings → Prompts** lists them with their defaults. Each can be saved, or returned to its default, which an empty text also does. The API is `/api/v1/settings/prompts`.
 - **A gap fixed:** a session started from an action item now runs in the item's realm.

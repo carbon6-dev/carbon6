@@ -207,7 +207,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="routes"
                         title="Model routing"
                         noun="rule"
-                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session)."
+                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names."
                         fields=ROUTE_FIELDS
                         examples=route_examples
                     />
@@ -2387,6 +2387,8 @@ enum FieldKind {
     Text,
     /// Labels, typed separated by commas; stored as a list.
     Labels,
+    /// Names, typed separated by commas; stored as a list.
+    List,
     /// One of these values.
     Choice(&'static [&'static str]),
     /// A connection, by name (empty: the placeholder's default).
@@ -2710,6 +2712,12 @@ const ROUTE_FIELDS: &[Field] = &[
     Field { key: "connection", label: "Connection", placeholder: "the session's (or your latest)", kind: FieldKind::Connection },
     Field { key: "model", label: "Model", placeholder: "e.g. claude-sonnet-5-5", kind: FieldKind::Model },
     Field { key: "effort", label: "Effort", placeholder: "the model's default; or low, medium, high, xhigh, max", kind: FieldKind::Mono },
+    Field {
+        key: "tools",
+        label: "Tools",
+        placeholder: "empty = all tools; e.g. mail_threads, mail_thread, memex_search",
+        kind: FieldKind::List,
+    },
     Field {
         key: "subagent_connection",
         label: "Subagent connection",
@@ -3075,6 +3083,7 @@ fn ListItem(
     };
     let set = move |k: &'static str, v: String| {
         let labels = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Labels);
+        let list = fields.iter().any(|f| f.key == k && f.kind == FieldKind::List);
         let json = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Json);
         item.update(|m| {
             let value = if json {
@@ -3082,6 +3091,10 @@ fn ListItem(
                 serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v))
             } else if labels {
                 serde_json::Value::Array(c6_api::labels::parse_labels(&v).into_iter().map(serde_json::Value::String).collect())
+            } else if list {
+                serde_json::Value::Array(
+                    v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| serde_json::Value::String(s.to_owned())).collect(),
+                )
             } else {
                 serde_json::Value::String(v)
             };
@@ -3095,7 +3108,11 @@ fn ListItem(
     let input_class = |f: &Field| {
         format!(
             "{INPUT} py-1 {}",
-            if matches!(f.kind, FieldKind::Mono | FieldKind::Labels | FieldKind::Model) { "font-mono text-xs" } else { "text-sm" }
+            if matches!(f.kind, FieldKind::Mono | FieldKind::Labels | FieldKind::List | FieldKind::Model) {
+                "font-mono text-xs"
+            } else {
+                "text-sm"
+            }
         )
     };
     let connections = LocalResource::new(api::connections);
@@ -3149,13 +3166,13 @@ fn ListItem(
                             <ModelInput connection value=Signal::derive(get(f.key)) on_set=move |v| set(f.key, v) class=input_class(f) placeholder=f.placeholder />
                         </label>
                     }.into_any()
-                } else if f.kind == FieldKind::Labels {
+                } else if matches!(f.kind, FieldKind::Labels | FieldKind::List) {
                     // Parsed when you leave the field, so typing is not reformatted.
                     view! {
                         <label class="space-y-0.5 sm:col-span-2">
                             <span class="text-xs text-zinc-500">{f.label}</span>
                             <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key)
-                                title="Sessions with all of these labels: yours, or worker:, repo:, folder: (a path prefix) and model:"
+                                title=if f.kind == FieldKind::Labels { "Sessions with all of these labels: yours, or worker:, repo:, folder: (a path prefix) and model:" } else { "Comma-separated tool names, in any profile's naming; empty: all tools" }
                                 on:change=move |ev| set(f.key, event_target_value(&ev)) />
                         </label>
                     }.into_any()
