@@ -10,6 +10,10 @@ DOCKER       ?= docker
 DOCKERFILE   := docker/Dockerfile
 IMAGE_PREFIX ?= carbon6
 TAG          ?= dev
+LINT_IMAGE    = $(IMAGE_PREFIX)/lint:$(TAG)
+# The checkout is mounted, so its files are the ones checked or formatted; the build and cargo's files go in a volume.
+DOCKER_LINT   = $(DOCKER) run --rm -u "$$(id -u):$$(id -g)" -e HOME=/cache/home -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target \
+                -v "$(CURDIR)":/src -v c6-lint-cache:/cache -w /src $(LINT_IMAGE)
 # This machine's architecture, as Docker names it (amd64 / arm64).
 ARCH         := $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 UI_PORT      ?= 7700
@@ -41,7 +45,7 @@ BREW_VERSION ?= $(if $(RELEASE_TAG),$(CRATE_VERSION),$(CRATE_VERSION).$(COMMIT_T
 BREW_ENV      = HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSION) --build-arg "MAINTAINER=$(DEB_MAINTAINER)"
 
-.PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
+.PHONY: help docker-build docker-build-all docker-test docker-lint-image docker-check docker-fmt docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
         ui build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
@@ -65,6 +69,15 @@ docker-build-all: ## Build Linux binaries for amd64 and arm64 into dist/linux_{a
 
 docker-test: ## Run the full test suite in Docker
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target test --progress plain .
+
+docker-lint-image:
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target lint --load -t $(LINT_IMAGE) .
+
+docker-check: docker-lint-image ## Run `make check` in Docker on this checkout: formatting, clippy (also for the web UI's wasm) and the test lint, with the Rust version the Dockerfile pins (the build is kept in the volume c6-lint-cache)
+	$(DOCKER_LINT) make check
+
+docker-fmt: docker-lint-image ## Format the source in Docker with the Rust version the Dockerfile pins (rewrites files here; docker-check only checks)
+	$(DOCKER_LINT) sh -c 'cargo fmt --all && cargo fmt --manifest-path site/Cargo.toml --all'
 
 docker-images: ## Build runtime images carbon6/c6h:dev and carbon6/c6w:dev (IMAGE_PREFIX, TAG)
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target c6h --load -t $(IMAGE_PREFIX)/c6h:$(TAG) .
