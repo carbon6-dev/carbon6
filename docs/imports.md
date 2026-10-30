@@ -9,8 +9,8 @@ Sessions you had in Claude Code or Codex come into carbon6 as sessions:
 - **In the Sessions list and search,** with their folder, branch, messages, tool calls and token usage, marked as imported from Claude Code or Codex.
 - **In the memex,** their digests are written like those of carbon6's own sessions, so later sessions' briefs include them.
 - **Continued in carbon6:**
-  - A Claude Code session, through a Claude Code connection, keeps its id. It resumes with Claude Code's own memory of it, on the machine that has its file.
-  - Either kind can also be continued with any other connection: carbon6's agent continues from the converted history.
+  - A Claude Code session, through a Claude Code connection, keeps its id. It resumes with Claude Code's own memory of it, on the machine that has its file (if that machine no longer has it, Claude Code starts over from a transcript of the import).
+  - Either kind can also be continued with any other connection: carbon6's agent continues from the converted history. Switching between Claude Code and other connections later is a handoff with a transcript (docs/architecture.md, "Model switching").
 
 ## 2. How
 

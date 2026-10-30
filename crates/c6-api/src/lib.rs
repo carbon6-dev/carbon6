@@ -1682,6 +1682,25 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// A model switch between Claude Code and carbon6's own agent loop.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Handoff {
+    /// "claude_code", or the tool profile carbon6's loop runs the model with.
+    pub tool_profile: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub system_prompt: String,
+}
+
+impl Handoff {
+    /// It handed the session over to Claude Code.
+    pub fn into_claude_code(&self) -> bool {
+        self.tool_profile == "claude_code"
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1864,6 +1883,13 @@ pub enum EventKind {
         #[serde(default)]
         effort: String,
         context_window: u64,
+        /// Set when the switch handed the session over between Claude Code
+        /// and carbon6's own agent loop: the runtime it runs on from here
+        /// ("claude_code", or carbon6's tool profile for the model), with
+        /// its tools and system prompt. The conversation so far reached it
+        /// as a transcript, without the other runtime's native state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<Handoff>,
     },
     /// From here on the session's subagents run on this connection and
     /// model by default (all empty: on the session's own).

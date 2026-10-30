@@ -154,6 +154,28 @@ message Rewound {
 message ModelSwitched {
   ModelSpec model = 1;
   uint64 context_window = 2;
+  // Set when the switch crosses runtimes (Claude Code and carbon6's own
+  // agent loop): what the session runs with from here on. Unset for a
+  // switch within a runtime, which keeps the session's tools and prompt.
+  Handoff handoff = 3;
+}
+
+// A switch between Claude Code and carbon6's own agent loop. The
+// destination does not inherit the other runtime's conversation: it gets
+// a transcript of everything before this point, rebuilt from the log.
+message Handoff {
+  // The runtime's tool profile ("claude_code", or the profile of the
+  // model carbon6's loop now runs), its tools and its system prompt.
+  string tool_profile = 1;
+  repeated string tools = 2;
+  string system_prompt = 3;
+  // Into Claude Code: the id of the Claude Code conversation started here
+  // (resumed by later turns until the next handoff).
+  string claude_session_id = 4;
+  // Into Claude Code, a conversation Claude Code already has: a session
+  // imported from Claude Code that carbon6 has not run yet continues it
+  // by its own id (the transcript only if Claude Code no longer has it).
+  bool native = 5;
 }
 
 message SessionStarted {
@@ -164,7 +186,9 @@ message SessionStarted {
   string system_prompt = 4;
   repeated string tools = 5;
   // Tool profile the session was started with ("generic", "claude",
-  // "codex"); fixed for the session so the tool list stays a stable prefix.
+  // "codex", "claude_code"); fixed until a switch hands the session over to
+  // the other runtime (ModelSwitched.handoff), so the tool list stays a
+  // stable prefix.
   string tool_profile = 6;
   // Set when the session runs in its own worktree.
   string worktree_branch = 7;

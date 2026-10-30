@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
-use c6_llm::{Message, Provider, Role, ToolProfile, model_info};
+use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
     BackgroundTask, Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Rewound, SessionActivity,
     SessionCommand, SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, session_command, session_event,
@@ -65,9 +65,9 @@ struct Handle {
     tools: Arc<SessionTools>,
     /// A turn is running.
     running: Arc<std::sync::atomic::AtomicBool>,
-    /// It runs Claude Code, whose tools carbon6 does not run (so its
-    /// subagents do not share them).
-    claude_code: bool,
+    /// It runs Claude Code now, whose tools carbon6 does not run (so its
+    /// subagents do not share them). A handoff changes it.
+    claude_code: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How a delegation's turn ended.
@@ -212,6 +212,10 @@ pub(crate) enum ActorMsg {
 /// Background-task notices may start this many turns per hour in an idle
 /// session; beyond that they wait for your next message.
 const AUTO_TURNS_PER_HOUR: usize = 20;
+
+/// Why a rewind may not go back past a handoff (the head says the same).
+const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
+                              the other runtime's conversation cannot be taken back";
 
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
@@ -392,6 +396,10 @@ impl SessionManager {
                 if !is_user {
                     return Err("can only rewind to before one of your messages".into());
                 }
+                // The other runtime's conversation cannot be taken back.
+                if events.iter().any(|e| e.seq >= r.to_seq && handoff_of(e).is_some()) {
+                    return Err(HANDOFF_REWIND.into());
+                }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
                 let _ = actor.send(ActorMsg::Rewind { command_id: cmd.command_id, to_seq: r.to_seq, restore_files: r.restore_files });
                 Ok(())
@@ -545,36 +553,13 @@ impl SessionManager {
         let context_window = model_info(provider, &model.model).context_window;
         let (profile, tools, system_prompt) = if model.connection_kind == "claude_code" {
             // Claude Code brings its own prompt (incl. CLAUDE.md) and tools.
-            (crate::claude_code::PROFILE.to_owned(), Vec::new(), "(Claude Code's own system prompt)".to_owned())
+            (crate::claude_code::PROFILE.to_owned(), Vec::new(), crate::claude_code::SYSTEM_PROMPT.to_owned())
         } else {
-            let profile = model_info(provider, &model.model).tool_profile;
-            // Secrets go into MCP servers' configs (and, per turn, commands).
-            let names: Vec<String> = applicable_secrets(&spec, &labels).into_iter().map(|(n, _)| n).collect();
-            let (secret_values, _) = fetch_secrets(&self.link, session_id, &names).await;
-            let built = build_tools(&spec, &local, profile, &labels, &secret_values).await;
+            let built = own_runtime(&self.link, session_id, &spec, &local, &labels, system_prompt, "startup").await;
             setup_errors = built.errors;
-            let mut prompt = system_prompt;
-            if let Some(h) = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels)
-                && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": "startup"})).await.context
-            {
-                prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
-            }
-            prompt.push_str(&context_sections(&spec, &labels));
-            // When to propose task cards (docs/task-cards.md): an editable prompt.
-            if built.tools.iter().any(|t| c6_tools::knowledge::is_task_card(&t.spec().name)) {
-                let guidance = spec_prompt(&spec, "session.task_cards", "");
-                if !guidance.trim().is_empty() {
-                    prompt.push_str(TASK_CARDS_HEADING);
-                    prompt.push_str(guidance.trim());
-                }
-            }
-            if !built.skills.is_empty() {
-                prompt.push_str("\n\n");
-                prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
-            }
             let names = built.tools.iter().map(|t| t.spec().name).collect();
             session_tools = built.tools;
-            (profile.as_str().to_owned(), names, prompt)
+            (built.profile.as_str().to_owned(), names, built.prompt)
         };
         let started = SessionStarted {
             command_id: command_id.to_owned(),
@@ -658,6 +643,8 @@ impl SessionManager {
             _ => None,
         });
         let Some(started) = started else { anyhow::bail!("session {session_id} has no SessionStarted event") };
+        // What it runs with now: a handoff may have changed it.
+        let started = runtime_of(started, &events);
         let mut next_seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
         // A turn left open by a failed turn task: close it so the head and
         // the history agree that it is over.
@@ -733,7 +720,9 @@ impl SessionManager {
     /// None for a Claude Code parent: carbon6 runs none of its tools, so
     /// its subagents work with hooks, policies and sinks of their own.
     fn parent_tools<'a>(&'a self, parent_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<Arc<SessionTools>>>> {
-        Box::pin(async move { Ok(self.load(parent_id).await?.filter(|h| !h.claude_code).map(|h| h.tools)) })
+        Box::pin(async move {
+            Ok(self.load(parent_id).await?.filter(|h| !h.claude_code.load(std::sync::atomic::Ordering::SeqCst)).map(|h| h.tools))
+        })
     }
 
     /// A session's tools in `profile`, built afresh: for a session loaded
@@ -834,8 +823,12 @@ impl SessionManager {
             hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
             session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: on_behalf_of.clone() })));
         }
-        if started.tool_profile != crate::claude_code::PROFILE && parent.is_none() {
-            // Policies first (a denial wins), then your hooks.
+        // What carbon6's tools report goes to the actor, whichever runtime
+        // the session runs on now: a handoff can change that, and in Claude
+        // Code these stay quiet (it runs its own tools).
+        if parent.is_none() {
+            // Policies first (a denial wins), then your hooks; installed
+            // only while carbon6's loop runs the tools (`own_loop_hooks`).
             let (ap_tx, mut ap_rx) = mpsc::unbounded_channel();
             policies = crate::policy::Policies::new(&spec.policies_json, &labels, ap_tx);
             let actor_tx = tx.clone();
@@ -846,18 +839,9 @@ impl SessionManager {
                     }
                 }
             });
-            let mut chain: Vec<Arc<dyn c6_tools::Hooks>> = Vec::new();
-            if let Some(p) = &policies {
-                chain.push(p.clone());
+            if started.tool_profile != crate::claude_code::PROFILE {
+                session_tools.set_hooks(own_loop_hooks(&policies, &hooks));
             }
-            if let Some(h) = &hooks {
-                chain.push(h.clone());
-            }
-            session_tools.set_hooks(match chain.len() {
-                0 => None,
-                1 => chain.pop(),
-                _ => Some(Arc::new(crate::policy::Chain(chain))),
-            });
             // Memory changes go to the actor, which logs them (the head
             // applies them).
             let (mem_tx, mut mem_rx) = mpsc::unbounded_channel();
@@ -893,7 +877,7 @@ impl SessionManager {
                 }
             });
         }
-        if started.tool_profile != crate::claude_code::PROFILE {
+        {
             // Background tasks report to the actor.
             let (task_tx, mut task_rx) = mpsc::unbounded_channel();
             session_tools.background.set_sink(Some(task_tx));
@@ -907,6 +891,7 @@ impl SessionManager {
             });
         }
         let spec_default = spec.clone();
+        let claude_code = Arc::new(std::sync::atomic::AtomicBool::new(started.tool_profile == crate::claude_code::PROFILE));
         let actor = Actor {
             spec,
             session_tools,
@@ -930,13 +915,9 @@ impl SessionManager {
             subagent_default: Arc::new(Mutex::new(crate::subagent::SubagentDefault::of(&spec_default))),
             running_flag: Arc::default(),
             report: None,
+            claude_code: claude_code.clone(),
         };
-        let handle = Handle {
-            tx,
-            tools: actor.session_tools.clone(),
-            running: actor.running_flag.clone(),
-            claude_code: actor.started.tool_profile == crate::claude_code::PROFILE,
-        };
+        let handle = Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code };
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
         Ok(handle)
@@ -946,9 +927,13 @@ impl SessionManager {
 /// The conversation a session's log adds up to (its seed first, rewinds
 /// applied), and the model it runs on now (its last switch, set in
 /// `spec`). Reasoning from before the current model's run is dropped:
-/// another model wrote it.
+/// another model wrote it. After a handoff between Claude Code and
+/// carbon6's own loop, everything before it is a marked transcript at the
+/// start of the conversation, not native history.
 fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> Conversation {
-    let all = [seed_events(spec), events.to_vec()].concat();
+    let seed = seed_events(spec);
+    let seed_len = seed.len();
+    let all = [seed, events.to_vec()].concat();
     let model_of = |e: &SessionEvent| match &e.kind {
         Some(session_event::Kind::ModelSwitched(m)) => m.model.clone(),
         Some(session_event::Kind::Started(s)) => s.model.clone(),
@@ -969,28 +954,154 @@ fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> C
         set_subagent_default(spec, m);
     }
     let current = spec.model.as_ref().map(key);
+    let handoff = events.iter().rposition(|e| handoff_of(e).is_some()).map(|h| seed_len + h);
+    let (transcript, all) = match handoff {
+        Some(h) => {
+            let before = &all[..h];
+            let from = runtime_left(before, handoff_of(&all[h]).expect("a handoff"));
+            (Some(c6_agent::handoff_context(before, &from, c6_agent::HANDOFF_BUDGET)), all[h..].to_vec())
+        }
+        None => (None, all),
+    };
     // Start of the current model's run: just after the last event naming
     // another model, at the next event naming this one.
     let other = all.iter().rposition(|e| model_of(e).is_some_and(|m| Some(key(&m)) != current));
-    let history = match other {
+    let mut history = match other {
         Some(i) => {
             let run = all[i + 1..].iter().position(|e| model_of(e).is_some()).map_or(all.len(), |p| i + 1 + p);
             history_from_events(&[c6_agent::portable_events(&all[..run]), all[run..].to_vec()].concat())
         }
         None => history_from_events(&all),
     };
-    // The last request's size since the last compaction, for the next
-    // compaction decision.
+    if let Some(t) = transcript {
+        match history.first_mut() {
+            Some(m) if m.role == Role::User => m.blocks.insert(0, Block::Text(t)),
+            _ => history.insert(0, Message::user_text(t)),
+        }
+    }
+    // The last request's size since the last compaction (or handoff: the
+    // other runtime's context is not this one's), for the next compaction
+    // decision.
     let context_tokens = c6_agent::effective_events(events)
         .iter()
         .rev()
-        .take_while(|e| !matches!(e.kind, Some(session_event::Kind::Compaction(_))))
+        .take_while(|e| !matches!(e.kind, Some(session_event::Kind::Compaction(_))) && handoff_of(e).is_none())
         .find_map(|e| match &e.kind {
             Some(session_event::Kind::Usage(u)) => Some(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens),
             _ => None,
         })
         .unwrap_or(0);
     Conversation { history, context_tokens }
+}
+
+/// What carbon6's loop checks around each tool call of a top-level
+/// session: the policies first (a denial wins), then your hooks. Claude
+/// Code runs its tools itself, with the hooks as its own settings.
+fn own_loop_hooks(
+    policies: &Option<Arc<crate::policy::Policies>>,
+    hooks: &Option<Arc<crate::hooks::HookRunner>>,
+) -> Option<Arc<dyn c6_tools::Hooks>> {
+    let mut chain: Vec<Arc<dyn c6_tools::Hooks>> = Vec::new();
+    if let Some(p) = policies {
+        chain.push(p.clone());
+    }
+    if let Some(h) = hooks {
+        chain.push(h.clone());
+    }
+    match chain.len() {
+        0 => None,
+        1 => chain.pop(),
+        _ => Some(Arc::new(crate::policy::Chain(chain))),
+    }
+}
+
+/// The handoff a model switch made, if it crossed runtimes.
+fn handoff_of(e: &SessionEvent) -> Option<&c6_proto::Handoff> {
+    match &e.kind {
+        Some(session_event::Kind::ModelSwitched(m)) => m.handoff.as_ref(),
+        _ => None,
+    }
+}
+
+/// What the session runs with from a handoff on.
+fn apply_handoff(started: &mut SessionStarted, h: &c6_proto::Handoff) {
+    started.tool_profile = h.tool_profile.clone();
+    started.tools = h.tools.clone();
+    started.system_prompt = h.system_prompt.clone();
+}
+
+/// The runtime a session runs on as of its log: its `Started`, with the
+/// tool profile, tools and system prompt of its last handoff.
+fn runtime_of(mut started: SessionStarted, events: &[SessionEvent]) -> SessionStarted {
+    if let Some(h) = events.iter().rev().find_map(handoff_of) {
+        apply_handoff(&mut started, h);
+    }
+    started
+}
+
+/// Whether a session is one imported from Claude Code (docs/imports.md)
+/// that carbon6 has not run yet: everything in its log came from Claude
+/// Code's file, so Claude Code's own conversation (by the session's id) is
+/// still the whole story.
+fn continues_claude_import(started: &SessionStarted, events: &[SessionEvent]) -> bool {
+    started.command_id == "import-claude_code"
+        && events.iter().all(|e| match &e.kind {
+            Some(session_event::Kind::User(u)) => u.command_id.starts_with("import-"),
+            Some(session_event::Kind::ModelSwitched(_) | session_event::Kind::Checkpoint(_) | session_event::Kind::Rewound(_)) => false,
+            _ => true,
+        })
+}
+
+/// The runtime a handoff `h` leaves, for its transcript's wording: the
+/// other one, with the last model that ran before it (`before`).
+fn runtime_left(before: &[SessionEvent], h: &c6_proto::Handoff) -> String {
+    let model = before
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            Some(session_event::Kind::ModelSwitched(m)) => m.model.as_ref().map(|m| m.model.clone()),
+            Some(session_event::Kind::Started(s)) => s.model.as_ref().map(|m| m.model.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let name = if h.tool_profile == crate::claude_code::PROFILE { "carbon6's own agent loop" } else { "Claude Code" };
+    if model.is_empty() { name.to_owned() } else { format!("{name} ({model})") }
+}
+
+/// The Claude Code conversation a Claude Code session's next turn
+/// continues, as of its log. Handed over to Claude Code, it is the one its
+/// last handoff started, which a new conversation begins with the
+/// handoff's transcript; created on Claude Code, its own id, with a side
+/// chat's context in front.
+fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> crate::claude_code::ClaudeConversation {
+    let turns_since = |from: usize| events[from..].iter().any(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_))));
+    match events.iter().rposition(|e| handoff_of(e).is_some()) {
+        Some(h) => {
+            let handoff = handoff_of(&events[h]).expect("a handoff");
+            let before = [seed_events(spec), events[..h].to_vec()].concat();
+            let preamble = c6_agent::handoff_context(&before, &runtime_left(&before, handoff), c6_agent::HANDOFF_BUDGET);
+            let id = if handoff.claude_session_id.is_empty() { session_id.to_owned() } else { handoff.claude_session_id.clone() };
+            crate::claude_code::ClaudeConversation {
+                id,
+                // Claude Code's own (imported) conversation goes on as it
+                // is; the transcript only if it has gone.
+                resume: handoff.native || turns_since(h),
+                preamble: Some(format!("{preamble}\n\nThe user now says:")),
+            }
+        }
+        None => crate::claude_code::ClaudeConversation {
+            id: session_id.to_owned(),
+            resume: turns_since(0),
+            // Claude Code keeps its own history: a side chat's context goes
+            // in as text with the first question.
+            preamble: (!spec.seed.is_empty()).then(|| {
+                format!(
+                    "<conversation-so-far>\n{}\n</conversation-so-far>\n\nThe user branched off the conversation above to ask:",
+                    c6_agent::transcript_text(&spec.seed)
+                )
+            }),
+        },
+    }
 }
 
 /// Sets a spec's default for its subagents (`None`: the session's own
@@ -1110,6 +1221,8 @@ struct Actor {
     /// (yours, notices, messages joining a turn): what they said, and
     /// whether the report should wake the parent.
     report: Option<(Vec<String>, bool)>,
+    /// Shared with the manager: it runs Claude Code now.
+    claude_code: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Actor {
@@ -1499,14 +1612,22 @@ impl Actor {
 
     /// Runs the session on `model` from the next turn on. Earlier reasoning
     /// is dropped from the history: it is bound to the model that wrote it.
+    /// A switch between Claude Code and carbon6's own loop hands the
+    /// session over instead (`hand_off`).
     async fn switch_model(&mut self, model: ModelSpec) -> anyhow::Result<()> {
+        let into_claude_code = model.connection_kind == "claude_code";
+        if into_claude_code != self.runs_claude_code() {
+            return self.hand_off(model).await;
+        }
         let current = self.spec.model.clone().unwrap_or_default();
         if (&current.connection_id, &current.model, &current.effort) == (&model.connection_id, &model.model, &model.effort) {
             return Ok(()); // e.g. redelivered after the switch was recorded
         }
         let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
         let context_window = model_info(provider, &model.model).context_window;
-        self.writer.append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(model.clone()), context_window })).await?;
+        self.writer
+            .append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(model.clone()), context_window, handoff: None }))
+            .await?;
         info!(session = %self.writer.session_id, model = %model.model, "model switched");
         // An effort change keeps the model, and with it the reasoning.
         let same_model = (&current.connection_id, &current.model) == (&model.connection_id, &model.model);
@@ -1514,6 +1635,98 @@ impl Actor {
         if !same_model && let Some(conv) = &mut self.conv {
             conv.history = c6_agent::portable_messages(std::mem::take(&mut conv.history));
         }
+        Ok(())
+    }
+
+    fn runs_claude_code(&self) -> bool {
+        self.started.tool_profile == crate::claude_code::PROFILE
+    }
+
+    /// Hands the session over between Claude Code and carbon6's own loop,
+    /// at a turn boundary: the destination's tool profile, tools and system
+    /// prompt are built afresh and recorded with the switch (so a reload
+    /// runs on it), and the conversation so far reaches it as a transcript
+    /// (`conversation_from_log`, `claude_conversation`), never as native
+    /// state. Claude Code runs only top-level sessions on the worker itself.
+    async fn hand_off(&mut self, model: ModelSpec) -> anyhow::Result<()> {
+        let sid = self.writer.session_id.clone();
+        let into_claude_code = model.connection_kind == "claude_code";
+        if into_claude_code {
+            let refusal = if self.spec.delegation.is_some() {
+                Some("subagents run in carbon6's own loop")
+            } else if !self.started.ssh_target.is_empty() {
+                Some("Claude Code runs on the worker itself, not over SSH")
+            } else {
+                None
+            };
+            if let Some(why) = refusal {
+                warn!(session = %sid, "switch to Claude Code refused: {why}");
+                let current = self.spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default();
+                let message = format!("This session cannot switch to Claude Code ({why}); it stays on {current}.");
+                self.writer.append(session_event::Kind::Error(ErrorEvent { message })).await?;
+                return Ok(());
+            }
+        }
+        let (handoff, tools, setup_errors) = if into_claude_code {
+            // A session imported from Claude Code that carbon6 never ran
+            // goes on in Claude Code's own conversation (docs/imports.md).
+            let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+            let native = continues_claude_import(&self.started, &events);
+            let handoff = c6_proto::Handoff {
+                tool_profile: crate::claude_code::PROFILE.to_owned(),
+                tools: Vec::new(),
+                system_prompt: crate::claude_code::SYSTEM_PROMPT.to_owned(),
+                // Else a conversation of its own: Claude Code has none of
+                // what happened here, and may have an older one under the
+                // session's id.
+                claude_session_id: if native { sid.clone() } else { uuid::Uuid::now_v7().to_string() },
+                native,
+            };
+            (handoff, Vec::new(), Vec::new())
+        } else {
+            // As a new session on that model would have it (Claude Code
+            // sessions always work in a local folder).
+            let mut spec = self.spec.clone();
+            spec.model = Some(model.clone());
+            let cwd = PathBuf::from(&self.started.cwd);
+            let labels = session_labels(&spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, &model.model, "");
+            let date = time::OffsetDateTime::now_utc().date().to_string();
+            let base = build_system_prompt(&spec.base_prompt, &cwd, &date);
+            let built = own_runtime(&self.link, &self.on_behalf_of, &spec, &cwd, &labels, base, "resume").await;
+            let handoff = c6_proto::Handoff {
+                tool_profile: built.profile.as_str().to_owned(),
+                tools: built.tools.iter().map(|t| t.spec().name).collect(),
+                system_prompt: built.prompt,
+                claude_session_id: String::new(),
+                native: false,
+            };
+            (handoff, built.tools, built.errors)
+        };
+        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+        let context_window = model_info(provider, &model.model).context_window;
+        self.writer
+            .append(session_event::Kind::ModelSwitched(ModelSwitched {
+                model: Some(model.clone()),
+                context_window,
+                handoff: Some(handoff.clone()),
+            }))
+            .await?;
+        for message in setup_errors {
+            self.writer.append(session_event::Kind::Error(ErrorEvent { message })).await?;
+        }
+        info!(session = %sid, model = %model.model, runtime = %handoff.tool_profile, "handed over");
+        self.spec.model = Some(model);
+        apply_handoff(&mut self.started, &handoff);
+        self.tools = tools;
+        self.claude_code.store(into_claude_code, std::sync::atomic::Ordering::SeqCst);
+        // Subagents keep their parent's hooks; a top-level session's are
+        // carbon6's to run only in its own loop.
+        if self.spec.delegation.is_none() {
+            self.session_tools.set_hooks(if into_claude_code { None } else { own_loop_hooks(&self.policies, &self.hooks) });
+        }
+        // The conversation from here: the transcript, then what follows.
+        let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        self.conv = Some(conversation_from_log(&mut self.spec, &events));
         Ok(())
     }
 
@@ -1568,8 +1781,9 @@ impl Actor {
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
         writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
 
-        let claude_code = self.started.tool_profile == crate::claude_code::PROFILE;
-        let seed = if claude_code { self.spec.seed.clone() } else { Vec::new() };
+        let claude_code = self.runs_claude_code();
+        let spec_for_claude = claude_code.then(|| self.spec.clone());
+        let log = self.journal.clone();
         let checkpoints = self.checkpoints.clone();
         let remote_session = !self.started.ssh_target.is_empty();
         // Subagents cannot be rewound: their parent's checkpoints cover the
@@ -1645,23 +1859,23 @@ impl Actor {
                     _ => None,
                 };
                 let mcp_config = registration.as_ref().map(|r| r.mcp_config());
+                // Which of Claude Code's conversations this turn continues
+                // (and what a new one is told first), as the log has it.
+                let conversation = match log.events_after(&writer.session_id, 0, u32::MAX).await {
+                    Ok(events) => claude_conversation(&writer.session_id, spec_for_claude.as_ref().expect("a Claude Code turn"), &events),
+                    Err(e) => {
+                        error!(session = %writer.session_id, "turn failed: {e:#}");
+                        return None;
+                    }
+                };
                 let inputs = inbox.lock().unwrap().drain();
-                // Claude Code keeps its own history: a side chat's context
-                // goes in as text with the first question.
-                let preamble = (turn == 1 && !seed.is_empty()).then(|| {
-                    format!(
-                        "<conversation-so-far>\n{}\n</conversation-so-far>\n\nThe user branched off the conversation above to ask:",
-                        c6_agent::transcript_text(&seed)
-                    )
-                });
                 let result = crate::claude_code::run_turn(
                     turn,
-                    &writer.session_id,
+                    &conversation,
                     &session_tools.cwd(),
                     &cfg.model,
                     cfg.effort.as_deref(),
                     inputs,
-                    preamble.as_deref(),
                     claude_settings.as_deref(),
                     mcp_config.as_deref(),
                     &sink,
@@ -1765,6 +1979,58 @@ pub(crate) struct BuiltTools {
     pub tools: Vec<Arc<dyn Tool>>,
     pub skills: Vec<Skill>,
     pub errors: Vec<String>,
+}
+
+/// What carbon6's own loop runs a session with: the tool profile of its
+/// model, the tools in it, and the system prompt (the environment section
+/// in `system_prompt`, then SessionStart hook context, memory, task-card
+/// guidance and the skills index). `errors`: setup problems to show.
+pub(crate) struct OwnRuntime {
+    pub profile: ToolProfile,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub prompt: String,
+    pub errors: Vec<String>,
+}
+
+/// Builds `OwnRuntime` for a session working in `local`, at creation
+/// (`source`: "startup") or when it is handed over from Claude Code
+/// ("resume"). `session_id` is whose secrets these are.
+pub(crate) async fn own_runtime(
+    link: &HeadLink,
+    session_id: &str,
+    spec: &CreateSession,
+    local: &Path,
+    labels: &[String],
+    system_prompt: String,
+    source: &str,
+) -> OwnRuntime {
+    let model = spec.model.clone().unwrap_or_default();
+    let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
+    let profile = model_info(provider, &model.model).tool_profile;
+    // Secrets go into MCP servers' configs (and, per turn, commands).
+    let names: Vec<String> = applicable_secrets(spec, labels).into_iter().map(|(n, _)| n).collect();
+    let (secret_values, _) = fetch_secrets(link, session_id, &names).await;
+    let built = build_tools(spec, local, profile, labels, &secret_values).await;
+    let mut prompt = system_prompt;
+    if let Some(h) = crate::hooks::HookRunner::new(session_id, local, &spec.hooks_json, labels)
+        && let Some(context) = h.run("SessionStart", None, serde_json::json!({"source": source})).await.context
+    {
+        prompt.push_str(&format!("\n\n# Session start context (from a SessionStart hook)\n\n{context}"));
+    }
+    prompt.push_str(&context_sections(spec, labels));
+    // When to propose task cards (docs/task-cards.md): an editable prompt.
+    if built.tools.iter().any(|t| c6_tools::knowledge::is_task_card(&t.spec().name)) {
+        let guidance = spec_prompt(spec, "session.task_cards", "");
+        if !guidance.trim().is_empty() {
+            prompt.push_str(TASK_CARDS_HEADING);
+            prompt.push_str(guidance.trim());
+        }
+    }
+    if !built.skills.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
+    }
+    OwnRuntime { profile, tools: built.tools, prompt, errors: built.errors }
 }
 
 fn yes() -> bool {
@@ -2290,5 +2556,219 @@ mod label_tests {
         assert!(other.try_wait().unwrap().is_none(), "another command was stopped");
         other.kill().unwrap();
         let _ = other.wait();
+    }
+}
+
+/// Switching between Claude Code and carbon6's own loop (docs/architecture.md,
+/// "Model switching"): what each runtime gets from the log.
+#[cfg(test)]
+mod handoff_tests {
+    use c6_proto::{AssistantMessage, ContentBlock, Handoff, TurnStarted, Usage, UserMessage, content_block};
+
+    use super::*;
+
+    fn ev(seq: u64, kind: session_event::Kind) -> SessionEvent {
+        SessionEvent { seq, ts_ms: 0, kind: Some(kind) }
+    }
+    fn model(connection: &str, name: &str, kind: &str) -> ModelSpec {
+        ModelSpec { connection_id: connection.into(), model: name.into(), connection_kind: kind.into(), ..Default::default() }
+    }
+    fn user(seq: u64, t: &str) -> SessionEvent {
+        ev(seq, session_event::Kind::User(UserMessage { text: t.into(), ..Default::default() }))
+    }
+    fn assistant(seq: u64, blocks: Vec<content_block::Block>) -> SessionEvent {
+        let blocks = blocks.into_iter().map(|b| ContentBlock { block: Some(b) }).collect();
+        ev(seq, session_event::Kind::Assistant(AssistantMessage { turn: 1, blocks, stop_reason: String::new() }))
+    }
+    fn switched(seq: u64, m: ModelSpec, handoff: Option<Handoff>) -> SessionEvent {
+        ev(seq, session_event::Kind::ModelSwitched(ModelSwitched { model: Some(m), context_window: 0, handoff }))
+    }
+    fn into_claude(id: &str) -> Handoff {
+        Handoff {
+            tool_profile: crate::claude_code::PROFILE.into(),
+            system_prompt: crate::claude_code::SYSTEM_PROMPT.into(),
+            claude_session_id: id.into(),
+            ..Default::default()
+        }
+    }
+    fn into_own() -> Handoff {
+        Handoff { tool_profile: "generic".into(), tools: vec!["bash".into()], system_prompt: "carbon6 prompt".into(), ..Default::default() }
+    }
+    fn texts(history: &[Message]) -> Vec<String> {
+        history
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .map(|b| match b {
+                Block::Text(t) => t.clone(),
+                Block::ToolUse { name, .. } => format!("tool_use:{name}"),
+                Block::ToolResult { content, .. } => format!("tool_result:{content}"),
+                Block::SignedThinking { text, .. } => format!("thinking:{text}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A session on carbon6's loop, handed to Claude Code, then back.
+    fn log() -> Vec<SessionEvent> {
+        let own = model("m", "gpt-x", "openai_compat");
+        vec![
+            ev(
+                1,
+                session_event::Kind::Started(SessionStarted {
+                    model: Some(own.clone()),
+                    tool_profile: "generic".into(),
+                    ..Default::default()
+                }),
+            ),
+            user(2, "fix the cache"),
+            assistant(
+                3,
+                vec![
+                    content_block::Block::SignedThinking(c6_proto::SignedThinking { text: "private plan".into(), signature: "S".into() }),
+                    content_block::Block::ToolUse(c6_proto::ToolUse {
+                        id: "call_1".into(),
+                        name: "bash".into(),
+                        input_json: "{\"command\":\"ls\"}".into(),
+                    }),
+                ],
+            ),
+            ev(
+                4,
+                session_event::Kind::ToolResult(c6_proto::ToolResult {
+                    call_id: "call_1".into(),
+                    tool: "bash".into(),
+                    output: "cache.rs".into(),
+                    ..Default::default()
+                }),
+            ),
+            assistant(5, vec![content_block::Block::Text("Found cache.rs.".into())]),
+            ev(6, session_event::Kind::Usage(Usage { input_tokens: 90_000, ..Default::default() })),
+            switched(7, model("cc", "opus", "claude_code"), Some(into_claude("conv-1"))),
+            user(8, "continue in claude"),
+            ev(9, session_event::Kind::TurnStarted(TurnStarted { turn: 2 })),
+            assistant(
+                10,
+                vec![content_block::Block::ToolUse(c6_proto::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "Edit".into(),
+                    input_json: "{}".into(),
+                })],
+            ),
+            ev(
+                11,
+                session_event::Kind::ToolResult(c6_proto::ToolResult {
+                    call_id: "toolu_1".into(),
+                    tool: "Edit".into(),
+                    output: "edited".into(),
+                    ..Default::default()
+                }),
+            ),
+            assistant(12, vec![content_block::Block::Text("Claude fixed it.".into())]),
+        ]
+    }
+
+    #[test]
+    fn claude_code_gets_a_conversation_of_its_own_with_the_transcript() {
+        let events = log();
+        let spec = CreateSession::default();
+        // Its first turn after the handoff: a new conversation, told the story so far.
+        let first = claude_conversation("session-1", &spec, &events[..8]);
+        assert_eq!((first.id.as_str(), first.resume), ("conv-1", false));
+        let p = first.preamble.unwrap();
+        assert!(p.starts_with("<carbon6-handoff from=\"carbon6's own agent loop (gpt-x)\">"), "{p}");
+        assert!(p.contains("fix the cache") && p.contains("[tool call bash: {\"command\":\"ls\"}]") && p.contains("cache.rs"), "{p}");
+        assert!(p.contains("Found cache.rs.") && p.ends_with("The user now says:"), "{p}");
+        assert!(!p.contains("private plan") && !p.contains("continue in claude"), "{p}");
+        // Later turns resume it.
+        let later = claude_conversation("session-1", &spec, &events);
+        assert_eq!((later.id.as_str(), later.resume), ("conv-1", true));
+        // A session created on Claude Code keeps its own id, as before.
+        let cc = vec![ev(1, session_event::Kind::Started(SessionStarted { tool_profile: "claude_code".into(), ..Default::default() }))];
+        let c = claude_conversation("session-1", &spec, &cc);
+        assert_eq!((c.id.as_str(), c.resume, c.preamble), ("session-1", false, None));
+        let mut cc = cc;
+        cc.push(ev(2, session_event::Kind::TurnStarted(TurnStarted { turn: 1 })));
+        assert!(claude_conversation("session-1", &spec, &cc).resume);
+    }
+
+    #[test]
+    fn back_in_carbon6s_loop_the_past_is_a_transcript_not_history() {
+        let mut events = log();
+        events.push(switched(13, model("m", "gpt-x", "openai_compat"), Some(into_own())));
+        events.push(user(14, "now on gpt again"));
+        let mut spec = CreateSession::default();
+        let conv = conversation_from_log(&mut spec, &events);
+        assert_eq!(spec.model.as_ref().map(|m| m.connection_kind.as_str()), Some("openai_compat"));
+        let t = texts(&conv.history);
+        // One user message: the marked transcript, then what you said since.
+        assert_eq!(conv.history.len(), 1, "{t:?}");
+        assert!(t[0].starts_with("<carbon6-handoff from=\"Claude Code (opus)\">"), "{}", t[0]);
+        for seen in ["fix the cache", "Found cache.rs.", "continue in claude", "[tool call Edit: {}]", "edited", "Claude fixed it."] {
+            assert!(t[0].contains(seen), "{seen} missing: {}", t[0]);
+        }
+        assert_eq!(t[1], "now on gpt again");
+        // No native blocks from before: Claude Code's tool calls, the
+        // first run's reasoning and calls are text only.
+        assert!(!t.iter().any(|b| b.starts_with("tool_use:") || b.starts_with("tool_result:") || b.starts_with("thinking:")), "{t:?}");
+        // The other runtime's context size is not this one's.
+        assert_eq!(conv.context_tokens, 0);
+        // The runtime a reload resumes on: the last handoff's.
+        let started = runtime_of(SessionStarted { tool_profile: "generic".into(), ..Default::default() }, &events[..12]);
+        assert_eq!((started.tool_profile.as_str(), started.system_prompt.as_str()), ("claude_code", crate::claude_code::SYSTEM_PROMPT));
+        let started = runtime_of(started, &events);
+        assert_eq!(
+            (started.tool_profile.as_str(), started.tools.as_slice(), started.system_prompt.as_str()),
+            ("generic", &["bash".to_owned()][..], "carbon6 prompt")
+        );
+    }
+
+    #[test]
+    fn an_imported_claude_code_session_goes_on_in_its_own_conversation() {
+        let started = SessionStarted { command_id: "import-claude_code".into(), ..Default::default() };
+        let imported = vec![
+            ev(1, session_event::Kind::Started(started.clone())),
+            ev(
+                2,
+                session_event::Kind::User(UserMessage {
+                    command_id: "import-2".into(),
+                    text: "fix the build".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(3, session_event::Kind::TurnStarted(TurnStarted { turn: 1 })),
+            assistant(4, vec![content_block::Block::Text("Fixed.".into())]),
+        ];
+        assert!(continues_claude_import(&started, &imported));
+        // Not once carbon6 has run it, nor for Codex's.
+        let mut ran = imported.clone();
+        ran.push(ev(5, session_event::Kind::Checkpoint(c6_proto::Checkpoint::default())));
+        assert!(!continues_claude_import(&started, &ran));
+        let codex = SessionStarted { command_id: "import-codex".into(), ..Default::default() };
+        assert!(!continues_claude_import(&codex, &imported));
+        // Its handoff resumes Claude Code's conversation by the session's
+        // id, with the transcript kept for a Claude Code that lost it.
+        let mut events = imported;
+        let handoff = Handoff { native: true, ..into_claude("session-1") };
+        events.push(switched(5, model("cc", "opus", "claude_code"), Some(handoff)));
+        let c = claude_conversation("session-1", &CreateSession::default(), &events);
+        assert_eq!((c.id.as_str(), c.resume), ("session-1", true));
+        assert!(c.preamble.unwrap().contains("fix the build"));
+    }
+
+    #[test]
+    fn a_switch_within_a_runtime_keeps_the_history_native() {
+        let events = log()[..6].to_vec();
+        let mut events = events;
+        events.push(switched(7, model("m", "gpt-y", "openai_compat"), None));
+        events.push(user(8, "on gpt-y"));
+        let mut spec = CreateSession::default();
+        let conv = conversation_from_log(&mut spec, &events);
+        let t = texts(&conv.history);
+        assert!(!t.iter().any(|b| b.contains("<carbon6-handoff")), "{t:?}");
+        // Tool calls stay native; the other model's signed reasoning goes.
+        assert!(t.contains(&"tool_use:bash".to_owned()) && t.contains(&"tool_result:cache.rs".to_owned()), "{t:?}");
+        assert!(!t.iter().any(|b| b.starts_with("thinking:")), "{t:?}");
+        assert_eq!(conv.context_tokens, 90_000);
+        assert_eq!(runtime_of(SessionStarted { tool_profile: "generic".into(), ..Default::default() }, &events).tool_profile, "generic");
     }
 }

@@ -624,10 +624,12 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     }.into_any(),
                     None => {
                         let row = detail.get().and_then(|d| d.ok()).map(|d| d.session);
+                        // Claude Code runs on the worker itself, not over SSH.
+                        let no_claude_code = row.as_ref().is_some_and(|s| s.ssh.is_some());
                         let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
                         let subagents = SubagentChoice::follow(events, start, choice.current);
                         view! {
-                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files subagents />
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files subagents no_claude_code />
                         }.into_any()
                     }
                 }
@@ -1349,6 +1351,7 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     let start = (session.connection_id.clone(), session.model.clone(), session.effort.clone().unwrap_or_default());
     let choice = ModelChoice::follow(feed.events, start);
     let place = (session.worker_id.to_string(), session.cwd.clone());
+    let no_claude_code = session.ssh.is_some();
     Effect::new(move || {
         let (_, m, e) = choice.current.get();
         model_label.set(self::model_label(&m, &e));
@@ -1356,7 +1359,7 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     view! {
         <div class="space-y-3 pb-2 pt-1">
             <Transcript session feed running />
-            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice files=Signal::derive(move || Some(place.clone())) />
+            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice files=Signal::derive(move || Some(place.clone())) no_claude_code />
         </div>
     }
 }
@@ -1477,10 +1480,16 @@ impl SubagentChoice {
     }
 }
 
-/// Connection select plus a model field that lists the connection's models
-/// and also takes free text.
+/// Connection select plus a model field that lists the connections' models
+/// and also takes free text. `no_claude_code`: leave Claude Code out (it
+/// cannot run there, e.g. over SSH or for subagents).
 #[component]
-fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: RwSignal<String>) -> impl IntoView {
+fn ModelPicker(
+    connection: RwSignal<String>,
+    model: RwSignal<String>,
+    effort: RwSignal<String>,
+    #[prop(optional)] no_claude_code: bool,
+) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     // Effort only where the connection passes it on to the model.
     let supports_effort =
@@ -1495,7 +1504,9 @@ fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: Rw
             connection.set(c);
             model.set(default.unwrap_or_default());
         }>
-            {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|c| {
+            {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
+                .filter(|c| !(no_claude_code && c.kind == "claude_code") || connection.get_untracked() == c.id)
+                .map(|c| {
                 let id = c.id.clone();
                 view! { <option value=c.id.clone() selected=move || connection.get() == id>{c.name.clone()}</option> }
             }).collect_view()}
@@ -1512,6 +1523,14 @@ fn ModelPicker(connection: RwSignal<String>, model: RwSignal<String>, effort: Rw
 /// Reasoning efforts; "" is the model's default.
 const EFFORTS: [(&str, &str); 6] =
     [("", "default effort"), ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh"), ("max", "max")];
+
+/// What a switch between Claude Code and carbon6's own agent does
+/// (docs/architecture.md, "Model switching").
+const HANDOFF_HELP: &str = "Claude Code and carbon6's agent are different runtimes, each with its own tools, system prompt and memory of \
+    the conversation. Switching between them hands the session over: it stays this session, with its log, but the next turn runs on the \
+    other runtime, which gets a transcript of the conversation so far (your messages, the replies, and tool calls with their output, long \
+    ones shortened) as context. Hidden reasoning, provider-side state and unfinished tool calls do not carry over, and you cannot rewind to \
+    before the handoff.";
 
 const SMALL_INPUT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900";
 
@@ -1980,7 +1999,7 @@ fn render_event(
             .into_any()
         }
         EventKind::Error { message } => view! { <ErrorBox message=message.clone() /> }.into_any(),
-        EventKind::ModelSwitched { model, .. } => view! {
+        EventKind::ModelSwitched { model, handoff: None, .. } => view! {
             <p class="flex items-center gap-2 text-xs text-zinc-500">
                 <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
                 {format!("Switched to {model}")}
@@ -1988,6 +2007,25 @@ fn render_event(
             </p>
         }
         .into_any(),
+        // A handoff between runtimes: what the new one was given.
+        EventKind::ModelSwitched { model, handoff: Some(h), .. } => {
+            let runtime = if h.into_claude_code() { "Claude Code".to_owned() } else { format!("carbon6's agent ({} tools)", h.tool_profile) };
+            let shown = (!h.into_claude_code()).then(|| (h.system_prompt.clone(), h.tools.join(", ")));
+            view! {
+                <div class="space-y-1 rounded-md border border-dashed border-amber-300 px-3 py-2 text-xs text-zinc-600 dark:border-amber-900 dark:text-zinc-400">
+                    <p class="font-medium" title=HANDOFF_HELP>{format!("Handed over to {runtime}, on {model} ⓘ")}</p>
+                    <p>"It got the conversation so far as a transcript: your messages, the replies, and tool calls with their output. The other runtime's reasoning and tool state did not carry over."</p>
+                    {shown.map(|(prompt, tools)| view! {
+                        <details>
+                            <summary class="cursor-pointer select-none text-zinc-500">"Its system prompt and tools"</summary>
+                            <p class="mt-1">{tools}</p>
+                            <pre class="mt-1 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt}</pre>
+                        </details>
+                    })}
+                </div>
+            }
+            .into_any()
+        }
         EventKind::Compaction { summary, tokens_before } => view! {
             <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-700">
                 <summary class="cursor-pointer select-none">
@@ -2603,8 +2641,13 @@ fn Composer(
     /// Offer a picker for the model its subagents run on.
     #[prop(optional)]
     subagents: Option<SubagentChoice>,
+    /// Leave Claude Code out of the model picker (an SSH session).
+    #[prop(optional)]
+    no_claude_code: bool,
 ) -> impl IntoView {
     let subagent_id = StoredValue::new(id.clone());
+    // Connection kinds: a switch into or out of Claude Code is a handoff.
+    let kinds = LocalResource::new(api::connections);
     let text = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
     // What you'd likely type next (docs/suggestions.md): fetched when a turn
@@ -2977,10 +3020,25 @@ fn Composer(
                     </button>
                     <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500 sm:flex" class:hidden=move || !model_open.get()>
                         <span>"Model"</span>
-                        <ModelPicker connection=m.connection model=m.model effort=m.effort />
+                        <ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code />
                         {move || {
                             let _ = (m.connection.get(), m.model.get(), m.effort.get());
-                            m.switch().map(|_| view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> })
+                            m.switch().map(|(to, _, _)| {
+                                // Into or out of Claude Code: a handoff, not a switch.
+                                let kinds = kinds.get().and_then(Result::ok).unwrap_or_default();
+                                let is_cc = |id: &str| kinds.iter().any(|c| c.id == id && c.kind == "claude_code");
+                                let (from_cc, to_cc) = (is_cc(&m.current.get_untracked().0), is_cc(&to));
+                                if from_cc == to_cc {
+                                    view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> }.into_any()
+                                } else {
+                                    let (to, from) = if to_cc { ("Claude Code", "carbon6's agent") } else { ("carbon6's agent", "Claude Code") };
+                                    view! {
+                                        <span class="text-amber-600 dark:text-amber-400" title=HANDOFF_HELP>
+                                            {format!("hands over to {to} on send: it gets a transcript of the conversation, not {from}'s reasoning or tool state ⓘ")}
+                                        </span>
+                                    }.into_any()
+                                }
+                            })
                         }}
                     </div>
                 })}
@@ -2996,7 +3054,7 @@ fn Composer(
                     <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500 sm:flex" class:hidden=move || !model_open.get()
                         title="The connection and model the Task tool's subagents run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.">
                         <span>"Subagents"</span>
-                        <ModelPicker connection=s.connection model=s.model effort=s.effort />
+                        <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=true />
                         {move || s.change().map(|req| view! {
                             <button class="text-violet-700 hover:underline dark:text-violet-400" on:click=move |_| set(req.clone())>"Set"</button>
                         })}

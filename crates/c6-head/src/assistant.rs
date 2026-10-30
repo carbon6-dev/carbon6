@@ -333,7 +333,9 @@ impl Actor {
                 }
                 if let Some(m) = input.model.filter(|m| !m.model.is_empty()) {
                     let context_window = info_of(&m).context_window;
-                    self.sink.append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(m.clone()), context_window })).await?;
+                    self.sink
+                        .append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(m.clone()), context_window, handoff: None }))
+                        .await?;
                     if let Some(conv) = &mut self.conv {
                         conv.history = c6_agent::portable_messages(std::mem::take(&mut conv.history));
                     }

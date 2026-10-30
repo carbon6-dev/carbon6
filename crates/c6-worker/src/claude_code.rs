@@ -24,6 +24,9 @@ use tracing::warn;
 /// Tool profile recorded for Claude Code sessions.
 pub const PROFILE: &str = "claude_code";
 
+/// What the log shows as a Claude Code session's system prompt.
+pub const SYSTEM_PROMPT: &str = "(Claude Code's own system prompt)";
+
 /// The `claude` binary: `$C6_CLAUDE_BIN`, then `PATH`, then the usual
 /// install locations (services often run without the user's PATH).
 pub fn find_claude() -> Option<PathBuf> {
@@ -52,17 +55,29 @@ pub struct Observer {
     pub started: SessionStarted,
 }
 
+/// Which Claude Code conversation a turn continues: Claude Code keeps its
+/// own history, resumed by id. A session created on Claude Code uses its
+/// carbon6 id; a session handed over to Claude Code (a switch from
+/// carbon6's own loop) starts a conversation of its own at each handoff.
+pub struct ClaudeConversation {
+    pub id: String,
+    /// It already exists (an earlier turn ran in it): `--resume`.
+    pub resume: bool,
+    /// What a new conversation is told first, before the inputs: a side
+    /// chat's branched-from context, or a handoff's transcript.
+    pub preamble: Option<String>,
+}
+
 /// Runs one Claude Code turn for `inputs`. Inputs that arrive mid-turn are
 /// left in the inbox and start the next turn.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     turn: u64,
-    session_id: &str,
+    conversation: &ClaudeConversation,
     cwd: &Path,
     model: &str,
     effort: Option<&str>,
     inputs: Vec<PendingInput>,
-    preamble: Option<&str>,
     // Hooks from the head, as Claude Code settings JSON.
     settings: Option<&str>,
     // carbon6's subagents as an MCP server (`--mcp-config` JSON).
@@ -72,8 +87,13 @@ pub async fn run_turn(
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
     let texts: Vec<String> = inputs.iter().map(|i| c6_agent::user_text(i.model_text(), &i.attachments)).collect();
-    let prompt: Vec<&str> = preamble.into_iter().chain(texts.iter().map(String::as_str)).collect();
-    let prompt = prompt.join("\n\n");
+    let asked = texts.join("\n\n");
+    // A new conversation gets the preamble first (also when a resume finds
+    // none: the first turn may have failed before Claude Code saved it).
+    let fresh = match conversation.preamble.as_deref() {
+        Some(p) => format!("{p}\n\n{asked}"),
+        None => asked.clone(),
+    };
     for input in inputs {
         sink.append(input.event()).await?;
     }
@@ -84,12 +104,12 @@ pub async fn run_turn(
             fail(sink, "Claude Code (`claude`) is not installed on this worker, or not on its PATH. Install it and sign in with `claude auth login`, or set C6_CLAUDE_BIN.".into()).await?
         }
         Some(bin) => {
-            // The carbon6 session id doubles as Claude Code's session id.
-            let mut reason =
-                run_process(&bin, turn, session_id, cwd, model, effort, settings, mcp_config, &prompt, turn > 1, sink, observer, cancel).await?;
+            let id = conversation.id.as_str();
+            let (resume, prompt) = if conversation.resume { (true, &asked) } else { (false, &fresh) };
+            let mut reason = run_process(&bin, turn, id, cwd, model, effort, settings, mcp_config, prompt, resume, sink, observer, cancel).await?;
             if let Outcome::NoConversation = reason {
                 // The first turn never created the conversation (e.g. it failed early).
-                reason = run_process(&bin, turn, session_id, cwd, model, effort, settings, mcp_config, &prompt, false, sink, observer, cancel).await?;
+                reason = run_process(&bin, turn, id, cwd, model, effort, settings, mcp_config, &fresh, false, sink, observer, cancel).await?;
             }
             match reason {
                 Outcome::Ended(r) => r,
@@ -538,15 +558,16 @@ EOF
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let inputs = vec![PendingInput { command_id: "c1".into(), text: "list files".into(), ..Default::default() }];
-        // Turn 2 tries --resume first; the fake has no conversation, so it falls back.
+        // Turn 2 tries --resume first; the fake has no conversation, so it
+        // falls back to a new one, which gets the preamble.
+        let conversation = ClaudeConversation { id: "0199-session".into(), resume: true, preamble: Some("CONTEXT".into()) };
         let reason = run_turn(
             2,
-            "0199-session",
+            &conversation,
             dir.path(),
             "opus",
             Some("high"),
             inputs,
-            None,
             Some(r#"{"hooks":{}}"#),
             Some(r#"{"mcpServers":{}}"#),
             &sink,
@@ -562,7 +583,7 @@ EOF
             r#"{"mcpServers":{}} 86400000"#,
             "carbon6's subagents are offered over MCP, with time to finish"
         );
-        assert_eq!(std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap(), "list files");
+        assert_eq!(std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap(), "CONTEXT\n\nlist files");
 
         let events = vec_sink.0.lock().unwrap().clone();
         let kinds: Vec<&str> = events

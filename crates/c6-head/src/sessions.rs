@@ -857,6 +857,14 @@ pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) 
     if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(_))) || target[0].seq != req.to_seq {
         return Err(bad_request("can only rewind to before one of your messages"));
     }
+    // A handoff to or from Claude Code cannot be taken back: the other
+    // runtime's conversation would not follow.
+    let since = st.store.events_after(session_id, req.to_seq.saturating_sub(1), i64::MAX).await?;
+    if since.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::ModelSwitched(m)) if m.handoff.is_some())) {
+        return Err(bad_request(
+            "can only rewind to a message after the last switch between Claude Code and carbon6's agent: the other runtime's conversation cannot be taken back",
+        ));
+    }
     let worker_id: WorkerId = session.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
     let data = SessionCommand {
@@ -870,8 +878,11 @@ pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) 
     Ok(())
 }
 
-/// The spec for switching `session` to another model. Claude Code runs a
-/// different agent loop, so a session cannot switch into or out of it.
+/// The spec for switching `session` to another model. A switch between
+/// Claude Code and other connections hands the session over to the other
+/// runtime (docs/architecture.md, "Model switching"): the worker rebuilds
+/// its tools and prompt and passes the conversation on as a transcript.
+/// Claude Code runs only top-level sessions on a worker that has it.
 async fn model_switch(
     st: &HeadState,
     session: &SessionRow,
@@ -886,9 +897,28 @@ async fn model_switch(
         return Err(bad_request(format!("the connection {} is not available to realm {}", to.name, session.realm)));
     }
     let from = st.store.connection(&session.connection_id).await?.map(|c| c.kind).unwrap_or_default();
-    // An imported session has no connection yet: it may take any.
-    if !session.connection_id.is_empty() && (to.kind == "claude_code") != (from == "claude_code") {
-        return Err(bad_request("a session cannot switch between Claude Code and other connections"));
+    if to.kind == "claude_code" && from != "claude_code" {
+        let worker: Option<WorkerId> = session.worker_id.parse().ok();
+        let refusal = if session.parent_call_id.is_some() {
+            Some("subagents run in carbon6's own loop, not on Claude Code".to_owned())
+        } else if !session.ssh_target.is_empty() {
+            Some("Claude Code runs on the worker itself, not over SSH: this session works on another machine".to_owned())
+        } else if worker.is_some() && worker == st.assistant.head_id() {
+            Some("the assistant calls models directly, not through Claude Code".to_owned())
+        } else {
+            // A connected worker says whether it has Claude Code; one that
+            // is away gets the switch with the message, and says so then.
+            match worker.and_then(|w| st.registry.get(w)) {
+                Some(live) if !live.capabilities.iter().any(|c| c == "claude_code") => Some(format!(
+                    "Claude Code (`claude`) is not installed on {}: install it there and sign in, or pick another connection",
+                    if session.worker_name.is_empty() { "this session's worker" } else { &session.worker_name }
+                )),
+                _ => None,
+            }
+        };
+        if let Some(why) = refusal {
+            return Err(bad_request(format!("this session cannot switch to Claude Code: {why}")));
+        }
     }
     Ok(ModelSpec {
         connection_id: connection_id.to_owned(),

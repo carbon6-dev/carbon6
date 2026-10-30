@@ -11,8 +11,8 @@ use c6_proto::{ephemeral_event, session_event};
 
 pub use base_prompt::BASE_PROMPT;
 pub use history::{
-    compacted_context, effective_events, history_from_events, model_text, portable_events, portable_messages, transcript_text, user_blocks,
-    user_text,
+    HANDOFF_BUDGET, compacted_context, effective_events, handoff_context, history_from_events, model_text, portable_events,
+    portable_messages, transcript_text, user_blocks, user_text,
 };
 pub use prompt::build_system_prompt;
 pub use turn::{COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, Conversation, TurnConfig, compact_turn, run_turn};

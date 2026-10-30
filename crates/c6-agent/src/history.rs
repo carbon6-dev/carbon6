@@ -163,6 +163,42 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
     out
 }
 
+/// How much transcript a handoff carries at most (characters); older
+/// steps beyond it are left out, and the text says so.
+pub const HANDOFF_BUDGET: usize = 120_000;
+
+/// The context a session hands to the other runtime (Claude Code, or
+/// carbon6's own loop) when it switches between them: a transcript of the
+/// conversation so far, rebuilt from the log (rewinds and compactions
+/// applied), clearly marked as such. Nothing native carries over: the
+/// earlier runtime's reasoning, provider blocks and tool state stay
+/// behind. `from` names the runtime it leaves. Within `budget` characters,
+/// keeping the most recent steps.
+pub fn handoff_context(events: &[SessionEvent], from: &str, budget: usize) -> String {
+    let mut transcript = transcript_text(&effective_events(events));
+    let total = transcript.chars().count();
+    if total > budget {
+        // Keep the tail, from the first step that starts within it.
+        let skip = total - budget;
+        let start = transcript.char_indices().nth(skip).map_or(transcript.len(), |(i, _)| i);
+        let start = transcript[start..].find("\n## ").map_or(start, |p| start + p);
+        transcript =
+            format!("[{} earlier characters of the transcript left out]\n{}", transcript[..start].chars().count(), &transcript[start..]);
+    }
+    let transcript = transcript.trim();
+    let transcript = if transcript.is_empty() { "(nothing yet)" } else { transcript };
+    format!(
+        "<carbon6-handoff from=\"{from}\">\n\
+         This session was handed over to you from {from} at this point. You did not take part in the conversation below and have \
+         none of its native state: it is a transcript carbon6 rebuilt from the session's log, for context only.\n\
+         - Tool calls in it were made by the earlier runtime with its own tools; their results are as recorded (long ones shortened).\n\
+         - Its hidden reasoning, provider-side state and any unfinished tool calls did not carry over.\n\
+         - The working directory holds everything done so far: check the files rather than trusting the transcript.\n\
+         <transcript>\n{transcript}\n</transcript>\n\
+         </carbon6-handoff>"
+    )
+}
+
 /// A plain-text digest of an in-memory conversation within about `budget`
 /// characters: the most recent steps in full (long tool input and output
 /// shortened), and before them only what the user asked.
@@ -485,5 +521,68 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["parent one", "parent two", "mine one", "mine again"]);
+    }
+
+    #[test]
+    fn a_handoff_is_a_marked_transcript_without_native_state() {
+        let at = |seq: u64, kind: session_event::Kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
+        let user = |t: &str| session_event::Kind::User(UserMessage { command_id: String::new(), text: t.into(), ..Default::default() });
+        let events = vec![
+            at(1, session_event::Kind::Started(Default::default())),
+            at(2, user("fix the cache")),
+            at(
+                3,
+                session_event::Kind::Assistant(AssistantMessage {
+                    turn: 1,
+                    blocks: vec![
+                        ContentBlock {
+                            block: Some(content_block::Block::SignedThinking(c6_proto::SignedThinking {
+                                text: "secret plan".into(),
+                                signature: "SIG-123".into(),
+                            })),
+                        },
+                        ContentBlock {
+                            block: Some(content_block::Block::Reasoning(c6_proto::Reasoning {
+                                id: "rs_1".into(),
+                                encrypted_content: "opaque-blob".into(),
+                                summary: String::new(),
+                            })),
+                        },
+                        ContentBlock { block: Some(content_block::Block::Text("Looking.".into())) },
+                        tool_use("t1"),
+                    ],
+                    stop_reason: "tool_calls".into(),
+                }),
+            ),
+            at(
+                4,
+                session_event::Kind::ToolResult(ToolResult {
+                    call_id: "t1".into(),
+                    tool: "bash".into(),
+                    output: "cache.rs".into(),
+                    ..Default::default()
+                }),
+            ),
+            at(5, user("never mind this")),
+            at(6, session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 5, ..Default::default() })),
+        ];
+        let h = handoff_context(&events, "carbon6's agent (gpt-x)", HANDOFF_BUDGET);
+        assert!(h.starts_with("<carbon6-handoff from=\"carbon6's agent (gpt-x)\">") && h.ends_with("</carbon6-handoff>"), "{h}");
+        assert!(h.contains("for context only") && h.contains("did not carry over"), "{h}");
+        assert!(h.contains("## User\nfix the cache") && h.contains("## Assistant\nLooking.") && h.contains("[tool call bash: {}]"), "{h}");
+        assert!(h.contains("[tool result]\ncache.rs"), "{h}");
+        // Reasoning, signatures and encrypted blocks stay behind; rewinds apply.
+        for gone in ["secret plan", "SIG-123", "opaque-blob", "never mind this"] {
+            assert!(!h.contains(gone), "{gone} leaked: {h}");
+        }
+        // Over budget: the latest steps, and a note on what was left out.
+        let long: Vec<SessionEvent> = (0..200).map(|i| at(i + 1, user(&format!("message {i} {}", "x".repeat(100))))).collect();
+        let h = handoff_context(&long, "Claude Code", 2_000);
+        assert!(
+            h.contains("earlier characters of the transcript left out") && h.contains("message 199") && !h.contains("message 0 "),
+            "{h}"
+        );
+        assert!(h.len() < 3_000, "{}", h.len());
+        assert!(handoff_context(&[], "Claude Code", 100).contains("(nothing yet)"));
     }
 }

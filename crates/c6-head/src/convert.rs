@@ -142,6 +142,11 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 model: spec.model,
                 effort: spec.effort,
                 context_window: m.context_window,
+                handoff: m.handoff.as_ref().map(|h| api::Handoff {
+                    tool_profile: h.tool_profile.clone(),
+                    tools: h.tools.clone(),
+                    system_prompt: h.system_prompt.clone(),
+                }),
             }
         }
         Kind::SubagentModelSet(m) => {
