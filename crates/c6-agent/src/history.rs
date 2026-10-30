@@ -41,6 +41,23 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
     msgs
 }
 
+/// The latest reported request size since compaction or a runtime handoff.
+pub fn context_tokens_from_events(events: &[SessionEvent]) -> u64 {
+    effective_events(events)
+        .iter()
+        .rev()
+        .take_while(|e| match &e.kind {
+            Some(session_event::Kind::Compaction(_)) => false,
+            Some(session_event::Kind::ModelSwitched(m)) => m.handoff.is_none(),
+            _ => true,
+        })
+        .find_map(|e| match &e.kind {
+            Some(session_event::Kind::Usage(u)) => Some(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 /// A user message as model blocks: its text, then each attachment (images
 /// as images; anything else as a file in text).
 /// What the model got for a user message: its text, or the expansion of
@@ -459,6 +476,37 @@ mod tests {
 
     fn ev(kind: session_event::Kind) -> SessionEvent {
         SessionEvent { seq: 0, ts_ms: 0, kind: Some(kind) }
+    }
+
+    #[test]
+    fn restored_usage_follows_compactions_handoffs_and_rewinds() {
+        let usage = |input| {
+            session_event::Kind::Usage(c6_proto::Usage {
+                input_tokens: input,
+                output_tokens: 3,
+                cache_read_tokens: 5,
+                cache_write_tokens: 7,
+                reasoning_tokens: 2,
+                ..Default::default()
+            })
+        };
+        let mut events = vec![ev(usage(100))];
+        assert_eq!(context_tokens_from_events(&events), 115, "reasoning is already counted in output");
+        events.push(ev(session_event::Kind::Compaction(Default::default())));
+        assert_eq!(context_tokens_from_events(&events), 0);
+        events.push(ev(usage(20)));
+        assert_eq!(context_tokens_from_events(&events), 35);
+        events.push(ev(usage(50)));
+        for (i, event) in events.iter_mut().enumerate() {
+            event.seq = i as u64 + 1;
+        }
+        events.push(ev(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 4, ..Default::default() })));
+        assert_eq!(context_tokens_from_events(&events), 35);
+        events.push(ev(session_event::Kind::ModelSwitched(c6_proto::ModelSwitched {
+            handoff: Some(Default::default()),
+            ..Default::default()
+        })));
+        assert_eq!(context_tokens_from_events(&events), 0);
     }
 
     fn tool_use(id: &str) -> ContentBlock {

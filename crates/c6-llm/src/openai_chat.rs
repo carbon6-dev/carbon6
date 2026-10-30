@@ -358,7 +358,7 @@ impl StreamState {
                 }
             }
             if let Some(r) = choice.finish_reason {
-                self.finish_reason = Some(r);
+                self.finish_reason = Some(if r == "length" { crate::stop::MAX_TOKENS.into() } else { r });
             }
         }
     }
@@ -499,6 +499,25 @@ mod tests {
             web_search: false,
             json: true,
         }
+    }
+
+    #[tokio::test]
+    async fn length_finish_reason_is_normalized() {
+        use c6_testkit::{MockLlm, Reply, within};
+
+        let mock = MockLlm::start().await;
+        mock.push(Reply::Truncated { reasoning: "think".into(), text: "unfinished".into() });
+        let client = OpenAiChat::new(&mock.base_url(), "", HashMap::new()).unwrap();
+        within("the truncated response", async {
+            let mut stream = client.stream(&json_request("high")).await.unwrap();
+            let mut acc = Accumulator::default();
+            while let Some(event) = stream.next().await {
+                acc.push(&event.unwrap());
+            }
+            assert_eq!(acc.stop_reason.as_deref(), Some(crate::stop::MAX_TOKENS));
+            assert_eq!(acc.finish(true).blocks, vec![Block::Thinking("think".into()), Block::Text("unfinished".into())]);
+        })
+        .await;
     }
 
     async fn after_rejections(errors: &[(u16, &str)], effort: &str) -> Vec<Value> {

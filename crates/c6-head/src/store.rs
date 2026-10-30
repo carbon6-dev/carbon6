@@ -371,6 +371,7 @@ pub struct ConnectionRow {
     pub base_url: String,
     pub api_key: Option<Vec<u8>>,
     pub default_model: Option<String>,
+    pub context_window: Option<i64>,
     pub created_at: i64,
     /// The realms it is available to (JSON array; empty: all).
     pub realms: String,
@@ -381,7 +382,7 @@ pub struct ConnectionRow {
 impl Store {
     pub async fn insert_connection(&self, c: &ConnectionRow) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at, members) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at, members, context_window) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&c.id)
         .bind(&c.name)
@@ -391,16 +392,18 @@ impl Store {
         .bind(&c.default_model)
         .bind(c.created_at)
         .bind(&c.members)
+        .bind(c.context_window)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Renames a connection, and (a pool's) sets its members.
-    pub async fn update_connection(&self, id: &str, name: &str, members: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE connections SET name = ?, members = ? WHERE id = ?")
+    /// Sets a connection's name, members and optional context window.
+    pub async fn update_connection(&self, id: &str, name: &str, members: &str, context_window: Option<i64>) -> anyhow::Result<()> {
+        sqlx::query("UPDATE connections SET name = ?, members = ?, context_window = ? WHERE id = ?")
             .bind(name)
             .bind(members)
+            .bind(context_window)
             .bind(id)
             .execute(&self.pool)
             .await?;

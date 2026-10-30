@@ -1608,6 +1608,17 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
 }
 
 #[component]
+fn ContextWindow(value: RwSignal<String>) -> impl IntoView {
+    view! {
+        <label class="block text-xs text-zinc-500">
+            "Context window"
+            <input type="number" min="1024" max="100000000" step="1" class=format!("mt-1 {INPUT}") placeholder="empty: automatic"
+                prop:value=move || value.get() on:input=move |ev| value.set(event_target_value(&ev)) />
+        </label>
+    }
+}
+
+#[component]
 fn ConnectionRow(
     c: Connection,
     all: Signal<Vec<Connection>>,
@@ -1615,12 +1626,20 @@ fn ConnectionRow(
     error: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let pool = c.kind == "pool";
+    let editable = c.kind != "claude_code";
+    let context_window = RwSignal::new(c.context_window.map(|n| n.to_string()).unwrap_or_default());
     let members = RwSignal::new(c.members.clone());
     let editing = RwSignal::new(false);
     let save_id = c.id.clone();
     let save = move |_| {
         let id = save_id.clone();
-        let req = c6_api::UpdateConnection { name: None, members: Some(members.get_untracked()) };
+        let window = context_window.get_untracked();
+        let window = if window.trim().is_empty() { Ok(0) } else { window.parse::<u64>() };
+        let Ok(window) = window else {
+            error.set(Some("context window must be a whole number".into()));
+            return;
+        };
+        let req = c6_api::UpdateConnection { name: None, members: pool.then(|| members.get_untracked()), context_window: Some(window) };
         spawn_local(async move {
             match api::update_connection(id, req).await {
                 Ok(_) => {
@@ -1685,7 +1704,7 @@ fn ConnectionRow(
                     {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code" | "pool", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
             </div>
-            {pool.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
+            {editable.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
             {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}
             <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=test>"Test"</button>
             <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=remove>"Delete"</button>
@@ -1693,8 +1712,9 @@ fn ConnectionRow(
         {move || reauth.get().then(|| view! { <ChatGptSignIn on_added=move || { reauth.set(false); on_change(); } again=again_id.clone() /> })}
         {move || editing.get().then(|| view! {
             <div class="space-y-2 px-4 pb-3">
-                <PoolMembers members all />
-                <div class="flex justify-end"><button class=BUTTON on:click=save.clone()>"Save members"</button></div>
+                {pool.then(|| view! { <PoolMembers members all /> })}
+                {editable.then(|| view! { <ContextWindow value=context_window /> })}
+                <div class="flex justify-end"><button class=BUTTON on:click=save.clone()>"Save"</button></div>
             </div>
         })}
     }
@@ -1709,6 +1729,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
     let base_url = RwSignal::new(String::new());
     let api_key = RwSignal::new(String::new());
     let default_model = RwSignal::new(String::new());
+    let context_window = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     // Result of "Test connection": the server's models, or why it failed.
@@ -1738,6 +1759,13 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
     };
 
     let add = move |_| {
+        let window = context_window.get_untracked();
+        let window =
+            if kind.get_untracked() == "claude_code" || window.trim().is_empty() { Ok(None) } else { window.parse::<u64>().map(Some) };
+        let Ok(window) = window else {
+            error.set(Some("context window must be a whole number".into()));
+            return;
+        };
         pending.set(true);
         let req = CreateConnection {
             kind: Some(kind.get_untracked()),
@@ -1745,6 +1773,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
             base_url: base_url.get_untracked(),
             api_key: Some(api_key.get_untracked()).filter(|k| !k.is_empty()),
             default_model: Some(default_model.get_untracked()).filter(|m| !m.is_empty()),
+            context_window: window,
             members: if kind.get_untracked() == "pool" { members.get_untracked() } else { Vec::new() },
         };
         spawn_local(async move {
@@ -1755,6 +1784,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                     base_url.set(String::new());
                     api_key.set(String::new());
                     default_model.set(String::new());
+                    context_window.set(String::new());
                     members.set(vec![PoolMember { connection_id: String::new(), slots: 1 }]);
                     tested.set(None);
                     on_added();
@@ -1820,6 +1850,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                         placeholder=Signal::derive(move || if matches!(tested.get(), Some(Ok(_))) { "pick or type a model".to_owned() } else { by_kind("claude-opus-5-5", "gpt-5.5", "qwen3.6:27b").get().to_owned() }) /></div>
                 </label>
             </div>
+            {move || (kind.get() != "claude_code").then(|| view! { <ContextWindow value=context_window /> })}
             {move || tested.get().map(|r| match r {
                 Ok(models) => view! {
                     <p class="text-sm text-emerald-700 dark:text-emerald-400">

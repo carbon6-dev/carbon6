@@ -46,7 +46,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             model: s.model.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
             effort: s.model.as_ref().map(|m| m.effort.clone()).unwrap_or_default(),
         },
-        Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn },
+        Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn, context_window: t.context_window },
         Kind::Assistant(a) => api::EventKind::Assistant {
             turn: a.turn,
             blocks: a

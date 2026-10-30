@@ -44,6 +44,8 @@ pub struct HeadLink {
     /// By (session, connection). In memory only: credentials are never
     /// written to disk on workers.
     cache: Mutex<HashMap<(String, String), CredentialGrant>>,
+    /// Invalidations also discard fills that started before them.
+    cache_generation: AtomicU64,
     next_request: AtomicU64,
     calls: Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>,
 }
@@ -137,6 +139,31 @@ impl HeadLink {
         self.credential_with(session_id, connection_id, false).await
     }
 
+    /// Forget grants after a connection changes in the head's process.
+    pub fn forget_connection(&self, connection_id: &str) {
+        let mut cache = self.cache.lock().unwrap();
+        self.cache_generation.fetch_add(1, Ordering::Relaxed);
+        cache.retain(|(_, id), _| id != connection_id);
+    }
+
+    /// The window for this turn or recorded model; unavailable credentials
+    /// and unknown servers keep the built-in figure. Claude Code is unchanged.
+    pub async fn context_window(&self, session_id: &str, model: &c6_proto::ModelSpec) -> u64 {
+        let built_in = c6_llm::window::built_in(&model.connection_kind, &model.model);
+        if model.connection_kind == "claude_code" {
+            return built_in;
+        }
+        let Ok(g) = self.session_credential(session_id, &model.connection_id).await else { return built_in };
+        let e = c6_llm::pool::Endpoint {
+            kind: g.kind,
+            base_url: g.base_url,
+            bearer: g.bearer,
+            headers: g.headers,
+            context_window: g.context_window,
+        };
+        c6_llm::window::known(&model.connection_id, &model.model, &e).await.unwrap_or(built_in)
+    }
+
     /// The pool a connection is, when the head is in this process and it is
     /// one (pools are only for what runs in the head).
     pub async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
@@ -153,7 +180,10 @@ impl HeadLink {
     async fn credential_with(&self, session_id: &str, connection_id: &str, refresh: bool) -> anyhow::Result<CredentialGrant> {
         let now = c6_core::now_ms();
         let key = (session_id.to_owned(), connection_id.to_owned());
-        let cached = self.cache.lock().unwrap().get(&key).cloned();
+        let (cached, generation) = {
+            let cache = self.cache.lock().unwrap();
+            (cache.get(&key).cloned(), self.cache_generation.load(Ordering::Relaxed))
+        };
         if let Some(g) = &cached
             && (g.expires_at_ms == 0 || g.expires_at_ms - EXPIRY_MARGIN_MS > now)
         {
@@ -165,7 +195,7 @@ impl HeadLink {
             if !grant.error.is_empty() {
                 bail!("head refused credentials: {}", grant.error);
             }
-            self.cache.lock().unwrap().insert(key, grant.clone());
+            self.cache_grant(key, &grant, generation);
             return Ok(grant);
         }
         let tx = self.outbound.lock().unwrap().clone();
@@ -189,8 +219,15 @@ impl HeadLink {
         if !grant.error.is_empty() {
             bail!("head refused credentials: {}", grant.error);
         }
-        self.cache.lock().unwrap().insert(key, grant.clone());
+        self.cache_grant(key, &grant, generation);
         Ok(grant)
+    }
+
+    fn cache_grant(&self, key: (String, String), grant: &CredentialGrant, generation: u64) {
+        let mut cache = self.cache.lock().unwrap();
+        if self.cache_generation.load(Ordering::Relaxed) == generation {
+            cache.insert(key, grant.clone());
+        }
     }
 
     pub(crate) fn on_grant(&self, grant: CredentialGrant) {
@@ -295,6 +332,50 @@ mod tests {
         push_merged(&mut v, text("b", 1, "y"));
         assert_eq!(v.len(), 4);
         assert_eq!(v[0], text("a", 1, "Hello"));
+    }
+
+    #[tokio::test]
+    async fn invalidation_discards_a_local_credential_fill_in_flight() {
+        struct Head {
+            window: AtomicU64,
+            calls: AtomicU64,
+            started: tokio::sync::Notify,
+            resume: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("unused".into())
+            }
+            async fn credential(&self, connection_id: &str) -> CredentialGrant {
+                let context_window = self.window.load(Ordering::Relaxed);
+                if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                }
+                CredentialGrant { connection_id: connection_id.into(), context_window, ..Default::default() }
+            }
+        }
+        let head = Arc::new(Head {
+            window: AtomicU64::new(16_384),
+            calls: AtomicU64::new(0),
+            started: Default::default(),
+            resume: Default::default(),
+        });
+        let link = Arc::new(HeadLink::local(head.clone()));
+        let pending = {
+            let link = link.clone();
+            tokio::spawn(async move { link.credential("c").await.unwrap() })
+        };
+        c6_testkit::within("the old credential fetch to start", head.started.notified()).await;
+        head.window.store(32_768, Ordering::Relaxed);
+        link.forget_connection("c");
+        // Cache the new grant before allowing the old fetch to finish.
+        assert_eq!(link.credential("c").await.unwrap().context_window, 32_768);
+        head.resume.notify_one();
+        assert_eq!(c6_testkit::within("the old credential fetch to finish", pending).await.unwrap().context_window, 16_384);
+        assert_eq!(link.credential("c").await.unwrap().context_window, 32_768);
+        assert_eq!(head.calls.load(Ordering::Relaxed), 2);
     }
 
     /// A token the provider refuses (401) is traded for a new one from the

@@ -10,6 +10,7 @@ pub mod openai_chat;
 pub mod openai_responses;
 pub mod pool;
 mod sse;
+pub mod window;
 
 use std::time::Duration;
 

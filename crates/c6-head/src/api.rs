@@ -425,6 +425,7 @@ fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
         kind: c.kind,
         base_url: c.base_url,
         default_model: c.default_model,
+        context_window: c.context_window.map(|n| n as u64),
         has_api_key: c.api_key.is_some(),
         created_at: c.created_at,
         realms: serde_json::from_str(&c.realms).unwrap_or_default(),
@@ -441,6 +442,7 @@ async fn list_connections(State(st): State<Arc<HeadState>>, Extension(caller): E
 }
 
 async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateConnection>) -> ApiResult<Json<api::Connection>> {
+    let context_window = checked_context_window(req.context_window)?;
     let kind = req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()).unwrap_or("openai_compat");
     if kind == crate::pools::KIND {
         return Ok(Json(create_pool(&st, &req).await?));
@@ -472,6 +474,7 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         kind: kind.to_owned(),
         base_url: base_url.to_owned(),
         api_key,
+        context_window,
         default_model: req.default_model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
         created_at: now_ms(),
         realms: "[]".into(),
@@ -479,6 +482,16 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
     };
     st.store.insert_connection(&row).await?;
     Ok(Json(connection_view(row)))
+}
+
+/// Zero restores automatic; other values are token counts.
+fn checked_context_window(n: Option<u64>) -> anyhow::Result<Option<i64>> {
+    let n = n.filter(|n| *n != 0);
+    anyhow::ensure!(
+        n.is_none_or(|n| (1_024..=100_000_000).contains(&n)),
+        crate::bad_request("context window must be between 1,024 and 100,000,000 tokens, or 0 for automatic")
+    );
+    Ok(n.map(|n| n as i64))
 }
 
 /// A pool (docs/pools.md): other connections, each with its calls at once.
@@ -495,6 +508,7 @@ async fn create_pool(st: &HeadState, req: &api::CreateConnection) -> anyhow::Res
         kind: crate::pools::KIND.into(),
         base_url: String::new(),
         api_key: None,
+        context_window: checked_context_window(req.context_window)?,
         default_model: req.default_model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned),
         created_at: now_ms(),
         realms: "[]".into(),
@@ -526,7 +540,14 @@ async fn update_connection(
         }
         None => c.members.clone(),
     };
-    st.store.update_connection(&id, &name, &members).await?;
+    let context_window = match req.context_window {
+        Some(n) => checked_context_window(Some(n))?,
+        None => c.context_window,
+    };
+    st.store.update_connection(&id, &name, &members, context_window).await?;
+    if let Some(link) = st.local_link.get() {
+        link.forget_connection(&id);
+    }
     let row = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
     Ok(Json(connection_view(row)))
 }
@@ -602,6 +623,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         base_url: crate::oauth::RESOURCE.into(),
         api_key: Some(secret),
         default_model: None,
+        context_window: None,
         created_at: now_ms(),
         realms: "[]".into(),
         members: "[]".into(),
@@ -646,6 +668,9 @@ fn html_escape(s: &str) -> String {
 async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if !st.store.delete_connection(&id).await? {
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such connection".into()));
+    }
+    if let Some(link) = st.local_link.get() {
+        link.forget_connection(&id);
     }
     Ok(StatusCode::NO_CONTENT)
 }

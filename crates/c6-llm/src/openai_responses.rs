@@ -298,6 +298,19 @@ mod tests {
     use crate::{Accumulator, Message, ToolSpec};
 
     #[test]
+    fn incomplete_output_limit_is_normalized() {
+        let mut st = State::new(futures::stream::empty().boxed());
+        st.handle(
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        );
+        let mut acc = Accumulator::default();
+        for e in &st.pending {
+            acc.push(e.as_ref().unwrap());
+        }
+        assert_eq!(acc.stop_reason.as_deref(), Some(crate::stop::MAX_TOKENS));
+    }
+
+    #[test]
     fn parses_reasoning_call_and_usage() {
         let mut st = State::new(futures::stream::empty().boxed());
         for e in [

@@ -75,21 +75,43 @@ pub async fn ask(
         via: String::new(),
     };
     let limits = *m.call_limits.lock().unwrap();
-    let client: Box<dyn c6_llm::ModelClient> = match m.link.pool(&task.connection_id).await {
-        Some(pool) => Box::new(c6_llm::pool::PoolClient::new(pool, &m.realm, origin).with_limits(limits)),
+    let (client, window): (Box<dyn c6_llm::ModelClient>, Option<u64>) = match m.link.pool(&task.connection_id).await {
+        Some(pool) => {
+            let window = pool.known_context_window(&task.model, &m.realm).await;
+            (Box::new(c6_llm::pool::PoolClient::new(pool, &m.realm, origin).with_limits(limits)), window)
+        }
         None => {
             let grant = m.link.credential(&task.connection_id).await?;
-            let client = c6_llm::client_for(&grant.kind, &grant.base_url, &grant.bearer, grant.headers.clone())?;
-            c6_llm::activity::track(c6_llm::limit::limited(client, limits), origin)
+            let endpoint = c6_llm::pool::Endpoint {
+                kind: grant.kind,
+                base_url: grant.base_url,
+                bearer: grant.bearer,
+                headers: grant.headers,
+                context_window: grant.context_window,
+            };
+            let window = c6_llm::window::known(&task.connection_id, &task.model, &endpoint).await;
+            let client = c6_llm::client_for(&endpoint.kind, &endpoint.base_url, &endpoint.bearer, endpoint.headers)?;
+            (c6_llm::activity::track(c6_llm::limit::limited(client, limits), origin), window)
         }
     };
     let effort = task.effort.clone().filter(|e| !e.is_empty());
+    let mut limit = output_limit(max_tokens, effort.as_deref());
+    if let Some(window) = window {
+        let prompt = estimate_prompt(system, &user);
+        let room = window.saturating_sub(prompt);
+        anyhow::ensure!(
+            room >= u64::from(max_tokens),
+            "the prompt (about {prompt} tokens) leaves no room for a {max_tokens}-token answer in {}'s {window}-token context window",
+            task.model
+        );
+        limit = u64::from(limit).min(room) as u32;
+    }
     let req = ModelRequest {
         model: task.model.clone(),
         system: system.to_owned(),
         messages: vec![Message { role: Role::User, blocks: user }],
         tools: Vec::new(),
-        max_output_tokens: Some(output_limit(max_tokens, effort.as_deref())),
+        max_output_tokens: Some(limit),
         cache_key: None,
         effort,
         web_search: false,
@@ -115,6 +137,21 @@ pub async fn ask(
     };
     anyhow::ensure!(!text.trim().is_empty(), "{} gave no answer (a thinking model may have spent its output tokens thinking)", task.model);
     Ok(text)
+}
+
+/// Estimate text at three characters per token, plus 1,024 per image and
+/// 256 for the chat template. Other blocks use their serialized text size.
+fn estimate_prompt(system: &str, user: &[Block]) -> u64 {
+    let mut chars = system.chars().count() as u64;
+    let mut images = 0;
+    for block in user {
+        match block {
+            Block::Text(text) => chars += text.chars().count() as u64,
+            Block::Image { .. } => images += 1,
+            _ => chars += serde_json::to_string(block).unwrap_or_default().chars().count() as u64,
+        }
+    }
+    chars.div_ceil(3) + images * 1_024 + 256
 }
 
 async fn answer(client: &dyn c6_llm::ModelClient, req: &ModelRequest) -> anyhow::Result<String> {
@@ -211,6 +248,12 @@ mod tests {
         assert!(matches!(error.downcast_ref::<c6_llm::LlmError>(), Some(c6_llm::LlmError::Unavailable(_))));
         assert!(super::transient(&error));
         assert!(futures_util::poll!(reading.as_mut()).is_pending());
+    }
+
+    #[test]
+    fn prompt_estimate_counts_characters_and_images() {
+        let user = [super::Block::Text("文".repeat(6)), super::Block::Image { media_type: "image/png".into(), data: vec![0; 10] }];
+        assert_eq!(super::estimate_prompt("sys", &user), 3 + 1_024 + 256);
     }
 
     #[test]

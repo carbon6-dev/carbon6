@@ -1663,6 +1663,7 @@ pub async fn credential_for(st: &HeadState, worker_id: Option<WorkerId>, worker_
         }
         info!(worker = %worker_name, %session, connection = %conn.id, "credentials given");
     }
+    grant.context_window = conn.context_window.unwrap_or_default() as u64;
     grant.kind = conn.kind.clone();
     grant.base_url = conn.base_url.clone();
     if conn.kind == "chatgpt" {
