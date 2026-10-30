@@ -21,5 +21,9 @@ runs:
         trunk=$(sed -n 's/^ARG TRUNK_VERSION=//p' docker/Dockerfile)
         arch=$(uname -m | sed 's/^arm64$/aarch64/')
         case $RUNNER_OS in macOS) os=apple-darwin ;; *) os=unknown-linux-gnu ;; esac
-        curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v$trunk/trunk-$arch-$os.tar.gz" | tar -xz -C "$HOME/.cargo/bin" trunk
-        trunk --version
+        # A folder of its own: some runners' Rust has no ~/.cargo/bin.
+        bin="$RUNNER_TEMP/trunk-bin"
+        mkdir -p "$bin"
+        curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v$trunk/trunk-$arch-$os.tar.gz" | tar -xz -C "$bin" trunk
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/trunk" --version
