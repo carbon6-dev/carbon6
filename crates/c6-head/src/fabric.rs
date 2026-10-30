@@ -55,6 +55,7 @@ pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::
             let kind = params["type"].as_str().unwrap_or_default().to_owned();
             let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
             crate::triggers::on_memex_event(st, &realm, &kind, &params["data"]).await;
+            crate::work::on_memex_event(st, &kind, &params["data"]).await;
             // Realms granted reads of that knowledge hear it too.
             let item_kind = match kind.as_str() {
                 "mail.received" => "email",
@@ -181,6 +182,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 crate::commons::from_session(st, &target, &realm, &params).await
             }
             "openapi" => Ok(crate::catalog::openapi(&crate::notify::api_urls(st).await)),
+            // The work it belongs to (docs/work.md §4).
+            "work" => crate::work::for_session(st, &target, &params).await,
             // Collections, in the session's realm (docs/os.md §4.1).
             "collections" | "records_query" | "records_get" | "records_put" | "records_delete" => {
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());

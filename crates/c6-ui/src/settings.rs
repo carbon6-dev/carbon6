@@ -55,6 +55,7 @@ const GROUPS: &[(&str, &[Page])] = &[
             ("workflows", "Workflows", "Steps of templates, approvals and notices"),
             ("triggers", "Triggers", "Schedules, webhooks and events that start work"),
             ("views", "Views", "Tables, boards, charts, feeds and pages of each realm"),
+            ("work", "Work", "What you've left open: guesses, notes, nudges"),
         ],
     ),
     (
@@ -285,6 +286,10 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     "web-search" => view! {
                         <OwnOrRoot name="web-search" />
                         <WebSearchSetting />
+                    }.into_any(),
+                    "work" => view! {
+                        <OwnOrRoot name="work" />
+                        <WorkSetting />
                     }.into_any(),
                     "suggestions" => view! {
                         <OwnOrRoot name="suggestions" />
@@ -1219,6 +1224,62 @@ fn SuggestionsSetting() -> impl IntoView {
                 <input type="checkbox" prop:checked=move || on.get() on:change=toggle />
                 "Suggest next messages"
             </label>
+            {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
+        </section>
+    }
+}
+
+/// How work behaves (docs/work.md): the agent's guesses and notes, when
+/// work has gone quiet, and nudges.
+#[component]
+fn WorkSetting() -> impl IntoView {
+    let shown = RwSignal::new(None::<c6_api::work::WorkSettings>);
+    let loaded = LocalResource::new(move || {
+        api::realm().track();
+        api::get_setting("work")
+    });
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            shown.set(serde_json::from_value(v).ok());
+        }
+    });
+    let error = RwSignal::new(None::<String>);
+    let save = move |change: &dyn Fn(&mut c6_api::work::WorkSettings)| {
+        let Some(mut s) = shown.get_untracked() else { return };
+        change(&mut s);
+        shown.set(Some(s.clone()));
+        spawn_local(async move {
+            error.set(api::put_setting("work", serde_json::to_value(&s).unwrap_or_default()).await.err());
+        });
+    };
+    let number = |v: String| v.trim().parse::<u32>().ok().filter(|n| *n > 0);
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">"Work"</h2>
+            <p class="text-sm text-zinc-500">"What you mean to finish, with the sessions, requests and links that belong to it (the Work panel). A small model call when you start a session (which work it serves) and when something attached moves (where it stands, and whether it looks done): a routing rule with the label task:work picks the model, else the session's own. The prompts are work.attach, work.summary, work.pickup and work.propose."</p>
+            {move || shown.get().map(|s| view! {
+                <label class="flex items-center gap-2 text-sm">
+                    <input type="checkbox" prop:checked=s.guess on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.guess = on) } />
+                    "An agent picks the work each new session serves (you can change it in the session's header)"
+                </label>
+                <label class="flex items-center gap-2 text-sm">
+                    <input type="checkbox" prop:checked=s.notes on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.notes = on) } />
+                    "An agent keeps each piece of work's \"where was I\" note and says when it looks done"
+                </label>
+                <label class="flex items-center gap-2 text-sm">
+                    "Gone quiet after"
+                    <input type="number" min="1" max="90" class=format!("{INPUT} w-20!") prop:value=s.quiet_days.to_string()
+                        on:change=move |ev| if let Some(n) = number(event_target_value(&ev)) { save(&|s| s.quiet_days = n) } />
+                    "days without movement"
+                </label>
+                <label class="flex items-center gap-2 text-sm">
+                    <input type="checkbox" prop:checked=s.nudge on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.nudge = on) } />
+                    "Notify me when work goes quiet, or has needed me for"
+                    <input type="number" min="1" max="720" class=format!("{INPUT} w-20!") prop:value=s.needs_hours.to_string()
+                        on:change=move |ev| if let Some(n) = number(event_target_value(&ev)) { save(&|s| s.needs_hours = n) } />
+                    "hours"
+                </label>
+            })}
             {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
         </section>
     }

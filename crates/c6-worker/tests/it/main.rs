@@ -57,6 +57,7 @@ mod updates;
 mod usage;
 mod views;
 mod websearch;
+mod work;
 mod worker_access;
 mod workflows;
 

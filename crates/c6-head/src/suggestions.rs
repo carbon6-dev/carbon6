@@ -126,7 +126,7 @@ async fn model_for(st: &HeadState, row: &crate::store::SessionRow) -> anyhow::Re
 
 /// The last exchanges, as the model reads them: your messages, the agent's
 /// final words, and which tools it used (never their output).
-async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -> anyhow::Result<String> {
+pub(crate) async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -> anyhow::Result<String> {
     let mut turns: Vec<String> = Vec::new();
     let mut end = last_seq;
     let mut size = 0;

@@ -13,7 +13,7 @@ use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox};
 use crate::workspace::{Go, View};
 
 /// Tomorrow at 9, or next Monday at 9, in your time.
-fn at_nine(days: u32) -> i64 {
+pub(crate) fn at_nine(days: u32) -> i64 {
     let d = js_sys::Date::new_0();
     d.set_date(d.get_date() + days);
     d.set_hours(9);
@@ -318,6 +318,8 @@ pub fn BriefPage() -> impl IntoView {
                             {move || queue.get().into_iter().enumerate().filter(|(_, r)| r.category == "first_contact").map(|(i, r)| view! { <Row r i picked b /> }).collect_view()}
                         </Section>
                     })}
+                    // Work you left open that needs you or went quiet (docs/work.md §7).
+                    <crate::work::LeftOpen />
                     <div class="grid gap-5 md:grid-cols-2">
                         <Section title="You owe" empty="No promises of yours open.">
                             {move || commitments.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.who == "me").take(6).map(|c| view! { <Owed c b /> }).collect_view()}
@@ -496,6 +498,7 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                     </p>
                     {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", crate::when::full(d))}</p> })}
                     <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
+                    <crate::work::RequestWork id title=if r.person_name.is_empty() { r.title.clone() } else { format!("{}: {}", r.person_name, r.title) } />
                 </div>
                 // A mail thread shows its senders' cards itself.
                 {(r.person.contains('@') && !r.sources.iter().any(|s| s.kind == "mail")).then(|| view! { <crate::understanding::Cards params=json!({"address": r.person.clone()}) /> })}
@@ -532,6 +535,7 @@ fn choices(text: &str) -> Vec<(String, Vec<String>)> {
 #[component]
 fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     let id = r.id;
+    let about = if r.person_name.is_empty() { r.title.clone() } else { format!("{}: {}", r.person_name, r.title) };
     let draft = RwSignal::new(r.draft.clone().filter(|d| d.error.is_none()));
     let failed = r.draft.as_ref().and_then(|d| d.error.clone());
     let text = RwSignal::new(r.draft.as_ref().map(|d| d.text.clone()).unwrap_or_default());
@@ -614,7 +618,7 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                     </div>
                 }.into_any(),
             }}
-            <crate::compose::WorkInSession key=format!("request:{id}") current=text set=Callback::new(move |t: String| {
+            <crate::compose::WorkInSession key=format!("request:{id}") about current=text set=Callback::new(move |t: String| {
                 text.set(t);
                 // Not drafted before: the session's draft, with where it goes.
                 if draft.get_untracked().is_none() {

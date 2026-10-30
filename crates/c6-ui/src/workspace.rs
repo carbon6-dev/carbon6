@@ -5,8 +5,9 @@
 //!
 //! A tile has at most two panes: a list (or whatever it was opened on) and
 //! the item opened from it. One rule: a click inside a tile opens in that
-//! tile's right pane; the header's navigation replaces the whole tile; only
-//! ⌘/Ctrl-click (or a tile's ⧉) makes a new tile. Each tile keeps its own
+//! tile's right pane; the header's navigation opens a tile of its own (the
+//! one already showing it, else a new one); ⌘/Ctrl-click (or a tile's ⧉)
+//! makes a new tile. Each tile keeps its own
 //! back and forward history (⌘[ and ⌘]).
 //!
 //! On a phone one tile shows at a time (a switcher at the bottom) and one
@@ -76,6 +77,11 @@ pub enum View {
     Contacts,
     Photos,
     Decisions,
+    /// Work you mean to finish (docs/work.md); with an id, that piece.
+    Work {
+        #[serde(default)]
+        id: String,
+    },
     /// Collections; one by name, or (empty) the list.
     Collections {
         #[serde(default)]
@@ -176,6 +182,8 @@ impl View {
             View::Contacts => "/contacts".into(),
             View::Photos => "/photos".into(),
             View::Decisions => "/decisions".into(),
+            View::Work { id } if id.is_empty() => "/work".into(),
+            View::Work { id } => format!("/work/{id}"),
             View::Collections { name } if name.is_empty() => "/collections".into(),
             View::Collections { name } => format!("/collections/{name}"),
             View::Realms => "/realms".into(),
@@ -270,6 +278,8 @@ impl View {
             ["contacts"] => View::Contacts,
             ["photos"] => View::Photos,
             ["decisions"] | ["todos"] => View::Decisions,
+            ["work"] => View::Work { id: String::new() },
+            ["work", id] => View::Work { id: (*id).to_owned() },
             ["collections"] => View::Collections { name: String::new() },
             ["collections", name] => View::Collections { name: (*name).to_owned() },
             ["views", name] => View::App { name: (*name).to_owned(), record: String::new() },
@@ -318,6 +328,8 @@ impl View {
             View::Contacts => "Contacts".into(),
             View::Photos => "Photos".into(),
             View::Decisions => "Decisions".into(),
+            View::Work { id } if id.is_empty() => "Work".into(),
+            View::Work { .. } => "Work item".into(),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
             View::Realms => "Realms".into(),
@@ -333,6 +345,7 @@ impl View {
     fn is_section(&self) -> bool {
         !matches!(self, View::Session { .. } | View::Worker { .. })
             && !matches!(self, View::Collections { name } if !name.is_empty())
+            && !matches!(self, View::Work { id } if !id.is_empty())
             && !matches!(self, View::App { record, .. } if !record.is_empty())
     }
 }
@@ -1001,8 +1014,8 @@ pub fn use_column() -> Option<ColumnCtx> {
     use_context::<ColumnCtx>()
 }
 
-/// Opens a view: from inside a column, beside it; from elsewhere, in the
-/// focused tile, or with `own`, in a tile of its own. ⌘/Ctrl-click opens
+/// Opens a view: from inside a column, beside it (or with `own`, in a tile
+/// of its own); from elsewhere (the header's menus), in a tile of its own. ⌘/Ctrl-click opens
 /// a new tile; middle-click and "copy link" use the plain URL.
 #[component]
 pub fn Go(
@@ -1027,8 +1040,10 @@ pub fn Go(
             if stop {
                 ev.stop_propagation();
             }
+            // The header's menus (outside any tile) open a tile of their
+            // own too, so what you were looking at stays (docs/work.md §7.1).
             let how = match How::from_mouse(&ev) {
-                How::Beside if own => How::OwnTile,
+                How::Beside if own || col.is_none() => How::OwnTile,
                 how => how,
             };
             match col {
@@ -1700,6 +1715,8 @@ fn render_view(view: View) -> AnyView {
                     View::Contacts => (move || { crate::api::realm().track(); view! { <crate::contacts::ContactsPage /> } }).into_any(),
                     View::Photos => view! { <crate::photos::PhotosPage /> }.into_any(),
                     View::Decisions => view! { <crate::decisions::DecisionsPage /> }.into_any(),
+                    View::Work { id } if id.is_empty() => view! { <crate::work::WorkPage /> }.into_any(),
+                    View::Work { id } => view! { <crate::work::WorkItemPage id=id.clone() /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
                     View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
                     View::Realms => view! { <crate::explorer::RealmsMap /> }.into_any(),

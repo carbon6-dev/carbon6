@@ -52,7 +52,7 @@ fn typing() -> bool {
 /// Loads a list again (`tick`) once sessions change, which may mean its
 /// decisions did (the live feed says only that sessions did): at most once
 /// every 10 seconds, and not while you type.
-fn reload_quietly(tick: RwSignal<u32>) {
+pub(crate) fn reload_quietly(tick: RwSignal<u32>) {
     let live = api::live();
     let due = StoredValue::new(false);
     Effect::new(move |seen: Option<()>| {

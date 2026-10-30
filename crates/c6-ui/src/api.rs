@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use c6_api::work::{WorkItem, WorkProposal, WorkRef};
 use c6_api::{
     Connection, CreateConnection, CreateEnrollment, CreateSession, Enrollment, LiveEvent, QueuedInput, SendMessage, Session, SessionDetail,
     StreamMsg, Worker,
@@ -1256,4 +1257,56 @@ pub async fn delete_record(name: String, id: String) -> Result<(), String> {
 
 pub async fn record_history(name: String, id: String) -> Result<Vec<c6_api::RecordChange>, String> {
     json(Request::get(&format!("/api/v1/collections/{}/records/{}/history{}", enc(&name), enc(&id), in_realm('?'))).send().await).await
+}
+
+// --- Work (docs/work.md) ---------------------------------------------------
+
+/// Open work (with snoozed), or closed work.
+pub async fn work_list(closed: bool) -> Result<Vec<WorkItem>, String> {
+    json(Request::get(&format!("/api/v1/work{}", if closed { "?closed=true" } else { "" })).send().await).await
+}
+
+pub async fn work_get(id: String) -> Result<WorkItem, String> {
+    json(Request::get(&format!("/api/v1/work/{id}")).send().await).await
+}
+
+/// The open work something belongs to (`session:<id>`, `request:<id>`, …).
+pub async fn work_of(reference: String) -> Result<Vec<WorkItem>, String> {
+    let q = js_sys::encode_uri_component(&reference).as_string().unwrap_or_default();
+    json(Request::get(&format!("/api/v1/work/of?ref={q}")).send().await).await
+}
+
+pub async fn work_add(title: String, done_when: String, attach: Vec<WorkRef>) -> Result<WorkItem, String> {
+    let w = c6_api::work::WorkNew { title, done_when, attach, labels: Vec::new() };
+    send_json(Request::post("/api/v1/work"), &w).await
+}
+
+pub async fn work_patch(id: String, p: c6_api::work::WorkPatch) -> Result<WorkItem, String> {
+    send_json(Request::patch(&format!("/api/v1/work/{id}")), &p).await
+}
+
+pub async fn work_attach(id: String, reference: String, title: String) -> Result<WorkItem, String> {
+    send_json(Request::post(&format!("/api/v1/work/{id}/attach")), &WorkRef { reference, title }).await
+}
+
+pub async fn work_detach(id: String, reference: String) -> Result<WorkItem, String> {
+    send_json(Request::post(&format!("/api/v1/work/{id}/detach")), &WorkRef { reference, title: String::new() }).await
+}
+
+pub async fn work_merge(id: String, from: String) -> Result<WorkItem, String> {
+    send_json(Request::post(&format!("/api/v1/work/{id}/merge")), &c6_api::work::WorkMerge { from }).await
+}
+
+pub async fn work_refresh(id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/work/{id}/refresh")).send().await).await
+}
+
+pub async fn work_proposals() -> Result<Vec<WorkProposal>, String> {
+    json(Request::post("/api/v1/work/proposals").send().await).await
+}
+
+/// The first message of a session that picks the work up again.
+pub async fn work_pickup(id: String) -> Result<String, String> {
+    let v: serde_json::Value = json(Request::get(&format!("/api/v1/work/{id}/pickup")).send().await).await?;
+    Ok(v["text"].as_str().unwrap_or_default().to_owned())
 }

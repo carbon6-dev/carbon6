@@ -60,6 +60,7 @@ pub mod updates;
 pub mod usage;
 pub mod views;
 mod webauthn;
+pub mod work;
 pub mod workflows;
 
 use std::net::{IpAddr, SocketAddr};
@@ -302,6 +303,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
     decisions::spawn_sweeper(state.clone());
+    // Nudges about work left open (docs/work.md §7).
+    work::spawn_sweeper(state.clone());
     {
         let st = state.clone();
         tokio::spawn(async move {

@@ -259,6 +259,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
     };
     let placeholder = if in_thread { "Reply…".to_owned() } else { format!("Message {}", place.name) };
     let channel_name = place.name.clone();
+    let place_name = StoredValue::new(place.name.clone());
     let tool =
         "rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     let s2 = send.clone();
@@ -340,7 +341,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                             {format!("Also send to {channel_name}")}
                         </label>
                     })}
-                    <crate::compose::WorkInSession key=target.get_value() current=text set=Callback::new(move |t: String| text.set(t)) />
+                    <crate::compose::WorkInSession key=target.get_value() about=place_name.get_value() current=text set=Callback::new(move |t: String| text.set(t)) />
                     <span class="flex-1"></span>
                     {(!in_thread).then(|| view! { <span>"Enter to send · Shift+Enter for a new line · ↑ to edit your last"</span> })}
                     <button class="rounded bg-sky-700 px-2 py-0.5 text-white disabled:opacity-40" disabled=move || text.get().trim().is_empty() on:click=move |_| s2()>"Send"</button>

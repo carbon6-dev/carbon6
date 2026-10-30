@@ -1,6 +1,6 @@
 # Work: what you've left open — Design
 
-Status: design (2026-10-29), not built. Decided with you:
+Status: built (2026-10-29; §11 is what was built). Decided with you:
 - every session you start and every request you take on **belongs to a piece of work**: an agent guesses which, and you fix it with one click;
 - work is **closed by you**: an agent offers "looks done" when it sees the evidence, and one key closes it;
 - work holds sessions, Brief requests and commitments, plain to-dos you type, and outside things (pull requests, CI runs, documents);
@@ -101,3 +101,24 @@ Per docs/os.md, no app-specific machinery:
 4. The attach guess in the session form and for Brief requests. The `work` tool for sessions.
 5. "Where was I", Resume and Pick up.
 6. "Looks done", the Brief section, nudges, and the one-time offer for the last two weeks.
+
+## 11. As built
+
+- **The menus (§7.1).** Every header link outside a tile opens in a tile of its own (`How::OwnTile`): the one already showing it, else a new one. ⌘-click still makes a new one.
+- **Records.** Work items are records of the system collection `work` in each realm (`api::work::WorkFields`: title, done_when, status, attached, note, offer, snoozed_until, moved_at, told, closed_at). The head writes them itself (`crates/c6-head/src/work.rs`), each change a version in the record's history. The Collections page shows them read-only. `moved_at` and `told` change without a version, because they are not edits. Attached things are refs: `session:<id>`, `request:<id>`, `thread:<account>:<thread>`, `chat:<workspace>:<channel>[:<ts>]`, `decision:<id>` or a URL, each with who attached it (`you`, `guess`, `session:<id>`) and, for outside things, a status (running, waiting, done, failed) and a detail.
+- **State** is worked out on every read from what's attached. Sessions come from the head (running; needs_you when a tool call waits for approval or a decision is open on it; failed; idle). Requests come in one `memex.requests.some` call per realm. Decisions come from their table. The order is §3's, with "gone quiet" (nothing moved for `quiet_days`) before an idle session's "your move", so a turn that ended long ago goes quiet. A request still open is "you owe a reply". One snoozed in the Brief is waiting.
+- **Events.** The triggers' hooks for sessions (finished, failed, needs approval) and decisions, and the memex's `request.opened` and the new `request.changed` (set, closed, or a new message joined it), mark the work holding that thing as moved and bring its note up to date. A subagent's or side chat's turn moves its root session's work.
+- **Agents' steps** call the model a routing rule for `task:work` picks, else the session's own (the latest attached session's for notes). Their tokens are recorded in the realm's usage as `work:<step>`, and they show on the Activity page. The prompts are `work.attach` (the guess), `work.summary` (the note, and `finished` with evidence for "looks done"), `work.pickup` (Pick up's first message) and `work.propose` (finding work in what's open). Notes are written in the background, one at a time per item; a change while one is written writes it again after. A "looks done" you dismissed isn't offered again for the same evidence.
+- **Sessions you start** (`POST /api/v1/sessions`, so not templates, triggers or subagents) take `work` (an item's id, `new`, `none` or `guess`) and `work_refs` (what they were started from: a reply box's request, thread or chat). The work already holding a ref is used first. The guess runs only when asked: the new-session form asks by default ("An agent picks"), so reply-box and form sessions are guessed, while API and CLI callers (`c6 run`) opt in with `guess` and otherwise cost no extra model call. Settings → Work can turn the guess off. "Start fresh" carries the old session's work.
+- **The `work` tool** lets a session read its work (`get`) and attach what it made (`attach`: a URL with title, status and detail; attaching again updates the status). It never closes work.
+- **API:** `GET/POST /api/v1/work`, `GET /api/v1/work/of?ref=`, `GET/PATCH /api/v1/work/{id}`, `POST …/attach`, `…/detach`, `…/merge`, `…/refresh`, `GET …/pickup`, `POST /api/v1/work/proposals`, and `GET/PUT /api/v1/settings/work` (per realm: guess, notes, quiet_days, nudge, needs_hours). All of them are in the catalog for the assistant.
+- **Nudges.** Every five minutes the head checks open work. It sends a notification (event `work`, on by default) when an item goes quiet, or has needed you for `needs_hours`, once per state until it moves again.
+- **UI** (`crates/c6-ui/src/work.rs`):
+  - **The Work panel** (`/work`) lists open work by state, with each item's why, next step and attached things. Its keys are J/K, Enter, E, H, # and R. It has "+ Add", "Find work in what's open" (proposals to accept or skip), and closed work behind a checkbox.
+  - **A piece of work** (`/work/<id>`) opens beside the list. It shows the note with ↻, what belongs to it with links (sessions, the Brief's request, Decisions, Mail, Chat, URLs), ✕ to take a thing off, and Attach. It has Resume (opens the latest session where it's shown, else in a tile of its own), Pick up (the session form, seeded from the latest session, with `work.pickup`'s first message, joining this work), Done, Tomorrow, Drop, Merge, Reopen, and the "looks done" banner with Close it and Not yet.
+  - **The new-session form** has a Work field: an agent picks, new, none, or an open item. "New like this" picks the session's own work.
+  - **Each top-level session's header** shows its work, its state and a "change…" menu.
+  - **The Brief** gets a "Left open" section, and "Keep as work" (or the work's name) on each request.
+  - **The Work link in the header** counts what needs a look.
+  - **Settings → Work** holds the settings above.
+- **Not built:** a commitment you make in a reply doesn't make work by itself (use "Keep as work"). Mail threads and chat conversations attached to work have no live state of their own (their request does). The one-time offer is the "Find work in what's open" button, always there rather than offered once.

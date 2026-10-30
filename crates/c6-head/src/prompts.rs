@@ -81,6 +81,26 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::TODO_SESSION,
     },
     Prompt {
+        name: "work.attach",
+        description: "Which piece of work a session you start belongs to: one already open, a new one, or none (docs/work.md §4). Placeholders: {{session}}, {{open}}.",
+        default: text::WORK_ATTACH,
+    },
+    Prompt {
+        name: "work.summary",
+        description: "A work item's \"where was I\" note, and when it looks done (docs/work.md §5). Placeholders: {{title}}, {{done_when}}, {{note}}, {{attached}}.",
+        default: text::WORK_SUMMARY,
+    },
+    Prompt {
+        name: "work.pickup",
+        description: "The first message of a session that picks a piece of work up again (you can change it before starting). Placeholders: {{title}}, {{done_when}}, {{note}}, {{attached}}.",
+        default: text::WORK_PICKUP,
+    },
+    Prompt {
+        name: "work.propose",
+        description: "How what's open is grouped into pieces of work, once, for you to accept or skip (docs/work.md §9). Placeholder: {{things}}.",
+        default: text::WORK_PROPOSE,
+    },
+    Prompt {
         name: "memex.brief.knowledge",
         description: "What a session's brief says before its environment knowledge.",
         default: text::BRIEF_KNOWLEDGE,

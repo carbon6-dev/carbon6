@@ -733,7 +733,7 @@ pub(crate) fn Compose(
             <textarea class=format!("{INPUT} min-h-48 text-sm") placeholder="Write (Markdown)" prop:value=move || body.get() on:input=move |ev| body.set(event_target_value(&ev))></textarea>
             <div class="flex flex-wrap items-center justify-end gap-2">
                 <span class="mr-auto">
-                    <crate::compose::WorkInSession key=key.get_value() current=body set=Callback::new(move |t: String| body.set(t))
+                    <crate::compose::WorkInSession key=key.get_value() about=subject.get_untracked() current=body set=Callback::new(move |t: String| body.set(t))
                         to=Signal::derive(move || to.get().split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect::<Vec<_>>()) />
                 </span>
                 <button class=BUTTON_QUIET on:click=move |_| { crate::compose::forget(key.get_value()); compose.set(None); }>"Discard"</button>

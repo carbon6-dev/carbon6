@@ -263,6 +263,8 @@ async fn start(
             effort: Some(t.effort.clone()).filter(|e| !e.is_empty()),
             worktree: false,
             realm: Some(realm.to_owned()),
+            work: None,
+            work_refs: Vec::new(),
         };
         match crate::sessions::create_as(st, req, &acting).await {
             Ok(s) => sessions.push(s),

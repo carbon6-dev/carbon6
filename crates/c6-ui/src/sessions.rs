@@ -1,5 +1,6 @@
 //! Sessions list and the new-session form.
 
+use c6_api::work::WorkRef;
 use c6_api::{Connection, CreateSession, Session, SessionStatus, WorkerStatus};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -582,6 +583,8 @@ pub struct SessionSeed {
     /// It ran in a git worktree of `cwd`: the new one gets its own.
     pub worktree: bool,
     pub realm: String,
+    /// The session it was made from: the new one joins its work.
+    pub from: String,
 }
 
 impl SessionSeed {
@@ -596,6 +599,7 @@ impl SessionSeed {
             labels: s.labels.clone(),
             worktree: false,
             realm: s.realm.clone(),
+            from: s.id.clone(),
         }
     }
 }
@@ -645,11 +649,19 @@ pub fn SessionDialog(
     #[prop(into)] title: String,
     #[prop(into)] note: String,
     first_message: String,
-    #[prop(into)] on_session: Callback<Session>,
+    #[prop(optional, into)] on_session: Option<Callback<Session>>,
     #[prop(into)] on_close: Callback<()>,
+    /// Start from this session's worker, folder, model and labels.
+    #[prop(optional)]
+    seed: Option<SessionSeed>,
+    /// The work it joins (docs/work.md §4), and what it was started from.
+    #[prop(optional)]
+    work: Option<String>,
+    #[prop(optional)] work_refs: Vec<WorkRef>,
 ) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let first = StoredValue::new(first_message);
+    let (seed, work, work_refs) = (StoredValue::new(seed), StoredValue::new(work), StoredValue::new(work_refs));
     view! {
         <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
@@ -662,7 +674,16 @@ pub fn SessionDialog(
                 <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
                     {move || connections.get().map(|r| match r {
                         Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
-                        Ok(conns) => view! { <SessionForm connections=conns first_message=first.get_value() on_session on_started=on_close on_cancel=on_close /> }.into_any(),
+                        Ok(conns) => match seed.get_value() {
+                            Some(seed) => view! {
+                                <SessionForm connections=conns seed first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
+                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() on_started=on_close on_cancel=on_close />
+                            }.into_any(),
+                            None => view! {
+                                <SessionForm connections=conns first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
+                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() on_started=on_close on_cancel=on_close />
+                            }.into_any(),
+                        },
                         Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     })}
                 </Suspense>
@@ -689,6 +710,13 @@ fn SessionForm(
     /// With the session it started.
     #[prop(optional, into)]
     on_session: Option<Callback<Session>>,
+    /// The work it joins (docs/work.md §4): an item's id, "new" or "none";
+    /// empty: an agent's guess.
+    #[prop(optional, into)]
+    work: String,
+    /// What it was started from, attached to its work with it.
+    #[prop(optional)]
+    work_refs: Vec<WorkRef>,
 ) -> impl IntoView {
     let live = api::live();
     let (ws, col) = (use_workspace(), use_column());
@@ -741,6 +769,22 @@ fn SessionForm(
     // Your labels for the session (remembered per folder).
     let labels = RwSignal::new(seed.labels.join(", "));
     let seed_realm = StoredValue::new(seed.realm.clone());
+    // The work it belongs to: yours to pick (a seed's session's, if any),
+    // else an agent picks.
+    let work_items = LocalResource::new(|| api::work_list(false));
+    let work_pick = RwSignal::new(work);
+    if !seed.from.is_empty() && work_pick.get_untracked().is_empty() {
+        let from = seed.from.clone();
+        spawn_local(async move {
+            if let Ok(ws) = api::work_of(format!("session:{from}")).await
+                && let Some(w) = ws.first()
+                && work_pick.get_untracked().is_empty()
+            {
+                work_pick.set(w.id.clone());
+            }
+        });
+    }
+    let work_refs = StoredValue::new(work_refs);
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
@@ -841,6 +885,9 @@ fn SessionForm(
             worktree: worktree.get_untracked() && !on_ssh,
             // A seed's realm; else the realm you are looking at (else home).
             realm: if seeded { Some(seed_realm.get_value()) } else { Some(crate::api::realm().get_untracked()) }.filter(|r| !r.is_empty()),
+            // "An agent picks" asks for its guess.
+            work: Some(work_pick.get_untracked()).map(|w| if w.is_empty() { "guess".to_owned() } else { w }),
+            work_refs: work_refs.get_value(),
         };
         if on_ssh {
             // Recent targets of this worker, newest first.
@@ -976,11 +1023,26 @@ fn SessionForm(
                     </select>
                 </label>
             </div>
-            <label class="block text-xs text-zinc-500">
-                "Labels"
-                <input class=format!("mt-1 font-mono {INPUT}") placeholder="optional, e.g. client:acme, spike (repo, folder, worker and model are added automatically)"
-                    prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
-            </label>
+            <div class="grid gap-3 sm:grid-cols-[2fr_1fr]">
+                <label class="block text-xs text-zinc-500">
+                    "Labels"
+                    <input class=format!("mt-1 font-mono {INPUT}") placeholder="optional, e.g. client:acme, spike (repo, folder, worker and model are added automatically)"
+                        prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
+                </label>
+                <label class="block text-xs text-zinc-500" title="What you mean to finish that this session serves (docs/work.md)">
+                    "Work"
+                    <select class=format!("mt-1 {INPUT}")
+                        prop:value=move || { work_items.track(); work_pick.get() }
+                        on:change=move |ev| work_pick.set(event_target_value(&ev))>
+                        <option value="">"An agent picks (or starts one)"</option>
+                        <option value="new">"New work"</option>
+                        <option value="none">"Not part of any work"</option>
+                        {move || work_items.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| {
+                            view! { <option value=w.id.clone()>{w.fields.title.clone()}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
+            </div>
             <textarea node_ref=prompt_box class=format!("{INPUT} min-h-24 resize-y")
                 placeholder=if seeded { "First message (optional: leave it empty to start an empty session; ⌘/Ctrl+Enter to start)" } else { "What should the agent do? (⌘/Ctrl+Enter to start)" }
                 prop:value=move || prompt.get()

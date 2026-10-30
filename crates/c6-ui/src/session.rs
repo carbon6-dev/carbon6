@@ -779,6 +779,12 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
                             <span>{{ let model = s.model.clone(); move || { let m = model_label.get(); if m.is_empty() { model.clone() } else { m } } }}</span>
                         </div>
                         <crate::labels::SessionLabels session=s.id.clone() labels=s.labels.clone() auto_labels=s.auto_labels.clone() />
+                        // The work it serves (docs/work.md §7).
+                        {(s.parent_id.is_none() && !s.observed && s.instance.is_empty()).then(|| {
+                            let (sid, fallback) = (s.id.clone(), s.title.clone());
+                            let title = Signal::derive(move || live.sessions.with(|ss| ss.iter().find(|x| x.id == sid).map(|x| x.title.clone())).unwrap_or_else(|| fallback.clone()));
+                            view! { <div class="mt-1"><crate::work::SessionWork session_id=s.id.clone() title /></div> }
+                        })}
                     </div>
                     <div class="flex flex-wrap items-center gap-2">
                         {tabs()}
@@ -2766,7 +2772,11 @@ fn Composer(
                             return;
                         }
                     };
+                    // It carries on this one's work (docs/work.md §4).
+                    let work = api::work_of(format!("session:{}", d.session.id)).await.ok().and_then(|w| w.first().map(|w| w.id.clone()));
                     let req = c6_api::CreateSession {
+                        work,
+                        work_refs: Vec::new(),
                         labels: d.session.labels,
                         worker_id: d.session.worker_id,
                         cwd: d.session.cwd,

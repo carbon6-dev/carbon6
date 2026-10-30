@@ -14,15 +14,23 @@ use crate::workspace::{Go, View};
 
 /// `key` names the box (request:<id>, thread:…, chat:…, compose:…);
 /// `current` is its text now and `set` puts text in it; `to`: who a new
-/// message goes to (their cards go in the context).
+/// message goes to (their cards go in the context); `about`: what the
+/// conversation is, as its work lists it.
 #[component]
 pub fn WorkInSession(
     #[prop(into)] key: String,
     #[prop(into)] current: Signal<String>,
     #[prop(into)] set: Callback<String>,
     #[prop(optional, into)] to: Option<Signal<Vec<String>>>,
+    #[prop(optional, into)] about: String,
 ) -> impl IntoView {
     let live = api::live();
+    // The session joins the conversation's work, with it (docs/work.md §4).
+    let work_refs = (!key.starts_with("compose:"))
+        .then(|| c6_api::work::WorkRef { reference: key.clone(), title: about })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let work_refs = StoredValue::new(work_refs);
     let key = StoredValue::new(key);
     let session = RwSignal::new(None::<String>);
     // The latest of the session's drafts this box took (kept in this
@@ -120,7 +128,7 @@ pub fn WorkInSession(
         {move || dialog.get().map(|first| view! {
             <crate::sessions::SessionDialog title="Work on this reply in a session"
                 note="The session gets the conversation, the people, the request and your draft. It can rewrite the draft here; you read it and send it, or not."
-                first_message=first on_session on_close=move |()| dialog.set(None) />
+                first_message=first on_session work_refs=work_refs.get_value() on_close=move |()| dialog.set(None) />
         })}
     }
 }

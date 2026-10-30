@@ -80,6 +80,7 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
             .execute(&m.store.pool)
             .await?;
         source(m, *id, f).await?;
+        changed(m, *id, "open").await;
         return urgent(m, *id, f).await;
     }
     // The same person's other open requests: is this one of them?
@@ -112,6 +113,7 @@ pub async fn follow(m: &Memex, f: &Found<'_>, task: Option<&Task>) -> anyhow::Re
                         .execute(&m.store.pool)
                         .await?;
                     source(m, *id, f).await?;
+                    changed(m, *id, "open").await;
                     return urgent(m, *id, f).await;
                 }
                 (true, false) => maybe = Some(*id),
@@ -191,7 +193,33 @@ async fn close(m: &Memex, id: i64, status: &str, by: &str) -> anyhow::Result<()>
         .execute(&m.store.pool)
         .await?;
     sqlx::query("DELETE FROM request_maybe WHERE a = ?1 OR b = ?1").bind(id).execute(&m.store.pool).await?;
+    changed(m, id, status).await;
     Ok(())
+}
+
+/// For triggers and the work it belongs to (docs/work.md §3): it moved.
+async fn changed(m: &Memex, id: i64, status: &str) {
+    m.emit("request.changed", json!({"request_id": id, "status": status})).await;
+}
+
+/// Requests by id, as work lists them: who, what, how it stands (the ones
+/// that are gone are left out).
+pub async fn some(m: &Memex, ids: &[i64]) -> anyhow::Result<Value> {
+    let mut out = Vec::new();
+    for id in ids.iter().take(500) {
+        if let Some(r) = sqlx::query("SELECT id, person, person_name, title, status, until, updated_at FROM requests WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&m.store.pool)
+            .await?
+        {
+            out.push(json!({
+                "id": r.get::<i64, _>("id"), "person": r.get::<String, _>("person"), "person_name": r.get::<String, _>("person_name"),
+                "title": r.get::<String, _>("title"), "status": r.get::<String, _>("status"), "until": r.get::<Option<i64>, _>("until"),
+                "updated_at": r.get::<i64, _>("updated_at"),
+            }));
+        }
+    }
+    Ok(json!(out))
 }
 
 /// Requests, the latest first: open ones (and snoozed ones whose time has
@@ -275,6 +303,7 @@ pub async fn set(m: &Memex, id: i64, status: &str, until: Option<i64>) -> anyhow
                 .bind(id)
                 .execute(&m.store.pool)
                 .await?;
+            changed(m, id, "snoozed").await;
         }
         "open" => {
             sqlx::query("UPDATE requests SET status = 'open', until = NULL, closed_by = NULL, updated_at = ? WHERE id = ?")
@@ -282,6 +311,7 @@ pub async fn set(m: &Memex, id: i64, status: &str, until: Option<i64>) -> anyhow
                 .bind(id)
                 .execute(&m.store.pool)
                 .await?;
+            changed(m, id, "open").await;
         }
         other => anyhow::bail!("a request is open, snoozed, done or dropped, not {other:?}"),
     }
@@ -333,6 +363,10 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
             json!(list(m, params["status"].as_str().unwrap_or("open"), params["limit"].as_u64().unwrap_or(100) as u32).await?)
         }
         "memex.requests.get" => json!(get(m, id).await?),
+        "memex.requests.some" => {
+            let ids: Vec<i64> = params["ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+            some(m, &ids).await?
+        }
         "memex.requests.set" => json!(set(m, id, params["status"].as_str().unwrap_or_default(), params["until"].as_i64()).await?),
         "memex.requests.merge" => json!(merge(m, params["into"].as_i64().unwrap_or(0), params["from"].as_i64().unwrap_or(0)).await?),
         "memex.requests.draft" => {

@@ -163,6 +163,16 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/own/{name}", get(get_own_setting).delete(drop_own_setting))
+        .route("/api/v1/work", get(list_work).post(add_work))
+        .route("/api/v1/work/of", get(work_of))
+        .route("/api/v1/work/proposals", post(propose_work))
+        .route("/api/v1/work/{id}", get(get_work).patch(patch_work))
+        .route("/api/v1/work/{id}/attach", post(attach_work))
+        .route("/api/v1/work/{id}/detach", post(detach_work))
+        .route("/api/v1/work/{id}/merge", post(merge_work))
+        .route("/api/v1/work/{id}/refresh", post(refresh_work))
+        .route("/api/v1/work/{id}/pickup", get(pickup_work))
+        .route("/api/v1/settings/work", get(get_work_settings).put(put_work_settings))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
@@ -716,7 +726,11 @@ async fn create_session(
     Json(mut req): Json<api::CreateSession>,
 ) -> ApiResult<Json<api::Session>> {
     req.realm = Some(caller.realm_for_new(req.realm.as_deref())?);
-    Ok(Json(crate::sessions::create(&st, req).await?))
+    let (work, refs, prompt) = (req.work.take(), std::mem::take(&mut req.work_refs), req.prompt.clone().unwrap_or_default());
+    let s = crate::sessions::create(&st, req).await?;
+    // The work it belongs to (docs/work.md §4).
+    crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt).await;
+    Ok(Json(s))
 }
 
 async fn create_side_chat(
@@ -832,6 +846,7 @@ fn per_realm_key(name: &str) -> ApiResult<&'static str> {
         "assistant" => Ok(crate::assistant::SETTING),
         "subagent-limits" => Ok(crate::sessions::SUBAGENT_LIMITS),
         "brief" => Ok(crate::memex::BRIEF),
+        "work" => Ok(crate::work::SETTING),
         _ => Err(ApiErr(StatusCode::NOT_FOUND, format!("{name:?} is not a setting a realm sets for itself"))),
     }
 }
@@ -3700,6 +3715,128 @@ async fn answer_question(
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "the conversation is not running".into()))
     }
+}
+
+// --- Work (docs/work.md) -----------------------------------------------------
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct WorkQuery {
+    /// Closed work (done or dropped) instead of open.
+    #[serde(default)]
+    closed: bool,
+}
+
+#[derive(schemars::JsonSchema, serde::Deserialize)]
+pub(crate) struct WorkOfQuery {
+    /// What it holds: session:<id>, request:<id>, thread:…, chat:…, decision:<id> or a URL.
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
+async fn list_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<WorkQuery>,
+) -> ApiResult<Json<Vec<api::work::WorkItem>>> {
+    Ok(Json(crate::work::list(&st, &caller, q.closed).await?))
+}
+
+async fn add_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(w): Json<api::work::WorkNew>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::create(&st, &caller, &w, "you").await?))
+}
+
+async fn work_of(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<WorkOfQuery>,
+) -> ApiResult<Json<Vec<api::work::WorkItem>>> {
+    Ok(Json(crate::work::of(&st, &q.reference, &caller).await?))
+}
+
+async fn get_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::get(&st, &id, &caller).await?))
+}
+
+async fn patch_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(p): Json<api::work::WorkPatch>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::patch(&st, &id, &p, &caller).await?))
+}
+
+async fn attach_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(r): Json<api::work::WorkRef>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::attach(&st, &id, &r, &caller, "you").await?))
+}
+
+async fn detach_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(r): Json<api::work::WorkRef>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::detach(&st, &id, &r, &caller).await?))
+}
+
+async fn merge_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(m): Json<api::work::WorkMerge>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::merge(&st, &id, &m.from, &caller).await?))
+}
+
+async fn refresh_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    crate::work::get(&st, &id, &caller).await?;
+    crate::work::refresh(&st, &id);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn pickup_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({"text": crate::work::pickup(&st, &id, &caller).await?})))
+}
+
+async fn propose_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<Vec<api::work::WorkProposal>>> {
+    Ok(Json(crate::work::propose(&st, &caller).await?))
+}
+
+async fn get_work_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::work::WorkSettings>> {
+    let raw = st.store.setting(crate::work::SETTING).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+async fn put_work_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::work::WorkSettings>) -> ApiResult<StatusCode> {
+    if s.quiet_days == 0 || s.quiet_days > 90 || s.needs_hours == 0 || s.needs_hours > 24 * 30 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "quiet days are 1 to 90, hours needing you 1 to 720".into()));
+    }
+    st.store.set_setting(crate::work::SETTING, &serde_json::to_string(&s).unwrap_or_default()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Decisions (docs/os.md §4.2) ---------------------------------------------

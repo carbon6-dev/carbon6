@@ -93,6 +93,7 @@ pub fn scope(name: &str) -> Option<Scope> {
     const REALM_AREAS: &[&str] = &[
         "sessions.",
         "decisions.",
+        "work.",
         "memories.",
         "memex.",
         "claims.",
@@ -511,6 +512,19 @@ fn build() -> Vec<Op> {
         op!("workflows.steps.decide", "automation", "POST" "/api/v1/workflows/runs/{id}/steps/{step}/decide", Write, Input::Body(schema::<api::ApprovalDecision>), "Approves or rejects a workflow step waiting for you.", choices = &[("id", "workflows.runs")]),
 
         // Action items.
+        op!("work.list", "work", "GET" "/api/v1/work", Read, Input::Query(schema::<crate::api::WorkQuery>), "Work you mean to finish (open by default), what needs you first: each with what's attached, its state and why, and its \"where was I\" note."),
+        op!("work.add", "work", "POST" "/api/v1/work", Write, Input::Body(schema::<api::work::WorkNew>), "Adds a piece of work (a to-do, or with things attached: session:<id>, request:<id>, a URL)."),
+        op!("work.of", "work", "GET" "/api/v1/work/of", Read, Input::Query(schema::<crate::api::WorkOfQuery>), "The open work something belongs to (a session, a request, a conversation)."),
+        op!("work.get", "work", "GET" "/api/v1/work/{id}", Read, Input::None, "A piece of work as it is now.", choices = &[("id", "work.list")]),
+        op!("work.edit", "work", "PATCH" "/api/v1/work/{id}", Write, Input::Body(schema::<api::work::WorkPatch>), "Renames, closes (done, dropped), reopens or snoozes work, or dismisses an agent's \"looks done\".", choices = &[("id", "work.list")]),
+        op!("work.attach", "work", "POST" "/api/v1/work/{id}/attach", Write, Input::Body(schema::<api::work::WorkRef>), "Attaches something to work: session:<id>, request:<id>, thread:<account>:<thread>, chat:<workspace>:<channel>, decision:<id> or a URL.", choices = &[("id", "work.list")]),
+        op!("work.detach", "work", "POST" "/api/v1/work/{id}/detach", Write, Input::Body(schema::<api::work::WorkRef>), "Takes something off a piece of work.", choices = &[("id", "work.list")]),
+        op!("work.merge", "work", "POST" "/api/v1/work/{id}/merge", Write, Input::Body(schema::<api::work::WorkMerge>), "Merges another piece of work into this one.", choices = &[("id", "work.list")]),
+        op!("work.refresh", "work", "POST" "/api/v1/work/{id}/refresh", Write, Input::None, "Brings a piece of work's \"where was I\" note up to date now.", choices = &[("id", "work.list")]),
+        op!("work.pickup", "work", "GET" "/api/v1/work/{id}/pickup", Read, Input::None, "The first message for a session that picks a piece of work up again: where it stood and what belongs to it.", choices = &[("id", "work.list")]),
+        op!("work.proposals", "work", "POST" "/api/v1/work/proposals", Read, Input::None, "Groups the open sessions and requests that belong to no work into proposed pieces of work, for the user to accept or skip."),
+        op!("work.settings.get", "work", "GET" "/api/v1/settings/work", Read, Input::None, "How work behaves in the realm: guessing a session's work, notes, when work has gone quiet, nudges."),
+        op!("work.settings.put", "work", "PUT" "/api/v1/settings/work", Write, Input::Body(schema::<api::work::WorkSettings>), "Changes how work behaves in the realm."),
         op!("decisions.list", "decisions", "GET" "/api/v1/decisions", Read, Input::Query(schema::<DecisionQuery>), "Decisions (open by default): what waits first, then by priority."),
         op!("decisions.count", "decisions", "GET" "/api/v1/decisions/count", Read, Input::None, "How many decisions are open."),
         op!("decisions.get", "decisions", "GET" "/api/v1/decisions/{id}", Read, Input::None, "A decision: its case, options or form, context, and answer.", choices = &[("id", "decisions.list")]),
@@ -744,6 +758,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
         "prompts" => json!({"type": "object", "required": ["name", "body"], "properties": {
             "name": {"type": "string"}, "description": {"type": "string"}, "body": {"type": "string"}
         }}),
+        "work" => schema::<api::work::WorkFields>(),
         "memory" => json!({"type": "object", "required": ["text"], "properties": {
             "scope": {"type": "string", "description": "One label, or empty: every session"},
             "text": {"type": "string", "maxLength": 2000},

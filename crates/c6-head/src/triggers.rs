@@ -421,6 +421,8 @@ pub async fn on_record(st: &HeadState, realm: &str, op: &str, rec: &api::Record,
 
 /// A decision was opened, answered, expired or dismissed.
 pub async fn on_decision(st: &HeadState, d: &api::Decision, op: &str) {
+    // Its work moved (docs/work.md §3).
+    crate::work::on_decision(st, d).await;
     let option = d.answer.as_ref().and_then(|a| a["option"].as_str()).unwrap_or_default();
     let event = json!({"type": "decision", "op": op, "decision": d, "option": option});
     dispatch(st, &d.realm, "decision", op, event).await;
@@ -428,6 +430,8 @@ pub async fn on_decision(st: &HeadState, d: &api::Decision, op: &str) {
 
 /// A session's turn finished or failed, or it waits for an approval.
 pub async fn on_session(st: &HeadState, session_id: &str, op: &str, message: &str) {
+    // Its work moved (docs/work.md §3).
+    crate::work::on_session(st, session_id).await;
     let Ok(Some(s)) = st.store.session(session_id).await else { return };
     let event = json!({"type": "session", "op": op, "message": message,
                        "session": {"id": s.id, "title": s.title, "labels": s.all_labels(), "realm": s.realm}});

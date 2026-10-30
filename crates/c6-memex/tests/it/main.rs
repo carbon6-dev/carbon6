@@ -27,6 +27,7 @@ mod records;
 mod relations;
 mod triage;
 mod understanding;
+mod work;
 
 /// The c6-extract kit's code, in this process (what workers run).
 pub fn extract_here() {

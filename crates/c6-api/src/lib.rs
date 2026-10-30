@@ -3,6 +3,7 @@
 
 pub mod labels;
 pub mod prompts;
+pub mod work;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1520,6 +1521,15 @@ pub struct CreateSession {
     /// The realm to run in. Default: the API token's realm, else home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
+    /// The work it belongs to (docs/work.md §4): a work item's id, "new",
+    /// "none", or "guess" (an agent picks, unless the work that holds
+    /// `work_refs` does). Empty: the work that holds `work_refs`, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<String>,
+    /// What it was started from (a request, a conversation), attached to
+    /// its work along with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_refs: Vec<work::WorkRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2956,7 +2966,7 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 10] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 11] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
@@ -2967,10 +2977,12 @@ pub const NOTIFY_EVENTS: [(&str, &str); 10] = [
     ("trigger", "a trigger's notify action"),
     ("budget", "a budget ran out"),
     ("host", "a host's scheduled check failed, or it is reachable again"),
+    ("work", "work you left open went quiet, or has needed you for a while"),
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 8] = ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 9] =
+    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.
