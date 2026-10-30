@@ -169,6 +169,19 @@ async fn the_walk_grows_cards_back_through_time() {
         (Some(2), Some(3), Some(0)),
         "{progress}"
     );
+
+    // An empty update keeps the card and its place in the history.
+    let before = c6_memex::cards::get(&m, "person:dana@globex.com").await.unwrap().unwrap();
+    mail(&m, "a3", "renewal", ("dana@globex.com", "Dana"), "me@mine.io", "Renewal", "Any news on the renewal?", false, 0).await;
+    let task = m.tasks().understanding.unwrap();
+    for answer in ["{}", r#"{"story": "   "}"#] {
+        mock.push_about("Write the owner's card for Dana", Reply::Text(answer.into()));
+        let error = c6_memex::cards::write(&m, &task, "person:dana@globex.com", "Dana", 0).await.unwrap_err();
+        assert_eq!(error.to_string(), "the model's answer has no story");
+        let after = c6_memex::cards::get(&m, "person:dana@globex.com").await.unwrap().unwrap();
+        assert_eq!(after.card, before.card);
+        assert_eq!((after.covered_to, after.threads), (before.covered_to, before.threads));
+    }
 }
 
 #[tokio::test]

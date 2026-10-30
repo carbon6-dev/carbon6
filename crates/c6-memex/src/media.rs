@@ -456,6 +456,10 @@ async fn see(m: &Memex, task: &Task, version: &str, r: &sqlx::sqlite::SqliteRow)
         .filter(|o| !o.is_empty() && o.len() < 40)
         .take(8)
         .collect();
+    anyhow::ensure!(
+        !caption.is_empty() || !scene.is_empty() || !seen_text.is_empty() || !objects.is_empty(),
+        "the model's answer describes nothing"
+    );
     // The facts line from the file stays first.
     let facts = r.get::<String, _>("body").lines().next().unwrap_or("").to_owned();
     let mut text = facts;

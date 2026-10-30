@@ -606,7 +606,14 @@ pub async fn summarize(m: &Memex, key: &str, allowed: &[String]) -> anyhow::Resu
     let prompt = api::prompts::fill(&template, &[("name", &thing.name), ("kind", &thing.kind), ("records", &records)]);
     let system = m.prompt("memex.understand.system", SYSTEM);
     let answer = llm::ask(m, &task, "summary", &thing.name, &system, vec![Block::Text(prompt)], llm::Output::Json(4000)).await?;
-    let summary = llm::json_of(&answer).ok().and_then(|v| v["summary"].as_str().map(str::to_owned)).unwrap_or(answer);
+    // Whole JSON or a wrapped summary; other text stays prose.
+    let json =
+        serde_json::from_str::<Value>(answer.trim()).ok().or_else(|| llm::json_of(&answer).ok().filter(|v| v.get("summary").is_some()));
+    let summary = match json {
+        Some(v) => v["summary"].as_str().unwrap_or("").to_owned(),
+        None => answer,
+    };
+    anyhow::ensure!(!summary.trim().is_empty(), "the model's answer has no summary");
     let item = api::MemexItemIn {
         kind: "note".into(),
         source: format!("pipeline:summary@{}", task.model),
