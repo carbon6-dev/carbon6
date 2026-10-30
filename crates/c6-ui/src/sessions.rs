@@ -658,10 +658,14 @@ pub fn SessionDialog(
     #[prop(optional)]
     work: Option<String>,
     #[prop(optional)] work_refs: Vec<WorkRef>,
+    /// The to-do of `work` it does.
+    #[prop(optional)]
+    todo: Option<String>,
 ) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     let first = StoredValue::new(first_message);
     let (seed, work, work_refs) = (StoredValue::new(seed), StoredValue::new(work), StoredValue::new(work_refs));
+    let todo = StoredValue::new(todo.unwrap_or_default());
     view! {
         <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
@@ -677,11 +681,11 @@ pub fn SessionDialog(
                         Ok(conns) => match seed.get_value() {
                             Some(seed) => view! {
                                 <SessionForm connections=conns seed first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
-                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() on_started=on_close on_cancel=on_close />
+                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() todo=todo.get_value() on_started=on_close on_cancel=on_close />
                             }.into_any(),
                             None => view! {
                                 <SessionForm connections=conns first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
-                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() on_started=on_close on_cancel=on_close />
+                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() todo=todo.get_value() on_started=on_close on_cancel=on_close />
                             }.into_any(),
                         },
                         Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -717,6 +721,9 @@ fn SessionForm(
     /// What it was started from, attached to its work with it.
     #[prop(optional)]
     work_refs: Vec<WorkRef>,
+    /// The to-do of `work` it does (empty: none).
+    #[prop(optional, into)]
+    todo: String,
 ) -> impl IntoView {
     let live = api::live();
     let (ws, col) = (use_workspace(), use_column());
@@ -785,6 +792,7 @@ fn SessionForm(
         });
     }
     let work_refs = StoredValue::new(work_refs);
+    let (todo, todo_work) = (StoredValue::new(todo), StoredValue::new(work_pick.get_untracked()));
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let conns = StoredValue::new(connections);
@@ -888,6 +896,8 @@ fn SessionForm(
             // "An agent picks" asks for its guess.
             work: Some(work_pick.get_untracked()).map(|w| if w.is_empty() { "guess".to_owned() } else { w }),
             work_refs: work_refs.get_value(),
+            // Its to-do, while it still joins that work.
+            todo: Some(todo.get_value()).filter(|t| !t.is_empty() && work_pick.get_untracked() == todo_work.get_value()),
         };
         if on_ssh {
             // Recent targets of this worker, newest first.

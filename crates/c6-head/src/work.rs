@@ -13,7 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 use c6_api as api;
-use c6_api::work::{Attached, LiveAttached, Told, WorkFields, WorkItem, WorkNote, WorkOffer, WorkProposal, WorkRef, WorkSettings};
+use c6_api::work::{
+    Attached, LiveAttached, Todo, TodoNew, TodoPatch, TodoStart, Told, WorkFields, WorkItem, WorkNote, WorkOffer, WorkProposal, WorkRef,
+    WorkSettings,
+};
 use c6_core::now_ms;
 use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
 use futures::StreamExt;
@@ -32,6 +35,9 @@ pub const SETTING: &str = "work";
 pub const ROUTE_LABEL: &str = "task:work";
 const MAX_TITLE: usize = 200;
 const MAX_ATTACHED: usize = 200;
+const MAX_TODOS: usize = 50;
+const MAX_TODO_TEXT: usize = 300;
+const MAX_TODO_PROMPT: usize = 20_000;
 /// What a note's model call reads at most (about 8,000 tokens).
 const MAX_INPUT_CHARS: usize = 32_000;
 const DAY: i64 = 24 * 3600 * 1000;
@@ -383,6 +389,7 @@ pub async fn merge(st: &HeadState, id: &str, from: &str, caller: &Caller) -> any
         let new: Vec<Attached> =
             other.fields.attached.iter().filter(|a| !f.attached.iter().any(|x| x.reference == a.reference)).cloned().collect();
         f.attached.extend(new);
+        f.todos.extend(other.fields.todos.iter().cloned());
         if f.done_when.is_empty() {
             f.done_when = other.fields.done_when.clone();
         }
@@ -395,6 +402,107 @@ pub async fn merge(st: &HeadState, id: &str, from: &str, caller: &Caller) -> any
     history(&mut tx, from, other.version + 1, "delete", &serde_json::to_value(&other.fields)?, "you", now_ms()).await?;
     tx.commit().await?;
     refresh(st, id);
+    get(st, id, caller).await
+}
+
+// --- To-dos -------------------------------------------------------------------
+
+fn new_todo(text: &str, prompt: &str, by: &str) -> anyhow::Result<Todo> {
+    Ok(Todo {
+        id: uuid::Uuid::now_v7().simple().to_string()[20..].to_owned(),
+        text: check_todo_text(text)?,
+        prompt: check_todo_prompt(prompt)?,
+        by: by.to_owned(),
+        at: now_ms(),
+        ..Default::default()
+    })
+}
+
+fn check_todo_text(t: &str) -> anyhow::Result<String> {
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.is_empty() || t.chars().count() > MAX_TODO_TEXT {
+        return Err(bad_request(format!("a to-do is a line of up to {MAX_TODO_TEXT} characters")));
+    }
+    Ok(t)
+}
+
+fn check_todo_prompt(p: &str) -> anyhow::Result<String> {
+    let p = p.trim();
+    if p.len() > MAX_TODO_PROMPT {
+        return Err(bad_request(format!("a to-do's prompt is at most {MAX_TODO_PROMPT} bytes")));
+    }
+    Ok(p.to_owned())
+}
+
+/// Adds a to-do; one with the same text still open is that one.
+fn add_todo_to(f: &mut WorkFields, t: Todo) -> anyhow::Result<bool> {
+    if f.todos.iter().any(|x| x.done_at.is_none() && x.text.eq_ignore_ascii_case(&t.text)) {
+        return Ok(false);
+    }
+    if f.todos.len() >= MAX_TODOS {
+        return Err(bad_request(format!("a piece of work holds at most {MAX_TODOS} to-dos")));
+    }
+    f.todos.push(t);
+    f.moved_at = now_ms();
+    Ok(true)
+}
+
+fn todo_mut<'a>(f: &'a mut WorkFields, todo: &str) -> anyhow::Result<&'a mut Todo> {
+    f.todos.iter_mut().find(|t| t.id == todo).ok_or_else(|| not_found(format!("no to-do {todo} in this work")))
+}
+
+/// Ticks a to-do off (or not), saying who and why.
+fn tick(t: &mut Todo, done: bool, by: &str, evidence: &str) -> bool {
+    if t.done_at.is_some() == done {
+        return false;
+    }
+    t.done_at = done.then(now_ms);
+    t.done_by = if done { by.to_owned() } else { String::new() };
+    t.evidence = if done { evidence.trim().chars().take(500).collect() } else { String::new() };
+    true
+}
+
+pub async fn todo_add(st: &HeadState, id: &str, n: &TodoNew, caller: &Caller) -> anyhow::Result<WorkItem> {
+    visible(st, id, caller).await?;
+    let t = new_todo(&n.text, &n.prompt, "you")?;
+    modify(st, id, "you", None, |f| add_todo_to(f, t)).await?;
+    get(st, id, caller).await
+}
+
+pub async fn todo_edit(st: &HeadState, id: &str, todo: &str, p: &TodoPatch, caller: &Caller) -> anyhow::Result<WorkItem> {
+    visible(st, id, caller).await?;
+    let text = p.text.as_deref().map(check_todo_text).transpose()?;
+    let prompt = p.prompt.as_deref().map(check_todo_prompt).transpose()?;
+    let mut ticked = false;
+    modify(st, id, "you", None, |f| {
+        let t = todo_mut(f, todo)?;
+        if let Some(text) = text {
+            t.text = text;
+        }
+        if let Some(prompt) = prompt {
+            t.prompt = prompt;
+        }
+        if let Some(done) = p.done {
+            ticked = tick(t, done, "you", "");
+        }
+        f.moved_at = now_ms();
+        Ok(true)
+    })
+    .await?;
+    if ticked {
+        refresh(st, id);
+    }
+    get(st, id, caller).await
+}
+
+pub async fn todo_remove(st: &HeadState, id: &str, todo: &str, caller: &Caller) -> anyhow::Result<WorkItem> {
+    visible(st, id, caller).await?;
+    modify(st, id, "you", None, |f| {
+        todo_mut(f, todo)?;
+        f.todos.retain(|t| t.id != todo);
+        Ok(true)
+    })
+    .await?;
     get(st, id, caller).await
 }
 
@@ -570,6 +678,11 @@ fn state_of(f: &WorkFields, live: &[LiveAttached], now: i64, s: &WorkSettings) -
     if let Some(l) = live.iter().filter(|l| l.reference.starts_with("session:") && l.state == "idle").max_by_key(|l| l.at) {
         return r("needs_you", format!("{} finished its turn: your move", l.title));
     }
+    let open: Vec<&Todo> = f.todos.iter().filter(|t| t.done_at.is_none()).collect();
+    if let Some(next) = open.first() {
+        let left = if open.len() == 1 { "1 to-do left".to_owned() } else { format!("{} of {} to-dos left", open.len(), f.todos.len()) };
+        return r("open", format!("{left}: {}", next.text));
+    }
     r("open", if f.attached.is_empty() { "Nothing started yet".into() } else { String::new() })
 }
 
@@ -628,8 +741,9 @@ pub async fn on_memex_event(st: &HeadState, kind: &str, data: &Value) {
 /// or "none"), else to the work that already holds what it was started
 /// from (`refs`), else, when asked (`work`: "guess", the new-session
 /// form's default), to an agent's guess. Without "guess" no model is
-/// called: API and CLI sessions cost what they did.
-pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>, refs: &[WorkRef], prompt: &str) {
+/// called: API and CLI sessions cost what they did. Started on one of an
+/// item's to-dos (`todo`), the to-do names it.
+pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>, refs: &[WorkRef], prompt: &str, todo: Option<&str>) {
     let session = WorkRef { reference: format!("session:{}", s.id), title: s.title.clone() };
     let mut all = vec![session];
     for r in refs {
@@ -671,13 +785,60 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
             }
         }
         id => match load(st, id).await {
-            Ok(Some(r)) if r.realm == s.realm => add_all(st, id, &all, "you").await,
+            Ok(Some(r)) if r.realm == s.realm => match add_all(st, id, &all, "you").await {
+                Ok(()) => match todo.map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(t) => {
+                        modify(st, id, "you", None, |f| {
+                            todo_mut(f, t)?.session = s.id.clone();
+                            Ok(true)
+                        })
+                        .await
+                    }
+                    None => Ok(()),
+                },
+                Err(e) => Err(e),
+            },
             _ => Err(bad_request(format!("no work item {id} in realm {}", s.realm))),
         },
     };
     if let Err(e) = result {
         warn!(session = %s.id, "attaching it to work: {e:#}");
     }
+}
+
+/// A task card kept as a to-do (docs/task-cards.md §4.1): added to the
+/// work its session belongs to (`into_session_work`), else to new work
+/// named after it. Returns the work item's id.
+pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool) -> anyhow::Result<String> {
+    let origin = d.context["session"].as_str().unwrap_or("").to_owned();
+    let mut target = None;
+    if into_session_work && !origin.is_empty() {
+        let root = match st.store.session(&origin).await? {
+            Some(s) => s.root_id.clone().or(s.parent_id.clone()).unwrap_or(s.id),
+            None => origin.clone(),
+        };
+        for id in holding(st, &format!("session:{root}")).await? {
+            if load(st, &id).await?.is_some_and(|r| r.realm == d.realm) {
+                target = Some(id);
+                break;
+            }
+        }
+    }
+    let mut todo = new_todo(&d.title, d.context["prompt"].as_str().unwrap_or(""), "you")?;
+    todo.from = format!("decision:{}", d.id);
+    todo.origin = origin;
+    let id = match target {
+        Some(id) => {
+            modify(st, &id, "you", None, |f| add_todo_to(f, todo)).await?;
+            id
+        }
+        None => {
+            let mut f = WorkFields { title: check_title(&d.title)?, status: "open".into(), ..Default::default() };
+            add_todo_to(&mut f, todo)?;
+            insert(st, &d.realm, &f, &[], "you").await?
+        }
+    };
+    Ok(id)
 }
 
 /// A time as you read it, in the head's time zone.
@@ -923,9 +1084,11 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
             return Ok(false);
         }
         f.note = Some(note);
-        // An offer you dismissed isn't made again for the same evidence.
+        // An offer you dismissed isn't made again for the same evidence,
+        // and none is made while a to-do is left.
         if let Some(o) = offer
             && f.offer.as_ref().is_none_or(|x| x.evidence != o.evidence)
+            && f.todos.iter().all(|t| t.done_at.is_some())
         {
             f.offer = Some(o);
         }
@@ -946,6 +1109,9 @@ async fn described(st: &HeadState, item: &WorkItem) -> anyhow::Result<String> {
         if let Some(a) = item.fields.attached.iter().find(|a| a.reference == l.reference && !a.detail.is_empty()) {
             out.push_str(&format!("  {}\n", a.detail));
         }
+    }
+    if !item.fields.todos.is_empty() {
+        out.push_str(&format!("\nTo-dos ([x] done, [ ] left):\n{}\n", checklist(&item.fields.todos)));
     }
     // The newest sessions' last exchanges, while there's room.
     for l in sessions.iter().take(4) {
@@ -973,10 +1139,58 @@ pub async fn pickup(st: &HeadState, id: &str, caller: &Caller) -> anyhow::Result
         .iter()
         .map(|l| format!("- {} ({}{})", l.title, l.reference, if l.state.is_empty() { String::new() } else { format!(", {}", l.state) }))
         .collect();
-    let attached = if attached.is_empty() { "(nothing yet)".to_owned() } else { attached.join("\n") };
+    let mut attached = if attached.is_empty() { "(nothing yet)".to_owned() } else { attached.join("\n") };
+    if !w.fields.todos.is_empty() {
+        attached.push_str(&format!("\n\nTo-dos:\n{}", checklist(&w.fields.todos)));
+    }
     let done_when = if w.fields.done_when.is_empty() { "(not said)" } else { &w.fields.done_when };
     let template = crate::prompts::get(st, "work.pickup", &w.realm).await;
     Ok(api::prompts::fill(&template, &[("title", &w.fields.title), ("done_when", done_when), ("note", &note), ("attached", &attached)]))
+}
+
+/// The to-dos as a checklist, for agents to read.
+fn checklist(todos: &[Todo]) -> String {
+    todos
+        .iter()
+        .map(|t| {
+            let mark = if t.done_at.is_some() { "x" } else { " " };
+            let session = if t.session.is_empty() { String::new() } else { format!(" (started in session:{})", t.session) };
+            format!("- [{mark}] {}{session} [{}]", t.text, t.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A to-do's text, if `work` holds it.
+pub async fn todo_text(st: &HeadState, work: &str, todo: &str) -> Option<String> {
+    load(st, work).await.ok().flatten()?.fields.todos.into_iter().find(|t| t.id == todo).map(|t| t.text)
+}
+
+/// A session's first message for a to-do (by `work.todo`), and the
+/// session to start from: the one that raised it, else the work's latest.
+pub async fn todo_start(st: &HeadState, id: &str, todo: &str, caller: &Caller) -> anyhow::Result<TodoStart> {
+    let w = get(st, id, caller).await?;
+    let t = w.fields.todos.iter().find(|t| t.id == todo).ok_or_else(|| not_found(format!("no to-do {todo} in this work")))?;
+    let note = match &w.fields.note {
+        Some(n) => format!("Done: {}\nLeft: {}\nNext: {}", n.done, n.left, n.next),
+        None => "(no note yet)".into(),
+    };
+    let what = if t.prompt.trim().is_empty() { &t.text } else { &t.prompt };
+    let done_when = if w.fields.done_when.is_empty() { "(not said)" } else { &w.fields.done_when };
+    let template = crate::prompts::get(st, "work.todo", &w.realm).await;
+    let text = api::prompts::fill(
+        &template,
+        &[("todo", what.trim()), ("id", &t.id), ("title", &w.fields.title), ("done_when", done_when), ("note", &note)],
+    );
+    let latest = w.live.iter().filter(|l| l.reference.starts_with("session:") && l.state != "gone").max_by_key(|l| l.at);
+    let mut seed = None;
+    for s in [t.origin.as_str(), latest.and_then(|l| l.reference.strip_prefix("session:")).unwrap_or("")] {
+        if !s.is_empty() && st.store.session(s).await?.is_some() {
+            seed = Some(s.to_owned());
+            break;
+        }
+    }
+    Ok(TodoStart { text, seed })
 }
 
 /// Groups what's open into work, by `work.propose`: top-level sessions of
@@ -1175,7 +1389,37 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
                 refresh(st, id);
             }
         }
-        other => return Err(bad_request(format!("work's actions are get and attach, not {other:?}"))),
+        "todo" => {
+            let mut t = new_todo(p["text"].as_str().unwrap_or(""), p["prompt"].as_str().unwrap_or(""), &by)?;
+            t.origin = session_id.to_owned();
+            // One piece of work holds it: the one updated last.
+            modify(st, &ids[0], &by, None, |f| add_todo_to(f, t)).await?;
+        }
+        "todo_done" => {
+            let todo = p["id"].as_str().unwrap_or("").trim().to_owned();
+            let evidence = p["evidence"].as_str().unwrap_or("").trim().to_owned();
+            if todo.is_empty() || evidence.is_empty() {
+                return Err(bad_request("todo_done takes the to-do's id and the evidence that it's done"));
+            }
+            let mut found = None;
+            for id in &ids {
+                if load(st, id).await?.is_some_and(|r| r.fields.todos.iter().any(|t| t.id == todo)) {
+                    found = Some(id.clone());
+                    break;
+                }
+            }
+            let id = found.ok_or_else(|| not_found(format!("no to-do {todo} in this session's work")))?;
+            modify(st, &id, &by, None, |f| {
+                let ticked = tick(todo_mut(f, &todo)?, true, &by, &evidence);
+                if ticked {
+                    f.moved_at = now_ms();
+                }
+                Ok(ticked)
+            })
+            .await?;
+            refresh(st, &id);
+        }
+        other => return Err(bad_request(format!("work's actions are get, attach, todo and todo_done, not {other:?}"))),
     }
     let mut out = Vec::new();
     for id in ids {
@@ -1184,6 +1428,8 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
             out.push(json!({
                 "id": r.id, "title": f.title, "done_when": f.done_when, "note": f.note,
                 "attached": f.attached.iter().map(|a| json!({"ref": a.reference, "title": a.title, "status": a.status})).collect::<Vec<_>>(),
+                "todos": f.todos.iter().map(|t| json!({"id": t.id, "text": t.text, "done": t.done_at.is_some(), "session": t.session}))
+                    .collect::<Vec<_>>(),
             }));
         }
     }
@@ -1211,6 +1457,23 @@ mod tests {
         assert_eq!(st(&[live("https://pr", "waiting", 0), live("session:a", "idle", now)]), "waiting");
         assert_eq!(st(&[live("request:1", "open", now)]), "needs_you");
         assert_eq!(st(&[live("request:1", "done", now)]), "open");
+        // To-dos left: open, saying how many and the next.
+        let mut a = new_todo("Bump  the lockfile", "", "you").unwrap();
+        let b = new_todo("Split the config", "Split src/config.rs.", "you").unwrap();
+        assert_eq!(a.text, "Bump the lockfile");
+        let mut listed = f.clone();
+        assert!(add_todo_to(&mut listed, a.clone()).unwrap() && add_todo_to(&mut listed, b.clone()).unwrap());
+        assert!(!add_todo_to(&mut listed, new_todo("bump the lockfile", "", "you").unwrap()).unwrap(), "the same open to-do");
+        assert_eq!(state_of(&listed, &[], now, &s), ("open".into(), "2 of 2 to-dos left: Bump the lockfile".into()));
+        assert!(tick(&mut a, true, "session:x", "cargo update ran") && !tick(&mut a, true, "you", ""));
+        assert_eq!((a.done_by.as_str(), a.evidence.as_str()), ("session:x", "cargo update ran"));
+        listed.todos[0] = a;
+        assert_eq!(state_of(&listed, &[], now, &s), ("open".into(), "1 to-do left: Split the config".into()));
+        assert_eq!(
+            checklist(&listed.todos),
+            format!("- [x] Bump the lockfile [{}]\n- [ ] Split the config [{}]", listed.todos[0].id, b.id)
+        );
+        assert!(new_todo(" ", "", "you").is_err() && new_todo(&"x".repeat(MAX_TODO_TEXT + 1), "", "you").is_err());
         // Nothing moved for longer than the setting: gone quiet, even with
         // a finished turn.
         let old = WorkFields { moved_at: now - 4 * DAY, ..f.clone() };

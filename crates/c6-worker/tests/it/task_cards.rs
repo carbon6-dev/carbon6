@@ -2,6 +2,7 @@
 //! session; the card shows in its session and in Decisions, and "Start it"
 //! starts that session where the first one worked, with the card's prompt.
 
+use c6_api::work::{TodoStart, WorkItem};
 use c6_api::{Connection, Decision, Event, EventKind, Session};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
@@ -122,6 +123,76 @@ async fn agents_propose_tasks_you_start_with_one_click() {
     assert_eq!((gone.title.as_str(), gone.state.as_str()), ("Document the cache flags", "withdrawn"), "{gone:?}");
     let left: Vec<Decision> = serde_json::from_value(get(format!("sessions/{}/decisions", s2.id)).await).unwrap();
     assert!(left.is_empty(), "{left:?}");
+
+    // 4. The other answers: do it in the proposing session, or keep it as a
+    // to-do in that session's work or in new work. (No work notes: they'd
+    // take the mock's replies.)
+    let r = http.put(format!("{api}/settings/work")).json(&json!({"notes": false})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    let propose =
+        |title: &str, prompt: &str| ("task_propose".to_owned(), json!({"title": title, "why": "w", "prompt": prompt}).to_string());
+    mock.push(Reply::ToolCalls(vec![
+        propose("Bump the lockfile", "Run cargo update -p serde."),
+        propose("Split the config module", "Split src/config.rs into load.rs and check.rs."),
+        propose("Fix the README typo", "README says 'recieve'; fix it."),
+    ]));
+    mock.push(Reply::Text("Sped up the build.".into()));
+    let s3: Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": wid, "cwd": project.path(), "connection_id": conn.id, "model": "m", "prompt": "speed up the build", "work": "new"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ended(s3.id.clone()).await;
+    let cards: Vec<Decision> = serde_json::from_value(get(format!("sessions/{}/decisions", s3.id)).await).unwrap();
+    let card = |title: &str| cards.iter().find(|c| c.title == title).unwrap().clone();
+    let labels: Vec<&str> = cards[0].options.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(labels, ["Start it", "Do it here", "Add to this work", "Add as new work", "Not now"]);
+    let answer = |id: i64, option: &'static str| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            let r = http.post(format!("{api}/decisions/{id}/answer")).json(&json!({"option": option})).send().await.unwrap();
+            assert!(r.status().is_success(), "{option}: {}", r.text().await.unwrap());
+        }
+    };
+
+    // Do it here: the session is told, and does it.
+    mock.push(Reply::Text("Bumped it.".into()));
+    answer(card("Bump the lockfile").id, "Do it here").await;
+    eventually("the session to be told", async || {
+        let m = mock.requests().last()?["messages"].to_string();
+        (m.contains("Do the task you proposed here") && m.contains("cargo update -p serde")).then_some(())
+    })
+    .await;
+    let here: Decision = serde_json::from_value(get(format!("decisions/{}", card("Bump the lockfile").id)).await).unwrap();
+    assert!(here.sessions.is_empty(), "no new session: {here:?}");
+
+    // Add to this work: a to-do in the work the session belongs to.
+    let split = card("Split the config module");
+    answer(split.id, "Add to this work").await;
+    let of: Vec<WorkItem> =
+        http.get(format!("{api}/work/of")).query(&[("ref", format!("session:{}", s3.id))]).send().await.unwrap().json().await.unwrap();
+    assert_eq!(of.len(), 1, "{of:?}");
+    let todo = of[0].fields.todos.iter().find(|t| t.text == "Split the config module").unwrap_or_else(|| panic!("{of:?}"));
+    assert_eq!(
+        (todo.prompt.as_str(), todo.from.clone(), todo.origin.as_str()),
+        ("Split src/config.rs into load.rs and check.rs.", format!("decision:{}", split.id), s3.id.as_str())
+    );
+    assert!(todo.done_at.is_none());
+
+    // Add as new work: work of its own, whose to-do starts from the
+    // session that proposed it, with the card's prompt.
+    let typo = card("Fix the README typo");
+    answer(typo.id, "Add as new work").await;
+    let all: Vec<WorkItem> = serde_json::from_value(get("work".into()).await).unwrap();
+    let w = all.iter().find(|w| w.fields.title == "Fix the README typo").unwrap_or_else(|| panic!("{all:?}"));
+    assert_eq!((w.state.as_str(), w.why.as_str()), ("open", "1 to-do left: Fix the README typo"), "{w:?}");
+    let start: TodoStart = serde_json::from_value(get(format!("work/{}/todos/{}/start", w.id, w.fields.todos[0].id)).await).unwrap();
+    assert!(start.text.contains("README says 'recieve'") && start.text.contains(&w.fields.todos[0].id), "{start:?}");
+    assert_eq!(start.seed.as_deref(), Some(s3.id.as_str()));
 
     stop.cancel();
     head.shutdown().await.unwrap();

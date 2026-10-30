@@ -40,6 +40,78 @@ pub struct WorkFields {
     pub told: Option<Told>,
     #[serde(default)]
     pub closed_at: Option<UnixMs>,
+    /// Its to-dos: a flat checklist, each one a session's worth of work
+    /// you can start when you're ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<Todo>,
+}
+
+/// One step of a piece of work, to start as a session later.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Todo {
+    pub id: String,
+    /// One line: what's to do.
+    pub text: String,
+    /// What a session started on it is told (else the text).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    /// Where it came from: `decision:<id>` for a task card.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    /// The session that raised it, whose worker and folder a session
+    /// started on it begins from.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// The latest session started on it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session: String,
+    /// you, or session:<id>.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub at: UnixMs,
+    #[serde(default)]
+    pub done_at: Option<UnixMs>,
+    /// Who ticked it off (you, or session:<id>), and an agent's evidence.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
+}
+
+/// `POST /api/v1/work/{id}/todos`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TodoNew {
+    pub text: String,
+    /// What a session started on it is told, if more than the text.
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// `PATCH /api/v1/work/{id}/todos/{todo}`: what changes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TodoPatch {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Tick it off, or not.
+    #[serde(default)]
+    pub done: Option<bool>,
+}
+
+/// `GET /api/v1/work/{id}/todos/{todo}/start`: a session's first message
+/// for it, and the session whose worker, folder and model it starts from.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TodoStart {
+    pub text: String,
+    #[serde(default)]
+    pub seed: Option<String>,
 }
 
 fn open() -> String {

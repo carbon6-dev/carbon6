@@ -8,6 +8,8 @@ While an agent works, it notices things worth doing that don't belong in the cur
 
 - A title and one or two lines on why now.
 - **Start it** begins a new session that does the task: same worker, folder and realm, with a self-contained prompt the agent wrote.
+- **Do it here** has the session that proposed it do it, as your next message to it.
+- **Add to this work** keeps it as a to-do in the work its session belongs to (docs/work.md); **Add as new work** keeps it as a piece of work of its own.
 - **Not now** dismisses the card.
 
 The current session carries on undisturbed, never waiting on a card.
@@ -31,13 +33,13 @@ The current session carries on undisturbed, never waiting on a card.
 A decision, so it's kept, listed and answered like everything else that needs you:
 
 - `kind: "task"`, `priority: "low"`, `group: "Suggested tasks"`;
-- `ref: "task:<session>:<id>"`, `options: ["Start it", "Not now"]`;
+- `ref: "task:<session>:<id>"`, `options: ["Start it", "Do it here", "Add to this work", "Add as new work", "Not now"]`;
 - `context: {session, prompt, worker, cwd, repo, worktree, labels}`;
 - `document`: the why, then the prompt in a collapsed block, so you see exactly what the new session will be told.
 
 Where it shows:
 
-- **The session:** under **Waiting for you** (that panel is already built), as a compact card with Start it and Not now.
+- **The session:** under **Waiting for you** (that panel is already built), as a compact card with its answers.
 - **Decisions:** in the "Suggested tasks" group, low priority, below what waits on you. It sends no notification to your phone, since task cards aren't urgent.
 
 ## 4. Starting one
@@ -50,6 +52,15 @@ Where it shows:
 - title = the card's title.
 
 The card is answered with "Start it" and names the new session ("working session ↗"). Starting one is never automatic.
+
+The new session is on its own from there: nothing it does is reported back to the session that proposed the card. You see its result in the new session (linked from the card), and the `from:<session>` label ties the two together.
+
+### 4.1 The other answers
+
+- **Do it here** sends the card's prompt to the session that proposed it, as a message from you ("Do the task you proposed here … (task card #N: title)"). If the session is in a turn, the message waits for it, as yours do.
+- **Add to this work** adds the card as a to-do (docs/work.md §12) to the open work, in the card's realm, that holds the session (its root, for a subagent): its title as the text, its prompt as the prompt, `from: decision:<id>`, and the session as its origin. If no work holds the session, it makes new work, as below.
+- **Add as new work** makes a work item titled like the card, with that one to-do.
+- **Starting it later:** ▶ Start on the to-do opens the new-session form where the proposing session worked, with the card's prompt (by `work.todo`). The session joins the work and can tick the to-do off.
 
 ## 5. Not doing
 

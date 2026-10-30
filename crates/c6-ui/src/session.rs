@@ -2777,6 +2777,7 @@ fn Composer(
                     let req = c6_api::CreateSession {
                         work,
                         work_refs: Vec::new(),
+                        todo: None,
                         labels: d.session.labels,
                         worker_id: d.session.worker_id,
                         cwd: d.session.cwd,

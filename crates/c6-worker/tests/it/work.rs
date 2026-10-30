@@ -242,3 +242,116 @@ async fn work_follows_what_belongs_to_it() {
     }
     stop.cancel();
 }
+
+/// To-dos (docs/work.md §12): you list a piece of work's steps, start one
+/// as a session later, and it, or you, ticks it off; a session adds more.
+#[tokio::test]
+async fn todos_become_sessions_later() {
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let conn: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // No agent steps of work's own: every model call here is the session's.
+    let r = http.put(format!("{api}/settings/work")).json(&json!({"guess": false, "notes": false})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let send = |req: reqwest::RequestBuilder| async move {
+        let r = req.send().await.unwrap();
+        let status = r.status();
+        let body: Value = r.json().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        body
+    };
+    let item = |v: Value| serde_json::from_value::<WorkItem>(v).unwrap();
+
+    // 1. You list the steps (the same open one twice: one to-do).
+    let w = item(send(http.post(format!("{api}/work")).json(&json!({"title": "Ship the cache"}))).await);
+    let todos = format!("{api}/work/{}/todos", w.id);
+    send(http.post(&todos).json(&json!({"text": "Write the cache tests"}))).await;
+    send(http.post(&todos).json(&json!({"text": "Document the flags", "prompt": "Add the cache flags to README.md."}))).await;
+    let w = item(send(http.post(&todos).json(&json!({"text": "write the cache tests"}))).await);
+    assert_eq!(w.fields.todos.len(), 2, "{w:?}");
+    assert_eq!((w.state.as_str(), w.why.as_str()), ("open", "2 of 2 to-dos left: Write the cache tests"));
+    let (tests, docs) = (w.fields.todos[0].id.clone(), w.fields.todos[1].id.clone());
+
+    // 2. Later, one becomes a session: its prompt, and how to tick it off.
+    let start: Value = send(http.get(format!("{todos}/{docs}/start"))).await;
+    let first = start["text"].as_str().unwrap().to_owned();
+    assert!(first.contains("Add the cache flags to README.md.") && first.contains("Ship the cache") && first.contains(&docs), "{first}");
+    assert!(start["seed"].is_null(), "no session to start from yet");
+    mock.push(Reply::ToolCalls(vec![(
+        "work".into(),
+        json!({"action": "todo_done", "id": docs, "evidence": "README.md lists the flags"}).to_string(),
+    )]));
+    mock.push(Reply::ToolCalls(vec![(
+        "work".into(),
+        json!({"action": "todo", "text": "Benchmark the cache", "prompt": "Run cargo bench -p cache and compare."}).to_string(),
+    )]));
+    mock.push(Reply::Text("Documented the flags; a benchmark is still worth running.".into()));
+    let s: Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn.id, "model": "m",
+                      "prompt": first, "work": w.id, "todo": docs}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // 3. The session ticked its to-do off and added the next.
+    let w = eventually("the session's to-dos", async || {
+        let w = item(send(http.get(format!("{api}/work/{}", w.id))).await);
+        (w.fields.todos.len() == 3).then_some(w)
+    })
+    .await;
+    let by = format!("session:{}", s.id);
+    let d = &w.fields.todos[1];
+    assert_eq!((d.session.as_str(), d.done_by.as_str(), d.evidence.as_str()), (s.id.as_str(), by.as_str(), "README.md lists the flags"));
+    assert!(d.done_at.is_some());
+    let b = &w.fields.todos[2];
+    assert_eq!(
+        (b.text.as_str(), b.prompt.as_str(), b.by.as_str(), b.origin.as_str()),
+        ("Benchmark the cache", "Run cargo bench -p cache and compare.", by.as_str(), s.id.as_str())
+    );
+    assert!(w.fields.attached.iter().any(|a| a.reference == by), "the session joined the work");
+    assert_eq!(s.title, "Document the flags", "named after its to-do");
+    let start: Value = send(http.get(format!("{todos}/{}/start", b.id))).await;
+    assert_eq!(start["seed"], json!(s.id), "it starts where the session that raised it ran");
+
+    // 4. You tick one off, untick it, change it, and take one away.
+    let w = item(send(http.patch(format!("{todos}/{tests}")).json(&json!({"done": true}))).await);
+    assert_eq!(w.fields.todos[0].done_by, "you");
+    let w = item(send(http.patch(format!("{todos}/{tests}")).json(&json!({"done": false, "text": "Write the cache's tests"}))).await);
+    assert!(w.fields.todos[0].done_at.is_none() && w.fields.todos[0].text == "Write the cache's tests", "{w:?}");
+    let w = item(send(http.delete(format!("{todos}/{}", b.id))).await);
+    assert_eq!(w.fields.todos.len(), 2);
+    let r = http.patch(format!("{todos}/nope")).json(&json!({"done": true})).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+    stop.cancel();
+}

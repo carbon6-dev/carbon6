@@ -300,6 +300,8 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
     let id = StoredValue::new(w.id.clone());
     let next = w.fields.note.as_ref().map(|n| n.next.clone()).filter(|n| !n.is_empty());
     let when = moved(&w);
+    let todos = w.fields.todos.len();
+    let left = w.fields.todos.iter().filter(|t| t.done_at.is_none()).count();
     view! {
         <button class="block w-full rounded-md border px-3 py-2 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900"
             class=("border-violet-400", move || picked.get() == index)
@@ -313,6 +315,11 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
             {(!w.why.is_empty()).then(|| view! { <p class="truncate text-xs text-zinc-600 dark:text-zinc-400">{w.why.clone()}</p> })}
             {next.map(|n| view! { <p class="truncate text-xs text-zinc-500">{format!("Next: {n}")}</p> })}
             <div class="mt-1 flex flex-wrap gap-1">
+                {(todos > 0).then(|| view! {
+                    <span class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300" title="To-dos done of all">
+                        {format!("☐ {}/{todos}", todos - left)}
+                    </span>
+                })}
                 {w.live.iter().take(6).map(|l| view! {
                     <span class="max-w-48 truncate rounded bg-zinc-100 px-1.5 text-[11px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" title=l.title.clone()>
                         {format!("{} {}", kind_mark(&l.reference), l.title)}
@@ -430,7 +437,10 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
     let (title, done_when) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
     let attach_ref = RwSignal::new(String::new());
     let attach_title = RwSignal::new(String::new());
-    let pickup = RwSignal::new(None::<(String, Option<Session>)>);
+    // A session to start: its first message, the session it starts from,
+    // and the to-do it does (none: Pick up).
+    let pickup = RwSignal::new(None::<(String, Option<Session>, Option<String>)>);
+    let new_todo = RwSignal::new(String::new());
     let live = api::live();
     let others = LocalResource::new(|| api::work_list(false));
     let merging = RwSignal::new(false);
@@ -438,7 +448,41 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
         let seed = last_session(&w).and_then(|s| live.sessions.with_untracked(|ss| ss.iter().find(|x| x.id == s).cloned()));
         spawn_local(async move {
             match api::work_pickup(w.id.clone()).await {
-                Ok(text) => pickup.set(Some((text, seed))),
+                Ok(text) => pickup.set(Some((text, seed, None))),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    // A to-do, started: its first message, from the session it came from
+    // or the work's latest.
+    let start_todo = move |todo: String| {
+        spawn_local(async move {
+            match api::work_todo_start(id.get_value(), todo.clone()).await {
+                Ok(s) => {
+                    let mut seed = None;
+                    if let Some(sid) = s.seed {
+                        seed = live.sessions.with_untracked(|ss| ss.iter().find(|x| x.id == sid).cloned());
+                        if seed.is_none() {
+                            seed = api::session(sid).await.ok().map(|d| d.session);
+                        }
+                    }
+                    pickup.set(Some((s.text, seed, Some(todo))));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let add_todo = move || {
+        let text = new_todo.get_untracked().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            match api::work_todo_add(id.get_value(), text).await {
+                Ok(w) => {
+                    new_todo.set(String::new());
+                    shown.set(Some(Ok(w)));
+                }
                 Err(e) => error.set(Some(e)),
             }
         });
@@ -576,13 +620,57 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                     </dl>
                                 }.into_any(),
                                 None => view! {
-                                    <p class="text-sm text-zinc-500">{if w.fields.attached.is_empty() {
+                                    <p class="text-sm text-zinc-500">{if w.fields.attached.is_empty() && !w.fields.todos.is_empty() {
+                                        "Nothing started yet: ▶ Start a to-do below, or Pick up the whole work."
+                                    } else if w.fields.attached.is_empty() {
                                         "Nothing belongs to it yet: start a session on it (Pick up), or attach something below."
                                     } else {
                                         "No note yet: an agent writes one when something here moves."
                                     }}</p>
                                 }.into_any(),
                             }}
+                        </section>
+                        <section class="space-y-1">
+                            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"To do"</h2>
+                            {w.fields.todos.iter().map(|t| {
+                                let done = t.done_at.is_some();
+                                let (tid, tid2, tid3) = (t.id.clone(), t.id.clone(), t.id.clone());
+                                let what = if t.prompt.is_empty() { t.text.clone() } else { t.prompt.clone() };
+                                let ticked_by = (done && t.done_by.starts_with("session:")).then(|| {
+                                    format!("Ticked off by {}{}", t.done_by, if t.evidence.is_empty() { String::new() } else { format!(": {}", t.evidence) })
+                                });
+                                view! {
+                                    <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+                                        <input type="checkbox" class="shrink-0" prop:checked=done title=if done { "Not done after all" } else { "Done" }
+                                            on:change=move |_| {
+                                                let todo = tid.clone();
+                                                let p = c6_api::work::TodoPatch { done: Some(!done), ..Default::default() };
+                                                spawn_local(async move { apply(api::work_todo_patch(id.get_value(), todo, p).await) });
+                                            } />
+                                        <span class=if done { "min-w-0 flex-1 truncate text-zinc-400 line-through" } else { "min-w-0 flex-1 truncate" } title=what>{t.text.clone()}</span>
+                                        {t.from.starts_with("decision:").then(|| view! { <span class="shrink-0 text-[11px] text-zinc-400" title="An agent proposed it as a task card">"task card"</span> })}
+                                        {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>"✓ agent"</span> })}
+                                        {(!t.session.is_empty()).then(|| view! {
+                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session ↗"</Go>
+                                        })}
+                                        {(!done && open).then(|| view! {
+                                            <button class=format!("{BUTTON_QUIET} shrink-0 text-xs") title="Start a session that does it"
+                                                on:click=move |_| start_todo(tid2.clone())>"▶ Start"</button>
+                                        })}
+                                        <button class="shrink-0 text-xs text-zinc-400 hover:text-red-600" title="Take it off this work"
+                                            on:click=move |_| { let todo = tid3.clone(); spawn_local(async move { apply(api::work_todo_remove(id.get_value(), todo).await) }); }>"✕"</button>
+                                    </div>
+                                }
+                            }).collect_view()}
+                            {w.fields.todos.is_empty().then(|| view! {
+                                <p class="px-2 text-sm text-zinc-500">"Nothing to do yet: add the steps you mean to take, and start each in a session when you're ready."</p>
+                            })}
+                            <div class="flex gap-2 pt-1">
+                                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="Add a to-do…"
+                                    prop:value=move || new_todo.get() on:input=move |ev| new_todo.set(event_target_value(&ev))
+                                    on:keydown=move |ev| if ev.key() == "Enter" { add_todo() } />
+                                <button class=BUTTON_QUIET on:click=move |_| add_todo()>"Add"</button>
+                            </div>
                         </section>
                         <section class="space-y-1">
                             <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"What belongs to it"</h2>
@@ -615,16 +703,19 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                     }.into_any()
                 }
             }}
-            {move || pickup.get().map(|(first, seed)| {
-                let (title, note) = ("Pick this work up in a new session", "Starts where it stood: the note and what belongs to it. It joins this work.");
+            {move || pickup.get().map(|(first, seed, todo)| {
+                let (title, note) = match todo {
+                    Some(_) => ("Start this to-do in a new session", "It joins this work, and the to-do links to it. Tick the to-do off when it's done, or the agent will."),
+                    None => ("Pick this work up in a new session", "Starts where it stood: the note and what belongs to it. It joins this work."),
+                };
                 let close = move |()| { pickup.set(None); reload(); };
-                // Where its latest session ran, with its model and labels.
+                // Where its latest session ran (or the to-do's), with its model and labels.
                 match seed.as_ref().map(crate::sessions::SessionSeed::from_session) {
                     Some(seed) => view! {
-                        <crate::sessions::SessionDialog title note first_message=first seed work=id.get_value() on_close=close />
+                        <crate::sessions::SessionDialog title note first_message=first seed work=id.get_value() todo=todo.unwrap_or_default() on_close=close />
                     }.into_any(),
                     None => view! {
-                        <crate::sessions::SessionDialog title note first_message=first work=id.get_value() on_close=close />
+                        <crate::sessions::SessionDialog title note first_message=first work=id.get_value() todo=todo.unwrap_or_default() on_close=close />
                     }.into_any(),
                 }
             })}

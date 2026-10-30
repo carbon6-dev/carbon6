@@ -265,6 +265,7 @@ async fn start(
             realm: Some(realm.to_owned()),
             work: None,
             work_refs: Vec::new(),
+            todo: None,
         };
         match crate::sessions::create_as(st, req, &acting).await {
             Ok(s) => sessions.push(s),

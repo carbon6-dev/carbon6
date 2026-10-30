@@ -211,6 +211,13 @@ pub const WORK_PICKUP: &str = "I'm picking this work up again: {{title}}\nDone w
 What belongs to it:\n{{attached}}\n\nLook at what you need of these, then tell me in a few lines where things stand and what you \
 would do next. Wait for me before changing anything.";
 
+/// The first message of a session started on one of a piece of work's
+/// to-dos (docs/work.md §12). `{{todo}}` (its prompt, else its text),
+/// `{{id}}`, `{{title}}`, `{{done_when}}`, `{{note}}`.
+pub const WORK_TODO: &str = "{{todo}}\n\n---\nThis is one step of a piece of work I mean to finish: {{title}} (done when: \
+{{done_when}}).\nWhere the work stands:\n{{note}}\n\nWhen this step is done, tick it off with the work tool (action todo_done, id \
+{{id}}, with the evidence in one line).";
+
 /// Pieces of work in what's open (the one-time offer, docs/work.md §9).
 /// `{{things}}` (open sessions and requests, one per line with a ref).
 pub const WORK_PROPOSE: &str = "The user has many things open at once and is losing track of them. Group what is open below into the \

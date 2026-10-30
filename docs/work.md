@@ -25,7 +25,7 @@ A **work item** is something you intend to finish:
 | realm, labels | as for sessions |
 | opened, last moved, closed | times |
 
-Work is flat: no projects, sub-items or dependencies. A label groups work items if you want that.
+Work is flat: no projects, sub-items or dependencies. A label groups work items if you want that. Its steps are a flat checklist of **to-dos** (§12), not nested work.
 
 A **plain to-do** ("renew the domain") is a work item with nothing attached yet. Starting a session from it attaches that session.
 
@@ -110,7 +110,7 @@ Per docs/os.md, no app-specific machinery:
 - **Events.** The triggers' hooks for sessions (finished, failed, needs approval) and decisions, and the memex's `request.opened` and the new `request.changed` (set, closed, or a new message joined it), mark the work holding that thing as moved and bring its note up to date. A subagent's or side chat's turn moves its root session's work.
 - **Agents' steps** call the model a routing rule for `task:work` picks, else the session's own (the latest attached session's for notes). Their tokens are recorded in the realm's usage as `work:<step>`, and they show on the Activity page. The prompts are `work.attach` (the guess), `work.summary` (the note, and `finished` with evidence for "looks done"), `work.pickup` (Pick up's first message) and `work.propose` (finding work in what's open). Notes are written in the background, one at a time per item; a change while one is written writes it again after. A "looks done" you dismissed isn't offered again for the same evidence.
 - **Sessions you start** (`POST /api/v1/sessions`, so not templates, triggers or subagents) take `work` (an item's id, `new`, `none` or `guess`) and `work_refs` (what they were started from: a reply box's request, thread or chat). The work already holding a ref is used first. The guess runs only when asked: the new-session form asks by default ("An agent picks"), so reply-box and form sessions are guessed, while API and CLI callers (`c6 run`) opt in with `guess` and otherwise cost no extra model call. Settings → Work can turn the guess off. "Start fresh" carries the old session's work.
-- **The `work` tool** lets a session read its work (`get`) and attach what it made (`attach`: a URL with title, status and detail; attaching again updates the status). It never closes work.
+- **The `work` tool** lets a session read its work (`get`) and attach what it made (`attach`: a URL with title, status and detail; attaching again updates the status). It also adds and ticks off to-dos (§12). It never closes work.
 - **API:** `GET/POST /api/v1/work`, `GET /api/v1/work/of?ref=`, `GET/PATCH /api/v1/work/{id}`, `POST …/attach`, `…/detach`, `…/merge`, `…/refresh`, `GET …/pickup`, `POST /api/v1/work/proposals`, and `GET/PUT /api/v1/settings/work` (per realm: guess, notes, quiet_days, nudge, needs_hours). All of them are in the catalog for the assistant.
 - **Nudges.** Every five minutes the head checks open work. It sends a notification (event `work`, on by default) when an item goes quiet, or has needed you for `needs_hours`, once per state until it moves again.
 - **UI** (`crates/c6-ui/src/work.rs`):
@@ -122,3 +122,15 @@ Per docs/os.md, no app-specific machinery:
   - **The Work link in the header** counts what needs a look.
   - **Settings → Work** holds the settings above.
 - **Not built:** a commitment you make in a reply doesn't make work by itself (use "Keep as work"). Mail threads and chat conversations attached to work have no live state of their own (their request does). The one-time offer is the "Find work in what's open" button, always there rather than offered once.
+
+## 12. To-dos
+
+Status: built (2026-10-30). Each piece of work has a checklist of to-dos: the steps you mean to take, each one a session's worth, to start when you're ready. It stays flat: no nesting, due dates, priorities or assignees, and at most 50 per item.
+
+- **A to-do** (`api::work::Todo`, in the item's `todos`) is a line of text, and optionally a `prompt` (what a session started on it is told, else the text). It notes where it came from (`from`: `decision:<id>` for a task card), the session that raised it (`origin`), the latest session started on it (`session`), who added it, and, once ticked off, when, by whom (`you` or `session:<id>`) and an agent's evidence. A new to-do whose text matches an open one (ignoring case) is that one.
+- **Adding them.** You type them on the work item (`POST /api/v1/work/{id}/todos`). A task card's "Add to this work" and "Add as new work" add one with the card's prompt (docs/task-cards.md §4.1). A session adds one with the `work` tool (action `todo`: text, prompt), to the work it belongs to.
+- **Starting one.** ▶ Start opens the new-session form, joining this work, filled in from the to-do's origin session (its worker, folder, model and labels), else the work's latest, with the first message from `work.todo` (an editable prompt: the to-do's prompt, what the work is, where it stands, and how to tick it off). `GET /api/v1/work/{id}/todos/{todo}/start` gives that message and the session to start from. A session created with `work` (the item's id) and `todo` is the to-do's `session`, and is named after the to-do unless you named it. The form sends `todo` only while the Work field still names that item.
+- **Ticking off.** You tick it (or untick it) on the work item (`PATCH …/todos/{todo}` with `done`). The session's agent ticks it with the `work` tool (action `todo_done`: id and the evidence in one line), as `work.todo` asks. Ticking moves the work and brings its note up to date. Only you remove a to-do (`DELETE …/todos/{todo}`).
+- **State.** Open to-dos don't make work need you. When nothing else says what it's doing, it's open, "2 of 5 to-dos left: <the next one>". The note's agent reads the checklist (`[x]` done, `[ ]` left) with what's attached, and no "looks done" is offered while a to-do is left. Pick up lists the checklist too. Merging work joins the checklists.
+- **UI.** The work item has a **To do** section between the note and what belongs to it: a checkbox, the text (its prompt on hover), "task card" and "✓ agent" marks, a link to its session, ▶ Start and ✕, and an "Add a to-do…" line. Each row of the Work panel shows the count done of all ("☐ 1/3").
+- **The assistant** has `work.todos.add`, `work.todos.edit`, `work.todos.remove` and `work.todos.start`.

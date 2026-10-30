@@ -1530,6 +1530,9 @@ pub struct CreateSession {
     /// its work along with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_refs: Vec<work::WorkRef>,
+    /// The to-do of `work` (an item's id) it was started on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

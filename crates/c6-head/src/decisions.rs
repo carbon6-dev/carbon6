@@ -359,11 +359,17 @@ async fn act(
         (Some("update"), Some(version), _) => {
             crate::updates::answer(st, version, option).await?;
         }
-        (Some("task"), Some(_), Some(_)) => {
-            if option == Some("Start it") {
-                start_task(st, d).await?;
+        (Some("task"), Some(_), Some(_)) => match option {
+            Some(TASK_START) => start_task(st, d).await?,
+            Some(TASK_HERE) => do_task_here(st, d).await?,
+            Some(TASK_TO_WORK) => {
+                crate::work::keep_todo(st, d, true).await?;
             }
-        }
+            Some(TASK_TO_NEW_WORK) => {
+                crate::work::keep_todo(st, d, false).await?;
+            }
+            _ => {}
+        },
         (Some("publish"), _, _) => {
             crate::commons::answer(st, d, option == Some("Publish")).await?;
         }
@@ -690,6 +696,12 @@ pub async fn from_session(st: &HeadState, session_id: &str, what: &str, params: 
     }
 }
 
+/// A task card's answers (docs/task-cards.md §4).
+pub const TASK_START: &str = "Start it";
+pub const TASK_HERE: &str = "Do it here";
+pub const TASK_TO_WORK: &str = "Add to this work";
+pub const TASK_TO_NEW_WORK: &str = "Add as new work";
+
 /// An agent proposes a task for a separate session, or withdraws one
 /// (docs/task-cards.md): a card in its session and in Decisions.
 pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Value) -> anyhow::Result<Value> {
@@ -752,13 +764,37 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
         priority: "low".into(),
         group: "Suggested tasks".into(),
         options: vec![
-            api::DecisionOption { label: "Start it".into(), does: "A new session does it, with the prompt below.".into() },
+            api::DecisionOption { label: TASK_START.into(), does: "A new session does it, with the prompt below.".into() },
+            api::DecisionOption {
+                label: TASK_HERE.into(),
+                does: "The session that proposed it does it, after what it's doing now.".into(),
+            },
+            api::DecisionOption {
+                label: TASK_TO_WORK.into(),
+                does: "A to-do in the session's work, to pick up later (new work if the session belongs to none).".into(),
+            },
+            api::DecisionOption { label: TASK_TO_NEW_WORK.into(), does: "A new piece of work holding this to-do.".into() },
             api::DecisionOption { label: "Not now".into(), does: "The card goes away.".into() },
         ],
         ..Default::default()
     };
     let decision = open(st, &d, &realm, &format!("{prefix}{}", uuid::Uuid::now_v7())).await?;
     Ok(json!({"id": decision.id, "count": decision.count}))
+}
+
+/// "Do it here": the card's task, as a message to the session that
+/// proposed it (queued behind its current turn).
+async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
+    let session = d.context["session"].as_str().ok_or_else(|| bad_request("the card names no session"))?;
+    let text = format!(
+        "Do the task you proposed here, in this session (task card #{}: {}).\n\n{}",
+        d.id,
+        d.title,
+        d.context["prompt"].as_str().unwrap_or("").trim()
+    );
+    crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await?;
+    info!(decision = d.id, %session, "task card done in its session");
+    Ok(())
 }
 
 /// "Start it": a session that does the card's task, where its session worked.

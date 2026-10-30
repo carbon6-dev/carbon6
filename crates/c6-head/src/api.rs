@@ -172,6 +172,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/work/{id}/merge", post(merge_work))
         .route("/api/v1/work/{id}/refresh", post(refresh_work))
         .route("/api/v1/work/{id}/pickup", get(pickup_work))
+        .route("/api/v1/work/{id}/todos", post(add_work_todo))
+        .route("/api/v1/work/{id}/todos/{todo}", axum::routing::patch(edit_work_todo).delete(remove_work_todo))
+        .route("/api/v1/work/{id}/todos/{todo}/start", get(start_work_todo))
         .route("/api/v1/settings/work", get(get_work_settings).put(put_work_settings))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
@@ -727,9 +730,16 @@ async fn create_session(
 ) -> ApiResult<Json<api::Session>> {
     req.realm = Some(caller.realm_for_new(req.realm.as_deref())?);
     let (work, refs, prompt) = (req.work.take(), std::mem::take(&mut req.work_refs), req.prompt.clone().unwrap_or_default());
+    let todo = req.todo.take();
+    // Started on a to-do: named after it, unless you named it.
+    if let (Some(w), Some(t)) = (work.as_deref(), todo.as_deref())
+        && req.title.as_deref().is_none_or(|t| t.trim().is_empty())
+    {
+        req.title = crate::work::todo_text(&st, w, t).await;
+    }
     let s = crate::sessions::create(&st, req).await?;
-    // The work it belongs to (docs/work.md §4).
-    crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt).await;
+    // The work it belongs to (docs/work.md §4), and the to-do it's on.
+    crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, todo.as_deref()).await;
     Ok(Json(s))
 }
 
@@ -3817,6 +3827,40 @@ async fn pickup_work(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({"text": crate::work::pickup(&st, &id, &caller).await?})))
+}
+
+async fn add_work_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(n): Json<api::work::TodoNew>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::todo_add(&st, &id, &n, &caller).await?))
+}
+
+async fn edit_work_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, todo)): Path<(String, String)>,
+    Json(p): Json<api::work::TodoPatch>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::todo_edit(&st, &id, &todo, &p, &caller).await?))
+}
+
+async fn remove_work_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, todo)): Path<(String, String)>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::todo_remove(&st, &id, &todo, &caller).await?))
+}
+
+async fn start_work_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, todo)): Path<(String, String)>,
+) -> ApiResult<Json<api::work::TodoStart>> {
+    Ok(Json(crate::work::todo_start(&st, &id, &todo, &caller).await?))
 }
 
 async fn propose_work(

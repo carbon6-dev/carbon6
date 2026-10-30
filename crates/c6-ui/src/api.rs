@@ -1310,3 +1310,20 @@ pub async fn work_pickup(id: String) -> Result<String, String> {
     let v: serde_json::Value = json(Request::get(&format!("/api/v1/work/{id}/pickup")).send().await).await?;
     Ok(v["text"].as_str().unwrap_or_default().to_owned())
 }
+
+pub async fn work_todo_add(id: String, text: String) -> Result<WorkItem, String> {
+    send_json(Request::post(&format!("/api/v1/work/{id}/todos")), &c6_api::work::TodoNew { text, prompt: String::new() }).await
+}
+
+pub async fn work_todo_patch(id: String, todo: String, p: c6_api::work::TodoPatch) -> Result<WorkItem, String> {
+    send_json(Request::patch(&format!("/api/v1/work/{id}/todos/{todo}")), &p).await
+}
+
+pub async fn work_todo_remove(id: String, todo: String) -> Result<WorkItem, String> {
+    json(Request::delete(&format!("/api/v1/work/{id}/todos/{todo}")).send().await).await
+}
+
+/// A session's first message for a to-do, and the session to start from.
+pub async fn work_todo_start(id: String, todo: String) -> Result<c6_api::work::TodoStart, String> {
+    json(Request::get(&format!("/api/v1/work/{id}/todos/{todo}/start")).send().await).await
+}

@@ -96,6 +96,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::WORK_PICKUP,
     },
     Prompt {
+        name: "work.todo",
+        description: "The first message of a session started on one of a piece of work's to-dos (you can change it before starting). Placeholders: {{todo}}, {{id}}, {{title}}, {{done_when}}, {{note}}.",
+        default: text::WORK_TODO,
+    },
+    Prompt {
         name: "work.propose",
         description: "How what's open is grouped into pieces of work, once, for you to accept or skip (docs/work.md §9). Placeholder: {{things}}.",
         default: text::WORK_PROPOSE,
