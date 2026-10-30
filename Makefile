@@ -41,7 +41,7 @@ BREW_VERSION ?= $(if $(RELEASE_TAG),$(CRATE_VERSION),$(CRATE_VERSION).$(COMMIT_T
 BREW_ENV      = HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSION) --build-arg "MAINTAINER=$(DEB_MAINTAINER)"
 
-.PHONY: help docker-build docker-build-all docker-test docker-images docker-head docker-head-stop docker-token docker-login-link \
+.PHONY: help docker-build docker-build-all docker-test docker-check docker-fmt docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
         ui build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
@@ -65,6 +65,13 @@ docker-build-all: ## Build Linux binaries for amd64 and arm64 into dist/linux_{a
 
 docker-test: ## Run the full test suite in Docker
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target test --progress plain .
+
+docker-check: ## Run `make check` in Docker: formatting, clippy (also for the web UI's wasm) and the test lint, with the Rust version the Dockerfile pins
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target check --progress plain .
+
+docker-fmt: ## Format the source in Docker with the Rust version the Dockerfile pins (rewrites files here; docker-check only checks)
+	$(DOCKER) buildx build -f $(DOCKERFILE) --target fmt --load -t $(IMAGE_PREFIX)/fmt:$(TAG) .
+	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR)":/src -w /src $(IMAGE_PREFIX)/fmt:$(TAG) sh -c 'cargo fmt --all && cargo fmt --manifest-path site/Cargo.toml --all'
 
 docker-images: ## Build runtime images carbon6/c6h:dev and carbon6/c6w:dev (IMAGE_PREFIX, TAG)
 	$(DOCKER) buildx build -f $(DOCKERFILE) --target c6h --load -t $(IMAGE_PREFIX)/c6h:$(TAG) .
