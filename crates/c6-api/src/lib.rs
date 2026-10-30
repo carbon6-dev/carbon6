@@ -10,6 +10,35 @@ use uuid::Uuid;
 /// Timestamps are Unix milliseconds.
 pub type UnixMs = i64;
 
+/// Non-destructive inspection of a background shell command, subagent or observed Claude Code task.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskSnapshot {
+    pub task_id: String,
+    /// "shell", "agent" or "claude_code" (observed, CLI-managed).
+    pub kind: String,
+    pub command: String,
+    pub running: bool,
+    /// None while running, or when the upstream runtime provides no numeric exit status.
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+    pub stdin: TaskStream,
+    pub stdout: TaskStream,
+    pub stderr: TaskStream,
+    /// Upstream combined output, when separate stdout/stderr are unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combined: Option<TaskStream>,
+}
+
+/// Retained stream contents and the number of older bytes discarded.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskStream {
+    pub text: String,
+    pub dropped_bytes: u64,
+    pub note: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -1798,14 +1827,14 @@ pub enum EventKind {
         #[serde(default)]
         restore_error: String,
     },
-    /// A background task (shell command or subagent) started or ended.
+    /// A background task (shell command, subagent or observed CLI task) started or ended.
     BackgroundTask {
         task_id: String,
-        /// "shell" or "agent".
+        /// "shell", "agent" or "claude_code".
         kind: String,
         description: String,
-        /// "started", "finished", "stopped" (by the agent),
-        /// "stopped_by_user" or "lost" (the worker restarted).
+        /// "started", "finished", "failed", "stopped" (by the agent),
+        /// "stopped_by_user" or "lost" (the worker or owning CLI exited without an outcome).
         state: String,
         #[serde(default)]
         exit_code: i32,

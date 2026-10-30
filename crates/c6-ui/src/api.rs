@@ -1019,6 +1019,11 @@ pub async fn stop_task(id: String, task: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/tasks/{task}/stop")).send().await).await
 }
 
+/// A read-only snapshot of a task's streams, independent of the model's read cursor.
+pub async fn task_snapshot(session: String, task: String) -> Result<c6_api::TaskSnapshot, String> {
+    json(Request::get(&format!("/api/v1/sessions/{}/tasks/{}", enc(&session), enc(&task))).send().await).await
+}
+
 /// The realm you look at's secrets (its own and root's), or every realm's.
 pub async fn secrets() -> Result<Vec<c6_api::SecretInfo>, String> {
     json(Request::get(&format!("/api/v1/settings/secrets{}", in_realm('?'))).send().await).await

@@ -1485,6 +1485,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         </span>
                     }
                 })}
+                {move || chrome().map(|c| view! { <crate::session::SessionTasks chrome=c /> })}
                 {move || chrome().is_some().then(|| view! {
                     <button class=btn title="Details: where it runs, labels, transcript, changes, files, terminal…" on:click=move |ev| details_at.set(Some(below(&ev, 560.0)))>"⋯"</button>
                 })}

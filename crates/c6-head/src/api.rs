@@ -91,6 +91,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
         .route("/api/v1/sessions/{id}/colour", put(set_session_colour))
         .route("/api/v1/sessions/{id}/subagent-model", put(set_subagent_model))
+        .route("/api/v1/sessions/{id}/tasks/{task}", get(task_snapshot))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
         .route("/api/v1/sessions/{id}/approvals/{call_id}", post(decide_approval))
         .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
@@ -1586,6 +1587,10 @@ async fn rewind_session(
 ) -> ApiResult<StatusCode> {
     crate::sessions::rewind(&st, &id, &req).await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn task_snapshot(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<Json<api::TaskSnapshot>> {
+    Ok(Json(crate::sessions::task_snapshot(&st, &id, &task).await?))
 }
 
 async fn stop_task(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<StatusCode> {

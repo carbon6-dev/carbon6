@@ -29,7 +29,14 @@ pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
             Arc::new(SendMessage::generic()),
         ],
         ToolProfile::Claude => claude(),
-        ToolProfile::Codex => vec![Arc::new(Shell), Arc::new(ApplyPatch), Arc::new(Plan::update_plan()), Arc::new(WebFetch::generic())],
+        ToolProfile::Codex => vec![
+            Arc::new(Shell),
+            Arc::new(ApplyPatch),
+            Arc::new(Plan::update_plan()),
+            Arc::new(WebFetch::generic()),
+            Arc::new(BashOutput::generic()),
+            Arc::new(KillShell::generic()),
+        ],
     }
 }
 
@@ -124,7 +131,7 @@ fn claude() -> Vec<Arc<dyn Tool>> {
                     "command": {"type": "string", "description": "The command to execute"},
                     "timeout": {"type": "number", "description": "Optional timeout in milliseconds (max 600000)"},
                     "description": {"type": "string", "description": "Clear, concise description of what this command does in 5-10 words"},
-                    "run_in_background": {"type": "boolean", "description": "Run in the background; read output later with BashOutput. You are told when it finishes."},
+                    "run_in_background": {"type": "boolean", "description": "Run in the background; inspect output with BashOutput. Completion is pushed automatically by default; do not poll just to wait."},
                     "notify": {"type": "boolean", "description": "With run_in_background: be told when it finishes (default true). Set false for servers and watchers meant to keep running."}
                 }, "required": ["command"], "additionalProperties": false}),
             },
@@ -181,12 +188,14 @@ impl Tool for Shell {
             name: "shell".into(),
             description: "Runs a shell command and returns its output. `command` is an argv array, typically \
                           [\"bash\", \"-lc\", \"<script>\"]. Use rg for searching and sed -n or cat for reading files; make \
-                          edits with apply_patch."
+                          edits with apply_patch. Background completion is pushed automatically by default; do not poll just to wait."
                 .into(),
             parameters: json!({"type": "object", "properties": {
                 "command": {"type": "array", "items": {"type": "string"}, "description": "The command to execute"},
                 "workdir": {"type": "string", "description": "The working directory to execute the command in"},
-                "timeout_ms": {"type": "number", "description": "The timeout for the command in milliseconds"}
+                "timeout_ms": {"type": "number", "description": "The timeout for the command in milliseconds"},
+                "run_in_background": {"type": "boolean", "description": "Start in the background and return an id for bash_output / kill_shell. Completion is pushed automatically by default; do not poll just to wait."},
+                "notify": {"type": "boolean", "description": "With run_in_background: push completion automatically (default true). Set false for servers and watchers meant to keep running."}
             }, "required": ["command"], "additionalProperties": false}),
         }
     }
@@ -217,6 +226,11 @@ impl Tool for Shell {
         if let Some(t) = input["timeout_ms"].as_u64() {
             bash_input["timeout_ms"] = t.into();
         }
+        for key in ["run_in_background", "notify"] {
+            if let Some(value) = input.get(key) {
+                bash_input[key] = value.clone();
+            }
+        }
         Bash.call(ctx, bash_input).await
     }
 }
@@ -233,6 +247,43 @@ fn shell_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::SessionTools;
+
+    #[tokio::test]
+    async fn codex_background_flags_and_tools_reach_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            session: Arc::new(SessionTools::new(dir.path().to_owned())),
+            cancel: Default::default(),
+            output: Arc::new(|_: &str| {}),
+            call_id: String::new(),
+        };
+        let tools = tools_for(ToolProfile::Codex);
+        let get = |name: &str| tools.iter().find(|t| t.spec().name == name).unwrap().clone();
+        let shell = get("shell");
+        assert_eq!(shell.spec().parameters["properties"]["run_in_background"]["type"], "boolean");
+        assert_eq!(shell.spec().parameters["properties"]["notify"]["type"], "boolean");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.session.background.set_sink(Some(tx));
+        for (index, notify) in [None, Some(false)].into_iter().enumerate() {
+            let mut input = json!({"command": ["bash", "-lc", "echo ready; sleep 30"], "run_in_background": true});
+            if let Some(notify) = notify {
+                input["notify"] = notify.into();
+            }
+            let r = shell.call(&ctx, input).await;
+            let id = format!("bg{}", index + 1);
+            assert!(r.content.contains(&id), "{r:?}");
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(event.state, crate::TaskState::Started);
+            assert_eq!(event.notify, notify.unwrap_or(true));
+            let r = get("kill_shell").call(&ctx, json!({"id": id})).await;
+            assert!(r.content.contains("Stopped"), "{r:?}");
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(event.state, crate::TaskState::Stopped);
+            assert_eq!(event.notify, notify.unwrap_or(true));
+            let r = get("bash_output").call(&ctx, json!({"id": id})).await;
+            assert!(r.content.contains("exited with code"), "{r:?}");
+        }
+    }
 
     #[tokio::test]
     async fn claude_and_codex_shapes_reach_the_same_tools() {
@@ -258,6 +309,6 @@ mod tests {
         assert_eq!(r.content, "it's\n");
 
         let names: Vec<String> = tools_for(ToolProfile::Codex).iter().map(|t| t.spec().name).collect();
-        assert_eq!(names, ["shell", "apply_patch", "update_plan", "web_fetch"]);
+        assert_eq!(names, ["shell", "apply_patch", "update_plan", "web_fetch", "bash_output", "kill_shell"]);
     }
 }

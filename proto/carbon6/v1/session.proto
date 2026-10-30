@@ -111,17 +111,17 @@ message Output {
   bytes data = 4;
 }
 
-// A background task (a shell command or subagent) started or ended.
+// A background task (shell command, subagent or observed CLI task) started or ended.
 message BackgroundTask {
   string task_id = 1;
-  // "shell" or "agent".
+  // "shell", "agent" or "claude_code".
   string kind = 2;
   // The command, or the subagent's description.
   string description = 3;
-  // "started", "finished", "stopped" (by the agent), "stopped_by_user", or
-  // "lost" (the worker restarted while it ran).
+  // "started", "finished", "failed", "stopped" (by the agent), "stopped_by_user", or
+  // "lost" (the worker or owning CLI exited without an outcome).
   string state = 4;
-  // When it finished.
+  // Numeric exit status when available; not meaningful for observed Claude Code tasks.
   int32 exit_code = 5;
   uint64 elapsed_ms = 6;
   // The agent is told when it ends.

@@ -239,6 +239,14 @@ impl SessionManager {
             .clone()
     }
 
+    /// A non-destructive task snapshot. Do not load or wake an idle session
+    /// merely to inspect it: restarted sessions no longer have live buffers.
+    pub(crate) fn task_snapshot(&self, session_id: &str, task_id: &str) -> Option<serde_json::Value> {
+        let tools = self.actors.lock().unwrap().get(session_id)?.tools.clone();
+        let snapshot = tools.background.snapshot(task_id)?;
+        serde_json::to_value(snapshot).ok()
+    }
+
     /// Session ids with a live actor.
     pub fn active(&self) -> Vec<String> {
         self.actors.lock().unwrap().iter().filter(|(_, a)| !a.tx.is_closed()).map(|(id, _)| id.clone()).collect()
@@ -1338,6 +1346,8 @@ impl Actor {
                         let state = match ev.state {
                             c6_tools::TaskState::Started => "started",
                             c6_tools::TaskState::Finished => "finished",
+                            c6_tools::TaskState::Failed => "failed",
+                            c6_tools::TaskState::Lost => "lost",
                             c6_tools::TaskState::Stopped => "stopped",
                             c6_tools::TaskState::StoppedByUser => "stopped_by_user",
                         };
@@ -1807,6 +1817,7 @@ impl Actor {
         let (manager, journal) = (self.manager.clone(), self.journal.clone());
         // Claude Code's own subagents are mirrored into sessions of their own.
         let observer = crate::claude_code::Observer {
+            tools: self.session_tools.clone(),
             journal: self.journal.clone(),
             link: self.link.clone(),
             session_id: self.writer.session_id.clone(),

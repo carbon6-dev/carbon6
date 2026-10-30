@@ -108,6 +108,11 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
                 _ => git_log(&dir).await,
             }
         }
+        "session.task" => {
+            let session = params["session_id"].as_str().context("session_id required")?;
+            let task = params["task_id"].as_str().context("task_id required")?;
+            Ok(worker.sessions.task_snapshot(session, task).unwrap_or(Value::Null))
+        }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
         "kit.job" => kit_job(worker, &params).await,
         "update.apply" => crate::update::apply(worker, &params).await,

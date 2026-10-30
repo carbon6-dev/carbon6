@@ -705,6 +705,12 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
     }
 }
 
+/// Keep task progress reachable in the tile's compact bar, including on mobile.
+#[component]
+pub fn SessionTasks(chrome: SessionChrome) -> impl IntoView {
+    view! { <crate::tasks::RunningTasks session=chrome.id.get_value() events=chrome.events compact=true /> }
+}
+
 /// A session's header: its title, where it runs, its labels, and its tabs
 /// and actions. `on_act`: in a popover, called after choosing a tab or an
 /// action (to close it).

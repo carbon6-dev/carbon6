@@ -47,6 +47,8 @@ pub fn find_claude() -> Option<PathBuf> {
 /// What Claude Code's own subagents are mirrored into: sessions of their
 /// own, read-only, under the session (docs/subagents.md §8).
 pub struct Observer {
+    /// The same task manager used by session inspection and the durable sink.
+    pub tools: Arc<c6_tools::SessionTools>,
     pub journal: Arc<crate::journal::Journal>,
     pub link: Arc<crate::link::HeadLink>,
     /// The session running Claude Code, as it was created.
@@ -127,6 +129,27 @@ enum Outcome {
     NoConversation,
 }
 
+/// CLI 2.1.314's official installed source resolves CLAUDE_CODE_TMPDIR
+/// before creating its claude-uid/session/tasks/*.output tree. Give each
+/// process a private root instead of trusting paths into the host filesystem.
+struct OutputRoot(PathBuf);
+
+impl OutputRoot {
+    fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = std::env::temp_dir().canonicalize()?;
+        let path = base.join(format!("c6-claude-{}", uuid::Uuid::now_v7()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for OutputRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_process(
     bin: &Path,
@@ -143,7 +166,17 @@ async fn run_process(
     observer: Option<&Observer>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Outcome> {
+    let output_root = match OutputRoot::new() {
+        Ok(root) => Some(root),
+        Err(e) => {
+            warn!(%e, "cannot create private Claude Code output directory; file inspection unavailable");
+            None
+        }
+    };
     let mut cmd = tokio::process::Command::new(bin);
+    if let Some(root) = &output_root {
+        cmd.env("CLAUDE_CODE_TMPDIR", &root.0);
+    }
     cmd.args(["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--dangerously-skip-permissions"]);
     cmd.args(if resume { ["--resume", session_id] } else { ["--session-id", session_id] });
     if !model.is_empty() && model != "default" {
@@ -179,7 +212,16 @@ async fn run_process(
     });
     let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
 
-    let mut mapper = Mapper { turn, saw_output: false, result: None, observer, calls: HashMap::new(), children: HashMap::new() };
+    let mut mapper = Mapper {
+        turn,
+        scope: session_id,
+        output_root: output_root.as_ref().map(|r| r.0.as_path()),
+        saw_output: false,
+        result: None,
+        observer,
+        calls: HashMap::new(),
+        children: HashMap::new(),
+    };
     let interrupted = loop {
         tokio::select! {
             _ = cancel.cancelled() => break true,
@@ -205,6 +247,12 @@ async fn run_process(
             }
         }
         let _ = child.wait().await;
+        if let Some(obs) = observer {
+            // Interrupting the owner does not prove every native task died
+            // (a descendant may ignore SIGINT). Only an upstream stopped
+            // notification can establish that outcome; otherwise it is lost.
+            obs.tools.background.close_native(session_id, c6_tools::TaskState::Lost);
+        }
         mapper.close_children(TurnEndReason::Interrupted).await?;
         return Ok(Outcome::Ended(TurnEndReason::Interrupted));
     }
@@ -241,6 +289,9 @@ struct Child {
 /// Maps stream-json lines to session events.
 struct Mapper<'a> {
     turn: u64,
+    /// CLI conversation identity, stable across carbon6 turns.
+    scope: &'a str,
+    output_root: Option<&'a Path>,
     saw_output: bool,
     result: Option<TurnEndReason>,
     observer: Option<&'a Observer>,
@@ -251,7 +302,82 @@ struct Mapper<'a> {
     children: HashMap<String, Child>,
 }
 
+impl Drop for Mapper<'_> {
+    fn drop(&mut self) {
+        if let Some(obs) = self.observer {
+            obs.tools.background.close_native(self.scope, c6_tools::TaskState::Lost);
+        }
+    }
+}
+
 impl Mapper<'_> {
+    /// Official SDKTaskStarted/Progress/Notification/UpdatedMessage protocol:
+    /// https://code.claude.com/docs/en/agent-sdk/typescript#sdktaskstartedmessage
+    /// Process these before parent_tool_use_id routing: nested tasks belong
+    /// in the common task registry too, even when their traffic is mirrored.
+    fn native_task(&self, v: &Value) -> bool {
+        if v["type"] != "system" {
+            return false;
+        }
+        let subtype = v["subtype"].as_str().unwrap_or("");
+        if !matches!(subtype, "task_started" | "task_progress" | "task_notification" | "task_updated") {
+            return false;
+        }
+        let Some(obs) = self.observer else { return true };
+        let Some(task_id) = v["task_id"].as_str().filter(|id| !id.is_empty()) else { return true };
+        let run = v["run_id"].as_str();
+        let bg = &obs.tools.background;
+        if subtype == "task_started" {
+            // Description, not the originating tool's command: the protocol
+            // does not promise a shell command for every kind of task.
+            bg.start_native(self.scope, task_id, run, v["description"].as_str().unwrap_or(""));
+            return true;
+        }
+        let state = match subtype {
+            "task_notification" => match v["status"].as_str() {
+                Some("completed") => c6_tools::TaskState::Finished,
+                Some("failed") => c6_tools::TaskState::Failed,
+                Some("stopped") => c6_tools::TaskState::Stopped,
+                _ => return true, // Do not guess future terminal statuses.
+            },
+            "task_updated" => match v["patch"]["status"].as_str() {
+                Some("completed") => c6_tools::TaskState::Finished,
+                Some("failed") => c6_tools::TaskState::Failed,
+                Some("killed") => c6_tools::TaskState::Stopped,
+                _ => c6_tools::TaskState::Started,
+            },
+            _ => c6_tools::TaskState::Started,
+        };
+        let description = if subtype == "task_updated" { v["patch"]["description"].as_str() } else { v["description"].as_str() };
+        // The summary is metadata, never fabricated stdout or stderr.
+        let summary = v["summary"].as_str().or_else(|| v["patch"]["error"].as_str());
+        let elapsed = v["usage"]["duration_ms"].as_u64().map(Duration::from_millis);
+        let notification = subtype == "task_notification";
+        let id = bg.observe_native(
+            self.scope,
+            task_id,
+            run,
+            description,
+            summary,
+            elapsed,
+            if notification { c6_tools::TaskState::Started } else { state },
+        );
+        // Only an official terminal notification can supply an inspectable
+        // path. Model-generated tool text is never interpreted as a path.
+        if notification
+            && let Some(root) = self.output_root
+            && let Some(path) = v["output_file"].as_str().filter(|s| !s.is_empty())
+        {
+            bg.capture_native_output(&id, root, Path::new(path), task_id);
+        }
+        if notification {
+            // A completion-driven UI snapshot must see the captured output,
+            // not race the file read and retain a metadata-only fallback.
+            bg.observe_native(self.scope, task_id, run, None, None, elapsed, state);
+        }
+        true
+    }
+
     fn note_calls(&mut self, content: &Value, made_in: Option<&str>) {
         for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
             if let Some(id) = b["id"].as_str() {
@@ -380,6 +506,10 @@ impl Mapper<'_> {
     }
 
     async fn handle(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        if self.native_task(v) {
+            self.saw_output = true;
+            return Ok(());
+        }
         // A subagent's traffic goes to its mirror (its report also comes as
         // the call's tool result).
         if let Some(call) = v["parent_tool_use_id"].as_str() {
@@ -524,6 +654,191 @@ mod tests {
         fn ephemeral(&self, _: ephemeral_event::Kind) {}
     }
 
+    #[tokio::test]
+    async fn native_sdk_task_protocol_maps_runs_progress_and_terminal_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tools.background.set_sink(Some(tx));
+        let observer = Observer {
+            tools: tools.clone(),
+            journal: Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap()),
+            link: Arc::default(),
+            session_id: "carbon6-session".into(),
+            spec: CreateSession::default(),
+            started: SessionStarted::default(),
+        };
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        let mut mapper = Mapper {
+            turn: 1,
+            scope: "cli-conversation",
+            output_root: Some(dir.path()),
+            saw_output: false,
+            result: None,
+            observer: Some(&observer),
+            calls: HashMap::new(),
+            children: HashMap::new(),
+        };
+        // Shapes from the official SDKTask*Message definitions. Lifecycle
+        // routing precedes subagent traffic routing, including nested tasks.
+        for line in [
+            r#"{"type":"system","subtype":"task_started","task_id":"native-task","run_id":"001","description":"Run checks","task_type":"local_bash","is_backgrounded":true,"parent_tool_use_id":"nested-call","session_id":"cli-conversation"}"#,
+            r#"{"type":"system","subtype":"task_progress","task_id":"native-task","run_id":"001","description":"Run checks","usage":{"total_tokens":42,"tool_uses":1,"duration_ms":27},"summary":"Still checking","session_id":"cli-conversation"}"#,
+        ] {
+            mapper.handle(&serde_json::from_str(line).unwrap(), &sink).await.unwrap();
+        }
+        let start = rx.try_recv().unwrap();
+        assert_eq!(start.kind, c6_tools::TaskKind::ClaudeCode);
+        assert_eq!(start.description, "Run checks");
+        assert!(!start.notify);
+        assert!(mapper.children.is_empty());
+        let snapshot = tools.background.snapshot(&start.id).unwrap();
+        assert!(snapshot.running);
+        assert_eq!(snapshot.elapsed_ms, 27);
+        assert!(snapshot.stdout.text.is_empty());
+        assert_eq!(snapshot.combined.as_ref().unwrap().text, "Still checking");
+        // A notification's existing file OUTSIDE our output tree must not
+        // be read, even though its path came from the trusted CLI stream.
+        let private = dir.path().join("private.txt");
+        std::fs::write(&private, "do not expose these bytes").unwrap();
+        mapper
+            .handle(
+                &serde_json::json!({
+                    "type": "system", "subtype": "task_notification", "task_id": "native-task", "run_id": "001",
+                    "status": "failed", "summary": "Checks failed", "output_file": private,
+                    "usage": {"total_tokens": 42, "tool_uses": 1, "duration_ms": 31}
+                }),
+                &sink,
+            )
+            .await
+            .unwrap();
+        let done = rx.try_recv().unwrap();
+        assert_eq!((done.state, done.exit_code, done.notify), (c6_tools::TaskState::Failed, None, false));
+        let snapshot = tools.background.snapshot(&start.id).unwrap();
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.elapsed_ms, 31);
+        assert_eq!(snapshot.combined.as_ref().unwrap().text, "Checks failed");
+        assert!(snapshot.combined.as_ref().unwrap().note.contains("unavailable"));
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("do not expose"));
+        mapper
+            .handle(
+                &serde_json::json!({
+                    "type":"system", "subtype":"task_started", "task_id":"native-task", "run_id":"002", "description":"Resume checks"
+                }),
+                &sink,
+            )
+            .await
+            .unwrap();
+        let resumed = rx.try_recv().unwrap();
+        assert_ne!(resumed.id, start.id);
+        let tasks = dir.path().join("claude-501/cli-conversation/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        let output = tasks.join("native-task.output");
+        std::fs::write(&output, "real combined bytes").unwrap();
+        mapper.handle(&serde_json::json!({
+            "type":"system", "subtype":"task_notification", "task_id":"native-task", "run_id":"002", "status":"stopped", "output_file":output, "summary":"Stopped"
+        }), &sink).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().state, c6_tools::TaskState::Stopped);
+        assert_eq!(tools.background.snapshot(&resumed.id).unwrap().combined.unwrap().text, "real combined bytes");
+        mapper
+            .handle(
+                &serde_json::json!({
+                    "type":"system", "subtype":"task_started", "task_id":"agent-task", "run_id":"agent-run",
+                    "description":"Background subagent", "task_type":"local_agent", "is_backgrounded":true
+                }),
+                &sink,
+            )
+            .await
+            .unwrap();
+        let agent = rx.try_recv().unwrap();
+        mapper
+            .handle(
+                &serde_json::json!({
+                    "type":"system", "subtype":"task_updated", "task_id":"agent-task", "run_id":"agent-run",
+                    "patch":{"status":"completed"}
+                }),
+                &sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().state, c6_tools::TaskState::Finished);
+        assert!(!tools.background.snapshot(&agent.id).unwrap().running);
+        mapper
+            .handle(
+                &serde_json::json!({
+                    "type":"system", "subtype":"task_started", "task_id":"orphan", "description":"No notification"
+                }),
+                &sink,
+            )
+            .await
+            .unwrap();
+        let orphan = rx.try_recv().unwrap();
+        drop(mapper);
+        let lost = rx.try_recv().unwrap();
+        assert_eq!(lost.id, orphan.id);
+        assert_eq!((lost.state, lost.exit_code, lost.notify), (c6_tools::TaskState::Lost, None, false));
+        assert!(!tools.background.snapshot(&orphan.id).unwrap().running);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn native_cli_output_is_captured_before_private_root_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-native");
+        std::fs::write(&bin, r#"#!/bin/sh
+cat > /dev/null
+tasks="$CLAUDE_CODE_TMPDIR/claude-501/session/tasks"
+mkdir -p "$tasks"
+printf 'actual combined bytes' > "$tasks/task.output"
+printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"task","description":"Native shell","task_type":"local_bash","is_backgrounded":true}'
+printf '{"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Completed","output_file":"%s"}\n' "$tasks/task.output"
+printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"orphan","description":"Unnotified task","task_type":"local_agent"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}'
+"#).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tools.background.set_sink(Some(tx));
+        let observer = Observer {
+            tools: tools.clone(),
+            journal: Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap()),
+            link: Arc::default(),
+            session_id: "carbon6-session".into(),
+            spec: CreateSession::default(),
+            started: SessionStarted::default(),
+        };
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        let result = run_process(
+            &bin,
+            1,
+            "session",
+            dir.path(),
+            "",
+            None,
+            None,
+            None,
+            "task",
+            false,
+            &sink,
+            Some(&observer),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Outcome::Ended(TurnEndReason::Completed)));
+        let started = rx.try_recv().unwrap();
+        let finished = rx.try_recv().unwrap();
+        let orphan = rx.try_recv().unwrap();
+        let lost = rx.try_recv().unwrap();
+        assert_eq!((finished.state, lost.state), (c6_tools::TaskState::Finished, c6_tools::TaskState::Lost));
+        assert_eq!(orphan.id, lost.id);
+        assert!(!finished.notify && !lost.notify);
+        assert_eq!(finished.exit_code, None);
+        assert_eq!(tools.background.snapshot(&started.id).unwrap().combined.unwrap().text, "actual combined bytes");
+        assert!(!tools.background.snapshot(&orphan.id).unwrap().running);
+    }
+
     /// A stand-in `claude` that checks its arguments and replays a transcript.
     fn fake_claude(dir: &Path) -> PathBuf {
         let script = r#"#!/bin/sh
@@ -531,6 +846,7 @@ case "$*" in *--dangerously-skip-permissions*) ;; *) echo "missing yolo flag" >&
 case "$*" in *"--resume"*) echo "No conversation found with session ID" >&2; exit 1;; esac
 prompt=$(cat)
 pwd > cwd.txt
+printf '%s' "$CLAUDE_CODE_TMPDIR" > output-root.txt
 while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--mcp-config" ] && printf '%s %s' "$2" "$MCP_TOOL_TIMEOUT" > mcp.txt; shift; done
 printf '%s' "$prompt" > prompt.txt
 cat <<'EOF'
@@ -584,6 +900,10 @@ EOF
             "carbon6's subagents are offered over MCP, with time to finish"
         );
         assert_eq!(std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap(), "CONTEXT\n\nlist files");
+        let output_root = PathBuf::from(std::fs::read_to_string(dir.path().join("output-root.txt")).unwrap());
+        assert!(output_root.is_absolute());
+        assert!(output_root.file_name().unwrap().to_string_lossy().starts_with("c6-claude-"));
+        assert!(!output_root.exists(), "private task files are cached and the process's directory is cleaned up");
 
         let events = vec_sink.0.lock().unwrap().clone();
         let kinds: Vec<&str> = events
@@ -653,6 +973,7 @@ JSON
         let bin = fake_claude_with_subagents(dir.path());
         let journal = Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let observer = Observer {
+            tools: Arc::new(c6_tools::SessionTools::new(dir.path().to_owned())),
             journal: journal.clone(),
             link: Arc::default(),
             session_id: "0199-main".into(),

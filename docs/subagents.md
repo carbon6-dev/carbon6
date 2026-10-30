@@ -263,6 +263,22 @@ As built: all six steps on 2026-10-14.
 6. **Subagents can start subagents.**
 7. **Default limits:** `max_subagent_depth` = 3 and `max_running_subagents` = 16 per tree.
 
+## Background tasks: completion and inspection
+
+carbon6-managed shell tasks use the same background manager across the Generic, Claude and Codex tool profiles. Set `run_in_background: true` on Bash / shell. Completion is pushed to the session: a running model receives the notice at its next boundary, and an idle session wakes automatically (subject to the existing 20 auto-turns/hour limit; excess notices wait for the next input). The model need not poll output simply to wait. Use `notify: false` for servers and watchers that should not wake it.
+
+The session's **Tasks** control shows the running count and lifecycle history, including completed, stopped and lost tasks. A compact task badge stays in the tile bar, including on mobile, so it is reachable while the transcript is scrolled. **Inspect** opens command, status, elapsed time and separate stdin/stdout/stderr panes; **Stop** is available while running. Opening the inspector, pressing **Refresh**, or receiving a lifecycle change fetches a snapshot. There is no periodic output polling and inspecting does not wake the model or advance its incremental output cursor.
+
+- Local shell stdin is closed. SSH stdin carries the launch script and closes; it is not interactive. The inspector is read-only, not a terminal.
+- stdout and stderr each retain the most recent 1 MiB; truncation is shown. The model's combined incremental output remains separate from the user's snapshot cursor. Commands and captured output are secret-redacted.
+- Subagent panes describe completed reports and failures, not invented operating-system streams. Running subagent progress is in its child session transcript.
+- Lifecycle metadata is durable, but stream buffers are held in worker memory. After a restart or while offline, the inspector explicitly reports unavailable streams rather than presenting empty output as success. Existing tasks whose streams were already combined cannot be retroactively separated.
+- `GET /api/v1/sessions/{id}/tasks/{task}` exposes the same read-only snapshot under the session's realm permissions.
+
+Claude Code CLI-native tasks appear in the same list, observed from the CLI's task lifecycle messages rather than run a second time. Claude Code handles their completion notices itself; carbon6 does not create duplicate model wakeups. Native outcomes are shown without inventing numeric process exit codes. If the CLI exits without an outcome, the task is marked lost rather than successful. These tasks are read-only here: stop their owning Claude Code turn, not an individual native task.
+
+Native stdin and separate stdout/stderr are unavailable. When the CLI supplies a task output file, carbon6 exposes a separately labelled **combined output** pane, bounded and redacted. The supported CLI protocol supplies that path at terminal notification, so running native tasks show upstream metadata rather than live stream bytes. Only regular task-output files under the private temporary directory assigned to that CLI process may be read; paths escaping the directory, symlinks and other file types are rejected. When no supported output is supplied, the inspector explains the limitation and shows task-summary metadata instead of fabricating streams.
+
 ## 14. Where a subagent runs
 
 A subagent may run on another connection and model than its parent: a cheap model for searches, or a GPT model under a Claude session. carbon6 runs it in its own loop whatever the parent runs on (never by starting another CLI), so it works for every main model, Claude Code included.

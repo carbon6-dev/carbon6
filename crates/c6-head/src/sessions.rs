@@ -1133,9 +1133,59 @@ pub fn check_policies(policies: &[api::Policy]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Inspect without loading an actor, waking a model, or consuming its output cursor.
+/// Lifecycle metadata survives a worker restart; in-memory stream buffers do not.
+pub async fn task_snapshot(st: &HeadState, session_id: &str, task_id: &str) -> anyhow::Result<api::TaskSnapshot> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if let Ok(value) = st
+        .registry
+        .call(
+            session.worker_id.parse()?,
+            "session.task",
+            serde_json::json!({"session_id": session_id, "task_id": task_id}),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        && !value.is_null()
+    {
+        return Ok(serde_json::from_value(value)?);
+    }
+    let events = st.store.events_after(session_id, 0, i64::MAX).await?;
+    let (event, task) = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            Some(session_event::Kind::BackgroundTask(task)) if task.task_id == task_id => Some((event, task)),
+            _ => None,
+        })
+        .ok_or_else(|| not_found("no such task"))?;
+    let running = task.state == "started";
+    let unavailable = api::TaskStream {
+        note: "Stream unavailable: task output is held in worker memory, which is not reachable or was cleared by a restart.".into(),
+        ..Default::default()
+    };
+    Ok(api::TaskSnapshot {
+        task_id: task.task_id.clone(),
+        kind: task.kind.clone(),
+        command: task.description.clone(),
+        running,
+        exit_code: (!running && task.state != "lost" && task.kind != "claude_code").then_some(task.exit_code),
+        elapsed_ms: if running { c6_core::now_ms().saturating_sub(event.ts_ms).max(0) as u64 } else { task.elapsed_ms },
+        stdin: api::TaskStream { note: "Input was not recorded; no interactive stdin is available.".into(), ..Default::default() },
+        stdout: unavailable.clone(),
+        stderr: unavailable.clone(),
+        combined: (task.kind == "claude_code").then_some(unavailable),
+    })
+}
+
 /// Stops a session's background task. `false`: its worker is not connected.
 pub async fn stop_task(st: &HeadState, session_id: &str, task_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if task_id.starts_with("claude:") {
+        return Err(bad_request(
+            "Claude Code owns this native task; individual task stopping is unavailable here. Stop the Claude Code turn instead.",
+        ));
+    }
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
