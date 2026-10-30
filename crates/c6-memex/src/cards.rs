@@ -200,6 +200,7 @@ async fn grow(
     crate::understand::count_call(m).await?;
     let answer = llm::ask(m, task, "card", &label, &system, vec![Block::Text(prompt)], llm::Output::Json(800)).await?;
     let v = llm::json_of(&answer)?;
+    anyhow::ensure!(!v["story"].as_str().unwrap_or("").trim().is_empty(), "the model's answer has no story");
     let card = json!({
         "relationship": v["relationship"].as_str().unwrap_or("other").trim().to_lowercase(),
         "role": v["role"].as_str().unwrap_or("").trim(),

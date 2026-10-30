@@ -347,6 +347,7 @@ async fn ask(
         llm::ask(m, task, "sorting", about, &system, vec![Block::Text(format!("{ask}\n\n{text}"))], llm::Output::Json(400)).await?;
     let v = llm::json_of(&answer)?;
     let category = v["category"].as_str().unwrap_or("").trim().to_lowercase();
+    anyhow::ensure!(!category.is_empty(), "the model's answer has no category");
     let category = if allowed.contains(&category.as_str()) { category } else { "fyi".to_owned() };
     let due = v["due"]
         .as_str()

@@ -326,6 +326,36 @@ async fn photos_and_videos() {
     })
     .await;
 
+    // An empty look keeps the earlier description, transcript and links.
+    for (answer, calls) in [("{}", 3), (r#"{"caption": "   ", "scene": " ", "text": " ", "objects": [" ", null]}"#, 4)] {
+        mock.push_about("These are frames from one video", Reply::Text(answer.into()));
+        sqlx::query("UPDATE media SET seen = NULL, error = NULL WHERE item_id = ?").bind(&video_id).execute(&m.store.pool).await.unwrap();
+        let put = http
+            .put(format!("{api}/settings/memex"))
+            .json(&json!({
+                "places_file": places.display().to_string(),
+                "vision": {"connection": "m", "model": "eyes-1"},
+                "transcription": {"connection": "m", "model": "ears-1"},
+                "calls_per_day": calls,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(put.status().is_success());
+        eventually("the vision budget applied", async || (m.tasks().per_day == calls).then_some(())).await;
+        eventually("the empty look finished", async || {
+            let seen: Option<String> =
+                sqlx::query_scalar("SELECT seen FROM media WHERE item_id = ?").bind(&video_id).fetch_one(&m.store.pool).await.ok()?;
+            seen.map(|_| ())
+        })
+        .await;
+        let failed = rpc("memex.media.get", json!({"id": video_id})).await;
+        assert_eq!(failed["error"], "vision: the model's answer describes nothing");
+        assert_eq!(failed["item"]["text"], item["item"]["text"]);
+        assert_eq!(failed["item"]["title"], item["item"]["title"]);
+        assert_eq!(failed["things"], item["things"]);
+    }
+
     // A photo deleted from the folder leaves the memex.
     std::fs::remove_file(pics.join("home11.jpg")).unwrap();
     http.post(format!("{api}/memex/scan")).send().await.unwrap();

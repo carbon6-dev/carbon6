@@ -1497,9 +1497,12 @@ async fn triage_marks_invitation_requests_and_a_join_can_clear_the_mark() {
     .await;
     request_race_model(&head, &connection, 4).await;
     eventually("the invitation update to be sorted", async || {
-        (c6_memex::requests::get(&m, id).await.unwrap().title == "RSVP to the updated Workshop").then_some(())
+        let title: String =
+            sqlx::query_scalar("SELECT title FROM triage WHERE target = 'thread:acct:invite'").fetch_one(&m.store.pool).await.ok()?;
+        (title == "Workshop update").then_some(())
     })
     .await;
+    assert_eq!(c6_memex::requests::get(&m, id).await.unwrap().title, "RSVP to the updated Workshop");
     assert!(!marked().await, "an invitation update cannot restore a cleared mark");
     assert_eq!(mock.requests().len(), 4);
     let before_merge: Vec<(String, String)> =
@@ -1539,6 +1542,19 @@ async fn triage_marks_invitation_requests_and_a_join_can_clear_the_mark() {
             .await
             .unwrap();
     assert_eq!(after_merge, before_merge);
+    // An empty sorting answer leaves open and snoozed requests alone.
+    for (status, calls) in [("open", 5), ("snoozed", 6)] {
+        c6_memex::requests::set(&m, into, status, Some(c6_core::now_ms() + HOUR)).await.unwrap();
+        mock.push_about("Sort this conversation", Reply::Text("{}".into()));
+        sqlx::query("DELETE FROM triage WHERE target = 'thread:acct:invite'").execute(&m.store.pool).await.unwrap();
+        request_race_model(&head, &connection, calls).await;
+        let sorted: (String, String) = eventually("the empty sorting answer recorded", async || {
+            sqlx::query_as("SELECT by, reason FROM triage WHERE target = 'thread:acct:invite'").fetch_optional(&m.store.pool).await.ok()?
+        })
+        .await;
+        assert_eq!(sorted, ("error".into(), "Couldn't be sorted: the model's answer has no category".into()));
+        assert_eq!(c6_memex::requests::get(&m, into).await.unwrap().status, status);
+    }
     head.shutdown().await.unwrap();
 }
 

@@ -218,6 +218,25 @@ async fn understanding_review_graph() {
     assert_eq!(note.0, "note");
     assert!(note.1.contains("\"inferred\":true"));
 
+    // Empty JSON summaries leave the earlier note in place.
+    for answer in ["{}", "[]", "null", "\"\"", r#"{"summary": ""}"#, r#"{"summary": "   "}"#] {
+        mock.push_about("Sum up what these records say", Reply::Text(answer.into()));
+        let r = http
+            .post(format!("{api}/memex/rpc"))
+            .json(&json!({"method": "memex.summarize", "params": {"id": "person:jane@acme.com"}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(!r.status().is_success());
+        assert!(r.text().await.unwrap().contains("the model's answer has no summary"));
+        let text: String =
+            sqlx::query_scalar("SELECT body FROM items WHERE source LIKE 'pipeline:summary%'").fetch_one(&m.store.pool).await.unwrap();
+        assert_eq!(text, s["summary"].as_str().unwrap());
+    }
+    let prose = "Its API returns {} when idle [p].";
+    mock.push_about("Sum up what these records say", Reply::Text(prose.into()));
+    assert_eq!(rpc("memex.summarize", json!({"id": "person:jane@acme.com"})).await, json!({"summary": prose}), "prose still works");
+
     // A new model reads everything again (budget allowing).
     mock.push(Reply::Text(json!({"summary": "Queues.", "topics": ["Queues"]}).to_string()));
     http.put(format!("{api}/settings/memex"))
