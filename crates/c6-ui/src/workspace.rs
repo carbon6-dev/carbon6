@@ -409,11 +409,15 @@ pub struct Layout {
     /// Index of the focused tile.
     pub focus: usize,
     pub next: u64,
+    /// Focus mode: the focused tile fills the workspace, and only it shows;
+    /// the tiles keep their places for when it ends.
+    #[serde(default)]
+    pub full: bool,
 }
 
 impl Layout {
     fn new(view: View) -> Self {
-        let mut l = Layout { tiles: Vec::new(), focus: 0, next: 1 };
+        let mut l = Layout { tiles: Vec::new(), focus: 0, next: 1, full: false };
         let t = l.new_tile(view);
         l.tiles.push(t);
         l
@@ -841,6 +845,22 @@ impl Workspace {
         self.open(None, View::home(), How::NewTile);
     }
 
+    /// Focus mode on (for the tile `key`) or off: in it, the focused tile
+    /// fills the workspace (and stays in it as the focus moves to another).
+    pub fn set_full(&self, key: Option<u64>) {
+        self.layout.update(|l| {
+            if let Some(i) = key.and_then(|k| l.tiles.iter().position(|t| t.key == k)) {
+                l.focus = i;
+                l.touch(i);
+            }
+            l.full = key.is_some();
+        });
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.layout.with(|l| l.full)
+    }
+
     pub fn focus_tile(&self, index: usize) {
         self.layout.update(|l| {
             if index < l.tiles.len() && l.focus != index {
@@ -1226,10 +1246,18 @@ pub fn Tiles() -> impl IntoView {
         }
     });
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
+    // In focus mode the focused tile takes the whole workspace (the others
+    // keep their places, hidden).
     let rects = Memo::new(move |_| {
         ws.layout.with(|l| {
             let placed: Vec<(usize, u64)> = l.tiles.iter().map(|t| (t.stack.unwrap_or(0), t.used)).collect();
-            l.tiles.iter().map(|t| t.key).zip(arrange(&placed)).collect::<HashMap<u64, Rect>>()
+            let mut rects = l.tiles.iter().map(|t| t.key).zip(arrange(&placed)).collect::<HashMap<u64, Rect>>();
+            if l.full
+                && let Some(t) = l.tiles.get(l.focus)
+            {
+                rects.insert(t.key, Rect { left: 0.0, top: 0.0, width: 1.0, height: 1.0 });
+            }
+            rects
         })
     });
     // Tiles are cards with room between them, placed by `arrange` (so one
@@ -1299,7 +1327,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
-    let many = Memo::new(move |_| ws.layout.with(|l| l.tiles.len() > 1));
+    // Focus mode: this tile alone, or hidden behind the one that is.
+    let full = Memo::new(move |_| ws.layout.with(|l| l.full));
+    let many = Memo::new(move |_| ws.layout.with(|l| l.tiles.len() > 1 && !l.full));
     let tile = Memo::new(move |_| ws.layout.with(|l| l.tile(key).cloned()));
     let cols = Memo::new(move |_| tile.get().map(|t| t.columns.iter().map(|c| c.key).collect::<Vec<_>>()).unwrap_or_default());
     // The tile's name: what it was opened on, and the item open in it.
@@ -1357,8 +1387,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     view! {
         <div
             class=move || format!(
-                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:flex md:p-1 md:transition-[left,top,width,height] md:duration-150 {}",
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height] md:duration-150 {} {}",
                 if focused.get() { "flex" } else { "hidden" },
+                if full.get() && !focused.get() { "md:hidden" } else { "md:flex" },
             )
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
         >
@@ -1446,6 +1477,18 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || two().then(|| view! {
                     <button class=format!("{btn} hidden md:inline") title="Move the open item to a tile of its own (or ⌘-click a link)" on:click=move |_| ws.detach(key)>"⧉"</button>
                 })}
+                <button class=format!("{btn} hidden md:inline") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
+                    aria-label=move || if full.get() { "Defocus" } else { "Focus" }
+                    on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
+                    // Corners pointing out (focus) or in (back to the tiles).
+                    <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d=move || if full.get() {
+                            "M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4"
+                        } else {
+                            "M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"
+                        } />
+                    </svg>
+                </button>
                 <button class=btn title="Close this tile" on:click=move |_| ws.close_tile(key)>"✕"</button>
             </div>
             <Popover at=palette_at class="w-auto">
@@ -1507,6 +1550,19 @@ mod tests {
     }
 
     /// Tiles placed as they open, as (column, when used) for `arrange`.
+    #[test]
+    fn focus_mode_is_remembered_with_the_layout() {
+        let mut l = opened(3);
+        l.full = true;
+        let back: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert!(back.full);
+        assert_eq!(back.tiles, l.tiles, "the tiles keep their places");
+        // A layout saved before focus mode loads out of it.
+        let mut v = serde_json::to_value(&l).unwrap();
+        v.as_object_mut().unwrap().remove("full");
+        assert!(!serde_json::from_value::<Layout>(v).unwrap().full);
+    }
+
     fn opened(n: usize) -> Layout {
         let mut l = Layout::new(View::home());
         for _ in 1..n {

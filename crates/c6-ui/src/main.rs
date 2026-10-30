@@ -163,7 +163,8 @@ fn Main() -> impl IntoView {
             <UpdatedBanner />
             <MissingRealm />
             <div class="flex min-h-0 flex-1">
-                {(!console).then(|| view! { <activity::Dock /> })}
+                // Focus mode gives the focused tile the whole width.
+                {(!console).then(|| view! { <div class=move || if ws.is_full() { "contents md:hidden" } else { "contents" }><activity::Dock /></div> })}
                 <workspace::Tiles />
             </div>
             {(!console).then(|| view! { <activity::MobileBar /> })}
