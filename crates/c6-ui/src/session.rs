@@ -97,7 +97,10 @@ impl UsageStats {
         for e in evs {
             match &e.kind {
                 EventKind::Started { context_window, .. } => st.context_window = *context_window,
-                EventKind::TurnStarted { turn } => {
+                EventKind::TurnStarted { turn, context_window } => {
+                    if *context_window > 0 {
+                        st.context_window = *context_window;
+                    }
                     st.current_turn = Some(*turn);
                     st.turns.insert(*turn, TurnStats { started: e.ts, ..Default::default() });
                 }
@@ -3327,6 +3330,17 @@ mod tests {
                 serde_json::from_value(e).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn context_meter_prefers_the_turn_window_and_accepts_older_events() {
+        let events: Vec<Event> = [
+            serde_json::json!({"seq": 1, "ts": 0, "type": "model_switched", "model": "qwen", "connection_id": "c", "effort": "", "context_window": 128_000}),
+            serde_json::json!({"seq": 2, "ts": 0, "type": "turn_started", "turn": 1, "context_window": 16_384}),
+            serde_json::json!({"seq": 3, "ts": 0, "type": "turn_started", "turn": 2}),
+        ].into_iter().map(|v| serde_json::from_value(v).unwrap()).collect();
+        assert_eq!(UsageStats::from_events(&events[..1]).context_window, 128_000);
+        assert_eq!(UsageStats::from_events(&events).context_window, 16_384);
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod cards;
 mod chaos;
 mod collections;
 mod commands;
+mod context_window;
 mod decisions;
 mod examples;
 mod explorer;

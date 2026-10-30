@@ -148,7 +148,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut outcomes = Vec::new();
     for name in &names {
-        let o = run_task(&cli, &client, profile, info.context_window, &cli.tasks.join(name), name).await?;
+        let endpoint =
+            c6_llm::pool::Endpoint { kind: cli.kind.clone(), base_url: cli.base_url.clone(), bearer: key.clone(), ..Default::default() };
+        let window = c6_llm::window::known(&cli.base_url, &cli.model, &endpoint).await.unwrap_or(info.context_window);
+        let o = run_task(&cli, &client, profile, window, &cli.tasks.join(name), name).await?;
         eprintln!(
             "  {} {:<24} {:>3} calls {:>3} tools {:>7.1}s  {}",
             if o.passed { "PASS" } else { "FAIL" },

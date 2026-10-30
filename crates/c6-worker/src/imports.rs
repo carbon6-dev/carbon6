@@ -91,7 +91,7 @@ impl Builder {
         if !self.open {
             self.turn += 1;
             self.open = true;
-            self.push(Kind::TurnStarted(TurnStarted { turn: self.turn }));
+            self.push(Kind::TurnStarted(TurnStarted { turn: self.turn, ..Default::default() }));
         }
     }
 

@@ -23,12 +23,12 @@ Sessions don't use pools. A session's worker dials its connection itself, so a s
 
 ## Setting one up
 
-1. Add each server as a connection of its own (**Settings → Connections**), for example `mac` (`http://mac.tailnet:11434/v1`) and `mumuzz` (`http://ollama.svc:11434/v1`).
+1. Add each server as a connection of its own (**Settings → Connections**), for example `mac` (`http://mac.tailnet:11434/v1`) and `mumuzz` (`http://ollama.svc:11434/v1`). Each has an optional **Context window**, empty for automatic detection (docs/connections.md).
 2. Add a connection of kind **Pool**: name it, and add its members with how many calls each takes at once (Ollama: its `OLLAMA_NUM_PARALLEL`).
 3. Choose the pool where you'd choose a connection, for example **Settings → Memex → Understanding**, and a model the members have.
 4. Set **Settings → Memex → calls at once** to about the total of the members' slots, up to 64 (default 1). For example, two 32-slot vLLM servers can use 64; a larger pool still shares 64 memex lanes. With more than one lane, one keeps new mail moving. Fewer lanes leave slots idle; more than the pool's slots queues calls.
 
-Edit a pool's members with **Edit** on its row, or `connections.update`.
+Edit a pool's members or context window with **Edit** on its row, or `connections.update`.
 
 ## Rules
 
@@ -37,14 +37,24 @@ Edit a pool's members with **Edit** on its row, or `connections.update`.
 - A pool's models (`connections.models`) are its members' models together.
 - A deleted member drops out of the pool.
 
+## Context windows
+
+The memex and assistant use the smallest effective window among the pool's
+members eligible for the requested model and realm, using the scheduler's
+model-list cache. Each member uses its setting, else detection
+capped by the built-in figure (docs/connections.md). Unknown members contribute
+their built-in window. If none is known, the memex keeps its existing output
+limits. This lets it budget before the pool picks a member. A `context_window`
+setting on the pool itself wins instead.
+
 ## Seeing it
 
 The **Activity** page shows each call with the member that took it and the pool, for example `mac (pool ollamas)`. A call refused by a member that went away shows as failed on that member, followed by the same call on another.
 
 ## API
 
-- `POST /api/v1/connections` (`connections.create`) with `kind: "pool"`, a `name` and `members`: `[{"connection_id": "mac", "slots": 2}, …]` (a connection's id or name).
-- `PATCH /api/v1/connections/{id}` (`connections.update`) with `members` (all of them) or `name`.
+- `POST /api/v1/connections` (`connections.create`) with `kind: "pool"`, a `name` and `members`: `[{"connection_id": "mac", "slots": 2}, …]` (a connection's id or name). Optional `context_window` sets its token window; omitted, `null` or 0 means automatic.
+- `PATCH /api/v1/connections/{id}` (`connections.update`) with `members` (all of them), `name` or `context_window` (tokens; 0 restores automatic, omitted or `null` leaves it unchanged).
 - `GET /api/v1/connections/{id}/models` (`connections.models`).
 
 ## As built

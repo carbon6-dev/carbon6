@@ -177,6 +177,7 @@ pub async fn open(st: &Arc<HeadState>, memex_dirs: &[std::path::PathBuf]) -> any
         tracing::warn!("taking in the memex's knowledge: {e:#}");
     }
     let link = Arc::new(c6_worker::link::HeadLink::local(Arc::new(Local { st: Arc::downgrade(st) })));
+    let _ = st.local_link.set(link.clone());
     let m = c6_memex::Memex::open(&dir(st), link).await?;
     m.set_extractor(Arc::new(crate::extract::KitExtractor { st: Arc::downgrade(st) }));
     m.spawn_jobs();

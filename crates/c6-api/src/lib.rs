@@ -111,6 +111,8 @@ pub struct Connection {
     pub kind: String,
     pub base_url: String,
     pub default_model: Option<String>,
+    /// Context window in tokens; none means automatic.
+    pub context_window: Option<u64>,
     pub has_api_key: bool,
     /// The connection passes a reasoning effort on to the model.
     #[serde(default)]
@@ -149,6 +151,8 @@ pub struct CreateConnection {
     pub base_url: String,
     pub api_key: Option<String>,
     pub default_model: Option<String>,
+    /// Context window in tokens (1,024 to 100,000,000); none or 0 means automatic.
+    pub context_window: Option<u64>,
     /// A pool's members.
     #[serde(default)]
     pub members: Vec<PoolMember>,
@@ -159,6 +163,8 @@ pub struct CreateConnection {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateConnection {
     pub name: Option<String>,
+    /// Context window in tokens; omitted or null leaves it unchanged, 0 restores automatic.
+    pub context_window: Option<u64>,
     /// A pool's members, all of them.
     pub members: Option<Vec<PoolMember>>,
 }
@@ -1854,6 +1860,9 @@ pub enum EventKind {
     },
     TurnStarted {
         turn: u64,
+        /// The window used by this turn; 0 means an older worker did not say.
+        #[serde(default)]
+        context_window: u64,
     },
     Assistant {
         turn: u64,

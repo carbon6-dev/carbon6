@@ -20,5 +20,6 @@ tracing = "0.1.44"
 url = "2.5.8"
 
 [dev-dependencies]
+axum = "0.8"
 c6-testkit = { path = "../c6-testkit" }
 tokio = { version = "1.53.2", features = ["full", "test-util"] }

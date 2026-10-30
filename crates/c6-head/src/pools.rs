@@ -42,7 +42,7 @@ impl c6_llm::pool::Dial for Dial {
         if !g.error.is_empty() {
             return Err(LlmError::Config(format!("pool member {member}: {}", g.error)));
         }
-        Ok(Endpoint { kind: g.kind, base_url: g.base_url, bearer: g.bearer, headers: g.headers })
+        Ok(Endpoint { kind: g.kind, base_url: g.base_url, bearer: g.bearer, headers: g.headers, context_window: g.context_window })
     }
 }
 
@@ -68,6 +68,7 @@ pub async fn get(st: &HeadState, id: &str) -> anyhow::Result<Option<Arc<Pool>>> 
         Pool::new(&c.id, Vec::new(), Arc::new(Dial { head }))
     });
     pool.set_members(list);
+    pool.set_context_window(c.context_window.unwrap_or_default() as u64);
     Ok(Some(pool.clone()))
 }
 
@@ -87,6 +88,19 @@ pub async fn client(
     let g = crate::sessions::credential_for(st, None, "head", req).await;
     anyhow::ensure!(g.error.is_empty(), "{}", g.error);
     Ok(c6_llm::activity::track(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?, origin))
+}
+
+/// A recorded or per-turn window for a head session. Pools use the
+/// smallest member window; a connection setting wins.
+pub async fn context_window(st: &HeadState, model: &c6_proto::ModelSpec, realm: &str) -> u64 {
+    let built_in = c6_llm::window::built_in(&model.connection_kind, &model.model);
+    if let Ok(Some(pool)) = get(st, &model.connection_id).await {
+        return pool.known_context_window(&model.model, realm).await.unwrap_or(built_in);
+    }
+    match st.local_link.get() {
+        Some(link) => link.context_window("", model).await,
+        None => built_in,
+    }
 }
 
 /// Checks a pool's members before they are saved: other connections (by

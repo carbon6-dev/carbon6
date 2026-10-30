@@ -41,6 +41,11 @@ use tokio::sync::Notify;
 #[derive(Clone, Debug)]
 pub enum Reply {
     Text(String),
+    /// Reasoning, then partial text cut off at the output token limit.
+    Truncated {
+        reasoning: String,
+        text: String,
+    },
     /// (name, arguments JSON) per call.
     ToolCalls(Vec<(String, String)>),
     Status(u16),
@@ -202,6 +207,9 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
         Reply::Text(text) => {
             let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);
             vec![delta(json!({"role": "assistant", "content": &text[..mid]})), delta(json!({"content": &text[mid..]})), finish("stop")]
+        }
+        Reply::Truncated { reasoning, text } => {
+            vec![delta(json!({"role": "assistant", "reasoning": reasoning})), delta(json!({"content": text})), finish("length")]
         }
         Reply::Broken(text) => {
             let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);

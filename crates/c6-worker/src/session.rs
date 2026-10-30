@@ -25,7 +25,7 @@ use crate::link::HeadLink;
 #[derive(Clone)]
 pub struct SessionManager {
     journal: Arc<Journal>,
-    link: Arc<HeadLink>,
+    pub(crate) link: Arc<HeadLink>,
     worktrees: PathBuf,
     /// The worker's state directory (checkpoint repositories live here).
     state_dir: PathBuf,
@@ -557,8 +557,7 @@ impl SessionManager {
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
         let mut session_tools = Vec::new();
-        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
-        let context_window = model_info(provider, &model.model).context_window;
+        let context_window = self.link.context_window(session_id, &model).await;
         let (profile, tools, system_prompt) = if model.connection_kind == "claude_code" {
             // Claude Code brings its own prompt (incl. CLAUDE.md) and tools.
             (crate::claude_code::PROFILE.to_owned(), Vec::new(), crate::claude_code::SYSTEM_PROMPT.to_owned())
@@ -987,18 +986,7 @@ fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> C
             _ => history.insert(0, Message::user_text(t)),
         }
     }
-    // The last request's size since the last compaction (or handoff: the
-    // other runtime's context is not this one's), for the next compaction
-    // decision.
-    let context_tokens = c6_agent::effective_events(events)
-        .iter()
-        .rev()
-        .take_while(|e| !matches!(e.kind, Some(session_event::Kind::Compaction(_))) && handoff_of(e).is_none())
-        .find_map(|e| match &e.kind {
-            Some(session_event::Kind::Usage(u)) => Some(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let context_tokens = c6_agent::context_tokens_from_events(events);
     Conversation { history, context_tokens }
 }
 
@@ -1633,8 +1621,7 @@ impl Actor {
         if (&current.connection_id, &current.model, &current.effort) == (&model.connection_id, &model.model, &model.effort) {
             return Ok(()); // e.g. redelivered after the switch was recorded
         }
-        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
-        let context_window = model_info(provider, &model.model).context_window;
+        let context_window = self.link.context_window(&self.on_behalf_of, &model).await;
         self.writer
             .append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(model.clone()), context_window, handoff: None }))
             .await?;
@@ -1712,8 +1699,7 @@ impl Actor {
             };
             (handoff, built.tools, built.errors)
         };
-        let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
-        let context_window = model_info(provider, &model.model).context_window;
+        let context_window = self.link.context_window(&self.on_behalf_of, &model).await;
         self.writer
             .append(session_event::Kind::ModelSwitched(ModelSwitched {
                 model: Some(model.clone()),
@@ -1766,7 +1752,7 @@ impl Actor {
         let model = self.spec.model.clone().unwrap_or_default();
         let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
         let info = model_info(provider, &model.model);
-        let cfg = TurnConfig {
+        let mut cfg = TurnConfig {
             model: model.model.clone(),
             system_prompt: self.started.system_prompt.clone(),
             max_output_tokens: (model.max_output_tokens > 0).then_some(model.max_output_tokens),
@@ -1826,6 +1812,9 @@ impl Actor {
         };
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
+            if !claude_code {
+                cfg.context_window = link.context_window(&on_behalf_of, &model).await;
+            }
             // Secrets for this turn's commands (values only in memory).
             if !secret_names.is_empty() {
                 let (values, errors) = fetch_secrets(&link, &on_behalf_of, &secret_names).await;
@@ -1966,7 +1955,7 @@ async fn run_session_turn(
         match checked.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
             Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), session_id, connection_id)),
             Err(e) => {
-                sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+                sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
                 sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e:#}") })).await?;
                 sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
                 return Ok(());
@@ -2656,7 +2645,7 @@ mod handoff_tests {
             ev(6, session_event::Kind::Usage(Usage { input_tokens: 90_000, ..Default::default() })),
             switched(7, model("cc", "opus", "claude_code"), Some(into_claude("conv-1"))),
             user(8, "continue in claude"),
-            ev(9, session_event::Kind::TurnStarted(TurnStarted { turn: 2 })),
+            ev(9, session_event::Kind::TurnStarted(TurnStarted { turn: 2, ..Default::default() })),
             assistant(
                 10,
                 vec![content_block::Block::ToolUse(c6_proto::ToolUse {
@@ -2698,7 +2687,7 @@ mod handoff_tests {
         let c = claude_conversation("session-1", &spec, &cc);
         assert_eq!((c.id.as_str(), c.resume, c.preamble), ("session-1", false, None));
         let mut cc = cc;
-        cc.push(ev(2, session_event::Kind::TurnStarted(TurnStarted { turn: 1 })));
+        cc.push(ev(2, session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })));
         assert!(claude_conversation("session-1", &spec, &cc).resume);
     }
 
@@ -2746,7 +2735,7 @@ mod handoff_tests {
                     ..Default::default()
                 }),
             ),
-            ev(3, session_event::Kind::TurnStarted(TurnStarted { turn: 1 })),
+            ev(3, session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })),
             assistant(4, vec![content_block::Block::Text("Fixed.".into())]),
         ];
         assert!(continues_claude_import(&started, &imported));

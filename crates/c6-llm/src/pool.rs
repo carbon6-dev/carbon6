@@ -68,6 +68,8 @@ pub struct Endpoint {
     pub base_url: String,
     pub bearer: String,
     pub headers: HashMap<String, String>,
+    /// Tokens; 0 means automatic.
+    pub context_window: u64,
 }
 
 /// What a pool asks of its owner: a member's endpoint (its credentials may
@@ -142,6 +144,7 @@ pub struct Pool {
     pub id: String,
     dial: Arc<dyn Dial>,
     state: Mutex<State>,
+    context_window: std::sync::atomic::AtomicU64,
 }
 
 /// A slot taken on a member, given back when dropped. Say how the call went
@@ -176,7 +179,7 @@ impl Drop for Slot {
 
 impl Pool {
     pub fn new(id: &str, members: Vec<Member>, dial: Arc<dyn Dial>) -> Arc<Self> {
-        let pool = Arc::new(Self { id: id.to_owned(), dial, state: Mutex::default() });
+        let pool = Arc::new(Self { id: id.to_owned(), dial, state: Mutex::default(), context_window: Default::default() });
         pool.set_members(members);
         pool
     }
@@ -206,6 +209,31 @@ impl Pool {
 
     pub fn members(&self) -> Vec<Member> {
         self.state.lock().unwrap().seats.iter().map(|s| s.member.clone()).collect()
+    }
+
+    pub fn set_context_window(&self, window: u64) {
+        self.context_window.store(window, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The smallest eligible member window for this model and realm. Unknown
+    /// members contribute their built-in window. A pool setting wins.
+    pub async fn known_context_window(&self, model: &str, realm: &str) -> Option<u64> {
+        let setting = self.context_window.load(std::sync::atomic::Ordering::Relaxed);
+        if setting > 0 {
+            return Some(setting);
+        }
+        let members = self.candidates(model, realm).await.ok()?;
+        let windows = futures::future::join_all(members.iter().map(|id| async move {
+            match self.endpoint(id).await.ok() {
+                Some(e) => {
+                    let known = crate::window::known(id, model, &e).await;
+                    (known.is_some(), known.unwrap_or_else(|| crate::window::built_in(&e.kind, model)))
+                }
+                None => (false, crate::window::built_in("openai_compat", model)),
+            }
+        }))
+        .await;
+        windows.iter().any(|(known, _)| *known).then(|| windows.iter().map(|(_, n)| *n).min()).flatten()
     }
 
     /// Calls in flight on each member, by id.
@@ -393,8 +421,7 @@ fn rest(seat: &mut Seat) {
 
 /// Whether a member's models include `model` (Ollama's `name` is `name:latest`).
 fn has_model(models: &[String], model: &str) -> bool {
-    let bare = |m: &str| m.strip_suffix(":latest").unwrap_or(m).to_owned();
-    model.is_empty() || models.is_empty() || models.iter().any(|m| bare(m) == bare(model))
+    model.is_empty() || models.is_empty() || models.iter().any(|m| crate::window::same_model(m, model))
 }
 
 async fn list_models(e: &Endpoint) -> Result<Vec<String>, LlmError> {
@@ -526,6 +553,37 @@ mod tests {
         assert_eq!(p.busy(), HashMap::from([("mac".into(), 2), ("mumuzz".into(), 1)]));
         drop((a, b, c));
         assert_eq!(p.busy(), HashMap::from([("mac".into(), 0), ("mumuzz".into(), 0)]));
+    }
+
+    #[tokio::test]
+    async fn known_windows_follow_model_and_realm_eligibility() {
+        struct Windows;
+        #[async_trait]
+        impl Dial for Windows {
+            async fn endpoint(&self, member: &str) -> Result<Endpoint, LlmError> {
+                Ok(Endpoint { context_window: if member == "large" { 32_768 } else { 4_096 }, ..Default::default() })
+            }
+        }
+        let p = Pool::new(
+            "p",
+            vec![member("small", 1, &[]), member("large", 1, &[]), member("unknown", 1, &[]), member("lab", 1, &["lab"])],
+            Arc::new(Windows),
+        );
+        {
+            let mut st = p.state.lock().unwrap();
+            st.seat("small").unwrap().models = Some((Instant::now(), Some(vec!["a".into()])));
+            st.seat("large").unwrap().models = Some((Instant::now(), Some(vec!["b:latest".into()])));
+            // Not fetched yet and resting: the scheduler cannot offer it
+            // for a named model, so it cannot constrain that model's window.
+            rest(st.seat("unknown").unwrap());
+        }
+        assert_eq!(p.known_context_window("b", "home").await, Some(32_768));
+        {
+            // An endpoint that cannot list models may have any model.
+            let mut st = p.state.lock().unwrap();
+            st.seat("unknown").unwrap().models = Some((Instant::now(), None));
+        }
+        assert_eq!(p.known_context_window("b", "home").await, Some(4_096));
     }
 
     #[tokio::test]

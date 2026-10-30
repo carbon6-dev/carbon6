@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, history_from_events, run_turn};
+use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, context_tokens_from_events, history_from_events, run_turn};
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
 use c6_llm::{Message, Provider, Role, ToolSpec, model_info};
@@ -259,7 +259,7 @@ impl Actor {
             labels: row.all_labels(),
             realm: row.realm.clone(),
         });
-        let conv = Conversation { history: history_from_events(&c6_agent::effective_events(&events)), context_tokens: 0 };
+        let conv = Conversation { history: history_from_events(&events), context_tokens: context_tokens_from_events(&events) };
         let mut actor = Actor {
             compact: crate::prompts::compact(&st, &row.realm).await,
             st,
@@ -286,8 +286,10 @@ impl Actor {
                     actor.sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false, ..Default::default() }));
                     actor.conv = Some(match done {
                         Ok(Some(c)) => c,
-                        _ => Conversation { history: history_from_events(&c6_agent::effective_events(
-                            &actor.st.store.events_after(&actor.session_id, 0, i64::MAX).await?)), context_tokens: 0 },
+                        _ => {
+                            let events = actor.st.store.events_after(&actor.session_id, 0, i64::MAX).await?;
+                            Conversation { history: history_from_events(&events), context_tokens: context_tokens_from_events(&events) }
+                        },
                     });
                     if !actor.inbox.lock().unwrap().is_empty() {
                         running = Some(actor.start_turn());
@@ -310,7 +312,7 @@ impl Actor {
                 }
                 self.model = spec.model.clone().unwrap_or_default();
                 self.system_prompt = spec.base_prompt.clone();
-                let info = info_of(&self.model);
+                let context_window = crate::pools::context_window(&self.st, &self.model, &self.env.realm).await;
                 self.sink
                     .append(session_event::Kind::Started(SessionStarted {
                         command_id: cmd.command_id.clone(),
@@ -319,7 +321,7 @@ impl Actor {
                         system_prompt: self.system_prompt.clone(),
                         tools: self.env.tools().iter().map(|t| t.spec().name).collect(),
                         tool_profile: "assistant".into(),
-                        context_window: info.context_window,
+                        context_window,
                         title: String::new(),
                         ..Default::default()
                     }))
@@ -332,7 +334,7 @@ impl Actor {
                     return Ok(());
                 }
                 if let Some(m) = input.model.filter(|m| !m.model.is_empty()) {
-                    let context_window = info_of(&m).context_window;
+                    let context_window = crate::pools::context_window(&self.st, &m, &self.env.realm).await;
                     self.sink
                         .append(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(m.clone()), context_window, handoff: None }))
                         .await?;
@@ -387,8 +389,7 @@ impl Actor {
         let turn = self.turns;
         let cancel = CancellationToken::new();
         let info = info_of(&self.model);
-        let provider = Provider::from_kind(&self.model.connection_kind).unwrap_or(Provider::OpenAiChat);
-        let cfg = TurnConfig {
+        let mut cfg = TurnConfig {
             model: self.model.model.clone(),
             system_prompt: self.system_prompt.clone(),
             max_output_tokens: None,
@@ -398,13 +399,14 @@ impl Actor {
             web_search: false,
             compact: self.compact.clone(),
         };
-        let _ = provider;
         let mut conv = self.conv.take().unwrap_or(Conversation { history: Vec::new(), context_tokens: 0 });
         let (st, sink, inbox, env, c, connection_id) =
             (self.st.clone(), self.sink.clone(), self.inbox.clone(), self.env.clone(), cancel.clone(), self.model.connection_id.clone());
         sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
         let session_id = self.session_id.clone();
+        let model = self.model.clone();
         let task = tokio::spawn(async move {
+            cfg.context_window = crate::pools::context_window(&st, &model, &env.realm).await;
             let dyn_sink: Arc<dyn EventSink> = sink.clone();
             let result = async {
                 let first: Vec<PendingInput> = std::mem::take(&mut *inbox.lock().unwrap());
@@ -431,7 +433,7 @@ impl Actor {
                 let client = match client {
                     Ok(c) => c,
                     Err(e) => {
-                        dyn_sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+                        dyn_sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
                         dyn_sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e}") })).await?;
                         dyn_sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
                         return anyhow::Ok(());

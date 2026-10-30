@@ -645,6 +645,7 @@ name = "c6-llm"
 version = "0.3.11"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "bytes",
  "c6-testkit",

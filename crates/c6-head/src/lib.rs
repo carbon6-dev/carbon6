@@ -146,6 +146,8 @@ pub struct HeadState {
     pub data_dir: std::path::PathBuf,
     /// The knowledge graph and its store (docs/knowledge.md), in this process.
     pub memex: std::sync::OnceLock<Arc<c6_memex::Memex>>,
+    /// Credentials for calls in this process, cleared when a connection changes.
+    pub(crate) local_link: std::sync::OnceLock<Arc<c6_worker::link::HeadLink>>,
     /// Updating carbon6 from GitHub releases (docs/updates.md).
     pub updates: updates::Updater,
     /// Pools of connections (docs/pools.md).
@@ -258,6 +260,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         shutdown: shutdown.clone(),
         data_dir: cfg.data_dir.clone(),
         memex: Default::default(),
+        local_link: Default::default(),
         updates: updater,
         pools: Default::default(),
         me: Default::default(),

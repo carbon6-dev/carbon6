@@ -15,6 +15,7 @@ mod assistant;
 mod chat;
 mod claims;
 mod compose;
+mod context_window;
 mod docs;
 mod drafts;
 mod files;

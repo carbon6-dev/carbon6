@@ -37,6 +37,8 @@ fn transient(e: &LlmError) -> bool {
     matches!(e, LlmError::Network(_) | LlmError::Protocol(_)) || e.retryable()
 }
 const COMPACT_MAX_OUTPUT: u32 = 16_000;
+const COMPACT_MIN_OUTPUT: u32 = 256;
+const COMPACT_FRAMING: u64 = 64;
 /// Default prompts (each an editable record of the `prompts` collection,
 /// docs/os.md §4.6): why the conversation is compacted, automatically or
 /// when asked, and what the summary must hold.
@@ -80,7 +82,7 @@ pub struct TurnConfig {
 /// Mutable conversation state carried across turns.
 pub struct Conversation {
     pub history: Vec<Message>,
-    /// Size of the last request (input + cache + output), for compaction.
+    /// Reported size of the last request (input + cache + output).
     pub context_tokens: u64,
 }
 
@@ -98,7 +100,7 @@ pub async fn run_turn(
     pending: &mut (dyn FnMut() -> Vec<PendingInput> + Send),
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
-    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, context_window: cfg.context_window })).await?;
     let t = Turn { turn, cfg, client, specs: tools.iter().map(|t| t.spec()).collect(), sink, cancel };
     let reason = t.run(tools, session_tools, conv, pending).await?;
     sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
@@ -118,12 +120,13 @@ pub async fn compact_turn(
     focus: &str,
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
-    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, context_window: cfg.context_window })).await?;
     let t = Turn { turn, cfg, client, specs: tools.iter().map(|t| t.spec()).collect(), sink, cancel };
     let reason = if conv.history.is_empty() {
         t.fail("there is nothing to compact yet".into()).await?
     } else {
-        match t.compact(conv, &cfg.compact.why_asked, focus, false).await? {
+        let estimate = next_tokens(conv.context_tokens, t.estimate_request(&conv.history, &t.specs), t.reported_estimate(conv));
+        match t.compact(conv, &cfg.compact.why_asked, focus, false, estimate).await? {
             Ok(()) => TurnEndReason::Completed,
             Err(_) if cancel.is_cancelled() => TurnEndReason::Interrupted,
             Err(e) => t.fail(format!("compaction failed: {e}")).await?,
@@ -164,6 +167,52 @@ impl Turn<'_> {
             web_search: self.cfg.web_search,
             json: false,
         }
+    }
+
+    /// Estimate unreported requests and growth since the last report at 3.5
+    /// characters per token, with a fixed allowance per image instead of bytes.
+    fn estimate_request(&self, history: &[Message], specs: &[ToolSpec]) -> u64 {
+        let mut chars = self.cfg.system_prompt.chars().count() as u64;
+        chars += serde_json::to_string(specs).unwrap_or_default().chars().count() as u64;
+        for message in history {
+            chars += 16;
+            for block in &message.blocks {
+                chars += match block {
+                    Block::Image { .. } => 3_584,
+                    _ => serde_json::to_string(block).unwrap_or_default().chars().count() as u64,
+                };
+            }
+        }
+        (chars * 2).div_ceil(7)
+    }
+
+    /// A report includes the last assistant reply, but not the tool results
+    /// and user messages that follow it.
+    fn reported_estimate(&self, conv: &Conversation) -> Option<u64> {
+        (conv.context_tokens > 0).then(|| {
+            let end = conv.history.iter().rposition(|m| m.role == Role::Assistant).map_or(0, |i| i + 1);
+            self.estimate_request(&conv.history[..end], &self.specs)
+        })
+    }
+
+    /// Summary space below the compaction threshold, beside the normal
+    /// system prompt, tools and summary wrapper that return afterwards,
+    /// with a little room for framing.
+    fn summary_room(&self) -> u64 {
+        if self.cfg.context_window == 0 {
+            return u64::MAX;
+        }
+        let prefix = self.estimate_request(&[Message::user_text(compacted_context(""))], &self.specs);
+        ((self.cfg.context_window as f64 * COMPACT_AT) as u64).saturating_sub(prefix).saturating_sub(COMPACT_FRAMING)
+    }
+
+    fn no_summary_room(&self) -> String {
+        let prefix = self.estimate_request(&[], &self.specs);
+        format!(
+            "the system prompt and tools take about {prefix} of {}'s {} tokens, leaving no room to compact this conversation: \
+             give the session fewer tools or a larger context window",
+            self.cfg.model, self.cfg.context_window
+        )
     }
 
     /// Streams one model call, forwarding deltas live when `live` is set.
@@ -221,16 +270,32 @@ impl Turn<'_> {
         let by_name: HashMap<String, Arc<dyn Tool>> = self.specs.iter().map(|s| s.name.clone()).zip(tools.iter().cloned()).collect();
         let mut compacted_for_overflow = false;
         let mut stop_hook_runs = 0;
+        let mut reported = self.reported_estimate(conv);
+        // Recompacting unchanged history cannot help, even if the fixed
+        // prefix alone exceeds the threshold.
+        let mut compacted_estimate = None;
 
         for _ in 0..MAX_STEPS {
             if self.cancel.is_cancelled() {
                 return Ok(TurnEndReason::Interrupted);
             }
+            let estimate = self.estimate_request(&conv.history, &self.specs);
+            let next = next_tokens(conv.context_tokens, estimate, reported);
             if self.cfg.context_window > 0
-                && conv.context_tokens as f64 > self.cfg.context_window as f64 * COMPACT_AT
-                && let Err(e) = self.compact(conv, &self.cfg.compact.why_full, "", true).await?
+                && next as f64 > self.cfg.context_window as f64 * COMPACT_AT
+                && compacted_estimate != Some(estimate)
             {
-                return self.fail(format!("compaction failed: {e}")).await;
+                if self.summary_room() < u64::from(COMPACT_MIN_OUTPUT) {
+                    if next > self.cfg.context_window {
+                        return self.fail(self.no_summary_room()).await;
+                    }
+                } else {
+                    if let Err(e) = self.compact(conv, &self.cfg.compact.why_full, "", true, next).await? {
+                        return self.fail(format!("compaction failed: {e}")).await;
+                    }
+                    reported = None;
+                    compacted_estimate = Some(self.estimate_request(&conv.history, &self.specs));
+                }
             }
 
             let req = self.request(conv.history.clone(), self.cfg.max_output_tokens);
@@ -238,9 +303,11 @@ impl Turn<'_> {
                 Ok(r) => r,
                 Err(LlmError::ContextOverflow(_)) if !compacted_for_overflow => {
                     compacted_for_overflow = true;
-                    if let Err(e) = self.compact(conv, &self.cfg.compact.why_full, "", true).await? {
+                    if let Err(e) = self.compact(conv, &self.cfg.compact.why_full, "", true, u64::MAX).await? {
                         return self.fail(format!("context window exceeded and compaction failed: {e}")).await;
                     }
+                    reported = None;
+                    compacted_estimate = Some(self.estimate_request(&conv.history, &self.specs));
                     continue;
                 }
                 Err(e) => return self.fail(format!("model request failed: {e}")).await,
@@ -263,6 +330,7 @@ impl Turn<'_> {
             if resp.usage != Default::default() {
                 let u = resp.usage;
                 conv.context_tokens = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens;
+                reported = (conv.context_tokens > 0).then(|| self.estimate_request(&conv.history, &self.specs));
             }
             if resp.interrupted {
                 return Ok(TurnEndReason::Interrupted);
@@ -374,41 +442,72 @@ impl Turn<'_> {
     /// Simple compaction: the model summarizes the conversation (same model,
     /// system and tools, so the cached prefix is reused) and the summary
     /// replaces the whole history. Nothing older is replayed, so no earlier
-    /// reasoning blocks are sent again. If the model answers with no text
+    /// reasoning blocks are sent again. If the model gives no complete summary
     /// (often a tool call: it carries on with the work), it is asked once
     /// more with the conversation as text and no tools. With `fallback`
     /// (automatic compaction), a mechanical digest stands in when that fails
     /// too, so the session is not stuck over its window. The outer `Result`
-    /// is a journal failure; the inner one a compaction failure.
-    async fn compact(&self, conv: &mut Conversation, why: &str, focus: &str, fallback: bool) -> anyhow::Result<Result<(), String>> {
+    /// is a journal failure; the inner one a compaction failure. The size
+    /// passed in uses reported usage plus growth when available. Both calls
+    /// reserve room for output and for restoring the normal prefix afterwards.
+    async fn compact(
+        &self,
+        conv: &mut Conversation,
+        why: &str,
+        focus: &str,
+        fallback: bool,
+        estimated_tokens: u64,
+    ) -> anyhow::Result<Result<(), String>> {
+        if self.cancel.is_cancelled() {
+            return Ok(Err("interrupted".into()));
+        }
+        let room = self.summary_room();
+        let output = room.min(u64::from(COMPACT_MAX_OUTPUT)) as u32;
+        if output < COMPACT_MIN_OUTPUT {
+            return Ok(Err(self.no_summary_room()));
+        }
         let mut prompt = format!("{why} {}", self.cfg.compact.instructions);
         if !focus.trim().is_empty() {
             prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {}", focus.trim()));
         }
+        let prompt_tokens =
+            self.estimate_request(&[Message::user_text(prompt.clone())], &[]).saturating_sub(self.estimate_request(&[], &[]));
+        let summary_tokens = estimated_tokens.saturating_add(prompt_tokens);
         let mut msgs = conv.history.clone();
         match msgs.last_mut() {
             Some(m) if m.role == Role::User => m.blocks.push(Block::Text(prompt.clone())),
             _ => msgs.push(Message::user_text(prompt.clone())),
         }
-        let first = match self.summarize(self.request(msgs, Some(COMPACT_MAX_OUTPUT))).await? {
-            Ok(summary) => return self.compacted(conv, summary).await,
-            // A request that failed may fail again; an interrupt is final.
-            Err(NoSummary::Failed(e)) => return Ok(Err(e)),
-            Err(NoSummary::Answered(e) | NoSummary::Overflow(e)) => e,
+        let first = if self.cfg.context_window == 0 || summary_tokens < self.cfg.context_window {
+            match self.summarize(self.request(msgs, Some(output)), summary_tokens).await? {
+                Ok(summary) => return self.compacted(conv, summary).await,
+                // A request that failed may fail again; an interrupt is final.
+                Err(NoSummary::Failed(e)) => return Ok(Err(e)),
+                Err(NoSummary::Answered(e) | NoSummary::Overflow(e)) => e,
+            }
+        } else {
+            "the conversation is too large to summarize in full".into()
         };
-        warn!(error = %first, "compaction: no summary; retrying with the conversation as text and no tools");
+        warn!(error = %first, "compaction: asking with a bounded digest and no tools");
 
-        // The window holds the whole conversation, so its text (shorter:
-        // tool output is clipped) fits too.
-        let budget = self.digest_budget(2);
-        let text = format!(
-            "Below is a conversation between a user and you, an agent working on their task, as text.\n\n{}\n\n---\n\n{prompt}",
-            messages_digest(&conv.history, budget)
-        );
-        let mut req = self.request(vec![Message::user_text(text)], Some(COMPACT_MAX_OUTPUT));
+        let text = |digest: &str| {
+            format!(
+                "Below is a conversation between a user and you, an agent working on their task, as text.\n\n{digest}\n\n---\n\n{prompt}"
+            )
+        };
+        let mut req = self.request(vec![Message::user_text(text(""))], Some(output));
         req.tools.clear();
         req.web_search = false;
-        let (second, answered) = match self.summarize(req).await? {
+        let fixed = self.estimate_request(&req.messages, &req.tools);
+        let digest_room = if self.cfg.context_window > 0 {
+            self.cfg.context_window.saturating_sub(fixed).saturating_sub(u64::from(output)).saturating_sub(COMPACT_FRAMING)
+        } else {
+            u64::MAX
+        };
+        let budget = self.digest_budget(2).min((digest_room.saturating_mul(7) / 2) as usize);
+        req.messages = vec![Message::user_text(text(&fit_text(&messages_digest(&conv.history, budget), digest_room)))];
+        let digest_tokens = self.estimate_request(&req.messages, &req.tools);
+        let (second, answered) = match self.summarize(req, digest_tokens).await? {
             Ok(summary) => return self.compacted(conv, summary).await,
             Err(NoSummary::Answered(e)) => (e, true),
             Err(NoSummary::Failed(e) | NoSummary::Overflow(e)) => (e, false),
@@ -420,18 +519,33 @@ impl Turn<'_> {
             return Ok(Err(why));
         }
 
-        warn!(error = %why, "compaction: falling back to a mechanical digest");
-        let digest = format!(
-            "(The model could not write a summary: {why}. This is a mechanical digest instead: the most recent steps, \
-             with long tool input and output shortened, and before them only what the user wrote. Re-read files rather \
-             than trusting shortened output.)\n\n{}",
-            messages_digest(&conv.history, self.digest_budget(1))
-        );
-        self.compacted(conv, digest).await
+        self.mechanical_digest(conv, &why, room).await
     }
 
-    /// One summarizing call: the summary, or what came back instead.
-    async fn summarize(&self, req: ModelRequest) -> anyhow::Result<Result<String, NoSummary>> {
+    async fn mechanical_digest(&self, conv: &mut Conversation, why: &str, room: u64) -> anyhow::Result<Result<(), String>> {
+        warn!(error = %why, "compaction: falling back to a mechanical digest");
+        let notice = format!(
+            "(The model could not write a summary: {why}. This is a mechanical digest instead: the most recent steps, \
+             with long tool input and output shortened, and before them only what the user wrote. Re-read files rather \
+             than trusting shortened output.)\n\n"
+        );
+        let fixed = serde_json::to_string(&notice).unwrap_or_default().chars().count() as u64;
+        let budget = self.digest_budget(1).min((room.saturating_mul(7) / 2).saturating_sub(fixed) as usize);
+        let digest = format!("{notice}{}", messages_digest(&conv.history, budget));
+        self.compacted(conv, fit_text(&digest, room)).await
+    }
+
+    /// Leave room for a complete summary in this call and beside the normal
+    /// prefix afterwards. A response cut off at the output limit is unusable.
+    async fn summarize(&self, mut req: ModelRequest, estimated_tokens: u64) -> anyhow::Result<Result<String, NoSummary>> {
+        if self.cfg.context_window > 0 {
+            let room = self.cfg.context_window.saturating_sub(estimated_tokens).saturating_sub(COMPACT_FRAMING);
+            let output = room.min(u64::from(req.max_output_tokens.unwrap_or(COMPACT_MAX_OUTPUT))) as u32;
+            if output < COMPACT_MIN_OUTPUT {
+                return Ok(Err(NoSummary::Overflow("the summary prompt leaves too little room for a useful summary".into())));
+            }
+            req.max_output_tokens = Some(output);
+        }
         let resp = match self.call(&req, false).await {
             Ok(r) => r,
             Err(e @ LlmError::ContextOverflow(_)) => return Ok(Err(NoSummary::Overflow(e.to_string()))),
@@ -444,10 +558,19 @@ impl Turn<'_> {
         if let Some(e) = resp.error {
             return Ok(Err(NoSummary::Failed(e.to_string())));
         }
+        if resp.stop_reason == stop::MAX_TOKENS {
+            return Ok(Err(NoSummary::Answered("the summary hit the output token limit before finishing".into())));
+        }
         let blocks = resp.message.map(|m| m.blocks).unwrap_or_default();
         let summary =
             blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n");
         if !summary.trim().is_empty() {
+            let tokens = self
+                .estimate_request(&[Message::user_text(summary.clone())], &[])
+                .saturating_sub(self.estimate_request(&[Message::user_text("")], &[]));
+            if tokens > self.summary_room() {
+                return Ok(Err(NoSummary::Answered("the summary does not fit beside the system prompt and tools".into())));
+            }
             return Ok(Ok(summary));
         }
         Ok(Err(NoSummary::Answered(no_summary(&blocks, &resp.stop_reason))))
@@ -518,12 +641,36 @@ impl Turn<'_> {
 
 /// Why a summarizing call gave no summary.
 enum NoSummary {
-    /// The model answered, but with no text.
+    /// The model answered, but with no usable summary.
     Answered(String),
     /// The conversation did not fit.
     Overflow(String),
     /// The request failed or was interrupted.
     Failed(String),
+}
+
+/// Reported usage plus estimated growth; without a report, estimate it all.
+fn next_tokens(context_tokens: u64, estimate: u64, reported: Option<u64>) -> u64 {
+    reported.map_or(estimate, |before| context_tokens.saturating_add(estimate.saturating_sub(before)))
+}
+
+/// Fit digest text within the request estimator's budget, including JSON escaping.
+fn fit_text(text: &str, tokens: u64) -> String {
+    let mut room = tokens.saturating_mul(7) / 2;
+    text.chars()
+        .take_while(|c| {
+            let chars = match c {
+                '"' | '\\' | '\n' | '\r' | '\t' => 2,
+                c if c.is_control() => 6,
+                _ => 1,
+            };
+            if chars > room {
+                return false;
+            }
+            room -= chars;
+            true
+        })
+        .collect()
 }
 
 /// What the model sent back instead of a summary.

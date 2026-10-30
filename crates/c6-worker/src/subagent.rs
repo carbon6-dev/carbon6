@@ -213,6 +213,7 @@ impl Subagents for Runner {
         let provider = Provider::from_kind(&model_spec.connection_kind).unwrap_or(Provider::OpenAiChat);
         let info = model_info(provider, &model_spec.model);
         let profile = info.tool_profile;
+        let context_window = p.manager.link.context_window(&root, &model_spec).await;
         let delegation = Delegation {
             parent_session_id: p.session_id.clone(),
             parent_call_id: parent_call_id.to_owned(),
@@ -294,7 +295,7 @@ impl Subagents for Runner {
             system_prompt,
             model: Some(model_spec.clone()),
             tool_profile: profile.as_str().to_owned(),
-            context_window: info.context_window,
+            context_window,
             agent: agent.map(|a| a.name.clone()).unwrap_or_default(),
             depth,
             ..p.started.clone()

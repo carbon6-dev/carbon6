@@ -11,6 +11,99 @@ use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
 
 #[tokio::test]
+async fn assistant_reload_restores_usage_since_compaction() {
+    for reported in [true, false] {
+        let mock = MockLlm::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let start = || {
+            c6_head::start(HeadConfig {
+                data_dir: dir.path().to_owned(),
+                bind: vec!["127.0.0.1".parse().unwrap()],
+                ui_port: 0,
+                worker_port: 0,
+                auth: false,
+                ..Default::default()
+            })
+        };
+        let head = start().await.unwrap();
+        let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let http = reqwest::Client::new();
+        let r = http
+            .post(format!("{api}/connections"))
+            .json(&json!({"name": "m", "base_url": mock.base_url(), "context_window": 200000}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let r = http
+            .put(format!("{api}/settings/assistant"))
+            .json(&json!({"model": {"connection": "m", "model": "mock-1"}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        mock.push(Reply::Text("ready".into()));
+        let s: Session =
+            http.post(format!("{api}/assistant")).json(&json!({"prompt": "start"})).send().await.unwrap().json().await.unwrap();
+        let events = eventually("the assistant's first turn to end", async || {
+            let events = head.state.store.events_after(&s.id, 0, i64::MAX).await.unwrap();
+            events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_)))).then_some(events)
+        })
+        .await;
+        // A durable history whose raw estimate exceeds the window, with
+        // optional usage after the compaction that replaced its predecessor.
+        use c6_proto::{AssistantMessage, Compaction, ContentBlock, SessionEvent, Usage, content_block, session_event::Kind};
+        let mut kinds = vec![
+            Kind::Usage(Usage { input_tokens: 190_000, ..Default::default() }),
+            Kind::Compaction(Compaction { summary: "earlier work".into(), ..Default::default() }),
+            Kind::Assistant(AssistantMessage {
+                blocks: vec![ContentBlock { block: Some(content_block::Block::Text("large history ".repeat(65_000))) }],
+                ..Default::default()
+            }),
+        ];
+        if reported {
+            kinds.push(Kind::Usage(Usage { input_tokens: 20_000, cache_read_tokens: 10_000, output_tokens: 100, ..Default::default() }));
+        }
+        let last = events.last().unwrap().seq;
+        let added: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| SessionEvent { seq: last + i as u64 + 1, ts_ms: c6_core::now_ms(), kind: Some(kind) })
+            .collect();
+        head.state.store.ingest(head.state.assistant.head_id().unwrap(), &s.id, &added).await.unwrap().unwrap();
+        head.shutdown().await.unwrap();
+
+        let head = start().await.unwrap();
+        let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        if !reported {
+            mock.push(Reply::Text("SUMMARY: continued work".into()));
+        }
+        mock.push(Reply::Text("continued".into()));
+        mock.push(Reply::Text("unexpected additional request".into()));
+        let r = http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "continue"})).send().await.unwrap();
+        assert!(r.status().is_success());
+        let events = eventually("the reloaded assistant's turn to end", async || {
+            let events = head.state.store.events_after(&s.id, 0, i64::MAX).await.unwrap();
+            (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == 2).then_some(events)
+        })
+        .await;
+        assert_eq!(mock.requests().len(), if reported { 2 } else { 3 });
+        let compactions: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(Kind::Compaction(c)) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compactions.len(), if reported { 1 } else { 2 });
+        if !reported {
+            assert_eq!(compactions[1].tokens_before, 0, "usage before compaction must not carry over");
+        }
+        head.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn assistant_discovers_asks_acts_and_asks_first() {
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();

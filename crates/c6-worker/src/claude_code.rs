@@ -99,7 +99,7 @@ pub async fn run_turn(
     for input in inputs {
         sink.append(input.event()).await?;
     }
-    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn })).await?;
+    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
 
     let reason = match find_claude() {
         None => {
@@ -443,7 +443,7 @@ impl Mapper<'_> {
             link: obs.link.clone(),
             next_seq: tokio::sync::Mutex::new(2),
         });
-        log.append(session_event::Kind::TurnStarted(TurnStarted { turn: 1 })).await?;
+        log.append(session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })).await?;
         self.children.insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true });
         Ok(Some((id, log)))
     }
