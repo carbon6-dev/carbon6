@@ -211,7 +211,7 @@ mod tests {
             &crate::llm::Task { connection_id: "test".into(), model: "test".into(), effort: None },
             kind,
             items,
-            &json!({"commitments": values}),
+            &json!({"summary": "Plans for the workshop.", "commitments": values}),
         )
         .await
         .unwrap();

@@ -348,8 +348,9 @@ async fn read(m: &Memex, task: &Task, kind: &str, items: &[String]) -> anyhow::R
 
 /// Records what the model said, replacing what this pipeline said before.
 pub(crate) async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], v: &Value) -> anyhow::Result<()> {
-    let made_by = version(task);
     let summary = v["summary"].as_str().unwrap_or("").trim().to_owned();
+    anyhow::ensure!(!summary.is_empty(), "the model's answer has no summary");
+    let made_by = version(task);
     for id in items {
         m.store.clear_links(id, &made_by).await?;
         // Earlier versions' inferences go too.
@@ -360,10 +361,8 @@ pub(crate) async fn apply(m: &Memex, task: &Task, kind: &str, items: &[String], 
             .await?;
     }
     let last = items.last().cloned().unwrap_or_default();
-    if !summary.is_empty() {
-        for id in items {
-            sqlx::query("UPDATE items SET summary = ? WHERE id = ?").bind(&summary).bind(id).execute(&m.store.pool).await?;
-        }
+    for id in items {
+        sqlx::query("UPDATE items SET summary = ? WHERE id = ?").bind(&summary).bind(id).execute(&m.store.pool).await?;
     }
     for t in v["topics"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).take(8) {
         let name = t.trim();
@@ -654,6 +653,153 @@ mod budget_tests {
 mod tests {
     use super::*;
     use c6_testkit::within;
+
+    async fn read_mail_thread(m: &Memex, task: &Task) -> Vec<String> {
+        let mut items = Vec::new();
+        for n in 1..=2 {
+            let id = m
+                .store
+                .put(
+                    &api::MemexItemIn {
+                        kind: "email".into(),
+                        source: "test".into(),
+                        external_id: n.to_string(),
+                        title: "Workshop".into(),
+                        text: format!("Message {n}."),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO mail (item_id, account, gmail_id, thread_id, date, from_addr, blob) VALUES (?, 'a', ?, 't', ?, 'pat@example.com', '')")
+                .bind(&id).bind(n.to_string()).bind(n).execute(&m.store.pool).await.unwrap();
+            items.push(id);
+        }
+        apply(
+            m,
+            task,
+            "thread",
+            &items,
+            &json!({"summary": "Plans for the workshop.", "topics": ["Workshop", "Planning"], "commitments": [{"who": "me", "what": "Send the agenda"}]}),
+        )
+        .await
+        .unwrap();
+        done(m, "thread:a:t", &version(task), &items, false, Ok(())).await.unwrap();
+        let topic = m.store.ensure_thing("topic:earlier", "topic", "Earlier").await.unwrap();
+        for id in &items {
+            m.store.link_inferred(id, "about", &topic, 0.7, "understand-v0@test", None).await.unwrap();
+        }
+        items
+    }
+
+    #[tokio::test]
+    async fn answers_without_summaries_keep_previous_reads_and_retry() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let task = Task { connection_id: "test".into(), model: "test".into(), effort: None };
+        let version = version(&task);
+        let items = read_mail_thread(&m, &task).await;
+        let topics = async || -> Vec<(i64, String, String)> {
+            sqlx::query_as("SELECT id, dst_thing, made_by FROM links WHERE rel = 'about' ORDER BY id")
+                .fetch_all(&m.store.pool)
+                .await
+                .unwrap()
+        };
+        let commitments = async || -> Vec<(i64, String, String, String)> {
+            sqlx::query_as("SELECT id, who, what, status FROM commitments ORDER BY id").fetch_all(&m.store.pool).await.unwrap()
+        };
+        let previous_topics = topics().await;
+        let previous_commitments = commitments().await;
+        assert_eq!(previous_topics.len(), 6);
+        assert_eq!(previous_commitments.len(), 1);
+        assert_eq!(previous_commitments[0].3, "open");
+
+        for answer in [
+            "{}",
+            r#"{"summary": ""}"#,
+            r#"{"summary": "   "}"#,
+            "[]",
+            r#"{"topics": ["x"], "commitments": [{"who": "me", "what": "Something else"}]}"#,
+            r#"{"summary": null}"#,
+            r#"{"summary": 7}"#,
+        ] {
+            // Each answer gets a fresh retry count.
+            sqlx::query("DELETE FROM enrich").execute(&m.store.pool).await.unwrap();
+            // read() rejects [], but apply() must also reject it.
+            let v = serde_json::from_str(answer).unwrap();
+            assert_eq!(
+                apply(&m, &task, "thread", &items, &v).await.unwrap_err().to_string(),
+                "the model's answer has no summary",
+                "{answer}"
+            );
+            for (is_retry, tries) in [(false, 1), (true, 2), (true, 3)] {
+                assert_eq!(retrying(&m, "thread:a:t", &version, &items).await.unwrap(), Some(is_retry));
+                let result = async {
+                    let v = llm::json_of(answer)?;
+                    apply(&m, &task, "thread", &items, &v).await
+                }
+                .await;
+                let error = result.as_ref().unwrap_err().to_string();
+                done(&m, "thread:a:t", &version, &items, is_retry, result).await.unwrap();
+                let recorded: (Option<String>, i64) =
+                    sqlx::query_as("SELECT error, tries FROM enrich WHERE target = 'thread:a:t'").fetch_one(&m.store.pool).await.unwrap();
+                assert_eq!(recorded, (Some(error), tries), "{answer}");
+                let summaries: Vec<String> =
+                    sqlx::query_scalar("SELECT summary FROM items ORDER BY id").fetch_all(&m.store.pool).await.unwrap();
+                assert_eq!(summaries, ["Plans for the workshop.", "Plans for the workshop."], "{answer}");
+                assert_eq!(topics().await, previous_topics, "{answer}");
+                assert_eq!(commitments().await, previous_commitments, "{answer}");
+                if tries < 3 {
+                    assert_eq!(retrying(&m, "thread:a:t", &version, &items).await.unwrap(), Some(true));
+                    assert_eq!(next(&m, &version).await.unwrap().unwrap().target, "thread:a:t");
+                } else {
+                    assert_eq!(retrying(&m, "thread:a:t", &version, &items).await.unwrap(), None);
+                    assert!(next(&m, &version).await.unwrap().is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_answers_replace_previous_reads_and_clear_errors() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let task = Task { connection_id: "test".into(), model: "test".into(), effort: None };
+        let version = version(&task);
+        let items = read_mail_thread(&m, &task).await;
+        done(&m, "thread:a:t", &version, &items, false, Err(anyhow::anyhow!("earlier read failed"))).await.unwrap();
+        assert_eq!(retrying(&m, "thread:a:t", &version, &items).await.unwrap(), Some(true));
+        let answer =
+            r#"{"summary": "  New plans.  ", "topics": ["New topic"], "commitments": [{"who": "me", "what": "Send the new agenda"}]}"#;
+        let v = llm::json_of(answer).unwrap();
+        let result = apply(&m, &task, "thread", &items, &v).await;
+        assert!(result.is_ok(), "{result:?}");
+        done(&m, "thread:a:t", &version, &items, true, result).await.unwrap();
+        for id in &items {
+            let summary: String =
+                sqlx::query_scalar("SELECT summary FROM items WHERE id = ?").bind(id).fetch_one(&m.store.pool).await.unwrap();
+            assert_eq!(summary, "New plans.");
+            let topics: Vec<(String, String)> = sqlx::query_as(
+                "SELECT t.key, l.made_by FROM links l JOIN things t ON t.id = l.dst_thing WHERE l.src_item = ? AND l.rel = 'about'",
+            )
+            .bind(id)
+            .fetch_all(&m.store.pool)
+            .await
+            .unwrap();
+            assert_eq!(topics, [("topic:new-topic".into(), version.clone())]);
+        }
+        let commitments: Vec<(String, String, String, String)> =
+            sqlx::query_as("SELECT item_id, who, what, status FROM commitments ORDER BY id").fetch_all(&m.store.pool).await.unwrap();
+        assert_eq!(commitments, [(items.last().unwrap().clone(), "me".into(), "Send the new agenda".into(), "open".into())]);
+        let recorded: (Option<String>, i64) =
+            sqlx::query_as("SELECT error, tries FROM enrich WHERE target = 'thread:a:t'").fetch_one(&m.store.pool).await.unwrap();
+        assert_eq!(recorded, (None, 0));
+        assert_eq!(retrying(&m, "thread:a:t", &version, &items).await.unwrap(), None);
+        assert!(next(&m, &version).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn failed_reads_count_content_and_model_changes() {
