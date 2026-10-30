@@ -10,7 +10,7 @@ When a turn finishes and the session is waiting for you, the message box offers 
 - "Commit this"
 - "Yes, use eu-west"
 
-**Tab** accepts it, so it becomes your message, which you can edit or send. Typing anything else replaces it, and **Esc** dismisses it. It's a guess to save typing; carbon6 never sends it on its own.
+Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes your message, which you can edit or send; accepting it never sends it. Typing anything else replaces it, and **Esc** dismisses it. It's a guess to save typing; carbon6 never sends it on its own.
 
 ## 2. When one is made
 
@@ -52,7 +52,7 @@ When a turn finishes and the session is waiting for you, the message box offers 
 ## 5. UI
 
 - The message box shows the suggestion as placeholder-styled text inside the textarea, only while it's empty and focused or idle.
-- **Tab** fills it in, with the cursor at the end; **Esc** hides it until the next turn.
+- Tap **Use suggestion** (a touch-sized button below the box), or press **Tab**, to fill it in and focus the box with the cursor at the end. Neither sends the message. The button is shown only while a suggestion is available; **Esc** hides it until the next turn.
 - It's fetched once when the turn ends (the live stream says so) and the page is visible.
 - Two counts are kept, how many were shown and how many accepted, for the leverage measurement later (docs/measurement.md).
 
@@ -60,7 +60,7 @@ When a turn finishes and the session is waiting for you, the message box offers 
 
 1. The prompt `session.suggest` with its default, and the realm setting (on).
 2. Head: the `suggestions` table, the route with the cache and the conditions in §2, and the model call through routing (`task:suggest`) with usage counted.
-3. UI: ghost text, Tab and Esc, fetched on turn end.
+3. UI: ghost text, tap-to-accept button, Tab and Esc, fetched on turn end.
 4. Tests:
    - a finished turn gets the mock's line;
    - an errored turn, a pending question, and the setting off get none;

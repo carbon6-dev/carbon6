@@ -2659,7 +2659,7 @@ fn Composer(
     let text = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
     // What you'd likely type next (docs/suggestions.md): fetched when a turn
-    // ends, shown faintly while the box is empty, taken with Tab.
+    // ends, shown faintly while the box is empty, taken with a tap or Tab.
     let next = RwSignal::new(None::<c6_api::Suggestion>);
     let suggest_for = id.clone();
     let suggests = !inline && wake.is_none();
@@ -2684,6 +2684,24 @@ fn Composer(
     let model_open = RwSignal::new(false);
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
+    // One path for a tap and Tab: fill the draft, never send it. Focus in the
+    // gesture handler itself so a phone can open its software keyboard.
+    let accept_next = move || {
+        if disabled.get_untracked() {
+            return;
+        }
+        let Some(s) = shown_next() else { return };
+        let Some(n) = next.get_untracked() else { return };
+        next.set(None);
+        text.set(s.clone());
+        if let Some(el) = area.get_untracked() {
+            el.set_value(&s);
+            let _ = el.focus();
+            let caret = s.encode_utf16().count() as u32;
+            let _ = el.set_selection_range(caret, caret);
+        }
+        spawn_local(api::suggestion_seen(id.get_value(), n.for_seq, true));
+    };
     // @-mention completion: (where the @ is, query), the matches, and the
     // highlighted one.
     let mention = RwSignal::new(None::<(usize, String)>);
@@ -2964,7 +2982,7 @@ fn Composer(
                         node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if let Some(s) = shown_next() { format!("{s}   (Tab)") } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
+                        placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
@@ -3004,13 +3022,12 @@ fn Composer(
                                 }
                             }
                             // The suggested next message: Tab takes it, Esc puts it away.
-                            if let Some(s) = shown_next().filter(|_| matches!(ev.key().as_str(), "Tab" | "Escape")) {
+                            if shown_next().is_some() && matches!(ev.key().as_str(), "Tab" | "Escape") {
                                 ev.prevent_default();
-                                let took = next.get_untracked().filter(|_| ev.key() == "Tab");
-                                next.set(None);
-                                if let Some(n) = took {
-                                    text.set(s);
-                                    spawn_local(api::suggestion_seen(id.get_value(), n.for_seq, true));
+                                if ev.key() == "Tab" {
+                                    accept_next();
+                                } else {
+                                    next.set(None);
                                 }
                                 return;
                             }
@@ -3024,6 +3041,15 @@ fn Composer(
                         view! { <button class=format!("{BUTTON} py-2") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()
                     }}
                 </div>
+                {move || shown_next().map(|_| view! {
+                    <button type="button"
+                        class="min-h-11 rounded-md px-3 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                        title="Put the suggested message in the box to edit or send; does not send it"
+                        prop:disabled=move || disabled.get()
+                        on:click=move |_| accept_next()>
+                        "Use suggestion"<span class="hidden sm:inline">" · Tab"</span>
+                    </button>
+                })}
                 {model.map(|m| view! {
                     // Folded away on phones until asked for.
                     <button class="self-start text-xs text-zinc-500 sm:hidden" class:hidden=move || model_open.get()
