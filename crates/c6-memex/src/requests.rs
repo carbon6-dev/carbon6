@@ -240,6 +240,25 @@ pub(crate) async fn close_calendar(
     sources: &[(String, i64, i64, String)],
     event: &CalendarAnswer,
 ) -> anyhow::Result<bool> {
+    let moved = calendar_transition(m, id, reason, sources, event, c6_core::now_ms()).await?;
+    if let Some(moved) = moved {
+        unpair(m, id).await?;
+        // A recheck of one Calendar closed before isn't news.
+        if moved {
+            changed(m, id, "done").await;
+        }
+    }
+    Ok(moved.is_some())
+}
+
+async fn calendar_transition(
+    m: &Memex,
+    id: i64,
+    reason: &str,
+    sources: &[(String, i64, i64, String)],
+    event: &CalendarAnswer,
+    now: i64,
+) -> anyhow::Result<Option<bool>> {
     let Some(threads): Option<Vec<_>> = sources
         .iter()
         .map(|(target, _, _, _)| {
@@ -248,13 +267,17 @@ pub(crate) async fn close_calendar(
         })
         .collect()
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if threads.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
-    let now = c6_core::now_ms();
-    let moved: Option<bool> = sqlx::query_scalar(
+    let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let was_open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM requests WHERE id = ? AND status IN ('open', 'snoozed'))")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let closed = sqlx::query(
         "UPDATE requests SET status = 'done', closed_by = 'calendar', reason = ?2, until = NULL, updated_at = CASE WHEN status = 'done' THEN updated_at ELSE ?3 END \
          WHERE id = ?1 AND category = 'needs_you' AND invitation = 1 \
          AND (status IN ('open', 'snoozed') OR (status = 'done' AND closed_by = 'calendar')) \
@@ -264,8 +287,7 @@ pub(crate) async fn close_calendar(
              WHERE s.request_id = ?1 AND (s.seen_mail = '[]' OR s.seen_mail != (SELECT json_group_array(item_id) FROM \
                  (SELECT item_id FROM mail WHERE account = json_extract(t.value, '$[1]') AND thread_id = json_extract(t.value, '$[2]') \
                   AND sent = 0 AND draft = 0 AND trash = 0 ORDER BY item_id)))) \
-         AND EXISTS (SELECT 1 FROM events WHERE account = ?5 AND calendar_id = ?6 AND event_id = ?7 AND my_status = ?8 AND updated = ?9) \
-         RETURNING updated_at = ?3",
+         AND EXISTS (SELECT 1 FROM events WHERE account = ?5 AND calendar_id = ?6 AND event_id = ?7 AND my_status = ?8 AND updated = ?9)",
     )
     .bind(id)
     .bind(reason)
@@ -277,16 +299,11 @@ pub(crate) async fn close_calendar(
     .bind(&event.status)
     .bind(event.updated)
     .bind(serde_json::to_string(&threads)?)
-    .fetch_optional(&m.store.pool)
-    .await?;
-    if let Some(moved) = moved {
-        unpair(m, id).await?;
-        // A recheck of one Calendar closed before isn't news.
-        if moved {
-            changed(m, id, "done").await;
-        }
-    }
-    Ok(moved.is_some())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected() != 0;
+    tx.commit().await?;
+    Ok(closed.then_some(was_open))
 }
 
 async fn unpair(m: &Memex, id: i64) -> anyhow::Result<()> {
@@ -489,4 +506,44 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
         }
         other => anyhow::bail!("the memex has no method {other}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn calendar_rechecks_do_not_repeat_the_transition() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO requests (id, person, title, category, invitation, created_at, updated_at) \
+             VALUES (1, 'pat@example.net', 'RSVP', 'needs_you', 1, 0, 0); \
+             INSERT INTO mail (item_id, account, gmail_id, thread_id, date, blob) VALUES ('mail', 'a', 'm', 't', 1, ''); \
+             INSERT INTO request_sources (request_id, target, kind, at, noted_at, seen_mail) \
+             VALUES (1, 'thread:a:t', 'mail', 1, 1, '[\"mail\"]'); \
+             INSERT INTO events (account, calendar_id, event_id, status, start, end, my_status, updated) \
+             VALUES ('a', 'primary', 'invite', 'confirmed', 1, 2, 'accepted', 1)",
+        )
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+        let sources = vec![("thread:a:t".into(), 1, 1, r#"["mail"]"#.into())];
+        let event = CalendarAnswer {
+            account: "a".into(),
+            calendar: "primary".into(),
+            event: "invite".into(),
+            status: "accepted".into(),
+            updated: 1,
+        };
+        for status in ["open", "snoozed"] {
+            sqlx::query("UPDATE requests SET status = ?, updated_at = 0 WHERE id = 1").bind(status).execute(&m.store.pool).await.unwrap();
+            assert_eq!(calendar_transition(&m, 1, "You accepted it in Calendar.", &sources, &event, 10).await.unwrap(), Some(true));
+            assert_eq!(calendar_transition(&m, 1, "You accepted it in Calendar.", &sources, &event, 10).await.unwrap(), Some(false));
+            assert!(close_calendar(&m, 1, "You accepted it in Calendar.", &sources, &event).await.unwrap());
+            let updated: i64 = sqlx::query_scalar("SELECT updated_at FROM requests WHERE id = 1").fetch_one(&m.store.pool).await.unwrap();
+            assert_eq!(updated, 10);
+        }
+    }
 }
