@@ -28,8 +28,6 @@ const CARD_CONTEXT: usize = 700;
 const COMMITMENT_CONTEXT: usize = 1000;
 const RECENT_CONTEXT: usize = 1000;
 const VOICE_CONTEXT: usize = 1300;
-const OVERDUE_DAYS: i64 = 30;
-const UNDATED_DAYS: i64 = 90;
 const RECENT_DAYS: i64 = 180;
 const VOICE_DAYS: i64 = 365;
 const MAIL_WINDOW: i64 = 2000;
@@ -507,14 +505,11 @@ pub(crate) async fn context(m: &Memex, r: &api::Request) -> anyhow::Result<Strin
          ((sent = 1 OR lower(from_addr) IN (SELECT address FROM own)) AND \
          EXISTS (SELECT 1 FROM json_each(to_json) WHERE lower(json_extract(value, '$[0]')) = ?1))) \
          SELECT who, what, due FROM commitments c JOIN items i ON i.id = c.item_id WHERE c.status = 'open' \
-         AND ((due IS NOT NULL AND due >= ?3) OR (due IS NULL AND i.created_at >= ?4)) \
          AND (lower(who) = ?1 OR lower(who) IN ('me', 'the owner') OR lower(who) IN (SELECT address FROM own)) \
-         AND c.item_id IN (SELECT item_id FROM direct) ORDER BY due IS NULL, due, c.id LIMIT 10",
+         AND c.item_id IN (SELECT item_id FROM direct) ORDER BY due IS NULL, due, c.said_at DESC, c.id DESC LIMIT 10",
     )
     .bind(&person)
     .bind(json!(mine).to_string())
-    .bind(now - OVERDUE_DAYS * DAY)
-    .bind(now - UNDATED_DAYS * DAY)
     .fetch_all(&m.store.pool)
     .await?;
     let mut commitments = String::new();
@@ -1486,7 +1481,7 @@ mod tests {
                 at(0, 7, 0),
                 &recent,
             ),
-            ("host@example.net", "STALE COMMITMENT", Some(at(-1000, 12, 0)), at(-1001, 7, 0), &invitation),
+            ("host@example.net", "STALE COMMITMENT", Some(at(-1000, 12, 0)), at(-1001, 7, 0), &old),
             ("host@example.net", "OLD UNDATED COMMITMENT", None, at(-100, 7, 0), &old),
             ("host@example.net", "PERSON OWES THIRD PARTY", Some(at(1, 12, 0)), at(0, 7, 0), &copied),
             ("host@example.net", "PERSON ON OWNER CC MAIL", Some(at(1, 12, 0)), at(0, 7, 0), &owner_copied),
@@ -1494,7 +1489,7 @@ mod tests {
             ("third@example.test", "THIRD PARTY COMMITMENT", Some(at(1, 12, 0)), at(0, 7, 0), &copied),
             ("me@example.com", "OWNER COMMITMENT ON COPIED MAIL", Some(at(1, 12, 0)), at(0, 7, 0), &copied),
         ] {
-            sqlx::query("INSERT INTO commitments (item_id, who, what, due, made_by, created_at) VALUES (?, ?, ?, ?, 'test', ?)")
+            sqlx::query("INSERT INTO commitments (item_id, who, what, due, made_by, created_at, said_at) VALUES (?1, ?2, ?3, ?4, 'understand-test', ?5, (SELECT created_at FROM items WHERE id = ?1))")
                 .bind(item)
                 .bind(who)
                 .bind(what)
@@ -1504,6 +1499,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        crate::commitments::expire(&m, c6_core::now_ms()).await.unwrap();
         sqlx::query("INSERT INTO cards (key, name, card, threads, model, updated_at) VALUES ('person:host@example.net', 'Host', ?, 1, 'test', 0)")
             .bind(json!({"relationship": "Dinner friend\u{034f}", "story": "Plans at https://host.example.test/plans?auth_token=card-secret#details"}).to_string())
             .execute(&m.store.pool).await.unwrap();
@@ -2719,7 +2715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undated_commitments_use_the_source_date() {
+    async fn commitments_use_shared_expiry_and_keep_reopened_promises() {
         c6_llm::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let m = Memex::open(dir.path(), Default::default()).await.unwrap();
@@ -2729,6 +2725,9 @@ mod tests {
             ("old", 200, None, "Old undated promise"),
             ("recent", 10, None, "Recent undated promise"),
             ("dated", 200, Some(now + DAY), "Still due soon"),
+            ("manual", 200, None, "Old manual promise"),
+            ("reopened", 200, None, "Reopened old promise"),
+            ("reaffirmed", 10, Some(now - 100 * DAY), "Recently reaffirmed promise"),
         ] {
             let item = kept_mail(
                 &m,
@@ -2746,22 +2745,67 @@ mod tests {
             )
             .await;
             sqlx::query(
-                "INSERT INTO commitments (item_id, who, what, due, made_by, created_at) VALUES (?, 'host@example.net', ?, ?, 'test', ?)",
+                "INSERT INTO commitments (item_id, who, what, due, made_by, created_at, said_at) VALUES (?, 'host@example.net', ?, ?, ?, ?, ?)",
             )
             .bind(item)
             .bind(what)
             .bind(due)
+            .bind(if id == "manual" { "session:test" } else { "understand-test" })
             .bind(now)
+            .bind(now - days * DAY)
             .execute(&m.store.pool)
             .await
             .unwrap();
         }
+        crate::commitments::expire(&m, now).await.unwrap();
+        let reopened =
+            sqlx::query_scalar("SELECT id FROM commitments WHERE what = 'Reopened old promise'").fetch_one(&m.store.pool).await.unwrap();
+        crate::understand::set_commitment(&m, reopened, "open").await.unwrap();
         let r = api::Request { person: "host@example.net".into(), ..Default::default() };
         let text = context(&m, &r).await.unwrap();
         let open = text.split_once("## Open between you\n").unwrap().1.split("\n## ").next().unwrap();
         assert!(open.contains("Recent undated promise"), "{open}");
         assert!(open.contains("Still due soon"), "{open}");
+        for what in ["Old manual promise", "Reopened old promise", "Recently reaffirmed promise"] {
+            assert!(open.contains(what), "{open}");
+        }
         assert!(!open.contains("Old undated promise"), "{open}");
+    }
+
+    #[tokio::test]
+    async fn open_commitments_take_the_ten_most_recently_said() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        m.accounts.lock().unwrap().push(crate::people::Account { email: "me@example.com".into(), ..Default::default() });
+        let now = c6_core::now_ms();
+        // Neither id order matches when the promises were made.
+        for days in [5, 10, 0, 8, 2, 7, 4, 9, 1, 6, 3] {
+            let id = format!("plans-{days}");
+            let at = now - days * DAY;
+            let item = kept_mail(
+                &m,
+                &id,
+                &id,
+                at,
+                Parsed {
+                    from: ("host@example.net".into(), "Host".into()),
+                    to: vec![("me@example.com".into(), "Me".into())],
+                    subject: "Plans".into(),
+                    text: "Here are the figures we discussed.".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await;
+            sqlx::query("INSERT INTO commitments (item_id, who, what, made_by, created_at, said_at) VALUES (?, 'host@example.net', ?, 'understand-test', ?, ?)")
+                .bind(item).bind(format!("Promise {days:02}")).bind(now).bind(at)
+                .execute(&m.store.pool).await.unwrap();
+        }
+        let text = context(&m, &api::Request { person: "host@example.net".into(), ..Default::default() }).await.unwrap();
+        let open = text.split_once("## Open between you\n").unwrap().1.split("\n## ").next().unwrap();
+        let promises: Vec<_> = open.lines().map(|line| line.split_once("Promise ").unwrap().1).collect();
+        assert_eq!(promises, ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09"]);
     }
 
     #[test]

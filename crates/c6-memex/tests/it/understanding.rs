@@ -67,7 +67,8 @@ async fn understanding_review_graph() {
 
     // Three items; the paper is the newest, the document the oldest.
     let day = 86_400_000;
-    let base = 1_700_000_000_000;
+    let base = c6_core::now_ms() - 14 * day;
+    let due = (chrono::Utc::now() + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
     m.store
         .put(&item("document", "d1", "Old notes on queues", "Notes about message queues and backpressure.", base, &[]), "test")
         .await
@@ -113,7 +114,7 @@ async fn understanding_review_graph() {
     mock.push(Reply::Text(format!(
         "Here you go:\n```json\n{}\n```",
         json!({"summary": "Fixed the flaky deploy step.", "topics": ["CI/CD", "Backpressure"],
-               "commitments": [{"who": "me", "what": "Rotate the CI token", "due": "2023-11-17"}]})
+               "commitments": [{"who": "me", "what": "Rotate the CI token", "due": due}]})
     )));
     // Two calls a day: the document waits for tomorrow.
     let put = http
@@ -179,6 +180,7 @@ async fn understanding_review_graph() {
         ("me", "Rotate the CI token", "Fix the deploy pipeline")
     );
     assert!(open[0].due.is_some());
+    assert_eq!(open[0].said_at, base + day);
     rpc("memex.commitment", json!({"id": open[0].id, "status": "done"})).await;
     assert!(rpc("memex.commitments", json!({})).await.as_array().unwrap().is_empty());
     assert_eq!(rpc("memex.commitments", json!({"status": "done"})).await.as_array().unwrap().len(), 1);
@@ -267,6 +269,9 @@ async fn understanding_review_graph() {
     .await;
     assert_eq!((c[0].who.as_str(), c[0].what.as_str(), c[0].due), ("bob@x.com", "Send the Q3 numbers", None));
     let asked = mock.requests().last().unwrap().to_string();
+    let last_date = chrono::DateTime::from_timestamp_millis(base + 11 * day).unwrap().format("%Y-%m-%d").to_string();
+    assert!(asked.contains(&format!("Its last message is dated {last_date}")), "{asked}");
+    assert!(asked.contains("today is "), "{asked}");
     assert!(asked.contains("Can you send the Q3 numbers?") && asked.contains("by Monday"), "both messages: {asked}");
     // Recorded as read once its findings are in.
     let target: String = eventually("the thread recorded as read", async || {

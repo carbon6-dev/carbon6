@@ -112,7 +112,7 @@ pub const DEFAULTS: &[Prompt] = &[
     },
     Prompt {
         name: "memex.understand.thread",
-        description: "How to read an email thread. Placeholder: {{owner}} (your addresses).",
+        description: "How to read an email thread. Placeholders: {{owner}} (your addresses), {{last}} (last message date), {{today}} (today), dates as YYYY-MM-DD.",
         default: text::UNDERSTAND_THREAD,
     },
     Prompt { name: "memex.understand.paper", description: "How to read a research paper.", default: text::UNDERSTAND_PAPER },
