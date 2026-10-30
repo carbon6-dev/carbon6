@@ -47,8 +47,10 @@ async fn claude_code_delegates_to_carbon6_subagents() {
         return;
     }
     let bins = tempfile::tempdir().unwrap();
+    let claude = fake_claude(bins.path());
     // SAFETY: this binary has one test; nothing else reads the variable.
-    unsafe { std::env::set_var("C6_CLAUDE_BIN", fake_claude(bins.path())) };
+    unsafe { std::env::set_var("C6_CLAUDE_BIN", &claude) };
+    c6_testkit::runnable(&claude, &["--version"]).await;
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let cfg = HeadConfig {
@@ -75,13 +77,20 @@ async fn claude_code_delegates_to_carbon6_subagents() {
         async |body: Value| -> Value { http.post(format!("{api}/connections")).json(&body).send().await.unwrap().json().await.unwrap() };
     let cc = add(json!({"kind": "claude_code", "name": "cc", "base_url": ""})).await;
     let api_conn = add(json!({"name": "api", "base_url": mock.base_url(), "default_model": "m2"})).await;
+    let r = http
+        .put(format!("{api}/settings/routes"))
+        .json(&json!([{"name": "cc with limited carbon6 tools", "connection": "cc", "model": "opus", "tools": ["Read"]}]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
     mock.push(Reply::Text("api says hi".into()));
 
     let project = tempfile::tempdir().unwrap();
     let s: Value = http
         .post(format!("{api}/sessions"))
         .json(&json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": project.path().display().to_string(),
-            "connection_id": cc["id"], "model": "opus", "prompt": "delegate"}))
+            "connection_id": cc["id"], "prompt": "delegate"}))
         .send()
         .await
         .unwrap()
@@ -111,6 +120,8 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0]["model"], "m2");
+    let names: Vec<&str> = reqs[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["read"], "carbon6 subagents inherit a Claude Code parent's list");
     assert!(!reqs[0].to_string().contains("Claude Code's own system prompt"), "a carbon6 prompt of its own");
     let children: Vec<Session> = http.get(format!("{api}/sessions/{id}/children")).send().await.unwrap().json().await.unwrap();
     assert_eq!(children.len(), 1);
@@ -118,6 +129,25 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     assert!(!child.observed, "carbon6's own, not mirrored");
     assert_eq!(child.parent_call_id.as_deref(), Some("toolu_m1"));
     assert_eq!((child.connection_id.as_str(), child.model.as_str()), (api_conn["id"].as_str().unwrap(), "m2"));
+
+    // Handing the parent to carbon6 applies the same saved list.
+    mock.push(Reply::Text("handed over".into()));
+    let r = http
+        .post(format!("{api}/sessions/{id}/messages"))
+        .json(&json!({"text": "continue", "connection_id": api_conn["id"], "model": "m2"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    eventually("the hand-over turn to end", async || {
+        let events: Vec<c6_api::Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+        (events.iter().filter(|e| matches!(e.kind, c6_api::EventKind::TurnEnded { .. })).count() == 2).then_some(())
+    })
+    .await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let names: Vec<&str> = requests[1]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["read"]);
     stop.cancel();
     head.shutdown().await.unwrap();
 }

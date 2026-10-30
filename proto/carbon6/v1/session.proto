@@ -211,6 +211,9 @@ message SessionStarted {
   // the tree (the top-level session is 0).
   string agent = 17;
   uint32 depth = 18;
+  // The provider's own web search isn't offered: a tool list leaves out
+  // web_search. False for older records, which keep hosted search.
+  bool hosted_search_off = 19;
 }
 
 message UserMessage {
@@ -536,6 +539,8 @@ message CreateSession {
   // c6_api::SubagentConnection): those the session's realm may use,
   // without Claude Code (a subagent runs in carbon6's own loop).
   string subagent_connections_json = 27;
+  // Only these tools, in any profile's naming; empty: all tools.
+  repeated string tools = 28;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

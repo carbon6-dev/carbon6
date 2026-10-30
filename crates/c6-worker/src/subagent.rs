@@ -177,16 +177,37 @@ struct AgentJson {
 
 /// The tools a subagent has, of its parent's: those its named agent
 /// allows, and none that start or continue subagents at the depth limit.
-fn filter_tools(spec: &CreateSession, tools: Vec<Arc<dyn Tool>>, agent: Option<&AgentDef>, depth: u32) -> Vec<Arc<dyn Tool>> {
+fn filter_tools(
+    spec: &CreateSession,
+    tools: Vec<Arc<dyn Tool>>,
+    parent: Option<(&[Arc<dyn Tool>], bool)>,
+    agent: Option<&AgentDef>,
+    depth: u32,
+) -> Vec<Arc<dyn Tool>> {
     tools
         .into_iter()
         .filter(|t| {
             let name = t.spec().name;
             let delegates = Task::is_task(&name) || SendMessage::is_send(&name);
             // What a subagent finds goes back to its parent, not into task cards.
-            !(delegates && !may_delegate(spec, depth)) && !c6_tools::knowledge::is_task_card(&name) && agent.is_none_or(|a| a.allows(&name))
+            !(delegates && !may_delegate(spec, depth))
+                && !c6_tools::knowledge::is_task_card(&name)
+                && agent.is_none_or(|a| a.allows(&name))
+                && parent.is_none_or(|(tools, search)| {
+                    tools.iter().any(|t| c6_tools::tool_allowed(&[t.spec().name], &name))
+                        || (search && c6_tools::tool_allowed(&["web_search".into()], &name))
+                })
         })
         .collect()
+}
+
+/// A provider's hosted search is subject to the same lists as other tools.
+fn web_search_allowed(spec: &CreateSession, started: &SessionStarted, agent: Option<&AgentDef>) -> bool {
+    let parent_agent = spec.delegation.as_ref().and_then(|d| serde_json::from_str::<AgentJson>(&d.agent_json).ok());
+    !started.hosted_search_off
+        && c6_tools::tool_allowed(&spec.tools, "web_search")
+        && parent_agent.is_none_or(|a| c6_tools::tool_allowed(&a.tools, "web_search"))
+        && agent.is_none_or(|a| a.allows("web_search"))
 }
 
 #[async_trait]
@@ -235,17 +256,21 @@ impl Subagents for Runner {
             ..p.spec.clone()
         };
         let claude_code_parent = p.started.tool_profile == crate::claude_code::PROFILE;
+        let search_allowed = web_search_allowed(&p.spec, &p.started, agent);
         // The parent's tools where its model takes the same profile; else
         // (another model family, or a Claude Code parent, whose tools
         // carbon6 does not run) tools of its own in its model's profile.
         let (tools, skills) = if p.started.tool_profile == profile.as_str() {
-            (filter_tools(&p.spec, self.tools.clone(), agent, depth), None)
+            (filter_tools(&p.spec, self.tools.clone(), None, agent, depth), None)
         } else {
             let built = p.manager.session_tool_set(&child_id, &spec, &p.started, profile).await;
             for e in &built.errors {
                 tracing::warn!(child = %child_id, "subagent setup: {e}");
             }
-            (filter_tools(&p.spec, built.tools, agent, depth), Some(built.skills))
+            // A named parent may already have narrowed its tools.
+            // Changing profiles must not give its descendants those tools back.
+            let parent = (!claude_code_parent).then_some((self.tools.as_slice(), search_allowed));
+            (filter_tools(&p.spec, built.tools, parent, agent, depth), Some(built.skills))
         };
         let mut system_prompt = match &skills {
             None => crate::session::without_task_cards(&p.started.system_prompt),
@@ -263,7 +288,7 @@ impl Subagents for Runner {
                     );
                     let date = time::OffsetDateTime::now_utc().date().to_string();
                     let mut prompt = c6_agent::build_system_prompt(&p.spec.base_prompt, std::path::Path::new(&p.started.cwd), &date);
-                    prompt.push_str(&crate::session::context_sections(&spec, &labels));
+                    prompt.push_str(&crate::session::context_sections(&spec, &labels, &tools));
                     prompt
                 } else {
                     crate::session::without_skills(&crate::session::without_task_cards(&p.started.system_prompt))
@@ -284,6 +309,7 @@ impl Subagents for Runner {
                 time::OffsetDateTime::now_utc().date()
             );
         }
+        system_prompt = crate::session::prompt_for_tools(&spec, &system_prompt, &tools, profile);
         let started = SessionStarted {
             title: match agent {
                 Some(a) => format!("{description} ({})", a.name),
@@ -292,6 +318,7 @@ impl Subagents for Runner {
             parent_session_id: p.session_id.clone(),
             parent_call_id: parent_call_id.to_owned(),
             tools: tools.iter().map(|t| t.spec().name).collect(),
+            hosted_search_off: !search_allowed,
             system_prompt,
             model: Some(model_spec.clone()),
             tool_profile: profile.as_str().to_owned(),
@@ -654,6 +681,62 @@ mod tests {
 
     fn choice(connection: &str, model: &str, effort: &str) -> ModelChoice {
         ModelChoice { connection: connection.into(), model: model.into(), effort: effort.into() }
+    }
+
+    #[test]
+    fn hosted_search_respects_parent_and_named_agent_tools() {
+        let mut parent = CreateSession::default();
+        let mut started = SessionStarted { tools: vec!["Read".into(), "Task".into()], ..Default::default() };
+        let mut agent = AgentDef {
+            name: "finder".into(),
+            description: String::new(),
+            model: String::new(),
+            prompt: String::new(),
+            tools: vec!["Read".into(), "Task".into()],
+        };
+        for kind in ["openai_compat", "anthropic", "openai", "claude_code"] {
+            parent.model = Some(spec("c1", kind, "m", ""));
+            assert!(web_search_allowed(&parent, &started, None), "permission does not depend on the parent's provider or search tools");
+            assert!(!web_search_allowed(&parent, &started, Some(&agent)));
+        }
+        for name in ["web_search", "WebSearch"] {
+            agent.tools = vec![name.into()];
+            assert!(web_search_allowed(&parent, &started, Some(&agent)));
+        }
+        parent.tools = vec!["Read".into()];
+        assert!(!web_search_allowed(&parent, &started, Some(&agent)));
+        parent.tools.clear();
+        parent.delegation = Some(Delegation {
+            agent_json: serde_json::to_string(&AgentJson { name: "finder".into(), tools: vec!["Read".into(), "Task".into()] }).unwrap(),
+            ..Default::default()
+        });
+        assert!(!web_search_allowed(&parent, &started, None), "an older named parent's list still applies");
+        parent.delegation = None;
+        started.hosted_search_off = true;
+        assert!(!web_search_allowed(&parent, &started, None), "an unnamed child inherits the denial");
+    }
+
+    #[tokio::test]
+    async fn parent_hosted_search_allows_a_childs_external_search_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = CreateSession {
+            model: Some(spec("native", "anthropic", "claude-sonnet-5-5", "")),
+            web_search_json: r#"{"provider":"brave","always":false}"#.into(),
+            ..Default::default()
+        };
+        let built = crate::session::build_tools(&parent, dir.path(), ToolProfile::Claude, &[], &[]).await;
+        assert!(!crate::session::has_tool(&built.tools, "web_search"));
+        let child = CreateSession { model: Some(spec("chat", "openai_compat", "m", "")), ..parent.clone() };
+        let child_tools = crate::session::build_tools(&child, dir.path(), ToolProfile::Generic, &[], &[]).await.tools;
+        assert!(crate::session::has_tool(&child_tools, "web_search"));
+        let started = SessionStarted::default();
+        let allowed = web_search_allowed(&parent, &started, None);
+        let filtered = filter_tools(&child, child_tools.clone(), Some((&built.tools, allowed)), None, 1);
+        assert!(crate::session::has_tool(&filtered, "web_search"));
+        let filtered = filter_tools(&child, child_tools.clone(), Some((&built.tools, false)), None, 1);
+        assert!(!crate::session::has_tool(&filtered, "web_search"));
+        let filtered = filter_tools(&child, child_tools.clone(), Some((&child_tools, false)), None, 1);
+        assert!(crate::session::has_tool(&filtered, "web_search"), "a parent's function search also passes the cap");
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         return Err(bad_request(format!("{} is not available to realm {realm}", worker.name)));
     }
     let cwd = req.cwd.trim().to_owned();
-    let (connection_id, model, subagent_model, subagent_connection_id, subagent_effort) = {
+    let (connection_id, model, subagent_model, subagent_connection_id, subagent_effort, tools) = {
         let mut route_labels = labels.clone();
         route_labels.extend(api::labels::auto_labels(&worker.name, "", if cwd.starts_with('/') { &cwd } else { "" }, "", "", &ssh));
         if let Some(why) = crate::usage::blocked(st, &route_labels, &realm).await? {
@@ -126,7 +126,7 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         if effort.is_none() {
             effort = check_effort(Some(routed.effort))?;
         }
-        (routed.connection, routed.model, routed.subagent_model, routed.subagent_connection, routed.subagent_effort)
+        (routed.connection, routed.model, routed.subagent_model, routed.subagent_connection, routed.subagent_effort, routed.tools)
     };
     if let Some(c) = st.store.connection(&connection_id).await? {
         if !crate::realms::available(&c.realms, &realm) {
@@ -168,6 +168,7 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         subagent_model,
         subagent_connection_id,
         subagent_effort,
+        tools: serde_json::to_string(&tools)?,
         realm,
         agent: String::new(),
         end_reason: String::new(),
@@ -243,6 +244,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         subagent_model: String::new(),
         subagent_connection_id: String::new(),
         subagent_effort: String::new(),
+        tools: "[]".into(),
         realm: realm.clone(),
         agent: String::new(),
         end_reason: String::new(),
@@ -314,6 +316,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         subagent_model: parent.subagent_model.clone(),
         subagent_connection_id: parent.subagent_connection_id.clone(),
         subagent_effort: parent.subagent_effort.clone(),
+        tools: parent.tools.clone(),
         // A side chat is in its parent's realm.
         realm: parent.realm.clone(),
         agent: String::new(),
@@ -396,6 +399,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         memories_json: crate::memory::for_sessions_of(st, &row.realm, &row.instance).await?,
         policies_json: with_builtin_policies(st, st.store.setting_in(POLICIES, &row.realm, &row.instance).await?.unwrap_or_default()).await,
         subagent_model: row.subagent_model.clone(),
+        tools: serde_json::from_str(&row.tools)?,
         subagent_target: subagent_target(row, &connections),
         subagent_connections_json: serde_json::to_string(&subagent_connections)?,
         memex_brief: String::new(),
@@ -986,6 +990,7 @@ struct Routed {
     /// The subagents' connection (an id; empty: the session's) and effort.
     subagent_connection: String,
     subagent_effort: String,
+    tools: Vec<String>,
 }
 
 /// Fills in what a new session left out. A model given: as is (on the
@@ -1051,6 +1056,7 @@ async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String],
             subagent_model: r.subagent_model.trim().to_owned(),
             subagent_connection,
             subagent_effort: r.subagent_effort.trim().to_owned(),
+            tools: r.tools,
         });
     }
     let connection = match (connection, st.store.latest_model("").await?) {
@@ -1071,6 +1077,10 @@ async fn route(st: &HeadState, connection: &str, model: &str, labels: &[String],
 /// Checks routing rules before they are saved.
 pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Result<()> {
     let connections = st.store.connections().await?;
+    let valid_tools: Vec<String> = [c6_llm::ToolProfile::Generic, c6_llm::ToolProfile::Claude, c6_llm::ToolProfile::Codex]
+        .into_iter()
+        .flat_map(c6_worker::session::builtin_tool_names)
+        .collect();
     for r in routes {
         if r.name.trim().is_empty() {
             return Err(bad_request("a routing rule needs a name"));
@@ -1108,6 +1118,16 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
             }
         }
         check_effort(Some(r.subagent_effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: subagent {e}", r.name)))?;
+        for tool in &r.tools {
+            if !c6_tools::tool_allowed(&valid_tools, tool) && !c6_tools::is_mcp_tool_name(tool) {
+                let names = c6_worker::session::builtin_tool_names(c6_llm::ToolProfile::Generic);
+                return Err(bad_request(format!(
+                    "routing rule {:?}: unknown tool {tool:?}; valid tools: {} (names in other profiles also accepted), or mcp__<server>__<tool>",
+                    r.name,
+                    names.join(", ")
+                )));
+            }
+        }
         check_selector(&r.applies_to)?;
     }
     Ok(())

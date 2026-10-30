@@ -3075,6 +3075,9 @@ pub struct Route {
     /// session's, on its own connection).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subagent_effort: String,
+    /// The tools sessions this rule picks get; empty: all tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
 }

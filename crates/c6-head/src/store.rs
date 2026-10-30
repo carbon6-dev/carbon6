@@ -477,6 +477,8 @@ pub struct SessionRow {
     /// session's) and their effort.
     pub subagent_connection_id: String,
     pub subagent_effort: String,
+    /// Tools from the routing rule, as a JSON array; `[]`: all tools.
+    pub tools: String,
     /// The realm it runs in (docs/os.md §3).
     pub realm: String,
     /// Subagents: the named agent; empty for a general-purpose one.
@@ -561,8 +563,8 @@ impl Store {
         };
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour, subagent_connection_id, subagent_effort) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour, subagent_connection_id, subagent_effort, tools) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -586,6 +588,7 @@ impl Store {
         .bind(&colour)
         .bind(&s.subagent_connection_id)
         .bind(&s.subagent_effort)
+        .bind(&s.tools)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -1115,7 +1118,7 @@ async fn create_subagent_session(
         return Ok(false);
     }
     let parent = sqlx::query(
-        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, instance, colour, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
+        "SELECT connection_id, model, effort, labels, worker_name, ssh_target, realm, instance, colour, tools, COALESCE(root_id, id) AS root FROM sessions WHERE id = ? AND worker_id = ?",
     )
     .bind(&s.parent_session_id)
     .bind(worker_id.to_string())
@@ -1134,7 +1137,7 @@ async fn create_subagent_session(
     };
     sqlx::query(
         "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, parent_call_id, \
-         labels, worker_name, ssh_target, realm, agent, root_id, observed, instance, colour) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         labels, worker_name, ssh_target, realm, agent, root_id, observed, instance, colour, tools) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(worker_id.to_string())
@@ -1160,6 +1163,7 @@ async fn create_subagent_session(
     .bind(parent.get::<String, _>("instance"))
     // And has its colour.
     .bind(parent.get::<String, _>("colour"))
+    .bind(parent.get::<String, _>("tools"))
     .execute(&mut *tx)
     .await?;
     Ok(true)

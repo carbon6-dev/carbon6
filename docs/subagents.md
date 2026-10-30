@@ -171,6 +171,7 @@ This comes from `history_from_events`. A tool call that was cut off gets its rep
   - Every level gets the root's tool hooks (not Stop), secrets, publisher, memory and notice sinks, as `subagent::Parent` does now.
   - Every level stays in the root's realm and keeps its labels.
   - The routing rule's `subagent_model` applies at every depth (a named agent's model still wins).
+  - The routing rule's `tools` list applies at every depth. A named agent's own list narrows it further; changing model profiles does not widen it.
 - **Who talks to whom:**
   - Reports and notices go up one level.
   - `SendMessage` goes down one level.
@@ -300,7 +301,31 @@ The head sends each session the connections its realm may use (`CreateSession.su
 
 ### Tools and prompt
 
-Where the subagent's model takes the parent's tool profile, it shares the parent's tools as before. Otherwise (a GPT subagent under a Claude parent, or any subagent of a Claude Code session) it gets tools of its own in its model's profile, with the same filters: the named agent's tools, the depth limit, no task cards. Its system prompt is the parent's with the skills index renamed for the profile. Under Claude Code, whose prompt is its own, it gets the prompt a carbon6 session would have. `SessionStarted.tool_profile`, `tools` and `context_window` are the subagent's own, so a reload rebuilds the same set.
+Where the subagent's model takes the parent's tool profile, it shares the parent's tools as before. Otherwise (a GPT subagent under a Claude parent, or any subagent of a Claude Code session) it gets tools of its own in its model's profile, with the inherited routing rule's tool list, then the same filters: the named agent's tools, the depth limit, no task cards. Its system prompt is the parent's with the skills index renamed for the profile, shown only if the skill loader is present. Under Claude Code, whose prompt is its own, it gets the prompt a carbon6 session would have. `SessionStarted.tool_profile`, `tools` and `context_window` are the subagent's own, so a reload rebuilds the same set.
+
+### Tool lists from routing rules
+
+**Settings → Model routing (Routes)** has a **Tools** field: comma-separated names; empty means all tools. The API (`settings.routes.put`, `PUT /api/v1/settings/routes`) uses a JSON array. For example, a rule for a local mail session could include:
+
+```json
+{
+  "name": "Mail locally",
+  "applies_to": ["mail"],
+  "connection": "ollama",
+  "model": "qwen3.6:27b",
+  "tools": ["mail_threads", "mail_thread", "memex_search", "memex_get", "remember"]
+}
+```
+
+The first enabled matching rule supplies the list when it picks a new session's model. Starting with an explicit model bypasses routing, including its tools. Only the listed tools' definitions are sent to the model; a deny policy still sends the definition and refuses calls, so it does not save that prompt space. An unavailable conditional tool (such as mail without mail access) stays unavailable even when listed. A nonempty list with no available tools gives the model no tools.
+
+Names use the same matching as named agents, across profiles: `read`/`Read`/`read_file`, `bash`/`Bash`/`shell`, `edit`/`Edit`/`apply_patch`/`MultiEdit`, `update_plan`/`TodoWrite`, `load_skill`/`skill`/`Skill`, and snake_case/PascalCase pairs such as `memex_search`/`MemexSearch`. Saving rejects unknown built-in names and lists the valid names. Optional tools (memex, mail, calendar, chat, skills, web search and browser) are valid even before their services are available. MCP tools use their full, case-sensitive `mcp__<server>__<tool>` name. They are discovered at runtime, so saving checks only the shape: nonempty server and tool parts, with ASCII letters, digits, `_` and `-`; it does not require a configured server.
+
+A session keeps its starting list, like its hooks, MCP servers and skills. Editing a rule affects new sessions; resuming or restarting a worker keeps the saved list. Side chats inherit their parent's list, and carbon6 subagents inherit it in every model profile. A named agent's list can only narrow it. Leave `task`/`Task` in the list to allow carbon6 sessions to start subagents.
+
+The assistant runs in the head with its own tools and is unaffected. Claude Code connections bring their own tools and prompt, also unaffected. A Claude Code parent's carbon6 subagents inherit the saved list, and a hand-over to carbon6's loop applies it.
+
+With a list, the stock base-prompt sentences about file and shell tools are omitted when the required tools are removed. Memory notes remain, with `remember` and `forget` instructions only for the available tools. The secrets section needs a shell tool or browser; the skills index needs the skill loader; task-card guidance needs both `task_propose` and `task_withdraw`. The stock tool instructions in memex briefs and side-chat notes are also omitted when their tools are removed. Without a list, or with those tools retained, the prompt bytes stay the same. The editable `session.base` is not rewritten: assembly removes only the exact stock tool sentences. Keep any custom tool instructions consistent with your lists.
 
 ### Records
 
