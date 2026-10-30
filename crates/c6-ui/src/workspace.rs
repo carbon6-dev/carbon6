@@ -1083,7 +1083,7 @@ pub fn Go(
 /// With `follow`, it keeps to the end as its content grows, while shown
 /// again after being hidden, and as content renders late, until you
 /// scroll away from the end yourself (wheel, touch, the scroll bar or
-/// keys); back at the end, it follows again.
+/// keys); back at the very end, it follows again.
 #[component]
 pub fn ScrollBox(
     #[prop(optional)] node_ref: Option<NodeRef<Div>>,
@@ -1146,7 +1146,17 @@ pub fn ScrollBox(
     let yours = move || by_you.set_value(true);
     view! {
         <div node_ref=node class=format!("min-h-0 flex-1 overflow-y-auto {class}")
-            on:wheel=move |ev: web_sys::WheelEvent| if ev.delta_y() < 0.0 { yours() }
+            // Up: stop following now, not when the scroll event says so: a small
+            // roll stays within `at_end`'s reach, and content arriving first
+            // would take you back down.
+            on:wheel=move |ev: web_sys::WheelEvent| if ev.delta_y() < 0.0 {
+                yours();
+                if let (Some(f), Some(el)) = (follow, node.get_untracked())
+                    && el.scroll_height() > el.client_height()
+                {
+                    f.set(false);
+                }
+            }
             on:touchstart=move |_| yours()
             on:keydown=move |ev: web_sys::KeyboardEvent| if matches!(ev.key().as_str(), "ArrowUp" | "PageUp" | "Home" | " ") { yours() }
             // The scroll bar: a press on the box itself, not its content.
@@ -1168,11 +1178,16 @@ pub fn ScrollBox(
                 c.scroll.set_value((el.scroll_top(), end));
             }
             if let Some(f) = follow {
-                if end {
+                if by_you.get_value() {
+                    // You moved it: it follows again only once you are back at the
+                    // very end, not merely near it (a small step up is still near).
+                    let back = el.scroll_height() - el.scroll_top() - el.client_height() < 4;
+                    f.set(back);
+                    if back {
+                        by_you.set_value(false);
+                    }
+                } else if end {
                     f.set(true);
-                    by_you.set_value(false);
-                } else if by_you.get_value() {
-                    f.set(false);
                 }
             }
             if let Some(f) = on_scroll {
