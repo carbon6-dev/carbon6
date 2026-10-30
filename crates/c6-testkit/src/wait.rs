@@ -28,6 +28,21 @@ pub async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) ->
     }
 }
 
+/// As `eventually`, and if it never happens, the panic adds `context()`
+/// (say, what a mock model was asked), so the failure shows why.
+pub async fn eventually_or<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>, context: impl Fn() -> String) -> T {
+    let end = tokio::time::Instant::now() + deadline();
+    loop {
+        if let Some(v) = f().await {
+            return v;
+        }
+        if tokio::time::Instant::now() >= end {
+            panic!("still waiting for {what} after {:?}: it never happened\n{}", deadline(), context());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Awaits `fut`. Panics, naming `what`, only if it never finishes (a hang).
 pub async fn within<F: Future>(what: &str, fut: F) -> F::Output {
     match tokio::time::timeout(deadline(), fut).await {

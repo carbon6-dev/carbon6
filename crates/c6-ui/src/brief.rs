@@ -299,7 +299,7 @@ pub fn BriefPage() -> impl IntoView {
                         let why = if s["model"] != true {
                             "No understanding model is chosen, so only what rules settle (lists, notifications, known pitches) is sorted. Choose one in Settings → Memex."
                         } else if s["budget_left"].as_u64() == Some(0) && waiting > 0 {
-                            "Today's model calls are used up, so new mail and chat wait until tomorrow. Raise calls per day in Settings → Memex."
+                            "The day's model calls are used up (a day is 24 hours from its first call), so new mail and chat wait for the next. Raise calls per day in Settings → Memex."
                         } else {
                             return None;
                         };

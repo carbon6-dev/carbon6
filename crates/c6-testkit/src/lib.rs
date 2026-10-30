@@ -2,7 +2,7 @@
 //! conditions (docs/testing.md).
 
 pub mod wait;
-pub use wait::{eventually, have, need, port, runnable, within};
+pub use wait::{eventually, eventually_or, have, need, port, runnable, within};
 
 /// Raise this test process's soft open-file limit, if possible, before its
 /// parallel tests start. This is only for test harness startup hooks.
@@ -64,6 +64,8 @@ struct Step {
 struct Inner {
     script: Mutex<VecDeque<Step>>,
     requests: Mutex<Vec<Value>>,
+    /// Each request as it was answered, one line: for a test's failure.
+    log: Mutex<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -126,6 +128,13 @@ impl MockLlm {
     pub fn requests(&self) -> Vec<Value> {
         self.inner.requests.lock().unwrap().clone()
     }
+
+    /// What each request asked (its model and the start of its last
+    /// message) and how it was answered, one per line: for a test to show
+    /// when a wait for a model's answer fails.
+    pub fn log(&self) -> String {
+        self.inner.log.lock().unwrap().join("\n")
+    }
 }
 
 /// A transcript (whatever the audio), with timestamps.
@@ -162,12 +171,25 @@ async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
 
 async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -> Response {
     let messages = body["messages"].to_string();
+    let asked: String = {
+        let last = body["messages"].as_array().and_then(|m| m.last()).map(|m| m["content"].to_string()).unwrap_or_default();
+        format!("{} {}", body["model"].as_str().unwrap_or("?"), last.chars().take(160).collect::<String>())
+    };
     inner.requests.lock().unwrap().push(body);
     let step = {
         let mut script = inner.script.lock().unwrap();
         let at = script.iter().position(|s| s.about.iter().all(|a| messages.contains(a.as_str())));
         at.and_then(|i| script.remove(i))
     };
+    let answered = match &step {
+        Some(s) => format!("{:?}", s.reply).chars().take(120).collect(),
+        None => "script exhausted (500)".to_owned(),
+    };
+    {
+        let mut log = inner.log.lock().unwrap();
+        let n = log.len() + 1;
+        log.push(format!("{n}. {asked}\n   -> {answered}"));
+    }
     let Some(step) = step else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock script exhausted").into_response();
     };

@@ -3738,7 +3738,8 @@ pub struct MemexStatus {
     /// Items and threads the understanding model has read (this version).
     #[serde(default)]
     pub understood: u64,
-    /// Model calls today, and the day's budget.
+    /// Model calls in the current day (24 hours from its first call), and
+    /// the day's budget.
     #[serde(default)]
     pub calls_today: u64,
     #[serde(default)]

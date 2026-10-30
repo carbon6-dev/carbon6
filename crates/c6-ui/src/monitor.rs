@@ -141,7 +141,7 @@ pub fn ActivityPage() -> impl IntoView {
                     let st = &m["status"];
                     let mut lines = Vec::new();
                     if let (Some(n), Some(per)) = (st["calls_today"].as_u64(), st["calls_per_day"].as_u64()) {
-                        lines.push(format!("Model calls today: {n} of {per}"));
+                        lines.push(format!("Model calls in the last day: {n} of {per}"));
                     }
                     if let Some(n) = st["extracting"].as_u64().filter(|n| *n > 0) {
                         lines.push(format!("{n} files waiting to be read"));
@@ -155,7 +155,7 @@ pub fn ActivityPage() -> impl IntoView {
                         let why = if v["model"] != true {
                             " (no understanding model chosen)"
                         } else if v["budget_left"].as_u64() == Some(0) {
-                            " (today's model calls are used up)"
+                            " (the day's model calls are used up)"
                         } else {
                             ""
                         };

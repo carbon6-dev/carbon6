@@ -69,12 +69,32 @@ async fn next(m: &Memex, version: &str) -> anyhow::Result<Option<(String, String
     Ok(item.map(|r| (format!("item:{}", r.get::<String, _>("id")), r.get::<String, _>("kind"), vec![r.get("id")])))
 }
 
-/// Calls left today.
+/// How long the budget's day lasts. A day starts with its first call and
+/// lasts 24 hours (not to a midnight: a run, or a test, never sees the
+/// count reset under it). Its row in `model_calls` is `p:<start ms>`.
+const BUDGET_DAY: i64 = 24 * 3600 * 1000;
+
+/// The current day's row, if one began less than 24 hours ago.
+async fn budget_day(m: &Memex) -> anyhow::Result<Option<String>> {
+    let latest: Option<String> =
+        sqlx::query_scalar("SELECT day FROM model_calls WHERE day LIKE 'p:%' ORDER BY CAST(substr(day, 3) AS INTEGER) DESC LIMIT 1")
+            .fetch_optional(&m.store.pool)
+            .await?;
+    let now = c6_core::now_ms();
+    Ok(latest.filter(|k| k[2..].parse::<i64>().is_ok_and(|start| now - start < BUDGET_DAY)))
+}
+
+/// Calls made in the current day.
+async fn calls_used(m: &Memex) -> anyhow::Result<i64> {
+    Ok(match budget_day(m).await? {
+        Some(day) => sqlx::query_scalar("SELECT calls FROM model_calls WHERE day = ?").bind(day).fetch_one(&m.store.pool).await?,
+        None => 0,
+    })
+}
+
+/// Calls left in the current day (24 hours from its first call).
 pub(crate) async fn budget_left(m: &Memex, per_day: u32) -> anyhow::Result<u32> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let used: i64 =
-        sqlx::query_scalar("SELECT calls FROM model_calls WHERE day = ?").bind(&today).fetch_optional(&m.store.pool).await?.unwrap_or(0);
-    Ok(per_day.saturating_sub(used as u32))
+    Ok(per_day.saturating_sub(calls_used(m).await? as u32))
 }
 
 /// Whether a model call may be made now: the connection isn't resting
@@ -83,19 +103,32 @@ pub(crate) async fn can_call(m: &Memex, task: &Task, per_day: u32) -> anyhow::Re
     Ok(!llm::resting(m, &task.connection_id) && budget_left(m, per_day).await? > 0)
 }
 
-/// Gives a call that failed for now back to today's budget.
+/// Gives a call that failed for now back to the day's budget.
 pub(crate) async fn refund_call(m: &Memex) -> anyhow::Result<()> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    sqlx::query("UPDATE model_calls SET calls = MAX(calls - 1, 0) WHERE day = ?").bind(today).execute(&m.store.pool).await?;
+    if let Some(day) = budget_day(m).await? {
+        sqlx::query("UPDATE model_calls SET calls = MAX(calls - 1, 0) WHERE day = ?").bind(day).execute(&m.store.pool).await?;
+    }
     Ok(())
 }
 
+/// Counts a call in the current day, or starts a day with it.
 pub(crate) async fn count_call(m: &Memex) -> anyhow::Result<()> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    sqlx::query("INSERT INTO model_calls (day, calls) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET calls = calls + 1")
-        .bind(today)
-        .execute(&m.store.pool)
-        .await?;
+    let now = c6_core::now_ms();
+    // One statement each: two calls starting a day at once make one day.
+    let started = sqlx::query(
+        "INSERT INTO model_calls (day, calls) SELECT ?, 1 WHERE NOT EXISTS \
+         (SELECT 1 FROM model_calls WHERE day LIKE 'p:%' AND CAST(substr(day, 3) AS INTEGER) > ?)",
+    )
+    .bind(format!("p:{now}"))
+    .bind(now - BUDGET_DAY)
+    .execute(&m.store.pool)
+    .await?
+    .rows_affected();
+    if started == 0
+        && let Some(day) = budget_day(m).await?
+    {
+        sqlx::query("UPDATE model_calls SET calls = calls + 1 WHERE day = ?").bind(day).execute(&m.store.pool).await?;
+    }
     Ok(())
 }
 
@@ -391,12 +424,7 @@ async fn run(m: std::sync::Arc<Memex>, lane: u32) {
 pub async fn status(m: &Memex, s: &mut api::MemexStatus) -> anyhow::Result<()> {
     let t = m.tasks();
     s.calls_per_day = t.per_day as u64;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    s.calls_today = sqlx::query_scalar::<_, i64>("SELECT calls FROM model_calls WHERE day = ?")
-        .bind(today)
-        .fetch_optional(&m.store.pool)
-        .await?
-        .unwrap_or(0) as u64;
+    s.calls_today = calls_used(m).await? as u64;
     if let Some(u) = &t.understanding {
         s.understood =
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM enrich WHERE version = ?").bind(version(u)).fetch_one(&m.store.pool).await?
@@ -474,4 +502,32 @@ pub async fn summarize(m: &Memex, key: &str, allowed: &[String]) -> anyhow::Resu
     };
     m.store.put(&item, &item.source).await?;
     Ok(summary)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_budget_day_is_24_hours_from_its_first_call() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        // A day from before (a date, as days were counted) and one that
+        // began 25 hours ago don't count.
+        let old = format!("p:{}", c6_core::now_ms() - 25 * 3600 * 1000);
+        for (day, calls) in [("2026-10-29", 40), (old.as_str(), 30)] {
+            sqlx::query("INSERT INTO model_calls (day, calls) VALUES (?, ?)").bind(day).bind(calls).execute(&m.store.pool).await.unwrap();
+        }
+        assert_eq!(budget_left(&m, 5).await.unwrap(), 5);
+        // The first call starts a day; the next ones count in it.
+        for _ in 0..3 {
+            count_call(&m).await.unwrap();
+        }
+        assert_eq!(budget_left(&m, 5).await.unwrap(), 2);
+        refund_call(&m).await.unwrap();
+        assert_eq!(budget_left(&m, 5).await.unwrap(), 3);
+        let days: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_calls WHERE day LIKE 'p:%'").fetch_one(&m.store.pool).await.unwrap();
+        assert_eq!(days, 2, "one new day, beside the old one");
+    }
 }

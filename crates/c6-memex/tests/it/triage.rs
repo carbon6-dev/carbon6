@@ -468,10 +468,14 @@ async fn mail_and_chat_sorted_for_the_brief() {
         json!({"target": "chat:T1:D9", "text": "Wednesday works. [[10:00 | 14:00]]?", "note": "Check the offsite"}).to_string(),
     ));
     budget(21).await;
-    let drafted = eventually("a draft", async || {
-        let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
-        r.draft.filter(|d| d.error.is_none())
-    })
+    let drafted = c6_testkit::eventually_or(
+        "a draft",
+        async || {
+            let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
+            r.draft.filter(|d| d.error.is_none())
+        },
+        || mock.log(),
+    )
     .await;
     assert_eq!((drafted.target.as_str(), drafted.kind.as_str(), drafted.note.as_str()), ("chat:T1:D9", "chat", "Check the offsite"));
     let read = mock.requests().last().unwrap()["messages"].to_string();
@@ -492,10 +496,14 @@ async fn mail_and_chat_sorted_for_the_brief() {
     mock.push(Reply::Text(json!({"target": "chat:T1:D9", "text": "Wednesday at 14:00 it is.", "note": ""}).to_string()));
     m.store.put(&chat("k5", "D9", "dm", "Or Thursday afternoon, if that's easier", HOUR / 10, false), "test-slack").await.unwrap();
     budget(23).await;
-    eventually("drafted again", async || {
-        let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
-        (r.draft?.text == "Wednesday at 14:00 it is.").then_some(())
-    })
+    c6_testkit::eventually_or(
+        "drafted again",
+        async || {
+            let r: Request = serde_json::from_value(rpc("memex.requests.get", json!({"id": raj})).await).ok()?;
+            (r.draft?.text == "Wednesday at 14:00 it is.").then_some(())
+        },
+        || mock.log(),
+    )
     .await;
 
     // A new request is an event: a trigger keeps a record of Acme's.
