@@ -24,8 +24,17 @@ NOTES=${notes:-"- $(git log -1 --format=%s "$sha")"} packaging/release/manifest.
 [ -f "$dir/release.json.sig" ] || { echo "release.json is unsigned: no edge build" >&2; exit 1; }
 printf 'carbon6 %s, built from %s on main.\n\nSince %s:\n\n%s\n' "$version" "${sha:0:7}" "${last:-the start}" "$notes" >"$dir/edge-notes.md"
 
-# The one edge release, replaced: the old one and its tag go first.
-gh release delete edge --repo "$repo" --cleanup-tag --yes 2>/dev/null || true
-gh release create edge --repo "$repo" --prerelease --target "$sha" --title "carbon6 edge ($version)" \
+# The one edge release, replaced: the new one is published first (under
+# `edge-next`), so a publish that fails leaves the old one in place; then
+# the old one and its tag go, and the new one takes the tag `edge`, which
+# is where machines look. Between the two, for a moment, there is none:
+# a machine that looks then finds no update that time.
+gh release delete edge-next --repo "$repo" --cleanup-tag --yes 2>/dev/null || true
+gh release create edge-next --repo "$repo" --prerelease --latest=false --target "$sha" --title "carbon6 edge ($version)" \
     --notes-file "$dir/edge-notes.md" "$dir"/*.deb "$dir"/*.tar.gz "$dir/release.json" "$dir/release.json.sig"
+if gh release view edge --repo "$repo" >/dev/null 2>&1; then
+    gh release delete edge --repo "$repo" --cleanup-tag --yes
+fi
+gh release edit edge-next --repo "$repo" --tag edge --target "$sha"
+gh api -X DELETE "repos/$repo/git/refs/tags/edge-next" >/dev/null 2>&1 || true
 echo "Published edge $version"
