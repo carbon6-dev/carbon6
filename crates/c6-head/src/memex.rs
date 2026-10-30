@@ -378,7 +378,7 @@ pub fn check_scopes(scopes: &[api::MemexScope]) -> anyhow::Result<()> {
 }
 
 /// The most model calls understanding may make side by side.
-pub const MAX_AT_ONCE: u32 = 8;
+pub const MAX_AT_ONCE: u32 = 64;
 
 /// What the memex asks for at start: its models, with each connection's id
 /// (it fetches credentials for them like a worker does).

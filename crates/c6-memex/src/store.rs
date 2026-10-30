@@ -87,7 +87,11 @@ impl Store {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(10));
-        let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
+        // Two per reading lane (a step may hold a transaction and query beside
+        // it) at the most lanes, plus other users. Sized for the ceiling, not
+        // the live setting: sqlx opens connections on demand and closes idle ones.
+        let pool_opts = SqlitePoolOptions::new().max_connections(2 * crate::understand::MAX_AT_ONCE + 8);
+        let (pool, report) = c6_core::upgrade::open(path, opts, pool_opts, &MIGRATOR, &UPGRADES).await?;
         Ok((Self { pool }, report))
     }
 

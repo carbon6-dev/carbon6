@@ -220,6 +220,77 @@ async fn lanes_side_by_side_never_take_the_same_thread() {
     for i in 0..6 {
         assert_eq!(asked.iter().filter(|a| a.contains(&format!("Topic {i} "))).count(), 1, "Topic {i}");
     }
-    let r = http.put(format!("{api}/settings/memex")).json(&json!({"calls_at_once": 9})).send().await.unwrap();
-    assert_eq!(r.status(), 400, "at most 8");
+    let r = http.put(format!("{api}/settings/memex")).json(&json!({"calls_at_once": 64})).send().await.unwrap();
+    assert!(r.status().is_success(), "64 lanes accepted");
+    let r = http.put(format!("{api}/settings/memex")).json(&json!({"calls_at_once": 65})).send().await.unwrap();
+    assert_eq!(r.status(), 400, "at most 64");
+}
+
+#[tokio::test]
+async fn eleven_reads_run_side_by_side_past_long_threads() {
+    crate::extract_here();
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let m = c6_head::knowledge::get(&head.state).unwrap();
+    let mut gates = Vec::new();
+    // Forty message rows cover only five of these threads. No recent mail or cards.
+    for i in 0..11 {
+        let from = format!("p{i}@firm{i}.com");
+        for j in 0..8 {
+            mail(
+                &m,
+                &format!("x{i}-{j}"),
+                &format!("t{i}"),
+                (&from, "P"),
+                "me@mine.io",
+                &format!("Topic {i}"),
+                "Hello.",
+                false,
+                (30 + i) * DAY + j * 1000,
+            )
+            .await;
+        }
+        gates.push(mock.push_gated(Reply::Text(json!({"summary": "A note.", "topics": [], "commitments": []}).to_string())));
+    }
+    let r = http
+        .put(format!("{api}/settings/memex"))
+        .json(&json!({"understanding": {"connection": "m", "model": "reader-1"}, "calls_per_day": 11, "calls_at_once": 12}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let asked = eventually("eleven reading calls held at once", async || {
+        m.wake.notify_waiters();
+        let requests = mock.requests();
+        (requests.len() >= 11).then_some(requests)
+    })
+    .await;
+    for gate in gates {
+        gate.notify_one();
+    }
+    assert_eq!(asked.len(), 11);
+    let asked: Vec<String> = asked.iter().map(|r| r["messages"].to_string()).collect();
+    assert!(asked.iter().all(|a| a.contains("This is an email thread")));
+    for i in 0..11 {
+        assert_eq!(asked.iter().filter(|a| a.contains(&format!("Topic {i} "))).count(), 1, "Topic {i}");
+    }
+    eventually("all eleven reads recorded", async || {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrich WHERE target LIKE 'thread:%'").fetch_one(&m.store.pool).await.unwrap();
+        (n == 11).then_some(())
+    })
+    .await;
 }

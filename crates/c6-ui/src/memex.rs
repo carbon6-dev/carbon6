@@ -638,7 +638,7 @@ pub fn MemexSettings() -> impl IntoView {
                     <span class="text-xs text-zinc-500">"Model calls a day"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />
                 </label>
-                <label class="space-y-0.5" title="Model calls understanding makes side by side (1 to 8). With more than one, new mail keeps one for itself. A local Ollama answers one at a time unless started with OLLAMA_NUM_PARALLEL.">
+                <label class="space-y-0.5" title="Model calls understanding makes side by side (1 to 64). With more than one, new mail keeps one for itself. A local Ollama answers one at a time unless started with OLLAMA_NUM_PARALLEL.">
                     <span class="text-xs text-zinc-500">"Calls at once"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="1" prop:value=move || at_once.get() on:input=move |ev| at_once.set(event_target_value(&ev)) />
                 </label>

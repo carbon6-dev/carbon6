@@ -26,7 +26,7 @@ Sessions don't use pools. A session's worker dials its connection itself, so a s
 1. Add each server as a connection of its own (**Settings → Connections**), for example `mac` (`http://mac.tailnet:11434/v1`) and `mumuzz` (`http://ollama.svc:11434/v1`).
 2. Add a connection of kind **Pool**: name it, and add its members with how many calls each takes at once (Ollama: its `OLLAMA_NUM_PARALLEL`).
 3. Choose the pool where you'd choose a connection, for example **Settings → Memex → Understanding**, and a model the members have.
-4. Set **Settings → Memex → calls at once** to about the total of the members' slots. The memex never makes more calls side by side than that, so a lower number leaves slots idle and a higher one only queues calls in the pool.
+4. Set **Settings → Memex → calls at once** to about the total of the members' slots, up to 64 (default 1). For example, two 32-slot vLLM servers can use 64; a larger pool still shares 64 memex lanes. With more than one lane, one keeps new mail moving. Fewer lanes leave slots idle; more than the pool's slots queues calls.
 
 Edit a pool's members with **Edit** on its row, or `connections.update`.
 
