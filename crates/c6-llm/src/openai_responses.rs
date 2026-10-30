@@ -353,8 +353,10 @@ mod tests {
             cache_key: Some("sess".into()),
             effort: Some("high".into()),
             web_search: true,
+            json: false,
         };
         let b = c.request_body(&req);
+        assert_eq!(c.request_body(&ModelRequest { json: true, ..req }), b);
         assert_eq!(b["store"], false);
         assert_eq!(b["include"][0], "reasoning.encrypted_content");
         assert_eq!(b["reasoning"]["effort"], "high");

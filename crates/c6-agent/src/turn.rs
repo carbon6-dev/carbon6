@@ -162,6 +162,7 @@ impl Turn<'_> {
             cache_key: Some(self.cfg.cache_key.clone()),
             effort: self.cfg.effort.clone(),
             web_search: self.cfg.web_search,
+            json: false,
         }
     }
 

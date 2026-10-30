@@ -782,6 +782,7 @@ async fn ask(
         cache_key: None,
         effort: Some("low".into()),
         web_search: false,
+        json: false,
     };
     let mut stream = client.stream(&req).await?;
     let mut acc = Accumulator::default();

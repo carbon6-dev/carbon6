@@ -112,6 +112,9 @@ pub struct ModelRequest {
     pub effort: Option<String>,
     /// Offer the provider's own web search tool, where it has one.
     pub web_search: bool,
+    /// The answer is one JSON object; Chat Completions asks for it with
+    /// `response_format`, other APIs ignore it.
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -125,6 +125,9 @@ async fn the_walk_grows_cards_back_through_time() {
     let asked: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
     assert!(!asked.iter().any(|a| a.contains("Your receipt")), "automated mail isn't read");
     assert_eq!(asked.len(), 9, "three reads, three times two cards");
+    for body in mock.requests() {
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+    }
     let last_card = asked.iter().rfind(|a| a.contains("Write the owner's card for Dana")).unwrap();
     assert!(last_card.contains("The card so far") && last_card.contains("Globex signed the first deal."), "{last_card}");
     // A card written for a newsletter before the rule (its news too) is

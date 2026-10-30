@@ -45,6 +45,12 @@ pub struct Task {
     pub effort: Option<String>,
 }
 
+/// The answer's format and token limit, before room for reasoning.
+pub enum Output {
+    Text(u32),
+    Json(u32),
+}
+
 /// The model's text answer to `system` and the user's blocks (text and
 /// images); `what` it's for and what it's `about` show in the activity
 /// panel.
@@ -55,8 +61,12 @@ pub async fn ask(
     about: &str,
     system: &str,
     user: Vec<Block>,
-    max_tokens: u32,
+    output: Output,
 ) -> anyhow::Result<String> {
+    let (max_tokens, json) = match output {
+        Output::Text(n) => (n, false),
+        Output::Json(n) => (n, true),
+    };
     let origin = c6_llm::activity::Origin {
         what: what.to_owned(),
         about: about.to_owned(),
@@ -83,6 +93,7 @@ pub async fn ask(
         cache_key: None,
         effort,
         web_search: false,
+        json,
     };
     let answered = tokio::select! {
         r = answer(client.as_ref(), &req) => r,

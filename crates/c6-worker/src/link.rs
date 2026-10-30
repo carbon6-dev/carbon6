@@ -349,6 +349,7 @@ mod tests {
             cache_key: None,
             effort: None,
             web_search: false,
+            json: false,
         };
         let mut stream = client.stream(&req).await.unwrap();
         let mut text = String::new();

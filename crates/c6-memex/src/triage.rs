@@ -343,7 +343,8 @@ async fn ask(
     let ask = api::prompts::fill(prompt, &[("owner", &owner), ("examples", &examples(m, kind).await?), ("urgent", &rule)]);
     let system = m.prompt("memex.understand.system", api::prompts::UNDERSTAND_SYSTEM);
     crate::understand::count_call(m).await?;
-    let answer = llm::ask(m, task, "sorting", about, &system, vec![Block::Text(format!("{ask}\n\n{text}"))], 400).await?;
+    let answer =
+        llm::ask(m, task, "sorting", about, &system, vec![Block::Text(format!("{ask}\n\n{text}"))], llm::Output::Json(400)).await?;
     let v = llm::json_of(&answer)?;
     let category = v["category"].as_str().unwrap_or("").trim().to_lowercase();
     let category = if allowed.contains(&category.as_str()) { category } else { "fyi".to_owned() };

@@ -347,6 +347,7 @@ Jobs live in a durable queue in the memex database, each with a priority, a budg
 - **What gets read**, newest first:
   - email threads, as one unit, and again when a thread has new mail; mailing lists, spam, trash and drafts are skipped;
   - sessions, documents, papers and web pages.
+- **JSON answers:** reading, thing summaries, sorting, cards, drafts, request matching and vision ask Chat Completions servers for `response_format: {"type": "json_object"}`. A server that rejects it or `reasoning_effort` is asked again without the rejected field. Other APIs ignore the JSON setting. System pages ask for plain Markdown instead.
 - **Failed reads:** malformed JSON affected about 0.4% of reads in a live mailbox. After unread work, the walk retries failures, newest first, up to three tries for the same content and model. New mail or a new model starts over; success clears the count. Status and Activity count successes and exhausted failures separately; pending retries count as neither.
 - **What comes back**, as JSON:
   - a summary (`items.summary`);

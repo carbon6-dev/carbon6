@@ -135,6 +135,9 @@ async fn the_memex_sorts_through_a_pool_and_survives_a_member_going_away() {
         assert_eq!((s.category.as_str(), s.by.as_str()), ("fyi", "model"), "{s:?}");
     }
     assert!(b.requests().len() >= before + 2);
+    for body in a.requests().into_iter().chain(b.requests()) {
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+    }
 
     // The activity panel says which member took each call.
     let calls = c6_llm::activity::calls();

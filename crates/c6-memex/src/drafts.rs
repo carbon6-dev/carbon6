@@ -397,7 +397,9 @@ async fn write_draft(m: &Memex, task: &llm::Task, id: i64) -> anyhow::Result<Opt
     let prompt = api::prompts::fill(&template, &[("request", request), ("context", context)]);
     let system = m.prompt("memex.requests.draft.system", api::prompts::REQUEST_DRAFT_SYSTEM);
     crate::understand::count_call(m).await?;
-    let v = llm::json_of(&llm::ask(m, task, "draft", &clip(&clean(&r.title), 120), &system, vec![Block::Text(prompt)], 1500).await?)?;
+    let v = llm::json_of(
+        &llm::ask(m, task, "draft", &clip(&clean(&r.title), 120), &system, vec![Block::Text(prompt)], llm::Output::Json(1500)).await?,
+    )?;
     let text = v["text"].as_str().unwrap_or("").trim().to_owned();
     anyhow::ensure!(!text.is_empty(), "the model wrote no draft");
     let target = draft_target(v["target"].as_str().unwrap_or(""), &r.sources);

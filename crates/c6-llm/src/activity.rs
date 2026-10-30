@@ -251,6 +251,7 @@ mod tests {
             cache_key: None,
             effort: Some("none".into()),
             web_search: false,
+            json: false,
         }
     }
 
