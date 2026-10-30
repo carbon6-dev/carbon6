@@ -5,6 +5,7 @@
 #   build      web UI, then release c6h, c6w, c6, c6-eval
 #   artifacts  just the binaries (use with --output)
 #   test       runs the test suite
+#   lint       the toolchain with rustfmt and clippy, to run `make check` and format the source in place on a mounted checkout (see `make docker-check`, `make docker-fmt`)
 #   c6h        runtime image for the head
 #   c6w        runtime image for a worker (it works on files in the container)
 #   debs       .deb packages of c6h and c6w with systemd units, and c6,
@@ -47,6 +48,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     git config --global user.email test@c6 && git config --global user.name test \
  && cargo test --locked
+
+FROM toolchain AS lint
+RUN rustup component add rustfmt clippy
+# Where `make docker-check` keeps the build and the cargo registry between runs
+# (a volume; any user can write to it).
+RUN mkdir -p /cache && chmod 777 /cache
 
 FROM debian:bookworm-slim AS c6h
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
