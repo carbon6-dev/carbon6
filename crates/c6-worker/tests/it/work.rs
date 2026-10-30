@@ -237,5 +237,8 @@ async fn work_follows_what_belongs_to_it() {
     assert_eq!(proposals[0]["title"], "Docs rewrite");
     let refs: Vec<&str> = proposals[0]["attach"].as_array().unwrap().iter().filter_map(|a| a["ref"].as_str()).collect();
     assert_eq!(refs, [d_ref.as_str()], "only what's open and unfiled");
+    for request in mock.requests().iter().filter(|r| r["model"] == "small") {
+        assert_eq!(request["response_format"], json!({"type": "json_object"}));
+    }
     stop.cancel();
 }
