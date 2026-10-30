@@ -71,6 +71,11 @@ pub enum View {
     Memex,
     Mail,
     Chat,
+    /// The messages behind a mail/chat reference or a saved Brief request,
+    /// independent of whether the request is still in the Brief.
+    Conversation {
+        target: String,
+    },
     /// Mail & chat's home: what needs you (docs/brief.md).
     Brief,
     Calendar,
@@ -177,6 +182,7 @@ impl View {
             View::Memex => "/memex".into(),
             View::Mail => "/mail".into(),
             View::Chat => "/chat".into(),
+            View::Conversation { target } => format!("/conversations/{}", encode(target)),
             View::Brief => "/brief".into(),
             View::Calendar => "/calendar".into(),
             View::Contacts => "/contacts".into(),
@@ -273,6 +279,7 @@ impl View {
             ["memex"] => View::Memex,
             ["mail"] => View::Mail,
             ["chat"] => View::Chat,
+            ["conversations", target] => View::Conversation { target: (*target).to_owned() },
             ["brief"] => View::Brief,
             ["calendar"] => View::Calendar,
             ["contacts"] => View::Contacts,
@@ -323,6 +330,7 @@ impl View {
             View::Memex => "Memex".into(),
             View::Mail => "Mail".into(),
             View::Chat => "Chat".into(),
+            View::Conversation { .. } => "Messages".into(),
             View::Brief => "Brief".into(),
             View::Calendar => "Calendar".into(),
             View::Contacts => "Contacts".into(),
@@ -1781,6 +1789,7 @@ fn render_view(view: View) -> AnyView {
                     // drawn again for the realm you pick.
                     View::Mail => (move || { crate::api::realm().track(); view! { <crate::mail::MailPage /> } }).into_any(),
                     View::Chat => view! { <crate::chat::ChatPage /> }.into_any(),
+                    View::Conversation { target } => (move || { crate::api::realm().track(); view! { <crate::brief::ConversationPage target=target.clone() /> } }).into_any(),
                     View::Brief => (move || { crate::api::realm().track(); view! { <crate::brief::BriefPage /> } }).into_any(),
                     View::Calendar => (move || { crate::api::realm().track(); view! { <crate::calendar::CalendarPage /> } }).into_any(),
                     View::Contacts => (move || { crate::api::realm().track(); view! { <crate::contacts::ContactsPage /> } }).into_any(),

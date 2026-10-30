@@ -389,22 +389,31 @@ fn Proposals(ps: Vec<WorkProposal>, proposals: RwSignal<Option<Vec<WorkProposal>
     }
 }
 
+/// Requests keep their work-state identity, but their links open the original
+/// messages, not the Brief's changing queue. Direct mail/chat refs do too.
+fn attached_view(reference: &str) -> Option<View> {
+    if let Some(id) = reference.strip_prefix("session:") {
+        Some(View::session(id))
+    } else if reference.strip_prefix("request:").is_some_and(|id| id.parse::<i64>().is_ok())
+        || reference.starts_with("thread:")
+        || reference.starts_with("chat:")
+    {
+        Some(View::Conversation { target: reference.to_owned() })
+    } else if reference.starts_with("decision:") {
+        Some(View::Decisions)
+    } else {
+        None
+    }
+}
+
 /// Where an attached thing opens.
 #[component]
 fn AttachedLink(l: LiveAttached) -> impl IntoView {
     let class = "min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400";
     let r = l.reference.clone();
     let text = format!("{} {}", kind_mark(&r), l.title);
-    if let Some(id) = r.strip_prefix("session:") {
-        view! { <Go to=View::session(id) class=class>{text}</Go> }.into_any()
-    } else if let Some(id) = r.strip_prefix("request:").and_then(|i| i.parse::<i64>().ok()) {
-        view! { <Go to=View::Brief own=true brief_request=id class=class>{text}</Go> }.into_any()
-    } else if r.starts_with("decision:") {
-        view! { <Go to=View::Decisions class=class>{text}</Go> }.into_any()
-    } else if r.starts_with("thread:") {
-        view! { <Go to=View::Mail own=true class=class>{text}</Go> }.into_any()
-    } else if r.starts_with("chat:") {
-        view! { <Go to=View::Chat own=true class=class>{text}</Go> }.into_any()
+    if let Some(to) = attached_view(&r) {
+        view! { <Go to class=class>{text}</Go> }.into_any()
     } else {
         view! { <a href=r target="_blank" rel="noopener noreferrer" class=class>{text}</a> }.into_any()
     }
@@ -865,5 +874,20 @@ pub fn RequestWork(id: i64, #[prop(into)] title: String) -> impl IntoView {
             }}
             {move || error.get().map(|e| view! { <span class="text-red-600">{e}</span> })}
         </span>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_attachments_open_their_contents_not_the_brief_or_an_inbox() {
+        for reference in ["request:42", "thread:me@example.com:thread-123", "chat:T1:C2:1234.5678", "chat:T1:C2"] {
+            assert_eq!(attached_view(reference), Some(View::Conversation { target: reference.to_owned() }));
+        }
+        assert_eq!(attached_view("session:abc"), Some(View::session("abc")));
+        assert_eq!(attached_view("decision:7"), Some(View::Decisions));
+        assert_eq!(attached_view("https://example.com/issue/1"), None);
     }
 }

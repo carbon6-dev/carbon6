@@ -106,11 +106,18 @@ async fn rows(st: &HeadState, realm: Option<&str>, closed: bool) -> anyhow::Resu
 
 /// The open items something is attached to.
 pub async fn holding(st: &HeadState, reference: &str) -> anyhow::Result<Vec<String>> {
+    holding_in(st, reference, None).await
+}
+
+async fn holding_in(st: &HeadState, reference: &str, realm: Option<&str>) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar(
         "SELECT r.id FROM records r WHERE r.collection = ? AND json_extract(r.fields, '$.status') = 'open' \
+         AND (? IS NULL OR r.realm = ?) \
          AND EXISTS (SELECT 1 FROM json_each(r.fields, '$.attached') a WHERE json_extract(a.value, '$.ref') = ?) ORDER BY r.updated_at DESC",
     )
     .bind(WORK)
+    .bind(realm)
+    .bind(realm)
     .bind(reference)
     .fetch_all(&st.store.pool)
     .await?)
@@ -691,7 +698,11 @@ fn state_of(f: &WorkFields, live: &[LiveAttached], now: i64, s: &WorkSettings) -
 /// Something attached moved (a session's turn ended, a request changed, a
 /// decision opened or was answered): its work's note is brought up to date.
 pub async fn moved_ref(st: &HeadState, reference: &str) {
-    let ids = match holding(st, reference).await {
+    moved_ref_in(st, reference, None).await;
+}
+
+async fn moved_ref_in(st: &HeadState, reference: &str, realm: Option<&str>) {
+    let ids = match holding_in(st, reference, realm).await {
         Ok(ids) => ids,
         Err(e) => {
             warn!(%reference, "finding its work: {e:#}");
@@ -728,11 +739,16 @@ pub async fn on_decision(st: &HeadState, d: &api::Decision) {
 }
 
 /// The memex's events: a request opened, changed or got a new message.
-pub async fn on_memex_event(st: &HeadState, kind: &str, data: &Value) {
-    if kind.starts_with("request.")
-        && let Some(id) = data["request_id"].as_i64()
-    {
-        moved_ref(st, &format!("request:{id}")).await;
+pub async fn on_memex_event(st: &HeadState, realm: &str, kind: &str, data: &Value) {
+    if kind.starts_with("request.") {
+        let mut ids: Vec<i64> = data["request_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+        ids.extend(data["request_id"].as_i64());
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            // Request ids (including merge redirects) are local to a realm.
+            moved_ref_in(st, &format!("request:{id}"), Some(realm)).await;
+        }
     }
 }
 

@@ -313,7 +313,33 @@ async fn unpair(m: &Memex, id: i64) -> anyhow::Result<()> {
 
 /// For triggers and the work it belongs to (docs/work.md §3): it moved.
 async fn changed(m: &Memex, id: i64, status: &str) {
-    m.emit("request.changed", json!({"request_id": id, "status": status})).await;
+    // Work may still hold any of the old ids: notify those references too,
+    // without rewriting its attachments or their history.
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "WITH RECURSIVE refs(id) AS (SELECT ? UNION SELECT r.from_id FROM request_redirects r JOIN refs ON r.into_id = refs.id) \
+         SELECT id FROM refs",
+    )
+    .bind(id)
+    .fetch_all(&m.store.pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(%id, "reading merged request references: {e:#}");
+        vec![id]
+    });
+    m.emit("request.changed", json!({"request_id": id, "request_ids": ids, "status": status})).await;
+}
+
+/// Follow merge edges in this realm's database. UNION bounds even a corrupt
+/// cycle; no terminal id then means an error, not an infinite loop.
+async fn request_id<'a>(db: impl sqlx::Executor<'a, Database = sqlx::Sqlite>, id: i64) -> anyhow::Result<i64> {
+    let resolved = sqlx::query_scalar(
+        "WITH RECURSIVE refs(id) AS (SELECT ? UNION SELECT r.into_id FROM request_redirects r JOIN refs ON r.from_id = refs.id) \
+         SELECT id FROM refs WHERE NOT EXISTS (SELECT 1 FROM request_redirects r WHERE r.from_id = refs.id)",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await?;
+    resolved.ok_or_else(|| anyhow::anyhow!("request {id} has a merge redirect cycle"))
 }
 
 /// Requests by id, as work lists them: who, what, how it stands (the ones
@@ -321,13 +347,14 @@ async fn changed(m: &Memex, id: i64, status: &str) {
 pub async fn some(m: &Memex, ids: &[i64]) -> anyhow::Result<Value> {
     let mut out = Vec::new();
     for id in ids.iter().take(500) {
-        if let Some(r) = sqlx::query("SELECT id, person, person_name, title, status, until, updated_at FROM requests WHERE id = ?")
-            .bind(id)
+        let resolved = request_id(&m.store.pool, *id).await?;
+        if let Some(r) = sqlx::query("SELECT person, person_name, title, status, until, updated_at FROM requests WHERE id = ?")
+            .bind(resolved)
             .fetch_optional(&m.store.pool)
             .await?
         {
             out.push(json!({
-                "id": r.get::<i64, _>("id"), "person": r.get::<String, _>("person"), "person_name": r.get::<String, _>("person_name"),
+                "id": id, "person": r.get::<String, _>("person"), "person_name": r.get::<String, _>("person_name"),
                 "title": r.get::<String, _>("title"), "status": r.get::<String, _>("status"), "until": r.get::<Option<i64>, _>("until"),
                 "updated_at": r.get::<i64, _>("updated_at"),
             }));
@@ -398,6 +425,7 @@ async fn request(m: &Memex, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<api::
 }
 
 pub async fn get(m: &Memex, id: i64) -> anyhow::Result<api::Request> {
+    let id = request_id(&m.store.pool, id).await?;
     // If a draft lands while this is read, poll once more for its new text.
     let drafting = m.claimed(&format!("draft:{id}"));
     let r = sqlx::query("SELECT * FROM requests WHERE id = ?").bind(id).fetch_optional(&m.store.pool).await?;
@@ -414,6 +442,7 @@ pub async fn get(m: &Memex, id: i64) -> anyhow::Result<api::Request> {
 /// You settle a request: done, dropped, snoozed until a time, or open
 /// again.
 pub async fn set(m: &Memex, id: i64, status: &str, until: Option<i64>) -> anyhow::Result<api::Request> {
+    let id = request_id(&m.store.pool, id).await?;
     match status {
         "done" | "dropped" => close(m, id, status, "you").await?,
         "snoozed" => {
@@ -441,10 +470,19 @@ pub async fn set(m: &Memex, id: i64, status: &str, until: Option<i64>) -> anyhow
 
 /// Two requests that are one: `from`'s conversations join `into`.
 pub async fn merge(m: &Memex, into: i64, from: i64) -> anyhow::Result<api::Request> {
-    anyhow::ensure!(into != from, "a request is already itself");
-    get(m, into).await?;
-    get(m, from).await?;
     let mut tx = m.store.pool.begin().await?;
+    let into = request_id(&mut *tx, into).await?;
+    let from = request_id(&mut *tx, from).await?;
+    anyhow::ensure!(into != from, "a request is already itself");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id IN (?, ?)").bind(into).bind(from).fetch_one(&mut *tx).await?;
+    anyhow::ensure!(count == 2, "no such request to merge");
+    sqlx::query("INSERT INTO request_redirects (from_id, into_id, merged_at) VALUES (?, ?, ?)")
+        .bind(from)
+        .bind(into)
+        .bind(c6_core::now_ms())
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("UPDATE requests SET invitation = invitation AND (SELECT invitation FROM requests WHERE id = ?) WHERE id = ?")
         .bind(from)
         .bind(into)
@@ -463,7 +501,9 @@ pub async fn merge(m: &Memex, into: i64, from: i64) -> anyhow::Result<api::Reque
     sqlx::query("DELETE FROM requests WHERE id = ?").bind(from).execute(&mut *tx).await?;
     sqlx::query("UPDATE requests SET updated_at = ? WHERE id = ?").bind(c6_core::now_ms()).bind(into).execute(&mut *tx).await?;
     tx.commit().await?;
-    get(m, into).await
+    let request = get(m, into).await?;
+    changed(m, into, &request.status).await;
+    Ok(request)
 }
 
 /// A conversation you sorted yourself: its request follows (no model).
@@ -488,6 +528,7 @@ pub async fn sorted_by_you(m: &Memex, t: &api::Triage) -> anyhow::Result<()> {
 
 pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<Value> {
     let id = params["id"].as_i64().unwrap_or(0);
+    let id = if id == 0 { id } else { request_id(&m.store.pool, id).await? };
     Ok(match method {
         "memex.requests.list" => {
             json!(list(m, params["status"].as_str().unwrap_or("open"), params["limit"].as_u64().unwrap_or(100) as u32).await?)
@@ -511,6 +552,83 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn merge_redirects_keep_old_ids_sources_and_history_across_reopening() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        for id in 1..=3 {
+            sqlx::query("INSERT INTO requests (id, person, title, category, created_at, updated_at) VALUES (?, 'pat@example.net', ?, 'needs_you', 0, 0)")
+                .bind(id).bind(format!("Request {id}")).execute(&m.store.pool).await.unwrap();
+            sqlx::query("INSERT INTO request_sources (request_id, target, kind, at) VALUES (?, ?, 'mail', ?)")
+                .bind(id)
+                .bind(format!("thread:import:test:thread-{id}"))
+                .bind(id)
+                .execute(&m.store.pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(merge(&m, 1, 2).await.unwrap().sources.len(), 2);
+        assert_eq!(get(&m, 2).await.unwrap().id, 1);
+        assert_eq!(merge(&m, 3, 2).await.unwrap().sources.len(), 3);
+        for id in [1, 2, 3] {
+            let r = get(&m, id).await.unwrap();
+            assert_eq!(r.id, 3);
+            assert_eq!(r.sources.len(), 3);
+        }
+        // Aliases cannot be merged back into themselves, creating a cycle.
+        assert!(merge(&m, 2, 3).await.is_err());
+        assert!(merge(&m, 3, 9999).await.is_err());
+        assert_eq!(set(&m, 2, "done", None).await.unwrap().id, 3);
+        let batch = some(&m, &[1, 2, 3, 9999]).await.unwrap();
+        assert_eq!(batch.as_array().unwrap().len(), 3);
+        for (row, id) in batch.as_array().unwrap().iter().zip([1, 2, 3]) {
+            assert_eq!(row["id"], id, "batch lookup keeps the attached id");
+            assert_eq!(row["status"], "done");
+        }
+        m.store.pool.close().await;
+        drop(m);
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        let r = get(&m, 2).await.unwrap();
+        assert_eq!((r.id, r.status.as_str(), r.sources.len()), (3, "done", 3));
+        let edges: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT from_id, into_id FROM request_redirects ORDER BY from_id").fetch_all(&m.store.pool).await.unwrap();
+        assert_eq!(edges, [(1, 3), (2, 1)], "retain the original merge edges");
+    }
+
+    #[tokio::test]
+    async fn saved_request_sources_remain_readable_after_leaving_the_brief() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO requests (id, person, title, category, created_at, updated_at) \
+             VALUES (1, 'pat@example.net', 'Follow up', 'needs_you', 0, 0); \
+             INSERT INTO request_sources (request_id, target, kind, at, noted_at) VALUES \
+             (1, 'thread:me@example.net:original-thread', 'mail', 1, 1), \
+             (1, 'chat:T1:C2:123.456', 'chat', 2, 2)",
+        )
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+        let until = c6_core::now_ms() + 86_400_000;
+        for status in ["done", "dropped", "snoozed"] {
+            sqlx::query("UPDATE requests SET status = ?, until = ? WHERE id = 1")
+                .bind(status)
+                .bind(until)
+                .execute(&m.store.pool)
+                .await
+                .unwrap();
+            assert!(list(&m, "open", 100).await.unwrap().is_empty());
+            // The Messages view uses get, not the active Brief's list.
+            let request: api::Request = serde_json::from_value(method(&m, "memex.requests.get", &json!({"id": 1})).await.unwrap()).unwrap();
+            assert_eq!(request.status, status);
+            assert_eq!(request.sources.len(), 2);
+            assert_eq!(request.sources[0].target, "thread:me@example.net:original-thread");
+            assert_eq!(request.sources[1].target, "chat:T1:C2:123.456");
+        }
+    }
 
     #[tokio::test]
     async fn calendar_rechecks_do_not_repeat_the_transition() {

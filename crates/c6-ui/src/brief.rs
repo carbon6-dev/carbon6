@@ -713,6 +713,51 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     }
 }
 
+/// Resolve a saved reference without consulting the Brief's open queue.
+async fn conversation_sources(target: &str) -> Result<Vec<c6_api::RequestSource>, String> {
+    if let Some(id) = target.strip_prefix("request:") {
+        let id = id.parse::<i64>().map_err(|_| "Invalid request reference".to_owned())?;
+        // get, unlike the Brief's list, includes done, dropped and snoozed
+        // requests. Their source messages remain readable.
+        let request = api::rpc_as::<Request>("memex.requests.get", json!({"id": id})).await?;
+        return Ok(request.sources);
+    }
+    let kind = if target.starts_with("thread:") {
+        "mail"
+    } else if target.starts_with("chat:") {
+        "chat"
+    } else {
+        return Err("This reference does not name a mail or chat conversation.".to_owned());
+    };
+    Ok(vec![c6_api::RequestSource { target: target.to_owned(), kind: kind.to_owned(), ..Default::default() }])
+}
+
+/// The original messages behind a Work attachment. Unlike a Brief request,
+/// this view does not disappear when the request is answered or put aside.
+#[component]
+pub fn ConversationPage(target: String) -> impl IntoView {
+    let sources = LocalResource::new(move || {
+        let target = target.clone();
+        async move { conversation_sources(&target).await }
+    });
+    let refresh = RwSignal::new(0u32);
+    view! {
+        <main class="mx-auto max-w-5xl space-y-3 p-4">
+            <h1 class="text-lg font-semibold">"Messages"</h1>
+            {move || match sources.get() {
+                None => view! { <p class="text-sm text-zinc-500">"Loading messages…"</p> }.into_any(),
+                Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
+                Some(Ok(sources)) if sources.is_empty() => view! {
+                    <p class="text-sm text-zinc-500">"This request no longer has a source conversation."</p>
+                }.into_any(),
+                Some(Ok(sources)) => sources.into_iter().rev().map(|s| view! {
+                    <Source target=s.target kind=s.kind title=s.title refresh />
+                }).collect_view().into_any(),
+            }}
+        </main>
+    }
+}
+
 /// A conversation a request came from: a mail thread or a chat thread or
 /// conversation.
 #[component]
@@ -730,7 +775,7 @@ fn Source(target: String, kind: String, title: String, refresh: RwSignal<u32>) -
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 })}
                 {move || compose.get().map(|d| view! { <crate::mail::Compose d compose status refresh /> })}
-                {move || open.get().is_some().then(|| view! { <crate::mail::Thread account=account.clone() thread=thread.clone() open compose refresh in_brief=true /> })}
+                {move || open.get().is_some().then(|| view! { <crate::mail::Thread account=account.clone() thread=thread.clone() open compose refresh in_brief=true embedded=true /> })}
             </section>
         }
         .into_any();

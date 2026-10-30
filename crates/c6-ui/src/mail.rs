@@ -396,6 +396,10 @@ pub(crate) fn Thread(
     compose: RwSignal<Option<Draft>>,
     refresh: RwSignal<u32>,
     #[prop(optional)] in_brief: bool,
+    /// A source embedded outside the mail inbox: there is no list to go back
+    /// to, and labelling the thread should leave its messages readable.
+    #[prop(optional)]
+    embedded: bool,
 ) -> impl IntoView {
     let (acc, th) = (StoredValue::new(account.clone()), StoredValue::new(thread.clone()));
     let messages = LocalResource::new(move || {
@@ -412,7 +416,7 @@ pub(crate) fn Thread(
             {
                 Ok(_) => {
                     refresh.update(|n| *n += 1);
-                    if close {
+                    if close && !embedded {
                         open.set(None);
                     } else {
                         messages.refetch();
@@ -438,7 +442,7 @@ pub(crate) fn Thread(
     view! {
         <section class="space-y-3">
             <div class="flex flex-wrap items-center gap-1 text-sm">
-                <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"← Back"</button>
+                {(!embedded).then(|| view! { <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"← Back"</button> })}
                 <span class="flex-1"></span>
                 <button class=BUTTON_QUIET on:click=move |_| modify(vec![], vec!["INBOX"], true)>"Archive"</button>
                 <button class=BUTTON_QUIET on:click=move |_| modify(vec!["INBOX"], vec![], false)>"Move to inbox"</button>

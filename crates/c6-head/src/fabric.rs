@@ -55,7 +55,7 @@ pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::
             let kind = params["type"].as_str().unwrap_or_default().to_owned();
             let realm = params["realm"].as_str().unwrap_or(crate::realms::HOME).to_owned();
             crate::triggers::on_memex_event(st, &realm, &kind, &params["data"]).await;
-            crate::work::on_memex_event(st, &kind, &params["data"]).await;
+            crate::work::on_memex_event(st, &realm, &kind, &params["data"]).await;
             // Realms granted reads of that knowledge hear it too.
             let item_kind = match kind.as_str() {
                 "mail.received" => "email",
