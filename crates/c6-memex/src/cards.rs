@@ -382,6 +382,7 @@ pub async fn progress(m: &Memex) -> anyhow::Result<Value> {
     let r = sqlx::query(
         "SELECT (SELECT COUNT(*) FROM cards) AS cards, (SELECT COUNT(DISTINCT key) FROM card_news) AS waiting, \
          (SELECT COUNT(*) FROM enrich WHERE target LIKE 'thread:%' AND error IS NULL) AS read, \
+         (SELECT COUNT(*) FROM enrich WHERE target LIKE 'thread:%' AND error IS NOT NULL AND tries >= 3) AS failed, \
          (SELECT COUNT(*) FROM correspondents) AS correspondents",
     )
     .fetch_one(&m.store.pool)
@@ -394,6 +395,7 @@ pub async fn progress(m: &Memex) -> anyhow::Result<Value> {
     .fetch_one(&m.store.pool)
     .await?;
     Ok(json!({"cards": r.get::<i64, _>("cards"), "cards_waiting": r.get::<i64, _>("waiting"), "threads_read": r.get::<i64, _>("read"),
+              "threads_failed": r.get::<i64, _>("failed"),
               "threads": threads, "oldest_read": oldest, "correspondents": r.get::<i64, _>("correspondents")}))
 }
 

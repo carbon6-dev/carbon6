@@ -347,6 +347,7 @@ Jobs live in a durable queue in the memex database, each with a priority, a budg
 - **What gets read**, newest first:
   - email threads, as one unit, and again when a thread has new mail; mailing lists, spam, trash and drafts are skipped;
   - sessions, documents, papers and web pages.
+- **Failed reads:** malformed JSON affected about 0.4% of reads in a live mailbox. After unread work, the walk retries failures, newest first, up to three tries for the same content and model. New mail or a new model starts over; success clears the count. Status and Activity count successes and exhausted failures separately; pending retries count as neither.
 - **What comes back**, as JSON:
   - a summary (`items.summary`);
   - topics (`topic:<slug>` things, linked `about`);

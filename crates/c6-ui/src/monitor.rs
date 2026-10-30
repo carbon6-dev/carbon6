@@ -166,10 +166,11 @@ pub fn ActivityPage() -> impl IntoView {
                             let read = w["threads_read"].as_i64().unwrap_or(0);
                             let back = w["oldest_read"].as_i64().map(crate::when::compact);
                             lines.push(format!(
-                                "{}: read {read} of {total} mail threads ({}%){}; {} relationship cards{}; {} correspondents",
+                                "{}: read {read} of {total} mail threads ({}%){}{}; {} relationship cards{}; {} correspondents",
                                 s(&r["realm"]),
                                 read * 100 / total,
                                 back.map(|b| format!(", back to {b}")).unwrap_or_default(),
+                                w["threads_failed"].as_i64().filter(|n| *n > 0).map(|n| format!("; {n} couldn't be read")).unwrap_or_default(),
                                 w["cards"].as_i64().unwrap_or(0),
                                 w["cards_waiting"].as_i64().filter(|n| *n > 0).map(|n| format!(" ({n} waiting to take in new threads)")).unwrap_or_default(),
                                 w["correspondents"].as_i64().unwrap_or(0)
