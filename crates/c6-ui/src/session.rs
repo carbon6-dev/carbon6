@@ -1413,7 +1413,9 @@ impl ModelChoice {
     /// The (connection, model, effort) to switch to, if the choice differs.
     fn switch(&self) -> Option<(String, String, String)> {
         let chosen = (self.connection.get_untracked(), self.model.get_untracked().trim().to_owned(), self.effort.get_untracked());
-        (!chosen.1.is_empty() && chosen != self.current.get_untracked()).then_some(chosen)
+        // Keep incomplete choices too: sending must report them, not silently
+        // leave the session on its previous connection.
+        (chosen != self.current.get_untracked()).then_some(chosen)
     }
 }
 
@@ -1480,6 +1482,11 @@ impl SubagentChoice {
     }
 }
 
+/// Claude Code can choose its own model; API connections need an explicit one.
+fn picker_model(kind: &str, default: Option<String>) -> String {
+    default.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| if kind == "claude_code" { "default".to_owned() } else { String::new() })
+}
+
 /// Connection select plus a model field that lists the connections' models
 /// and also takes free text. `no_claude_code`: leave Claude Code out (it
 /// cannot run there, e.g. over SSH or for subagents).
@@ -1497,12 +1504,13 @@ fn ModelPicker(
     view! {
         <select class=format!("{SMALL_INPUT} max-w-48") on:change=move |ev| {
             let c = event_target_value(&ev);
-            let default = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c)).and_then(|x| x.default_model);
+            let chosen = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c));
+            let default = chosen.map(|x| picker_model(&x.kind, x.default_model)).unwrap_or_default();
             if !supports_effort(&c) {
                 effort.set(String::new());
             }
             connection.set(c);
-            model.set(default.unwrap_or_default());
+            model.set(default);
         }>
             {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
                 .filter(|c| !(no_claude_code && c.kind == "claude_code") || connection.get_untracked() == c.id)
@@ -2847,6 +2855,10 @@ fn Composer(
             _ => {}
         }
         let switch = model.and_then(|m| m.switch());
+        if switch.as_ref().is_some_and(|(c, m, _)| c.trim().is_empty() || m.is_empty()) {
+            error.set(Some("Choose a connection and a model before sending; the session has not switched.".to_owned()));
+            return;
+        }
         text.set(String::new());
         attachments.set(Vec::new());
         mention.set(None);
@@ -3023,7 +3035,10 @@ fn Composer(
                         <ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code />
                         {move || {
                             let _ = (m.connection.get(), m.model.get(), m.effort.get());
-                            m.switch().map(|(to, _, _)| {
+                            m.switch().map(|(to, model, _)| {
+                                if to.trim().is_empty() || model.is_empty() {
+                                    return view! { <span class="text-amber-600 dark:text-amber-400">"choose a connection and model before sending"</span> }.into_any();
+                                }
                                 // Into or out of Claude Code: a handoff, not a switch.
                                 let kinds = kinds.get().and_then(Result::ok).unwrap_or_default();
                                 let is_cc = |id: &str| kinds.iter().any(|c| c.id == id && c.kind == "claude_code");
@@ -3272,6 +3287,34 @@ mod tests {
                 serde_json::from_value(e).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn connection_without_a_default_does_not_silently_cancel_a_switch() {
+        assert_eq!(picker_model("claude_code", None), "default");
+        assert_eq!(picker_model("claude_code", Some("  ".into())), "default");
+        assert_eq!(picker_model("claude_code", Some("sonnet".into())), "sonnet");
+        assert_eq!(picker_model("anthropic", None), "");
+        assert_eq!(picker_model("anthropic", Some("opus".into())), "opus");
+
+        let owner = Owner::new();
+        owner.with(|| {
+            let current = ("api".to_owned(), "old-model".to_owned(), String::new());
+            let choice = ModelChoice {
+                connection: RwSignal::new(current.0.clone()),
+                model: RwSignal::new(current.1.clone()),
+                effort: RwSignal::new(current.2.clone()),
+                current: Memo::new(move |_| current.clone()),
+            };
+            assert_eq!(choice.switch(), None);
+            choice.connection.set("cc".into());
+            choice.model.set(picker_model("claude_code", None));
+            assert_eq!(choice.switch(), Some(("cc".into(), "default".into(), String::new())));
+            // Clearing the model must stay a pending choice, so the composer
+            // can report the missing model instead of dropping the switch.
+            choice.model.set("  ".into());
+            assert_eq!(choice.switch(), Some(("cc".into(), String::new(), String::new())));
+        });
     }
 
     #[test]
