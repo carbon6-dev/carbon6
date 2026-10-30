@@ -1,5 +1,7 @@
 # Slide decks — Design
 
+Status: replaced by docs/docs.md (2026-10-30). Decks become first-class documents of carbon6 instead of an app; the decisions in §1 stand.
+
 carbon6 makes presentation decks the way Claude does: from a prompt to an outline you approve, a look you choose, then slides built and checked by eye until they look professional. It is an app (docs/os.md §5), configuration only, on two general capabilities.
 
 ## 1. Decisions

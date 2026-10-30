@@ -25,7 +25,7 @@ A **work item** is something you intend to finish:
 | realm, labels | as for sessions |
 | opened, last moved, closed | times |
 
-Work is flat: no projects, sub-items or dependencies. A label groups work items if you want that. Its steps are a flat checklist of **to-dos** (§12), not nested work.
+Work is flat: no sub-items or dependencies. Long-running efforts made of many work items are **projects** (docs/projects.md), one level above. Its steps are a flat checklist of **to-dos** (§12), not nested work.
 
 A **plain to-do** ("renew the domain") is a work item with nothing attached yet. Starting a session from it attaches that session.
 
