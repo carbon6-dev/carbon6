@@ -76,22 +76,32 @@ pub(crate) async fn save_in(
             .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
             .and_then(|d| d.and_hms_opt(17, 0, 0))
             .map(|d| d.and_utc().timestamp_millis());
+        let owner = who(c["who"].as_str().unwrap_or("me"), &accounts);
         // An expired promise may be reaffirmed on a newer item; a decision by hand still stands.
+        let previous: Vec<String> = sqlx::query_scalar(
+            "SELECT who FROM commitments WHERE item_id IN (SELECT value FROM json_each(?1)) AND lower(what) = lower(?2) \
+             AND (status != 'expired' OR item_id = ?3 OR decided_at IS NOT NULL)",
+        )
+        .bind(&items)
+        .bind(what)
+        .bind(last)
+        .fetch_all(&mut *conn)
+        .await?;
+        if previous.iter().any(|stored| who(stored, &accounts) == owner) {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO commitments (item_id, who, what, due, made_by, created_at, said_at, status) \
-            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE NOT EXISTS (SELECT 1 FROM commitments \
-            WHERE item_id IN (SELECT value FROM json_each(?9)) AND lower(what) = lower(?3) \
-            AND (status != 'expired' OR item_id = ?1 OR decided_at IS NOT NULL))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(last)
-        .bind(who(c["who"].as_str().unwrap_or("me"), &accounts))
+        .bind(owner)
         .bind(what)
         .bind(due)
         .bind(made_by)
         .bind(now)
         .bind(said_at)
         .bind(if expired(made_by, said_at, due, now) { "expired" } else { "open" })
-        .bind(&items)
         .execute(&mut *conn)
         .await?;
     }
@@ -236,6 +246,68 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, cases.iter().map(|(_, who)| (who.to_string(), said)).collect::<Vec<_>>());
         }
+    }
+
+    #[tokio::test]
+    async fn equal_promises_are_kept_for_each_owner_and_decisions_stay_with_them() {
+        let (_dir, m) = memex().await;
+        let now = c6_core::now_ms();
+        m.accounts.lock().unwrap().push(Account { email: "rae@example.net".into(), name: "Rae Quinn".into(), ..Default::default() });
+        let id = item(&m, "plans", now).await;
+        let values = json!([
+            {"who":"Rae Quinn", "what":"Send availability"},
+            {"who":"RAE@example.net", "what":"send availability"},
+            {"who":"Pat@example.net", "what":"Send availability"},
+            {"who":"PAT@EXAMPLE.NET", "what":"SEND AVAILABILITY"}
+        ]);
+        save(&m, std::slice::from_ref(&id), &values, "understand-v1", now).await.unwrap();
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, who FROM commitments ORDER BY who").fetch_all(&m.store.pool).await.unwrap();
+        assert_eq!(rows.iter().map(|(_, who)| who.as_str()).collect::<Vec<_>>(), ["me", "pat@example.net"]);
+        for status in ["done", "expired"] {
+            set(&m, rows[0].0, status, now).await.unwrap();
+            save(&m, std::slice::from_ref(&id), &values, "understand-v1", now).await.unwrap();
+            let kept: Vec<(i64, String, String, Option<i64>)> =
+                sqlx::query_as("SELECT id, who, status, decided_at FROM commitments ORDER BY who").fetch_all(&m.store.pool).await.unwrap();
+            assert_eq!(kept.len(), 2);
+            assert_eq!(kept[0], (rows[0].0, "me".into(), status.into(), Some(now)));
+            assert_eq!((kept[1].1.as_str(), kept[1].2.as_str(), kept[1].3), ("pat@example.net", "open", None));
+        }
+    }
+
+    #[tokio::test]
+    async fn decided_legacy_owner_aliases_block_rereads_before_cleanup() {
+        let (_dir, m) = memex().await;
+        let now = c6_core::now_ms();
+        m.accounts.lock().unwrap().push(Account { email: "rae@example.net".into(), name: "Rae Quinn".into(), ..Default::default() });
+        for alias in ["RAE@example.NET", "Rae   Quinn", "Some Name <rae@example.net>"] {
+            for status in ["done", "dropped", "expired"] {
+                let item = item(&m, &format!("{alias}:{status}"), now).await;
+                let id = insert(&m, &item, "Send availability", status, now, None, "understand-v1").await;
+                sqlx::query("UPDATE commitments SET who = ?, decided_at = ? WHERE id = ?")
+                    .bind(alias)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&m.store.pool)
+                    .await
+                    .unwrap();
+                save(&m, std::slice::from_ref(&item), &json!([{"who":"me", "what":"send availability"}]), "understand-v1", now)
+                    .await
+                    .unwrap();
+                let rows: Vec<(i64, String, String, Option<i64>)> =
+                    sqlx::query_as("SELECT id, who, status, decided_at FROM commitments WHERE item_id = ?")
+                        .bind(&item)
+                        .fetch_all(&m.store.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(rows, [(id, alias.into(), status.into(), Some(now))]);
+            }
+        }
+        let cleaned: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memex_once WHERE name = 'commitment-owners')")
+            .fetch_one(&m.store.pool)
+            .await
+            .unwrap();
+        assert!(!cleaned);
     }
 
     #[tokio::test]
