@@ -206,6 +206,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         },
         root_id: r.root_id.clone(),
         subagents_running: 0,
+        side_chats_running: 0,
         observed: r.observed,
         instance: r.instance.clone(),
         colour: r.colour.clone(),
@@ -213,6 +214,11 @@ pub fn session(r: &SessionRow) -> api::Session {
         subagent_model: r.subagent_model.clone(),
         subagent_effort: r.subagent_effort.clone(),
     }
+}
+
+pub fn session_with_activity(r: &SessionRow, activity: Option<&crate::store::SessionActivity>) -> api::Session {
+    let activity = activity.copied().unwrap_or_default();
+    api::Session { subagents_running: activity.subagents_running, side_chats_running: activity.side_chats_running, ..session(r) }
 }
 
 pub fn queued(c: &CommandRow) -> api::QueuedInput {

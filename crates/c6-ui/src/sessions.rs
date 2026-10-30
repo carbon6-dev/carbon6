@@ -59,7 +59,7 @@ pub fn SessionsPage() -> impl IntoView {
                             .sessions
                             .get()
                             .into_iter()
-                            .filter(|s| st.is_empty() || serde_json::to_value(s.status).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
+                            .filter(|s| st.is_empty() || serde_json::to_value(s.display_status()).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
                             .filter(|s| crate::labels::matches(s, &wanted))
                             .filter(|s| realm.is_empty() || s.realm == realm)
                             .filter(|s| {
@@ -176,7 +176,7 @@ fn grouped(
         .into_iter()
         .map(|(value, list)| {
             let here = format!("{path}{key}:{}\u{1f}", value.as_deref().unwrap_or(""));
-            let (count, running) = (list.len(), list.iter().filter(|s| s.status == SessionStatus::Running).count());
+            let (count, running) = (list.len(), list.iter().filter(|s| s.display_status() == SessionStatus::Running).count());
             let name = match &value {
                 Some(v) => view! { <span class="font-mono">{v.clone()}</span> }.into_any(),
                 None => view! { <span class="italic">{format!("no {key}")}</span> }.into_any(),
@@ -336,6 +336,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let live = api::live();
     let worker = live.worker_name(&s.worker_id.to_string());
     let updated = s.updated_at;
+    let status = s.display_status();
     view! {
         <div class="group flex items-center gap-1 pr-2 hover:bg-zinc-100 dark:hover:bg-zinc-900">
         <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-3 pl-4" title="Open beside this list (⌘-click: new tile)">
@@ -355,7 +356,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                     </div>
                 })}
             </div>
-            <StatusPill status=s.status />
+            <StatusPill status />
             <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
         </Go>
         <SessionMenu id=s.id.clone() />
@@ -489,7 +490,7 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
     let state = if s.awaiting_approval {
         "h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"
     } else {
-        match s.status {
+        match s.display_status() {
             SessionStatus::Running => "h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-blue-500",
             SessionStatus::Failed => "h-1.5 w-1.5 shrink-0 rounded-full bg-red-500",
             _ => "hidden",
@@ -540,7 +541,7 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
             on:mouseleave=move |_| hover.hide_soon()>
             <div class="flex items-start gap-2">
                 <div class="min-w-0 flex-1 break-words font-medium">{s.title.clone()}</div>
-                <StatusPill status=s.status />
+                <StatusPill status=s.display_status() />
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-zinc-500">
@@ -1082,7 +1083,8 @@ fn SessionForm(
     }
 }
 
-/// Live status for a session id, from the session list feed.
+/// Raw main-turn status for operational controls, not aggregated display status.
+/// From the session list feed.
 pub fn live_status(id: &str) -> Option<SessionStatus> {
     api::live().sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.status))
 }

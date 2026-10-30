@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use c6_api::SessionStatus;
+use c6_api::{Session, SessionStatus};
 use leptos::prelude::*;
 use web_sys::{Notification, NotificationOptions, NotificationPermission};
 
@@ -14,7 +14,13 @@ fn enabled() -> bool {
     Notification::permission() == NotificationPermission::Granted && storage_get("c6.notify").as_deref() != Some("0")
 }
 
-/// Watches the live session list and notifies on running → idle/failed,
+fn finished(previous: &mut HashMap<String, SessionStatus>, session: &Session) -> bool {
+    let status = session.display_status();
+    let was = previous.insert(session.id.clone(), status);
+    was == Some(SessionStatus::Running) && matches!(status, SessionStatus::Idle | SessionStatus::Failed)
+}
+
+/// Watches the live session list and notifies on aggregated running → idle/failed,
 /// for the sessions the label filter shows.
 pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: crate::labels::LabelFilter) {
     let previous = StoredValue::new(HashMap::<String, SessionStatus>::new());
@@ -26,8 +32,7 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
         let wanted = filter.0.get_untracked();
         previous.update_value(|prev| {
             for s in &sessions {
-                let was = prev.insert(s.id.clone(), s.status);
-                let finished = was == Some(SessionStatus::Running) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed);
+                let finished = finished(prev, s);
                 // Starting to wait for your approval is worth a notice too.
                 let asks = s.awaiting_approval && !waiting.with_value(|w| w.contains(&s.id));
                 if asks {
@@ -41,7 +46,7 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
                         "{} on {}",
                         if asks {
                             "Needs your approval"
-                        } else if s.status == SessionStatus::Failed {
+                        } else if s.display_status() == SessionStatus::Failed {
                             "Failed"
                         } else {
                             "Finished"
@@ -98,5 +103,54 @@ pub fn NotifyToggle() -> impl IntoView {
                 _ => "🔕 off",
             }}
         </button>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": "s1", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "t", "cwd": "/src/app",
+            "connection_id": "anthropic", "model": "claude-x", "status": "idle", "error": null,
+            "created_at": 0, "updated_at": 0, "last_seq": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn completion_waits_for_side_chats_and_subagents() {
+        let mut previous = HashMap::new();
+        let mut s = session();
+        s.status = SessionStatus::Running;
+        assert!(!finished(&mut previous, &s));
+
+        s.side_chats_running = 1;
+        s.subagents_running = 1;
+        s.status = SessionStatus::Idle;
+        assert!(!finished(&mut previous, &s));
+
+        s.side_chats_running = 0;
+        assert!(!finished(&mut previous, &s));
+
+        s.subagents_running = 0;
+        assert!(finished(&mut previous, &s));
+        assert!(!finished(&mut previous, &s));
+    }
+
+    #[test]
+    fn side_chat_only_activity_can_finish_or_fail() {
+        for end in [SessionStatus::Idle, SessionStatus::Failed] {
+            let mut previous = HashMap::new();
+            let mut s = session();
+            assert!(!finished(&mut previous, &s));
+            s.side_chats_running = 1;
+            assert!(!finished(&mut previous, &s));
+            s.side_chats_running = 0;
+            s.status = end;
+            assert!(finished(&mut previous, &s));
+            assert!(!finished(&mut previous, &s));
+        }
     }
 }

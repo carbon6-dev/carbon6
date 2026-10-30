@@ -710,13 +710,13 @@ const EVENT_PAGE: i64 = 1000;
 /// The session list a caller sees: its realm's, or (you, root) every
 /// realm's most recent.
 pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Session>> {
-    let working = st.store.subagents_running().await?;
+    let working = st.store.session_activity(caller.realm.as_deref()).await?;
     Ok(st
         .store
         .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
         .await?
         .iter()
-        .map(|r| api::Session { subagents_running: working.get(&r.id).copied().unwrap_or(0), ..crate::convert::session(r) })
+        .map(|r| crate::convert::session_with_activity(r, working.get(&r.id)))
         .collect())
 }
 
@@ -940,6 +940,7 @@ async fn search(
 
 async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::SessionDetail>> {
     let row = st.store.session(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let working = st.store.session_activity(Some(&row.realm)).await?;
     let worker_id: Option<WorkerId> = row.worker_id.parse().ok();
     let worker = match worker_id {
         Some(w) => st.store.worker(w).await?,
@@ -947,7 +948,7 @@ async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
     };
     let queued = st.store.queued_inputs(&id).await?.iter().map(crate::convert::queued).collect();
     Ok(Json(api::SessionDetail {
-        session: crate::convert::session(&row),
+        session: crate::convert::session_with_activity(&row, working.get(&row.id)),
         worker_name: worker.map(|w| w.name).unwrap_or_else(|| "(removed)".into()),
         worker_online: worker_id.is_some_and(|w| st.registry.get(w).is_some()),
         queued,

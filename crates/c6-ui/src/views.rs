@@ -340,9 +340,12 @@ fn RecordBody(view: ViewDef, id: String) -> impl IntoView {
                             if ss.is_empty() {
                                 view! { <p class="text-xs text-zinc-500">"None yet: the view's actions start sessions about this record."</p> }.into_any()
                             } else {
-                                ss.into_iter().map(|s| view! {
-                                    <div class="text-sm"><Go to=View::Session { id: s.id.clone(), target: None } class="hover:underline">{s.title.clone()}</Go>
-                                    <span class="ml-2 text-xs text-zinc-500">{format!("{:?} · {}", s.status, ago(now_ms() - s.updated_at))}</span></div>
+                                ss.into_iter().map(|s| {
+                                    let status = s.display_status();
+                                    view! {
+                                        <div class="text-sm"><Go to=View::Session { id: s.id.clone(), target: None } class="hover:underline">{s.title.clone()}</Go>
+                                        <span class="ml-2 text-xs text-zinc-500">{format!("{:?} · {}", status, ago(now_ms() - s.updated_at))}</span></div>
+                                    }
                                 }).collect_view().into_any()
                             }
                         }
@@ -424,12 +427,15 @@ fn FeedView(view: ViewDef) -> impl IntoView {
                         .filter(|s| labels.iter().all(|l| s.labels.contains(l) || s.auto_labels.contains(l)))
                         .collect();
                     ss.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-                    ss.into_iter().take(50).map(|s| view! {
-                        <div class="flex items-center gap-2 border-b border-zinc-100 py-1 text-sm dark:border-zinc-800">
-                            <span class="w-24 shrink-0 text-xs text-zinc-500">{ago(now_ms() - s.updated_at)}</span>
-                            <Go to=View::Session { id: s.id.clone(), target: None } class="min-w-0 flex-1 truncate hover:underline">{s.title.clone()}</Go>
-                            <span class="text-xs text-zinc-500">{format!("{:?}", s.status)}</span>
-                        </div>
+                    ss.into_iter().take(50).map(|s| {
+                        let status = s.display_status();
+                        view! {
+                            <div class="flex items-center gap-2 border-b border-zinc-100 py-1 text-sm dark:border-zinc-800">
+                                <span class="w-24 shrink-0 text-xs text-zinc-500">{ago(now_ms() - s.updated_at)}</span>
+                                <Go to=View::Session { id: s.id.clone(), target: None } class="min-w-0 flex-1 truncate hover:underline">{s.title.clone()}</Go>
+                                <span class="text-xs text-zinc-500">{format!("{:?}", status)}</span>
+                            </div>
+                        }
                     }).collect_view()
                 }}
             </div>

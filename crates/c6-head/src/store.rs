@@ -493,6 +493,12 @@ pub struct SessionRow {
     pub colour: String,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionActivity {
+    pub subagents_running: u32,
+    pub side_chats_running: u32,
+}
+
 impl SessionRow {
     pub fn user_labels(&self) -> Vec<String> {
         serde_json::from_str(&self.labels).unwrap_or_default()
@@ -604,15 +610,39 @@ impl Store {
         .await?)
     }
 
-    /// Subagents working now, per top-level session.
-    pub async fn subagents_running(&self) -> anyhow::Result<std::collections::HashMap<String, u32>> {
+    /// Running descendants for display, in one batch for list/feed and detail.
+    /// Side chats count for each ancestor; subagents retain their top-level
+    /// root semantics. Never follow a relationship into a different realm.
+    pub async fn session_activity(&self, realm: Option<&str>) -> anyhow::Result<std::collections::HashMap<String, SessionActivity>> {
         let rows = sqlx::query(
-            "SELECT root_id, COUNT(*) AS n FROM sessions WHERE root_id IS NOT NULL AND parent_call_id IS NOT NULL \
-             AND status = 'running' GROUP BY root_id",
+            "WITH RECURSIVE side_ancestors(id, realm, child_id) AS (\
+                 SELECT p.id, p.realm, s.id FROM sessions s JOIN sessions p ON p.id = s.parent_id AND p.realm = s.realm \
+                 WHERE s.fork_seq IS NOT NULL AND s.parent_call_id IS NULL AND s.status = 'running' AND (?1 IS NULL OR s.realm = ?1) \
+                 UNION \
+                 SELECT p.id, p.realm, a.child_id FROM side_ancestors a JOIN sessions s ON s.id = a.id \
+                 JOIN sessions p ON p.id = s.parent_id AND p.realm = a.realm\
+             ), activity AS (\
+                 SELECT id, 0 AS subagents, COUNT(*) AS side_chats FROM side_ancestors GROUP BY id \
+                 UNION ALL \
+                 SELECT p.id, COUNT(*), 0 FROM sessions s JOIN sessions p ON p.id = s.root_id AND p.realm = s.realm \
+                 WHERE s.parent_call_id IS NOT NULL AND s.status = 'running' AND (?1 IS NULL OR s.realm = ?1) GROUP BY p.id\
+             ) SELECT id, SUM(subagents) AS subagents, SUM(side_chats) AS side_chats FROM activity GROUP BY id",
         )
+        .bind(realm)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| (r.get::<String, _>("root_id"), r.get::<i64, _>("n") as u32)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("id"),
+                    SessionActivity {
+                        subagents_running: r.get::<i64, _>("subagents") as u32,
+                        side_chats_running: r.get::<i64, _>("side_chats") as u32,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Every session below `id`: its side chats and subagents, theirs, and so

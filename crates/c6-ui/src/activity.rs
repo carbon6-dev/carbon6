@@ -145,10 +145,10 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
     view! {
         <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
             <span class=format!("h-6 w-1 shrink-0 rounded-sm {}", crate::colour::solid(crate::colour::of(&s))) title="Its colour"></span>
-            <span class=dot(s.status, t)></span>
+            <span class=dot(s.display_status(), t)></span>
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘-click: new tile)">
                 <div class="truncate text-sm">{s.title.clone()}</div>
-                <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.status, t), worker)}</div>
+                <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
             </Go>
             {dismissable.then(|| {
                 let id = id.clone();
@@ -219,10 +219,10 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
     let (dismiss_id, pin_id) = (s.id.clone(), s.id.clone());
     view! {
         <div class="flex items-center gap-3 px-4 py-3">
-            <span class=dot(s.status, t)></span>
+            <span class=dot(s.display_status(), t)></span>
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
-                <div class="truncate text-xs text-zinc-500">{format!("{} · {} · {}", what(s.status, t), worker, ago(now_ms() - s.updated_at))}</div>
+                <div class="truncate text-xs text-zinc-500">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-1">
                         {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
@@ -365,7 +365,7 @@ fn MissionCard(id: String) -> impl IntoView {
     view! {
         <div class="flex h-48 flex-col rounded-lg border sm:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
             <div class="group flex items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
-                {move || session.get().map(|s| view! { <span class=dot(s.status, tracked())></span> })}
+                {move || session.get().map(|s| view! { <span class=dot(s.display_status(), tracked())></span> })}
                 <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
                 </Go>

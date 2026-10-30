@@ -226,9 +226,12 @@ pub struct Session {
     /// Side chats and subagents: the top-level session of their tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_id: Option<String>,
-    /// In the session list: how many subagents in its tree are working now.
+    /// How many subagents in its tree are working now (top-level sessions).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub subagents_running: u32,
+    /// How many descendant side chats are running, excluding subagents.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub side_chats_running: u32,
     /// A subagent of Claude Code's, mirrored from its stream: read-only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observed: bool,
@@ -247,6 +250,81 @@ pub struct Session {
     pub subagent_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subagent_effort: String,
+}
+
+impl Session {
+    /// Overall activity for display, not the main turn's operational status.
+    /// Approval remains an independent flag; starting and failed sessions
+    /// keep their status even when descendants are active.
+    pub fn display_status(&self) -> SessionStatus {
+        match self.status {
+            SessionStatus::Idle if self.side_chats_running > 0 || self.subagents_running > 0 => SessionStatus::Running,
+            status => status,
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn session() -> Session {
+        // Older servers did not send activity counts or the other optional
+        // fields. Keep that wire format readable.
+        serde_json::from_value(json!({
+            "id": "root", "worker_id": "00000000-0000-0000-0000-000000000000",
+            "title": "root", "cwd": "/tmp", "connection_id": "c", "model": "m",
+            "status": "idle", "error": null, "effort": null,
+            "created_at": 0, "updated_at": 0, "last_seq": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn session_activity_wire_defaults_and_round_trip() {
+        let mut s = session();
+        assert_eq!(s.side_chats_running, 0);
+        assert_eq!(s.subagents_running, 0);
+        let wire = serde_json::to_value(&s).unwrap();
+        assert!(wire.get("side_chats_running").is_none());
+        assert!(wire.get("subagents_running").is_none());
+        s.side_chats_running = 3;
+        s.subagents_running = 2;
+        let wire = serde_json::to_value(&s).unwrap();
+        assert_eq!(wire["side_chats_running"], 3);
+        assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
+    }
+
+    #[test]
+    fn session_display_status_preserves_main_turn_and_approval() {
+        let mut s = session();
+        for status in [SessionStatus::Idle, SessionStatus::Running, SessionStatus::Starting, SessionStatus::Failed] {
+            for (side_chats, subagents) in [(0, 0), (2, 0), (0, 1), (2, 1)] {
+                for awaiting in [false, true] {
+                    s.status = status;
+                    s.side_chats_running = side_chats;
+                    s.subagents_running = subagents;
+                    s.awaiting_approval = awaiting;
+                    let expected =
+                        if status == SessionStatus::Idle && side_chats + subagents > 0 { SessionStatus::Running } else { status };
+                    assert_eq!(s.display_status(), expected);
+                    assert_eq!(s.status, status);
+                    assert_eq!(s.awaiting_approval, awaiting);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn session_activity_schema_is_optional() {
+        let schema = serde_json::to_value(schemars::schema_for!(Session)).unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("side_chats_running")));
+        assert_eq!(schema["properties"]["side_chats_running"]["type"], "integer");
+        assert_eq!(schema["properties"]["side_chats_running"]["minimum"], 0);
+    }
 }
 
 /// `PUT /api/v1/sessions/{id}/subagent-model`: the default connection,

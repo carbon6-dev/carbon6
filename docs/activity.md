@@ -49,6 +49,12 @@ Each app's scheduled kit syncs: mail, calendar and contacts (the Google apps) an
 
 While model calls are in flight or a sync is under way, a pulsing dot in the top bar shows how many. Clicking it opens the page.
 
+## Session indicators
+
+A session's displayed status includes its side chats and subagents: an idle main chat still shows **running** while any of them is working. The tile bar, session list and rail, Activity/Mission views, running filters/counts and desktop completion notifications use this aggregate. Once the last running chat finishes, it returns to idle; starting or failed main-chat states and approval warnings retain their precedence.
+
+This is presentation, not a change to the main chat's execution state. You can still send a message to an idle main chat while a side chat runs, and its Send/Stop/Esc controls apply only to its own turn. The API retains that raw `status` and exposes `side_chats_running` and `subagents_running` separately.
+
 ## API
 
 These are console ops (`system.*`):

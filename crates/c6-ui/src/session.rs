@@ -720,6 +720,14 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
     let SessionChrome {
         id, detail, status, started, model_label, events, tab, details, find_open, like_this, root, force_open, col, ..
     } = chrome;
+    // Presentation includes work in side chats/subagents. Keep `status` and
+    // `running()` elsewhere tied to this chat's own turn for Send/Stop/Esc.
+    let display_status = Memo::new(move |_| {
+        live.sessions
+            .with(|ss| ss.iter().find(|s| s.id == id.get_value()).map(c6_api::Session::display_status))
+            .or_else(|| detail.get().and_then(Result::ok).map(|d| d.session.display_status()))
+            .unwrap_or_else(|| status.get())
+    });
     let popover = on_act.is_some();
     let act = move || {
         if let Some(f) = on_act {
@@ -810,7 +818,7 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
                         })}
                         <crate::tasks::RunningTasks session=id.get_value() events />
                         <SubagentsPill session=id.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.get_value() />
-                        {move || view! { <StatusPill status=status.get() /> }}
+                        {move || view! { <StatusPill status=display_status.get() /> }}
                         <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
                             act();
                             spawn_local(async move {

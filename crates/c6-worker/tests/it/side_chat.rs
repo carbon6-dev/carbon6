@@ -62,6 +62,90 @@ fn last_request(mock: &MockLlm) -> String {
     mock.requests().last().unwrap()["messages"].to_string()
 }
 
+/// Exercise the head's API with controlled stored activity, independently of
+/// model timing: operational status must never be rewritten for display.
+#[tokio::test]
+async fn side_chat_activity_counts_are_realm_safe_and_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let env = Env { api: format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port()), http: reqwest::Client::new() };
+    let pool = head.state.store.pool();
+    for (id, parent, root, realm, status, fork, call) in [
+        ("main", None, None, "home", "idle", None, None),
+        ("other", None, None, "home", "idle", None, None),
+        ("realm-root", None, None, "root", "idle", None, None),
+        ("side", Some("main"), Some("main"), "home", "running", Some(1), None),
+        ("nested", Some("side"), Some("main"), "home", "running", Some(2), None),
+        ("sibling", Some("main"), Some("main"), "home", "running", Some(1), None),
+        ("starting", Some("main"), Some("main"), "home", "starting", Some(1), None),
+        ("failed", Some("main"), Some("main"), "home", "failed", Some(1), None),
+        ("idle", Some("main"), Some("main"), "home", "idle", Some(1), None),
+        ("agent", Some("side"), Some("main"), "home", "running", None, Some("call")),
+        ("realm-side", Some("realm-root"), Some("realm-root"), "root", "running", Some(1), None),
+        // Even malformed cross-realm references cannot affect home counts.
+        ("cross-side", Some("main"), Some("main"), "root", "running", Some(1), None),
+        ("cross-agent", Some("main"), Some("main"), "root", "running", None, Some("call")),
+    ] {
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, \
+             parent_id, root_id, realm, fork_seq, parent_call_id) VALUES (?, ?, ?, '/tmp', 'c', 'm', ?, 0, 0, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("00000000-0000-0000-0000-000000000000")
+        .bind(id)
+        .bind(status)
+        .bind(parent)
+        .bind(root)
+        .bind(realm)
+        .bind(fork)
+        .bind(call)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    let list: Vec<Session> = env.get("/sessions").await;
+    let main = list.iter().find(|s| s.id == "main").unwrap();
+    assert_eq!(main.status, SessionStatus::Idle);
+    assert_eq!(main.display_status(), SessionStatus::Running);
+    assert_eq!((main.side_chats_running, main.subagents_running), (3, 1));
+    let detail: SessionDetail = env.get("/sessions/main").await;
+    assert_eq!(&detail.session, main, "detail and list share counts and retain raw status");
+    let stored = head.state.store.session("main").await.unwrap().unwrap();
+    assert_eq!(stored.status, "idle");
+    for (id, sides) in [("other", 0), ("realm-root", 1), ("side", 1), ("sibling", 0), ("nested", 0)] {
+        let detail: SessionDetail = env.get(&format!("/sessions/{id}")).await;
+        assert_eq!(detail.session.side_chats_running, sides, "{id}");
+        assert_eq!(detail.session.subagents_running, 0, "subagents keep root-only semantics: {id}");
+    }
+    let scoped = c6_head::api::sessions_snapshot(&head.state, &c6_head::realms::Caller::in_realm("home")).await.unwrap();
+    assert!(scoped.iter().all(|s| s.realm == "home"));
+    assert_eq!(scoped.iter().find(|s| s.id == "main").unwrap(), main, "realm-scoped feed snapshot matches list");
+
+    // Completed side chats no longer count; the root's still-active
+    // subagent keeps overall display activity until it too completes.
+    sqlx::query("UPDATE sessions SET status = 'idle' WHERE fork_seq IS NOT NULL AND realm = 'home'").execute(pool).await.unwrap();
+    let detail: SessionDetail = env.get("/sessions/main").await;
+    assert_eq!((detail.session.side_chats_running, detail.session.subagents_running), (0, 1));
+    assert_eq!(detail.session.display_status(), SessionStatus::Running);
+    sqlx::query("UPDATE sessions SET status = 'idle' WHERE id = 'agent'").execute(pool).await.unwrap();
+    let detail: SessionDetail = env.get("/sessions/main").await;
+    assert_eq!(detail.session.status, SessionStatus::Idle);
+    assert_eq!(detail.session.display_status(), SessionStatus::Idle);
+    assert_eq!((detail.session.side_chats_running, detail.session.subagents_running), (0, 0));
+    let list: Vec<Session> = env.get("/sessions").await;
+    assert_eq!(list.iter().find(|s| s.id == "main").unwrap(), &detail.session);
+    head.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn side_chats_branch_continue_nest_and_restore() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
@@ -102,7 +186,7 @@ async fn side_chats_branch_continue_nest_and_restore() {
 
     // A side chat on the first answer, with another model: it sees the
     // conversation up to there and nothing after.
-    mock.push(Reply::Text("side answer".into()));
+    let side_gate = mock.push_gated(Reply::Text("side answer".into()));
     let side: Session = env
         .post(
             &format!("/sessions/{}/side-chats", main.id),
@@ -110,7 +194,21 @@ async fn side_chats_branch_continue_nest_and_restore() {
         )
         .await;
     assert_eq!((side.parent_id.as_deref(), side.fork_seq), (Some(main.id.as_str()), Some(anchor)));
+    let active = eventually("side chat activity on its idle main", async || {
+        let d: SessionDetail = env.get(&format!("/sessions/{}", main.id)).await;
+        (d.session.side_chats_running == 1).then_some(d.session)
+    })
+    .await;
+    assert_eq!(active.status, SessionStatus::Idle);
+    assert_eq!(active.display_status(), SessionStatus::Running);
+    assert_eq!(active.subagents_running, 0);
+    let top: Vec<Session> = env.get("/sessions").await;
+    assert_eq!(top.iter().find(|s| s.id == main.id).unwrap(), &active);
+    side_gate.notify_one();
     let side_evs = env.idle(&side.id, 1).await;
+    let d: SessionDetail = env.get(&format!("/sessions/{}", main.id)).await;
+    assert_eq!(d.session.side_chats_running, 0);
+    assert_eq!(d.session.display_status(), SessionStatus::Idle);
     let req = &mock.requests().last().unwrap().clone();
     assert_eq!(req["model"], "side-model");
     let msgs = req["messages"].to_string();
@@ -128,13 +226,25 @@ async fn side_chats_branch_continue_nest_and_restore() {
     assert!(msgs.contains("first question") && msgs.contains("side answer") && msgs.contains("and then?"), "{msgs}");
 
     // Nested: a side chat of the side chat.
-    mock.push(Reply::Text("nested answer".into()));
+    let nested_gate = mock.push_gated(Reply::Text("nested answer".into()));
     let nested: Session = env
         .post(
             &format!("/sessions/{}/side-chats", side.id),
             json!({"anchor_seq": first_assistant(&side_evs), "connection_id": conn.id, "model": "side-model", "prompt": "deeper?"}),
         )
         .await;
+    eventually("nested side chat activity on each ancestor", async || {
+        let main: SessionDetail = env.get(&format!("/sessions/{}", main.id)).await;
+        let side: SessionDetail = env.get(&format!("/sessions/{}", side.id)).await;
+        (main.session.side_chats_running == 1 && side.session.side_chats_running == 1).then(|| {
+            for s in [&main.session, &side.session] {
+                assert_eq!(s.status, SessionStatus::Idle);
+                assert_eq!(s.display_status(), SessionStatus::Running);
+            }
+        })
+    })
+    .await;
+    nested_gate.notify_one();
     env.idle(&nested.id, 1).await;
     let msgs = last_request(&mock);
     for s in ["first question", "main answer one", "why?", "side answer", "deeper?"] {

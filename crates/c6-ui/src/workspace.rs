@@ -932,8 +932,9 @@ impl Workspace {
             let mut flagged = Vec::new();
             previous.update_value(|prev| {
                 for s in &sessions {
-                    let was = prev.insert(s.id.clone(), s.status);
-                    let ended = was == Some(SessionStatus::Running) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed);
+                    let status = s.display_status();
+                    let was = prev.insert(s.id.clone(), status);
+                    let ended = was == Some(SessionStatus::Running) && matches!(status, SessionStatus::Idle | SessionStatus::Failed);
                     if ended && !visible.contains(&s.id) {
                         flagged.push(s.id.clone());
                     }
@@ -978,7 +979,7 @@ impl Workspace {
                 push(s, Tracked::Pinned, &mut out);
             }
         }
-        for s in sessions.iter().filter(|s| s.status == SessionStatus::Running) {
+        for s in sessions.iter().filter(|s| s.display_status() == SessionStatus::Running) {
             push(s.clone(), Tracked::Running, &mut out);
         }
         for id in self.attention.get() {
@@ -1302,7 +1303,7 @@ fn status_pill(s: &Session) -> (&'static str, &'static str) {
     if s.awaiting_approval {
         return ("bg-amber-500 text-white", "needs approval");
     }
-    match s.status {
+    match s.display_status() {
         SessionStatus::Running => ("bg-blue-600 text-white", "running"),
         SessionStatus::Idle => ("bg-white/70 text-zinc-600 dark:bg-black/30 dark:text-zinc-300", "idle"),
         SessionStatus::Starting => ("bg-white/70 text-amber-700 dark:bg-black/30 dark:text-amber-300", "starting"),
@@ -1480,7 +1481,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     let (cls, label) = status_pill(&s);
                     view! {
                         <span class=format!("flex shrink-0 items-center gap-1 rounded-full px-1.5 py-px text-[10px] font-medium {cls}")>
-                            {(s.status == SessionStatus::Running).then(|| view! { <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-white"></span> })}
+                            {(s.display_status() == SessionStatus::Running).then(|| view! { <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-white"></span> })}
                             {label}
                         </span>
                     }
@@ -1541,6 +1542,24 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_status_includes_side_chat_activity_without_changing_the_main_turn() {
+        let mut session: Session = serde_json::from_value(serde_json::json!({
+            "id": "main", "worker_id": "00000000-0000-0000-0000-000000000000",
+            "title": "Main", "cwd": "", "connection_id": "", "model": "",
+            "status": "idle", "created_at": 0, "updated_at": 0, "last_seq": 0,
+            "side_chats_running": 1
+        }))
+        .unwrap();
+        assert_eq!(status_pill(&session).1, "running");
+        assert_eq!(session.status, SessionStatus::Idle, "the main composer must remain available");
+        session.awaiting_approval = true;
+        assert_eq!(status_pill(&session).1, "needs approval");
+        session.awaiting_approval = false;
+        session.side_chats_running = 0;
+        assert_eq!(status_pill(&session).1, "idle");
+    }
 
     #[test]
     fn brief_views_load_without_carrying_selection() {
