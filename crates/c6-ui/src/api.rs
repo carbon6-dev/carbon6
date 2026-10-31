@@ -552,6 +552,17 @@ pub async fn dismiss_rejected(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/rejected")).send().await).await
 }
 
+/// Cancels a queued input before it is delivered.
+pub async fn cancel_queued_input(id: String, command_id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/{}", enc(&command_id))).send().await).await
+}
+
+/// Pulls a queued message and every message queued after it out of the
+/// queue (they are canceled), to be re-sent edited, reordered or dropped.
+pub async fn pull_queued(id: String, command_id: String) -> Result<Vec<QueuedInput>, String> {
+    json(Request::post(&format!("/api/v1/sessions/{id}/queue/{}/pull", enc(&command_id))).send().await).await
+}
+
 // --- Worker files, git, terminals ---------------------------------------------
 
 pub fn enc(s: &str) -> String {

@@ -115,6 +115,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
         "kit.job" => kit_job(worker, &params).await,
+        "session.queue_op" => session_queue_op(worker, &params).await,
         "update.apply" => crate::update::apply(worker, &params).await,
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
@@ -145,6 +146,61 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
 fn path_param(params: &Value) -> anyhow::Result<PathBuf> {
     let p = params["path"].as_str().filter(|p| !p.is_empty()).context("path required")?;
     Ok(crate::expand_home(p))
+}
+
+/// Edit or cancel one of a session's queued inputs before it is delivered.
+///
+/// `{"session_id", "command_id", "op": "update"|"cancel", "data"?: base64
+/// UserInput}`. Answers `{"state": ...}`:
+/// - `updated` / `cancelled`: it was in the session's inbox and the change
+///   is done.
+/// - `in_flight`: it is being sent to the model now (or its turn is
+///   starting): the head refuses with 409.
+/// - `pending`: not in the inbox and not delivered yet (the worker
+///   restarted, or the input was never delivered here): the head's row
+///   rewrite takes effect when the command is (re)delivered.
+/// - `delivered`: it was already delivered: the head refuses with 409.
+///
+/// An old worker answers "unknown method"; the head then keeps the row as
+/// it is (503), so upgrading the head before the workers changes nothing.
+async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
+    use base64::Engine;
+    use prost::Message;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let session_id = p["session_id"].as_str().context("session_id required")?.to_owned();
+    let command_id = p["command_id"].as_str().context("command_id required")?.to_owned();
+    let op = p["op"].as_str().context("op required")?;
+    let input = match op {
+        "update" => {
+            let data = p["data"].as_str().filter(|d| !d.is_empty()).context("data required for an update")?;
+            let data = b64.decode(data)?;
+            let input: c6_proto::UserInput = c6_proto::UserInput::decode(&data[..])?;
+            Some(c6_agent::PendingInput {
+                command_id: command_id.clone(),
+                text: input.text,
+                attachments: input.attachments,
+                command: input.command,
+                wake: input.wake,
+                ..Default::default()
+            })
+        }
+        "cancel" => None,
+        _ => bail!("op is update or cancel"),
+    };
+    match worker.sessions.queue_op(&session_id, &command_id, input) {
+        crate::session::QueueOp::Updated => Ok(json!({"state": "updated"})),
+        crate::session::QueueOp::Cancelled => Ok(json!({"state": "cancelled"})),
+        crate::session::QueueOp::Absent => {
+            if worker.sessions.is_running(&session_id) {
+                // The turn may be draining the inbox as this is answered.
+                Ok(json!({"state": "in_flight"}))
+            } else if worker.journal.is_applied(&command_id).await? {
+                Ok(json!({"state": "delivered"}))
+            } else {
+                Ok(json!({"state": "pending"}))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -489,10 +545,10 @@ mod tests {
         let identity = crate::Identity { meta, key_pem: String::new(), cert_pem: String::new(), ca_pem: String::new() };
         let worker = Worker::open(dir.path(), identity).await.unwrap();
         worker.overrides.lock().unwrap().kit_jobs = Some(true);
-        assert_eq!(crate::capabilities(&worker, false, true), vec!["kits"]);
-        assert!(crate::capabilities(&worker, false, false).is_empty());
+        assert_eq!(crate::capabilities(&worker, false, true), vec!["queue_ops", "kits"]);
+        assert_eq!(crate::capabilities(&worker, false, false), vec!["queue_ops"]);
         worker.overrides.lock().unwrap().kit_jobs = Some(false);
-        assert_eq!(crate::capabilities(&worker, true, true), vec!["claude_code"]);
+        assert_eq!(crate::capabilities(&worker, true, true), vec!["claude_code", "queue_ops"]);
         let e = handle(&worker, "kit.job", json!({"spec": {}, "command": []})).await.unwrap_err();
         assert!(e.to_string().contains("C6_KIT_JOBS=off"), "{e}");
     }
@@ -536,6 +592,33 @@ mod tests {
         let names: Vec<&str> = listing["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["a.txt", "new.txt", "untracked.txt"]);
         assert!(listing["git_root"].as_str().is_some());
+    }
+
+    /// A queue operation on a session the worker has not started (or that
+    /// restarted away) answers `pending`: the head's row rewrite takes
+    /// effect when the command is delivered.
+    #[tokio::test]
+    async fn queue_op_without_a_live_session_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::identity::IdentityMeta {
+            worker_id: c6_core::WorkerId(uuid::Uuid::now_v7()),
+            worker_name: "w".into(),
+            head_url: String::new(),
+            tls_domain: None,
+        };
+        let identity = crate::Identity { meta, key_pem: String::new(), cert_pem: String::new(), ca_pem: String::new() };
+        let worker = Worker::open(dir.path(), identity).await.unwrap();
+
+        let r = session_queue_op(&worker, &json!({"session_id": "s1", "command_id": "c1", "op": "cancel"})).await.unwrap();
+        assert_eq!(r["state"], "pending");
+
+        // An update decodes the input before answering.
+        let r = session_queue_op(&worker, &json!({"session_id": "s1", "command_id": "c1", "op": "update", "data": "!!not base64!!"}))
+            .await
+            .unwrap_err();
+        assert!(!r.to_string().is_empty());
+        let r = session_queue_op(&worker, &json!({"session_id": "s1", "command_id": "c1", "op": "nonsense"})).await.unwrap_err();
+        assert!(r.to_string().contains("update or cancel"));
     }
 }
 

@@ -89,7 +89,8 @@ pub enum UserError {
     NotFound(String),
     /// Not allowed for this caller (a realm-scoped token).
     Forbidden(String),
-    /// What the request was based on changed since (a document's guard).
+    /// What the request was based on changed since (a document's guard, a
+    /// queued input that was delivered in the meantime).
     Conflict(String),
 }
 
@@ -105,6 +106,15 @@ impl std::error::Error for UserError {}
 
 pub(crate) fn bad_request(msg: impl Into<String>) -> anyhow::Error {
     UserError::BadRequest(msg.into()).into()
+}
+
+/// A connected worker that cannot edit or cancel queued inputs (an older
+/// one): refuse up front, naming what to do.
+pub(crate) fn queue_unsupported(worker_name: &str) -> anyhow::Error {
+    conflict(format!(
+        "this session's worker is older than the head: update it (or reconnect it) to edit or cancel queued messages on {}",
+        if worker_name.is_empty() { "it" } else { worker_name }
+    ))
 }
 
 pub(crate) fn forbidden(msg: impl Into<String>) -> anyhow::Error {

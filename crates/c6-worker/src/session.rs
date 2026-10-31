@@ -68,6 +68,9 @@ struct Handle {
     /// It runs Claude Code now, whose tools carbon6 does not run (so its
     /// subagents do not share them). A handoff changes it.
     claude_code: Arc<std::sync::atomic::AtomicBool>,
+    /// Inputs waiting for the next model-request boundary: the head edits
+    /// or cancels one before it is delivered.
+    inbox: Arc<Mutex<Inbox>>,
 }
 
 /// How a delegation's turn ended.
@@ -289,6 +292,21 @@ impl SessionManager {
 
     fn live(&self, session_id: &str) -> Option<mpsc::UnboundedSender<ActorMsg>> {
         self.actors.lock().unwrap().get(session_id).map(|a| a.tx.clone())
+    }
+
+    /// Edit or cancel one of a session's queued inputs, if its actor is
+    /// live and the input is still waiting in its inbox. `input` is the
+    /// edited payload (for an edit; `None` cancels).
+    pub(crate) fn queue_op(&self, session_id: &str, command_id: &str, input: Option<PendingInput>) -> QueueOp {
+        let actors = self.actors.lock().unwrap();
+        let Some(h) = actors.get(session_id).filter(|a| !a.tx.is_closed()) else {
+            return QueueOp::Absent;
+        };
+        let mut inbox = h.inbox.lock().unwrap();
+        match input {
+            Some(i) => inbox.replace(command_id, i),
+            None => inbox.remove(command_id),
+        }
     }
 
     /// Closes turns left open by a crash or kill.
@@ -912,7 +930,7 @@ impl SessionManager {
             turns,
             writer,
             link: self.link.clone(),
-            inbox: Arc::default(),
+            inbox: Arc::new(Mutex::new(Inbox::default())),
             // Files on an SSH target are not checkpointed.
             checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, if remote { &local } else { Path::new(&started_cwd) })),
             auto_turns: VecDeque::new(),
@@ -925,7 +943,8 @@ impl SessionManager {
             report: None,
             claude_code: claude_code.clone(),
         };
-        let handle = Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code };
+        let handle =
+            Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
         tokio::spawn(actor.run(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
         Ok(handle)
@@ -1149,6 +1168,17 @@ fn seed_events(spec: &CreateSession) -> Vec<SessionEvent> {
     if same_model { spec.seed.clone() } else { c6_agent::portable_events(&spec.seed) }
 }
 
+/// The outcome of a queue operation (edit or cancel) on one of a session's
+/// inputs waiting in its inbox.
+pub(crate) enum QueueOp {
+    /// The input was in the inbox; its payload was replaced.
+    Updated,
+    /// The input was in the inbox and is gone now.
+    Cancelled,
+    /// Not in the inbox (delivered, or never here).
+    Absent,
+}
+
 /// Inputs waiting for the next model-request boundary.
 #[derive(Default)]
 struct Inbox {
@@ -1169,6 +1199,28 @@ impl Inbox {
     /// The model switch the next input asks for, which applies before it.
     fn take_switch(&mut self) -> Option<ModelSpec> {
         self.queue.front_mut().and_then(|(_, m)| m.take())
+    }
+
+    /// Swap the input's payload for new text (the head edited a queued
+    /// message). Its model switch stays: switching is a separate concern.
+    /// The id stays `seen`, so a redelivery of the same id is still
+    /// ignored.
+    fn replace(&mut self, command_id: &str, input: PendingInput) -> QueueOp {
+        let Some(i) = self.queue.iter().position(|(i, _)| i.command_id == command_id) else {
+            return QueueOp::Absent;
+        };
+        self.queue[i].0 = input;
+        QueueOp::Updated
+    }
+
+    /// Drop the input (the head canceled a queued message). The id stays
+    /// `seen`, so a redelivery of the same id cannot push it back.
+    fn remove(&mut self, command_id: &str) -> QueueOp {
+        let Some(i) = self.queue.iter().position(|(i, _)| i.command_id == command_id) else {
+            return QueueOp::Absent;
+        };
+        self.queue.remove(i);
+        QueueOp::Cancelled
     }
 
     /// Inputs up to the next model switch or `/compact`: those wait for a
@@ -3207,5 +3259,46 @@ mod handoff_tests {
         assert!(!t.iter().any(|b| b.starts_with("thinking:")), "{t:?}");
         assert_eq!(conv.context_tokens, 90_000);
         assert_eq!(runtime_of(SessionStarted { tool_profile: "generic".into(), ..Default::default() }, &events).tool_profile, "generic");
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    fn input(id: &str, text: &str) -> PendingInput {
+        PendingInput { command_id: id.into(), text: text.into(), ..Default::default() }
+    }
+
+    /// Editing and canceling a queued input: the swap keeps the entry's
+    /// model switch and its place in line; a redelivery of either id is
+    /// still ignored.
+    #[test]
+    fn replace_and_remove() {
+        let mut inbox = Inbox::default();
+        inbox.push(input("a", "first"), None);
+        inbox.push(input("b", "second"), Some(ModelSpec::default()));
+        inbox.push(input("c", "third"), None);
+
+        // The swap keeps the entry's model switch and its place in line.
+        assert!(matches!(inbox.replace("b", input("b", "second, edited")), QueueOp::Updated));
+        let b = inbox.queue.iter().find(|(i, _)| i.command_id == "b").unwrap();
+        assert_eq!(b.0.text, "second, edited");
+        assert!(b.1.is_some(), "the model switch survives the edit");
+        assert_eq!(inbox.queue.iter().map(|(i, _)| i.command_id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+
+        assert!(matches!(inbox.replace("zz", input("zz", "no")), QueueOp::Absent));
+        assert!(matches!(inbox.remove("zz"), QueueOp::Absent));
+
+        // The edited id was seen: a redelivery of the old payload does not
+        // push it back in.
+        inbox.push(input("b", "second, the old text"), None);
+        assert_eq!(inbox.queue.iter().filter(|(i, _)| i.command_id == "b").count(), 1);
+
+        inbox.push(input("d", "fourth"), None);
+        assert!(matches!(inbox.remove("d"), QueueOp::Cancelled));
+        // And its redelivery is ignored too.
+        inbox.push(input("d", "fourth"), None);
+        assert!(inbox.queue.iter().all(|(i, _)| i.command_id != "d"));
     }
 }

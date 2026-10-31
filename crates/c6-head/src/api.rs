@@ -142,6 +142,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/approve/{token}", get(crate::notify::approve_page).post(crate::notify::approve_answer))
         .route("/api/v1/sessions/{id}/config", get(session_config))
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
+        .route("/api/v1/sessions/{id}/queue/{command_id}", put(edit_queued).delete(cancel_queued))
+        .route("/api/v1/sessions/{id}/queue/{command_id}/pull", post(pull_queued))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/head/fs/list", get(head_fs_list))
         .route("/api/v1/head/fs/read", get(head_fs_read))
@@ -278,6 +280,11 @@ impl From<anyhow::Error> for ApiErr {
             Some(crate::UserError::Forbidden(m)) => return Self(StatusCode::FORBIDDEN, m.clone()),
             Some(crate::UserError::Conflict(m)) => return Self(StatusCode::CONFLICT, m.clone()),
             None => {}
+        }
+        // The worker could not be reached (or did not answer): the request
+        // was fine, and it can be retried.
+        if let Some(m) = e.downcast_ref::<crate::sessions::WorkerUnreachable>() {
+            return Self(StatusCode::SERVICE_UNAVAILABLE, m.0.clone());
         }
         tracing::warn!("api error: {e:#}");
         Self(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
@@ -2673,6 +2680,26 @@ async fn dismiss_rejected(State(st): State<Arc<HeadState>>, Path(id): Path<Strin
     st.store.dismiss_rejected(&id).await?;
     crate::sessions::publish_queue(&st, &id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn edit_queued(
+    State(st): State<Arc<HeadState>>,
+    Path((id, command_id)): Path<(String, String)>,
+    Json(req): Json<api::EditQueuedInput>,
+) -> ApiResult<Json<api::QueuedInput>> {
+    Ok(Json(crate::sessions::edit_queued(&st, &id, &command_id, &req.text).await?))
+}
+
+async fn cancel_queued(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    crate::sessions::cancel_queued(&st, &id, &command_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pull_queued(
+    State(st): State<Arc<HeadState>>,
+    Path((id, command_id)): Path<(String, String)>,
+) -> ApiResult<Json<Vec<api::QueuedInput>>> {
+    Ok(Json(crate::sessions::pull_queued(&st, &id, &command_id).await?))
 }
 
 async fn session_stream(

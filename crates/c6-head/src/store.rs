@@ -1229,6 +1229,30 @@ impl Store {
             .await?)
     }
 
+    /// The session's queued messages from one of them on, in queue order:
+    /// the anchor and every message queued after it (other queued
+    /// operations, which carry no text, are left alone). `None` if the
+    /// anchor is not a queued message of the session.
+    pub async fn pending_tail(&self, session_id: &str, anchor: &str) -> anyhow::Result<Option<Vec<CommandRow>>> {
+        let Some(seq) = sqlx::query("SELECT seq FROM commands WHERE id = ? AND session_id = ? AND state = 'pending' AND text IS NOT NULL")
+            .bind(anchor)
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|r| r.get::<i64, _>(0))
+        else {
+            return Ok(None);
+        };
+        let rows = sqlx::query_as(
+            "SELECT * FROM commands WHERE session_id = ? AND state = 'pending' AND text IS NOT NULL AND seq >= ? ORDER BY seq",
+        )
+        .bind(session_id)
+        .bind(seq)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(Some(rows))
+    }
+
     /// Marks a pending command rejected. A rejected `Create` fails the
     /// session and everything queued behind it. Returns the session id.
     pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
@@ -1262,13 +1286,13 @@ impl Store {
         Ok(Some(session_id))
     }
 
-    /// A pending input's text and encoded command.
-    pub async fn pending_input(&self, command_id: &str) -> anyhow::Result<Option<(String, Vec<u8>)>> {
-        Ok(sqlx::query("SELECT text, data FROM commands WHERE id = ? AND state = 'pending'")
+    /// A pending input's text, creation time and encoded command.
+    pub async fn pending_input(&self, command_id: &str) -> anyhow::Result<Option<(String, i64, Vec<u8>)>> {
+        Ok(sqlx::query("SELECT text, created_at, data FROM commands WHERE id = ? AND state = 'pending'")
             .bind(command_id)
             .fetch_optional(&self.pool)
             .await?
-            .and_then(|r| Some((r.get::<Option<String>, _>("text")?, r.get::<Vec<u8>, _>("data")))))
+            .map(|r| (r.get::<Option<String>, _>("text").unwrap_or_default(), r.get("created_at"), r.get::<Vec<u8>, _>("data"))))
     }
 
     /// Retires a rejected input and queues a restore followed by a copy of it.
@@ -1288,5 +1312,24 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Rewrites a queued input in place (the user edited it). `false` if it
+    /// is no longer pending (delivered, or canceled, in the meantime).
+    pub async fn update_pending_command(&self, id: &str, data: &[u8], text: Option<&str>) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE commands SET data = ?, text = ? WHERE id = ? AND state = 'pending'")
+            .bind(data)
+            .bind(text)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Cancels a queued input (the user withdrew it): it is never delivered.
+    /// `false` if it is no longer pending.
+    pub async fn cancel_pending_command(&self, id: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE commands SET state = 'done' WHERE id = ? AND state = 'pending'").bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
     }
 }
