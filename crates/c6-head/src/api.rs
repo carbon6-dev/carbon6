@@ -163,6 +163,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
+        .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
+        .route("/api/v1/marks", get(get_marks).put(put_mark))
         .route("/api/v1/settings/own/{name}", get(get_own_setting).delete(drop_own_setting))
         .route("/api/v1/work", get(list_work).post(add_work))
         .route("/api/v1/work/of", get(work_of))
@@ -379,7 +381,8 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
         changes.borrow_and_update();
         let Ok(workers) = workers_for(&st, &caller).await else { return };
         let Ok(sessions) = sessions_snapshot(&st, &caller).await else { return };
-        for ev in [api::LiveEvent::Workers { workers }, api::LiveEvent::Sessions { sessions }] {
+        let Ok(marks) = crate::marks::book(&st, &caller).await else { return };
+        for ev in [api::LiveEvent::Workers { workers }, api::LiveEvent::Sessions { sessions }, api::LiveEvent::Marks { marks }] {
             let Ok(text) = serde_json::to_string(&ev) else { return };
             if socket.send(Message::Text(text.into())).await.is_err() {
                 return;
@@ -754,12 +757,17 @@ const EVENT_PAGE: i64 = 1000;
 /// realm's most recent.
 pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Session>> {
     let working = st.store.session_activity(caller.realm.as_deref()).await?;
+    let work = crate::work::session_tags(st, caller.realm.as_deref()).await?;
     Ok(st
         .store
         .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
         .await?
         .iter()
-        .map(|r| crate::convert::session_with_activity(r, working.get(&r.id)))
+        .map(|r| {
+            // Subagents and side chats serve their tree's work.
+            let tag = work.get(&r.id).or_else(|| r.root_id.as_ref().and_then(|root| work.get(root)));
+            api::Session { work: tag.cloned(), ..crate::convert::session_with_activity(r, working.get(&r.id)) }
+        })
         .collect())
 }
 
@@ -970,6 +978,51 @@ async fn put_session_grouping(
     }
     st.store.set_setting(&grouping_key(&caller), &serde_json::to_string(&g).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+const SESSION_FACETS: &str = "session_facets";
+
+fn facets_key(caller: &Caller) -> String {
+    match &caller.realm {
+        Some(r) => format!("{SESSION_FACETS}:{r}"),
+        None => SESSION_FACETS.to_owned(),
+    }
+}
+
+/// Which aspects a session's header shows: each realm chooses its own.
+async fn get_session_facets(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<api::marks::SessionFacets>> {
+    let raw = st.store.setting(&facets_key(&caller)).await?;
+    Ok(Json(raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()))
+}
+
+async fn put_session_facets(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(f): Json<api::marks::SessionFacets>,
+) -> ApiResult<StatusCode> {
+    if let Some(a) = f.shown.iter().find(|a| !api::marks::ASPECTS.contains(&a.as_str())) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{a:?} is not an aspect (one of {})", api::marks::ASPECTS.join(", "))));
+    }
+    // In the aspects' own order, each once.
+    let shown = api::marks::ASPECTS.into_iter().filter(|a| f.shown.iter().any(|x| x == a)).map(str::to_owned).collect();
+    let value = serde_json::to_string(&api::marks::SessionFacets { shown }).map_err(anyhow::Error::from)?;
+    st.store.set_setting(&facets_key(&caller), &value).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_marks(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<api::marks::Marks>> {
+    Ok(Json(crate::marks::book(&st, &caller).await?))
+}
+
+async fn put_mark(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(m): Json<api::marks::SetMark>,
+) -> ApiResult<Json<api::marks::Marks>> {
+    Ok(Json(crate::marks::set(&st, &caller, &m).await?))
 }
 
 async fn search(

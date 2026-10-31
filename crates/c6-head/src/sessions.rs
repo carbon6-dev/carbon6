@@ -633,10 +633,10 @@ pub fn check_labels(labels: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
-/// Sets a session's colour, one of `SESSION_COLOURS`.
+/// Sets a session's mark (`api::marks`).
 pub async fn set_colour(st: &HeadState, session_id: &str, colour: &str) -> anyhow::Result<api::Session> {
-    if !api::SESSION_COLOURS.contains(&colour) {
-        return Err(bad_request(format!("{colour:?} is not a session colour (one of {})", api::SESSION_COLOURS.join(", "))));
+    if !api::marks::is_mark(colour) {
+        return Err(bad_request(crate::marks::not_a_mark(colour)));
     }
     if !st.store.set_session_colour(session_id, colour).await? {
         return Err(not_found("no such session"));

@@ -1169,23 +1169,18 @@ async fn create_subagent_session(
     Ok(true)
 }
 
-/// The colour a new top-level session in `realm` takes: the one least used
+/// The mark a new top-level session in `realm` takes: the one least used
 /// among the realm's most recently active sessions (so the ones you have
-/// open tell apart), the first such in `SESSION_COLOURS`' order.
+/// open tell apart), the first such in `c6_api::marks::all`'s order.
 async fn least_used_colour(tx: &mut sqlx::SqliteConnection, realm: &str) -> anyhow::Result<String> {
     let recent: Vec<String> = sqlx::query_scalar(
         "SELECT colour FROM sessions WHERE archived = 0 AND parent_id IS NULL AND realm = ? ORDER BY updated_at DESC LIMIT ?",
     )
     .bind(realm)
-    .bind(c6_api::SESSION_COLOURS.len() as i64)
+    .bind(c6_api::marks::COLOURS.len() as i64)
     .fetch_all(&mut *tx)
     .await?;
-    Ok(pick_colour(&recent).to_owned())
-}
-
-/// The first of `SESSION_COLOURS` used least often in `taken`.
-pub fn pick_colour(taken: &[String]) -> &'static str {
-    c6_api::SESSION_COLOURS.into_iter().min_by_key(|c| taken.iter().filter(|t| t == c).count()).unwrap_or("sky")
+    Ok(c6_api::marks::pick(&recent))
 }
 
 // --- Commands -----------------------------------------------------------------

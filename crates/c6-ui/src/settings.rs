@@ -18,7 +18,7 @@ const GROUPS: &[(&str, &[Page])] = &[
     (
         "General",
         &[
-            ("appearance", "Appearance", "Light or dark, in this browser"),
+            ("appearance", "Appearance", "Light or dark, and what sessions show"),
             ("account", "Sign-in", "Passkeys, signed-in browsers, API tokens"),
             ("notifications", "Notifications", "Channels, push on this device, links"),
         ],
@@ -183,6 +183,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 {move || match current.get().as_str() {
                     "appearance" => view! {
                         <AppearanceSetting />
+                        <crate::aspects::FacetsSetting />
                     }.into_any(),
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {

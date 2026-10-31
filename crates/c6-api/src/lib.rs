@@ -3,6 +3,7 @@
 
 pub mod docs;
 pub mod labels;
+pub mod marks;
 pub mod projects;
 pub mod prompts;
 pub mod work;
@@ -101,6 +102,8 @@ pub enum LiveEvent {
     Sessions { sessions: Vec<Session> },
     /// A document changed (docs/docs.md §6): read it again.
     Doc { change: docs::DocChange },
+    /// Every mark given (docs/marks.md); same cadence as the snapshots.
+    Marks { marks: marks::Marks },
 }
 
 // --- LLM connections --------------------------------------------------------
@@ -248,10 +251,15 @@ pub struct Session {
     /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance: String,
-    /// Its colour, one of [`SESSION_COLOURS`]: the cue that tells its tiles
-    /// apart. Picked when it starts; empty for sessions from before colours.
+    /// Its mark (`marks.rs`: a colour, plain or in a pattern): the cue that
+    /// tells its tiles apart. Picked when it starts; empty for sessions
+    /// from before colours.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub colour: String,
+    /// The open work it serves (its tree's top session's, for subagents and
+    /// side chats), in the live list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<work::WorkTag>,
     /// The default for its subagents: a connection (empty: the session's),
     /// a model (empty: the session's) and an effort.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -363,11 +371,6 @@ pub struct SubagentConnection {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_model: String,
 }
-
-/// The colours a session can have, in the order new sessions take them
-/// (the one least used among the realm's recent sessions).
-pub const SESSION_COLOURS: [&str; 12] =
-    ["sky", "emerald", "amber", "rose", "violet", "teal", "orange", "indigo", "lime", "pink", "cyan", "fuchsia"];
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -3498,7 +3501,7 @@ pub struct SetLabels {
     pub labels: Vec<String>,
 }
 
-/// `PUT /api/v1/sessions/{id}/colour`: one of [`SESSION_COLOURS`].
+/// `PUT /api/v1/sessions/{id}/colour`: a mark (`marks::all`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetColour {

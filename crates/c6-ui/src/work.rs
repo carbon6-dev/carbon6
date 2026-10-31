@@ -345,6 +345,7 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
             class=("dark:border-zinc-800", move || picked.get() != index)
             on:click=move |ev| { picked.set(index); open_item.run((id.get_value(), How::from_mouse(&ev))); }>
             <div class="flex items-center gap-2">
+                <WorkGlyph id=w.id.clone() />
                 <span class="min-w-0 flex-1 truncate font-medium">{w.fields.title.clone()}</span>
                 <span class="shrink-0 text-xs text-zinc-400">{(when > 0).then(|| since(when))}</span>
             </div>
@@ -352,8 +353,9 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
             {next.map(|n| view! { <p class="truncate text-xs text-zinc-500">{format!("Next: {n}")}</p> })}
             <div class="mt-1 flex flex-wrap gap-1">
                 {(!w.project_title.is_empty()).then(|| view! {
-                    <span class="max-w-48 truncate rounded bg-indigo-100 px-1.5 text-[11px] text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300" title="Its project">
-                        {format!("◇ {}", w.project_title)}
+                    <span class="inline-flex max-w-48 items-center gap-1 truncate rounded bg-indigo-100 px-1.5 text-[11px] text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300" title="Its project">
+                        <crate::marks::ValueGlyph key=format!("project:{}", w.fields.project) size=9 />
+                        {w.project_title.clone()}
                     </span>
                 })}
                 {(todos > 0).then(|| view! {
@@ -589,6 +591,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 let (t2, d2) = (t.clone(), d.clone());
                                 view! {
                                     <div class="flex items-start gap-2">
+                                        <span class="mt-2"><crate::marks::MarkButton key=format!("work:{}", w1.id) shape=crate::marks::Shape::Diamond size=14 /></span>
                                         <h1 class="min-w-0 flex-1 text-xl font-semibold">{t}</h1>
                                         <button class=format!("{BUTTON_QUIET} text-xs") title="Rename, or say what done means"
                                             on:click=move |_| { title.set(t2.clone()); done_when.set(d2.clone()); editing.set(true); }>"Edit"</button>
@@ -774,6 +777,12 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
     }
 }
 
+/// A piece of work's mark, in its shape (docs/marks.md).
+#[component]
+fn WorkGlyph(id: String) -> impl IntoView {
+    view! { <crate::marks::ValueGlyph key=format!("work:{id}") /> }
+}
+
 /// A session's work, in its header: which work it serves, and the way to
 /// change that.
 #[component]
@@ -826,11 +835,13 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
             <span>"Work:"</span>
             {move || current().map(|w| view! {
                 {(!w.fields.project.is_empty()).then(|| view! {
+                    <crate::marks::ValueGlyph key=format!("project:{}", w.fields.project) />
                     <Go to=View::Projects { id: w.fields.project.clone() } class="max-w-40 truncate text-violet-700 hover:underline dark:text-violet-400" title="Its project">
                         {w.project_title.clone()}
                     </Go>
                     <span class="text-zinc-400">"›"</span>
                 })}
+                <WorkGlyph id=w.id.clone() />
                 <Go to=View::Work { id: w.id.clone() } class="max-w-56 truncate text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>
                     {w.fields.title.clone()}
                 </Go>
@@ -866,6 +877,7 @@ fn ProjectPick(w: WorkItem, apply: Callback<Result<WorkItem, String>>) -> impl I
         <div class="flex items-center gap-2 text-sm">
             <span class="text-zinc-500">"Project:"</span>
             {(!current.is_empty()).then(|| view! {
+                <crate::marks::ValueGlyph key=format!("project:{current}") />
                 <Go to=View::Projects { id: current.clone() } class="text-violet-700 hover:underline dark:text-violet-400">{w.project_title.clone()}</Go>
             })}
             <select class="max-w-48 cursor-pointer rounded bg-transparent px-1 text-xs text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
@@ -929,6 +941,7 @@ pub fn LeftOpen() -> impl IntoView {
                     }).collect_view()}
                     {items.into_iter().take(6).map(|w| view! {
                         <Go to=View::Work { id: w.id.clone() } class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                            <WorkGlyph id=w.id.clone() />
                             <StatePill state=w.state.clone() />
                             <span class="min-w-0 flex-1 truncate">{w.fields.title.clone()}</span>
                             <span class="hidden max-w-[50%] truncate text-xs text-zinc-500 sm:inline">{w.why.clone()}</span>

@@ -337,11 +337,14 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let worker = live.worker_name(&s.worker_id.to_string());
     let updated = s.updated_at;
     let status = s.display_status();
+    let (mark, chips) = (crate::marks::fill(&crate::marks::of(&s)), s.clone());
     view! {
         <div class="group flex items-center gap-1 pr-2 hover:bg-zinc-100 dark:hover:bg-zinc-900">
         <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-3 pl-4" title="Open beside this list (⌘-click: new tile)">
+            <span class="h-8 w-1 shrink-0 rounded-sm" style=mark title="Its mark"></span>
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
+                <div class="mt-0.5 flex items-center gap-2"><crate::aspects::AspectChips s=chips /></div>
                 <div class="truncate text-xs text-zinc-500">
                     {worker} " · " <span class="font-mono">{match (&s.ssh, s.cwd.is_empty()) {
                         (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
@@ -486,7 +489,8 @@ impl Hover {
 #[component]
 fn RailRow(s: Session, hover: Hover) -> impl IntoView {
     let id = s.id.clone();
-    let colour = crate::colour::of(&s);
+    let colour = crate::marks::of(&s);
+    let glyphs = s.clone();
     let state = if s.awaiting_approval {
         "h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"
     } else {
@@ -506,8 +510,9 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
             on:mouseleave=move |_| hover.hide_soon()
         >
             <Go to=View::session(s.id.clone()) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-[13px] hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
-                <span class=format!("h-2.5 w-1 shrink-0 rounded-sm {}", crate::colour::solid(colour))></span>
+                <span class="h-2.5 w-1 shrink-0 rounded-sm" style=crate::marks::fill(&colour)></span>
                 <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
+                <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=glyphs /></span>
                 <span class=state></span>
             </Go>
         </div>
@@ -555,7 +560,8 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
                     {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
                 </div>
             })}
-            <crate::colour::Palette session=s.id.clone() />
+            <crate::aspects::AspectChips s=s.clone() />
+            <crate::marks::SessionPalette session=s.id.clone() />
             <div class="flex flex-wrap gap-1.5 pt-1">
                 <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(open_id.clone()), How::Beside) }>"Open"</button>
                 <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::NewTile) }>"New tile"</button>

@@ -25,6 +25,8 @@ pub struct LiveFeed {
     pub connected: ReadSignal<bool>,
     /// The latest change to a document (docs/docs.md §6).
     pub doc: ReadSignal<Option<c6_api::docs::DocChange>>,
+    /// Every mark given to an aspect's value (docs/marks.md).
+    pub marks: ReadSignal<c6_api::marks::Marks>,
 }
 
 impl LiveFeed {
@@ -33,6 +35,7 @@ impl LiveFeed {
         let (sessions, set_sessions) = signal(Vec::new());
         let (connected, set_connected) = signal(false);
         let (doc, set_doc) = signal(None);
+        let (marks, set_marks) = signal(c6_api::marks::Marks::new());
         spawn_local(async move {
             let mut backoff = 500;
             loop {
@@ -48,6 +51,12 @@ impl LiveFeed {
                                     LiveEvent::Workers { workers } => set_workers.set(workers),
                                     LiveEvent::Sessions { sessions } => set_sessions.set(sessions),
                                     LiveEvent::Doc { change } => set_doc.set(Some(change)),
+                                    // Sent with every snapshot: only a change wakes what wears them.
+                                    LiveEvent::Marks { marks: given } => {
+                                        if marks.with_untracked(|m| *m != given) {
+                                            set_marks.set(given)
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => leptos::logging::warn!("bad live event: {e}"),
@@ -59,7 +68,7 @@ impl LiveFeed {
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, sessions, connected, doc }
+        Self { workers, sessions, connected, doc, marks }
     }
 
     pub fn worker_name(&self, id: &str) -> String {
@@ -998,7 +1007,7 @@ pub async fn commands(session: String) -> Result<Vec<c6_api::CommandInfo>, Strin
     json(Request::get("/api/v1/commands").query([("session", session)]).send().await).await
 }
 
-/// Replaces the labels you attached to a session.
+/// Sets a session's mark.
 pub async fn set_colour(id: String, colour: String) -> Result<Session, String> {
     send_json(Request::put(&format!("/api/v1/sessions/{id}/colour")), &c6_api::SetColour { colour }).await
 }
@@ -1271,6 +1280,11 @@ pub async fn record_history(name: String, id: String) -> Result<Vec<c6_api::Reco
 // --- Work (docs/work.md) ---------------------------------------------------
 
 /// Open work (with snoozed), or closed work.
+/// Gives an aspect's value its mark (empty: takes it away).
+pub async fn set_mark(key: String, mark: String) -> Result<c6_api::marks::Marks, String> {
+    send_json(Request::put("/api/v1/marks"), &c6_api::marks::SetMark { key, mark }).await
+}
+
 pub async fn work_list(closed: bool) -> Result<Vec<WorkItem>, String> {
     json(Request::get(&format!("/api/v1/work{}", if closed { "?closed=true" } else { "" })).send().await).await
 }

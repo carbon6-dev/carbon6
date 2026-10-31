@@ -144,10 +144,13 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
     let dismissable = t == Tracked::Attention;
     view! {
         <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
-            <span class=format!("h-6 w-1 shrink-0 rounded-sm {}", crate::colour::solid(crate::colour::of(&s))) title="Its colour"></span>
+            <span class="h-6 w-1 shrink-0 rounded-sm" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
             <span class=dot(s.display_status(), t)></span>
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘-click: new tile)">
-                <div class="truncate text-sm">{s.title.clone()}</div>
+                <div class="flex items-center gap-1.5">
+                    <span class="min-w-0 flex-1 truncate text-sm">{s.title.clone()}</span>
+                    <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=s.clone() /></span>
+                </div>
                 <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
             </Go>
             {dismissable.then(|| {

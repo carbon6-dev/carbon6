@@ -261,6 +261,19 @@ pub struct WorkPatch {
     pub phase: Option<String>,
 }
 
+/// A session's open work, as the live list names it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WorkTag {
+    pub id: String,
+    pub title: String,
+    /// Its project (docs/projects.md), if it is in one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_title: String,
+}
+
 /// A thing to attach (`POST /api/v1/work/{id}/attach`), or to detach.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

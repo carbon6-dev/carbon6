@@ -237,8 +237,88 @@ async fn sessions_get_colours_you_can_change() {
     // Emerald is free again: the next session takes it.
     assert_eq!(start().await.colour, "emerald");
     assert_eq!(set(&a.id, "beige").await.status(), 400, "only the palette's colours");
+    assert_eq!(set(&a.id, "sky/plaid").await.status(), 400, "and its patterns");
     assert_eq!(set("no-such-session", "teal").await.status(), 404);
+    // A colour can come in a pattern.
+    assert_eq!(set(&c.id, "navy/dots").await.json::<Session>().await.unwrap().colour, "navy/dots");
+
+    // Its worker and its work have marks too, the same everywhere.
+    let marks = async || http.get(format!("{api}/marks")).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(marks().await[format!("worker:{wid}")], "sky", "a worker gets the first mark no other worker has");
+    let r = http.put(format!("{api}/settings/work")).json(&json!({"guess": false, "notes": false})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let work: Value = http
+        .post(format!("{api}/work"))
+        .json(&json!({"title": "Ship marks", "attach": [{"ref": format!("session:{}", a.id)}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let work_id = work["id"].as_str().unwrap().to_owned();
+    let other: Value =
+        http.post(format!("{api}/work")).json(&json!({"title": "Something else"})).send().await.unwrap().json().await.unwrap();
+    let m = marks().await;
+    assert_eq!((&m[format!("work:{work_id}")], &m[format!("work:{}", other["id"].as_str().unwrap())]), (&json!("sky"), &json!("emerald")));
+    // A project brings the work in: the session's tag names it, and it has a mark of its own.
+    let project: Value = http
+        .post(format!("{api}/projects"))
+        .json(&json!({"title": "Visuals", "work": [work_id]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_owned();
+    assert_eq!(marks().await[format!("project:{project_id}")], "sky");
+    let listed: Vec<Session> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
+    let tag = listed.iter().find(|s| s.id == a.id).unwrap().work.clone().expect("the list says which work it serves");
+    assert_eq!((tag.id.as_str(), tag.title.as_str()), (work_id.as_str(), "Ship marks"));
+    assert_eq!((tag.project.as_str(), tag.project_title.as_str()), (project_id.as_str(), "Visuals"));
+    assert_eq!(listed.iter().find(|s| s.id == b.id).unwrap().work, None);
+
+    let mark =
+        async |key: &str, mark: &str| http.put(format!("{api}/marks")).json(&json!({ "key": key, "mark": mark })).send().await.unwrap();
+    assert!(mark(&format!("worker:{wid}"), "olive/vstripes").await.status().is_success());
+    assert!(mark("repo:carbon6", "maroon").await.status().is_success());
+    let m = marks().await;
+    assert_eq!((&m[format!("worker:{wid}")], &m["repo:carbon6"]), (&json!("olive/vstripes"), &json!("maroon")));
+    assert!(mark("repo:carbon6", "").await.status().is_success());
+    assert_eq!(marks().await.get("repo:carbon6"), None, "taken away: back to the one worked out from its name");
+    assert_eq!(mark("repo:carbon6", "beige").await.status(), 400);
+    assert_eq!(mark("colour:red", "red").await.status(), 400, "only aspects' values have marks");
+    assert_eq!(mark("work:no-such-work", "red").await.status(), 404);
+    assert_eq!(mark("project:no-such-project", "red").await.status(), 404);
+    assert!(mark(&format!("project:{project_id}"), "teal/dots").await.status().is_success());
+    assert_eq!(marks().await[format!("project:{project_id}")], "teal/dots");
 
     stop.cancel();
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn which_aspects_a_session_header_shows_is_kept() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_facets", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let get = async || http.get(&url).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(get().await, json!({"shown": ["worker", "work", "project", "realm"]}), "the default");
+    let r = http.put(&url).json(&json!({"shown": ["model", "worker", "model"]})).send().await.unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(get().await, json!({"shown": ["worker", "model"]}), "in the aspects' order, each once");
+    let r = http.put(&url).json(&json!({"shown": ["colour"]})).send().await.unwrap();
+    assert_eq!(r.status(), 400);
     head.shutdown().await.unwrap();
 }

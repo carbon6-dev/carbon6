@@ -210,6 +210,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         observed: r.observed,
         instance: r.instance.clone(),
         colour: r.colour.clone(),
+        work: None,
         subagent_connection_id: r.subagent_connection_id.clone(),
         subagent_model: r.subagent_model.clone(),
         subagent_effort: r.subagent_effort.clone(),

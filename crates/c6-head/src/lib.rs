@@ -30,6 +30,7 @@ pub mod instances;
 pub mod kitjobs;
 pub mod knowledge;
 pub mod lists;
+pub mod marks;
 pub mod memex;
 pub mod memory;
 pub mod notify;

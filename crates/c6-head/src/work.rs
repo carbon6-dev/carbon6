@@ -200,6 +200,38 @@ pub async fn holding(st: &HeadState, reference: &str) -> anyhow::Result<Vec<Stri
     holding_in(st, reference, None).await
 }
 
+/// The open work each session serves, for the live list: the item that
+/// moved last, when it is in several.
+pub async fn session_tags(st: &HeadState, realm: Option<&str>) -> anyhow::Result<HashMap<String, api::work::WorkTag>> {
+    let rows = sqlx::query(
+        "SELECT substr(json_extract(a.value, '$.ref'), 9) AS session, r.id, coalesce(json_extract(r.fields, '$.title'), '') AS title, \
+         coalesce(p.id, '') AS project, coalesce(json_extract(p.fields, '$.title'), '') AS project_title \
+         FROM records r JOIN json_each(r.fields, '$.attached') a \
+         LEFT JOIN records p ON p.collection = ? AND p.realm = r.realm AND p.id = json_extract(r.fields, '$.project') \
+         WHERE r.collection = ? AND json_extract(r.fields, '$.status') = 'open' \
+         AND (? IS NULL OR r.realm = ?) AND json_extract(a.value, '$.ref') LIKE 'session:%' ORDER BY r.updated_at",
+    )
+    .bind(crate::projects::PROJECTS)
+    .bind(WORK)
+    .bind(realm)
+    .bind(realm)
+    .fetch_all(&st.store.pool)
+    .await?;
+    // Later rows (moved last) win.
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let tag = api::work::WorkTag {
+                id: r.get("id"),
+                title: r.get("title"),
+                project: r.get("project"),
+                project_title: r.get("project_title"),
+            };
+            (r.get("session"), tag)
+        })
+        .collect())
+}
+
 async fn holding_in(st: &HeadState, reference: &str, realm: Option<&str>) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar(
         "SELECT r.id FROM records r WHERE r.collection = ? AND json_extract(r.fields, '$.status') = 'open' \

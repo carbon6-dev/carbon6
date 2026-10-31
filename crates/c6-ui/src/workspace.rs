@@ -1404,7 +1404,13 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         })
     });
     let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
-    let colour = Memo::new(move |_| session.get().map(|s| crate::colour::of(&s)));
+    let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
+    // Its work's mark, as a stripe down the tile's left edge.
+    let work_mark = Memo::new(move |_| session.get().and_then(|s| s.work).map(|w| crate::marks::live_mark(&format!("work:{}", w.id))));
+    // Pointing at a value in some tile's bar dims the tiles without it.
+    let spot = crate::aspects::use_spotlight();
+    let dim =
+        Memo::new(move |_| spot.0.get().is_some_and(|k| !session.get().is_some_and(|s| crate::aspects::of(&s).iter().any(|a| a.key == k))));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let details_at = RwSignal::new(None::<(f64, f64)>);
     let rename_at = RwSignal::new(None::<(f64, f64)>);
@@ -1435,9 +1441,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     view! {
         <div
             class=move || format!(
-                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height] md:duration-150 {} {}",
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {} {}",
                 if focused.get() { "flex" } else { "hidden" },
                 if full.get() && !focused.get() { "md:hidden" } else { "md:flex" },
+                if dim.get() { "opacity-35" } else { "" },
             )
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
         >
@@ -1467,6 +1474,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 ws.drop_at.set(None);
             }
         >
+            {move || work_mark.get().map(|m| view! {
+                <div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-[3px]" style=crate::marks::fill(&m)></div>
+            })}
             {move || hint().map(|at| view! {
                 <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
             })}
@@ -1474,9 +1484,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // colour and state), and what you can do to the whole tile.
             // Dragged by its bar to another place or column.
             <div class=move || format!(
-                "flex h-9 shrink-0 cursor-grab items-center gap-1 border-b px-2 text-xs active:cursor-grabbing {}",
-                crate::colour::bar(colour.get().unwrap_or_default()),
+                "@container flex h-9 shrink-0 cursor-grab items-center gap-1 border-b px-2 text-xs active:cursor-grabbing {}",
+                if colour.get().is_some() { crate::marks::BAR } else { "bg-zinc-50 border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800" },
             )
+                style=move || colour.get().map(|c| crate::marks::bar_style(&c)).unwrap_or_default()
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -1494,10 +1505,12 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
                 <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
                 {move || colour.get().map(|c| view! {
-                    <button class=format!("ml-0.5 h-3 w-3 shrink-0 rounded-full ring-1 ring-black/10 hover:scale-125 dark:ring-white/20 {}", crate::colour::solid(c))
-                        title="This session's colour: change it" on:click=move |ev| palette_at.set(Some(below(&ev, 180.0)))></button>
+                    <button class="ml-0.5 flex shrink-0 hover:scale-125" title="This session's mark: change it" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
+                        <crate::marks::Glyph mark=Signal::stored(c) shape=crate::marks::Shape::Circle size=12 />
+                    </button>
                 })}
                 <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-700 dark:text-zinc-200" title=move || title.get()>{title}</span>
+                <crate::aspects::AspectStrip session=session />
                 {move || session.get().filter(|s| s.parent_id.is_none() && !s.observed).map(|_| view! {
                     <button class=btn title="Rename this session" on:click=move |ev| { ev.stop_propagation(); rename_at.set(Some(below(&ev, 320.0))) }>"✎"</button>
                 })}
@@ -1541,7 +1554,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 <button class=btn title="Close this tile" on:click=move |_| ws.close_tile(key)>"✕"</button>
             </div>
             <Popover at=palette_at class="w-auto">
-                {move || shown.get().map(|(_, id)| view! { <crate::colour::Palette session=id on_pick=move |()| palette_at.set(None) /> })}
+                {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
             </Popover>
             <Popover at=rename_at class="w-[min(22rem,calc(100vw-1rem))] p-3">
                 // Keyed on the id, and the name read untracked: the session changes as it works, and a rebuilt form loses what was typed.

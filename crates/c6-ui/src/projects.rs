@@ -135,6 +135,7 @@ pub fn ProjectsPage() -> impl IntoView {
                                 <button class="block w-full rounded-md border border-zinc-200 px-3 py-2 text-left hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
                                     on:click=move |ev| open_project.with_value(|f| f(id.clone(), How::from_mouse(&ev)))>
                                     <div class="flex items-center gap-2">
+                                        <crate::marks::ValueGlyph key=format!("project:{}", p.id) />
                                         <span class="min-w-[6rem] flex-1 truncate font-medium">{p.fields.title.clone()}</span>
                                         <StatePill state=p.state.clone() />
                                         <span class="shrink-0 text-xs text-zinc-400">{since(p.fields.moved_at.max(p.updated_at))}</span>
@@ -220,6 +221,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                     let closed = matches!(p.fields.status.as_str(), "done" | "dropped");
                     let (t, pu) = (p.fields.title.clone(), p.fields.purpose.clone());
                     let mine = p.id.clone();
+                    let mark_key = format!("project:{}", p.id);
                     let open: Vec<_> = p.work.iter().filter(|w| !matches!(w.state.as_str(), "done" | "dropped")).cloned().collect();
                     let done: Vec<_> = p.work.iter().filter(|w| matches!(w.state.as_str(), "done" | "dropped")).cloned().collect();
                     let in_it: Vec<String> = p.work.iter().map(|w| w.id.clone()).collect();
@@ -241,6 +243,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 let (t2, p2) = (t.clone(), pu.clone());
                                 view! {
                                     <div class="flex items-start gap-2">
+                                        <span class="mt-2"><crate::marks::MarkButton key=mark_key.clone() shape=crate::marks::Shape::Hexagon size=14 /></span>
                                         <h1 class="min-w-0 flex-1 text-xl font-semibold">{t.clone()}</h1>
                                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| { title.set(t2.clone()); purpose.set(p2.clone()); editing.set(true); }>"Edit"</button>
                                     </div>
@@ -351,6 +354,7 @@ fn WorkRow(w: c6_api::projects::ProjectWork, project: String, apply: Callback<Re
             <span class=format!("shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium {}", state_class(if w.state == "needs_you" { "needs_you" } else if w.state == "moving" { "moving" } else { "" }))>
                 {c6_api::work::state_label(&w.state)}
             </span>
+            <crate::marks::ValueGlyph key=format!("work:{}", w.id) />
             <span class="min-w-[8rem] flex-1 truncate">
                 <Go to=View::Work { id: w.id.clone() } class="text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>{w.title.clone()}</Go>
                 {(!w.why.is_empty()).then(|| view! { <span class="ml-2 text-xs text-zinc-500">{w.why.clone()}</span> })}

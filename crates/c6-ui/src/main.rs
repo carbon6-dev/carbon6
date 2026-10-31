@@ -3,13 +3,13 @@
 mod activity;
 mod analytics;
 mod api;
+mod aspects;
 mod assistant;
 mod auth;
 mod brief;
 mod calendar;
 mod chat;
 mod collections;
-mod colour;
 mod compose;
 mod contacts;
 mod decisions;
@@ -23,6 +23,7 @@ mod labels;
 mod mail;
 mod mail_html;
 mod markdown;
+mod marks;
 mod memex;
 mod models;
 mod monitor;
@@ -88,6 +89,8 @@ fn Main() -> impl IntoView {
     provide_context(live);
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
+    provide_context(aspects::Facets::load());
+    provide_context(aspects::Spotlight(RwSignal::new(None)));
     // A signed-in browser opening a login link (to sign in again).
     if window().location().pathname().unwrap_or_default().starts_with("/login/") {
         return view! {
@@ -303,14 +306,11 @@ fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
     }
 }
 
-/// A realm's colour, the same everywhere it shows.
-fn realm_colour(id: &str) -> &'static str {
-    const OTHERS: [&str; 6] = ["bg-emerald-500", "bg-violet-500", "bg-rose-500", "bg-teal-500", "bg-indigo-500", "bg-lime-500"];
-    match id {
-        "home" => "bg-sky-500",
-        "commons" => "bg-amber-500",
-        _ => OTHERS[id.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619)) as usize % OTHERS.len()],
-    }
+/// A realm's mark, the same everywhere it shows (docs/marks.md).
+#[component]
+fn RealmGlyph(#[prop(into)] id: String) -> impl IntoView {
+    let key = format!("realm:{id}");
+    view! { <marks::Glyph mark=Signal::derive(move || marks::live_mark(&key)) shape=marks::Shape::Triangle size=10 /> }
 }
 
 /// Where you are (a realm, in its colour, or the console) and the way to
@@ -349,12 +349,14 @@ fn PlaceMenu() -> impl IntoView {
             None => "Console".into(),
         }
     };
-    let dot = here.as_deref().map_or("bg-zinc-900 dark:bg-zinc-100", realm_colour);
     view! {
         <details node_ref=menu class="relative">
             <summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700"
                 title="Where you are: a realm, or the console">
-                <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {dot}")></span>
+                {match here.clone() {
+                    Some(r) => view! { <RealmGlyph id=r /> }.into_any(),
+                    None => view! { <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span> }.into_any(),
+                }}
                 <span class="max-w-32 truncate font-medium">{name}</span>
                 {move || (elsewhere() > 0).then(|| view! {
                     <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you in other realms">{elsewhere()}</span>
@@ -370,7 +372,7 @@ fn PlaceMenu() -> impl IntoView {
                     view! {
                         <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))
                             class=format!("flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "font-medium" } else { "" })>
-                            <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {}", realm_colour(&p.id))></span>
+                            <RealmGlyph id=p.id.clone() />
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                             {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
                             {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
@@ -406,7 +408,7 @@ fn PlaceLinks() -> impl IntoView {
                 let current = here.as_deref() == Some(p.id.as_str());
                 view! {
                     <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone())) class=format!("flex items-center gap-2 {MENU} {}", if current { "font-medium" } else { "" })>
-                        <span class=format!("h-2.5 w-2.5 shrink-0 rounded-full {}", realm_colour(&p.id))></span>
+                        <RealmGlyph id=p.id.clone() />
                         <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                         {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{p.waiting}</span> })}
                         {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
