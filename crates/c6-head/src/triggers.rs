@@ -33,13 +33,14 @@ pub const MAX_WEBHOOK_BODY: usize = 1024 * 1024;
 /// Triggers whose actions cause other triggers, at most this deep.
 pub const MAX_DEPTH: usize = 5;
 
-pub const EVENTS: [&str; 7] = ["schedule", "webhook", "memex", "record", "decision", "session", "series"];
+pub const EVENTS: [&str; 8] = ["schedule", "webhook", "memex", "record", "decision", "session", "series", "doc"];
 pub const ACTIONS: [&str; 7] = ["start", "write", "ask", "notify", "record", "operation", "kit"];
-const OPS: [(&str, &[&str]); 4] = [
+const OPS: [(&str, &[&str]); 5] = [
     ("series", &["crossed", "cleared"]),
     ("record", &["created", "updated", "deleted"]),
     ("decision", &["opened", "answered", "expired", "dismissed"]),
     ("session", &["finished", "failed", "needs_approval"]),
+    ("doc", &["created", "changed", "commented", "thread_resolved", "exported"]),
 ];
 
 tokio::task_local! {
@@ -148,7 +149,7 @@ async fn check(st: &HeadState, a: &api::Automation, realm: &str) -> anyhow::Resu
                 ));
             }
         }
-        "record" | "decision" | "session" => {
+        "record" | "decision" | "session" | "doc" => {
             let allowed = OPS.iter().find(|(k, _)| *k == a.trigger).map(|(_, o)| *o).unwrap_or_default();
             for op in a.event_params["ops"].as_array().into_iter().flatten() {
                 if !op.as_str().is_some_and(|o| allowed.contains(&o)) {

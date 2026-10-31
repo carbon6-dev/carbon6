@@ -16,6 +16,7 @@ mod chaos;
 mod collections;
 mod commands;
 mod decisions;
+mod documents;
 mod examples;
 mod explorer;
 mod extract;

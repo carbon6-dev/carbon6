@@ -1,6 +1,7 @@
 //! JSON types for the head's `/api/v1`, shared by `c6h` and the web UI.
 //! Must stay wasm-compatible: no tokio, no std-only dependencies.
 
+pub mod docs;
 pub mod labels;
 pub mod prompts;
 pub mod work;
@@ -97,6 +98,8 @@ pub enum LiveEvent {
     Workers { workers: Vec<Worker> },
     /// Full session list snapshot (not archived); same cadence.
     Sessions { sessions: Vec<Session> },
+    /// A document changed (docs/docs.md §6): read it again.
+    Doc { change: docs::DocChange },
 }
 
 // --- LLM connections --------------------------------------------------------

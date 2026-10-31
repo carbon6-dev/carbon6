@@ -251,6 +251,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/catalog/call", post(call_catalog))
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
+        .merge(crate::docs::http::routes())
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), settings_realm))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
@@ -271,6 +272,7 @@ impl From<anyhow::Error> for ApiErr {
             Some(crate::UserError::BadRequest(m)) => return Self(StatusCode::BAD_REQUEST, m.clone()),
             Some(crate::UserError::NotFound(m)) => return Self(StatusCode::NOT_FOUND, m.clone()),
             Some(crate::UserError::Forbidden(m)) => return Self(StatusCode::FORBIDDEN, m.clone()),
+            Some(crate::UserError::Conflict(m)) => return Self(StatusCode::CONFLICT, m.clone()),
             None => {}
         }
         tracing::warn!("api error: {e:#}");
@@ -278,7 +280,7 @@ impl From<anyhow::Error> for ApiErr {
     }
 }
 
-type ApiResult<T> = Result<T, ApiErr>;
+pub(crate) type ApiResult<T> = Result<T, ApiErr>;
 
 fn parse_worker_id(id: &str) -> ApiResult<WorkerId> {
     id.parse().map_err(|_| ApiErr(StatusCode::BAD_REQUEST, "invalid worker id".into()))
@@ -371,6 +373,7 @@ async fn live(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Cal
 /// sessions and the workers it may use.
 async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) {
     let mut changes = st.registry.subscribe();
+    let mut docs = st.docs.live.subscribe();
     loop {
         changes.borrow_and_update();
         let Ok(workers) = workers_for(&st, &caller).await else { return };
@@ -381,17 +384,31 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
                 return;
             }
         }
-        tokio::select! {
-            _ = st.shutdown.cancelled() => return,
-            r = changes.changed() => {
-                if r.is_err() { return }
-                // Coalesce bursts (e.g. many heartbeats) into one snapshot.
-                tokio::time::sleep(Duration::from_millis(250)).await;
+        // Documents' changes go out as they happen, between snapshots.
+        loop {
+            tokio::select! {
+                _ = st.shutdown.cancelled() => return,
+                r = changes.changed() => {
+                    if r.is_err() { return }
+                    // Coalesce bursts (e.g. many heartbeats) into one snapshot.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    break;
+                }
+                c = docs.recv() => match c {
+                    Ok(change) if crate::docs::visible_to(&caller, &change) => {
+                        let Ok(text) = serde_json::to_string(&api::LiveEvent::Doc { change }) else { return };
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return,
+                },
+                msg = socket.recv() => match msg {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                    Some(Ok(_)) => {}
+                },
             }
-            msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                Some(Ok(_)) => {}
-            },
         }
     }
 }

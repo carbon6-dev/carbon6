@@ -23,6 +23,8 @@ pub struct LiveFeed {
     pub workers: ReadSignal<Vec<Worker>>,
     pub sessions: ReadSignal<Vec<Session>>,
     pub connected: ReadSignal<bool>,
+    /// The latest change to a document (docs/docs.md §6).
+    pub doc: ReadSignal<Option<c6_api::docs::DocChange>>,
 }
 
 impl LiveFeed {
@@ -30,6 +32,7 @@ impl LiveFeed {
         let (workers, set_workers) = signal(Vec::new());
         let (sessions, set_sessions) = signal(Vec::new());
         let (connected, set_connected) = signal(false);
+        let (doc, set_doc) = signal(None);
         spawn_local(async move {
             let mut backoff = 500;
             loop {
@@ -44,6 +47,7 @@ impl LiveFeed {
                                 match ev {
                                     LiveEvent::Workers { workers } => set_workers.set(workers),
                                     LiveEvent::Sessions { sessions } => set_sessions.set(sessions),
+                                    LiveEvent::Doc { change } => set_doc.set(Some(change)),
                                 }
                             }
                             Err(e) => leptos::logging::warn!("bad live event: {e}"),
@@ -55,7 +59,7 @@ impl LiveFeed {
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, sessions, connected }
+        Self { workers, sessions, connected, doc }
     }
 
     pub fn worker_name(&self, id: &str) -> String {

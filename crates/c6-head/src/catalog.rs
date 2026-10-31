@@ -94,6 +94,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "sessions.",
         "decisions.",
         "work.",
+        "docs.",
         "memories.",
         "memex.",
         "claims.",
@@ -330,6 +331,10 @@ const AREAS: &[(&str, &str)] = &[
         "apps",
         "Apps: packages of configuration (collections, series, triggers, views, skills, templates…) installed into realms of their own; install, upgrade, export, remove.",
     ),
+    (
+        "docs",
+        "Documents: docs and decks people and agents write together (tabs of blocks with stable ids, guarded edits, history), in Markdown with <?c6 block k?> tokens.",
+    ),
     ("explorer", "The realm explorer: what each realm holds, what happened lately, and every object with what is connected to it."),
     ("views", "Views: a realm's configured screens (tables, boards, records, charts, feeds, pages) and their actions."),
     ("series", "Series: numbers over time in a realm (points with dimensions), summarized over windows; thresholds are triggers."),
@@ -530,6 +535,15 @@ fn build() -> Vec<Op> {
         op!("work.proposals", "work", "POST" "/api/v1/work/proposals", Read, Input::None, "Groups the open sessions and requests that belong to no work into proposed pieces of work, for the user to accept or skip."),
         op!("work.settings.get", "work", "GET" "/api/v1/settings/work", Read, Input::None, "How work behaves in the realm: guessing a session's work, notes, when work has gone quiet, nudges."),
         op!("work.settings.put", "work", "PUT" "/api/v1/settings/work", Write, Input::Body(schema::<api::work::WorkSettings>), "Changes how work behaves in the realm."),
+        op!("docs.list", "docs", "GET" "/api/v1/docs", Read, Input::Query(schema::<api::docs::DocQuery>), "Documents in the realm (docs and decks), recent first: title, kind, labels, who made and last changed them, pending blocks. Filter by kind, label, by (you, session:<id>) or q (title words)."),
+        op!("docs.create", "docs", "POST" "/api/v1/docs", Write, Input::Body(schema::<api::docs::DocNew>), "Creates a doc or a deck from Markdown: title, then the content, usually a pending block per section (doc) or slide (deck, slides separated by ---), as <?c6 block k?> tokens with blocks {k: {type: pending, intent}}. Returns the document and the ids its blocks and keys got."),
+        op!("docs.get", "docs", "GET" "/api/v1/docs/{id}", Read, Input::Query(schema::<api::InRealm>), "A whole document: its tabs and every block (id, kind, Markdown, hash, who last wrote it).", choices = &[("id", "docs.list")]),
+        op!("docs.read", "docs", "GET" "/api/v1/docs/{id}/read", Read, Input::Query(schema::<api::docs::DocRead>), "Reads part of a document: view=outline (ids, headings, first words, hashes), block or slide (id: its Markdown and hash), search (q), since (rev: what changed since that version), markdown (a tab or all), full; at= an older version.", choices = &[("id", "docs.list")]),
+        op!("docs.edit", "docs", "POST" "/api/v1/docs/{id}/ops", Write, Input::Body(schema::<api::docs::DocBatch>), "Changes a document with a batch of operations, all or nothing: insert Markdown (before/after a block, at a section's or tab's end, into a slide's region), replace (a block's Markdown with ifRev and ifHash from a read; find/with words; a table cell; a slide's layout, notes, hidden), delete (guarded), move, table rows and columns, set (title, theme, tab title, tab order, a chip), add_tab, delete_tab. A guard that no longer holds refuses the batch: read again; their edit wins.", choices = &[("id", "docs.list")]),
+        op!("docs.rename", "docs", "PATCH" "/api/v1/docs/{id}", Write, Input::Body(schema::<api::docs::DocPatch>), "Renames a document or changes its labels.", choices = &[("id", "docs.list")]),
+        op!("docs.delete", "docs", "DELETE" "/api/v1/docs/{id}", Destructive, Input::Query(schema::<api::InRealm>), "Deletes a document.", choices = &[("id", "docs.list")]),
+        op!("docs.history", "docs", "GET" "/api/v1/docs/{id}/history", Read, Input::Query(schema::<crate::docs::http::HistoryQuery>), "A document's versions, newest first: who made each (you, session:<id>), when, and the blocks it added, changed and removed.", choices = &[("id", "docs.list")]),
+        op!("docs.restore", "docs", "POST" "/api/v1/docs/{id}/restore", Write, Input::Body(schema::<api::docs::DocRestore>), "Brings back an earlier version of a document, or one block or slide of it, as a new change.", choices = &[("id", "docs.list")]),
         op!("decisions.list", "decisions", "GET" "/api/v1/decisions", Read, Input::Query(schema::<DecisionQuery>), "Decisions (open by default): what waits first, then by priority."),
         op!("decisions.count", "decisions", "GET" "/api/v1/decisions/count", Read, Input::None, "How many decisions are open."),
         op!("decisions.get", "decisions", "GET" "/api/v1/decisions/{id}", Read, Input::None, "A decision: its case, options or form, context, and answer.", choices = &[("id", "decisions.list")]),
@@ -1222,7 +1236,7 @@ mod tests {
         let mut routes: Vec<(String, String)> = Vec::new();
         let re = regex::Regex::new(r#"(?m)\.route\(\s*"([^"]+)",(.*)$"#).unwrap();
         let method = regex::Regex::new(r"\b(get|post|put|delete|patch)\(").unwrap();
-        for src in [include_str!("api.rs"), include_str!("auth.rs"), include_str!("assistant.rs")] {
+        for src in [include_str!("api.rs"), include_str!("auth.rs"), include_str!("assistant.rs"), include_str!("docs/http.rs")] {
             for c in re.captures_iter(src) {
                 for m in method.captures_iter(&c[2]) {
                     routes.push((m[1].to_uppercase(), c[1].to_owned()));

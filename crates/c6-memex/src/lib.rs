@@ -680,6 +680,15 @@ impl Memex {
         self.realm == REALM_HOME
     }
 
+    /// The knowledge of `realm`: this one's, or (home's) another realm's,
+    /// for what the head keeps in a realm's database itself (documents).
+    pub async fn of_realm(&self, realm: &str) -> anyhow::Result<Arc<Memex>> {
+        if realm == self.realm {
+            return self.this.upgrade().ok_or_else(|| anyhow::anyhow!("the memex stopped"));
+        }
+        self.realm_memex(realm).await
+    }
+
     /// Another realm's memex (home's only): its own database under
     /// `realms/<realm>/`, opened and started when first used.
     async fn realm_memex(&self, realm: &str) -> anyhow::Result<Arc<Memex>> {

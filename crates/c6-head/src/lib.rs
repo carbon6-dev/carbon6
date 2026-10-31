@@ -14,6 +14,7 @@ pub mod config;
 mod convert;
 mod cron;
 pub mod decisions;
+pub mod docs;
 pub mod explorer;
 mod export;
 pub mod extract;
@@ -85,12 +86,14 @@ pub enum UserError {
     NotFound(String),
     /// Not allowed for this caller (a realm-scoped token).
     Forbidden(String),
+    /// What the request was based on changed since (a document's guard).
+    Conflict(String),
 }
 
 impl std::fmt::Display for UserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UserError::BadRequest(m) | UserError::NotFound(m) | UserError::Forbidden(m) => f.write_str(m),
+            UserError::BadRequest(m) | UserError::NotFound(m) | UserError::Forbidden(m) | UserError::Conflict(m) => f.write_str(m),
         }
     }
 }
@@ -107,6 +110,10 @@ pub(crate) fn forbidden(msg: impl Into<String>) -> anyhow::Error {
 
 pub(crate) fn not_found(msg: impl Into<String>) -> anyhow::Error {
     UserError::NotFound(msg.into()).into()
+}
+
+pub(crate) fn conflict(msg: impl Into<String>) -> anyhow::Error {
+    UserError::Conflict(msg.into()).into()
 }
 
 pub struct HeadState {
@@ -150,6 +157,8 @@ pub struct HeadState {
     pub updates: updates::Updater,
     /// Pools of connections (docs/pools.md).
     pub pools: pools::Pools,
+    /// Documents' changes, for the live feed and their settled events.
+    pub docs: docs::Docs,
     /// Itself, for what must outlive a borrow (set once it is made).
     me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
 }
@@ -260,6 +269,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         memex: Default::default(),
         updates: updater,
         pools: Default::default(),
+        docs: Default::default(),
         me: Default::default(),
     });
     let _ = state.me.set(Arc::downgrade(&state));
