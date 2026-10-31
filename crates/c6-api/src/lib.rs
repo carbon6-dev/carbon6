@@ -9,7 +9,7 @@ pub mod prompts;
 pub mod slides;
 pub mod work;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+pub use uuid::Uuid;
 
 /// Timestamps are Unix milliseconds.
 pub type UnixMs = i64;
@@ -1772,6 +1772,14 @@ pub struct RewindRequest {
     /// Also put files back as they were before that message.
     #[serde(default)]
     pub restore_files: bool,
+}
+
+/// `PUT /api/v1/sessions/{id}/queue/{command_id}`: the edited text of a
+/// queued input, before it is delivered.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EditQueuedInput {
+    pub text: String,
 }
 
 /// Input accepted by the head but not yet recorded by the worker.

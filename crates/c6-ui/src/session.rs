@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason};
+use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason, WorkerStatus};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -10,6 +10,9 @@ use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, storage_get, storage_set};
 use crate::workspace::{ColumnCtx, Go, ScrollBox, Target, View, use_column};
 use crate::{api, markdown, sessions};
+
+/// The small bordered action buttons on a message row (Edit, Rewind, Ask).
+const UBTN: &str = "rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 shadow-sm hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100";
 
 /// Live-only state, replaced by durable events as they arrive.
 #[derive(Clone, Default)]
@@ -149,12 +152,25 @@ fn turn_line(t: &TurnStats, now: Option<i64>) -> String {
     parts.join(" · ")
 }
 
+/// One message in the queue-edit box: a stable id (for reordering and
+/// deleting it) and its text.
+#[derive(Clone, PartialEq)]
+pub(crate) struct QueueRow {
+    id: u64,
+    text: String,
+}
+
 /// Live state of one session's log, fed by its stream.
 #[derive(Clone, Copy)]
 pub(crate) struct Feed {
     pub(crate) events: RwSignal<Vec<Event>>,
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
+    /// The queue-edit box is open (its messages are in `edit_rows`).
+    pub(crate) edit_open: RwSignal<bool>,
+    /// The messages pulled out of the queue, to be re-sent edited,
+    /// reordered or dropped (in send order), while the box is open.
+    pub(crate) edit_rows: RwSignal<Vec<QueueRow>>,
     activity: RwSignal<Option<bool>>,
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
@@ -200,6 +216,8 @@ impl Feed {
             events: RwSignal::new(Vec::new()),
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
+            edit_open: RwSignal::new(false),
+            edit_rows: RwSignal::new(Vec::new()),
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
@@ -991,8 +1009,26 @@ fn SubagentsPill(session: String, tree: String, events: RwSignal<Vec<Event>>, fo
 /// shown under them (recursively).
 #[component]
 fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoView {
-    let Feed { events, streaming, queued, secrets, from, to, .. } = feed;
+    let Feed { events, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
+    let worker_id = session.worker_id;
+    // Pulling a queued message (and the ones after it) into the edit box:
+    // it is canceled and returned, and the box opens or takes it in. The
+    // rows live in `edit_rows`, read by the box's list; the open flag is
+    // what the box's mount depends on. A second pull only appends to
+    // `edit_rows` (the flag is already open, so the box's body does not
+    // re-run), and your in-progress edits stay.
+    let pull = Callback::new(move |pulled: Vec<QueuedInput>| {
+        edit_rows.update(|all| {
+            let first = all.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+            for (i, p) in pulled.iter().enumerate() {
+                all.push(QueueRow { id: first + i as u64, text: p.text.clone() });
+            }
+        });
+        if !edit_open.get_untracked() {
+            edit_open.set(true);
+        }
+    });
     // What's drawn: the window (before it, only the summary's events), to
     // the end or where a jump stops it.
     let shown_events = Memo::new(move |_| {
@@ -1155,7 +1191,6 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                         }
                         _ => None,
                     };
-                    let ubtn = "rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 shadow-sm hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100";
                     view! {
                         <div
                             id=format!("{}-e{seq}", id.get_value())
@@ -1189,10 +1224,10 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                             {anchorable.then(|| view! {
                                 <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
                                     {move || (can_rewind && is_user && by().is_none()).then(|| view! {
-                                        <button class=ubtn title="Change this message and send it again (rewinds to before it)" on:click=move |_| rewinding.set(Some((seq, true)))>"✎ Edit"</button>
-                                        <button class=ubtn title="Rewind the conversation (and optionally files) to before this message" on:click=move |_| rewinding.set(Some((seq, false)))>"↶ Rewind"</button>
+                                        <button class=UBTN title="Change this message and send it again (rewinds to before it)" on:click=move |_| rewinding.set(Some((seq, true)))>"✎ Edit"</button>
+                                        <button class=UBTN title="Rewind the conversation (and optionally files) to before this message" on:click=move |_| rewinding.set(Some((seq, false)))>"↶ Rewind"</button>
                                     })}
-                                    <button class=ubtn title="Ask about this in a side chat" on:click=move |_| asking.set(Some(seq))>"↳ Ask"</button>
+                                    <button class=UBTN title="Ask about this in a side chat" on:click=move |_| asking.set(Some(seq))>"↳ Ask"</button>
                                 </div>
                             })}
                         </div>
@@ -1238,7 +1273,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             {move || running.get().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
                 <p class="font-mono text-[11px] text-zinc-500">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
             })}
-            {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() /> }).collect_view()}
+            {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
+            {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
         </div>
     }
 }
@@ -2632,22 +2668,162 @@ fn ToolCard(
 }
 
 #[component]
-fn Queued(q: QueuedInput, session_id: String) -> impl IntoView {
+fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Callback<Vec<QueuedInput>>) -> impl IntoView {
     let rejected = q.rejected.clone();
+    let text = q.text;
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let (session_id, command_id, text) = (StoredValue::new(session_id), StoredValue::new(q.command_id), StoredValue::new(text));
+    // A connected worker that is older than the head cannot edit or cancel
+    // its queued inputs: hide the buttons (the head would 409 them). An away
+    // worker, or one the live feed has not listed yet, gets the click and
+    // says so then (503).
+    let queue_ops = Signal::derive(move || {
+        !api::live().workers.with(|ws| {
+            ws.iter()
+                .find(|w| w.id == worker_id)
+                .is_some_and(|w| w.status == WorkerStatus::Online && !w.capabilities.iter().any(|c| c == "queue_ops"))
+        })
+    });
+    // Pulls this message and the ones queued after it into the edit box
+    // (the head cancels them); the box opens or takes them in.
+    let do_pull = move || {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        let (id, cid, pull) = (session_id.get_value(), command_id.get_value(), pull);
+        spawn_local(async move {
+            match api::pull_queued(id, cid).await {
+                Ok(pulled) => pull.run(pulled),
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
     view! {
         <div class="flex flex-col items-end gap-1">
             <div class=if rejected.is_some() { "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-red-300 px-4 py-2 text-sm opacity-70 dark:border-red-900" } else { "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-zinc-500 dark:border-zinc-700" }>
-                {q.text.clone()}
+                {text.get_value()}
             </div>
             {match rejected {
                 Some(reason) => view! {
                     <span class="text-xs text-red-600">
                         {format!("Not delivered: {reason}")} " "
-                        <button class="underline" on:click=move |_| { let id = session_id.clone(); spawn_local(async move { let _ = api::dismiss_rejected(id).await; }); }>"Dismiss"</button>
+                        <button class="underline" on:click=move |_| { let id = session_id.get_value(); spawn_local(async move { let _ = api::dismiss_rejected(id).await; }); }>"Dismiss"</button>
                     </span>
                 }.into_any(),
-                None => view! { <span class="text-xs text-zinc-500">"queued"</span> }.into_any(),
+                None => view! {
+                    <span class="flex items-center gap-2 text-xs text-zinc-500">
+                        "queued"
+                        {move || queue_ops.get().then(|| view! {
+                            <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
+                                prop:disabled=move || busy.get() on:click=move |_| do_pull()>"✎ Edit"</button>
+                            <button class=UBTN title="Remove this message from the queue"
+                                on:click=move |_| { let (id, cid) = (session_id.get_value(), command_id.get_value()); spawn_local(async move {
+                                    if let Err(e) = api::cancel_queued_input(id, cid).await { error.set(Some(e)); }
+                                }); }>"✕ Cancel"</button>
+                        })}
+                    </span>
+                }.into_any(),
             }}
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+        </div>
+    }
+}
+
+/// The queue-edit box: the messages pulled out of the queue, each a
+/// textarea — edited in place, moved up or down, dropped, or new ones
+/// added. Sending re-queues them, in order, as fresh messages; closing it
+/// discards them (they were pulled out of the queue, not held). Its rows
+/// are shared (`rows`): the box is opened by `edit_open`, so a second
+/// pull appends to it without re-running this body.
+#[component]
+fn QueueEditBox(rows: RwSignal<Vec<QueueRow>>, session_id: String, on_close: Callback<()>) -> impl IntoView {
+    let session_id = StoredValue::new(session_id);
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let send = move || {
+        if busy.get_untracked() {
+            return;
+        }
+        let texts: Vec<(u64, String)> =
+            rows.with_untracked(|r| r.iter().map(|x| (x.id, x.text.trim().to_owned())).filter(|(_, t)| !t.is_empty()).collect());
+        if texts.is_empty() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        let id = session_id.get_value();
+        spawn_local(async move {
+            let mut sent = Vec::new();
+            for (row_id, text) in texts {
+                match api::send_message(id.clone(), text, None, Vec::new()).await {
+                    Ok(_) => sent.push(row_id),
+                    Err(e) => {
+                        error.set(Some(e));
+                        break;
+                    }
+                }
+            }
+            busy.set(false);
+            if error.get_untracked().is_none() {
+                on_close.run(());
+            } else {
+                // The ones that made it are in the queue again: drop them
+                // here, so sending again does not double them.
+                rows.update(|r| r.retain(|x| !sent.contains(&x.id)));
+            }
+        });
+    };
+    view! {
+        <div class="w-full rounded-xl border border-zinc-300 bg-white p-3 text-sm dark:border-zinc-700 dark:bg-zinc-900">
+            <div class="mb-2 flex items-center gap-2 text-xs text-zinc-500">
+                "Edit the queued messages, then send them again"
+                <span class="flex-1"></span>
+                <button class=format!("{BUTTON_QUIET} text-xs") title="Discard these messages (they were pulled out of the queue)"
+                    prop:disabled=move || busy.get() on:click=move |_| on_close.run(())>"Discard"</button>
+            </div>
+            <div class="flex flex-col gap-2">
+                <For each=move || rows.get() key=|r| r.id let:row>
+                    <QueueEditRow id=row.id rows=rows />
+                </For>
+            </div>
+            <div class="mt-2 flex items-center gap-3">
+                <button class=format!("{BUTTON_QUIET} text-xs") prop:disabled=move || busy.get()
+                    on:click=move |_| rows.update(|r| {
+                        let next = r.iter().map(|x| x.id).max().unwrap_or(0) + 1;
+                        r.push(QueueRow { id: next, text: String::new() });
+                    })>"＋ Add a message"</button>
+                <span class="flex-1"></span>
+                <span class="text-xs text-zinc-400">"Closing this discards these messages"</span>
+                <button class=format!("{BUTTON} text-xs") prop:disabled=move || busy.get() on:click=move |_| send()>"Send"</button>
+            </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+        </div>
+    }
+}
+
+/// One message in the queue-edit box.
+#[component]
+fn QueueEditRow(id: u64, rows: RwSignal<Vec<QueueRow>>) -> impl IntoView {
+    view! {
+        <div class="flex items-start gap-1.5">
+            <textarea class=format!("{INPUT} min-h-[2.5rem] resize-y") rows=2
+                prop:value=move || rows.with(|r| r.iter().find(|x| x.id == id).map(|x| x.text.clone()).unwrap_or_default())
+                on:input=move |ev| {
+                    let text = event_target_value(&ev);
+                    rows.update(|r| if let Some(x) = r.iter_mut().find(|x| x.id == id) { x.text = text; });
+                }></textarea>
+            <div class="flex flex-col gap-1">
+                <button class=UBTN title="Move up"
+                    on:click=move |_| rows.update(|r| if let Some(i) = r.iter().position(|x| x.id == id) && i > 0 { r.swap(i - 1, i); })>"↑"</button>
+                <button class=UBTN title="Move down"
+                    on:click=move |_| rows.update(|r| if let Some(i) = r.iter().position(|x| x.id == id) && i + 1 < r.len() { r.swap(i, i + 1); })>"↓"</button>
+                <button class=UBTN title="Drop this message"
+                    on:click=move |_| rows.update(|r| r.retain(|x| x.id != id))>"✕"</button>
+            </div>
         </div>
     }
 }

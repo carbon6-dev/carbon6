@@ -16,7 +16,24 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::store::{NewCommand, SessionRow};
-use crate::{HeadState, bad_request, convert, not_found};
+use crate::{HeadState, bad_request, conflict, convert, not_found};
+
+/// The worker could not be reached (or did not answer): the request was
+/// fine and can be retried (the head answers 503).
+#[derive(Debug)]
+pub struct WorkerUnreachable(pub String);
+
+impl std::fmt::Display for WorkerUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerUnreachable {}
+
+fn unreachable(e: String) -> anyhow::Error {
+    anyhow::Error::new(WorkerUnreachable(format!("the worker could not be asked: {e}")))
+}
 
 /// Settings keys, included in every new session's configuration.
 pub const MCP_SERVERS: &str = "mcp_servers";
@@ -808,6 +825,211 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None })
 }
 
+/// A session that takes input (the checks `send_input` and the queue
+/// operations share).
+fn takes_input(session: &SessionRow) -> anyhow::Result<()> {
+    if session.observed {
+        return Err(bad_request("this is Claude Code's own subagent: it is shown here, and Claude Code runs it"));
+    }
+    if session.status == "failed" {
+        return Err(bad_request(format!("session failed to start: {}", session.error.as_deref().unwrap_or_default())));
+    }
+    Ok(())
+}
+
+/// A connected worker that cannot edit or cancel its queued inputs (an
+/// older one): 409, naming what to do. The head's own worker (assistant
+/// sessions) is never "older" than the head: it is the head.
+fn queue_gate(st: &HeadState, worker_id: WorkerId, worker_name: &str) -> anyhow::Result<()> {
+    if st.assistant.head_id() == Some(worker_id) {
+        return Ok(());
+    }
+    match st.registry.get(worker_id) {
+        Some(live) if !live.capabilities.iter().any(|c| c == "queue_ops") => Err(crate::queue_unsupported(worker_name)),
+        _ => Ok(()),
+    }
+}
+
+/// The pending input a queue operation names: its creation time and the
+/// check that the command is this session's.
+async fn pending_of(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<Option<(i64, c6_proto::UserInput)>> {
+    Ok(match st.store.pending_input(command_id).await? {
+        Some((_text, created_at, data)) => {
+            let Some(cmd) = SessionCommand::decode(data.as_slice()).ok() else {
+                return Ok(None);
+            };
+            if cmd.session_id != session_id {
+                return Ok(None);
+            }
+            let input = match cmd.kind {
+                Some(session_command::Kind::Input(i)) => i,
+                _ => return Ok(None),
+            };
+            Some((created_at, input))
+        }
+        None => None,
+    })
+}
+
+/// Edits a queued input before it is delivered: its text (and the command
+/// and memex attachments that go with it). 409 once it is in flight, 409
+/// when a connected worker cannot do it (an older one), 503 while the
+/// worker cannot be reached (the row stays as it is).
+pub async fn edit_queued(st: &HeadState, session_id: &str, command_id: &str, text: &str) -> anyhow::Result<api::QueuedInput> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(bad_request("message is empty"));
+    }
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_input(&session)?;
+    let Some((created_at, input)) = pending_of(st, session_id, command_id).await? else {
+        return Err(not_found("no such queued input"));
+    };
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    // A connected worker says whether it can edit or cancel its queued
+    // inputs; one that is away gets asked and says so then (503).
+    queue_gate(st, worker_id, &session.worker_name)?;
+    // The change the worker makes to its inbox, if the input is there.
+    let new_input = {
+        // @memex: attachments were the old text's: the new text's, attached
+        // again below. A command was the old text's too.
+        let mut input = input;
+        input.text = text.to_owned();
+        input.attachments.retain(|a| !a.name.starts_with("@memex:"));
+        input.command.clear();
+        input.command_candidates_json.clear();
+        with_command(st, &session.realm, session.head_labels(), input).await?
+    };
+    let data = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(new_input.encode_to_vec())
+    };
+    let call = st
+        .registry
+        .call(
+            worker_id,
+            "session.queue_op",
+            serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "update", "data": data }),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    let state = match call {
+        Ok(r) => r["state"].as_str().unwrap_or_default().to_owned(),
+        Err(e) => return Err(unreachable(e)),
+    };
+    match state.as_str() {
+        "updated" | "pending" => {}
+        "in_flight" | "delivered" => {
+            return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+        }
+        _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
+    }
+    // The row, in place (same id: what is settled by it settles by the
+    // rewritten row too). `pending` re-delivers the rewrite; a worker
+    // without the method (an older one) never answers, so it stays as it
+    // was.
+    let names: Vec<&str> = new_input.attachments.iter().filter(|a| !a.name.starts_with("@memex:")).map(|a| a.name.as_str()).collect();
+    let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
+    if !st.store.update_pending_command(command_id, &input_command(command_id, session_id, new_input), Some(&shown)).await? {
+        return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+    }
+    publish_queue(st, session_id).await;
+    st.registry.deliver(worker_id);
+    Ok(api::QueuedInput { command_id: command_id.to_owned(), text: shown, created_at, rejected: None })
+}
+
+/// Cancels a queued input before it is delivered: it is never sent. 409
+/// once it is in flight, 409 when a connected worker cannot do it (an
+/// older one), 503 while the worker cannot be reached (the row stays as
+/// it is).
+pub async fn cancel_queued(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<()> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_input(&session)?;
+    if pending_of(st, session_id, command_id).await?.is_none() {
+        return Err(not_found("no such queued input"));
+    }
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    queue_gate(st, worker_id, &session.worker_name)?;
+    let call = st
+        .registry
+        .call(
+            worker_id,
+            "session.queue_op",
+            serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "cancel" }),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    let state = match call {
+        Ok(r) => r["state"].as_str().unwrap_or_default().to_owned(),
+        Err(e) => return Err(unreachable(e)),
+    };
+    match state.as_str() {
+        "cancelled" | "pending" => {}
+        "in_flight" | "delivered" => {
+            return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+        }
+        _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
+    }
+    if !st.store.cancel_pending_command(command_id).await? {
+        return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+    }
+    publish_queue(st, session_id).await;
+    Ok(())
+}
+
+/// Pulls a queued input and everything queued after it out of the queue,
+/// to be re-sent edited, reordered or dropped: the messages are canceled
+/// (never delivered as they were) and returned, oldest first. 409 once
+/// the anchor is on its way to the agent, 409 when a connected worker
+/// cannot do it (an older one), 503 while the worker cannot be asked
+/// (the rows stay as they are).
+pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<Vec<api::QueuedInput>> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_input(&session)?;
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    // The head's own worker (assistant sessions) is never asked: its
+    // connection answers none of the head's RPCs.
+    let head_worker = st.assistant.head_id() == Some(worker_id);
+    queue_gate(st, worker_id, &session.worker_name)?;
+    let rows = st.store.pending_tail(session_id, command_id).await?.ok_or_else(|| not_found("no such queued input"))?;
+    // The anchor first: if it is on its way, nothing is pulled.
+    for row in &rows {
+        if !head_worker {
+            let call = st
+                .registry
+                .call(
+                    worker_id,
+                    "session.queue_op",
+                    serde_json::json!({ "session_id": session_id, "command_id": row.id, "op": "cancel" }),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+            let state = match call {
+                Ok(r) => r["state"].as_str().unwrap_or_default().to_owned(),
+                Err(e) => return Err(unreachable(e)),
+            };
+            match state.as_str() {
+                "cancelled" | "pending" => {}
+                "in_flight" | "delivered" => {
+                    return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+                }
+                _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
+            }
+        }
+        if !st.store.cancel_pending_command(&row.id).await? {
+            return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+        }
+    }
+    publish_queue(st, session_id).await;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let text = row.text?;
+            Some(api::QueuedInput { command_id: row.id, text, created_at: row.created_at, rejected: None })
+        })
+        .collect())
+}
+
 /// The subagent-limits setting.
 pub const SUBAGENT_LIMITS: &str = "subagent_limits";
 
@@ -1431,7 +1653,7 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     if session.status == "failed" || session.observed || session.worker_id != worker_id.to_string() {
         return Ok(false);
     }
-    let Some((text, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
+    let Some((text, _created_at, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
     // The same input (model switch, attachments and all), under a new id.
     let input = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
         Some(session_command::Kind::Input(i)) => i,
