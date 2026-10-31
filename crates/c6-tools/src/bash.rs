@@ -197,7 +197,8 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
     if text.is_empty() {
         text = "(no output)".into();
     }
-    Ok(ToolOutput::limited(text, is_error))
+    let saved = (text.chars().count() > crate::SHELL_INLINE_CHARS).then(|| crate::util::save_output(&text)).flatten();
+    Ok(ToolOutput::shell(text, is_error, saved.as_deref()))
 }
 
 /// `run` on the session's SSH target: the same streaming, limits and
@@ -302,7 +303,8 @@ async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str,
     if text.is_empty() {
         text = "(no output)".into();
     }
-    Ok(ToolOutput::limited(text, is_error))
+    // Its files are on the other machine, so nothing is kept here.
+    Ok(ToolOutput::shell(text, is_error, None))
 }
 
 fn read_pipe(mut reader: std::io::PipeReader, tx: mpsc::UnboundedSender<Vec<u8>>) {
@@ -355,6 +357,22 @@ mod tests {
         Bash.call(&ctx, json!({"command": "cd sub"})).await;
         let r = Bash.call(&ctx, json!({"command": "pwd -P"})).await;
         assert!(r.content.trim().ends_with("/sub"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn long_output_keeps_its_end_inline_and_all_of_it_in_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), Default::default());
+        let r = Bash.call(&ctx, json!({"command": "echo FIRST; for i in $(seq 1 4000); do echo line $i; done; echo LAST"})).await;
+        assert!(r.truncated);
+        assert!(r.content.chars().count() < crate::SHELL_INLINE_CHARS + 400, "{}", r.content.len());
+        assert!(r.content.starts_with("FIRST") && r.content.trim_end().ends_with("LAST"));
+        let path = r.content.split(" is in ").nth(1).and_then(|s| s.split(':').next()).unwrap();
+        let all = std::fs::read_to_string(path).unwrap();
+        assert!(all.contains("line 2000\n") && all.trim_end().ends_with("LAST"));
+        let _ = std::fs::remove_file(path);
+        // Short output is untouched.
+        assert_eq!(Bash.call(&ctx, json!({"command": "echo hi"})).await.content, "hi\n");
     }
 
     #[tokio::test]

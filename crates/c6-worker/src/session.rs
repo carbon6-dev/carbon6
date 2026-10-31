@@ -1923,6 +1923,7 @@ impl Actor {
             context_window: info.context_window,
             web_search: hosted_web_search(provider, &self.started),
             compact: compact_prompts(&self.spec),
+            compact_at: model.compact_at_percent,
         };
         let mut conv = self.conv.take().expect("no turn is running");
         let sub = crate::subagent::Parent {

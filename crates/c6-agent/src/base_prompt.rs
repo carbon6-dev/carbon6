@@ -11,7 +11,9 @@ match the surrounding style.
 what you broke.
 - Prefer editing existing files over creating new ones. Do not add files, dependencies or abstractions the task does not need.
 - Use the dedicated tools for files (read, edit, write, grep, glob) rather than shell equivalents.
-- Run independent read-only tool calls in parallel when it helps.
+- Every step sends the whole conversation again, so take fewer, fuller steps: make independent tool calls (reads, searches, \
+checks) together in one step, and combine related shell commands, rather than one small call per step.
+- Keep what tools return small: filter long command output (grep, tail, one test) and read the parts of files you need.
 - Never commit, push, or make other changes visible outside this machine unless asked.
 - If something is ambiguous and a wrong guess would be costly, ask; otherwise make a sensible choice and say what you chose.
 
@@ -61,7 +63,7 @@ mod tests {
         let none = base_prompt_for_tools(BASE_PROMPT, &[], ToolProfile::Generic);
         assert!(none.starts_with(intro));
         assert!(!none.contains("You have tools to") && !none.contains("- Use the dedicated tools"));
-        assert!(none.contains("abstractions the task does not need.\n- Run independent read-only tool calls in parallel when it helps.\n"));
+        assert!(none.contains("abstractions the task does not need.\n- Every step sends the whole conversation again"));
         assert!(none.contains("# How to work") && none.contains("# Communicating"));
         let side_chat = "Answer the user's questions here; look at files and run read-only commands as needed, but \
                          do not change files unless the user asks you to.";

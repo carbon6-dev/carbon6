@@ -22,8 +22,25 @@ use crate::{EventSink, PendingInput};
 const MAX_STEPS: usize = 500;
 /// How many times Stop hooks may keep one turn going.
 const MAX_STOP_HOOK_RUNS: usize = 10;
-/// Compact once the context reaches this share of the window.
-const COMPACT_AT: f64 = 0.85;
+/// Compact once the context reaches this share of the window, unless the
+/// connection says otherwise ([`TurnConfig::compact_at`]). Large windows
+/// compact sooner: every call sends the whole conversation again, so a
+/// long one near the top of a 272k window costs far more per step than its
+/// summary does; small windows need the room to write the summary at all.
+pub const COMPACT_AT: f64 = 0.85;
+pub const COMPACT_AT_LARGE: f64 = 0.7;
+/// Windows of at least this many tokens are large.
+pub const LARGE_WINDOW: u64 = 100_000;
+
+/// The share of `window` at which a conversation compacts: `setting` (a
+/// percentage) when given, else the default for its size.
+pub fn compact_share(window: u64, setting: u32) -> f64 {
+    match setting {
+        1..=100 => f64::from(setting) / 100.0,
+        _ if window >= LARGE_WINDOW => COMPACT_AT_LARGE,
+        _ => COMPACT_AT,
+    }
+}
 /// Model calls that fail on the way (a dropped stream, an overloaded or
 /// erroring provider) are tried again this many times, waiting longer each
 /// time, before the turn stops with the error.
@@ -77,6 +94,9 @@ pub struct TurnConfig {
     /// Offer the provider's built-in web search, where it has one.
     pub web_search: bool,
     pub compact: CompactPrompts,
+    /// Percent of the window at which to compact; 0: [`compact_share`]'s
+    /// default for the window.
+    pub compact_at: u32,
 }
 
 /// Mutable conversation state carried across turns.
@@ -203,7 +223,9 @@ impl Turn<'_> {
             return u64::MAX;
         }
         let prefix = self.estimate_request(&[Message::user_text(compacted_context(""))], &self.specs);
-        ((self.cfg.context_window as f64 * COMPACT_AT) as u64).saturating_sub(prefix).saturating_sub(COMPACT_FRAMING)
+        ((self.cfg.context_window as f64 * compact_share(self.cfg.context_window, self.cfg.compact_at)) as u64)
+            .saturating_sub(prefix)
+            .saturating_sub(COMPACT_FRAMING)
     }
 
     fn no_summary_room(&self) -> String {
@@ -282,7 +304,7 @@ impl Turn<'_> {
             let estimate = self.estimate_request(&conv.history, &self.specs);
             let next = next_tokens(conv.context_tokens, estimate, reported);
             if self.cfg.context_window > 0
-                && next as f64 > self.cfg.context_window as f64 * COMPACT_AT
+                && next as f64 > self.cfg.context_window as f64 * compact_share(self.cfg.context_window, self.cfg.compact_at)
                 && compacted_estimate != Some(estimate)
             {
                 if self.summary_room() < u64::from(COMPACT_MIN_OUTPUT) {
@@ -776,5 +798,20 @@ fn clip(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn large_windows_compact_sooner_unless_set() {
+        assert_eq!(compact_share(16_384, 0), COMPACT_AT);
+        assert_eq!(compact_share(272_000, 0), COMPACT_AT_LARGE);
+        assert_eq!(compact_share(LARGE_WINDOW, 0), COMPACT_AT_LARGE);
+        assert_eq!(compact_share(272_000, 50), 0.5);
+        assert_eq!(compact_share(16_384, 90), 0.9);
+        assert_eq!(compact_share(16_384, 250), COMPACT_AT, "out of range: the default");
     }
 }

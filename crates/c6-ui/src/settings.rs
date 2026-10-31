@@ -1674,6 +1674,27 @@ fn ContextWindow(value: RwSignal<String>) -> impl IntoView {
     }
 }
 
+/// What sessions on a connection do by default to spend fewer tokens.
+#[component]
+fn SessionDefaults(subagent_model: RwSignal<String>, compact_at: RwSignal<String>) -> impl IntoView {
+    view! {
+        <div class="grid gap-2 sm:grid-cols-2">
+            <label class="block text-xs text-zinc-500">
+                "Subagent model"
+                <input class=format!("mt-1 {INPUT}") placeholder="empty: the session's own"
+                    title="Subagents of sessions on this connection run on this model unless a routing rule or the session names another. A smaller model costs far less for searching and reading."
+                    prop:value=move || subagent_model.get() on:input=move |ev| subagent_model.set(event_target_value(&ev)) />
+            </label>
+            <label class="block text-xs text-zinc-500">
+                "Compact at (% of context window)"
+                <input type="number" min="30" max="95" step="1" class=format!("mt-1 {INPUT}") placeholder="empty: 70 for large windows, else 85"
+                    title="Sessions summarize their conversation once it fills this share of the window. Every call sends the whole conversation, so compacting sooner spends fewer tokens per step."
+                    prop:value=move || compact_at.get() on:input=move |ev| compact_at.set(event_target_value(&ev)) />
+            </label>
+        </div>
+    }
+}
+
 #[component]
 fn ConnectionRow(
     c: Connection,
@@ -1684,6 +1705,10 @@ fn ConnectionRow(
     let pool = c.kind == "pool";
     let editable = c.kind != "claude_code";
     let context_window = RwSignal::new(c.context_window.map(|n| n.to_string()).unwrap_or_default());
+    let subagent_model = RwSignal::new(c.subagent_model.clone().unwrap_or_default());
+    let compact_at = RwSignal::new(c.compact_at.map(|n| n.to_string()).unwrap_or_default());
+    // What sessions on it do: not for pools (head-side only) or Claude Code.
+    let sessions_on = !pool && editable;
     let members = RwSignal::new(c.members.clone());
     let editing = RwSignal::new(false);
     let save_id = c.id.clone();
@@ -1695,7 +1720,19 @@ fn ConnectionRow(
             error.set(Some("context window must be a whole number".into()));
             return;
         };
-        let req = c6_api::UpdateConnection { name: None, members: pool.then(|| members.get_untracked()), context_window: Some(window) };
+        let compact = compact_at.get_untracked();
+        let compact = if compact.trim().is_empty() { Ok(0) } else { compact.trim().parse::<u32>() };
+        let Ok(compact) = compact else {
+            error.set(Some("compact at must be a whole percentage".into()));
+            return;
+        };
+        let req = c6_api::UpdateConnection {
+            name: None,
+            members: pool.then(|| members.get_untracked()),
+            context_window: Some(window),
+            subagent_model: sessions_on.then(|| subagent_model.get_untracked()),
+            compact_at: sessions_on.then_some(compact),
+        };
         spawn_local(async move {
             match api::update_connection(id, req).await {
                 Ok(_) => {
@@ -1757,6 +1794,8 @@ fn ConnectionRow(
                     {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
                     {pool.then_some(move || format!(" · {}", members_text()))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
+                    {c.subagent_model.clone().map(|m| format!(" · subagents: {m}"))}
+                    {c.compact_at.map(|n| format!(" · compacts at {n}%"))}
                     {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code" | "pool", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
             </div>
@@ -1770,6 +1809,7 @@ fn ConnectionRow(
             <div class="space-y-2 px-4 pb-3">
                 {pool.then(|| view! { <PoolMembers members all /> })}
                 {editable.then(|| view! { <ContextWindow value=context_window /> })}
+                {sessions_on.then(|| view! { <SessionDefaults subagent_model compact_at /> })}
                 <div class="flex justify-end"><button class=BUTTON on:click=save.clone()>"Save"</button></div>
             </div>
         })}

@@ -286,3 +286,97 @@ async fn settings_reach_assistant_turns_subagents_and_model_switches() {
     stop.cancel();
     head.shutdown().await.unwrap();
 }
+
+/// A server reporting `first` prompt tokens on its first call and few after,
+/// replying "SUMMARY" to the second call (a compaction, when one comes).
+async fn reporting_server(first: u64) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let seen = requests.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let requests = seen.clone();
+            async move {
+                let mut requests = requests.lock().unwrap();
+                let n = requests.len();
+                requests.push(body);
+                let text = if n == 1 { "SUMMARY" } else { "ok" };
+                let reply = json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]});
+                let usage = json!({"choices": [], "usage": {"prompt_tokens": if n == 0 { first } else { 100 }, "completion_tokens": 100}});
+                format!("data: {reply}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, requests)
+}
+
+#[tokio::test]
+async fn connection_session_defaults_validate_and_reach_sessions() {
+    let (dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (head, api) = head(dir.path()).await;
+    let http = reqwest::Client::new();
+    // 40,000 of 65,536 tokens: 61%, under the default 85% for a window this
+    // size, with room below 50% for the summary.
+    let (base, requests) = reporting_server(40_000).await;
+    let c: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "local", "base_url": base, "context_window": 65_536}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!((c.subagent_model.as_deref(), c.compact_at), (None, None));
+    let path = format!("{api}/connections/{}", c.id);
+    for invalid in [10, 29, 96] {
+        let r = http.patch(&path).json(&json!({"compact_at": invalid})).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(r.text().await.unwrap().contains("compact at must be between"));
+    }
+    let c: Connection =
+        http.patch(&path).json(&json!({"compact_at": 50, "subagent_model": " small "})).send().await.unwrap().json().await.unwrap();
+    assert_eq!((c.subagent_model.as_deref(), c.compact_at), (Some("small"), Some(50)));
+    let c: Connection = http.patch(&path).json(&json!({"name": "renamed"})).send().await.unwrap().json().await.unwrap();
+    assert_eq!((c.subagent_model.as_deref(), c.compact_at), (Some("small"), Some(50)), "omitted leaves them alone");
+
+    let (worker, stop) = worker(&head, state.path()).await;
+    let s: Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({
+            "worker_id": worker.identity.meta.worker_id.0, "cwd": project.path(), "connection_id": c.id, "model": "big", "prompt": "hi"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ended(&http, &api, &s.id, 1).await;
+    // Its subagents default to the connection's subagent model.
+    let (spec, _) = worker.journal.load_session(&s.id).await.unwrap().unwrap();
+    let target = spec.subagent_target.expect("a subagent default");
+    assert_eq!((target.connection_id.as_str(), target.model.as_str(), target.compact_at_percent), (c.id.as_str(), "small", 50));
+    assert_eq!(spec.model.unwrap().compact_at_percent, 50);
+    // At 50%, the 61% conversation compacts before its next call.
+    assert!(
+        http.post(format!("{api}/sessions/{}/messages", s.id))
+            .json(&json!({"text": "continue"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let events = ended(&http, &api, &s.id, 2).await;
+    assert!(events.iter().any(|e| matches!(&e.kind, EventKind::Compaction { summary, .. } if summary == "SUMMARY")));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    // Cleared: the session's own model, and the default point.
+    let c: Connection = http.patch(&path).json(&json!({"compact_at": 0, "subagent_model": ""})).send().await.unwrap().json().await.unwrap();
+    assert_eq!((c.subagent_model.as_deref(), c.compact_at), (None, None));
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}

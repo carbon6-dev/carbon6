@@ -377,12 +377,17 @@ pub struct ConnectionRow {
     pub realms: String,
     /// A pool's members (JSON array of `api::PoolMember`).
     pub members: String,
+    /// The model subagents of its sessions run on when nothing else says.
+    pub subagent_model: Option<String>,
+    /// Percent of the context window at which its sessions compact.
+    pub compact_at: Option<i64>,
 }
 
 impl Store {
     pub async fn insert_connection(&self, c: &ConnectionRow) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at, members, context_window) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at, members, context_window, subagent_model, compact_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&c.id)
         .bind(&c.name)
@@ -393,18 +398,23 @@ impl Store {
         .bind(c.created_at)
         .bind(&c.members)
         .bind(c.context_window)
+        .bind(&c.subagent_model)
+        .bind(c.compact_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Sets a connection's name, members and optional context window.
-    pub async fn update_connection(&self, id: &str, name: &str, members: &str, context_window: Option<i64>) -> anyhow::Result<()> {
-        sqlx::query("UPDATE connections SET name = ?, members = ?, context_window = ? WHERE id = ?")
-            .bind(name)
-            .bind(members)
-            .bind(context_window)
-            .bind(id)
+    /// Sets a connection's name, members, optional context window and its
+    /// sessions' defaults.
+    pub async fn update_connection(&self, c: &ConnectionRow) -> anyhow::Result<()> {
+        sqlx::query("UPDATE connections SET name = ?, members = ?, context_window = ?, subagent_model = ?, compact_at = ? WHERE id = ?")
+            .bind(&c.name)
+            .bind(&c.members)
+            .bind(c.context_window)
+            .bind(&c.subagent_model)
+            .bind(c.compact_at)
+            .bind(&c.id)
             .execute(&self.pool)
             .await?;
         Ok(())

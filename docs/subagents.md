@@ -293,7 +293,8 @@ The connection, model and effort come from the first of these that says, most sp
 1. **The `Task` call:** `connection` (a name or id from the list in the tool's description), `model` (a model id, or `connection/model`) and `effort`. The model sets them when you ask ("use a subagent on my blacktitan ChatGPT connection with gpt-6.1-sol at high"). A connection without a model runs its default model.
 2. **A named agent's `model`:** an alias (`opus`, `sonnet`, `haiku`) on an Anthropic connection, or `connection/model` on any.
 3. **The session's default for subagents:** picked in the session (the **Subagents** row under the message box; `PUT /sessions/{id}/subagent-model`), else the routing rule's (**Subagent connection**, **Subagent model**, **Subagent effort**).
-4. **The parent's own model.**
+4. **The connection's subagent model:** set on the session's connection (Settings → Connections → Edit → **Subagent model**), on that same connection. A smaller model there (`gpt-6-luna` under `gpt-6.1-sol`) makes searching and reading far cheaper; subagents were a third of the calls when a ChatGPT plan ran out in three days.
+5. **The parent's own model.**
 
 The effort carries over only while the subagent stays on the same connection. Its own subagents inherit the session's default.
 

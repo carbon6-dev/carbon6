@@ -132,6 +132,15 @@ pub struct Connection {
     /// A pool's members (docs/pools.md).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<PoolMember>,
+    /// The model subagents of sessions on it run on when no routing rule or
+    /// session setting names one (a cheaper one saves tokens); none: the
+    /// session's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_model: Option<String>,
+    /// Percent of the context window at which its sessions compact their
+    /// conversation; none: the default (70).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u32>,
 }
 
 /// A pool's member: one of the other connections, and how many calls it
@@ -175,6 +184,14 @@ pub struct UpdateConnection {
     pub context_window: Option<u64>,
     /// A pool's members, all of them.
     pub members: Option<Vec<PoolMember>>,
+    /// Subagents' model when nothing else names one; "" restores the
+    /// session's own. Omitted or null leaves it unchanged.
+    #[serde(default)]
+    pub subagent_model: Option<String>,
+    /// Percent of the context window at which sessions compact (30 to 95);
+    /// 0 restores the default. Omitted or null leaves it unchanged.
+    #[serde(default)]
+    pub compact_at: Option<u32>,
 }
 
 // --- Sessions ---------------------------------------------------------------

@@ -398,6 +398,7 @@ impl Actor {
             context_window: info.context_window,
             web_search: false,
             compact: self.compact.clone(),
+            compact_at: self.model.compact_at_percent,
         };
         let mut conv = self.conv.take().unwrap_or(Conversation { history: Vec::new(), context_tokens: 0 });
         let (st, sink, inbox, env, c, connection_id) =

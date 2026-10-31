@@ -53,6 +53,12 @@ pub use web::{SearchConfig, WebFetch, WebSearch};
 /// Output kept inline for the model; the rest is elided from the middle.
 pub const MAX_OUTPUT_CHARS: usize = 30_000;
 
+/// Shell output kept inline: a build or test log stays in the conversation
+/// and is sent again with every later call, so only its start and (mostly)
+/// its end are kept; the whole of it goes to a file the agent can read.
+pub const SHELL_INLINE_CHARS: usize = 12_000;
+const SHELL_INLINE_HEAD: usize = 3_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Concurrency {
     /// Read-only; may run alongside other shared tools.
@@ -87,6 +93,28 @@ impl ToolOutput {
     pub fn limited(content: String, is_error: bool) -> Self {
         let (content, truncated) = util::truncate_middle(&content, MAX_OUTPUT_CHARS);
         Self { content, is_error, truncated, images: Vec::new() }
+    }
+
+    /// Shell output: within [`SHELL_INLINE_CHARS`] as is; longer, its start
+    /// and end inline, and all of it in a file (`saved`, when given) that the
+    /// result names, so the agent can read or search the rest.
+    pub fn shell(content: String, is_error: bool, saved: Option<&std::path::Path>) -> Self {
+        let count = content.chars().count();
+        if count <= SHELL_INLINE_CHARS {
+            return Self { content, is_error, truncated: false, images: Vec::new() };
+        }
+        let tail = SHELL_INLINE_CHARS - SHELL_INLINE_HEAD;
+        let head: String = content.chars().take(SHELL_INLINE_HEAD).collect();
+        let end: String = content.chars().skip(count - tail).collect();
+        let omitted = count - SHELL_INLINE_CHARS;
+        let note = match saved {
+            Some(p) => format!(
+                "… [{omitted} characters omitted; the whole output ({count} characters) is in {}: read or grep it rather than running the command again] …",
+                p.display()
+            ),
+            None => format!("… [{omitted} characters omitted; rerun with grep, head or tail to see more] …"),
+        };
+        Self { content: format!("{head}\n\n{note}\n\n{end}"), is_error, truncated: true, images: Vec::new() }
     }
 
     /// With an image for the model to see (PNG, JPEG, GIF or WebP).

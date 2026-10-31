@@ -97,6 +97,7 @@ pub fn resolve_model(
         max_output_tokens: if c.id == m.connection_id { m.max_output_tokens } else { 0 },
         effort: if c.id == m.connection_id { m.effort.clone() } else { String::new() },
         connection_kind: c.kind.clone(),
+        compact_at_percent: if c.id == m.connection_id { m.compact_at_percent } else { 0 },
     };
 
     let mut m = parent.clone();
@@ -887,6 +888,7 @@ mod tests {
             max_output_tokens: 0,
             effort: effort.into(),
             connection_kind: kind.into(),
+            compact_at_percent: 0,
         }
     }
 

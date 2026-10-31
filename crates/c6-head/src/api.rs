@@ -440,6 +440,8 @@ fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
         has_api_key: c.api_key.is_some(),
         created_at: c.created_at,
         realms: serde_json::from_str(&c.realms).unwrap_or_default(),
+        subagent_model: c.subagent_model,
+        compact_at: c.compact_at.map(|n| n as u32),
     }
 }
 
@@ -490,10 +492,15 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         created_at: now_ms(),
         realms: "[]".into(),
         members: "[]".into(),
+        subagent_model: None,
+        compact_at: None,
     };
     st.store.insert_connection(&row).await?;
     Ok(Json(connection_view(row)))
 }
+
+/// The share of the context window a connection may set for compaction.
+const COMPACT_AT_RANGE: std::ops::RangeInclusive<u32> = 30..=95;
 
 /// Zero restores automatic; other values are token counts.
 fn checked_context_window(n: Option<u64>) -> anyhow::Result<Option<i64>> {
@@ -524,6 +531,8 @@ async fn create_pool(st: &HeadState, req: &api::CreateConnection) -> anyhow::Res
         created_at: now_ms(),
         realms: "[]".into(),
         members: serde_json::to_string(&members)?,
+        subagent_model: None,
+        compact_at: None,
     };
     st.store.insert_connection(&row).await?;
     Ok(connection_view(row))
@@ -555,7 +564,23 @@ async fn update_connection(
         Some(n) => checked_context_window(Some(n))?,
         None => c.context_window,
     };
-    st.store.update_connection(&id, &name, &members, context_window).await?;
+    let subagent_model = match &req.subagent_model {
+        Some(m) if c.kind == "claude_code" && !m.trim().is_empty() => {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, "subagents run in carbon6's own loop, not on Claude Code".into()));
+        }
+        Some(m) => Some(m.trim().to_owned()).filter(|m| !m.is_empty()),
+        None => c.subagent_model.clone(),
+    };
+    let compact_at = match req.compact_at {
+        Some(0) => None,
+        Some(n) if !(COMPACT_AT_RANGE).contains(&n) => {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, "compact at must be between 30 and 95 percent, or 0 for the default".into()));
+        }
+        Some(n) => Some(i64::from(n)),
+        None => c.compact_at,
+    };
+    let row = crate::store::ConnectionRow { name, members, context_window, subagent_model, compact_at, ..c };
+    st.store.update_connection(&row).await?;
     if let Some(link) = st.local_link.get() {
         link.forget_connection(&id);
     }
@@ -638,6 +663,8 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         created_at: now_ms(),
         realms: "[]".into(),
         members: "[]".into(),
+        subagent_model: None,
+        compact_at: None,
     };
     st.store.insert_connection(&row).await?;
     Ok(connection_view(row))

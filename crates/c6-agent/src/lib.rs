@@ -15,7 +15,10 @@ pub use history::{
     portable_events, portable_messages, transcript_text, user_blocks, user_text,
 };
 pub use prompt::build_system_prompt;
-pub use turn::{COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, Conversation, TurnConfig, compact_turn, run_turn};
+pub use turn::{
+    COMPACT_AT, COMPACT_AT_LARGE, COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, Conversation, LARGE_WINDOW, TurnConfig,
+    compact_share, compact_turn, run_turn,
+};
 
 /// What a subagent is told (docs/os.md §4.6: an editable prompt).
 pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which cannot see this conversation. \

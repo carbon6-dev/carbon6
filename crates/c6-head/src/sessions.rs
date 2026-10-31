@@ -308,7 +308,14 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         remote_template: String::new(),
     };
     let spec = CreateSession {
-        model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
+        model: Some(ModelSpec {
+            connection_id,
+            model,
+            max_output_tokens: 0,
+            effort: String::new(),
+            compact_at_percent: compact_at(&connection),
+            connection_kind: connection.kind,
+        }),
         base_prompt: crate::assistant::prompt(st, &req.context, &realm).await,
         labels,
         ..Default::default()
@@ -438,6 +445,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
             max_output_tokens: 0,
             effort: row.effort.clone().unwrap_or_default(),
             connection_kind: connection.kind.clone(),
+            compact_at_percent: compact_at(&connection),
         }),
         cwd: row.cwd.clone(),
         base_prompt,
@@ -488,13 +496,21 @@ fn subagent_connections(connections: &[crate::store::ConnectionRow], realm: &str
         .collect()
 }
 
-/// The default for a session's subagents, from its row: `None` when they
-/// run on the session's own model.
+/// A connection's compaction point for its sessions (0: the default).
+fn compact_at(c: &crate::store::ConnectionRow) -> u32 {
+    c.compact_at.map_or(0, |n| n.clamp(0, 100) as u32)
+}
+
+/// The default for a session's subagents, from its row, else its
+/// connection's subagent model: `None` when they run on the session's own
+/// model.
 fn subagent_target(row: &SessionRow, connections: &[crate::store::ConnectionRow]) -> Option<ModelSpec> {
-    let model = row.subagent_model.trim();
+    let mut model = row.subagent_model.trim();
     let connection_id = row.subagent_connection_id.trim();
     if model.is_empty() && connection_id.is_empty() {
-        return None;
+        // The connection's choice, on the same connection.
+        let own = connections.iter().find(|c| c.id == row.connection_id)?;
+        model = own.subagent_model.as_deref().map(str::trim).filter(|m| !m.is_empty() && *m != row.model)?;
     }
     let connection_id = if connection_id.is_empty() { row.connection_id.as_str() } else { connection_id };
     let c = connections.iter().find(|c| c.id == connection_id)?;
@@ -509,6 +525,7 @@ fn subagent_target(row: &SessionRow, connections: &[crate::store::ConnectionRow]
         max_output_tokens: 0,
         effort: row.subagent_effort.trim().to_owned(),
         connection_kind: c.kind.clone(),
+        compact_at_percent: compact_at(c),
     })
 }
 
@@ -724,7 +741,14 @@ pub async fn set_subagent_model(st: &HeadState, session_id: &str, req: &api::Set
             return Err(bad_request(format!("the connection {} is not available to realm {}", c.name, session.realm)));
         }
         crate::pools::not_for_sessions(&c, "subagents")?;
-        Some(ModelSpec { connection_id: c.id, model: model.to_owned(), max_output_tokens: 0, effort, connection_kind: c.kind })
+        Some(ModelSpec {
+            compact_at_percent: compact_at(&c),
+            connection_id: c.id,
+            model: model.to_owned(),
+            max_output_tokens: 0,
+            effort,
+            connection_kind: c.kind,
+        })
     };
     let (c, m, e) = spec.as_ref().map(|s| (s.connection_id.as_str(), s.model.as_str(), s.effort.as_str())).unwrap_or_default();
     st.store.set_subagent_model(session_id, c, m, e).await?;
@@ -1202,6 +1226,7 @@ async fn model_switch(
         model: model.to_owned(),
         max_output_tokens: 0,
         effort: effort.unwrap_or_default(),
+        compact_at_percent: compact_at(&to),
         connection_kind: to.kind,
     })
 }

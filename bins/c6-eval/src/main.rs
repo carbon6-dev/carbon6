@@ -215,6 +215,7 @@ async fn run_task(
         context_window,
         web_search: false,
         compact: Default::default(),
+        compact_at: 0,
     };
     let tools: Vec<_> = c6_tools::tools_for(profile).into_iter().filter(|t| !c6_tools::Task::is_task(&t.spec().name)).collect();
     let recorder = Arc::new(Recorder::default());

@@ -621,6 +621,9 @@ message ModelSpec {
   // Connection kind (openai_compat, openai, chatgpt, anthropic), so the
   // worker can pick the tool profile before fetching credentials.
   string connection_kind = 5;
+  // Compact the conversation once it fills this percentage of the model's
+  // context window (the connection's setting); 0 = the default.
+  uint32 compact_at_percent = 6;
 }
 
 message UserInput {
