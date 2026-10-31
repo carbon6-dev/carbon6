@@ -3408,13 +3408,6 @@ fn Composer(
         }
     });
     let has_text = Memo::new(move |_| !text.with(|t| t.trim().is_empty()) || !attachments.with(Vec::is_empty));
-    // On Claude Code a message sent mid-turn waits for the turn to end; carbon6's
-    // own agent reads it at its next step.
-    let queues = Memo::new(move |_| {
-        let Some(m) = model else { return false };
-        let (c, _, _) = m.current.get();
-        kinds.get().and_then(Result::ok).is_some_and(|ks| ks.iter().any(|k| k.id == c && k.kind == "claude_code"))
-    });
     let picker = NodeRef::<leptos::html::Input>::new();
     let touch = crate::util::touch_first();
     view! {
@@ -3560,14 +3553,12 @@ fn Composer(
                     {move || if stopping.get() {
                         view! { <button class=format!("{BUTTON} py-2") disabled=true>"Stopping…"</button> }.into_any()
                     } else if running.get() && has_text.get() {
-                        let (label, title) = if queues.get() {
-                            ("Queue", "Queue it: it starts the next turn, once this one ends")
-                        } else {
-                            ("Send", "Send it now: the agent reads it at its next step")
-                        };
+                        // Both runtimes take it into the running turn (Claude Code's
+                        // process stays up: docs/background.md §4).
                         view! {
                             <div class="flex shrink-0 flex-col gap-1">
-                                <button class=format!("{BUTTON} py-1.5") title=title prop:disabled=move || disabled.get() on:click=move |_| send()>{label}</button>
+                                <button class=format!("{BUTTON} py-1.5") title="Send it now: the agent reads it at its next step"
+                                    prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button>
                                 <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                                     title="Stop this turn; your message starts the next one" on:click=stop_and_send>"Stop & send"</button>
                             </div>
