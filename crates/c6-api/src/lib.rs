@@ -3,6 +3,7 @@
 
 pub mod docs;
 pub mod labels;
+pub mod projects;
 pub mod prompts;
 pub mod work;
 use serde::{Deserialize, Serialize};

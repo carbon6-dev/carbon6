@@ -104,6 +104,58 @@ async fn rows(st: &HeadState, realm: Option<&str>, closed: bool) -> anyhow::Resu
     Ok(rows.iter().map(stored).collect())
 }
 
+/// Puts a work item in a project of its realm (with a phase), or takes it
+/// out (`project` ""). A work item is in one project at most.
+pub async fn set_project(st: &HeadState, id: &str, realm: &str, project: &str, phase: &str, by: &str) -> anyhow::Result<()> {
+    let w = load(st, id).await?.ok_or_else(|| not_found(format!("no work item {id}")))?;
+    if w.realm != realm {
+        return Err(bad_request(format!("that work is in realm {}, the project in {realm}", w.realm)));
+    }
+    let before = w.fields.project.clone();
+    modify(st, id, by, None, |f| {
+        if f.project == project && f.phase == phase {
+            return Ok(false);
+        }
+        f.project = project.to_owned();
+        f.phase = if project.is_empty() { String::new() } else { phase.to_owned() };
+        Ok(true)
+    })
+    .await?;
+    let now = now_ms();
+    for p in [before.as_str(), project] {
+        if !p.is_empty() {
+            crate::projects::touch(st, p, now).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The project a work item is in.
+pub async fn project_of(st: &HeadState, id: &str) -> Option<String> {
+    load(st, id).await.ok().flatten().map(|r| r.fields.project).filter(|p| !p.is_empty())
+}
+
+/// The ids of the work items in a project (open and closed).
+pub async fn in_project(st: &HeadState, project: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT id FROM records WHERE collection = ? AND json_extract(fields, '$.project') = ? ORDER BY updated_at DESC")
+        .bind(WORK)
+        .bind(project)
+        .fetch_all(&st.store.pool)
+        .await?)
+}
+
+/// The work items in a project, as they are now.
+pub async fn items_in_project(st: &HeadState, project: &str) -> anyhow::Result<Vec<WorkItem>> {
+    let rows = sqlx::query(
+        "SELECT * FROM records WHERE collection = ? AND json_extract(fields, '$.project') = ? ORDER BY updated_at DESC LIMIT 1000",
+    )
+    .bind(WORK)
+    .bind(project)
+    .fetch_all(&st.store.pool)
+    .await?;
+    view(st, rows.iter().map(stored).collect()).await
+}
+
 /// Whether a work item holds a ref.
 pub async fn holds(st: &HeadState, id: &str, reference: &str) -> bool {
     load(st, id).await.ok().flatten().is_some_and(|r| r.fields.attached.iter().any(|a| a.reference == reference))
@@ -345,6 +397,20 @@ pub async fn patch(st: &HeadState, id: &str, p: &api::work::WorkPatch, caller: &
     {
         return Err(bad_request("work is open, done or dropped"));
     }
+    // Into or out of a project, and its phase there.
+    if p.project.is_some() || p.phase.is_some() {
+        let row = visible(st, id, caller).await?;
+        let project = p.project.clone().unwrap_or(row.fields.project.clone());
+        let phase = p.phase.clone().unwrap_or(row.fields.phase.clone());
+        if !project.is_empty() {
+            let pr = crate::projects::load(st, &project).await?.filter(|x| x.realm == row.realm);
+            let pr = pr.ok_or_else(|| bad_request(format!("no project {project} in realm {}", row.realm)))?;
+            if !phase.is_empty() && !pr.fields.phases.iter().any(|x| x.id == phase) {
+                return Err(bad_request(format!("the project has no phase {phase}")));
+            }
+        }
+        set_project(st, id, &row.realm, &project, &phase, "you").await?;
+    }
     modify(st, id, "you", p.labels.clone(), |f| {
         if let Some(t) = title {
             f.title = t;
@@ -580,7 +646,12 @@ async fn view_at(st: &HeadState, rows: Vec<Stored>, now: i64) -> anyhow::Result<
             settings_of.insert(r.realm.clone(), settings(st, &r.realm).await);
         }
         let (state, why) = state_of(&r.fields, &live, now, &settings_of[&r.realm]);
+        let project_title = match r.fields.project.as_str() {
+            "" => String::new(),
+            p => crate::projects::title_of(st, &r.realm, p).await.unwrap_or_default(),
+        };
         out.push(WorkItem {
+            project_title,
             id: r.id,
             realm: r.realm,
             version: r.version,

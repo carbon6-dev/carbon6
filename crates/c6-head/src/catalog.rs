@@ -94,6 +94,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "sessions.",
         "decisions.",
         "work.",
+        "projects.",
         "docs.",
         "memories.",
         "memex.",
@@ -331,6 +332,7 @@ const AREAS: &[(&str, &str)] = &[
         "apps",
         "Apps: packages of configuration (collections, series, triggers, views, skills, templates…) installed into realms of their own; install, upgrade, export, remove.",
     ),
+    ("projects", "Projects: long-running efforts made of work items, with their documents, links and phases; moving work in and out."),
     (
         "docs",
         "Documents: docs and decks people and agents write together (tabs of blocks with stable ids, guarded edits, history), in Markdown with <?c6 block k?> tokens.",
@@ -535,6 +537,13 @@ fn build() -> Vec<Op> {
         op!("work.proposals", "work", "POST" "/api/v1/work/proposals", Read, Input::None, "Groups the open sessions and requests that belong to no work into proposed pieces of work, for the user to accept or skip."),
         op!("work.settings.get", "work", "GET" "/api/v1/settings/work", Read, Input::None, "How work behaves in the realm: guessing a session's work, notes, when work has gone quiet, nudges."),
         op!("work.settings.put", "work", "PUT" "/api/v1/settings/work", Write, Input::Body(schema::<api::work::WorkSettings>), "Changes how work behaves in the realm."),
+        op!("projects.list", "projects", "GET" "/api/v1/projects", Read, Input::Query(schema::<crate::projects::ProjectQuery>), "Projects (active and paused by default; closed=true for done and dropped), what needs you first: each with its purpose, state and why, work, documents and phases."),
+        op!("projects.add", "projects", "POST" "/api/v1/projects", Write, Input::Body(schema::<api::projects::ProjectNew>), "Starts a project: title, purpose (what it's for and what success means), labels, and work items to bring in."),
+        op!("projects.get", "projects", "GET" "/api/v1/projects/{id}", Read, Input::None, "A project as it is now: its work (open first), documents, links, phases and state.", choices = &[("id", "projects.list")]),
+        op!("projects.edit", "projects", "PATCH" "/api/v1/projects/{id}", Write, Input::Body(schema::<api::projects::ProjectPatch>), "Renames a project, changes its purpose or labels, sets its status (active, paused, done, dropped), or dismisses an agent's \"looks done\".", choices = &[("id", "projects.list")]),
+        op!("projects.work", "projects", "POST" "/api/v1/projects/{id}/work", Write, Input::Body(schema::<api::projects::ProjectWorkIn>), "Moves a work item into a project (out of any other), optionally in one of its phases.", choices = &[("id", "projects.list")]),
+        op!("projects.detach", "projects", "POST" "/api/v1/projects/{id}/detach", Write, Input::Body(schema::<api::projects::ProjectDetach>), "Takes a work item (work), a document (doc) or a link (ref) out of a project.", choices = &[("id", "projects.list")]),
+        op!("projects.merge", "projects", "POST" "/api/v1/projects/{id}/merge", Write, Input::Body(schema::<api::projects::ProjectMerge>), "Merges another project into this one: its work, documents and links; the other is gone.", choices = &[("id", "projects.list")]),
         op!("docs.list", "docs", "GET" "/api/v1/docs", Read, Input::Query(schema::<api::docs::DocQuery>), "Documents in the realm (docs and decks), recent first: title, kind, labels, who made and last changed them, pending blocks. Filter by kind, label, by (you, session:<id>) or q (title words)."),
         op!("docs.create", "docs", "POST" "/api/v1/docs", Write, Input::Body(schema::<api::docs::DocNew>), "Creates a doc or a deck from Markdown: title, then the content, usually a pending block per section (doc) or slide (deck, slides separated by ---), as <?c6 block k?> tokens with blocks {k: {type: pending, intent}}. Returns the document and the ids its blocks and keys got."),
         op!("docs.get", "docs", "GET" "/api/v1/docs/{id}", Read, Input::Query(schema::<api::InRealm>), "A whole document: its tabs and every block (id, kind, Markdown, hash, who last wrote it).", choices = &[("id", "docs.list")]),
@@ -780,6 +789,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
             "name": {"type": "string"}, "description": {"type": "string"}, "body": {"type": "string"}
         }}),
         "work" => schema::<api::work::WorkFields>(),
+        "projects" => schema::<api::projects::ProjectFields>(),
         "memory" => json!({"type": "object", "required": ["text"], "properties": {
             "scope": {"type": "string", "description": "One label, or empty: every session"},
             "text": {"type": "string", "maxLength": 2000},
@@ -1238,7 +1248,13 @@ mod tests {
         let mut routes: Vec<(String, String)> = Vec::new();
         let re = regex::Regex::new(r#"(?m)\.route\(\s*"([^"]+)",(.*)$"#).unwrap();
         let method = regex::Regex::new(r"\b(get|post|put|delete|patch)\(").unwrap();
-        for src in [include_str!("api.rs"), include_str!("auth.rs"), include_str!("assistant.rs"), include_str!("docs/http.rs")] {
+        for src in [
+            include_str!("api.rs"),
+            include_str!("auth.rs"),
+            include_str!("assistant.rs"),
+            include_str!("docs/http.rs"),
+            include_str!("projects.rs"),
+        ] {
             for c in re.captures_iter(src) {
                 for m in method.captures_iter(&c[2]) {
                     routes.push((m[1].to_uppercase(), c[1].to_owned()));

@@ -136,7 +136,34 @@ pub fn WorkPage() -> impl IntoView {
     let finding = RwSignal::new(false);
     let col = use_column();
     let active = Signal::derive(move || col.as_ref().is_none_or(|c| c.active.get()));
-    let items = Memo::new(move |_| list.get().and_then(Result::ok).unwrap_or_default());
+    // "" every project, "none" work in none, else a project's id.
+    let in_project = RwSignal::new(String::new());
+    let projects = Memo::new(move |_| {
+        let mut p: Vec<(String, String)> = list
+            .get()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| !w.fields.project.is_empty())
+            .map(|w| (w.fields.project, w.project_title))
+            .collect();
+        p.sort_by(|a, b| a.1.cmp(&b.1));
+        p.dedup();
+        p
+    });
+    let items = Memo::new(move |_| {
+        let want = in_project.get();
+        list.get()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| match want.as_str() {
+                "" => true,
+                "none" => w.fields.project.is_empty(),
+                p => w.fields.project == p,
+            })
+            .collect::<Vec<_>>()
+    });
     let open_item = move |id: String, how: How| match use_column() {
         Some(c) => c.open(View::Work { id }, how),
         None => use_workspace().open(None, View::Work { id }, how),
@@ -222,6 +249,14 @@ pub fn WorkPage() -> impl IntoView {
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap gap-2">
                 <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>"+ Add"</button>
+                {move || (!projects.get().is_empty()).then(|| view! {
+                    <select class=format!("{INPUT} w-auto!") title="Only the work of a project"
+                        on:change=move |ev| in_project.set(event_target_value(&ev))>
+                        <option value="">"Every project"</option>
+                        <option value="none">"In no project"</option>
+                        {projects.get().into_iter().map(|(id, t)| view! { <option value=id.clone() selected=move || in_project.get() == id>{t}</option> }).collect_view()}
+                    </select>
+                })}
                 <button class=BUTTON_QUIET disabled=move || finding.get() on:click=find
                     title="An agent groups your open sessions and requests that belong to no work yet; you accept or skip each">
                     {move || if finding.get() { "Looking…" } else { "Find work in what's open" }}
@@ -316,6 +351,11 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
             {(!w.why.is_empty()).then(|| view! { <p class="truncate text-xs text-zinc-600 dark:text-zinc-400">{w.why.clone()}</p> })}
             {next.map(|n| view! { <p class="truncate text-xs text-zinc-500">{format!("Next: {n}")}</p> })}
             <div class="mt-1 flex flex-wrap gap-1">
+                {(!w.project_title.is_empty()).then(|| view! {
+                    <span class="max-w-48 truncate rounded bg-indigo-100 px-1.5 text-[11px] text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300" title="Its project">
+                        {format!("◇ {}", w.project_title)}
+                    </span>
+                })}
                 {(todos > 0).then(|| view! {
                     <span class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300" title="To-dos done of all">
                         {format!("☐ {}/{todos}", todos - left)}
@@ -560,6 +600,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 <StatePill state=w.state.clone() />
                                 <span class="text-zinc-600 dark:text-zinc-400">{w.why.clone()}</span>
                             </div>
+                            <ProjectPick w=w.clone() apply=Callback::new(apply) />
                         </header>
                         {w.fields.offer.clone().filter(|_| open).map(|o| view! {
                             <div class="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-800 dark:bg-emerald-950/30">
@@ -784,6 +825,12 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
         <span class="inline-flex min-w-0 items-center gap-1 text-xs text-zinc-500">
             <span>"Work:"</span>
             {move || current().map(|w| view! {
+                {(!w.fields.project.is_empty()).then(|| view! {
+                    <Go to=View::Projects { id: w.fields.project.clone() } class="max-w-40 truncate text-violet-700 hover:underline dark:text-violet-400" title="Its project">
+                        {w.project_title.clone()}
+                    </Go>
+                    <span class="text-zinc-400">"›"</span>
+                })}
                 <Go to=View::Work { id: w.id.clone() } class="max-w-56 truncate text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>
                     {w.fields.title.clone()}
                 </Go>
@@ -805,6 +852,37 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
             </select>
             {move || error.get().map(|e| view! { <span class="text-red-600">{e}</span> })}
         </span>
+    }
+}
+
+/// The project a piece of work is in: a link, and a menu to move it.
+#[component]
+fn ProjectPick(w: WorkItem, apply: Callback<Result<WorkItem, String>>) -> impl IntoView {
+    let id = StoredValue::new(w.id.clone());
+    let projects = LocalResource::new(|| api::projects_list(false));
+    let current = w.fields.project.clone();
+    let cur = current.clone();
+    view! {
+        <div class="flex items-center gap-2 text-sm">
+            <span class="text-zinc-500">"Project:"</span>
+            {(!current.is_empty()).then(|| view! {
+                <Go to=View::Projects { id: current.clone() } class="text-violet-700 hover:underline dark:text-violet-400">{w.project_title.clone()}</Go>
+            })}
+            <select class="max-w-48 cursor-pointer rounded bg-transparent px-1 text-xs text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                title="Move it into a project, or out (docs/projects.md)"
+                on:change=move |ev| {
+                    let to = event_target_value(&ev);
+                    if to == "-" { return; }
+                    let p = WorkPatch { project: Some(to), ..Default::default() };
+                    spawn_local(async move { apply.run(api::work_patch(id.get_value(), p).await) });
+                }>
+                <option value="-">{if cur.is_empty() { "none · move into a project…" } else { "move…" }}</option>
+                {(!cur.is_empty()).then(|| view! { <option value="">"Out of its project"</option> })}
+                {move || projects.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != cur).map(|p| view! {
+                    <option value=p.id.clone()>{p.fields.title.clone()}</option>
+                }).collect_view()}
+            </select>
+        </div>
     }
 }
 

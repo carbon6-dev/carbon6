@@ -35,6 +35,7 @@ mod operations;
 mod outputs;
 mod packages;
 mod policies;
+mod projects;
 mod prompts;
 mod providers;
 mod push;

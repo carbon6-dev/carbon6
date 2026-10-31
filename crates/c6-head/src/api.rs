@@ -252,6 +252,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
         .merge(crate::docs::http::routes())
+        .merge(crate::projects::routes())
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), settings_realm))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))

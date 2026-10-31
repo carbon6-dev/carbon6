@@ -1377,3 +1377,35 @@ pub async fn doc_history(id: String) -> Result<Vec<c6_api::docs::DocVersion>, St
 pub async fn doc_restore(id: String, r: &c6_api::docs::DocRestore) -> Result<c6_api::docs::DocApplied, String> {
     send_json(Request::post(&format!("/api/v1/docs/{}/restore", enc(&id))), r).await
 }
+
+// --- Projects (docs/projects.md) -----------------------------------------------
+
+use c6_api::projects::{ProjectItem, ProjectNew, ProjectPatch};
+
+pub async fn projects_list(closed: bool) -> Result<Vec<ProjectItem>, String> {
+    json(Request::get(&format!("/api/v1/projects{}", if closed { "?closed=true" } else { "" })).send().await).await
+}
+
+pub async fn project_get(id: String) -> Result<ProjectItem, String> {
+    json(Request::get(&format!("/api/v1/projects/{}", enc(&id))).send().await).await
+}
+
+pub async fn project_add(n: &ProjectNew) -> Result<ProjectItem, String> {
+    send_json(Request::post("/api/v1/projects"), n).await
+}
+
+pub async fn project_patch(id: String, p: &ProjectPatch) -> Result<ProjectItem, String> {
+    send_json(Request::patch(&format!("/api/v1/projects/{}", enc(&id))), p).await
+}
+
+pub async fn project_work(id: String, work: String, phase: String) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/work", enc(&id))), &c6_api::projects::ProjectWorkIn { work, phase }).await
+}
+
+pub async fn project_detach(id: String, d: &c6_api::projects::ProjectDetach) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/detach", enc(&id))), d).await
+}
+
+pub async fn project_merge(id: String, from: String) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/merge", enc(&id))), &c6_api::projects::ProjectMerge { from }).await
+}

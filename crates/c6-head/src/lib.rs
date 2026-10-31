@@ -38,6 +38,7 @@ pub mod operations;
 pub mod packages;
 pub mod pki;
 pub mod pools;
+pub mod projects;
 pub mod prompts;
 pub mod providers;
 pub mod push;

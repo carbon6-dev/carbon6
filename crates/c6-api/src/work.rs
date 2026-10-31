@@ -44,6 +44,11 @@ pub struct WorkFields {
     /// you can start when you're ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<Todo>,
+    /// The project it belongs to (docs/projects.md), and its phase there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
 }
 
 /// One step of a piece of work, to start as a session later.
@@ -194,6 +199,9 @@ pub struct WorkItem {
     pub labels: Vec<String>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
+    /// Its project's title (empty: none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_title: String,
 }
 
 /// An attached thing as it is now.
@@ -245,6 +253,12 @@ pub struct WorkPatch {
     pub dismiss_offer: bool,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// Move it into a project (its id), or out ("").
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Its phase in the project ("" for none).
+    #[serde(default)]
+    pub phase: Option<String>,
 }
 
 /// A thing to attach (`POST /api/v1/work/{id}/attach`), or to detach.

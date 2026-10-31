@@ -222,7 +222,7 @@ pub async fn check_upgrade(path: &Path) -> anyhow::Result<c6_core::upgrade::Repo
 
 /// Settings each realm may set for itself; where it hasn't, root's applies
 /// (docs/realms-ux.md §9). A realm's own is kept as `<key>@<realm>`.
-pub const PER_REALM: &[&str] = &["session_suggestions", "web_search", "assistant", "subagent_limits", "brief", "work"];
+pub const PER_REALM: &[&str] = &["session_suggestions", "web_search", "assistant", "subagent_limits", "brief", "work", "docs"];
 
 fn own_key(key: &str, realm: &str) -> String {
     format!("{key}@{realm}")

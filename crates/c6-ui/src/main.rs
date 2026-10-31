@@ -31,6 +31,7 @@ mod outputs;
 mod people;
 mod photos;
 mod place;
+mod projects;
 mod push;
 mod search;
 mod session;
@@ -140,6 +141,7 @@ fn Main() -> impl IntoView {
                                 </span>
                             </Go>
                             <decisions::DecisionLink class=NAV />
+                            <projects::ProjectsLink class=NAV />
                             <work::WorkLink class=NAV />
                             <docs::DocsLink class=NAV />
                             <NavLink to=View::Analytics label="Analytics" />
@@ -253,6 +255,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Sessions class=MENU>"Sessions"</Go>
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <decisions::DecisionLink class=MENU />
+                    <projects::ProjectsLink class=MENU />
                     <work::WorkLink class=MENU />
                     <docs::DocsLink class=MENU />
                     <Go to=View::Mission class=MENU>"Mission control"</Go>

@@ -312,11 +312,15 @@ pub const MEMORY: &str = "memory";
 /// schema of today's code (code owns these schemas, so they follow it).
 pub async fn ensure(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let now = c6_core::now_ms();
-    let memory = [
+    let memory: [(&str, &str); 3] = [
         (MEMORY, "Memory notes: durable notes sessions start with, scoped by a label."),
         (
             crate::work::WORK,
             "Work: what you mean to finish, with the sessions, requests and other things that belong to it (docs/work.md).",
+        ),
+        (
+            crate::projects::PROJECTS,
+            "Projects: long-running efforts made of work, with their documents, links and phases (docs/projects.md).",
         ),
     ];
     for (key, description) in LISTS.iter().map(|l| (l.key, l.description)).chain(memory) {
