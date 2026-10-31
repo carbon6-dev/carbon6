@@ -1277,7 +1277,56 @@ fn DocsSetting() -> impl IntoView {
             {choice("realm", "Any document in this realm.")}
             {choice("own", "Only the ones it made; never others.")}
             {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
+            <DocsGoogle />
         </section>
+    }
+}
+
+/// The Google accounts documents export to (Google Docs and Slides), with
+/// the drive.file scope only.
+#[component]
+fn DocsGoogle() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let accounts = LocalResource::new(move || {
+        api::realm().track();
+        tick.track();
+        api::docs_google_accounts()
+    });
+    let error = RwSignal::new(None::<String>);
+    let connect = move |_| {
+        spawn_local(async move {
+            match api::docs_google_connect(window().location().pathname().unwrap_or_default(), true).await {
+                Ok(u) => {
+                    let _ = window().location().set_href(&u);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let remove = move |id: String| {
+        spawn_local(async move {
+            error.set(api::docs_google_remove(id).await.err());
+            tick.update(|t| *t += 1);
+        });
+    };
+    view! {
+        <p class="text-sm font-medium">"Google Docs and Slides"</p>
+        <p class="text-sm text-zinc-500">"Exports to Google go to an account here. It is asked only for drive.file: carbon6 reaches the files it makes, nothing else in your Drive. It uses your Google OAuth client (Settings → Mail & calendar), with the Google Drive API enabled for it."</p>
+        {move || accounts.get().and_then(Result::ok).map(|list| view! {
+            <ul class="space-y-1 text-sm">
+                {list.into_iter().map(|a| {
+                    let id = a.id.clone();
+                    view! {
+                        <li class="flex items-center gap-2">
+                            <span class="min-w-0 flex-1 truncate">{a.account.clone()}</span>
+                            <button class=BUTTON_QUIET on:click=move |_| remove(id.clone())>"Disconnect"</button>
+                        </li>
+                    }
+                }).collect_view()}
+            </ul>
+        })}
+        <button class=BUTTON_QUIET on:click=connect>"Connect a Google account"</button>
+        {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
     }
 }
 

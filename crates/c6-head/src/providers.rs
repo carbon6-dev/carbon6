@@ -46,6 +46,10 @@ pub fn check(p: &api::AppPackage) -> Vec<String> {
 }
 
 async fn provider(st: &HeadState, realm: &str, instance: &str, name: &str) -> anyhow::Result<api::OAuthProvider> {
+    // Documents' own Google sign-in (Google Docs and Slides exports).
+    if instance == crate::docs::google::INSTANCE && name == "google" {
+        return crate::docs::google::provider(st).await;
+    }
     let i = crate::instances::get(&st.store.pool, realm, instance)
         .await?
         .ok_or_else(|| not_found(format!("no app {instance} in realm {realm}")))?;
@@ -353,6 +357,16 @@ async fn access_token(st: &HeadState, r: &sqlx::sqlite::SqliteRow) -> anyhow::Re
         .execute(&st.store.pool)
         .await?;
     Ok((access.to_owned(), expires))
+}
+
+/// A current access token for one account (for the head's own calls).
+pub async fn token_of(st: &HeadState, id: &str) -> anyhow::Result<String> {
+    let r = sqlx::query("SELECT * FROM oauth_accounts WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&st.store.pool)
+        .await?
+        .ok_or_else(|| not_found("no such account"))?;
+    Ok(access_token(st, &r).await?.0)
 }
 
 /// The access tokens an app's kit jobs get: `C6_ACCOUNTS`, a JSON list of

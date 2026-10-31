@@ -851,6 +851,7 @@ fn Exports(id: String, kind: String) -> impl IntoView {
                 }).collect_view()}
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            <ToGoogle id=id.get_value() />
             {move || past.get().and_then(Result::ok).filter(|p| !p.is_empty()).map(|p| view! {
                 <div class="space-y-0.5">
                     <div class="text-xs text-zinc-500">"Made before"</div>
@@ -863,6 +864,93 @@ fn Exports(id: String, kind: String) -> impl IntoView {
                 </div>
             })}
         </section>
+    }
+}
+
+/// Google Docs or Slides (docs/docs.md §10): connect an account (only the
+/// files carbon6 makes), export, and after that update the Google file or
+/// make a new one; a Google file edited in Google since is said first.
+#[component]
+fn ToGoogle(id: String) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let tick = RwSignal::new(0u32);
+    let google = LocalResource::new(move || {
+        tick.track();
+        api::doc_google(id.get_value())
+    });
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let changed = RwSignal::new(false);
+    let go = move |new: bool, anyway: bool| {
+        busy.set(true);
+        error.set(None);
+        changed.set(false);
+        spawn_local(async move {
+            if let Err(e) = api::doc_to_google(id.get_value(), c6_api::docs::GoogleExportIn { new, anyway, account: None }).await {
+                changed.set(e.contains("changed in Google"));
+                error.set(Some(e));
+            }
+            busy.set(false);
+            tick.update(|t| *t += 1);
+        });
+    };
+    let connect = move |_| {
+        spawn_local(async move {
+            let back = window().location().pathname().unwrap_or_default();
+            match api::docs_google_connect(back, false).await {
+                Ok(u) => {
+                    let _ = window().location().set_href(&u);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        {move || google.get().and_then(Result::ok).map(|g| {
+            let app = g.app.clone();
+            view! {
+                <div class="space-y-1 border-t border-zinc-200 pt-2 dark:border-zinc-800">
+                    <div class="text-xs text-zinc-500">{app.clone()}</div>
+                    {if g.accounts.is_empty() {
+                        view! {
+                            <div class="flex items-center gap-2">
+                                <button class=BUTTON_QUIET on:click=connect>"Connect Google"</button>
+                                <span class="text-xs text-zinc-500">"Only the files carbon6 makes in your Drive (drive.file)."</span>
+                            </div>
+                        }.into_any()
+                    } else if let Some(f) = g.file.clone() {
+                        view! {
+                            <div class="space-y-1">
+                                <div class="flex items-center gap-2">
+                                    <a href=f.url.clone() target="_blank" rel="noopener" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
+                                        {format!("Open in {app}")}
+                                    </a>
+                                    <span class="shrink-0 text-xs text-zinc-400">{format!("v{} · {} · {}", f.rev, f.account, since(f.at))}</span>
+                                </div>
+                                <div class="flex flex-wrap gap-2">
+                                    <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| go(false, false)>
+                                        {move || if busy.get() { "Exporting…" } else { "Update the Google file" }}
+                                    </button>
+                                    <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| go(true, false)>"Make a new one"</button>
+                                    {move || changed.get().then(|| view! {
+                                        <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| go(false, true)
+                                            title="Replaces the edits made in Google since the last export">"Update anyway"</button>
+                                    })}
+                                </div>
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| go(false, false)
+                                title=format!("Made by the render kit, then uploaded to {} as {app}", g.accounts.join(", "))>
+                                {move || if busy.get() { "Exporting…".to_owned() } else { format!("To {}", g.app) }}
+                            </button>
+                        }.into_any()
+                    }}
+                    {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                </div>
+            }
+        })}
     }
 }
 

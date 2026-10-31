@@ -1954,7 +1954,7 @@ async fn google_connect(
 /// Where a page is, for the address providers send you back to: the
 /// head's public address (`ui_public_url`, a proxy's) when set, else what
 /// the page says, else from Host.
-fn page_origin(st: &HeadState, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn page_origin(st: &HeadState, headers: &HeaderMap) -> Option<String> {
     st.public_ui
         .clone()
         .or_else(|| headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned))

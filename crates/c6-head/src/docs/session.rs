@@ -265,6 +265,13 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
         "export" => {
             need_id()?;
             let format = p["format"].as_str().unwrap_or("").trim().to_owned();
+            // To Google Docs or Slides: its Google file updated (never over
+            // edits made in Google since: that is yours to decide), or new.
+            if format == "google" {
+                let g = c6_api::docs::GoogleExportIn { new: p["new"].as_bool().unwrap_or(false), anyway: false, account: None };
+                let f = super::google::export(st, &realm, &id, &g, &by).await?;
+                return Ok(json!({"did": "exported", "google": f}));
+            }
             let e = super::export::export(st, &realm, &id, &format, &by).await?;
             Ok(
                 json!({"did": "exported", "export": e, "note": "Attach it to your work with the work tool (ref: the export's url) if it belongs there."}),

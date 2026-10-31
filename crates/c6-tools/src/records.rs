@@ -193,7 +193,7 @@ records_tool!(
      each with one edit. action read: id, view (outline, block with block=<id>, slide, search with q, since with rev, markdown). \
      action edit: id, ops [{op: insert|replace|delete|move|table|set|add_tab|delete_tab, ...}]; replace a whole block (markdown) or \
      delete one with ifRev and ifHash from your read; replace words with find and with. A refused guard means someone else changed it: \
-     read again. action comment: op list, create, reply or resolve threads (a thread sent to you says what to do). action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document. action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
+     read again. action comment: op list, create, reply or resolve threads (a thread sent to you says what to do). action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document; format google: to Google Docs or Slides, updating its Google file (new: true for another). action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
      you made and your work's you edit freely; others need the user's OK once.",
     json!({"type": "object", "properties": {
         "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "comment", "look", "export", "history", "restore"]},
@@ -217,7 +217,8 @@ records_tool!(
         "answering": {"type": "string"},
         "first": {"type": "integer", "description": "look: the first slide (from 1)"},
         "last": {"type": "integer", "description": "look: the last slide (at most 12 at once)"},
-        "format": {"type": "string", "enum": ["md", "html", "pdf", "docx", "odt", "pptx", "odp", "png"]}
+        "format": {"type": "string", "enum": ["md", "html", "pdf", "docx", "odt", "pptx", "odp", "png", "google"]},
+        "new": {"type": "boolean", "description": "export google: make a new Google file, not update the one it has"}
     }, "required": ["action"], "additionalProperties": false})
     .tap_ops(),
     |ctx, input| { doc_call(ctx, input).await }

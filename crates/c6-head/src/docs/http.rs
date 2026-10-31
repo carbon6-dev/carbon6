@@ -27,6 +27,10 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/{id}/exports", get(exports))
         .route("/api/v1/docs/{id}/exports/{export}/file", get(export_file))
         .route("/api/v1/docs/import", post(import))
+        .route("/api/v1/docs/{id}/google", get(google).post(to_google))
+        .route("/api/v1/docs/google/connect", post(google_connect))
+        .route("/api/v1/docs/google/accounts", get(google_accounts))
+        .route("/api/v1/docs/google/accounts/{account}", axum::routing::delete(google_remove))
         .route("/api/v1/docs/{id}/threads", get(threads).post(new_thread))
         .route("/api/v1/docs/{id}/threads/{thread}/comments", post(reply))
         .route("/api/v1/docs/{id}/threads/{thread}/resolve", post(resolve))
@@ -198,6 +202,59 @@ async fn export_file(
     let disposition = format!("attachment; filename=\"{}\"", name.replace('"', ""));
     Ok(([(axum::http::header::CONTENT_TYPE, media.to_owned()), (axum::http::header::CONTENT_DISPOSITION, disposition)], bytes)
         .into_response())
+}
+
+async fn google(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<api::docs::DocGoogle>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::google::of_doc(&st, &realm, &id).await?))
+}
+
+async fn to_google(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(g): Json<api::docs::GoogleExportIn>,
+) -> ApiResult<Json<api::docs::GoogleFile>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::google::export(&st, &realm, &id, &g, &super::by_of(&caller)).await?))
+}
+
+async fn google_connect(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    headers: axum::http::HeaderMap,
+    Json(c): Json<api::docs::GoogleConnect>,
+) -> ApiResult<Json<Value>> {
+    let realm = realm(&st, &caller, &r).await?;
+    let origin = crate::api::page_origin(&st, &headers);
+    Ok(Json(serde_json::json!({"authorize_url": super::google::connect(&st, &realm, origin.as_deref(), &c.back).await?})))
+}
+
+async fn google_accounts(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::OAuthAccount>>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::google::accounts(&st, &realm).await?))
+}
+
+async fn google_remove(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(account): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<axum::http::StatusCode> {
+    let realm = realm(&st, &caller, &r).await?;
+    super::google::remove(&st, &realm, &account).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn import(

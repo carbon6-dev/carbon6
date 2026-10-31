@@ -515,6 +515,145 @@ async fn documents_export_and_import() {
     let (_, cmd, _) = runs.lock().unwrap().last().cloned().unwrap();
     assert_eq!(cmd[5..], ["2".to_owned(), "3".to_owned()]);
 
+    // Google Docs and Slides (docs/docs.md §10), against a stand-in Google:
+    // a sign-in with drive.file only, uploads converted, the file
+    // remembered, updates that say when Google's copy changed.
+    type Calls = Arc<Mutex<Vec<(String, String, String, Vec<u8>)>>>;
+    let calls: Calls = Arc::default();
+    let modified = Arc::new(Mutex::new(String::from("2026-10-31T10:00:00.000Z")));
+    let google = {
+        use axum::extract::{Path as P, RawQuery};
+        use axum::http::HeaderMap;
+        use axum::routing::{get, patch, post as on_post};
+        let (c1, c2, c3) = (calls.clone(), calls.clone(), calls.clone());
+        let (m1, m2, m3) = (modified.clone(), modified.clone(), modified.clone());
+        axum::Router::new()
+            .route(
+                "/token",
+                on_post(|axum::extract::Form(f): axum::extract::Form<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(f["client_secret"], "s3cret");
+                    axum::Json(json!({"access_token": "drive-token", "refresh_token": "r1", "expires_in": 3600,
+                                      "scope": "openid email profile https://www.googleapis.com/auth/drive.file"}))
+                }),
+            )
+            .route("/me", get(|| async { axum::Json(json!({"email": "ada@example.com", "name": "Ada"})) }))
+            .route(
+                "/upload/drive/v3/files",
+                on_post(move |q: RawQuery, h: HeaderMap, body: axum::body::Bytes| {
+                    let (c, m) = (c1.clone(), m1.clone());
+                    async move {
+                        let auth = h["authorization"].to_str().unwrap().to_owned();
+                        let ct = h["content-type"].to_str().unwrap().to_owned();
+                        c.lock().unwrap().push((format!("POST ?{}", q.0.unwrap_or_default()), auth, ct, body.to_vec()));
+                        let n = c.lock().unwrap().len();
+                        axum::Json(json!({"id": format!("g{n}"), "webViewLink": format!("https://docs.google.com/document/d/g{n}/edit"),
+                                          "modifiedTime": *m.lock().unwrap()}))
+                    }
+                }),
+            )
+            .route(
+                "/upload/drive/v3/files/{id}",
+                patch(move |P(id): P<String>, q: RawQuery, h: HeaderMap, body: axum::body::Bytes| {
+                    let (c, m) = (c2.clone(), m2.clone());
+                    async move {
+                        let ct = h["content-type"].to_str().unwrap().to_owned();
+                        c.lock().unwrap().push((format!("PATCH {id} ?{}", q.0.unwrap_or_default()), String::new(), ct, body.to_vec()));
+                        *m.lock().unwrap() = "2026-10-31T11:00:00.000Z".into();
+                        axum::Json(json!({"id": id, "webViewLink": format!("https://docs.google.com/document/d/{id}/edit"),
+                                          "modifiedTime": *m.lock().unwrap()}))
+                    }
+                }),
+            )
+            .route(
+                "/drive/v3/files/{id}",
+                get(move |P(id): P<String>| {
+                    let (c, m) = (c3.clone(), m3.clone());
+                    async move {
+                        c.lock().unwrap().push((format!("GET {id}"), String::new(), String::new(), Vec::new()));
+                        axum::Json(json!({"id": id, "modifiedTime": *m.lock().unwrap(), "trashed": false}))
+                    }
+                }),
+            )
+    };
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gbase = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, google).await });
+    head.state
+        .store
+        .set_setting(
+            "google_endpoints",
+            &json!({"authorize_url": format!("{gbase}/auth"), "token_url": format!("{gbase}/token"),
+                    "userinfo_url": format!("{gbase}/me"), "api_url": gbase})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    // No account yet: it says where to connect one.
+    let r = http.post(format!("{api}/docs/{id}/google")).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("Connect a Google account"));
+    for (k, v) in [("GOOGLE_CLIENT_ID", "client-1"), ("GOOGLE_CLIENT_SECRET", "s3cret")] {
+        let r = http.put(format!("{api}/settings/secrets/{k}")).json(&json!({"value": v})).send().await.unwrap();
+        assert!(r.status().is_success());
+    }
+    let start = post("docs/google/connect".into(), json!({"back": format!("/docs/{id}")})).await;
+    let url = reqwest::Url::parse(start["authorize_url"].as_str().unwrap()).unwrap();
+    let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert!(url.as_str().starts_with(&format!("{gbase}/auth")));
+    assert_eq!(q["scope"], "openid email profile https://www.googleapis.com/auth/drive.file", "drive.file only");
+    let quiet = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let back =
+        quiet.get(format!("{}/auth/google/callback?code=c&state={}", api.trim_end_matches("/api/v1"), q["state"])).send().await.unwrap();
+    let to = back.headers()["location"].to_str().unwrap().to_owned();
+    assert!(to.starts_with(&format!("/docs/{id}?oauth=connected")), "{to}");
+    let g: Value = http.get(format!("{api}/docs/{id}/google")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((g["accounts"][0].as_str(), g["file"].is_null(), g["app"].as_str()), (Some("ada@example.com"), true, Some("Google Docs")));
+
+    // First export: the kit's Word file, uploaded converted to a Google Doc.
+    let f = post(format!("docs/{id}/google"), json!({})).await;
+    assert_eq!((f["id"].as_str(), f["account"].as_str(), f["rev"].as_i64()), (Some("g1"), Some("ada@example.com"), Some(1)));
+    assert_eq!(f["url"], "https://docs.google.com/document/d/g1/edit");
+    {
+        let c = calls.lock().unwrap();
+        let (what, auth, ct, body) = &c[0];
+        assert!(what.starts_with("POST ?uploadType=multipart"), "{what}");
+        assert_eq!(auth, "Bearer drive-token");
+        assert!(ct.starts_with("multipart/related; boundary="), "{ct}");
+        let body = String::from_utf8_lossy(body);
+        assert!(
+            body.contains(r#""mimeType":"application/vnd.google-apps.document""#) && body.contains(r#""name":"Launch plan""#),
+            "{body}"
+        );
+        assert!(body.contains("wordprocessingml") && body.contains("docx of"), "{body}");
+    }
+    let g: Value = http.get(format!("{api}/docs/{id}/google")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(g["file"]["id"], "g1", "the document remembers its Google file");
+    // Again: the same file, updated.
+    let f = post(format!("docs/{id}/google"), json!({})).await;
+    assert_eq!(f["id"], "g1");
+    {
+        let c = calls.lock().unwrap();
+        assert_eq!(c[1].0, "GET g1");
+        assert!(c[2].0.starts_with("PATCH g1 ?uploadType=media"), "{}", c[2].0);
+        assert!(c[2].2.contains("wordprocessingml"));
+    }
+    // Changed in Google since: it says so, and updates only when you say.
+    *modified.lock().unwrap() = "2026-10-31T12:00:00.000Z".into();
+    let r = http.post(format!("{api}/docs/{id}/google")).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert!(r.text().await.unwrap().contains("changed in Google since the last export"));
+    let n = calls.lock().unwrap().len();
+    post(format!("docs/{id}/google"), json!({"anyway": true})).await;
+    assert!(calls.lock().unwrap()[n + 1].0.starts_with("PATCH g1"));
+    // Or a new one; a deck becomes Google Slides from PowerPoint.
+    let f = post(format!("docs/{id}/google"), json!({"new": true})).await;
+    assert_ne!(f["id"], "g1");
+    let f = post(format!("docs/{did}/google"), json!({})).await;
+    let c = calls.lock().unwrap().last().cloned().unwrap();
+    let body = String::from_utf8_lossy(&c.3);
+    assert!(body.contains("application/vnd.google-apps.presentation") && body.contains("pptx of"), "{body}");
+    assert!(f["id"].is_string());
+
     // Import: Markdown read here; Word through the kit.
     use base64::Engine;
     let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);

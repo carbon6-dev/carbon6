@@ -462,6 +462,68 @@ pub struct DocExportIn {
     pub format: String,
 }
 
+/// A document's Google file (docs/docs.md §10): where it was exported to
+/// last, as a Google Doc or Google Slides.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GoogleFile {
+    /// Its id in Google Drive.
+    pub id: String,
+    /// Where it opens in Google.
+    pub url: String,
+    /// The Google account it is in.
+    pub account: String,
+    /// The document's version last exported to it.
+    pub rev: i64,
+    /// When Google says it was last changed, as of that export (a later
+    /// time means it was edited in Google since).
+    #[serde(default)]
+    pub modified: String,
+    pub by: String,
+    pub at: UnixMs,
+}
+
+/// `GET /api/v1/docs/{id}/google`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocGoogle {
+    /// The realm's Google accounts for documents (Settings → Docs).
+    pub accounts: Vec<String>,
+    /// Its Google file, once exported.
+    #[serde(default)]
+    pub file: Option<GoogleFile>,
+    /// Google Docs or Google Slides.
+    pub app: String,
+}
+
+/// `POST /api/v1/docs/{id}/google`: to Google Docs (a doc) or Google
+/// Slides (a deck). By default its Google file is updated (a new revision
+/// in Google), or made the first time.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GoogleExportIn {
+    /// Make a new Google file, not update the one it has.
+    #[serde(default)]
+    pub new: bool,
+    /// Update even though the Google file changed in Google since the last
+    /// export (those changes are replaced).
+    #[serde(default)]
+    pub anyway: bool,
+    /// Which account a new file goes in (default: the one before, else the
+    /// first).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// `POST /api/v1/docs/google/connect`: a Google sign-in for documents.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GoogleConnect {
+    /// The page to come back to (default: Settings).
+    #[serde(default)]
+    pub back: String,
+}
+
 /// `POST /api/v1/docs/import`: a file becomes a document.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

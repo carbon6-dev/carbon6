@@ -240,7 +240,14 @@ fn file_name(title: &str, format: &str) -> String {
 /// it was made from.
 pub async fn export(st: &HeadState, realm: &str, id: &str, format: &str, by: &str) -> anyhow::Result<DocExport> {
     let doc = super::get(st, realm, id).await?;
-    let kind = doc.summary.kind.clone();
+    let bytes = render(st, realm, &doc, format).await?;
+    keep(st, realm, &doc, format, bytes, by).await
+}
+
+/// A document's file in a format (Google's exports upload Word and
+/// PowerPoint files made here).
+pub async fn render(st: &HeadState, realm: &str, doc: &Doc, format: &str) -> anyhow::Result<Vec<u8>> {
+    let (id, kind) = (doc.summary.id.as_str(), doc.summary.kind.clone());
     let Some((_, kit)) = formats(&kind).iter().find(|(f, _)| *f == format) else {
         return Err(bad_request(format!("a {kind} exports to {}", formats(&kind).iter().map(|(f, _)| *f).collect::<Vec<_>>().join(", "))));
     };
@@ -253,11 +260,11 @@ pub async fn export(st: &HeadState, realm: &str, id: &str, format: &str, by: &st
         plain_markdown(&state)
     };
     let html = if kind == "deck" {
-        deck_html(&doc, &crate::decks::theme_css(st, realm, &doc.summary.theme).await, false)
+        deck_html(doc, &crate::decks::theme_css(st, realm, &doc.summary.theme).await, false)
     } else {
         doc_html(&doc.summary.title, &md)
     };
-    let bytes: Vec<u8> = if !kit {
+    Ok(if !kit {
         match format {
             "md" => md.into_bytes(),
             _ => html.into_bytes(),
@@ -265,7 +272,7 @@ pub async fn export(st: &HeadState, realm: &str, id: &str, format: &str, by: &st
     } else {
         let mut inputs = BTreeMap::from([("doc.md".to_owned(), md.into_bytes()), ("deck.html".to_owned(), html.into_bytes())]);
         if kind == "deck" {
-            inputs.insert("deck.json".into(), serde_json::to_vec(&deck_json(&doc))?);
+            inputs.insert("deck.json".into(), serde_json::to_vec(&deck_json(doc))?);
         }
         let (tool, args) = match format {
             "pdf" => ("pdf", json!({"html": "deck.html", "out": "out/file.pdf"})),
@@ -279,8 +286,7 @@ pub async fn export(st: &HeadState, realm: &str, id: &str, format: &str, by: &st
         } else {
             files.get(&format!("file.{format}")).cloned().ok_or_else(|| anyhow::anyhow!("the render kit made no {format}"))?
         }
-    };
-    keep(st, realm, &doc, format, bytes, by).await
+    })
 }
 
 /// A zip of the slides' pictures (stored, not compressed: PNGs are already).

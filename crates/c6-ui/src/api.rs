@@ -1453,6 +1453,31 @@ pub async fn doc_exports(id: String) -> Result<Vec<c6_api::docs::DocExport>, Str
     json(Request::get(&format!("/api/v1/docs/{}/exports", enc(&id))).send().await).await
 }
 
+/// A document's Google file and the realm's Google accounts for documents.
+pub async fn doc_google(id: String) -> Result<c6_api::docs::DocGoogle, String> {
+    json(Request::get(&format!("/api/v1/docs/{}/google", enc(&id))).send().await).await
+}
+
+pub async fn doc_to_google(id: String, g: c6_api::docs::GoogleExportIn) -> Result<c6_api::docs::GoogleFile, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/google", enc(&id))), &g).await
+}
+
+/// A Google sign-in for documents: where to go (coming back to `back`).
+pub async fn docs_google_connect(back: String, settings: bool) -> Result<String, String> {
+    let q = if settings { in_realm('?') } else { String::new() };
+    let v: serde_json::Value =
+        send_json(Request::post(&format!("/api/v1/docs/google/connect{q}")), &c6_api::docs::GoogleConnect { back }).await?;
+    Ok(v["authorize_url"].as_str().unwrap_or_default().to_owned())
+}
+
+pub async fn docs_google_accounts() -> Result<Vec<c6_api::OAuthAccount>, String> {
+    json(Request::get(&format!("/api/v1/docs/google/accounts{}", in_realm('?'))).send().await).await
+}
+
+pub async fn docs_google_remove(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/docs/google/accounts/{}{}", enc(&id), in_realm('?'))).send().await).await
+}
+
 pub async fn doc_import(i: &c6_api::docs::DocImport) -> Result<c6_api::docs::Doc, String> {
     send_json(Request::post("/api/v1/docs/import"), i).await
 }
