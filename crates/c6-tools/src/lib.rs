@@ -12,6 +12,7 @@ pub mod kits;
 pub mod knowledge;
 pub mod memex;
 pub mod memory;
+pub mod messages;
 mod names;
 pub mod notify;
 mod patch;
@@ -184,6 +185,9 @@ pub struct SessionTools {
     /// The session's web browser, started on first use.
     pub browser: browser::BrowserSlot,
     head: Mutex<Option<Arc<dyn HeadCaller>>>,
+    /// How many session messages led to what the agent is doing now
+    /// (docs/background.md §6): a message it sends is one more.
+    message_hops: std::sync::atomic::AtomicU32,
     /// Files read (or written) this session, with the mtime we saw. Writes to
     /// existing files require a prior read and an unchanged mtime, so the
     /// model never clobbers content it has not seen.
@@ -211,6 +215,7 @@ impl SessionTools {
             notices: Mutex::default(),
             browser: Default::default(),
             head: Mutex::default(),
+            message_hops: Default::default(),
         }
     }
 
@@ -224,6 +229,17 @@ impl SessionTools {
 
     pub fn set_head(&self, h: Option<Arc<dyn HeadCaller>>) {
         *self.head.lock().unwrap() = h;
+    }
+
+    /// How many session messages led to the agent's current work.
+    pub fn message_hops(&self) -> u32 {
+        self.message_hops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the agent works on now came from a session message after
+    /// `hops` of them (0: from you).
+    pub fn set_message_hops(&self, hops: u32) {
+        self.message_hops.store(hops, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn head(&self) -> Option<Arc<dyn HeadCaller>> {

@@ -449,6 +449,9 @@ impl SessionManager {
                     command: input.command,
                     wake: input.wake,
                     delegated_by: input.delegated_by,
+                    from_session_id: input.from_session_id,
+                    from_title: input.from_title,
+                    hops: input.hops,
                     ..Default::default()
                 };
                 let choice = CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels };
@@ -1227,7 +1230,16 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
         .iter()
         .filter_map(|e| match &e.kind {
             Some(session_event::Kind::NoticeQueued(n)) if !taken.contains(&n.command_id) => Some((
-                PendingInput { command_id: n.command_id.clone(), text: n.text.clone(), command: n.command.clone(), ..Default::default() },
+                PendingInput {
+                    command_id: n.command_id.clone(),
+                    text: n.text.clone(),
+                    command: n.command.clone(),
+                    prompt: n.prompt.clone(),
+                    from_session_id: n.from_session_id.clone(),
+                    from_title: n.from_title.clone(),
+                    hops: n.hops,
+                    ..Default::default()
+                },
                 n.wake,
             )),
             _ => None,
@@ -1452,7 +1464,27 @@ impl Actor {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
+                    // Another session's agent wrote (docs/background.md §6): a
+                    // notice, not your message (no commands, mentions or hooks).
+                    Some(ActorMsg::Input(input, _, _)) if !input.from_session_id.is_empty() => {
+                        let mut input = *input;
+                        let note = spec_prompt(&self.spec, "session.message_received", c6_agent::SESSION_MESSAGE_NOTE);
+                        input.command = "session-message".into();
+                        input.prompt = format!(
+                            "<session-message from=\"{}\" title=\"{}\">\n{}\n</session-message>\n\n{note}",
+                            input.from_session_id,
+                            input.from_title.replace('"', "'"),
+                            input.text
+                        );
+                        if let Err(e) = self.notice(input, running.is_some(), true).await {
+                            error!(session = %self.writer.session_id, "queueing a session message: {e:#}");
+                            return;
+                        }
+                    }
                     Some(ActorMsg::Input(mut input, model, choice)) => {
+                        // Your message: what the agent does from now on is not
+                        // a session message's chain.
+                        self.session_tools.set_message_hops(0);
                         // Pick the custom command's variant for this
                         // session, expand the command and attach the files
                         // it mentions, as they are now.
@@ -1859,8 +1891,16 @@ impl Actor {
         if !self.noticed.insert(input.command_id.clone()) {
             return Ok(());
         }
-        let queued =
-            c6_proto::NoticeQueued { command_id: input.command_id.clone(), text: input.text.clone(), command: input.command.clone(), wake };
+        let queued = c6_proto::NoticeQueued {
+            command_id: input.command_id.clone(),
+            text: input.text.clone(),
+            command: input.command.clone(),
+            wake,
+            prompt: input.prompt.clone(),
+            from_session_id: input.from_session_id.clone(),
+            from_title: input.from_title.clone(),
+            hops: input.hops,
+        };
         self.writer.append(session_event::Kind::NoticeQueued(queued)).await?;
         self.deliver_notice(input, busy, wake, true).await
     }
@@ -1870,6 +1910,10 @@ impl Actor {
     /// beyond it, once the hour allows), else it waits for the next input.
     /// `announce`: say so in the log when the limit holds it.
     async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
+        // What the agent does next follows from this message's chain.
+        if input.hops > 0 {
+            self.session_tools.set_message_hops(input.hops);
+        }
         if busy || !self.inbox.lock().unwrap().queue.is_empty() {
             self.inbox.lock().unwrap().push(input, None);
             return Ok(());
@@ -2066,21 +2110,29 @@ impl Actor {
     /// `SendMessage`, which can run in the background (their notices go to
     /// the session's process, docs/background.md §4), `TaskOutput` and
     /// `TaskStop` for those (none of these without a connection or template
-    /// to run on), and carbon6's documents (`doc`).
+    /// to run on), carbon6's documents (`doc`), and the session-message
+    /// tools its tool list allows.
     fn claude_code_subagent_tools(&self) -> Vec<Arc<dyn Tool>> {
         let depth = crate::subagent::depth_of(&self.spec);
         let connections = task_connections(&self.spec);
         let templates = task_templates(&self.spec);
-        // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
-        let doc: Arc<dyn Tool> = Arc::new(c6_tools::records::Doc::new(false));
+        // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9), and
+        // messages to other sessions (docs/background.md §6), on every
+        // connection.
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(c6_tools::records::Doc::new(false)),
+            Arc::new(c6_tools::messages::MessageSession::new(true)),
+            Arc::new(c6_tools::messages::ListSessions::new(true)),
+        ];
+        tools.retain(|t| t.spec().name == "doc" || c6_tools::tool_allowed(&self.spec.tools, &t.spec().name));
         if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(&self.spec, depth) {
-            return vec![doc];
+            return tools;
         }
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
         let labels =
             session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
         let agents = session_agents(&self.spec, &labels);
-        vec![
+        let mut all: Vec<Arc<dyn Tool>> = vec![
             Arc::new(
                 c6_tools::Task::with_agents(true, agents)
                     .with_connections(connections)
@@ -2090,8 +2142,9 @@ impl Actor {
             Arc::new(c6_tools::SendMessage::claude()),
             Arc::new(c6_tools::BashOutput::carbon6()),
             Arc::new(c6_tools::KillShell::carbon6()),
-            doc,
-        ]
+        ];
+        all.extend(tools);
+        all
     }
 
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
@@ -2696,6 +2749,9 @@ fn builtin_tools(
     tools.push(Arc::new(c6_tools::records::RecordsDelete::new(profile == ToolProfile::Claude)));
     // carbon6's API reference, for writing code that works with carbon6.
     tools.push(Arc::new(c6_tools::api_reference::ApiReference::new(profile == ToolProfile::Claude)));
+    // Messages to other sessions in the realm (docs/background.md §6).
+    tools.push(Arc::new(c6_tools::messages::MessageSession::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::messages::ListSessions::new(profile == ToolProfile::Claude)));
     if spec.memex_tools {
         tools.push(Arc::new(c6_tools::memex::MemexSearch::new(profile == ToolProfile::Claude)));
         tools.push(Arc::new(c6_tools::memex::MemexGet::new(profile == ToolProfile::Claude)));
@@ -3463,6 +3519,7 @@ mod notice_tests {
             text: format!("about {id}"),
             command: "task-notification".into(),
             wake,
+            ..Default::default()
         })
     }
 

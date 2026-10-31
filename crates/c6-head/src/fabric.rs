@@ -186,6 +186,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
                 crate::commons::from_session(st, &target, &realm, &params).await
             }
             "openapi" => Ok(crate::catalog::openapi(&crate::notify::api_urls(st).await)),
+            // Messages to other sessions in its realm (docs/background.md §6),
+            // from the session that calls (a subagent's calls come as its
+            // top-level session's).
+            "message" => crate::sessions::message_from(st, &session, &params).await,
+            "sessions" => crate::sessions::sessions_for(st, &session, &params).await,
             // The work it belongs to (docs/work.md §4).
             "work" => crate::work::for_session(st, &target, &params).await,
             // Documents (docs/docs.md §9).

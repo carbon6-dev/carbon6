@@ -1394,6 +1394,12 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
     if !(1..=1440).contains(&l.claude_code_idle_minutes) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "an idle Claude Code process stays up 1 to 1440 minutes".into()));
     }
+    if !(1..=32).contains(&l.max_message_hops) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "a chain of session messages is 1 to 32 long".into()));
+    }
+    if !(1..=1000).contains(&l.messages_per_hour) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "a session sends 1 to 1000 messages an hour".into()));
+    }
     st.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &serde_json::to_string(&l).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }

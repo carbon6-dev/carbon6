@@ -1048,6 +1048,9 @@ impl Store {
                     .await?;
                 }
                 Some(Kind::User(u)) => done.push(u.command_id.clone()),
+                // A session message the worker recorded as a notice is
+                // applied: it is delivered from its log from now on.
+                Some(Kind::NoticeQueued(n)) => done.push(n.command_id.clone()),
                 Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
                 Some(Kind::Usage(u)) => crate::usage::record(&mut tx, session_id, ev.seq, ev.ts_ms, u).await?,
                 Some(Kind::Approval(a)) => {
