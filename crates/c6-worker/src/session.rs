@@ -1746,8 +1746,10 @@ impl Actor {
     fn claude_code_subagent_tools(&self) -> Vec<Arc<dyn Tool>> {
         let depth = self.spec.delegation.as_ref().map_or(0, |d| d.depth);
         let connections = task_connections(&self.spec);
+        // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
+        let doc: Arc<dyn Tool> = Arc::new(c6_tools::records::Doc::new(false));
         if connections.is_empty() || !crate::subagent::may_delegate(&self.spec, depth) {
-            return Vec::new();
+            return vec![doc];
         }
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
         let labels =
@@ -1756,6 +1758,7 @@ impl Actor {
         vec![
             Arc::new(c6_tools::Task::with_agents(true, agents).with_connections(connections).foreground_only()),
             Arc::new(c6_tools::SendMessage::claude().foreground_only()),
+            doc,
         ]
     }
 
@@ -2221,6 +2224,8 @@ pub(crate) async fn build_tools(
     tools.push(Arc::new(c6_tools::apps::AppCall::new(profile == ToolProfile::Claude)));
     // The work the session belongs to (docs/work.md §4).
     tools.push(Arc::new(c6_tools::records::Work::new(profile == ToolProfile::Claude)));
+    // Documents written with the user (docs/docs.md §9).
+    tools.push(Arc::new(c6_tools::records::Doc::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::records::SeriesRecord::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::records::SeriesQuery::new(profile == ToolProfile::Claude)));
     // Collections: typed tables in the session's realm.

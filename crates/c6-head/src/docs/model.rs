@@ -372,7 +372,8 @@ impl State {
     fn guard(&self, r: &Row, if_rev: Option<i64>, if_hash: Option<&str>, rev: i64) -> anyhow::Result<()> {
         let (Some(seen), Some(hash)) = (if_rev, if_hash) else {
             return Err(bad_request(format!(
-                "replacing or deleting a whole block needs ifRev and ifHash: read block {} first (view=block)",
+                "replacing or deleting a whole block needs ifRev and ifHash: read block {} first (view=block). (A pending block you \
+                 were filling that someone has edited since is theirs now: read it and work around it.)",
                 r.id
             )));
         };
@@ -516,7 +517,12 @@ impl State {
             DocOp::Replace { id, markdown, blocks, find, with_text, nth, cell, text, layout, notes, hidden, if_rev, if_hash } => {
                 let r = self.row(id)?.clone();
                 if let Some(markdown) = markdown {
-                    self.guard(&r, *if_rev, if_hash.as_deref(), rev)?;
+                    // Its writer fills a block still pending without a
+                    // guard: once you edit it, it isn't pending any more.
+                    let own_pending = r.kind == "pending" && r.attrs["by"] == by && if_hash.is_none();
+                    if !own_pending {
+                        self.guard(&r, *if_rev, if_hash.as_deref(), rev)?;
+                    }
                     let parsed = self.parse_for(&r.parent, markdown, blocks)?;
                     if parsed.is_empty() {
                         return Err(bad_request("the markdown is empty: delete the block instead"));
@@ -1050,6 +1056,36 @@ mod tests {
         assert_eq!(top(&s)[0], "u.5");
         let mut blocks = Map::new();
         assert_eq!(s.markdown("u.0", &mut blocks), "Also.\n\n# Plan\n\nBetter words.\n\n## Risks\n\nSlips.");
+    }
+
+    #[test]
+    fn a_writer_fills_its_own_pending_blocks_until_someone_takes_them() {
+        let sess = "session:abc123";
+        let mut s = State::new(Meta { kind: "doc".into(), title: "T".into(), ..Default::default() });
+        s.first_tab("T", sess);
+        let blocks: Map<String, Value> =
+            serde_json::from_value(json!({"a": {"type": "pending", "intent": "A"}, "b": {"type": "pending", "intent": "B"}})).unwrap();
+        let ins = DocOp::Insert {
+            markdown: "<?c6 block a?>\n\n<?c6 block b?>".into(),
+            blocks,
+            before: None,
+            after: None,
+            section: None,
+            slide: None,
+            region: None,
+            tab: None,
+        };
+        let got = s.apply(&[ins], sess, 1).unwrap();
+        let (a, b) = (got.keys["a"].as_str().unwrap().to_owned(), got.keys["b"].as_str().unwrap().to_owned());
+        assert_eq!(a, "sabc123.2");
+        // Someone else can't skip the guard on it.
+        assert!(s.apply(&[replace_md(&a, "## A", None, None)], "you", 2).is_err());
+        s.apply(&[replace_md(&a, "## A\n\nDone.", None, None)], sess, 2).unwrap();
+        // You take B by editing it: the writer's fill now needs a guard.
+        let hb = s.hash(&s.rows[&b]);
+        s.apply(&[replace_md(&b, "Mine.", Some(2), Some(hb))], "you", 3).unwrap();
+        let e = s.apply(&[replace_md(&b, "## B", None, None)], sess, 4).unwrap_err();
+        assert!(e.to_string().contains("is theirs now"), "{e}");
     }
 
     #[test]

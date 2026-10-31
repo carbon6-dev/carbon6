@@ -99,7 +99,7 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     assert_eq!(init["result"]["serverInfo"]["name"], "carbon6");
     let tools: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("tools.json")).unwrap()).unwrap();
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["Task", "SendMessage"]);
+    assert_eq!(names, ["Task", "SendMessage", "doc"]);
     let task = &tools["result"]["tools"][0]["inputSchema"]["properties"];
     assert_eq!(task["connection"]["enum"], json!(["api"]), "Claude Code is not offered to subagents");
     assert!(task.get("run_in_background").is_none(), "{task}");

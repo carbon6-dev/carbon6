@@ -97,8 +97,9 @@ async fn documents_keep_their_blocks_through_guarded_edits() {
     let e: Value = r.json().await.unwrap();
     assert!(e["error"].as_str().unwrap().contains("guard_mismatch"), "{e}");
     assert_eq!(get(format!("docs/{id}")).await["rev"], 2);
-    // No guard on a whole-block replace: refused.
-    let r = send(M::POST, format!("docs/{id}/ops"), json!({"ops": [{"op": "replace", "id": s2, "markdown": "x"}]})).await;
+    // No guard on a whole-block replace: refused (a pending block's own
+    // writer fills it without one).
+    let r = send(M::POST, format!("docs/{id}/ops"), json!({"ops": [{"op": "replace", "id": blocks[0]["id"], "markdown": "# x"}]})).await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     // Words found and replaced; a find that no longer matches is refused.
     let para = blocks[1]["id"].as_str().unwrap().to_owned();
@@ -204,4 +205,133 @@ async fn documents_keep_their_blocks_through_guarded_edits() {
     assert_eq!(w["live"][1]["state"], "gone", "a deleted document");
     // Root keeps no documents.
     assert_eq!(get("docs?realm=root".into()).await["error"], "documents live in a realm: root keeps none");
+}
+
+/// A session writes documents with the `doc` tool: the birth with a
+/// pending section, filling it, and editing another document only once you
+/// allow it.
+#[tokio::test]
+async fn sessions_write_documents_with_the_doc_tool() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.request(method, &url).json(&body).send().await.unwrap() }
+    };
+    let get = |path: String| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.get(&url).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    // Only the session calls the model here.
+    let r =
+        send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4}))
+            .await;
+    assert!(r.status().is_success());
+    let conn: Value = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await.json().await.unwrap();
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    let results = |ev: &[Value]| -> Vec<String> {
+        ev.iter().filter(|e| e["type"] == "tool_result").map(|e| e["output"].as_str().unwrap_or("").to_owned()).collect()
+    };
+
+    // 1. The birth: a title and a pending section, in a session of a work item.
+    let create = json!({"action": "create", "title": "Rollout plan", "markdown": "# Rollout plan\n\n<?c6 block s1?>",
+                        "blocks": {"s1": {"type": "pending", "intent": "Phases: what ships when"}}});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), json!({"action": "guide"}).to_string()), ("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Started doc.".into()));
+    let s: Value = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "plan the rollout", "work": "new"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let sid = s["id"].as_str().unwrap().to_owned();
+    let ev = turns(sid.clone(), 1).await;
+    let out = results(&ev);
+    assert!(out[0].contains("Birth first"), "the guide is docs.style: {}", out[0]);
+    let made: Value = serde_json::from_str(&out[1]).unwrap_or_else(|_| panic!("{}", out[1]));
+    let id = made["doc"]["id"].as_str().unwrap().to_owned();
+    let pending = made["keys"]["s1"].as_str().unwrap().to_owned();
+    assert_eq!(made["pending"][0]["id"], pending.as_str());
+    assert_eq!(made["pending"][0]["intent"], "Phases: what ships when");
+    assert!(made["blocks"].as_array().unwrap().iter().any(|b| b["kind"] == "heading" && b["words"] == "Rollout plan"), "{made}");
+    let doc = get(format!("docs/{id}")).await;
+    assert_eq!(doc["created_by"], format!("session:{sid}"));
+    assert_eq!(doc["writers"][0], format!("session:{sid}"), "it shows who is writing the pending section");
+    // It belongs to the session's work.
+    let w = get(format!("work/of?ref=session:{sid}")).await;
+    assert!(w[0]["attached"].as_array().unwrap().iter().any(|a| a["ref"] == format!("doc:{id}")), "{w}");
+
+    // 2. Filling its own pending section needs no guard (`block` names it,
+    // as models often write it).
+    let fill =
+        json!({"action": "edit", "id": id, "ops": [{"op": "replace", "block": pending, "markdown": "## Phases\n\n1. Staff\n2. Everyone"}]});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), fill.to_string())]));
+    mock.push(Reply::Text("Filled.".into()));
+    let r = send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "fill it in"})).await;
+    assert!(r.status().is_success());
+    turns(sid.clone(), 2).await;
+    let md = get(format!("docs/{id}/read?view=markdown")).await;
+    assert_eq!(md["tabs"][0]["markdown"], "# Rollout plan\n\n## Phases\n\n1. Staff\n2. Everyone");
+    let h = get(format!("docs/{id}/history")).await;
+    assert_eq!(h[0]["by"], format!("session:{sid}"));
+
+    // 3. Your document isn't its work's: the first edit asks you, nothing changes.
+    let yours: Value = send(M::POST, "docs".into(), json!({"title": "Team handbook", "markdown": "Be kind."})).await.json().await.unwrap();
+    let yid = yours["id"].as_str().unwrap().to_owned();
+    let words = json!({"action": "edit", "id": format!("doc:{yid}"), "ops": [{"op": "replace", "id": yours["tabs"][0]["blocks"][0]["id"], "find": "kind", "with": "kind and brief"}]});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), words.to_string())]));
+    mock.push(Reply::Text("Asked.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "edit the handbook"})).await;
+    let ev = turns(sid.clone(), 3).await;
+    let out = results(&ev);
+    assert!(out.last().unwrap().contains("the user is asked to let you edit it"), "{out:?}");
+    assert_eq!(get(format!("docs/{yid}")).await["rev"], 1);
+    let ds = get("decisions".into()).await;
+    let d = ds.as_array().unwrap().iter().find(|d| d["title"].as_str().unwrap_or("").contains("Team handbook")).unwrap().clone();
+    let r = send(M::POST, format!("decisions/{}/answer", d["id"]), json!({"option": "Allow"})).await;
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    // Allowed: the same edit lands.
+    mock.push(Reply::ToolCalls(vec![("doc".into(), words.to_string())]));
+    mock.push(Reply::Text("Done.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "try again"})).await;
+    turns(sid.clone(), 4).await;
+    let b = get(format!("docs/{yid}/read?view=markdown")).await;
+    assert_eq!(b["tabs"][0]["markdown"], "Be kind and brief.");
+    stop.cancel();
 }

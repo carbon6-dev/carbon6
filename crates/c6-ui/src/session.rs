@@ -377,6 +377,22 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     // Keyboard shortcuts only act in the active column.
     let active = move || col.is_none_or(|c| c.active.get_untracked());
     let root = col.map(|c| c.root_id()).unwrap_or_default();
+    // A document this session starts opens in a tile of its own (the
+    // session stays), so you watch it being written (docs/docs.md §6).
+    {
+        let by = format!("session:{id}");
+        let seen = live.doc.get_untracked();
+        Effect::new(move |_| {
+            let Some(c) = live.doc.get() else { return };
+            if c.what == "created"
+                && c.by == by
+                && Some(&c) != seen.as_ref()
+                && let Some(col) = col
+            {
+                col.open(View::Docs { id: c.id.clone() }, crate::workspace::How::OwnTile);
+            }
+        });
+    }
     let detail = LocalResource::new({
         let id = id.clone();
         move || api::session(id.clone())
@@ -2397,6 +2413,7 @@ fn tool_kind(name: &str) -> &str {
         "BashOutput" => "bash_output",
         "KillShell" => "kill_shell",
         "Skill" => "load_skill",
+        "doc" | "Doc" | "mcp__carbon6__doc" => "doc",
         other => other,
     }
 }
@@ -2436,6 +2453,11 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             .unwrap_or("")
             .to_owned(),
         "load_skill" => input.get("skill").or_else(|| input.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+        "doc" => {
+            let what = s("action");
+            let title = s("title");
+            if title.is_empty() { format!("{what} {}", s("id")) } else { format!("{what} \"{title}\"") }
+        }
         "plan" => {
             let items = plan_items(input);
             let done = items.iter().filter(|(_, st)| st == "completed").count();
@@ -2501,6 +2523,29 @@ fn ToolCard(
         let to = input.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
         Memo::new(move |_| s.resolve(&to))
     });
+    // A document it wrote: a card that opens it (docs/docs.md §12).
+    let doc_card = (kind == "doc").then(|| {
+        let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        Signal::derive(move || {
+            let r = result.get().filter(|r| !r.is_error)?;
+            let v: serde_json::Value = serde_json::from_str(&r.output).ok()?;
+            let d = v.get("doc")?;
+            let what = match v["did"].as_str().unwrap_or(&action) {
+                "created" => "made".to_owned(),
+                "edited" => {
+                    let n: usize = v["changed"].as_array().map(Vec::len).unwrap_or(0);
+                    format!("{n} {} changed", if n == 1 { "block" } else { "blocks" })
+                }
+                other => other.to_owned(),
+            };
+            Some((
+                d["id"].as_str()?.to_owned(),
+                d["title"].as_str().unwrap_or("").to_owned(),
+                d["kind"].as_str().unwrap_or("doc").to_owned(),
+                what,
+            ))
+        })
+    });
     // Where a search hit in this call's output scrolls to.
     let dom_id = format!("call-{call_id}");
     let started_open = plan.is_some();
@@ -2549,6 +2594,15 @@ fn ToolCard(
                 })}
             </div>
         </details>
+        {move || doc_card.and_then(|c| c.get()).map(|(id, title, kind, what)| view! {
+            <div class="mx-3 mb-2">
+                <crate::workspace::Go to=crate::workspace::View::Docs { id } class="inline-flex items-center gap-2 rounded-md border border-zinc-200 px-2 py-1 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
+                    <span class="text-zinc-400">{if kind == "deck" { "▦" } else { "▤" }}</span>
+                    <span class="font-medium">{title}</span>
+                    <span class="text-xs text-zinc-500">{what}</span>
+                </crate::workspace::Go>
+            </div>
+        })}
         // What the tool showed the model, visible without expanding the card.
         {move || result.get().filter(|r| !r.images.is_empty()).map(|r| view! {
             <div class="mx-3 mb-2 flex flex-wrap gap-2">

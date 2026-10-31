@@ -225,6 +225,24 @@ pieces of work they mean to finish: one goal each, holding the sessions and requ
 Answer with JSON only: {\"work\": [{\"title\": a few words, \"done_when\": one line, \"refs\": [the refs that belong]}]}. Leave out \
 quick questions and throwaways; a ref goes in one piece of work at most.";
 
+/// How agents write documents with the `doc` tool (docs/docs.md §6).
+pub const DOCS_STYLE: &str = "How to write a carbon6 document (a doc or a deck) with the doc tool.\n\n\
+Birth first. Create it at once with its title and one pending block per section (a doc) or per slide (a deck), each with its intent \
+(\"Risks: what could slip and the fallback\"), before any research or reading: the user sees the plan open in front of them and can \
+steer it. Markdown: `<?c6 block s1?>` on a line of its own, with blocks {\"s1\": {\"type\": \"pending\", \"intent\": \"…\"}}.\n\
+Fill one section or slide per edit: replace the pending block's id with its Markdown (a heading, then the body), with ifRev and ifHash \
+from the create result or your last read. The user watches it fill; keep going section by section.\n\n\
+Write it well:\n\
+- Lead with the answer or the decision; background after.\n\
+- Size sections to the ask. One concise tab is the norm; add a tab only for bulk (sources, raw data, notes).\n\
+- Tables for comparisons and trackers; lists for steps; short paragraphs otherwise. No filler, no restating the question.\n\
+- Cite sources as links where they back a claim.\n\
+- Refer to carbon6 things by their refs (doc:<id>, session:<id>, work:<id>) so the user can open them.\n\n\
+Editing what exists: read the outline, then only the blocks you change. Change words with find and with; replace a whole block only \
+when you rewrite it. If an edit is refused with guard_mismatch, someone else changed that block: read it again, keep their change, \
+and say what you kept. Never retype text that was deleted from memory: bring it back from the history with action restore.\n\
+In your reply, give the document's ref (doc:<id>) instead of pasting its text.";
+
 #[cfg(test)]
 mod tests {
     #[test]

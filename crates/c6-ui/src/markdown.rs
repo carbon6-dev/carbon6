@@ -14,6 +14,12 @@ pub fn to_html(src: &str) -> String {
             Event::Start(Tag::Link { .. } | Tag::CodeBlock(_)) => plain += 1,
             Event::End(pulldown_cmark::TagEnd::Link | pulldown_cmark::TagEnd::CodeBlock) => plain -= 1,
             Event::Text(t) if plain == 0 && t.contains("doc:") => return doc_links(t),
+            // `doc:<id>` alone in backticks, as models write refs, links too.
+            Event::Code(c) if plain == 0 && c.starts_with("doc:") && c.len() == 40 && doc_links(c).len() == 4 => {
+                let mut l = doc_links(c);
+                l[2] = Event::Code(c.clone());
+                return l;
+            }
             _ => {}
         }
         vec![ev]
@@ -100,7 +106,10 @@ mod tests {
             out.contains("<a href=\"/docs/01a18f50-9f48-7567-8070-43e1f17ba642\" title=\"Open the document\">doc:01a18f50</a> now."),
             "{out}"
         );
-        assert!(out.contains("<code>doc:01a18f50-9f48-7567-8070-43e1f17ba642</code>") && out.contains("doc:short"), "{out}");
+        assert!(out.contains("<a href=\"/docs/01a18f50-9f48-7567-8070-43e1f17ba642\" title=\"Open the document\"><code>doc:01a18f50-9f48-7567-8070-43e1f17ba642</code></a>"), "{out}");
+        assert!(out.contains("doc:short"), "{out}");
+        let fenced = to_html("```\ndoc:01a18f50-9f48-7567-8070-43e1f17ba642\n```");
+        assert!(!fenced.contains("<a "), "{fenced}");
     }
 
     #[test]

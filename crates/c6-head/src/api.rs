@@ -875,6 +875,7 @@ fn per_realm_key(name: &str) -> ApiResult<&'static str> {
         "subagent-limits" => Ok(crate::sessions::SUBAGENT_LIMITS),
         "brief" => Ok(crate::memex::BRIEF),
         "work" => Ok(crate::work::SETTING),
+        "docs" => Ok(crate::docs::session::SETTING),
         _ => Err(ApiErr(StatusCode::NOT_FOUND, format!("{name:?} is not a setting a realm sets for itself"))),
     }
 }

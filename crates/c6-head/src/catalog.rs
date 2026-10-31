@@ -544,6 +544,8 @@ fn build() -> Vec<Op> {
         op!("docs.delete", "docs", "DELETE" "/api/v1/docs/{id}", Destructive, Input::Query(schema::<api::InRealm>), "Deletes a document.", choices = &[("id", "docs.list")]),
         op!("docs.history", "docs", "GET" "/api/v1/docs/{id}/history", Read, Input::Query(schema::<crate::docs::http::HistoryQuery>), "A document's versions, newest first: who made each (you, session:<id>), when, and the blocks it added, changed and removed.", choices = &[("id", "docs.list")]),
         op!("docs.restore", "docs", "POST" "/api/v1/docs/{id}/restore", Write, Input::Body(schema::<api::docs::DocRestore>), "Brings back an earlier version of a document, or one block or slide of it, as a new change.", choices = &[("id", "docs.list")]),
+        op!("docs.settings.get", "docs", "GET" "/api/v1/settings/docs", Read, Input::None, "How documents behave in the realm: which documents sessions may write without asking (write: work, realm or own)."),
+        op!("docs.settings.put", "docs", "PUT" "/api/v1/settings/docs", Write, Input::Body(schema::<api::docs::DocsSettings>), "Changes which documents sessions may write without asking: work (those they made and their work's; others once you allow each), realm (any) or own (only those they made)."),
         op!("decisions.list", "decisions", "GET" "/api/v1/decisions", Read, Input::Query(schema::<DecisionQuery>), "Decisions (open by default): what waits first, then by priority."),
         op!("decisions.count", "decisions", "GET" "/api/v1/decisions/count", Read, Input::None, "How many decisions are open."),
         op!("decisions.get", "decisions", "GET" "/api/v1/decisions/{id}", Read, Input::None, "A decision: its case, options or form, context, and answer.", choices = &[("id", "decisions.list")]),

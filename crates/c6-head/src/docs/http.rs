@@ -22,6 +22,21 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/{id}/read", get(read))
         .route("/api/v1/docs/{id}/history", get(history))
         .route("/api/v1/docs/{id}/restore", post(restore))
+        .route("/api/v1/settings/docs", get(get_settings).put(put_settings))
+}
+
+/// The realm's (`?realm=`, through the settings middleware).
+async fn get_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::docs::DocsSettings>> {
+    let raw = st.store.setting(super::session::SETTING).await?.unwrap_or_default();
+    Ok(Json(serde_json::from_str(&raw).unwrap_or_default()))
+}
+
+async fn put_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::docs::DocsSettings>) -> ApiResult<axum::http::StatusCode> {
+    if !matches!(s.write.as_str(), "work" | "realm" | "own") {
+        return Err(crate::api::ApiErr(axum::http::StatusCode::BAD_REQUEST, "write is work, realm or own".into()));
+    }
+    st.store.set_setting(super::session::SETTING, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/docs/{id}/history`.

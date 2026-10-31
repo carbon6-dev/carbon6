@@ -106,6 +106,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::WORK_PROPOSE,
     },
     Prompt {
+        name: "docs.style",
+        description: "How agents write documents with the doc tool: the birth with pending sections, filling them one per edit, and the style (docs/docs.md §6). A session reads it with the tool's action guide.",
+        default: text::DOCS_STYLE,
+    },
+    Prompt {
         name: "memex.brief.knowledge",
         description: "What a session's brief says before its environment knowledge.",
         default: text::BRIEF_KNOWLEDGE,

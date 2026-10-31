@@ -176,3 +176,65 @@ records_tool!(
     }, "additionalProperties": false}),
     |ctx, input| { call(ctx, "session.work", input).await }
 );
+
+records_tool!(
+    Doc,
+    "doc",
+    "Doc",
+    Concurrency::Shared,
+    "carbon6 documents (docs and decks) that you and the user write together and keep (docs/docs.md); they open in a panel the \
+     user watches. Markdown in and out; non-text parts are <?c6 block k?> tokens with their values in blocks {k: {...}}. Blocks have \
+     stable ids. action guide: how to write one (read it before your first document). action create: kind (doc, deck), title, \
+     markdown (a deck's slides separated by ---), blocks; start with a pending block per section ({type: pending, intent}), then fill \
+     each with one edit. action read: id, view (outline, block with block=<id>, slide, search with q, since with rev, markdown). \
+     action edit: id, ops [{op: insert|replace|delete|move|table|set|add_tab|delete_tab, ...}]; replace a whole block (markdown) or \
+     delete one with ifRev and ifHash from your read; replace words with find and with. A refused guard means someone else changed it: \
+     read again. action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
+     you made and your work's you edit freely; others need the user's OK once.",
+    json!({"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "history", "restore"]},
+        "id": {"type": "string", "description": "The document (its id, or doc:<id>)"},
+        "kind": {"type": "string", "enum": ["doc", "deck"]},
+        "title": {"type": "string"},
+        "markdown": {"type": "string"},
+        "blocks": {"type": "object", "description": "Values of the <?c6 block k?> tokens: {k: {type: pending, intent}}, chips"},
+        "theme": {"type": "string"},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "view": {"type": "string", "enum": ["outline", "block", "slide", "search", "since", "markdown", "full"]},
+        "block": {"type": "string", "description": "A block or slide id"},
+        "q": {"type": "string"},
+        "rev": {"type": "integer"},
+        "tab": {"type": "string"},
+        "ops": {"type": "array", "description": "For edit: operations, applied all or none"},
+        "answering": {"type": "string"}
+    }, "required": ["action"], "additionalProperties": false})
+    .tap_ops(),
+    |ctx, input| { call(ctx, "session.doc", input).await }
+);
+
+/// The `doc` tool's schema, with what each of `ops` takes (too deep for
+/// one `json!`).
+trait TapOps {
+    fn tap_ops(self) -> Value;
+}
+
+impl TapOps for Value {
+    fn tap_ops(mut self) -> Value {
+        self["properties"]["ops"]["items"] = json!({"type": "object", "properties": {
+            "op": {"type": "string", "enum": ["insert", "replace", "delete", "move", "table", "set", "add_tab", "delete_tab"]},
+            "id": {"type": "string", "description": "The block or slide it acts on (not the document's id)"},
+            "markdown": {"type": "string"},
+            "blocks": {"type": "object"},
+            "ifRev": {"type": "integer", "description": "The document version you read (whole-block replace and delete)"},
+            "ifHash": {"type": "string", "description": "The block's hash when you read it"},
+            "find": {"type": "string"}, "with": {"type": "string"}, "nth": {"type": "integer"},
+            "after": {"type": "string"}, "before": {"type": "string"}, "section": {"type": "string"},
+            "slide": {"type": "string"}, "region": {"type": "string"}, "tab": {"type": "string"},
+            "cell": {"type": "array", "items": {"type": "integer"}}, "text": {"type": "string"},
+            "layout": {"type": "string"}, "notes": {"type": "string"}, "hidden": {"type": "boolean"},
+            "action": {"type": "string"}, "at": {"type": "integer"}, "cells": {"type": "array", "items": {"type": "string"}},
+            "title": {"type": "string"}, "theme": {"type": "string"}, "tab_title": {"type": "string"}
+        }, "required": ["op"]});
+        self
+    }
+}

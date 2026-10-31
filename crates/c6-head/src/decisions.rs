@@ -325,6 +325,7 @@ async fn act(
                 )));
             }
         }
+        (Some("docwrite"), Some(_), Some(_)) => crate::docs::session::decided(st, reference, option).await?,
         (Some("workflow"), Some(run), Some(step)) => {
             if !crate::workflows::decide(st, run, step, option == Some("Go ahead")).await? {
                 return Err(bad_request("that step is not waiting any more"));

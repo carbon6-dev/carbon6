@@ -201,6 +201,8 @@ pub enum DocOp {
     /// they repeat, 1-based), a table cell, or a slide's layout, notes or
     /// hidden flag.
     Replace {
+        /// The block (or slide); `block` is the same.
+        #[serde(alias = "block")]
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         markdown: Option<String>,
@@ -230,6 +232,8 @@ pub enum DocOp {
     },
     /// A block or slide (guarded).
     Delete {
+        /// The block (or slide); `block` is the same.
+        #[serde(alias = "block")]
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none", rename = "ifRev", alias = "if_rev")]
         if_rev: Option<i64>,
@@ -238,6 +242,8 @@ pub enum DocOp {
     },
     /// A block or slide, before or after another, or to the end of a tab.
     Move {
+        /// The block (or slide); `block` is the same.
+        #[serde(alias = "block")]
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<String>,
@@ -250,6 +256,8 @@ pub enum DocOp {
     /// delete_column at a 0-based index (adding: before it; past the end:
     /// at the end).
     Table {
+        /// The block (or slide); `block` is the same.
+        #[serde(alias = "block")]
         id: String,
         action: String,
         at: usize,
@@ -401,4 +409,25 @@ pub struct DocChange {
     pub by: String,
     /// created, changed or deleted.
     pub what: String,
+}
+
+/// How documents behave in a realm (`/api/v1/settings/docs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocsSettings {
+    /// Which documents a session may write without asking: `work` (those
+    /// it made and its work's; others once you allow each), `realm` (any in
+    /// the realm) or `own` (only those it made; never others).
+    #[serde(default = "work")]
+    pub write: String,
+}
+
+fn work() -> String {
+    "work".into()
+}
+
+impl Default for DocsSettings {
+    fn default() -> Self {
+        Self { write: work() }
+    }
 }

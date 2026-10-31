@@ -12,6 +12,7 @@
 pub mod http;
 pub mod markdown;
 pub mod model;
+pub mod session;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;

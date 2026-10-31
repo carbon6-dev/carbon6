@@ -104,6 +104,23 @@ async fn rows(st: &HeadState, realm: Option<&str>, closed: bool) -> anyhow::Resu
     Ok(rows.iter().map(stored).collect())
 }
 
+/// Whether a work item holds a ref.
+pub async fn holds(st: &HeadState, id: &str, reference: &str) -> bool {
+    load(st, id).await.ok().flatten().is_some_and(|r| r.fields.attached.iter().any(|a| a.reference == reference))
+}
+
+/// The refs a work item holds.
+pub async fn refs(st: &HeadState, id: &str) -> Vec<String> {
+    load(st, id).await.ok().flatten().map(|r| r.fields.attached.into_iter().map(|a| a.reference).collect()).unwrap_or_default()
+}
+
+/// Attaches a ref to a work item as `by` (a session: what it made).
+pub async fn attach_by(st: &HeadState, id: &str, r: &WorkRef, by: &str) -> anyhow::Result<()> {
+    modify(st, id, by, None, |f| attach_to(f, r, by)).await?;
+    refresh(st, id);
+    Ok(())
+}
+
 /// The open items something is attached to.
 pub async fn holding(st: &HeadState, reference: &str) -> anyhow::Result<Vec<String>> {
     holding_in(st, reference, None).await

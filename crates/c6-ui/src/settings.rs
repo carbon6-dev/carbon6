@@ -56,6 +56,7 @@ const GROUPS: &[(&str, &[Page])] = &[
             ("triggers", "Triggers", "Schedules, webhooks and events that start work"),
             ("views", "Views", "Tables, boards, charts, feeds and pages of each realm"),
             ("work", "Work", "What you've left open: guesses, notes, nudges"),
+            ("docs", "Docs", "Which documents sessions write without asking"),
         ],
     ),
     (
@@ -290,6 +291,10 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     "work" => view! {
                         <OwnOrRoot name="work" />
                         <WorkSetting />
+                    }.into_any(),
+                    "docs" => view! {
+                        <OwnOrRoot name="docs" />
+                        <DocsSetting />
                     }.into_any(),
                     "suggestions" => view! {
                         <OwnOrRoot name="suggestions" />
@@ -1224,6 +1229,50 @@ fn SuggestionsSetting() -> impl IntoView {
                 <input type="checkbox" prop:checked=move || on.get() on:change=toggle />
                 "Suggest next messages"
             </label>
+            {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
+        </section>
+    }
+}
+
+/// How documents behave (docs/docs.md §9): which documents sessions may
+/// write without asking.
+#[component]
+fn DocsSetting() -> impl IntoView {
+    let shown = RwSignal::new(None::<c6_api::docs::DocsSettings>);
+    let loaded = LocalResource::new(move || {
+        api::realm().track();
+        api::get_setting("docs")
+    });
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            shown.set(serde_json::from_value(v).ok());
+        }
+    });
+    let error = RwSignal::new(None::<String>);
+    let set = move |write: &'static str| {
+        let s = c6_api::docs::DocsSettings { write: write.into() };
+        shown.set(Some(s.clone()));
+        spawn_local(async move {
+            error.set(api::put_setting("docs", serde_json::to_value(&s).unwrap_or_default()).await.err());
+        });
+    };
+    let choice = move |value: &'static str, text: &'static str| {
+        view! {
+            <label class="flex items-start gap-2 text-sm">
+                <input type="radio" name="docs-write" class="mt-1" prop:checked=move || shown.get().is_some_and(|s| s.write == value)
+                    on:change=move |_| set(value) />
+                <span>{text}</span>
+            </label>
+        }
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">"Docs"</h2>
+            <p class="text-sm text-zinc-500">"Docs and decks you and agents write together (the Docs page). Sessions have a doc tool; how they write is the prompt docs.style (Settings → Prompts). Every session reads any document of the realm."</p>
+            <p class="text-sm font-medium">"Which documents a session edits without asking"</p>
+            {choice("work", "The ones it made and its work's. Any other, once you allow it (a decision per document). The default.")}
+            {choice("realm", "Any document in this realm.")}
+            {choice("own", "Only the ones it made; never others.")}
             {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
         </section>
     }

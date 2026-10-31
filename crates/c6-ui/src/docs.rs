@@ -34,6 +34,7 @@ fn author_named(by: &str) -> String {
         let live = api::live();
         let title = live.sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.title.clone()));
         return match title.filter(|t| !t.trim().is_empty()) {
+            Some(t) if t.chars().count() > 32 => format!("session {}…", t.chars().take(30).collect::<String>().trim_end()),
             Some(t) => format!("session {t}"),
             None => "a session".into(),
         };
@@ -209,7 +210,7 @@ pub fn DocsPage() -> impl IntoView {
                                         </span>
                                     })}
                                     {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-zinc-500">{format!("#{l}")}</span> }).collect_view()}
-                                    <span class="shrink-0 text-xs text-zinc-400">{format!("{} · {}", author_named(&d.updated_by), since(d.updated_at))}</span>
+                                    <span class="max-w-[40%] shrink truncate text-xs text-zinc-400">{format!("{} · {}", author_named(&d.updated_by), since(d.updated_at))}</span>
                                 </a>
                             }
                         }).collect_view()}
