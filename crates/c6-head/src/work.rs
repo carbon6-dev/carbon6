@@ -157,6 +157,16 @@ pub async fn project_of(st: &HeadState, id: &str) -> Option<String> {
     load(st, id).await.ok().flatten().map(|r| r.fields.project).filter(|p| !p.is_empty())
 }
 
+/// The phase of its project a work item is in.
+pub async fn phase_of(st: &HeadState, id: &str) -> Option<String> {
+    load(st, id).await.ok().flatten().map(|r| r.fields.phase).filter(|p| !p.is_empty())
+}
+
+/// A work item's title.
+pub async fn title_of(st: &HeadState, id: &str) -> Option<String> {
+    load(st, id).await.ok().flatten().map(|r| r.fields.title)
+}
+
 /// The ids of the work items in a project (open and closed).
 pub async fn in_project(st: &HeadState, project: &str) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT id FROM records WHERE collection = ? AND json_extract(fields, '$.project') = ? ORDER BY updated_at DESC")
@@ -1613,6 +1623,22 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
                 refresh(st, id);
             }
         }
+        // A piece of work for its project, for you to accept (planning a phase).
+        "propose" => {
+            let title = p["title"].as_str().unwrap_or("").trim();
+            if title.is_empty() {
+                return Err(bad_request("propose takes the work's title, and done_when"));
+            }
+            let mut made = None;
+            for id in &ids {
+                if project_of(st, id).await.is_some() {
+                    made = Some(crate::projects::propose(st, id, title, p["done_when"].as_str().unwrap_or(""), &by).await?);
+                    break;
+                }
+            }
+            let made = made.ok_or_else(|| bad_request("propose is for work that is in a project; this session's isn't"))?;
+            return Ok(json!({"did": "proposed", "proposal": made, "note": "The user accepts or dismisses it on the project's page."}));
+        }
         "todo" => {
             let mut t = new_todo(p["text"].as_str().unwrap_or(""), p["prompt"].as_str().unwrap_or(""), &by)?;
             t.origin = session_id.to_owned();
@@ -1643,7 +1669,7 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
             .await?;
             refresh(st, &id);
         }
-        other => return Err(bad_request(format!("work's actions are get, attach, todo and todo_done, not {other:?}"))),
+        other => return Err(bad_request(format!("work's actions are get, attach, todo, todo_done and propose, not {other:?}"))),
     }
     let mut out = Vec::new();
     for id in ids {

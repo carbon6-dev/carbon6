@@ -164,9 +164,10 @@ records_tool!(
      the work's project instead (a doc:<id> with a role: plan, spec, notes or review; or a link), so it outlives this work; get shows \
      the project, its purpose, where it stands and its documents. action todo adds a to-do the user can start as a session \
      later: text (one line) and prompt (what that session is told; make it stand alone). action todo_done ticks one off when it is \
-     done: id and evidence (one line).",
+     done: id and evidence (one line). action propose (work in a project only, when planning a phase): a piece of work for the \
+     project, for the user to accept: title and done_when.",
     json!({"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["get", "attach", "todo", "todo_done"]},
+        "action": {"type": "string", "enum": ["get", "attach", "todo", "todo_done", "propose"]},
         "ref": {"type": "string"},
         "title": {"type": "string"},
         "status": {"type": "string", "enum": ["running", "waiting", "done", "failed"]},
@@ -175,6 +176,7 @@ records_tool!(
         "prompt": {"type": "string"},
         "id": {"type": "string"},
         "evidence": {"type": "string"},
+        "done_when": {"type": "string"},
         "to": {"type": "string", "enum": ["work", "project"]},
         "role": {"type": "string", "enum": ["plan", "spec", "notes", "review"]}
     }, "additionalProperties": false}),

@@ -10,6 +10,12 @@ pub fn now_ms() -> i64 {
 /// How long ago (crate::when, where every page's dates come from).
 pub use crate::when::ago;
 
+/// Today in this browser's time zone, as YYYY-MM-DD.
+pub fn today() -> String {
+    let d = js_sys::Date::new_0();
+    format!("{:04}-{:02}-{:02}", d.get_full_year(), d.get_month() + 1, d.get_date())
+}
+
 /// A signal that ticks every few seconds, for relative times.
 pub fn clock() -> RwSignal<i64> {
     let now = RwSignal::new(now_ms());

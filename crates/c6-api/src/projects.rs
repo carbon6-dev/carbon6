@@ -45,6 +45,9 @@ pub struct ProjectFields {
     pub told: Option<Told>,
     #[serde(default)]
     pub closed_at: Option<UnixMs>,
+    /// Work sessions proposed, waiting for you.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed: Vec<ProposedWork>,
 }
 
 fn active() -> String {
@@ -68,6 +71,32 @@ pub struct Phase {
     /// An agent's "phase looks done".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offer: Option<WorkOffer>,
+    /// Why it's done: the evidence of the "looks done" you accepted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
+    /// The evidence of a "looks done" you dismissed (not offered again).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dismissed: String,
+}
+
+/// A piece of work a session proposed for the project (planning a phase),
+/// for you to accept or dismiss.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProposedWork {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub done_when: String,
+    /// The phase it is for (empty: none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
+    /// session:<id>.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub at: UnixMs,
 }
 
 /// A document of the project, with its role.
@@ -266,6 +295,64 @@ pub struct ProjectDetach {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectMerge {
     pub from: String,
+}
+
+/// `POST /api/v1/projects/{id}/phases`: one change to the phases.
+/// `action`: add (title, done_when, target; the first phase starts
+/// current), edit (phase, and what changes), remove (phase; its work stays
+/// in the project, in no phase), move (phase, to: its new place from 0),
+/// start (phase becomes current), advance (the current phase is done and
+/// the next one current: "phase looks done" accepted), dismiss (phase: not
+/// done after all).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PhaseIn {
+    pub action: String,
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub done_when: Option<String>,
+    /// YYYY-MM-DD, or empty for none.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub to: Option<usize>,
+}
+
+/// `POST /api/v1/projects/{id}/plan`: a work item for planning, and the
+/// first message of a session on it. `phase`: plan that phase ("Plan
+/// <phase>", by `project.plan_phase`); `update`: bring the plan doc up to
+/// date after a phase (by `project.plan_update`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectPlanIn {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub update: bool,
+}
+
+/// What `POST …/plan` made: the work item, the session's first message,
+/// and the session to start like (its worker, folder and model).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectStart {
+    pub work: String,
+    pub text: String,
+    #[serde(default)]
+    pub seed: Option<String>,
+}
+
+/// `POST /api/v1/projects/{id}/proposed`: accept a proposed piece of work
+/// (it becomes a work item in the project, in its phase) or dismiss it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProposedIn {
+    pub proposal: String,
+    #[serde(default)]
+    pub accept: bool,
 }
 
 /// The order projects are listed in, by state: what needs you first.

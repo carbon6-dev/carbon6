@@ -222,3 +222,198 @@ async fn projects_keep_their_plan_documents_and_where_they_are() {
     assert_eq!(get(format!("projects/{pid}")).await["told"]["state"], "stalled");
     stop.cancel();
 }
+
+/// Phases (docs/projects.md §7, §8): they change only when you say so; an
+/// agent offers "phase looks done" once the phase's work is closed; Plan
+/// the next phase makes planning work whose session proposes the phase's
+/// work for you to accept; and sessions in project work are told the
+/// project's context.
+#[tokio::test]
+async fn phases_move_on_when_you_say_and_sessions_know_their_project() {
+    use c6_testkit::{MockLlm, Reply, eventually};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    const WHERE: &str = "where we are\\\" note on a long-running project";
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            (s, r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let ok = |(s, v): (StatusCode, Value)| {
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let get = |path: String| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.get(&url).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let conn = ok(send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await);
+    let settings = |context: bool| json!({"guess": false, "notes": true, "quiet_days": 3, "nudge": true, "needs_hours": 4, "project_context": context});
+    ok(send(M::PUT, "settings/work".into(), settings(true)).await);
+    ok(send(
+        M::PUT,
+        "settings/routes".into(),
+        json!([{"name": "projects", "applies_to": ["task:projects", "task:work"], "connection": conn["id"], "model": "small", "enabled": true}]),
+    )
+    .await);
+    for _ in 0..30 {
+        mock.push_about(
+            WHERE,
+            Reply::Text(
+                json!({"note": ["The guide is out.", "Next: the pilot"], "finished": false, "phase_done": true, "phase_evidence": "The guide was published"})
+                    .to_string(),
+            ),
+        );
+        mock.push_about(
+            "Keep the user's note on a piece of work",
+            Reply::Text(json!({"done": "", "left": "", "next": "", "finished": false}).to_string()),
+        );
+    }
+    let start = |prompt: &str, work: &str| {
+        mock.push_about_all(&["You are carbon6", prompt], Reply::Text("ok".into()));
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m", "prompt": prompt, "work": work})
+    };
+
+    // 1. Phases: the first added is current; you order and date them.
+    let p = ok(send(M::POST, "projects".into(), json!({"title": "Realms for the team", "purpose": "The team uses realms daily"})).await);
+    let pid = p["id"].as_str().unwrap().to_owned();
+    let plan_doc = p["docs"][0]["doc"].as_str().unwrap().to_owned();
+    let phase = |p: &Value, i: usize| p["phases"][i].clone();
+    let p = ok(send(
+        M::POST,
+        format!("projects/{pid}/phases"),
+        json!({"action": "add", "title": "Write the guide", "done_when": "The guide is published"}),
+    )
+    .await);
+    let p1 = phase(&p, 0)["id"].as_str().unwrap().to_owned();
+    assert_eq!(phase(&p, 0)["state"], "current");
+    let r = send(M::POST, format!("projects/{pid}/phases"), json!({"action": "add", "title": "Pilot", "target": "Dec 1"})).await;
+    assert_eq!(r.0, StatusCode::BAD_REQUEST, "a target is a date");
+    let p = ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "add", "title": "Pilot", "target": "2026-12-01"})).await);
+    let p2 = phase(&p, 1)["id"].as_str().unwrap().to_owned();
+    assert_eq!(phase(&p, 1)["state"], "upcoming");
+    let p = ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "move", "phase": p2, "to": 0})).await);
+    assert_eq!(phase(&p, 0)["id"], p2.as_str());
+    ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "move", "phase": p2, "to": 1})).await);
+
+    // 2. Work in the first phase; a session on it is told the project's context.
+    let a = ok(send(M::POST, "work".into(), json!({"title": "Draft the guide"})).await)["id"].as_str().unwrap().to_owned();
+    assert_eq!(send(M::POST, format!("projects/{pid}/work"), json!({"work": a, "phase": "nope"})).await.0, StatusCode::BAD_REQUEST);
+    ok(send(M::POST, format!("projects/{pid}/work"), json!({"work": a, "phase": p1})).await);
+    let s1 = ok(send(M::POST, "sessions".into(), start("Write the first draft", &a)).await)["id"].as_str().unwrap().to_owned();
+    let first = eventually("the session's first turn", async || {
+        mock.requests()
+            .into_iter()
+            .map(|r| r["messages"].to_string())
+            .find(|m| m.contains("Write the first draft") && m.contains("You are carbon6"))
+    })
+    .await;
+    assert!(first.contains("is part of the project Realms for the team"), "{first}");
+    assert!(
+        first.contains("Current phase: Write the guide (done when: The guide is published)") && first.contains(&format!("doc:{plan_doc}")),
+        "{first}"
+    );
+
+    // 3. Its work closes: the phase looks done. You say not yet, and it isn't offered again for the same evidence.
+    ok(send(M::PATCH, format!("work/{a}"), json!({"status": "done"})).await);
+    let p = eventually("phase looks done", async || {
+        let p = get(format!("projects/{pid}")).await;
+        (p["phases"][0]["offer"]["evidence"] == "The guide was published").then_some(p)
+    })
+    .await;
+    assert_eq!((p["state"].as_str(), p["why"].as_str()), (Some("needs_you"), Some("Write the guide looks done: The guide was published")));
+    assert_eq!(p["note"]["text"], "The guide is out.\nNext: the pilot", "a note given as lines");
+    let p = ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "dismiss", "phase": p1})).await);
+    assert!(p["phases"][0]["offer"].is_null() && p["phases"][0]["dismissed"] == "The guide was published", "{p}");
+    eventually("no note being written", async || (!c6_head::projects::writing()).then_some(())).await;
+    let asked = |m: &MockLlm| m.requests().iter().filter(|r| r["messages"].to_string().contains(WHERE)).count();
+    let before = asked(&mock);
+    ok(send(M::POST, format!("projects/{pid}/refresh"), json!({})).await);
+    eventually("the note written again", async || (asked(&mock) > before && !c6_head::projects::writing()).then_some(())).await;
+    assert!(get(format!("projects/{pid}")).await["phases"][0]["offer"].is_null(), "not offered again");
+
+    // 4. You move on: the phase is done, the next current.
+    let p = ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "advance"})).await);
+    assert_eq!((phase(&p, 0)["state"].as_str(), phase(&p, 1)["state"].as_str()), (Some("done"), Some("current")));
+
+    // 5. Plan the next phase: planning work in it, and a session's first message.
+    let plan = ok(send(M::POST, format!("projects/{pid}/plan"), json!({})).await);
+    let pw = plan["work"].as_str().unwrap().to_owned();
+    let text = plan["text"].as_str().unwrap().to_owned();
+    assert!(
+        text.contains("Plan the phase \"Pilot\"") && text.contains(&format!("doc:{plan_doc}")) && text.contains("Draft the guide"),
+        "{text}"
+    );
+    assert_eq!(plan["seed"], s1.as_str(), "starts like the project's latest session");
+    let w = get(format!("work/{pw}")).await;
+    assert_eq!(
+        (w["title"].as_str(), w["project"].as_str(), w["phase"].as_str()),
+        (Some("Plan Pilot"), Some(pid.as_str()), Some(p2.as_str()))
+    );
+    // Its session proposes the phase's work; you accept one and dismiss one.
+    let s2 = ok(send(M::POST, "sessions".into(), start("Plan the pilot", &pw)).await)["id"].as_str().unwrap().to_owned();
+    let propose = |t: &str| json!({"action": "propose", "title": t, "done_when": "the team says so"});
+    let got = c6_head::work::for_session(&head.state, &s2, &propose("Invite the pilot team")).await.unwrap();
+    assert_eq!(got["did"], "proposed");
+    c6_head::work::for_session(&head.state, &s2, &propose("Write the FAQ")).await.unwrap();
+    assert!(c6_head::work::for_session(&head.state, &s2, &propose("Write the FAQ")).await.is_err(), "once");
+    let p = get(format!("projects/{pid}")).await;
+    let proposed = p["proposed"].as_array().unwrap().clone();
+    assert_eq!(
+        (proposed.len(), proposed[0]["phase"].as_str(), proposed[0]["by"].as_str()),
+        (2, Some(p2.as_str()), Some(format!("session:{s2}").as_str()))
+    );
+    ok(send(M::POST, format!("projects/{pid}/proposed"), json!({"proposal": proposed[0]["id"], "accept": true})).await);
+    let p = ok(send(M::POST, format!("projects/{pid}/proposed"), json!({"proposal": proposed[1]["id"]})).await);
+    assert!(p["proposed"].is_null(), "{p}");
+    let invited = p["work"].as_array().unwrap().iter().find(|w| w["title"] == "Invite the pilot team").cloned().unwrap();
+    assert_eq!(invited["phase"], p2.as_str());
+    assert!(!p["work"].to_string().contains("Write the FAQ"));
+
+    // 6. Bring the plan up to date after the phase that's done.
+    let up = ok(send(M::POST, format!("projects/{pid}/plan"), json!({"update": true})).await);
+    let t = up["text"].as_str().unwrap();
+    assert!(t.contains("The phase \"Write the guide\"") && t.contains("the next is Pilot") && t.contains("Draft the guide"), "{t}");
+    assert_eq!(get(format!("work/{}", up["work"].as_str().unwrap())).await["title"], "Update the plan after Write the guide");
+
+    // 7. A phase removed: its work stays in the project, in none.
+    ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "remove", "phase": p2})).await);
+    let w = get(format!("work/{}", invited["id"].as_str().unwrap())).await;
+    assert_eq!((w["project"].as_str(), w["phase"].as_str()), (Some(pid.as_str()), None));
+
+    // 8. A realm that turns the context off: sessions get only what they're given.
+    ok(send(M::PUT, "settings/work".into(), settings(false)).await);
+    ok(send(M::POST, "sessions".into(), start("Send the invites", invited["id"].as_str().unwrap())).await);
+    let first = eventually("the third session's first turn", async || {
+        mock.requests()
+            .into_iter()
+            .filter_map(|r| r["messages"].as_array()?.last()?["content"].as_str().map(str::to_owned))
+            .find(|m| m.starts_with("Send the invites"))
+    })
+    .await;
+    assert_eq!(first, "Send the invites", "only what it was given");
+    stop.cancel();
+}

@@ -318,9 +318,10 @@ async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str, _by: &str) -
     let sent_to = if start {
         let seed = st.store.session(&session).await?.ok_or_else(|| not_found("its session is gone"))?;
         let labels: Vec<String> = serde_json::from_str(&seed.labels).unwrap_or_default();
+        let first = crate::projects::with_context(st, work.as_deref(), &text).await.unwrap_or_else(|| text.clone());
         let req: c6_api::CreateSession = serde_json::from_value(json!({
             "worker_id": seed.worker_id, "cwd": seed.cwd, "connection_id": seed.connection_id, "model": seed.model,
-            "title": format!("Comment on {title}"), "prompt": text, "labels": labels, "realm": realm,
+            "title": format!("Comment on {title}"), "prompt": first, "labels": labels, "realm": realm,
         }))?;
         let s = crate::sessions::create(st, req).await?;
         crate::work::on_new_session(st, &s, work.as_deref(), &[], &text, None).await;

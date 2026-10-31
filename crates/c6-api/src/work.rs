@@ -320,6 +320,10 @@ pub struct WorkSettings {
     pub nudge: bool,
     #[serde(default = "needs_hours")]
     pub needs_hours: u32,
+    /// A session started in work that is in a project is told the
+    /// project's purpose, phase, note and documents (`project.context`).
+    #[serde(default = "yes")]
+    pub project_context: bool,
 }
 
 fn yes() -> bool {
@@ -336,7 +340,7 @@ fn needs_hours() -> u32 {
 
 impl Default for WorkSettings {
     fn default() -> Self {
-        Self { guess: true, notes: true, quiet_days: quiet_days(), nudge: true, needs_hours: needs_hours() }
+        Self { guess: true, notes: true, quiet_days: quiet_days(), nudge: true, needs_hours: needs_hours(), project_context: true }
     }
 }
 

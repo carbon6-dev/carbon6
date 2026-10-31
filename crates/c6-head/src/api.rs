@@ -797,6 +797,10 @@ async fn create_session(
     {
         req.title = crate::work::todo_text(&st, w, t).await;
     }
+    // In a project: the project's context follows the first message.
+    if let Some(p) = crate::projects::with_context(&st, work.as_deref(), &prompt).await {
+        req.prompt = Some(p);
+    }
     let s = crate::sessions::create(&st, req).await?;
     // The work it belongs to (docs/work.md §4), and the to-do it's on.
     crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, todo.as_deref()).await;

@@ -457,6 +457,382 @@ pub(crate) fn late(f: &ProjectFields, today: &str) -> bool {
     f.status == "active" && f.phases.iter().any(|p| p.state == "current" && !p.target.is_empty() && p.target.as_str() < today)
 }
 
+// --- Phases (docs/projects.md §7) --------------------------------------------
+
+fn check_target(t: &str) -> anyhow::Result<String> {
+    let t = t.trim();
+    if !t.is_empty() && chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d").is_err() {
+        return Err(bad_request("a target date is YYYY-MM-DD"));
+    }
+    Ok(t.to_owned())
+}
+
+/// One change to a project's phases. A phase's state changes only here,
+/// when you say so.
+pub async fn phases(st: &HeadState, id: &str, c: &api::projects::PhaseIn, caller: &Caller, by: &str) -> anyhow::Result<ProjectItem> {
+    let p = visible(st, id, caller).await?;
+    let title = c.title.as_deref().map(str::trim).map(|t| {
+        if t.is_empty() || t.chars().count() > MAX_TITLE {
+            Err(bad_request(format!("a phase needs a title (up to {MAX_TITLE} characters)")))
+        } else {
+            Ok(t.to_owned())
+        }
+    });
+    let title = title.transpose()?;
+    let target = c.target.as_deref().map(check_target).transpose()?;
+    let done_when = c.done_when.as_deref().map(|d| d.trim().chars().take(MAX_PURPOSE).collect::<String>());
+    let which = c.phase.trim().to_owned();
+    let find = |f: &ProjectFields| -> anyhow::Result<usize> {
+        f.phases.iter().position(|x| x.id == which).ok_or_else(|| not_found(format!("the project has no phase {which:?}")))
+    };
+    let mut emptied = false;
+    match c.action.as_str() {
+        "add" => {
+            let title = title.ok_or_else(|| bad_request("add takes the phase's title"))?;
+            modify(st, id, by, None, |f| {
+                let first = !f.phases.iter().any(|x| x.state == "current");
+                f.phases.push(api::projects::Phase {
+                    id: format!("ph{}", &uuid::Uuid::now_v7().simple().to_string()[24..]),
+                    title,
+                    done_when: done_when.unwrap_or_default(),
+                    target: target.unwrap_or_default(),
+                    state: if first && f.phases.is_empty() { "current" } else { "upcoming" }.into(),
+                    ..Default::default()
+                });
+                Ok(true)
+            })
+            .await?;
+        }
+        "edit" => {
+            modify(st, id, by, None, |f| {
+                let i = find(f)?;
+                let ph = &mut f.phases[i];
+                if let Some(t) = title {
+                    ph.title = t;
+                }
+                if let Some(d) = done_when {
+                    ph.done_when = d;
+                }
+                if let Some(t) = target {
+                    ph.target = t;
+                }
+                Ok(true)
+            })
+            .await?;
+        }
+        "remove" => {
+            modify(st, id, by, None, |f| {
+                let i = find(f)?;
+                f.phases.remove(i);
+                Ok(true)
+            })
+            .await?;
+            emptied = true;
+        }
+        "move" => {
+            let to = c.to.ok_or_else(|| bad_request("move takes to: the phase's new place, from 0"))?;
+            modify(st, id, by, None, |f| {
+                let i = find(f)?;
+                let ph = f.phases.remove(i);
+                f.phases.insert(to.min(f.phases.len()), ph);
+                Ok(true)
+            })
+            .await?;
+        }
+        "start" => {
+            modify(st, id, by, None, |f| {
+                let i = find(f)?;
+                for (k, ph) in f.phases.iter_mut().enumerate() {
+                    if k == i {
+                        ph.state = "current".into();
+                    } else if ph.state == "current" {
+                        ph.state = "upcoming".into();
+                    }
+                    ph.offer = None;
+                }
+                f.moved_at = now_ms();
+                Ok(true)
+            })
+            .await?;
+        }
+        "advance" => {
+            modify(st, id, by, None, |f| {
+                let i = f.phases.iter().position(|x| x.state == "current").ok_or_else(|| bad_request("no phase is current"))?;
+                f.phases[i].state = "done".into();
+                if let Some(o) = f.phases[i].offer.take() {
+                    f.phases[i].evidence = o.evidence;
+                }
+                if let Some(next) = f.phases.iter_mut().skip(i + 1).find(|x| x.state != "done") {
+                    next.state = "current".into();
+                }
+                f.moved_at = now_ms();
+                Ok(true)
+            })
+            .await?;
+        }
+        "dismiss" => {
+            modify(st, id, by, None, |f| {
+                let i = find(f)?;
+                let ph = &mut f.phases[i];
+                let Some(o) = ph.offer.take() else { return Ok(false) };
+                ph.dismissed = o.evidence;
+                Ok(true)
+            })
+            .await?;
+        }
+        other => {
+            return Err(bad_request(format!("a phase's actions are add, edit, remove, move, start, advance and dismiss, not {other:?}")));
+        }
+    }
+    // Work in a phase that's gone stays in the project, in none.
+    if emptied {
+        for w in crate::work::items_in_project(st, id).await? {
+            if w.fields.phase == which {
+                crate::work::set_project(st, &w.id, &p.realm, id, "", by).await?;
+            }
+        }
+    }
+    refresh(st, id);
+    get(st, id, caller).await
+}
+
+/// The latest session of a project's work (to start the next one like it).
+async fn latest_session(st: &HeadState, id: &str) -> anyhow::Result<Option<String>> {
+    let mut best: Option<crate::store::SessionRow> = None;
+    for w in crate::work::in_project(st, id).await? {
+        for r in crate::work::refs(st, &w).await {
+            if let Some(sid) = r.strip_prefix("session:")
+                && let Some(s) = st.store.session(sid).await?
+                && best.as_ref().is_none_or(|b| b.updated_at < s.updated_at)
+            {
+                best = Some(s);
+            }
+        }
+    }
+    Ok(best.map(|s| s.id))
+}
+
+fn phase_list(f: &ProjectFields) -> String {
+    if f.phases.is_empty() {
+        return "(none)".into();
+    }
+    f.phases
+        .iter()
+        .map(|p| {
+            format!(
+                "- {} ({}{}): {}",
+                p.title,
+                if p.state.is_empty() { "upcoming" } else { &p.state },
+                if p.target.is_empty() { String::new() } else { format!(", target {}", p.target) },
+                if p.done_when.is_empty() { "(done when not said)" } else { &p.done_when }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn doc_list(docs: &[LiveDoc]) -> String {
+    if docs.is_empty() {
+        return "(none)".into();
+    }
+    docs.iter()
+        .map(|d| {
+            format!(
+                "- {} (doc:{}, {}{})",
+                d.title,
+                d.doc,
+                if d.kind.is_empty() { "gone" } else { &d.kind },
+                if d.role.is_empty() { String::new() } else { format!(", {}", d.role) }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A work item for planning (a phase, or the plan after a phase), and the
+/// first message of a session on it, which you start (and may change).
+pub async fn plan(
+    st: &HeadState,
+    id: &str,
+    q: &api::projects::ProjectPlanIn,
+    caller: &Caller,
+    by: &str,
+) -> anyhow::Result<api::projects::ProjectStart> {
+    let item = get(st, id, caller).await?;
+    let f = &item.fields;
+    let plan_doc =
+        item.docs.iter().find(|d| d.role == "plan").map(|d| format!("{} (doc:{})", d.title, d.doc)).unwrap_or_else(|| "(none)".into());
+    let work_lines = |phase: Option<&str>| -> String {
+        let lines: Vec<String> = item
+            .work
+            .iter()
+            .filter(|w| phase.is_none_or(|p| w.phase == p))
+            .map(|w| {
+                format!(
+                    "- {} ({}){}",
+                    w.title,
+                    api::work::state_label(&w.state),
+                    if w.why.is_empty() { String::new() } else { format!(": {}", w.why) }
+                )
+            })
+            .collect();
+        if lines.is_empty() { "(none yet)".into() } else { lines.join("\n") }
+    };
+    let (title, phase, text) = if q.update {
+        // The phase just done: the last done before the current one.
+        let current = f.phases.iter().position(|x| x.state == "current");
+        let done = f.phases.iter().enumerate().rev().find(|(i, x)| x.state == "done" && current.is_none_or(|c| *i < c)).map(|(_, x)| x);
+        let done = done.ok_or_else(|| bad_request("no phase is done yet"))?;
+        let next = current.map(|c| f.phases[c].title.clone()).unwrap_or_else(|| "(none: it was the last)".into());
+        let template = crate::prompts::get(st, "project.plan_update", &item.realm).await;
+        let evidence = if done.evidence.is_empty() { "(you marked it done)".to_owned() } else { done.evidence.clone() };
+        let text = api::prompts::fill(
+            &template,
+            &[
+                ("title", &f.title),
+                ("phase", &done.title),
+                ("next", &next),
+                ("plan", &plan_doc),
+                ("evidence", &evidence),
+                ("work", &work_lines(Some(&done.id))),
+            ],
+        );
+        (format!("Update the plan after {}", done.title), String::new(), text)
+    } else {
+        let which = q.phase.trim();
+        let ph = if which.is_empty() {
+            f.phases.iter().find(|x| x.state == "upcoming").or_else(|| f.phases.iter().find(|x| x.state == "current"))
+        } else {
+            f.phases.iter().find(|x| x.id == which)
+        };
+        let ph = ph.ok_or_else(|| bad_request("which phase? the project has none to plan"))?;
+        let template = crate::prompts::get(st, "project.plan_phase", &item.realm).await;
+        let text = api::prompts::fill(
+            &template,
+            &[
+                ("title", &f.title),
+                ("purpose", if f.purpose.is_empty() { "(not said)" } else { &f.purpose }),
+                ("phase", &ph.title),
+                ("done_when", if ph.done_when.is_empty() { "(not said)" } else { &ph.done_when }),
+                ("target", if ph.target.is_empty() { "(none)" } else { &ph.target }),
+                ("phases", &phase_list(f)),
+                ("plan", &plan_doc),
+                ("docs", &doc_list(&item.docs)),
+                ("work", &work_lines(None)),
+            ],
+        );
+        (format!("Plan {}", ph.title), ph.id.clone(), text)
+    };
+    let w = crate::work::create(st, caller, &api::work::WorkNew { title, ..Default::default() }, by).await?;
+    crate::work::set_project(st, &w.id, &item.realm, id, &phase, by).await?;
+    let seed = latest_session(st, id).await?;
+    Ok(api::projects::ProjectStart { work: w.id, text, seed })
+}
+
+/// A session proposes a piece of work for its work's project (planning a
+/// phase): yours to accept or dismiss. In the phase of the session's work,
+/// else the current one.
+pub async fn propose(st: &HeadState, work: &str, title: &str, done_when: &str, by: &str) -> anyhow::Result<String> {
+    let title = check_title(title)?;
+    let pid = crate::work::project_of(st, work)
+        .await
+        .ok_or_else(|| bad_request("propose is for work that is in a project; this session's isn't"))?;
+    let phase = crate::work::phase_of(st, work).await.unwrap_or_default();
+    let mut made = String::new();
+    modify(st, &pid, by, None, |f| {
+        if f.proposed.len() >= 50 {
+            return Err(bad_request("the project has 50 proposals waiting: ask the user to go through them first"));
+        }
+        if f.proposed.iter().any(|x| x.title.eq_ignore_ascii_case(&title)) {
+            return Err(bad_request(format!("{title:?} is already proposed")));
+        }
+        let phase = if phase.is_empty() || !f.phases.iter().any(|x| x.id == phase) {
+            f.phases.iter().find(|x| x.state == "current").map(|x| x.id.clone()).unwrap_or_default()
+        } else {
+            phase
+        };
+        made = format!("pw{}", &uuid::Uuid::now_v7().simple().to_string()[24..]);
+        f.proposed.push(api::projects::ProposedWork {
+            id: made.clone(),
+            title,
+            done_when: done_when.trim().chars().take(MAX_PURPOSE).collect(),
+            phase,
+            by: by.to_owned(),
+            at: now_ms(),
+        });
+        Ok(true)
+    })
+    .await?;
+    Ok(made)
+}
+
+/// You accept a proposed piece of work (a work item in the project, in its
+/// phase) or dismiss it.
+pub async fn proposed(st: &HeadState, id: &str, q: &api::projects::ProposedIn, caller: &Caller, by: &str) -> anyhow::Result<ProjectItem> {
+    let p = visible(st, id, caller).await?;
+    let one =
+        p.fields.proposed.iter().find(|x| x.id == q.proposal).cloned().ok_or_else(|| not_found(format!("no proposal {}", q.proposal)))?;
+    if q.accept {
+        let w = crate::work::create(
+            st,
+            caller,
+            &api::work::WorkNew { title: one.title.clone(), done_when: one.done_when.clone(), ..Default::default() },
+            by,
+        )
+        .await?;
+        let phase = if p.fields.phases.iter().any(|x| x.id == one.phase) { one.phase.as_str() } else { "" };
+        crate::work::set_project(st, &w.id, &p.realm, id, phase, by).await?;
+    }
+    modify(st, id, by, None, |f| {
+        f.proposed.retain(|x| x.id != one.id);
+        Ok(true)
+    })
+    .await?;
+    get(st, id, caller).await
+}
+
+/// What a session started in a work item in a project is told after its
+/// first message (`project.context`), unless the realm turned it off.
+pub async fn context_for(st: &HeadState, work: &str) -> Option<String> {
+    let pid = crate::work::project_of(st, work).await?;
+    let r = load(st, &pid).await.ok()??;
+    if r.fields.status != "active" || !crate::work::settings(st, &r.realm).await.project_context {
+        return None;
+    }
+    let work_title = crate::work::title_of(st, work).await.unwrap_or_default();
+    let item = view(st, vec![r]).await.ok()?.remove(0);
+    let f = &item.fields;
+    let phase = f
+        .phases
+        .iter()
+        .find(|x| x.state == "current")
+        .map(|x| format!("{}{}", x.title, if x.done_when.is_empty() { String::new() } else { format!(" (done when: {})", x.done_when) }))
+        .unwrap_or_else(|| "(no phases)".into());
+    let template = crate::prompts::get(st, "project.context", &item.realm).await;
+    Some(api::prompts::fill(
+        &template,
+        &[
+            ("title", &f.title),
+            ("purpose", if f.purpose.is_empty() { "(not said)" } else { &f.purpose }),
+            ("phase", &phase),
+            ("note", f.note.as_ref().map(|n| n.text.as_str()).unwrap_or("(no note yet)")),
+            ("docs", &doc_list(&item.docs)),
+            ("work", &work_title),
+        ],
+    ))
+}
+
+/// A first message with its project's context after it (a session started
+/// without one gets none: it would start a turn).
+pub async fn with_context(st: &HeadState, work: Option<&str>, prompt: &str) -> Option<String> {
+    let w = work.map(str::trim).filter(|w| !w.is_empty() && !matches!(*w, "new" | "none" | "guess"))?;
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    let c = context_for(st, w).await?;
+    Some(format!("{prompt}\n\n---\n{c}"))
+}
+
 // --- Documents and links -----------------------------------------------------
 
 /// A document joins the project with a role, or changes role. One plan.
@@ -616,24 +992,7 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
             None => return Ok(()),
         },
     };
-    let phases = if item.fields.phases.is_empty() {
-        "(none)".to_owned()
-    } else {
-        item.fields
-            .phases
-            .iter()
-            .map(|p| {
-                format!(
-                    "- {} ({}{}): {}",
-                    p.title,
-                    if p.state.is_empty() { "upcoming" } else { &p.state },
-                    if p.target.is_empty() { String::new() } else { format!(", target {}", p.target) },
-                    p.done_when
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let phases = phase_list(&item.fields);
     let mut work = String::new();
     for w in &item.work {
         let next = crate::work::next_step(st, &w.id).await.map(|n| format!("; next: {n}")).unwrap_or_default();
@@ -663,15 +1022,36 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
         ],
     );
     let v = crate::work::ask_as(st, &item.realm, model, "projects", "where we are", &item.fields.title, prompt).await?;
-    let text: String = v["note"].as_str().unwrap_or("").trim().chars().take(2000).collect();
+    // Some models give the note's lines as a list.
+    let text = match &v["note"] {
+        Value::Array(lines) => lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
+        n => n.as_str().unwrap_or("").to_owned(),
+    };
+    let text: String = text.trim().chars().take(2000).collect();
     let evidence: String = v["evidence"].as_str().unwrap_or("").trim().chars().take(500).collect();
     let all_closed = item.work.iter().all(|w| matches!(w.state.as_str(), "done" | "dropped"));
     let offer = (v["finished"] == true && !evidence.is_empty() && all_closed).then(|| api::work::WorkOffer { evidence, at: now_ms() });
+    // The current phase looks done: only once it has work, all closed.
+    let current = item.fields.phases.iter().find(|p| p.state == "current").map(|p| p.id.clone());
+    let phase_work: Vec<&ProjectWork> = item.work.iter().filter(|w| current.as_deref() == Some(w.phase.as_str())).collect();
+    let phase_closed = !phase_work.is_empty() && phase_work.iter().all(|w| matches!(w.state.as_str(), "done" | "dropped"));
+    let phase_evidence: String = v["phase_evidence"].as_str().unwrap_or("").trim().chars().take(500).collect();
+    let phase_offer = (v["phase_done"] == true && !phase_evidence.is_empty() && phase_closed)
+        .then(|| api::work::WorkOffer { evidence: phase_evidence, at: now_ms() });
     modify(st, id, "agent:project.summary", None, |f| {
-        if f.status != "active" || text.is_empty() {
+        if f.status != "active" || (text.is_empty() && offer.is_none() && phase_offer.is_none()) {
             return Ok(false);
         }
-        f.note = Some(api::projects::ProjectNote { text, at: now_ms() });
+        if !text.is_empty() {
+            f.note = Some(api::projects::ProjectNote { text, at: now_ms() });
+        }
+        if let (Some(o), Some(c)) = (phase_offer, current.as_deref())
+            && let Some(ph) = f.phases.iter_mut().find(|p| p.id == c && p.state == "current")
+            && ph.offer.is_none()
+            && ph.dismissed != o.evidence
+        {
+            ph.offer = Some(o);
+        }
         // A "looks done" you dismissed isn't offered again for the same evidence.
         if let Some(o) = offer
             && f.offer.as_ref().is_none_or(|x| x.evidence != o.evidence)
@@ -746,6 +1126,36 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/projects/{id}/docs", post(doc_project))
         .route("/api/v1/projects/{id}/links", post(link_project))
         .route("/api/v1/projects/{id}/refresh", post(refresh_project))
+        .route("/api/v1/projects/{id}/phases", post(phases_project))
+        .route("/api/v1/projects/{id}/plan", post(plan_project))
+        .route("/api/v1/projects/{id}/proposed", post(proposed_project))
+}
+
+async fn phases_project(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(c): Json<api::projects::PhaseIn>,
+) -> ApiResult<Json<ProjectItem>> {
+    Ok(Json(phases(&st, &id, &c, &caller, &crate::docs::by_of(&caller)).await?))
+}
+
+async fn plan_project(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(q): Json<api::projects::ProjectPlanIn>,
+) -> ApiResult<Json<api::projects::ProjectStart>> {
+    Ok(Json(plan(&st, &id, &q, &caller, &crate::docs::by_of(&caller)).await?))
+}
+
+async fn proposed_project(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(q): Json<api::projects::ProposedIn>,
+) -> ApiResult<Json<ProjectItem>> {
+    Ok(Json(proposed(&st, &id, &q, &caller, &crate::docs::by_of(&caller)).await?))
 }
 
 async fn doc_project(

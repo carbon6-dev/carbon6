@@ -117,13 +117,28 @@ pub const DEFAULTS: &[Prompt] = &[
     },
     Prompt {
         name: "project.summary",
-        description: "A project's \"where we are\" note, and when the project looks done (docs/projects.md §6). Placeholders: {{title}}, {{purpose}}, {{phases}}, {{note}}, {{work}}, {{docs}}.",
+        description: "A project's \"where we are\" note, and when the project or its current phase looks done (docs/projects.md §6, §7). Placeholders: {{title}}, {{purpose}}, {{phases}}, {{note}}, {{work}}, {{docs}}.",
         default: text::PROJECT_SUMMARY,
     },
     Prompt {
         name: "project.plan",
         description: "The plan doc a new project starts with, in Markdown (docs/projects.md §3). Placeholders: {{title}}, {{purpose}}.",
         default: text::PROJECT_PLAN,
+    },
+    Prompt {
+        name: "project.plan_phase",
+        description: "The first message of a session planning a phase (Plan the next phase, docs/projects.md §7): it proposes the phase's work and brings the plan up to date. Placeholders: {{title}}, {{purpose}}, {{phase}}, {{done_when}}, {{target}}, {{phases}}, {{plan}}, {{docs}}, {{work}}.",
+        default: text::PROJECT_PLAN_PHASE,
+    },
+    Prompt {
+        name: "project.plan_update",
+        description: "The first message of a session bringing a project's plan up to date after a phase is done (docs/projects.md §7). Placeholders: {{title}}, {{phase}}, {{next}}, {{plan}}, {{evidence}}, {{work}}.",
+        default: text::PROJECT_PLAN_UPDATE,
+    },
+    Prompt {
+        name: "project.context",
+        description: "What a session started in work that is in a project is told after its first message: the project's purpose, phase, where we are and documents (docs/projects.md §8; Settings → Work turns it off). Placeholders: {{title}}, {{purpose}}, {{phase}}, {{note}}, {{docs}}, {{work}}.",
+        default: text::PROJECT_CONTEXT,
     },
     Prompt {
         name: "docs.style",

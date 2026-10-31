@@ -1368,6 +1368,10 @@ fn WorkSetting() -> impl IntoView {
                     "An agent keeps each piece of work's \"where was I\" note and says when it looks done"
                 </label>
                 <label class="flex items-center gap-2 text-sm">
+                    <input type="checkbox" prop:checked=s.project_context on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.project_context = on) } />
+                    "A session started in work that is in a project is told the project's purpose, phase, where it stands and its documents (the prompt project.context)"
+                </label>
+                <label class="flex items-center gap-2 text-sm">
                     "Gone quiet after"
                     <input type="number" min="1" max="90" class=format!("{INPUT} w-20!") prop:value=s.quiet_days.to_string()
                         on:change=move |ev| if let Some(n) = number(event_target_value(&ev)) { save(&|s| s.quiet_days = n) } />

@@ -1447,6 +1447,18 @@ pub async fn project_refresh(id: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/projects/{}/refresh", enc(&id))).send().await).await
 }
 
+pub async fn project_phases(id: String, c: &c6_api::projects::PhaseIn) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/phases", enc(&id))), c).await
+}
+
+pub async fn project_plan(id: String, q: &c6_api::projects::ProjectPlanIn) -> Result<c6_api::projects::ProjectStart, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/plan", enc(&id))), q).await
+}
+
+pub async fn project_proposed(id: String, proposal: String, accept: bool) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/proposed", enc(&id))), &c6_api::projects::ProposedIn { proposal, accept }).await
+}
+
 /// The realm's deck themes (docs/docs.md §5).
 pub async fn deck_themes() -> Result<Vec<c6_api::slides::DeckTheme>, String> {
     json(Request::get("/api/v1/decks/themes").send().await).await
