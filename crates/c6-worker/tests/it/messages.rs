@@ -151,6 +151,9 @@ async fn a_session_messages_another_on_another_worker() {
         !a_events.iter().any(|e| matches!(&e.kind, EventKind::User { command, .. } if command == "session-message")),
         "nothing reached A"
     );
+    // B's transcript attributes it to A, not to you.
+    let md = http.get(format!("{api}/sessions/{b}/export")).send().await.unwrap().text().await.unwrap();
+    assert!(md.contains(r#"## ✉ From "Alice""#) && !md.contains("## You\n\nWhat is your status?"), "{md}");
     stop_a.cancel();
     stop_b.cancel();
 }

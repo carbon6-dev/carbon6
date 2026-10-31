@@ -307,6 +307,10 @@ fn MissionCard(id: String) -> impl IntoView {
                         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.clone()),
                         _ => None,
                     }),
+                    // From another session's agent, not you.
+                    EventKind::User { text, from_title, from_session_id, .. } if !from_session_id.is_empty() => {
+                        Some(format!("✉ {from_title}: {text}"))
+                    }
                     EventKind::User { text, .. } => Some(format!("› {text}")),
                     EventKind::Error { message } => Some(format!("Error: {message}")),
                     _ => None,

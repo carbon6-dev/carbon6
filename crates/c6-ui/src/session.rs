@@ -2467,7 +2467,14 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
                 match &e.kind {
                     // From the agent that started it, or from you.
                     EventKind::User { text, delegated_by, command, .. } if command != "task-notification" && !text.is_empty() => {
-                        out.push((if delegated_by.is_empty() { "✎" } else { "↘" }, text.lines().next().unwrap_or_default().to_owned()));
+                        let mark = if command == "session-message" {
+                            "✉"
+                        } else if delegated_by.is_empty() {
+                            "✎"
+                        } else {
+                            "↘"
+                        };
+                        out.push((mark, text.lines().next().unwrap_or_default().to_owned()));
                     }
                     EventKind::Assistant { blocks, .. } => {
                         for b in blocks {
@@ -2515,9 +2522,11 @@ fn tool_kind(name: &str) -> &str {
         "TodoWrite" | "update_plan" => "plan",
         "Task" | "mcp__carbon6__Task" => "task",
         "SendMessage" | "mcp__carbon6__SendMessage" => "send_message",
+        "message_session" | "MessageSession" | "mcp__carbon6__MessageSession" => "message_session",
+        "list_sessions" | "ListSessions" | "mcp__carbon6__ListSessions" => "list_sessions",
         "WebFetch" => "web_fetch",
-        "BashOutput" => "bash_output",
-        "KillShell" => "kill_shell",
+        "BashOutput" | "mcp__carbon6__TaskOutput" => "bash_output",
+        "KillShell" | "mcp__carbon6__TaskStop" => "kill_shell",
         "Skill" => "load_skill",
         "doc" | "Doc" | "mcp__carbon6__doc" => "doc",
         other => other,
@@ -2549,12 +2558,14 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             s("input").lines().filter_map(|l| l.strip_prefix("*** ").filter(|r| r.contains("File:"))).collect::<Vec<_>>().join(", ")
         }
         "task" => s("description"),
-        "send_message" => s("message").lines().next().unwrap_or("").to_owned(),
+        "send_message" | "message_session" => s("message").lines().next().unwrap_or("").to_owned(),
+        "list_sessions" => s("query"),
         "web_fetch" => s("url"),
         "bash_output" | "kill_shell" => input
             .get("id")
             .or_else(|| input.get("bash_id"))
             .or_else(|| input.get("shell_id"))
+            .or_else(|| input.get("task_id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned(),
@@ -2613,8 +2624,8 @@ fn ToolCard(
         }
         "apply_patch" => input.get("input").and_then(|v| v.as_str()).map(str::to_owned),
         "task" => input.get("prompt").and_then(|v| v.as_str()).map(str::to_owned),
-        "send_message" => input.get("message").and_then(|v| v.as_str()).map(str::to_owned),
-        "read" | "glob" | "grep" | "plan" | "web_fetch" | "bash_output" | "kill_shell" | "load_skill" => None,
+        "send_message" | "message_session" => input.get("message").and_then(|v| v.as_str()).map(str::to_owned),
+        "read" | "glob" | "grep" | "plan" | "web_fetch" | "bash_output" | "kill_shell" | "load_skill" | "list_sessions" => None,
         _ => serde_json::to_string_pretty(&input).ok(),
     };
     let plan = (kind == "plan").then(|| plan_items(&input));
@@ -2652,6 +2663,13 @@ fn ToolCard(
             ))
         })
     });
+    // A message to another session: to whom (its title, from the result),
+    // and a way there (docs/background.md §6).
+    let sent_to = (kind == "message_session").then(|| {
+        let to = input.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+        let title = Memo::new(move |_| result.get().filter(|r| !r.is_error).and_then(|r| r.output.split('"').nth(1).map(str::to_owned)));
+        (to, title)
+    });
     // Where a search hit in this call's output scrolls to.
     let dom_id = format!("call-{call_id}");
     let started_open = plan.is_some();
@@ -2669,6 +2687,11 @@ fn ToolCard(
                 }}
                 <span class="font-mono text-xs font-semibold">{name.clone()}</span>
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
+                {sent_to.map(|(to, title)| view! {
+                    <Go to=View::session(to.clone()) class="shrink-0 text-[11px] text-sky-700 hover:underline dark:text-sky-400" stop=true>
+                        {move || format!("→ sent to {} ↗", title.get().unwrap_or_else(|| "a session".into()))}
+                    </Go>
+                })}
                 {move || continued.and_then(|c| c.get()).map(|cid| {
                     let target = format!("sub-{cid}");
                     view! {
@@ -3613,6 +3636,19 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message to another session reads as one, in every tool profile's
+    /// naming and over Claude Code's MCP bridge.
+    #[test]
+    fn session_message_calls_read_as_messages() {
+        let input = serde_json::json!({"to": "0199-b", "message": "What is your status?\nMore."});
+        for name in ["message_session", "MessageSession", "mcp__carbon6__MessageSession"] {
+            assert_eq!(tool_kind(name), "message_session");
+            assert_eq!(summarize(name, &input), "What is your status?");
+        }
+        assert_eq!(tool_kind("mcp__carbon6__ListSessions"), "list_sessions");
+        assert_eq!(summarize("mcp__carbon6__TaskStop", &serde_json::json!({"task_id": "bg3"})), "bg3");
+    }
 
     fn log(users: &[u64], n: u64) -> Vec<Event> {
         (1..=n)

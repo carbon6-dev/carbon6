@@ -138,7 +138,8 @@ pub(crate) async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -
         let mut tools: Vec<String> = Vec::new();
         for e in &events {
             match &e.kind {
-                Some(session_event::Kind::User(u)) => you.push(u.text.trim().to_owned()),
+                // Yours, not another session's agent's.
+                Some(session_event::Kind::User(u)) if u.from_session_id.is_empty() => you.push(u.text.trim().to_owned()),
                 Some(session_event::Kind::Assistant(a)) => {
                     let text: String = a
                         .blocks
@@ -162,7 +163,7 @@ pub(crate) async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -
         if you.is_empty()
             && let Some(prev) =
                 st.store.events_after(session_id, first.seq.saturating_sub(3), 3).await?.into_iter().rev().find_map(|e| match e.kind {
-                    Some(session_event::Kind::User(u)) if e.seq < first.seq => Some(u.text),
+                    Some(session_event::Kind::User(u)) if e.seq < first.seq && u.from_session_id.is_empty() => Some(u.text),
                     _ => None,
                 })
         {

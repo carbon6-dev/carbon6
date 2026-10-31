@@ -648,7 +648,13 @@ async fn digest(st: &HeadState, session: &SessionRow, labels: Vec<String>) -> Op
         match &e.kind {
             Some(session_event::Kind::User(u)) if u.command != "task-notification" => {
                 flush(&mut cur, &mut turns);
-                cur = Some((u.text.clone(), Vec::new(), String::new()));
+                // Another session's agent asked, not the user.
+                let asked = if u.from_session_id.is_empty() {
+                    u.text.clone()
+                } else {
+                    format!("(a message from session \"{}\") {}", u.from_title, u.text)
+                };
+                cur = Some((asked, Vec::new(), String::new()));
             }
             Some(session_event::Kind::Assistant(m)) => {
                 if let Some((_, tools, answer)) = cur.as_mut() {
