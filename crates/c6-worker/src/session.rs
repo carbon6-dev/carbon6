@@ -996,6 +996,8 @@ impl SessionManager {
             running_flag: Arc::default(),
             report: None,
             claude_code: claude_code.clone(),
+            claude: None,
+            claude_stdin: Arc::default(),
         };
         let handle =
             Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
@@ -1241,13 +1243,33 @@ struct Inbox {
     /// Every command id ever queued here, so redeliveries are ignored even
     /// while an input is being recorded.
     seen: HashSet<String>,
+    /// Told when an input is queued (a running Claude Code turn writes it
+    /// to its process).
+    more: Arc<tokio::sync::Notify>,
 }
 
 impl Inbox {
     fn push(&mut self, input: PendingInput, model: Option<ModelSpec>) {
         if self.seen.insert(input.command_id.clone()) {
             self.queue.push_back((input, model));
+            self.more.notify_one();
         }
+    }
+
+    /// Inputs a process never took, first again.
+    fn requeue(&mut self, inputs: Vec<PendingInput>) {
+        for input in inputs.into_iter().rev() {
+            self.queue.push_front((input, None));
+        }
+    }
+
+    /// Inputs that may join a running turn: none while a `/compact` or a
+    /// model switch is next.
+    fn join(&mut self) -> Vec<PendingInput> {
+        if self.queue.front().is_some_and(|(i, m)| m.is_some() || i.is_compact()) {
+            return Vec::new();
+        }
+        self.drain()
     }
 
     /// The model switch the next input asks for, which applies before it.
@@ -1326,11 +1348,19 @@ struct Actor {
     report: Option<(Vec<String>, bool)>,
     /// Shared with the manager: it runs Claude Code now.
     claude_code: Arc<std::sync::atomic::AtomicBool>,
+    /// Its Claude Code process while no turn holds it (docs/background.md
+    /// §4), and that process's input.
+    claude: Option<crate::claude_code::Process>,
+    claude_stdin: crate::claude_code::Stdin,
 }
+
+/// What a turn task gives back: the conversation, and the Claude Code
+/// process if it is still up. `None`: the turn failed to record itself.
+type TurnTask = tokio::task::JoinHandle<Option<(Conversation, Option<crate::claude_code::Process>)>>;
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
-        let mut running: Option<(tokio::task::JoinHandle<Option<Conversation>>, CancellationToken)> = None;
+        let mut running: Option<(TurnTask, CancellationToken)> = None;
         // A rewind that waits for the running turn to stop.
         let mut rewind: Option<(String, u64, bool)> = None;
         loop {
@@ -1352,6 +1382,7 @@ impl Actor {
                 running = Some(self.start_turn());
                 self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            let idle_until = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.idle_until());
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -1492,7 +1523,16 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::StopTask(id)) => {
-                        self.session_tools.background.kill_by_user(&id);
+                        match self.session_tools.background.native_stop(&id) {
+                            Some(task_id) => {
+                                if let Err(e) = crate::claude_code::stop_task(&self.claude_stdin, &task_id).await {
+                                    warn!(session = %self.writer.session_id, task = %id, "stopping a Claude Code task: {e}");
+                                }
+                            }
+                            None => {
+                                self.session_tools.background.kill_by_user(&id);
+                            }
+                        }
                     }
                     Some(ActorMsg::Reserve(n)) => self.session_tools.background.reserve_ids(n),
                     Some(ActorMsg::Approval(e)) => {
@@ -1547,13 +1587,43 @@ impl Actor {
                         rewind = Some((command_id, to_seq, restore_files));
                     }
                 },
+                // Claude Code wrote while no turn ran: a background task's
+                // progress, or a turn it starts by itself.
+                line = async { self.claude.as_mut().expect("checked").next_line().await }, if running.is_none() && self.claude.is_some() => {
+                    match line {
+                        None => {
+                            let unsent = self.claude.take().expect("checked").exited().await;
+                            self.inbox.lock().unwrap().requeue(unsent);
+                        }
+                        Some(v) => {
+                            let sink: Arc<dyn EventSink> = self.writer.clone();
+                            match self.claude.as_mut().expect("checked").idle_line(v, &sink).await {
+                                Ok(true) => {
+                                    running = Some(self.start_turn());
+                                    self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    error!(session = %self.writer.session_id, "recording Claude Code's output: {e:#}");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Idle long enough, with no background tasks: close it.
+                _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
+                    info!(session = %self.writer.session_id, "closing an idle Claude Code process");
+                    self.claude.take().expect("checked").close().await;
+                }
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     running = None;
                     self.running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false, ..Default::default() }));
                     match done {
-                        Ok(Some(conv)) => {
+                        Ok(Some((conv, claude))) => {
                             self.conv = Some(conv);
+                            self.claude = claude;
                             if let Err(e) = self.settle_delegations().await {
                                 error!(session = %self.writer.session_id, "reading a delegation's outcome: {e:#}");
                             }
@@ -1798,6 +1868,10 @@ impl Actor {
     /// state. Claude Code runs only top-level sessions on the worker itself.
     async fn hand_off(&mut self, model: ModelSpec) -> anyhow::Result<()> {
         let sid = self.writer.session_id.clone();
+        // Leaving Claude Code: its process goes, with its background tasks.
+        if let Some(p) = self.claude.take() {
+            p.stop().await;
+        }
         let into_claude_code = model.connection_kind == "claude_code";
         if into_claude_code {
             let refusal = if self.spec.delegation.is_some() {
@@ -1905,7 +1979,7 @@ impl Actor {
         ]
     }
 
-    fn start_turn(&mut self) -> (tokio::task::JoinHandle<Option<Conversation>>, CancellationToken) {
+    fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
         self.turns += 1;
         let turn = self.turns;
         let cancel = CancellationToken::new();
@@ -1963,14 +2037,15 @@ impl Actor {
         let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
         let (manager, journal) = (self.manager.clone(), self.journal.clone());
         // Claude Code's own subagents are mirrored into sessions of their own.
-        let observer = crate::claude_code::Observer {
+        let observer = Arc::new(crate::claude_code::Observer {
             tools: self.session_tools.clone(),
             journal: self.journal.clone(),
             link: self.link.clone(),
             session_id: self.writer.session_id.clone(),
             spec: self.spec.clone(),
             started: self.started.clone(),
-        };
+        });
+        let (mut claude, claude_stdin) = (self.claude.take(), self.claude_stdin.clone());
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             if !claude_code {
@@ -2005,21 +2080,23 @@ impl Actor {
                 }
             }
             let result = if claude_code {
-                let registration = match (bridge_tools.is_empty(), manager.bridge().await) {
-                    (false, Some(bridge)) => {
-                        session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, &[]))));
-                        Some(bridge.register(crate::mcp_bridge::Entry {
+                let bridge = if bridge_tools.is_empty() { None } else { manager.bridge().await };
+                if bridge.is_some() {
+                    session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, &[]))));
+                }
+                // A new process gets its own registration, for as long as it runs.
+                let register = || {
+                    bridge.as_ref().map(|b| {
+                        b.register(crate::mcp_bridge::Entry {
                             session_id: writer.session_id.clone(),
                             session: session_tools.clone(),
-                            tools: bridge_tools,
-                            cancel: c.clone(),
-                            journal,
+                            tools: bridge_tools.clone(),
+                            cancel: Mutex::default(),
+                            journal: journal.clone(),
                             matched: Mutex::default(),
-                        }))
-                    }
-                    _ => None,
+                        })
+                    })
                 };
-                let mcp_config = registration.as_ref().map(|r| r.mcp_config());
                 // Which of Claude Code's conversations this turn continues
                 // (and what a new one is told first), as the log has it.
                 let conversation = match log.events_after(&writer.session_id, 0, u32::MAX).await {
@@ -2029,25 +2106,29 @@ impl Actor {
                         return None;
                     }
                 };
-                let inputs = inbox.lock().unwrap().drain();
-                let result = crate::claude_code::run_turn(
+                let launch = crate::claude_code::Launch {
+                    conversation: conversation.id.clone(),
+                    effort: cfg.effort.clone(),
+                    settings: claude_settings,
+                };
+                let process = claude.take();
+                let result = claude_turn(
                     turn,
+                    process,
                     &conversation,
+                    launch,
                     &session_tools.cwd(),
                     &cfg.model,
-                    cfg.effort.as_deref(),
-                    inputs,
-                    claude_settings.as_deref(),
-                    mcp_config.as_deref(),
+                    &claude_stdin,
+                    &register,
+                    observer,
+                    &inbox,
                     &sink,
-                    Some(&observer),
                     &c,
                 )
-                .await
-                .map(drop);
-                drop(registration);
+                .await;
                 session_tools.set_subagents(None);
-                result
+                result.map(|p| claude = p)
             } else {
                 run_session_turn(
                     turn,
@@ -2066,7 +2147,7 @@ impl Actor {
                 .await
             };
             match result {
-                Ok(()) => Some(conv),
+                Ok(()) => Some((conv, claude)),
                 Err(e) => {
                     // Only journal writes fail here.
                     error!(session = %writer.session_id, "turn failed: {e:#}");
@@ -2076,6 +2157,93 @@ impl Actor {
         });
         (task, cancel)
     }
+}
+
+/// Runs a Claude Code turn on the session's process (docs/background.md
+/// §4), starting one if there is none, or if it was started with other
+/// settings and has no background tasks to lose. Gives the process back
+/// while it is up; inputs a process that died never took go back to the
+/// inbox.
+#[allow(clippy::too_many_arguments)]
+async fn claude_turn(
+    turn: u64,
+    mut process: Option<crate::claude_code::Process>,
+    conversation: &crate::claude_code::ClaudeConversation,
+    launch: crate::claude_code::Launch,
+    cwd: &Path,
+    model: &str,
+    stdin: &crate::claude_code::Stdin,
+    register: &(dyn Fn() -> Option<crate::mcp_bridge::Registration> + Send + Sync),
+    observer: Arc<crate::claude_code::Observer>,
+    inbox: &Arc<Mutex<Inbox>>,
+    sink: &Arc<dyn EventSink>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<crate::claude_code::Process>> {
+    use crate::claude_code::Process;
+    // Only a process with nothing under way: no tasks, no inputs it has
+    // not taken, no turn it has begun.
+    if let Some(p) = process.take_if(|p| p.launch() != &launch && p.idle_until().is_some()) {
+        p.close().await;
+    }
+    let inputs = inbox.lock().unwrap().drain();
+    if process.is_none() && inputs.is_empty() {
+        return Ok(None);
+    }
+    let more = inbox.lock().unwrap().more.clone();
+    let feed = || inbox.lock().unwrap().join();
+    let failed = async |message: String| -> anyhow::Result<Option<Process>> {
+        for input in &inputs {
+            sink.append(input.event()).await?;
+        }
+        sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
+        sink.append(session_event::Kind::Error(ErrorEvent { message })).await?;
+        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+        Ok(None)
+    };
+    let (mut p, bin) = match process {
+        Some(p) => (p, None),
+        None => {
+            let Some(bin) = crate::claude_code::find_claude() else {
+                return failed("Claude Code (`claude`) is not installed on this worker, or not on its PATH. Install it and sign in with `claude auth login`, or set C6_CLAUDE_BIN.".into()).await;
+            };
+            match Process::spawn(&bin, launch.clone(), conversation.resume, cwd, model, stdin.clone(), register(), Some(observer.clone())) {
+                Ok(p) => (p, Some(bin)),
+                Err(e) => return failed(format!("failed to start Claude Code: {e}")).await,
+            }
+        }
+    };
+    p.set_turn_cancel(cancel);
+    // A new conversation gets the preamble first (also when a resume finds
+    // none: the first turn may have failed before Claude Code saved it).
+    let preamble = (bin.is_some() && !conversation.resume).then_some(conversation.preamble.as_deref()).flatten();
+    let mut end = p.turn(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel).await?;
+    if end.no_conversation
+        && let Some(bin) = &bin
+    {
+        drop(p);
+        p = match Process::spawn(bin, launch, false, cwd, model, stdin.clone(), register(), Some(observer)) {
+            Ok(p) => p,
+            Err(e) => {
+                sink.append(session_event::Kind::Error(ErrorEvent { message: format!("failed to start Claude Code: {e}") })).await?;
+                sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+                return Ok(None);
+            }
+        };
+        p.set_turn_cancel(cancel);
+        end = p.turn(turn, inputs, true, conversation.preamble.as_deref(), model, sink, &feed, &more, cancel).await?;
+        if end.no_conversation {
+            sink.append(session_event::Kind::Error(ErrorEvent {
+                message: "Claude Code could not find or create this conversation.".into(),
+            }))
+            .await?;
+            sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+        }
+    }
+    if end.alive {
+        return Ok(Some(p));
+    }
+    inbox.lock().unwrap().requeue(p.take_unsent());
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]

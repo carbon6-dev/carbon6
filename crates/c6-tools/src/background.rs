@@ -221,6 +221,10 @@ struct NativeTasks {
 
 struct NativeTask {
     scope: String,
+    /// The CLI's id for it.
+    task_id: String,
+    /// You asked the CLI to stop it.
+    stop_asked: bool,
     description: String,
     started: Instant,
     elapsed: Option<Duration>,
@@ -304,6 +308,8 @@ impl Background {
         let is_new = !native.tasks.contains_key(&id);
         let task = native.tasks.entry(id.clone()).or_insert_with(|| NativeTask {
             scope: scope.to_owned(),
+            task_id: task_id.to_owned(),
+            stop_asked: false,
             description: String::new(),
             started: Instant::now(),
             elapsed: None,
@@ -326,6 +332,8 @@ impl Background {
             task.elapsed = Some(elapsed);
         }
         let finished = state != TaskState::Started && matches!(task.state, TaskState::Started | TaskState::Lost);
+        // A stop you asked for reads as yours.
+        let state = if state == TaskState::Stopped && task.stop_asked { TaskState::StoppedByUser } else { state };
         if finished {
             task.state = state;
             task.elapsed = Some(task.elapsed.unwrap_or_else(|| task.started.elapsed()));
@@ -354,6 +362,15 @@ impl Background {
             }
         }
         id
+    }
+
+    /// A running native task you asked to stop: the CLI's id for it, to ask
+    /// its process. `None`: not a running native task.
+    pub fn native_stop(&self, id: &str) -> Option<String> {
+        let mut native = self.native.lock().unwrap();
+        let task = native.tasks.get_mut(id).filter(|t| t.state == TaskState::Started)?;
+        task.stop_asked = true;
+        Some(task.task_id.clone())
     }
 
     /// The CLI process is gone. Do not manufacture a successful completion
@@ -494,7 +511,7 @@ impl Background {
             stdin: TaskStream { note: "Claude Code owns this task; stdin is unavailable and not writable.".into(), ..Default::default() },
             stdout: TaskStream { note: "Separate stdout is unavailable for CLI-managed tasks.".into(), ..Default::default() },
             stderr: TaskStream {
-                note: format!("Claude Code lifecycle state: {:?}. Separate stdout/stderr and individual Stop are unavailable.", task.state),
+                note: format!("Claude Code lifecycle state: {:?}. Separate stdout/stderr are unavailable.", task.state),
                 ..Default::default()
             },
             combined: Some(task.combined.clone().unwrap_or_else(|| {
@@ -1155,5 +1172,19 @@ mod tests {
         assert_eq!(failure.stderr.text, "failure [secret:TOKEN]");
         assert_eq!(failure.exit_code, Some(1));
         assert_eq!(bg.read_new(&id).unwrap().0, failure.stderr.text);
+    }
+
+    #[test]
+    fn a_native_task_you_stop_reads_as_stopped_by_you() {
+        let bg = Background::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bg.set_sink(Some(tx));
+        let id = bg.start_native("s", "t1", Some("r1"), "Build");
+        assert_eq!(rx.try_recv().unwrap().state, TaskState::Started);
+        assert_eq!(bg.native_stop(&id).as_deref(), Some("t1"), "the CLI's own id, to ask it");
+        bg.observe_native("s", "t1", Some("r1"), None, Some("Stopped"), None, TaskState::Stopped);
+        assert_eq!(rx.try_recv().unwrap().state, TaskState::StoppedByUser);
+        assert_eq!(bg.native_stop(&id), None, "an ended task cannot be stopped");
+        assert_eq!(bg.native_stop("bg1"), None, "not a native task");
     }
 }

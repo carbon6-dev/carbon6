@@ -26,7 +26,7 @@ impl Task {
     }
 
     fn can_stop(&self) -> bool {
-        self.running() && self.kind != "claude_code"
+        self.running()
     }
 
     fn status(&self) -> String {
@@ -35,7 +35,7 @@ impl Task {
             "finished" if self.kind == "claude_code" => "finished".into(),
             "finished" => format!("finished · exit {}", self.exit_code),
             "failed" => "failed".into(),
-            "stopped" if self.kind == "claude_code" => "stopped (Claude Code interrupted)".into(),
+            "stopped" if self.kind == "claude_code" => "stopped by Claude Code".into(),
             "stopped" => "stopped by the agent".into(),
             "stopped_by_user" => "stopped by you".into(),
             "lost" => "lost (worker restarted or CLI exited)".into(),
@@ -244,7 +244,7 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
         "finished" if exit_code == 0 => ("✓", "exited 0".to_owned(), "text-zinc-500"),
         "finished" => ("✗", format!("exited {exit_code}"), "text-red-600 dark:text-red-400"),
         "failed" => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "stopped" if native => ("■", "stopped (Claude Code interrupted)".to_owned(), "text-zinc-500"),
+        "stopped" if native => ("■", "stopped by Claude Code".to_owned(), "text-zinc-500"),
         "stopped" => ("■", "stopped by the agent".to_owned(), "text-zinc-500"),
         "stopped_by_user" => ("■", "stopped by you".to_owned(), "text-zinc-500"),
         "lost" => ("!", "lost (worker restarted or CLI exited)".to_owned(), "text-amber-700 dark:text-amber-400"),
@@ -357,14 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn native_claude_code_handles_completion_and_cannot_be_stopped() {
+    fn native_claude_code_handles_completion_and_can_be_stopped() {
         let mut native = event(1, "native", "started");
         if let EventKind::BackgroundTask { kind, .. } = &mut native.kind {
             *kind = "claude_code".into();
         }
         let tasks = lifecycle(&[native, event(2, "shell", "started"), event(3, "done", "finished")]);
         assert!(tasks[0].running());
-        assert!(!tasks[0].can_stop());
+        assert!(tasks[0].can_stop());
         assert_eq!(tasks[0].notification(), "Claude Code handles completion");
         assert!(tasks[1].can_stop());
         assert!(!tasks[2].can_stop());
@@ -375,7 +375,7 @@ mod tests {
         for (state, expected) in [
             ("finished", "finished"),
             ("failed", "failed"),
-            ("stopped", "stopped (Claude Code interrupted)"),
+            ("stopped", "stopped by Claude Code"),
             ("lost", "lost (worker restarted or CLI exited)"),
         ] {
             let mut native = event(1, "native", state);
