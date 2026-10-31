@@ -594,6 +594,8 @@ async fn a_lost_subagent_is_restored_from_the_head() {
     let mut b = tools.clone();
     b.sort();
     assert_eq!(a, b, "the same tools");
+    // Its messages would go in its top-level session's name.
+    assert!(!offered.iter().any(|t| t == "message_session" || t == "list_sessions"), "{offered:?}");
     stop2.cancel();
 }
 

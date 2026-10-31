@@ -133,7 +133,7 @@ Not goals:
   - "sent";
   - "queued: its worker is offline";
   - or why it was refused.
-- **`list_sessions`** (`ListSessions`, `mcp__carbon6__ListSessions`) lists the realm's top-level sessions, so the agent can find a target, most recently active first, at most 50, without the caller. It takes an optional `query` (matched against title, labels and folder) and returns each session's id, title, state (running, idle or offline), worker and labels. Archived sessions are not listed.
+- **`list_sessions`** (`ListSessions`, `mcp__carbon6__ListSessions`) lists the realm's top-level sessions, so the agent can find a target, most recently active first, at most 50, each followed by its side chats ("side chat of *X*"), without the caller. It takes an optional `query` (matched against title, labels and folder) and returns each session's id, title, state (running, idle or offline), worker and labels. Archived sessions are not listed.
 - Both are built-in tools in every carbon6 profile (`c6_tools::messages`), so they are valid names in routing rules' tool lists and named agents' tool lists. A Claude Code session gets them over the MCP bridge on any connection, as its tool list allows.
 - `message_session` is a separate tool from `SendMessage`. `SendMessage` delegates to the caller's own subagent and may wait for its report; this one only delivers.
 
@@ -150,7 +150,7 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
   - `UserMessage` carries the same fields; `NoticeQueued` carries them and the prompt.
 - **The target's worker** appends `NoticeQueued` and queues it, with `wake: true` and the hourly limit (§5). The head marks the command done when it ingests that `NoticeQueued`, so a held message isn't sent again on reconnect.
 - **The recipient sees** `<session-message from="<id>" title="<title>">…</session-message>`, followed by the realm's `session.message_received` prompt (Settings → Prompts). The prompt says how to reply with `message_session` and to reply only when an answer is needed.
-- **The sender is the calling session itself,** a side chat included, so replies go to it. A subagent's head calls go as its top-level session's, so its messages come from (and replies go to) that session. Its realm decides what it may reach.
+- **The sender is the calling session itself,** a side chat included, so replies go to it. Subagents don't get the tools (`messages::is_message_tool`, as task cards): their head calls go in their top-level session's name, and what they find goes to their parent. Its realm decides what it may reach.
 
 ### Head checks
 
@@ -203,5 +203,4 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 
 ## 11. Open
 
-- Side chats are valid targets, but `list_sessions` doesn't list them: should it?
-- Subagents send as their top-level session. Should they be refused the tools instead, as they are task cards?
+Settled 2026-10-31: side chats are listed under their sessions; subagents don't get the messaging tools.

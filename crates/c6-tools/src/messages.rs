@@ -14,6 +14,13 @@ async fn call(ctx: &ToolCtx, method: &str, params: Value) -> Result<Value, Strin
     head.call(method, params).await
 }
 
+/// Whether `name` is one of these tools (subagents don't get them: their
+/// head calls go as their top-level session's, and what they find goes
+/// back to their parent).
+pub fn is_message_tool(name: &str) -> bool {
+    matches!(name, "message_session" | "MessageSession" | "list_sessions" | "ListSessions")
+}
+
 /// Sends another session a message.
 pub struct MessageSession {
     claude: bool,
@@ -78,8 +85,8 @@ impl Tool for ListSessions {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: if self.claude { "ListSessions" } else { "list_sessions" }.into(),
-            description: "Lists other sessions you can message (this realm's, not archived), most recently active first: id, title, \
-                          whether it is running, idle or offline, its worker and labels."
+            description: "Lists other sessions you can message (this realm's, not archived), most recently active first, each \
+                          session's side chats under it: id, title, whether it is running, idle or offline, its worker and labels."
                 .into(),
             parameters: json!({"type": "object", "properties": {
                 "query": {"type": "string", "description": "Only sessions whose title, labels or folder contain this"}
@@ -100,8 +107,10 @@ impl Tool for ListSessions {
                     .flatten()
                     .map(|s| {
                         let labels = s["labels"].as_array().map(|l| l.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+                        let side = s["side_chat_of"]["title"].as_str().map(|p| format!(" · side chat of \"{p}\"")).unwrap_or_default();
                         format!(
-                            "- {} \"{}\" · {} · worker {}{}",
+                            "{}- {} \"{}\"{side} · {} · worker {}{}",
+                            if side.is_empty() { "" } else { "  " },
                             s["id"].as_str().unwrap_or_default(),
                             s["title"].as_str().unwrap_or_default(),
                             s["state"].as_str().unwrap_or_default(),

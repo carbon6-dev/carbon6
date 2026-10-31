@@ -1184,33 +1184,51 @@ pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> 
 }
 
 /// The sessions an agent may message: its realm's top-level sessions, not
-/// archived, most recently active first, without itself.
+/// archived, most recently active first, each followed by its side chats
+/// (those whose parent is not listed come last), without itself.
 pub async fn sessions_for(st: &HeadState, from: &SessionRow, params: &Value) -> anyhow::Result<Value> {
     let query = params["query"].as_str().unwrap_or_default().trim().to_lowercase();
-    let rows = st.store.sessions(Some(&from.realm), 500).await?;
-    let sessions: Vec<Value> = rows
-        .iter()
-        .filter(|r| r.id != from.id && !r.observed)
-        .filter(|r| {
-            query.is_empty()
+    let matches = |r: &SessionRow| {
+        r.id != from.id
+            && !r.observed
+            && (query.is_empty()
                 || r.title.to_lowercase().contains(&query)
                 || r.cwd.to_lowercase().contains(&query)
-                || r.all_labels().iter().any(|l| l.to_lowercase().contains(&query))
-        })
-        .take(50)
-        .map(|r| {
-            let online = r.worker_id.parse::<WorkerId>().ok().is_some_and(|w| st.registry.get(w).is_some());
-            let state = if !online {
-                "offline"
-            } else if r.status == "running" {
-                "running"
-            } else {
-                "idle"
-            };
-            json!({"id": r.id, "title": r.title, "state": state, "worker": r.worker_name, "labels": r.user_labels()})
-        })
-        .collect();
-    Ok(json!({"sessions": sessions}))
+                || r.all_labels().iter().any(|l| l.to_lowercase().contains(&query)))
+    };
+    let top: Vec<SessionRow> = st.store.sessions(Some(&from.realm), 500).await?.into_iter().filter(|r| matches(r)).take(50).collect();
+    let mut sides: Vec<SessionRow> = st.store.side_chats(&from.realm, 200).await?.into_iter().filter(|r| matches(r)).take(50).collect();
+    let row = |r: &SessionRow, parent: Option<&SessionRow>| {
+        let online = r.worker_id.parse::<WorkerId>().ok().is_some_and(|w| st.registry.get(w).is_some());
+        let state = if !online {
+            "offline"
+        } else if r.status == "running" {
+            "running"
+        } else {
+            "idle"
+        };
+        let mut v = json!({"id": r.id, "title": r.title, "state": state, "worker": r.worker_name, "labels": r.user_labels()});
+        if let Some(p) = parent {
+            v["side_chat_of"] = json!({"id": p.id, "title": p.title});
+        }
+        v
+    };
+    let mut out = Vec::new();
+    for t in &top {
+        out.push(row(t, None));
+        for s in sides.iter().filter(|s| s.parent_id.as_deref() == Some(t.id.as_str())) {
+            out.push(row(s, Some(t)));
+        }
+        sides.retain(|s| s.parent_id.as_deref() != Some(t.id.as_str()));
+    }
+    for s in &sides {
+        let parent = match &s.parent_id {
+            Some(p) => st.store.session(p).await?,
+            None => None,
+        };
+        out.push(row(s, parent.as_ref()));
+    }
+    Ok(json!({"sessions": out}))
 }
 
 /// The subagent-limits setting.
