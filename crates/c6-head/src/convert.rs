@@ -166,9 +166,13 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             let spec = m.model.clone().unwrap_or_default();
             api::EventKind::SubagentModelSet { connection_id: spec.connection_id, model: spec.model, effort: spec.effort }
         }
-        // The worker's bookkeeping: the transcript shows the notice when a
-        // turn takes it.
-        Kind::NoticeQueued(_) => return None,
+        // Shown when a turn takes it; until then, it waits.
+        Kind::NoticeQueued(n) => api::EventKind::NoticeQueued {
+            command_id: n.command_id.clone(),
+            text: n.text.clone(),
+            command: n.command.clone(),
+            from_title: n.from_title.clone(),
+        },
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
 }

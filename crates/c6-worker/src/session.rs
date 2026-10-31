@@ -217,6 +217,8 @@ pub(crate) enum ActorMsg {
     },
     /// How a remote subagent's turn ended (from the head, as a command).
     RemoteReport(String, Box<c6_proto::DelegationEnded>),
+    /// Deliver the held notices now, whatever the hourly limit (you asked).
+    ReleaseNotices,
     /// From the log, on reload (docs/background.md §5): when notices
     /// started turns in the last hour, the ids of every notice recorded,
     /// and those no turn took, to deliver again.
@@ -525,6 +527,12 @@ impl SessionManager {
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
                 let _ = actor.send(ActorMsg::RemoteReport(cmd.command_id, Box::new(d)));
+                Ok(())
+            }
+            Some(session_command::Kind::ReleaseNotices(_)) => {
+                // Loading it delivers what it can; then the rest, now.
+                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+                let _ = actor.send(ActorMsg::ReleaseNotices);
                 Ok(())
             }
             Some(session_command::Kind::StopTask(t)) => {
@@ -1595,6 +1603,14 @@ impl Actor {
                         if let Err(e) = self.notice(input, running.is_some(), wake).await {
                             error!(session = %self.writer.session_id, "queueing a subagent's report: {e:#}");
                             return;
+                        }
+                    }
+                    Some(ActorMsg::ReleaseNotices) => {
+                        let held = std::mem::take(&mut self.deferred);
+                        info!(session = %self.writer.session_id, notices = held.len(), "delivering held notices: you asked");
+                        let mut inbox = self.inbox.lock().unwrap();
+                        for (n, _) in held {
+                            inbox.push(n, None);
                         }
                     }
                     Some(ActorMsg::Reloaded { auto_turns_ms, noticed, pending }) => {

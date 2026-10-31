@@ -1039,6 +1039,11 @@ pub async fn session_config(id: String) -> Result<c6_api::EffectiveConfig, Strin
 }
 
 /// Stops a session's background task.
+/// Delivers the notices waiting for a session's agent now.
+pub async fn deliver_notices(id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/sessions/{}/notices/deliver", enc(&id))).send().await).await
+}
+
 pub async fn stop_task(id: String, task: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/tasks/{task}/stop")).send().await).await
 }

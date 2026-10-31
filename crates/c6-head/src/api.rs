@@ -93,6 +93,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/subagent-model", put(set_subagent_model))
         .route("/api/v1/sessions/{id}/tasks/{task}", get(task_snapshot))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
+        .route("/api/v1/sessions/{id}/notices/deliver", post(deliver_notices))
         .route("/api/v1/sessions/{id}/approvals/{call_id}", post(decide_approval))
         .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
         .route("/api/v1/settings/routes", get(get_routes).put(put_routes))
@@ -1740,6 +1741,14 @@ async fn rewind_session(
 
 async fn task_snapshot(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<Json<api::TaskSnapshot>> {
     Ok(Json(crate::sessions::task_snapshot(&st, &id, &task).await?))
+}
+
+async fn deliver_notices(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    if crate::sessions::release_notices(&st, &id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
+    }
 }
 
 async fn stop_task(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<StatusCode> {

@@ -1,6 +1,6 @@
 //! Notices that are never lost (docs/background.md §5): a background task's
-//! end held by the hourly limit is recorded, survives a worker restart, and
-//! reaches the agent with your next message.
+//! end held by the hourly limit is recorded, survives a worker restart, is
+//! shown as waiting, and reaches the agent once when you deliver it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -104,15 +104,31 @@ async fn a_held_notice_survives_a_worker_restart() {
     stop.cancel();
     drop(worker);
     let (worker, stop) = run_worker(state.path()).await;
-    // Your next message brings it.
+    // It is still waiting, as its events say (what the UI's pill shows).
+    let waiting = |evs: &[Event]| {
+        evs.iter().filter(|e| matches!(&e.kind, EventKind::NoticeQueued { command_id, .. } if command_id == "task:bg2:finished")).count()
+            == 1
+            && !evs.iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "task:bg2:finished"))
+    };
+    assert!(waiting(&events(&id).await));
+    // Deliver now: a turn takes it, whatever the limit.
     mock.push(Reply::Text("bg2 ended too.".into()));
-    http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": "what happened?"})).send().await.unwrap();
+    let r = http.post(format!("{api}/sessions/{id}/notices/deliver")).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::NO_CONTENT);
     idle(&id, 3).await;
     let last = mock.requests().last().unwrap()["messages"].to_string();
-    assert!(last.contains(r#"id=\"bg2\""#) && last.contains("what happened?"), "{last}");
-    let reloads = events(&id).await;
-    let told = reloads.iter().filter(|e| matches!(&e.kind, EventKind::User { text, .. } if text.contains(r#"id="bg2""#))).count();
+    assert!(last.contains(r#"id=\"bg2\""#), "{last}");
+    let after = events(&id).await;
+    assert!(!waiting(&after));
+    let told = after.iter().filter(|e| matches!(&e.kind, EventKind::User { text, .. } if text.contains(r#"id="bg2""#))).count();
     assert_eq!(told, 1, "told once");
+    // Your next message doesn't bring it again.
+    mock.push(Reply::Text("Nothing else.".into()));
+    http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": "anything else?"})).send().await.unwrap();
+    idle(&id, 4).await;
+    assert!(!mock.requests().last().unwrap()["messages"].to_string().ends_with(r#"id=\"bg2\""#));
+    let told = events(&id).await.iter().filter(|e| matches!(&e.kind, EventKind::User { text, .. } if text.contains(r#"id="bg2""#))).count();
+    assert_eq!(told, 1, "still told once");
     drop(worker);
     stop.cancel();
 }
