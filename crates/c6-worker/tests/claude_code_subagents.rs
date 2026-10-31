@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 /// streaming the call first as Claude Code does.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
-cat > /dev/null
+read -r line
 url=""
 while [ $# -gt 0 ]; do [ "$1" = "--mcp-config" ] && url=$(printf '%s' "$2" | sed 's/.*"url":"\([^"]*\)".*/\1/'); shift; done
 if [ -z "$url" ]; then

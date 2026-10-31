@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 /// A `claude` whose turn runs one subagent.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
-cat > /dev/null
+read -r line
 cat <<'JSON'
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Task","input":{"description":"look around","prompt":"List files."}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}
 {"type":"user","message":{"content":"List files."},"parent_tool_use_id":"toolu_9"}

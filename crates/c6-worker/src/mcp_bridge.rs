@@ -22,14 +22,14 @@ use crate::journal::Journal;
 /// `mcp__carbon6__Task` and `mcp__carbon6__SendMessage`.
 pub const SERVER: &str = "carbon6";
 
-/// What one Claude Code turn may call.
+/// What one Claude Code process may call.
 pub(crate) struct Entry {
     pub session_id: String,
     /// The session's tool state, with its subagent runner set for the turn.
     pub session: Arc<SessionTools>,
     pub tools: Vec<Arc<dyn Tool>>,
-    /// The turn's: stopping it stops the subagents it started.
-    pub cancel: CancellationToken,
+    /// The running turn's: stopping it stops the subagents it started.
+    pub cancel: Mutex<CancellationToken>,
     pub journal: Arc<Journal>,
     /// Tool calls of the session already matched to an MCP call.
     pub matched: Mutex<HashSet<String>>,
@@ -43,7 +43,7 @@ pub(crate) struct Bridge {
     entries: Entries,
 }
 
-/// A turn's registration; dropping it ends the turn's access.
+/// A process's registration; dropping it ends the process's access.
 pub(crate) struct Registration {
     pub url: String,
     token: String,
@@ -81,6 +81,13 @@ impl Bridge {
 }
 
 impl Registration {
+    /// Calls from now on belong to the turn `cancel` stops.
+    pub fn set_cancel(&self, cancel: &CancellationToken) {
+        if let Some(e) = self.entries.lock().unwrap().get(&self.token) {
+            *e.cancel.lock().unwrap() = cancel.clone();
+        }
+    }
+
     /// Claude Code's `--mcp-config` for it.
     pub fn mcp_config(&self) -> String {
         json!({"mcpServers": {SERVER: {"type": "http", "url": self.url}}}).to_string()
@@ -148,7 +155,7 @@ async fn handle(
                     let call_id = call_id_for(&entry, &name, &input).await;
                     let ctx = ToolCtx {
                         session: entry.session.clone(),
-                        cancel: entry.cancel.child_token(),
+                        cancel: entry.cancel.lock().unwrap().child_token(),
                         output: Arc::new(|_: &str| {}),
                         call_id,
                     };

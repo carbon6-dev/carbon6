@@ -139,10 +139,10 @@ async fn background_tasks_notify_the_agent() {
         let r = anon.get(format!("{api}/sessions/{session}/tasks/bg1")).send().await.unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED, "unauthenticated inspection must not disclose session existence");
     }
+    // Claude Code's tasks are stopped by asking its process (docs/background.md
+    // §4); this session has none, so nothing happens.
     let r = http.post(format!("{api}/sessions/{}/tasks/claude:native-task/stop", s.id)).send().await.unwrap();
-    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "native task stopping must not silently succeed");
-    let error = r.text().await.unwrap();
-    assert!(error.contains("Claude Code owns this native task"), "{error}");
+    assert_eq!(r.status(), reqwest::StatusCode::NO_CONTENT, "a native task's stop goes to the worker");
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(mock.requests().len(), 3, "inspection must not wake the model");
 

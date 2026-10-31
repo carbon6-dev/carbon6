@@ -1496,14 +1496,10 @@ pub async fn task_snapshot(st: &HeadState, session_id: &str, task_id: &str) -> a
     })
 }
 
-/// Stops a session's background task. `false`: its worker is not connected.
+/// Stops a session's background task (one of Claude Code's too: its
+/// process is asked to). `false`: its worker is not connected.
 pub async fn stop_task(st: &HeadState, session_id: &str, task_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    if task_id.starts_with("claude:") {
-        return Err(bad_request(
-            "Claude Code owns this native task; individual task stopping is unavailable here. Stop the Claude Code turn instead.",
-        ));
-    }
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),

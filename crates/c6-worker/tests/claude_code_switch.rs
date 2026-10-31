@@ -17,11 +17,11 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// A `claude` that records its arguments and prompt in the session folder,
+/// A `claude` that records its arguments and first message in the session folder,
 /// then edits a file and says which model it ran.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
-prompt=$(cat)
+read -r prompt
 printf '%s\n' "$*" >> claude-calls.log
 printf '%s\n=====\n' "$prompt" >> claude-prompts.log
 model=default; prev=""
@@ -97,7 +97,12 @@ fn handoffs(evs: &[Event]) -> Vec<(String, String)> {
 fn claude_runs(project: &Path) -> (Vec<String>, Vec<String>) {
     let read = |f: &str| std::fs::read_to_string(project.join(f)).unwrap_or_default();
     let calls = read("claude-calls.log").lines().map(str::to_owned).collect();
-    let prompts = read("claude-prompts.log").split("\n=====\n").filter(|p| !p.is_empty()).map(str::to_owned).collect();
+    // Each is the stream-json message it was sent.
+    let prompts = read("claude-prompts.log")
+        .split("\n=====\n")
+        .filter(|p| !p.is_empty())
+        .map(|p| serde_json::from_str::<Value>(p).unwrap()["message"]["content"].as_str().unwrap().to_owned())
+        .collect();
     (calls, prompts)
 }
 

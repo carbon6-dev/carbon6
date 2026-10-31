@@ -86,6 +86,12 @@ pub const GROUPS: &[Group] = &[
                 summary: "Subagents as sessions of their own: watched live, stopped, and continued with their history.",
             },
             Doc {
+                slug: "background",
+                file: "docs/background.md",
+                label: "Background work and session messages",
+                summary: "Background tasks that always reach their session, a Claude Code process that stays up, and messages between sessions.",
+            },
+            Doc {
                 slug: "memex",
                 file: "docs/memex.md",
                 label: "Memex",
