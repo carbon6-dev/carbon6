@@ -266,6 +266,16 @@ pub fn DocPage(id: String) -> impl IntoView {
         tick.track();
         api::work_of(format!("doc:{}", id.get_value()))
     });
+    let in_projects = LocalResource::new(move || {
+        tick.track();
+        async move {
+            let me = id.get_value();
+            let all = api::projects_list(false).await.unwrap_or_default();
+            all.into_iter()
+                .filter_map(|p| p.docs.iter().find(|d| d.doc == me).map(|d| (p.id.clone(), p.fields.title.clone(), d.role.clone())))
+                .collect::<Vec<_>>()
+        }
+    });
     let rename = move || {
         let t = title.get_untracked();
         renaming.set(false);
@@ -377,9 +387,18 @@ pub fn DocPage(id: String) -> impl IntoView {
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_block()>"Add (⌘↵)"</button>
                             </div>
                         </div>
-                        {move || used_in.get().and_then(Result::ok).filter(|w| !w.is_empty()).map(|w| view! {
+                        {move || {
+                            let w = used_in.get().and_then(Result::ok).unwrap_or_default();
+                            let p = in_projects.get().unwrap_or_default();
+                            (!w.is_empty() || !p.is_empty()).then_some((w, p))
+                        }.map(|(w, p)| view! {
                             <section class="space-y-1 border-t border-zinc-200 pt-3 dark:border-zinc-800">
                                 <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Refers to it"</h2>
+                                {p.into_iter().map(|(pid, title, role)| view! {
+                                    <Go to=View::Projects { id: pid } class="block text-sm text-sky-700 hover:underline dark:text-sky-400">
+                                        {format!("Project · {title}{}", if role.is_empty() { String::new() } else { format!(" ({role})") })}
+                                    </Go>
+                                }).collect_view()}
                                 {w.into_iter().map(|w| view! {
                                     <Go to=View::Work { id: w.id.clone() } class="block text-sm text-sky-700 hover:underline dark:text-sky-400">{format!("Work · {}", w.fields.title)}</Go>
                                 }).collect_view()}

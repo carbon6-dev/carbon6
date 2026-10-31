@@ -106,6 +106,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::WORK_PROPOSE,
     },
     Prompt {
+        name: "project.summary",
+        description: "A project's \"where we are\" note, and when the project looks done (docs/projects.md §6). Placeholders: {{title}}, {{purpose}}, {{phases}}, {{note}}, {{work}}, {{docs}}.",
+        default: text::PROJECT_SUMMARY,
+    },
+    Prompt {
+        name: "project.plan",
+        description: "The plan doc a new project starts with, in Markdown (docs/projects.md §3). Placeholders: {{title}}, {{purpose}}.",
+        default: text::PROJECT_PLAN,
+    },
+    Prompt {
         name: "docs.style",
         description: "How agents write documents with the doc tool: the birth with pending sections, filling them one per edit, and the style (docs/docs.md §6). A session reads it with the tool's action guide.",
         default: text::DOCS_STYLE,

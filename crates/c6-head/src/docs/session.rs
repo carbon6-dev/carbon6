@@ -41,6 +41,12 @@ pub async fn may_write(st: &HeadState, realm: &str, id: &str, session: &str) -> 
             if crate::work::holds(st, &w, &reference).await {
                 return Ok(Ok(()));
             }
+            // Its project's documents too (docs/projects.md §3).
+            if let Some(p) = crate::work::project_of(st, &w).await
+                && crate::projects::holds_doc(st, &p, id).await
+            {
+                return Ok(Ok(()));
+            }
         }
         let granted: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_writers WHERE doc_id = ? AND writer = ?")
             .bind(id)
@@ -178,6 +184,15 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
                 let r = c6_api::work::WorkRef { reference: format!("doc:{}", doc.summary.id), title: doc.summary.title.clone() };
                 if let Err(e) = crate::work::attach_by(st, &w, &r, &by).await {
                     tracing::warn!(work = %w, "attaching a document: {e:#}");
+                }
+                // And to its project, so it outlives the work.
+                if let Some(p) = crate::work::project_of(st, &w).await
+                    && let Ok(Some(row)) = crate::projects::load(st, &p).await
+                {
+                    let d = c6_api::projects::ProjectDocIn { doc: doc.summary.id.clone(), role: String::new() };
+                    if let Err(e) = crate::projects::add_doc_in(st, &row, &d, &by).await {
+                        tracing::warn!(project = %p, "attaching a document: {e:#}");
+                    }
                 }
             }
             Ok(json!({"did": "created", "doc": about(&doc.summary), "keys": applied.keys, "blocks": shown(&doc, &applied.hashes),

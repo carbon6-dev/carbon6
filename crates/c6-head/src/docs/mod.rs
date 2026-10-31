@@ -801,6 +801,10 @@ async fn settled(st: &HeadState, realm: &str, id: &str, x: Settling) {
     let event = json!({"type": "doc", "op": "changed", "doc": event_doc(&doc.summary), "authors": x.authors,
                        "from_rev": x.from_rev, "rev": x.rev});
     crate::triggers::dispatch(st, realm, "doc", "changed", event).await;
+    // Its projects moved (their plan, spec or notes changed).
+    for p in crate::projects::holding_doc(st, realm, id).await {
+        crate::projects::refresh(st, &p);
+    }
 }
 
 /// Whether some document's changes haven't settled yet (for tests).

@@ -889,7 +889,12 @@ fn ProjectPick(w: WorkItem, apply: Callback<Result<WorkItem, String>>) -> impl I
 /// The Brief's "Left open": work that needs you or went quiet.
 #[component]
 pub fn LeftOpen() -> impl IntoView {
-    let (list, _) = open_work();
+    let (list, tick) = open_work();
+    // Projects that stalled or need you (docs/projects.md §9).
+    let projects = LocalResource::new(move || {
+        tick.track();
+        api::projects_list(false)
+    });
     move || {
         let items: Vec<WorkItem> = list
             .get()
@@ -898,14 +903,30 @@ pub fn LeftOpen() -> impl IntoView {
             .into_iter()
             .filter(|w| matches!(w.state.as_str(), "needs_you" | "quiet"))
             .collect();
-        (!items.is_empty()).then(|| {
-            let n = items.len();
+        let stuck: Vec<c6_api::projects::ProjectItem> = projects
+            .get()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| matches!(p.state.as_str(), "needs_you" | "stalled"))
+            .collect();
+        (!items.is_empty() || !stuck.is_empty()).then(|| {
+            let n = items.len() + stuck.len();
             view! {
                 <section class="space-y-1">
                     <h2 class="flex items-baseline gap-2 text-xs font-medium uppercase tracking-wide text-zinc-500">
                         {format!("Left open ({n})")}
                         <Go to=View::Work { id: String::new() } class="normal-case tracking-normal text-zinc-400 hover:underline">"all work"</Go>
                     </h2>
+                    {stuck.into_iter().take(4).map(|p| view! {
+                        <Go to=View::Projects { id: p.id.clone() } class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                            <span class="shrink-0 rounded bg-rose-100 px-1.5 py-0.5 text-[11px] font-medium text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">
+                                {c6_api::projects::state_label(&p.state)}
+                            </span>
+                            <span class="min-w-0 flex-1 truncate">{format!("◇ {}", p.fields.title)}</span>
+                            <span class="hidden max-w-[50%] truncate text-xs text-zinc-500 sm:inline">{p.why.clone()}</span>
+                        </Go>
+                    }).collect_view()}
                     {items.into_iter().take(6).map(|w| view! {
                         <Go to=View::Work { id: w.id.clone() } class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
                             <StatePill state=w.state.clone() />

@@ -83,7 +83,7 @@ pub fn ProjectsPage() -> impl IntoView {
         if t.trim().is_empty() {
             return;
         }
-        let n = ProjectNew { title: t, purpose: purpose.get_untracked(), ..Default::default() };
+        let n = ProjectNew { title: t, purpose: purpose.get_untracked(), plan: true, ..Default::default() };
         spawn_local(async move {
             match api::project_add(&n).await {
                 Ok(p) => {
@@ -249,9 +249,31 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                             }}
                             <div class="flex flex-wrap items-center gap-2 text-sm">
                                 <StatePill state=p.state.clone() />
+                                {p.late.then(|| view! { <span class="rounded bg-rose-100 px-1.5 py-0.5 text-[11px] font-medium text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">"late"</span> })}
                                 <span class="text-zinc-600 dark:text-zinc-400">{p.why.clone()}</span>
                             </div>
                         </header>
+                        {p.fields.offer.clone().filter(|_| active).map(|o| view! {
+                            <div class="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-800 dark:bg-emerald-950/30">
+                                <span class="min-w-0 flex-1">{format!("Looks done: {}", o.evidence)}</span>
+                                <button class=BUTTON on:click=move |_| patch(ProjectPatch { status: Some("done".into()), ..Default::default() })>"Close it"</button>
+                                <button class=BUTTON_QUIET on:click=move |_| patch(ProjectPatch { dismiss_offer: true, ..Default::default() })>"Not yet"</button>
+                            </div>
+                        })}
+                        <section class="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+                            <div class="flex items-center gap-2">
+                                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">"Where we are"</h2>
+                                {p.fields.note.as_ref().map(|n| view! { <span class="text-xs text-zinc-400">{since(n.at)}</span> })}
+                                <button class="text-xs text-zinc-500 hover:underline" title="Write it again now"
+                                    on:click=move |_| spawn_local(async move {
+                                        if let Err(e) = api::project_refresh(id.get_value()).await { error.set(Some(e)); }
+                                    })>"↻"</button>
+                            </div>
+                            <p class="whitespace-pre-wrap text-sm">{match &p.fields.note {
+                                Some(n) => n.text.clone(),
+                                None => "No note yet: an agent writes one when work in the project opens, closes or moves in, or its documents change.".to_owned(),
+                            }}</p>
+                        </section>
                         <div class="flex flex-wrap gap-2">
                             {active.then(|| view! {
                                 <button class=BUTTON_QUIET on:click=move |_| patch(ProjectPatch { status: Some("paused".into()), ..Default::default() })>"Pause"</button>
@@ -300,19 +322,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 </select>
                             </div>
                         </section>
-                        {(!p.docs.is_empty()).then(|| view! {
-                            <section class="space-y-1">
-                                <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Documents"</h2>
-                                {p.docs.iter().map(|d| view! {
-                                    <div class="flex items-center gap-2 px-2 py-1 text-sm">
-                                        <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
-                                            {format!("{} {}", if d.kind == "deck" { "▦" } else { "▤" }, d.title)}
-                                        </Go>
-                                        {(!d.role.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{d.role.clone()}</span> })}
-                                    </div>
-                                }).collect_view()}
-                            </section>
-                        })}
+                        <Documents p=p.clone() apply=Callback::new(apply) />
                         {(!done.is_empty()).then(|| view! {
                             <section class="space-y-1">
                                 <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Closed work"</h2>
@@ -352,5 +362,121 @@ fn WorkRow(w: c6_api::projects::ProjectWork, project: String, apply: Callback<Re
                     spawn_local(async move { apply.run(api::project_detach(p, &d).await) });
                 }>"✕"</button>
         </div>
+    }
+}
+
+/// A project's documents with their roles (the plan first), a way to add
+/// one or start a new one, and its links.
+#[component]
+fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> impl IntoView {
+    let id = StoredValue::new(p.id.clone());
+    let all_docs = LocalResource::new(|| async { api::docs_list(&c6_api::docs::DocQuery::default()).await });
+    let mine: Vec<String> = p.docs.iter().map(|d| d.doc.clone()).collect();
+    let role = RwSignal::new(String::new());
+    let (link, link_title) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
+    let set_role = move |doc: String, r: String| spawn_local(async move { apply.run(api::project_doc(id.get_value(), doc, r).await) });
+    let ws = use_workspace();
+    let col = use_column();
+    let title = StoredValue::new(p.fields.title.clone());
+    let new_doc = move |kind: &'static str| {
+        let n = c6_api::docs::DocNew { kind: kind.into(), title: format!("{}: new {kind}", title.get_value()), ..Default::default() };
+        spawn_local(async move {
+            match api::doc_create(&n).await {
+                Ok(d) => {
+                    let did = d.summary.id.clone();
+                    apply.run(api::project_doc(id.get_value(), did.clone(), String::new()).await);
+                    match col {
+                        Some(c) => c.open(View::Docs { id: did }, How::Beside),
+                        None => ws.open(None, View::Docs { id: did }, How::Beside),
+                    }
+                }
+                Err(e) => apply.run(Err(e)),
+            }
+        });
+    };
+    let add_link = move || {
+        let (r, t) = (link.get_untracked(), link_title.get_untracked());
+        if r.trim().is_empty() {
+            return;
+        }
+        link.set(String::new());
+        link_title.set(String::new());
+        spawn_local(async move { apply.run(api::project_link(id.get_value(), r, t).await) });
+    };
+    view! {
+        <section class="space-y-1">
+            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Documents"</h2>
+            {p.docs.iter().map(|d| {
+                let doc = d.doc.clone();
+                let doc2 = d.doc.clone();
+                let current = d.role.clone();
+                view! {
+                    <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+                        <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
+                            {format!("{} {}", if d.kind == "deck" { "▦" } else { "▤" }, d.title)}
+                        </Go>
+                        <span class="shrink-0 text-xs text-zinc-400">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
+                        <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                            title="Its role in the project" on:change=move |ev| set_role(doc.clone(), event_target_value(&ev))>
+                            {["", "plan", "spec", "notes", "review"].into_iter().map(|r| view! {
+                                <option value=r selected=current == r>{if r.is_empty() { "no role" } else { r }}</option>
+                            }).collect_view()}
+                        </select>
+                        <button class="shrink-0 text-xs text-zinc-400 hover:text-red-600" title="Take it off the project (the document stays)"
+                            on:click=move |_| {
+                                let d = ProjectDetach { doc: Some(doc2.clone()), ..Default::default() };
+                                spawn_local(async move { apply.run(api::project_detach(id.get_value(), &d).await) });
+                            }>"✕"</button>
+                    </div>
+                }
+            }).collect_view()}
+            <div class="flex flex-wrap items-center gap-2 pt-1 text-sm">
+                <select class=format!("{INPUT} w-auto! max-w-64") on:change=move |ev| {
+                    let doc = event_target_value(&ev);
+                    if doc.is_empty() { return; }
+                    set_role(doc, role.get_untracked());
+                }>
+                    <option value="">"+ Add a document…"</option>
+                    {move || all_docs.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|d| !mine.contains(&d.id)).map(|d| view! {
+                        <option value=d.id.clone()>{d.title.clone()}</option>
+                    }).collect_view()}
+                </select>
+                <select class=format!("{INPUT} w-auto!") title="Its role" on:change=move |ev| role.set(event_target_value(&ev))>
+                    <option value="">"no role"</option>
+                    <option value="plan">"plan"</option>
+                    <option value="spec">"spec"</option>
+                    <option value="notes">"notes"</option>
+                    <option value="review">"review"</option>
+                </select>
+                <button class=BUTTON_QUIET on:click=move |_| new_doc("doc")>"+ New doc"</button>
+                <button class=BUTTON_QUIET on:click=move |_| new_doc("deck")>"+ New deck"</button>
+            </div>
+            <h2 class="pt-2 text-xs font-medium uppercase tracking-wide text-zinc-500">"Links"</h2>
+            {p.fields.links.iter().map(|l| {
+                let r = l.reference.clone();
+                let href = if r.starts_with("http") { r.clone() } else { String::new() };
+                let text = if l.title.is_empty() { l.reference.clone() } else { l.title.clone() };
+                view! {
+                    <div class="flex items-center gap-2 px-2 py-0.5 text-sm">
+                        {if href.is_empty() {
+                            view! { <span class="min-w-0 flex-1 truncate">{text}</span> }.into_any()
+                        } else {
+                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{format!("↗ {text}")}</a> }.into_any()
+                        }}
+                        <button class="shrink-0 text-xs text-zinc-400 hover:text-red-600" on:click=move |_| {
+                            let d = ProjectDetach { link: Some(r.clone()), ..Default::default() };
+                            spawn_local(async move { apply.run(api::project_detach(id.get_value(), &d).await) });
+                        }>"✕"</button>
+                    </div>
+                }
+            }).collect_view()}
+            <div class="flex gap-2">
+                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="A link: URL, record:<collection>:<id>, decision:<id>" prop:value=move || link.get()
+                    on:input=move |ev| link.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { add_link() } />
+                <input class=format!("{INPUT} w-40!") placeholder="Its name" prop:value=move || link_title.get()
+                    on:input=move |ev| link_title.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { add_link() } />
+                <button class=BUTTON_QUIET on:click=move |_| add_link()>"Link"</button>
+            </div>
+        </section>
     }
 }

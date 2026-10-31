@@ -121,13 +121,35 @@ pub async fn set_project(st: &HeadState, id: &str, realm: &str, project: &str, p
         Ok(true)
     })
     .await?;
+    // Both projects moved: their notes are brought up to date.
     let now = now_ms();
     for p in [before.as_str(), project] {
         if !p.is_empty() {
             crate::projects::touch(st, p, now).await?;
+            crate::projects::refresh(st, p);
         }
     }
     Ok(())
+}
+
+/// The connection and model of a work item's latest session.
+pub(crate) async fn latest_model(st: &HeadState, id: &str) -> Option<(String, String)> {
+    let r = load(st, id).await.ok()??;
+    let mut latest: Option<crate::store::SessionRow> = None;
+    for a in &r.fields.attached {
+        if let Some(sid) = a.reference.strip_prefix("session:")
+            && let Ok(Some(s)) = st.store.session(sid).await
+            && latest.as_ref().is_none_or(|l| l.updated_at < s.updated_at)
+        {
+            latest = Some(s);
+        }
+    }
+    latest.map(|s| (s.connection_id, s.model)).filter(|(c, _)| !c.is_empty())
+}
+
+/// A work item's next step, from its note.
+pub(crate) async fn next_step(st: &HeadState, id: &str) -> Option<String> {
+    load(st, id).await.ok()??.fields.note.map(|n| n.next).filter(|n| !n.is_empty())
 }
 
 /// The project a work item is in.
@@ -437,6 +459,12 @@ pub async fn patch(st: &HeadState, id: &str, p: &api::work::WorkPatch, caller: &
         Ok(true)
     })
     .await?;
+    // Work opening or closing moves its project.
+    if p.status.is_some()
+        && let Some(project) = project_of(st, id).await
+    {
+        crate::projects::refresh(st, &project);
+    }
     get(st, id, caller).await
 }
 
@@ -1003,12 +1031,24 @@ async fn add_all(st: &HeadState, id: &str, refs: &[WorkRef], by: &str) -> anyhow
 /// The connection and model for work in a realm: a routing rule for
 /// `task:work` (the realm's, then root's), else `fallback` (a session's).
 async fn model_for(st: &HeadState, realm: &str, fallback: Option<(String, String)>) -> anyhow::Result<Option<(String, String)>> {
+    model_for_route(st, realm, ROUTE_LABEL, fallback).await
+}
+
+/// The connection and model a routing rule for `label` picks (the realm's,
+/// then root's), else `fallback`.
+pub(crate) async fn model_for_route(
+    st: &HeadState,
+    realm: &str,
+    label: &str,
+    fallback: Option<(String, String)>,
+) -> anyhow::Result<Option<(String, String)>> {
+    let route_label = label;
     let connections = st.store.connections().await?;
-    let labels = vec![ROUTE_LABEL.to_owned()];
+    let labels = vec![route_label.to_owned()];
     for r in [realm, crate::realms::ROOT] {
         let routes: Vec<api::Route> =
             serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, r).await?.unwrap_or_default()).unwrap_or_default();
-        for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == ROUTE_LABEL)) {
+        for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
             if !api::labels::applies(&route.applies_to, &labels) {
                 continue;
             }
@@ -1030,10 +1070,17 @@ async fn model_for(st: &HeadState, realm: &str, fallback: Option<(String, String
 
 /// Asks the model, for JSON. Its tokens count in the realm's usage, as
 /// `work:<about>`.
-async fn ask(
+async fn ask(st: &HeadState, realm: &str, model: (String, String), what: &str, about: &str, prompt: String) -> anyhow::Result<Value> {
+    ask_as(st, realm, model, "work", what, about, prompt).await
+}
+
+/// Asks the model for JSON; its tokens count in the realm's usage as
+/// `<area>:<what>`.
+pub(crate) async fn ask_as(
     st: &HeadState,
     realm: &str,
     (connection, model): (String, String),
+    area: &str,
     what: &str,
     about: &str,
     prompt: String,
@@ -1051,8 +1098,9 @@ async fn ask(
         system: String::new(),
         messages: vec![Message { role: Role::User, blocks: vec![Block::Text(prompt)] }],
         tools: Vec::new(),
-        // Room for a thinking model's reasoning.
-        max_output_tokens: Some(2048),
+        // Room for a thinking model's reasoning (more for a project's
+        // note, which reads all of its work).
+        max_output_tokens: Some(if area == "projects" { 8192 } else { 2048 }),
         cache_key: None,
         effort: Some("low".into()),
         web_search: false,
@@ -1069,7 +1117,7 @@ async fn ask(
         "INSERT OR REPLACE INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write, realm) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(format!("work:{what}"))
+    .bind(format!("{area}:{what}"))
     .bind(-now_ms())
     .bind(now_ms())
     .bind(&connection)
@@ -1460,6 +1508,9 @@ pub fn spawn_sweeper(st: std::sync::Arc<HeadState>) {
             if let Err(e) = sweep(&st, now_ms()).await {
                 warn!("nudging about work: {e:#}");
             }
+            if let Err(e) = crate::projects::sweep(&st).await {
+                warn!("nudging about projects: {e:#}");
+            }
         }
     });
 }
@@ -1476,6 +1527,30 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
     let by = format!("session:{session_id}");
     match p["action"].as_str().unwrap_or("get") {
         "get" => {}
+        // What it made, for the project (docs/projects.md §8): it outlives the work.
+        "attach" if p["to"] == "project" => {
+            let reference = p["ref"].as_str().unwrap_or_default().trim().to_owned();
+            let mut done = false;
+            for id in &ids {
+                let Some(project) = project_of(st, id).await else { continue };
+                let Some(row) = crate::projects::load(st, &project).await? else { continue };
+                if let Some(doc) = reference.strip_prefix("doc:") {
+                    let role = p["role"].as_str().unwrap_or("").to_owned();
+                    crate::projects::add_doc_in(st, &row, &c6_api::projects::ProjectDocIn { doc: doc.to_owned(), role }, &by).await?;
+                } else {
+                    let l = c6_api::projects::ProjectLinkIn {
+                        reference: reference.clone(),
+                        title: p["title"].as_str().unwrap_or("").to_owned(),
+                    };
+                    crate::projects::add_link_in(st, &row, &l, &by).await?;
+                }
+                done = true;
+                break;
+            }
+            if !done {
+                return Err(bad_request("this session's work is in no project: attach it to the work instead"));
+            }
+        }
         "attach" => {
             let reference = check_ref(p["ref"].as_str().unwrap_or_default())?;
             let status = p["status"].as_str().unwrap_or("").trim().to_owned();
@@ -1538,8 +1613,24 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
     for id in ids {
         if let Some(r) = load(st, &id).await? {
             let f = r.fields;
+            let project = match f.project.as_str() {
+                "" => Value::Null,
+                pid => match crate::projects::load(st, pid).await? {
+                    Some(p) => {
+                        let mut docs = Vec::new();
+                        for d in &p.fields.documents {
+                            if let Some((title, kind, _)) = crate::docs::title_of(st, &p.realm, &d.doc).await {
+                                docs.push(json!({"ref": format!("doc:{}", d.doc), "title": title, "kind": kind, "role": d.role}));
+                            }
+                        }
+                        json!({"id": p.id, "title": p.fields.title, "purpose": p.fields.purpose,
+                               "where_we_are": p.fields.note.map(|n| n.text), "documents": docs})
+                    }
+                    None => Value::Null,
+                },
+            };
             out.push(json!({
-                "id": r.id, "title": f.title, "done_when": f.done_when, "note": f.note,
+                "id": r.id, "title": f.title, "done_when": f.done_when, "note": f.note, "project": project,
                 "attached": f.attached.iter().map(|a| json!({"ref": a.reference, "title": a.title, "status": a.status})).collect::<Vec<_>>(),
                 "todos": f.todos.iter().map(|t| json!({"id": t.id, "text": t.text, "done": t.done_at.is_some(), "session": t.session}))
                     .collect::<Vec<_>>(),

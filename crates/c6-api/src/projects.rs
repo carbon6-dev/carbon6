@@ -183,7 +183,40 @@ pub struct ProjectNew {
     /// Work items to bring in at once (their ids).
     #[serde(default)]
     pub work: Vec<String>,
+    /// Start its plan doc from the prompt `project.plan` (default yes).
+    #[serde(default = "yes")]
+    pub plan: bool,
 }
+
+fn yes() -> bool {
+    true
+}
+
+/// `POST /api/v1/projects/{id}/docs`: a document joins the project with a
+/// role (posting it again changes the role). One plan at most: a new plan
+/// makes the old one roleless.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectDocIn {
+    /// The document's id (or doc:<id>).
+    pub doc: String,
+    /// plan, spec, notes, review, or empty.
+    #[serde(default)]
+    pub role: String,
+}
+
+/// `POST /api/v1/projects/{id}/links`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectLinkIn {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// Roles a document plays in a project.
+pub const ROLES: [&str; 4] = ["plan", "spec", "notes", "review"];
 
 /// `PATCH /api/v1/projects/{id}`: what changes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

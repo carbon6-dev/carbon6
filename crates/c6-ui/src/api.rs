@@ -1409,3 +1409,15 @@ pub async fn project_detach(id: String, d: &c6_api::projects::ProjectDetach) -> 
 pub async fn project_merge(id: String, from: String) -> Result<ProjectItem, String> {
     send_json(Request::post(&format!("/api/v1/projects/{}/merge", enc(&id))), &c6_api::projects::ProjectMerge { from }).await
 }
+
+pub async fn project_doc(id: String, doc: String, role: String) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/docs", enc(&id))), &c6_api::projects::ProjectDocIn { doc, role }).await
+}
+
+pub async fn project_link(id: String, reference: String, title: String) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/links", enc(&id))), &c6_api::projects::ProjectLinkIn { reference, title }).await
+}
+
+pub async fn project_refresh(id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/projects/{}/refresh", enc(&id))).send().await).await
+}
