@@ -30,6 +30,10 @@ pub const SUBAGENT_PARTIAL: &str = "The subagent did not finish. Its work so far
 to continue it with what it already did, send it a message with the send-message tool (to: its id) rather than starting a new one. \
 Check its changes before relying on them.";
 
+/// What an agent is told after a message from another session
+/// (docs/background.md §6: an editable prompt).
+pub const SESSION_MESSAGE_NOTE: &str = "This message is from the agent of another session, not from the user. Act on it as part of your work if it is relevant. Reply with the message-session tool (to: its id) only when it asks for something or needs an answer; do not reply just to acknowledge it.";
+
 /// What a subagent is told when you resume it after a turn that did not
 /// finish (an editable prompt).
 pub const SUBAGENT_RESUME: &str = "You were stopped partway through. Your work so far is above. Check where you left off, \
@@ -74,6 +78,11 @@ pub struct PendingInput {
     pub delegated_by: String,
     /// In a subagent: its report should start a turn in its idle parent.
     pub wake: bool,
+    /// A message from another session (docs/background.md §6): its id, its
+    /// title, and how many session messages led to it.
+    pub from_session_id: String,
+    pub from_title: String,
+    pub hops: u32,
 }
 
 impl PendingInput {
@@ -88,6 +97,9 @@ impl PendingInput {
             blocked: self.blocked.clone(),
             delegated_by: self.delegated_by.clone(),
             wake: self.wake,
+            from_session_id: self.from_session_id.clone(),
+            from_title: self.from_title.clone(),
+            hops: self.hops,
         })
     }
 

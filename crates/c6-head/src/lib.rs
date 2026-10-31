@@ -175,6 +175,9 @@ pub struct HeadState {
     pub pools: pools::Pools,
     /// Documents' changes, for the live feed and their settled events.
     pub docs: docs::Docs,
+    /// When each session sent other sessions messages in the last hour
+    /// (docs/background.md §6).
+    pub(crate) messages_sent: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<i64>>>,
     /// Itself, for what must outlive a borrow (set once it is made).
     me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
 }
@@ -287,6 +290,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         updates: updater,
         pools: Default::default(),
         docs: Default::default(),
+        messages_sent: Default::default(),
         me: Default::default(),
     });
     let _ = state.me.set(Arc::downgrade(&state));

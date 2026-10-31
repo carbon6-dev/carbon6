@@ -2036,8 +2036,17 @@ fn render_event(
             <p class="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400"><span>"↻"</span><span class="whitespace-pre-wrap">{text.clone()}</span></p>
         }
         .into_any(),
-        EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } => {
+        EventKind::User { text, attachments, command, prompt, blocked, delegated_by, from_session_id, from_title, .. } => {
             let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
+            // From another session's agent (docs/background.md §6).
+            let sender = (!from_session_id.is_empty()).then(|| {
+                let (id, title) = (from_session_id.clone(), from_title.clone());
+                view! {
+                    <p class="text-[11px] text-sky-700 dark:text-sky-400">
+                        "✉ from "<Go to=View::session(id) class="hover:underline" stop=true>{if title.is_empty() { "another session".to_owned() } else { title }}</Go>
+                    </p>
+                }
+            });
             // In a subagent: who sent it.
             let from = if !delegated_by.is_empty() {
                 Some("↘ from the agent that started it")
@@ -2071,6 +2080,7 @@ fn render_event(
                 .collect_view();
             view! {
                 <div class="flex flex-col items-end gap-1.5">
+                    {sender}
                     {from.map(|f| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{f}</p> })}
                     {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
                     {(!text.is_empty()).then(|| view! {

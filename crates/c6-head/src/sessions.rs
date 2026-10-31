@@ -11,6 +11,7 @@ use c6_proto::{
     SessionEventBatch, UserInput, session_command, session_event,
 };
 use prost::Message;
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -1105,6 +1106,111 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
             Some(api::QueuedInput { command_id: row.id, text, created_at: row.created_at, rejected: None })
         })
         .collect())
+}
+
+/// The most text one session message carries.
+const MAX_MESSAGE_CHARS: usize = 20_000;
+
+/// One session's agent sends another session in its realm a message
+/// (docs/background.md §6). It goes like your messages, through the
+/// command queue to the target's worker (kept while that worker is
+/// offline), which delivers it to the agent as a notice.
+pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> anyhow::Result<Value> {
+    let to_id = params["to"].as_str().unwrap_or_default().trim();
+    let text = params["message"].as_str().unwrap_or_default().trim();
+    let hops = params["hops"].as_u64().unwrap_or(1).min(u32::MAX as u64) as u32;
+    if text.is_empty() {
+        return Err(bad_request("the message is empty"));
+    }
+    if text.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(bad_request(format!("the message is longer than {MAX_MESSAGE_CHARS} characters")));
+    }
+    let to =
+        st.store.session(to_id).await?.ok_or_else(|| bad_request(format!("no session {to_id:?}; the list-sessions tool lists them")))?;
+    if to.id == from.id {
+        return Err(bad_request("that is this session"));
+    }
+    if to.realm != from.realm {
+        return Err(bad_request("that session is in another realm: messages go only to sessions in this one"));
+    }
+    if to.archived != 0 {
+        return Err(bad_request("that session is archived"));
+    }
+    if to.observed || to.parent_call_id.is_some() {
+        return Err(bad_request("that is a subagent: only the agent that started it talks to it"));
+    }
+    if to.status == "failed" {
+        return Err(bad_request("that session failed to start"));
+    }
+    let limits = subagent_limits(st, Some(&from.realm)).await?;
+    if hops > limits.max_message_hops {
+        return Err(bad_request(format!(
+            "not sent: this would be message {hops} in a chain of messages between sessions, and the limit is {}. Tell the user instead.",
+            limits.max_message_hops
+        )));
+    }
+    let now = now_ms();
+    {
+        let mut sent = st.messages_sent.lock().unwrap();
+        let times = sent.entry(from.id.clone()).or_default();
+        while times.front().is_some_and(|t| now - t > 3_600_000) {
+            times.pop_front();
+        }
+        if times.len() >= limits.messages_per_hour as usize {
+            return Err(bad_request(format!(
+                "not sent: this session already sent {} messages to other sessions in the last hour",
+                limits.messages_per_hour
+            )));
+        }
+        times.push_back(now);
+    }
+    let worker_id: WorkerId = to.worker_id.parse()?;
+    let id = Uuid::now_v7().to_string();
+    let input = UserInput {
+        text: text.to_owned(),
+        labels: to.head_labels(),
+        from_session_id: from.id.clone(),
+        from_title: from.title.clone(),
+        hops,
+        ..Default::default()
+    };
+    let shown = format!("from \"{}\": {text}", from.title);
+    let data = input_command(&id, &to.id, input);
+    st.store.enqueue_command(&NewCommand { id: &id, session_id: &to.id, worker_id, data, text: Some(&shown) }).await?;
+    publish_queue(st, &to.id).await;
+    st.registry.deliver(worker_id);
+    info!(from = %from.id, to = %to.id, hops, "session message");
+    Ok(json!({"to": to.id, "title": to.title, "queued": st.registry.get(worker_id).is_none()}))
+}
+
+/// The sessions an agent may message: its realm's top-level sessions, not
+/// archived, most recently active first, without itself.
+pub async fn sessions_for(st: &HeadState, from: &SessionRow, params: &Value) -> anyhow::Result<Value> {
+    let query = params["query"].as_str().unwrap_or_default().trim().to_lowercase();
+    let rows = st.store.sessions(Some(&from.realm), 500).await?;
+    let sessions: Vec<Value> = rows
+        .iter()
+        .filter(|r| r.id != from.id && !r.observed)
+        .filter(|r| {
+            query.is_empty()
+                || r.title.to_lowercase().contains(&query)
+                || r.cwd.to_lowercase().contains(&query)
+                || r.all_labels().iter().any(|l| l.to_lowercase().contains(&query))
+        })
+        .take(50)
+        .map(|r| {
+            let online = r.worker_id.parse::<WorkerId>().ok().is_some_and(|w| st.registry.get(w).is_some());
+            let state = if !online {
+                "offline"
+            } else if r.status == "running" {
+                "running"
+            } else {
+                "idle"
+            };
+            json!({"id": r.id, "title": r.title, "state": state, "worker": r.worker_name, "labels": r.user_labels()})
+        })
+        .collect();
+    Ok(json!({"sessions": sessions}))
 }
 
 /// The subagent-limits setting.

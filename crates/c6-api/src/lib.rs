@@ -1747,12 +1747,29 @@ pub struct SubagentLimits {
     /// up, in minutes.
     #[serde(default = "default_claude_code_idle_minutes")]
     pub claude_code_idle_minutes: u32,
+    /// How long a chain of messages between sessions may get: a message sent
+    /// from a turn a session message started is one more.
+    #[serde(default = "default_max_message_hops")]
+    pub max_message_hops: u32,
+    /// How many messages one session may send other sessions per hour.
+    #[serde(default = "default_messages_per_hour")]
+    pub messages_per_hour: u32,
 }
 
 pub const DEFAULT_SUBAGENT_DEPTH: u32 = 3;
 pub const DEFAULT_RUNNING_SUBAGENTS: u32 = 16;
 pub const DEFAULT_AUTO_TURNS_PER_HOUR: u32 = 20;
 pub const DEFAULT_CLAUDE_CODE_IDLE_MINUTES: u32 = 15;
+pub const DEFAULT_MAX_MESSAGE_HOPS: u32 = 4;
+pub const DEFAULT_MESSAGES_PER_HOUR: u32 = 30;
+
+fn default_max_message_hops() -> u32 {
+    DEFAULT_MAX_MESSAGE_HOPS
+}
+
+fn default_messages_per_hour() -> u32 {
+    DEFAULT_MESSAGES_PER_HOUR
+}
 
 fn default_auto_turns_per_hour() -> u32 {
     DEFAULT_AUTO_TURNS_PER_HOUR
@@ -1777,6 +1794,8 @@ impl Default for SubagentLimits {
             max_running: DEFAULT_RUNNING_SUBAGENTS,
             auto_turns_per_hour: DEFAULT_AUTO_TURNS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
+            max_message_hops: DEFAULT_MAX_MESSAGE_HOPS,
+            messages_per_hour: DEFAULT_MESSAGES_PER_HOUR,
         }
     }
 }
@@ -1919,6 +1938,12 @@ pub enum EventKind {
         /// Sent to a subagent with "wake the parent".
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         wake: bool,
+        /// A message from another session's agent: that session, and its
+        /// title then (docs/background.md §6).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        from_session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        from_title: String,
     },
     TurnStarted {
         turn: u64,

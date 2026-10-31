@@ -1,6 +1,6 @@
 # Background work and session messages — Design
 
-Status: draft (2026-10-30). Steps 1–3 (§4, §5) are built; see §9 for what they leave to later steps.
+Status: built (2026-10-31), steps 1–4; §9 lists what each leaves to later.
 
 The main agent stays free to talk while its work runs in the background. A background task that ends always reaches its session, whether the session is mid-turn, idle or reloaded after a restart. Sessions can also message each other within a realm, across workers, fire and forget.
 
@@ -132,37 +132,39 @@ Not goals:
   - "sent";
   - "queued: its worker is offline";
   - or why it was refused.
-- **`list_sessions`** (`ListSessions`) lists the realm's top-level sessions, so the agent can find a target. It takes an optional `query` (matched against title, labels and workspace) and returns each session's id, title, status (running, idle or offline), worker, labels and last activity. Archived sessions are not listed.
-- Both are valid names in routing rules' tool lists and named agents' tool lists.
+- **`list_sessions`** (`ListSessions`, `mcp__carbon6__ListSessions`) lists the realm's top-level sessions, so the agent can find a target, most recently active first, at most 50, without the caller. It takes an optional `query` (matched against title, labels and folder) and returns each session's id, title, state (running, idle or offline), worker and labels. Archived sessions are not listed.
+- Both are built-in tools in every carbon6 profile (`c6_tools::messages`), so they are valid names in routing rules' tool lists and named agents' tool lists. A Claude Code session gets them over the MCP bridge on any connection, as its tool list allows.
 - `message_session` is a separate tool from `SendMessage`. `SendMessage` delegates to the caller's own subagent and may wait for its report; this one only delivers.
 
 ### Path
 
 ```
-message_session ─► HeadCall session.message {session_id, to, text, hops}
-                   head: checks (below) ─► send_input as a notice ─► commands table ─► target's worker
+message_session ─► HeadCall session.message {session_id, to, message, hops}
+                   head: checks (below) ─► an input from that session ─► commands table ─► target's worker
                                                        (durable; redelivered on reconnect)
 ```
 
 - **Proto.**
-  - `UserInput` gains `from_session_id` (9) and `hops` (10). An input with `from_session_id` is a notice, not your message.
-  - `UserMessage` and `NoticeQueued` carry both fields.
-- **The target's worker** appends `NoticeQueued` and queues it, with `wake: true` and the hourly limit (§5).
+  - `UserInput` gains `from_session_id` (9), `from_title` (10) and `hops` (11). An input with `from_session_id` is a notice, not your message: no commands, mentions or prompt hooks.
+  - `UserMessage` carries the same fields; `NoticeQueued` carries them and the prompt.
+- **The target's worker** appends `NoticeQueued` and queues it, with `wake: true` and the hourly limit (§5). The head marks the command done when it ingests that `NoticeQueued`, so a held message isn't sent again on reconnect.
 - **The recipient sees** `<session-message from="<id>" title="<title>">…</session-message>`, followed by the realm's `session.message_received` prompt (Settings → Prompts). The prompt says how to reply with `message_session` and to reply only when an answer is needed.
-- **The sender is the calling session itself,** a side chat or subagent included, so replies go to it. Its realm decides what it may reach.
+- **The sender is the calling session itself,** a side chat included, so replies go to it. A subagent's head calls go as its top-level session's, so its messages come from (and replies go to) that session. Its realm decides what it may reach.
 
 ### Head checks
 
-- The target exists and is in the sender's realm (`realms::of_session`). Other realms are refused until grants cover messaging.
-- The target is not the sender, not archived, not `observed`, and not a subagent. A subagent's turns report to its parent, which would be told about work it never asked for.
-- **Hops.** A message sent from a turn that a session message started or joined carries that message's `hops + 1`. Your own messages reset it to 0. Beyond `max_message_hops` (default 4) the head refuses, so two agents cannot keep waking each other.
-- **Rate.** At most `messages_per_hour` (default 30) per sending session. The text is capped at the inline output limit.
+`sessions::message_from`:
+
+- The target exists and is in the sender's realm. Other realms are refused until grants cover messaging.
+- The target is not the sender, not archived, not `observed`, not a subagent and not failed. A subagent's turns report to its parent, which would be told about work it never asked for. Side chats may be messaged.
+- **Hops.** A session's hop count is that of the last session message delivered to it (`SessionTools::message_hops`); a message it sends carries one more. Your own messages reset it to 0. Beyond `max_message_hops` (default 4) the head refuses, so two agents cannot keep waking each other.
+- **Rate.** At most `messages_per_hour` (default 30) per sending session, counted in the head's memory (a head restart starts it again). The text is capped at 20,000 characters.
 
 ### UI
 
-- **Sender:** the call shows as a card, "→ sent to *title* ↗".
-- **Recipient:** the message shows as a bubble "from *title* ↗", styled as a notice, not as yours.
-- **Search and the session list** don't count session messages as your input.
+- **Recipient (built):** the message shows as a bubble with "✉ from *title*" above it, which opens that session. Its prompt (with the wrapper) is under the bubble, as for an expanded command.
+- **Sender (later):** the call shows as an ordinary tool card for now; a card "→ sent to *title* ↗" is to come.
+- **Later:** search and the session list shouldn't count session messages as your input.
 
 ## 7. Settings (no new strings in code)
 
@@ -170,9 +172,9 @@ message_session ─► HeadCall session.message {session_id, to, text, hops}
 |---|---|---|
 | Settings → Agents → Limits (built) | `claude_code_idle_minutes` | 15 |
 | Settings → Agents → Limits (built) | `auto_turns_per_hour` | 20 |
-| Settings → Agents | `max_message_hops` | 4 |
-| Settings → Agents | `messages_per_hour` | 30 |
-| Settings → Prompts | `session.message_received` | how to reply, and only when needed |
+| Settings → Agents → Limits (built) | `max_message_hops` | 4 |
+| Settings → Agents → Limits (built) | `messages_per_hour` | 30 |
+| Settings → Prompts (built) | `session.message_received` | that it comes from another agent, and to reply only when needed |
 
 ## 8. Edge cases
 
@@ -187,7 +189,7 @@ message_session ─► HeadCall session.message {session_id, to, text, hops}
 1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Left for later: cleanup at recovery after a worker crash. (The idle time became a setting in step 3.)
 2. **carbon6's notices and background tools under Claude Code (§4).** Built 2026-10-31: bridge registration per process (in step 1); `Task` and `SendMessage` with `run_in_background`, plus `TaskOutput` and `TaskStop`. Test: a background subagent's call returns at once, its report reaches the same process as a message, and that message's turn is logged as a `task-notification`.
 3. **Notices that are never lost (§5).** Built 2026-10-31: `NoticeQueued`, re-delivery on load, the limit's timer, and both settings. Tests: a log's pending notices and automatic turns (`notice_tests`); a notice held by the limit survives a worker restart and reaches the agent once, with your next message (`it/notices.rs`). Left for later: the head treating `NoticeQueued` as applied (step 4) and the held-notices pill.
-4. **Session messages (§6).** Proto fields, `session.message` and `session.list` in `fabric.rs`, the tools (including over the MCP bridge), head checks, the prompt and the UI.
+4. **Session messages (§6).** Built 2026-10-31: the proto fields, `session.message` and `session.sessions` in `fabric.rs`, the tools (also over the MCP bridge), the head's checks, the prompt and the recipient's bubble. Test (`it/messages.rs`): a session lists the realm's sessions and messages one on another worker, which wakes with it as a message from that session; its reply, beyond a chain limit of 1, is refused. Left for later: the sender's card and grants for other realms.
 
 ## 10. Decisions (settled 2026-10-30)
 
@@ -200,4 +202,5 @@ message_session ─► HeadCall session.message {session_id, to, text, hops}
 
 ## 11. Open
 
-- Should side chats be valid targets? This design allows them: they are top-level enough, and their replies go to the side chat.
+- Side chats are valid targets, but `list_sessions` doesn't list them: should it?
+- Subagents send as their top-level session. Should they be refused the tools instead, as they are task cards?

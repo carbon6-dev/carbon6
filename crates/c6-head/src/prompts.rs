@@ -41,6 +41,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::SUBAGENT_RESUME,
     },
     Prompt {
+        name: "session.message_received",
+        description: "Added after a message from another session's agent (docs/background.md §6).",
+        default: c6_agent::SESSION_MESSAGE_NOTE,
+    },
+    Prompt {
         name: "session.subagent_partial",
         description: "Told to an agent after the summary of a subagent that did not finish.",
         default: c6_agent::SUBAGENT_PARTIAL,

@@ -3503,7 +3503,8 @@ fn SecretsSetting() -> impl IntoView {
 }
 
 /// Settings: how deep subagents nest and how many work at once, how often
-/// notices wake a session, and how long an idle Claude Code process stays up.
+/// notices wake a session, how long an idle Claude Code process stays up, and
+/// how far messages between sessions go.
 #[component]
 fn SubagentLimitsSetting() -> impl IntoView {
     let setting = RwSignal::new(c6_api::SubagentLimits::default());
@@ -3554,6 +3555,21 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     <span class="text-xs text-zinc-500">"Claude Code idle minutes (1–1440)"</span>
                     <input type="number" min="1" max="1440" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.claude_code_idle_minutes.to_string()) on:input=move |ev| setting.update(|s| s.claude_code_idle_minutes = number(&ev)) />
+                </label>
+            </div>
+            <p class="text-sm text-zinc-500">
+                "An agent can message another session of its realm. A reply to a message, and a reply to that, make a chain: one longer than this is refused, so two agents can't keep waking each other. A session sends at most this many messages an hour."
+            </p>
+            <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Longest chain of messages (1–32)"</span>
+                    <input type="number" min="1" max="32" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.max_message_hops.to_string()) on:input=move |ev| setting.update(|s| s.max_message_hops = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Messages per session per hour (1–1000)"</span>
+                    <input type="number" min="1" max="1000" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.messages_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.messages_per_hour = number(&ev)) />
                 </label>
             </div>
             <div class="flex items-center justify-end gap-3">
