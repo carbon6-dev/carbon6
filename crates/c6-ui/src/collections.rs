@@ -202,6 +202,19 @@ fn NewCollection(done: Callback<()>) -> impl IntoView {
     }
 }
 
+/// A field's value in a table: a `doc:<id>` opens the document.
+fn cell_view(v: Option<&Value>) -> leptos::prelude::AnyView {
+    match v.and_then(Value::as_str).and_then(|s| s.strip_prefix("doc:")) {
+        Some(id) if !id.is_empty() => view! {
+            <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned() } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
+                {format!("▤ doc:{}", id.chars().take(8).collect::<String>())}
+            </crate::workspace::Go>
+        }
+        .into_any(),
+        _ => cell(v).into_any(),
+    }
+}
+
 /// A field's value as table text.
 fn cell(v: Option<&Value>) -> String {
     match v {
@@ -303,7 +316,7 @@ fn CollectionView(name: String) -> impl IntoView {
                                                                 editing.set(Some(Some(row.clone())));
                                                             }
                                                         }>
-                                                        {columns.get_value().into_iter().map(|col| view! { <td class="max-w-xs truncate px-3 py-1.5">{cell(r.fields.get(&col))}</td> }).collect_view()}
+                                                        {columns.get_value().into_iter().map(|col| view! { <td class="max-w-xs truncate px-3 py-1.5">{cell_view(r.fields.get(&col))}</td> }).collect_view()}
                                                         <td class="whitespace-nowrap px-3 py-1.5 text-xs text-zinc-500">{format!("{} · {}", ago(now_ms() - r.updated_at), r.updated_by)}</td>
                                                     </tr>
                                                 }

@@ -545,7 +545,7 @@ pub async fn dismiss_rejected(id: String) -> Result<(), String> {
 
 // --- Worker files, git, terminals ---------------------------------------------
 
-fn enc(s: &str) -> String {
+pub fn enc(s: &str) -> String {
     js_sys::encode_uri_component(s).as_string().unwrap_or_default()
 }
 
@@ -1335,4 +1335,45 @@ pub async fn work_todo_remove(id: String, todo: String) -> Result<WorkItem, Stri
 /// A session's first message for a to-do, and the session to start from.
 pub async fn work_todo_start(id: String, todo: String) -> Result<c6_api::work::TodoStart, String> {
     json(Request::get(&format!("/api/v1/work/{id}/todos/{todo}/start")).send().await).await
+}
+
+// --- Documents (docs/docs.md) ------------------------------------------------
+
+pub async fn docs_list(q: &c6_api::docs::DocQuery) -> Result<Vec<c6_api::docs::DocSummary>, String> {
+    let mut params = Vec::new();
+    for (k, v) in [("kind", &q.kind), ("q", &q.q), ("label", &q.label), ("by", &q.by)] {
+        if let Some(v) = v {
+            params.push(format!("{k}={}", enc(v)));
+        }
+    }
+    json(Request::get(&format!("/api/v1/docs?{}", params.join("&"))).send().await).await
+}
+
+pub async fn doc_get(id: String) -> Result<c6_api::docs::Doc, String> {
+    json(Request::get(&format!("/api/v1/docs/{}", enc(&id))).send().await).await
+}
+
+pub async fn doc_create(n: &c6_api::docs::DocNew) -> Result<c6_api::docs::Doc, String> {
+    send_json(Request::post("/api/v1/docs"), n).await
+}
+
+pub async fn doc_ops(id: String, b: &c6_api::docs::DocBatch) -> Result<c6_api::docs::DocApplied, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/ops", enc(&id))), b).await
+}
+
+pub async fn doc_patch(id: String, p: &c6_api::docs::DocPatch) -> Result<c6_api::docs::Doc, String> {
+    send_json(Request::patch(&format!("/api/v1/docs/{}", enc(&id))), p).await
+}
+
+/// A small read of a document (`view=outline|block|…`, as a query).
+pub async fn doc_read(id: &str, query: &str) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/docs/{}/read?{query}", enc(id))).send().await).await
+}
+
+pub async fn doc_history(id: String) -> Result<Vec<c6_api::docs::DocVersion>, String> {
+    json(Request::get(&format!("/api/v1/docs/{}/history", enc(&id))).send().await).await
+}
+
+pub async fn doc_restore(id: String, r: &c6_api::docs::DocRestore) -> Result<c6_api::docs::DocApplied, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/restore", enc(&id))), r).await
 }

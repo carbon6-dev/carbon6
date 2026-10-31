@@ -194,6 +194,14 @@ async fn documents_keep_their_blocks_through_guarded_edits() {
     assert_eq!(get("docs".into()).await.as_array().unwrap().len(), 1);
     assert_eq!(get("docs?by=you".into()).await.as_array().unwrap().len(), 1);
     assert_eq!(get("docs?by=session".into()).await.as_array().unwrap().len(), 0);
+    // Work refers to a document by doc:<id>, with its title as it is now.
+    let w = ok(send(M::POST, "work".into(), json!({"title": "Ship realms", "attach": [{"ref": format!("doc:{id}")}]})).await).await;
+    assert_eq!(w["live"][0]["title"], "Realms for the team");
+    let held = get(format!("work/of?ref=doc:{id}")).await;
+    assert_eq!(held[0]["id"], w["id"]);
+    ok(send(M::POST, format!("work/{}/attach", w["id"].as_str().unwrap()), json!({"ref": format!("doc:{did}")})).await).await;
+    let w = get(format!("work/{}", w["id"].as_str().unwrap())).await;
+    assert_eq!(w["live"][1]["state"], "gone", "a deleted document");
     // Root keeps no documents.
     assert_eq!(get("docs?realm=root".into()).await["error"], "documents live in a realm: root keeps none");
 }

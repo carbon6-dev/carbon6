@@ -156,14 +156,14 @@ fn check_title(t: &str) -> anyhow::Result<String> {
 /// `chat:`, `decision:`, or an http(s) URL.
 fn check_ref(r: &str) -> anyhow::Result<String> {
     let r = r.trim();
-    let ok = ["session:", "request:", "thread:", "chat:", "decision:", "http://", "https://"]
+    let ok = ["session:", "request:", "thread:", "chat:", "decision:", "doc:", "http://", "https://"]
         .iter()
         .any(|p| r.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
         && r.len() <= 2000
         && !r.contains(char::is_whitespace);
     if !ok {
         return Err(bad_request(format!(
-            "{r:?}: attach session:<id>, request:<id>, thread:<account>:<thread>, chat:<workspace>:<channel>, decision:<id> or a URL"
+            "{r:?}: attach session:<id>, request:<id>, thread:<account>:<thread>, chat:<workspace>:<channel>, decision:<id>, doc:<id> or a URL"
         )));
     }
     Ok(r.to_owned())
@@ -619,6 +619,15 @@ async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(
         l.title = d.get("title");
         l.state = d.get("state");
         l.at = d.get("updated_at");
+    }
+    if let Some(id) = a.reference.strip_prefix("doc:") {
+        match crate::docs::title_of(st, realm, id).await {
+            Some((title, _, at)) => {
+                l.title = title;
+                l.at = at;
+            }
+            None => l.state = "gone".into(),
+        }
     }
     if l.title.is_empty() {
         l.title = a.reference.clone();
@@ -1506,7 +1515,15 @@ mod tests {
 
     #[test]
     fn refs_name_what_they_point_at() {
-        for ok in ["session:abc", "request:12", "thread:me@x.com:t1", "chat:T1:C2:1.2", "decision:4", "https://github.com/o/r/pull/1"] {
+        for ok in [
+            "doc:01a18f50",
+            "session:abc",
+            "request:12",
+            "thread:me@x.com:t1",
+            "chat:T1:C2:1.2",
+            "decision:4",
+            "https://github.com/o/r/pull/1",
+        ] {
             assert!(check_ref(ok).is_ok(), "{ok}");
         }
         for bad in ["", "session:", "ftp://x", "a b", "notes"] {

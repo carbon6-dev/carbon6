@@ -75,6 +75,9 @@ pub async fn realm_for(st: &HeadState, caller: &Caller, asked: Option<&str>) -> 
 
 /// The realm's knowledge database.
 async fn pool(st: &HeadState, realm: &str) -> anyhow::Result<sqlx::SqlitePool> {
+    if !crate::memex::has_memex(realm) {
+        return Err(bad_request("documents live in a realm: root keeps none"));
+    }
     let m = crate::knowledge::get(st).ok_or_else(|| anyhow::anyhow!("the knowledge store is not open"))?;
     Ok(m.of_realm(realm).await?.store.pool.clone())
 }
@@ -384,16 +387,16 @@ pub async fn get(st: &HeadState, realm: &str, id: &str) -> anyhow::Result<Doc> {
     Ok(doc_of(realm, id, &h))
 }
 
-/// A document's title (for refs).
-pub async fn title_of(st: &HeadState, realm: &str, id: &str) -> Option<(String, String)> {
+/// A document's title, kind and when it last changed (for refs).
+pub async fn title_of(st: &HeadState, realm: &str, id: &str) -> Option<(String, String, i64)> {
     let pool = pool(st, realm).await.ok()?;
-    sqlx::query("SELECT title, kind FROM docs WHERE id = ? AND deleted_at IS NULL")
+    sqlx::query("SELECT title, kind, updated_at FROM docs WHERE id = ? AND deleted_at IS NULL")
         .bind(id)
         .fetch_optional(&pool)
         .await
         .ok()
         .flatten()
-        .map(|r| (r.get("title"), r.get("kind")))
+        .map(|r| (r.get("title"), r.get("kind"), r.get("updated_at")))
 }
 
 pub async fn patch(st: &HeadState, realm: &str, id: &str, p: &DocPatch, by: &str) -> anyhow::Result<Doc> {
@@ -807,10 +810,4 @@ pub fn settling(st: &HeadState) -> bool {
 /// Whether the caller may see a live change.
 pub fn visible_to(caller: &Caller, c: &DocChange) -> bool {
     caller.sees(&c.realm)
-}
-
-/// The document a `doc:<id>` ref names, if it's in the realm.
-pub async fn resolve(st: &HeadState, realm: &str, reference: &str) -> Option<(String, String)> {
-    let id = reference.strip_prefix("doc:")?;
-    title_of(st, realm, id).await
 }

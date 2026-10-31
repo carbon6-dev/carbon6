@@ -14,6 +14,7 @@ mod compose;
 mod contacts;
 mod decisions;
 mod details;
+mod docs;
 mod explorer;
 mod files;
 mod fleet;
@@ -140,6 +141,7 @@ fn Main() -> impl IntoView {
                             </Go>
                             <decisions::DecisionLink class=NAV />
                             <work::WorkLink class=NAV />
+                            <docs::DocsLink class=NAV />
                             <NavLink to=View::Analytics label="Analytics" />
                             <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
                             <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
@@ -252,6 +254,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <decisions::DecisionLink class=MENU />
                     <work::WorkLink class=MENU />
+                    <docs::DocsLink class=MENU />
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
                     <Go to=View::Workers class=MENU>"Workers"</Go>
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>

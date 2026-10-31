@@ -1207,7 +1207,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
                 <div class="space-y-2">
                     {(!s.thinking.is_empty()).then(|| view! { <Thinking text=s.thinking.clone() open=true /> })}
-                    {(!s.text.is_empty()).then(|| view! { <div class="md" inner_html=markdown::to_html(&s.text)></div> })}
+                    {(!s.text.is_empty()).then(|| view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=markdown::to_html(&s.text)></div> })}
                 </div>
             }))}
             {move || (running.get() && streaming.with(|s| s.text.is_empty() && s.thinking.is_empty())).then(|| view! {
@@ -2006,7 +2006,7 @@ fn render_event(
                         ContentBlock::ServerTool { label } => view! {
                             <p class="flex items-center gap-2 text-xs text-zinc-500"><span>"⌕"</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
-                        ContentBlock::Text { text } => view! { <div class="md" inner_html=markdown::to_html(text)></div> }.into_any(),
+                        ContentBlock::Text { text } => view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=markdown::to_html(text)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
                             let (out_id, res_id) = (id.clone(), id.clone());

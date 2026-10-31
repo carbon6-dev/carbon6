@@ -83,6 +83,7 @@ fn kind_mark(reference: &str) -> &'static str {
         "thread" => "✉",
         "chat" => "💬",
         "decision" => "?",
+        "doc" => "▤",
         _ => "↗",
     }
 }
@@ -402,7 +403,7 @@ fn attached_view(reference: &str) -> Option<View> {
     } else if reference.starts_with("decision:") {
         Some(View::Decisions)
     } else {
-        None
+        reference.strip_prefix("doc:").map(|id| View::Docs { id: id.to_owned() })
     }
 }
 

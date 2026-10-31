@@ -159,7 +159,7 @@ records_tool!(
     Concurrency::Shared,
     "The user's work this session belongs to (docs/work.md): what they mean to finish, what's attached, its to-dos, and where it \
      stands. action get (default) shows it. action attach adds something you made or found that belongs to it, so the user sees it \
-     with the work: ref (a URL, such as a pull request, CI run or document), title, status (running, waiting, done or failed, as you \
+     with the work: ref (a URL, such as a pull request or CI run, or doc:<id> for a carbon6 document), title, status (running, waiting, done or failed, as you \
      last saw it) and detail (one line). Attach again to update its status. action todo adds a to-do the user can start as a session \
      later: text (one line) and prompt (what that session is told; make it stand alone). action todo_done ticks one off when it is \
      done: id and evidence (one line).",

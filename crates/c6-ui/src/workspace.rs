@@ -87,6 +87,11 @@ pub enum View {
         #[serde(default)]
         id: String,
     },
+    /// Docs and decks (docs/docs.md); with an id, that document.
+    Docs {
+        #[serde(default)]
+        id: String,
+    },
     /// Collections; one by name, or (empty) the list.
     Collections {
         #[serde(default)]
@@ -190,6 +195,8 @@ impl View {
             View::Decisions => "/decisions".into(),
             View::Work { id } if id.is_empty() => "/work".into(),
             View::Work { id } => format!("/work/{id}"),
+            View::Docs { id } if id.is_empty() => "/docs".into(),
+            View::Docs { id } => format!("/docs/{id}"),
             View::Collections { name } if name.is_empty() => "/collections".into(),
             View::Collections { name } => format!("/collections/{name}"),
             View::Realms => "/realms".into(),
@@ -287,6 +294,8 @@ impl View {
             ["decisions"] | ["todos"] => View::Decisions,
             ["work"] => View::Work { id: String::new() },
             ["work", id] => View::Work { id: (*id).to_owned() },
+            ["docs"] => View::Docs { id: String::new() },
+            ["docs", id] => View::Docs { id: (*id).to_owned() },
             ["collections"] => View::Collections { name: String::new() },
             ["collections", name] => View::Collections { name: (*name).to_owned() },
             ["views", name] => View::App { name: (*name).to_owned(), record: String::new() },
@@ -338,6 +347,8 @@ impl View {
             View::Decisions => "Decisions".into(),
             View::Work { id } if id.is_empty() => "Work".into(),
             View::Work { .. } => "Work item".into(),
+            View::Docs { id } if id.is_empty() => "Docs".into(),
+            View::Docs { .. } => "Document".into(),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
             View::Realms => "Realms".into(),
@@ -354,6 +365,7 @@ impl View {
         !matches!(self, View::Session { .. } | View::Worker { .. })
             && !matches!(self, View::Collections { name } if !name.is_empty())
             && !matches!(self, View::Work { id } if !id.is_empty())
+            && !matches!(self, View::Docs { id } if !id.is_empty())
             && !matches!(self, View::App { record, .. } if !record.is_empty())
     }
 }
@@ -1817,6 +1829,8 @@ fn render_view(view: View) -> AnyView {
                     View::Decisions => view! { <crate::decisions::DecisionsPage /> }.into_any(),
                     View::Work { id } if id.is_empty() => view! { <crate::work::WorkPage /> }.into_any(),
                     View::Work { id } => view! { <crate::work::WorkItemPage id=id.clone() /> }.into_any(),
+                    View::Docs { id } if id.is_empty() => view! { <crate::docs::DocsPage /> }.into_any(),
+                    View::Docs { id } => view! { <crate::docs::DocPage id=id.clone() /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
                     View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
                     View::Realms => view! { <crate::explorer::RealmsMap /> }.into_any(),

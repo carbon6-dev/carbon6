@@ -6,7 +6,19 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
 pub fn to_html(src: &str) -> String {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let events = Parser::new_ext(src, opts).map(|ev| match ev {
+    // `doc:<id>` in text links to that document (docs/docs.md §12), not
+    // inside code or another link.
+    let mut plain = 0i32;
+    let events = Parser::new_ext(src, opts).flat_map(move |ev| {
+        match &ev {
+            Event::Start(Tag::Link { .. } | Tag::CodeBlock(_)) => plain += 1,
+            Event::End(pulldown_cmark::TagEnd::Link | pulldown_cmark::TagEnd::CodeBlock) => plain -= 1,
+            Event::Text(t) if plain == 0 && t.contains("doc:") => return doc_links(t),
+            _ => {}
+        }
+        vec![ev]
+    });
+    let events = events.map(|ev| match ev {
         Event::Html(h) | Event::InlineHtml(h) => Event::Text(h),
         Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
             Event::Start(Tag::Link { link_type, dest_url: safe_url(dest_url), title, id })
@@ -18,6 +30,35 @@ pub fn to_html(src: &str) -> String {
     });
     let mut out = String::new();
     html::push_html(&mut out, events);
+    out
+}
+
+/// Text with each `doc:<uuid>` as a link to `/docs/<uuid>`.
+fn doc_links(t: &str) -> Vec<Event<'static>> {
+    let mut out = Vec::new();
+    let mut rest = t;
+    while let Some(i) = rest.find("doc:") {
+        let id: String = rest[i + 4..].chars().take_while(|c| c.is_ascii_hexdigit() || *c == '-').collect();
+        if id.len() != 36 {
+            out.push(Event::Text(CowStr::from(rest[..i + 4].to_owned())));
+            rest = &rest[i + 4..];
+            continue;
+        }
+        out.push(Event::Text(CowStr::from(rest[..i].to_owned())));
+        let tag = Tag::Link {
+            link_type: pulldown_cmark::LinkType::Inline,
+            dest_url: CowStr::from(format!("/docs/{id}")),
+            title: CowStr::from("Open the document"),
+            id: CowStr::from(""),
+        };
+        out.push(Event::Start(tag));
+        out.push(Event::Text(CowStr::from(format!("doc:{}", &id[..8]))));
+        out.push(Event::End(pulldown_cmark::TagEnd::Link));
+        rest = &rest[i + 4 + 36..];
+    }
+    if !rest.is_empty() {
+        out.push(Event::Text(CowStr::from(rest.to_owned())));
+    }
     out
 }
 
@@ -50,6 +91,16 @@ mod tests {
         assert!(!out.contains("<script>"));
         assert!(out.contains("&lt;script&gt;"));
         assert!(out.contains("<strong>b</strong>"));
+    }
+
+    #[test]
+    fn doc_refs_link_to_documents() {
+        let out = to_html("See doc:01a18f50-9f48-7567-8070-43e1f17ba642 now. `doc:01a18f50-9f48-7567-8070-43e1f17ba642` doc:short");
+        assert!(
+            out.contains("<a href=\"/docs/01a18f50-9f48-7567-8070-43e1f17ba642\" title=\"Open the document\">doc:01a18f50</a> now."),
+            "{out}"
+        );
+        assert!(out.contains("<code>doc:01a18f50-9f48-7567-8070-43e1f17ba642</code>") && out.contains("doc:short"), "{out}");
     }
 
     #[test]
