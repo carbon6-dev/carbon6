@@ -26,6 +26,22 @@ fn tokens(n: u64) -> String {
     }
 }
 
+/// How much of the prompt came from the provider's cache, and whether that
+/// is low enough to look at: an agent loop resends its whole conversation on
+/// each call, so it should mostly be cached once it has some size.
+fn cached(r: &UsageRow) -> (String, bool) {
+    let prompt = r.input + r.cache_read;
+    if prompt == 0 {
+        return ("–".into(), false);
+    }
+    let share = r.cache_read as f64 / prompt as f64;
+    (format!("{:.0}%", share * 100.0), prompt >= LOW_CACHE_MIN_PROMPT && share < LOW_CACHE_SHARE)
+}
+
+/// Below this share of cached input a row is marked, once it has this much.
+const LOW_CACHE_SHARE: f64 = 0.6;
+const LOW_CACHE_MIN_PROMPT: u64 = 1_000_000;
+
 #[component]
 pub fn UsagePage() -> impl IntoView {
     let filter = crate::labels::use_filter().0;
@@ -160,6 +176,7 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
                             <th class="pb-1 text-left font-normal"></th>
                             <th class="pb-1 text-right font-normal">"Calls"</th>
                             <th class="pb-1 text-right font-normal">"In"</th>
+                            <th class="pb-1 text-right font-normal" title="Of the input, how much the provider served from its prompt cache. Low on a long session means each call pays for the whole conversation again.">"Cached"</th>
                             <th class="pb-1 text-right font-normal">"Out"</th>
                             <th class="pb-1 text-right font-normal">"Cost"</th>
                         </tr></thead>
@@ -171,11 +188,14 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
                                 } else {
                                     view! { <span class="font-mono">{name}</span> }.into_any()
                                 };
+                                let (share, low) = cached(&r);
                                 view! {
                                     <tr class="border-t border-zinc-100 dark:border-zinc-800/60">
                                         <td class="max-w-[14rem] truncate py-1 pr-2">{cell}</td>
                                         <td class="py-1 text-right tabular-nums">{r.calls}</td>
                                         <td class="py-1 text-right tabular-nums">{tokens(r.input + r.cache_read)}</td>
+                                        <td class=if low { "py-1 text-right tabular-nums font-medium text-amber-600 dark:text-amber-400" } else { "py-1 text-right tabular-nums" }
+                                            title=if low { "Little of this input was cached" } else { "" }>{share}</td>
                                         <td class="py-1 text-right tabular-nums">{tokens(r.output)}</td>
                                         <td class="py-1 text-right tabular-nums">{if r.calls == r.unpriced_calls { "—".into() } else { usd(r.cost) }}</td>
                                     </tr>
@@ -186,5 +206,23 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
                 }.into_any()
             }}
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(input: u64, cache_read: u64) -> UsageRow {
+        UsageRow { input, cache_read, ..Default::default() }
+    }
+
+    #[test]
+    fn cached_share_marks_large_uncached_input() {
+        assert_eq!(cached(&row(0, 0)), ("–".into(), false));
+        assert_eq!(cached(&row(465_000_000, 343_000_000)), ("42%".into(), true), "the case that used up a plan's week");
+        assert_eq!(cached(&row(80_000_000, 728_000_000)), ("90%".into(), false));
+        // Small amounts aren't worth a mark, whatever their share.
+        assert_eq!(cached(&row(900_000, 0)), ("0%".into(), false));
     }
 }

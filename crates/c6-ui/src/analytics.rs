@@ -306,7 +306,7 @@ fn Models(rows: Vec<ActivityRow>) -> impl IntoView {
                     <thead class="text-xs text-zinc-500"><tr>
                         <th class="py-1 text-left font-normal">"Model"</th><th class="w-32"></th><th class=TH>"Time"</th>
                         <th class=TH>"Calls"</th><th class=TH>"Per call"</th><th class=TH>"Output/s"</th>
-                        <th class=TH>"Tokens in · out"</th><th class=TH>"Cost"</th>
+                        <th class=TH>"Tokens in · out"</th><th class=TH title="Of the input, how much the provider served from its prompt cache">"Cached"</th><th class=TH>"Cost"</th>
                     </tr></thead>
                     <tbody>
                         {rows.into_iter().map(|r| view! {
@@ -318,6 +318,7 @@ fn Models(rows: Vec<ActivityRow>) -> impl IntoView {
                                 <td class=TD>{r.model_ms.checked_div(r.calls).map_or_else(|| "–".into(), dur)}</td>
                                 <td class=TD>{if r.model_ms == 0 { "–".into() } else { format!("{:.0} tok", r.output as f64 * 1000.0 / r.model_ms as f64) }}</td>
                                 <td class=TD>{format!("{} · {}", tokens(r.input + r.cache_read), tokens(r.output))}</td>
+                                <td class=TD>{pct(r.cache_read, r.input + r.cache_read)}</td>
                                 <td class=TD>{usd(r.cost)}</td>
                             </tr>
                         }).collect_view()}

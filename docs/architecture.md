@@ -286,7 +286,7 @@ trait ModelClient {
   - Volatile context (date, git status) goes in the first user message, not the system prompt.
   - MCP tool schemas are frozen for the life of a session.
 - **Anthropic.** `cache_control` breakpoints go on the tools and system block, plus a rolling breakpoint on the latest message (and the one before it, staying within the 4-breakpoint limit). Thinking blocks are kept, with their signatures, across tool-use loops. Extended or adaptive thinking and effort are set per model.
-- **OpenAI Responses.** `store: false` plus `include: ["reasoning.encrypted_content"]`, so reasoning carries over statelessly. That way any worker can rebuild any session. `prompt_cache_key = session_id`, and `reasoning.effort` is set per session.
+- **OpenAI Responses.** `store: false` plus `include: ["reasoning.encrypted_content"]`, so reasoning carries over statelessly. That way any worker can rebuild any session. `prompt_cache_key = session_id`, and `reasoning.effort` is set per session. ChatGPT-plan requests also send the session id as a `session_id` header, as Codex does: without it the backend served about half of a session's calls from a cache holding only the instructions (42% of input cached over four days of real use), and each of those calls paid for the whole conversation again. The Usage page's **Cached** column shows the share per day, model, connection, label and session, and marks large amounts below 60%; Analytics shows it per model.
 - **Chat Completions.** Prefix stability only. Provider-specific extras, such as reasoning fields on local servers, go through `extra_body` set in the model registry.
 - **Usage accounting.** Cache read and write tokens are recorded in `Usage` events, and the UI shows the cache hit rate per session.
 

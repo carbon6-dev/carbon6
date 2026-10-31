@@ -41,6 +41,20 @@ impl OpenAiResponses {
         Self { attempts: 1, ..self }
     }
 
+    /// ChatGPT's backend keeps a conversation's prompt cache on one machine
+    /// only when told which conversation a request belongs to, as Codex does
+    /// with `session_id`; `prompt_cache_key` alone left about half of the
+    /// calls of a session missing everything but the instructions.
+    pub fn request_headers(&self, req: &ModelRequest) -> HashMap<String, String> {
+        let mut headers = self.headers.clone();
+        if self.plan
+            && let Some(k) = req.cache_key.as_deref().filter(|k| !k.is_empty())
+        {
+            headers.entry("session_id".into()).or_insert_with(|| k.to_owned());
+        }
+        headers
+    }
+
     pub fn request_body(&self, req: &ModelRequest) -> Value {
         let mut body = json!({
             "model": req.model,
@@ -137,7 +151,8 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
 impl ModelClient for OpenAiResponses {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
-        let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &self.headers, &body, self.attempts).await?;
+        let headers = self.request_headers(req);
+        let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &headers, &body, self.attempts).await?;
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
             loop {
@@ -378,5 +393,35 @@ mod tests {
         assert_eq!(types, ["message", "reasoning", "function_call", "function_call_output"]);
         assert_eq!(b["prompt_cache_key"], "sess");
         assert_eq!(b["tools"][1]["type"], "web_search");
+    }
+
+    #[test]
+    fn plan_requests_name_their_conversation() {
+        let req = ModelRequest {
+            model: "gpt-5.5".into(),
+            system: String::new(),
+            messages: vec![Message::user_text("go")],
+            tools: vec![],
+            max_output_tokens: None,
+            cache_key: Some("sess".into()),
+            effort: None,
+            web_search: false,
+            json: false,
+        };
+        let plan = OpenAiResponses::new("https://chatgpt.example/backend", "tok", HashMap::new(), true).unwrap();
+        let h = plan.request_headers(&req);
+        assert_eq!(h.get("session_id").map(String::as_str), Some("sess"));
+        assert_eq!(h.get("authorization").map(String::as_str), Some("Bearer tok"));
+        // Nothing to name: no header, rather than an empty one.
+        assert!(!plan.request_headers(&ModelRequest { cache_key: Some(String::new()), ..req.clone() }).contains_key("session_id"));
+        assert!(!plan.request_headers(&ModelRequest { cache_key: None, ..req.clone() }).contains_key("session_id"));
+        // A connection's own header wins.
+        let own =
+            OpenAiResponses::new("https://chatgpt.example/backend", "tok", HashMap::from([("session_id".into(), "mine".into())]), true)
+                .unwrap();
+        assert_eq!(own.request_headers(&req)["session_id"], "mine");
+        // API keys route by prompt_cache_key alone.
+        let api = OpenAiResponses::new("https://api.openai.com/v1", "tok", HashMap::new(), false).unwrap();
+        assert!(!api.request_headers(&req).contains_key("session_id"));
     }
 }
