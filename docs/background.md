@@ -163,9 +163,9 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 
 ### UI
 
-- **Recipient (built):** the message shows as a bubble with "✉ from *title*" above it, which opens that session. Its prompt (with the wrapper) is under the bubble, as for an expanded command.
-- **Sender (later):** the call shows as an ordinary tool card for now; a card "→ sent to *title* ↗" is to come.
-- **Later:** search and the session list shouldn't count session messages as your input.
+- **Recipient:** the message shows as a bubble with "✉ from *title*" above it, which opens that session. Its prompt (with the wrapper) is under the bubble, as for an expanded command.
+- **Sender:** the call's card reads "→ sent to *title* ↗" (the title from its result), which opens the session; the message is in the card.
+- **Attributed, never yours:** the activity preview ("✉ *title*: …"), a subagent's peek, the Markdown export ("## ✉ From *title*"), search (its own kind, "message from a session"), suggested next messages (not counted as yours) and the memex's reading of the session ("a message from session *title*").
 
 ## 7. Settings (no new strings in code)
 
@@ -190,7 +190,7 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Cleanup after a worker crash, and notices for lost Claude Code tasks, followed on 2026-10-31. (The idle time became a setting in step 3.)
 2. **carbon6's notices and background tools under Claude Code (§4).** Built 2026-10-31: bridge registration per process (in step 1); `Task` and `SendMessage` with `run_in_background`, plus `TaskOutput` and `TaskStop`. Test: a background subagent's call returns at once, its report reaches the same process as a message, and that message's turn is logged as a `task-notification`.
 3. **Notices that are never lost (§5).** Built 2026-10-31: `NoticeQueued`, re-delivery on load, the limit's timer, and both settings. Tests: a log's pending notices and automatic turns (`notice_tests`); a notice held by the limit survives a worker restart and reaches the agent once, with your next message (`it/notices.rs`). Left for later: the head treating `NoticeQueued` as applied (step 4) and the held-notices pill.
-4. **Session messages (§6).** Built 2026-10-31: the proto fields, `session.message` and `session.sessions` in `fabric.rs`, the tools (also over the MCP bridge), the head's checks, the prompt and the recipient's bubble. Test (`it/messages.rs`): a session lists the realm's sessions and messages one on another worker, which wakes with it as a message from that session; its reply, beyond a chain limit of 1, is refused. Left for later: the sender's card and grants for other realms.
+4. **Session messages (§6).** Built 2026-10-31: the proto fields, `session.message` and `session.sessions` in `fabric.rs`, the tools (also over the MCP bridge), the head's checks, the prompt and the recipient's bubble. Test (`it/messages.rs`): a session lists the realm's sessions and messages one on another worker, which wakes with it as a message from that session; its reply, beyond a chain limit of 1, is refused. The sender's card and attribution followed on 2026-10-31. Left for later: grants for other realms.
 
 ## 10. Decisions (settled 2026-10-30)
 

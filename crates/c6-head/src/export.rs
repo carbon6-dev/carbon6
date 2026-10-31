@@ -17,6 +17,9 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
                 let what = if u.command == "stop-hook" { "Stop hook" } else { "Background task ended" };
                 out.push_str(&format!("\n> **{what}**\n>\n{}\n", u.text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")))
             }
+            Some(Kind::User(u)) if !u.from_session_id.is_empty() => {
+                out.push_str(&format!("\n## ✉ From \"{}\" (session `{}`)\n\n{}\n", u.from_title, u.from_session_id, u.text))
+            }
             Some(Kind::User(u)) if !u.blocked.is_empty() => {
                 out.push_str(&format!("\n## You\n\n~~{}~~\n\n> Blocked by a hook: {}\n", u.text, u.blocked))
             }

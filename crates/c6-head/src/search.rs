@@ -36,7 +36,8 @@ fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
             for a in u.attachments.iter().filter(|a| !a.mime.starts_with("image/")) {
                 text.push_str(&format!("\n\n{}\n{}", a.name, String::from_utf8_lossy(&a.data)));
             }
-            out.push((0, "user", text))
+            // Another session's agent wrote it, not you.
+            out.push((0, if u.from_session_id.is_empty() { "user" } else { "session_message" }, text))
         }
         Some(Kind::Assistant(a)) => {
             for (i, b) in a.blocks.iter().enumerate() {
