@@ -63,7 +63,7 @@ Not goals:
 - **The model is switched in place** with `set_model` at the next turn, so a switch keeps the process and its tasks.
 - **Restart it** when what it was started with changes and no background task would be lost: its conversation, its effort or its hooks (`claude_code::Launch`). While tasks run, the old process carries on.
 - **A handoff to carbon6's own loop** stops the process at once (`Process::stop`). Its tasks are recorded as lost.
-- **The CLI's own wait limit** is set to a day (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, as `MCP_TOOL_TIMEOUT` is for carbon6's tools), so it never kills tasks itself.
+- **The CLI's own wait limit** (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`) applies only once its input is closed (tested 2026-10-31: with input open, a task outlived a 15-second limit and woke the agent). carbon6 closes it only when idle with no tasks, or when the worker is gone, so the limit is set to 5 seconds: a process whose worker crashed stops its tasks and exits instead of working on unread.
 - **The idle time** is the `claude_code_idle_minutes` setting (default 15).
 
 ### Inputs
@@ -90,7 +90,8 @@ Not goals:
 
 - **Esc** sends the interrupt request. If no `result` arrives within 5 s, the turn falls back to SIGINT, then SIGKILL, of the process group, and marks the native tasks lost.
 - **Stopping one task.** The Tasks control's Stop works for Claude Code's tasks too: the worker sends `stop_task` with the CLI's id, and the task reads "stopped by you". This replaces the planned Stop all.
-- **Worker restart (not built yet).** The plan: journal the process group when the process starts; `recover()` kills that group if it is still alive and marks its native tasks lost. Today the process dies with a worker that stops cleanly (`kill_on_drop`). After a crash, its stdin closes, so it ends once its tasks do. Either way, the conversation resumes on the next input.
+- **Worker restart.** A running process is recorded in `<state>/claude/<conversation>.pid` (its process group and conversation; `Process::record_in`), and the record goes when the process does. At startup, before any session resumes, `recover()` stops every recorded process that is still a `claude` running that conversation (`sweep_orphans`; a reused process id is left alone), SIGINT then SIGKILL. Its native tasks were recorded as started without an end, so the session's reload records them lost, and the agent is told (below). The conversation resumes on the next input. A process dropped without being closed takes its process group with it.
+- **Lost Claude Code tasks are told to the agent.** Claude Code delivers its own tasks' notices, except for a task lost with its process (a worker restart, a crash of the CLI, a handoff). Then carbon6 sends the agent a notice naming the task, saying that files it changed stay and that it may need redoing. The notice wakes an idle session, within the hourly limit.
 
 ### carbon6's tools and notices
 
@@ -186,7 +187,7 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 
 ## 9. Steps
 
-1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Left for later: cleanup at recovery after a worker crash. (The idle time became a setting in step 3.)
+1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Cleanup after a worker crash, and notices for lost Claude Code tasks, followed on 2026-10-31. (The idle time became a setting in step 3.)
 2. **carbon6's notices and background tools under Claude Code (§4).** Built 2026-10-31: bridge registration per process (in step 1); `Task` and `SendMessage` with `run_in_background`, plus `TaskOutput` and `TaskStop`. Test: a background subagent's call returns at once, its report reaches the same process as a message, and that message's turn is logged as a `task-notification`.
 3. **Notices that are never lost (§5).** Built 2026-10-31: `NoticeQueued`, re-delivery on load, the limit's timer, and both settings. Tests: a log's pending notices and automatic turns (`notice_tests`); a notice held by the limit survives a worker restart and reaches the agent once, with your next message (`it/notices.rs`). Left for later: the head treating `NoticeQueued` as applied (step 4) and the held-notices pill.
 4. **Session messages (§6).** Built 2026-10-31: the proto fields, `session.message` and `session.sessions` in `fabric.rs`, the tools (also over the MCP bridge), the head's checks, the prompt and the recipient's bubble. Test (`it/messages.rs`): a session lists the realm's sessions and messages one on another worker, which wakes with it as a message from that session; its reply, beyond a chain limit of 1, is refused. Left for later: the sender's card and grants for other realms.
