@@ -153,7 +153,61 @@ pub(crate) struct Process {
     /// When its last turn ended (or it started).
     idle_since: tokio::time::Instant,
     registration: Option<crate::mcp_bridge::Registration>,
+    /// Where its process group is recorded while it runs, so a worker that
+    /// starts after a crash can stop it ([`sweep_orphans`]).
+    pidfile: Option<PathBuf>,
     _output_root: Option<OutputRoot>,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Its background tasks are in its process group: none outlive it.
+        if let (Ok(None), Some(pg)) = (self.child.try_wait(), self.pgid) {
+            let _ = killpg(pg, Signal::SIGKILL);
+        }
+        if let Some(p) = &self.pidfile {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Stops the Claude Code processes a previous worker left running (it
+/// crashed, so their input closed and nobody reads them), from the records
+/// in `dir`. A record whose process is gone, or is now some other program,
+/// is only removed.
+pub async fn sweep_orphans(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "pid")
+            && let Some((pgid, conversation)) = std::fs::read_to_string(&path).ok().and_then(|s| {
+                let mut lines = s.lines();
+                Some((lines.next()?.trim().parse::<i32>().ok()?, lines.next()?.trim().to_owned()))
+            })
+            && pgid > 0
+            && is_claude_for(pgid, &conversation)
+        {
+            warn!(pgid, %conversation, "stopping a Claude Code process left by the previous worker");
+            let pg = Pid::from_raw(pgid);
+            let _ = killpg(pg, Signal::SIGINT);
+            for _ in 0..30 {
+                if nix::sys::signal::kill(pg, None).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = killpg(pg, Signal::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Process `pid` is a Claude Code CLI running `conversation` (not a
+/// process that has since been given the same id).
+fn is_claude_for(pid: i32, conversation: &str) -> bool {
+    let Ok(out) = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output() else { return false };
+    let line = String::from_utf8_lossy(&out.stdout);
+    out.status.success() && !conversation.is_empty() && line.contains("claude") && line.contains(conversation)
 }
 
 impl Process {
@@ -197,9 +251,11 @@ impl Process {
             // A subagent may work for a long time: Claude Code waits for it.
             cmd.args(["--mcp-config", &m.mcp_config()]).env("MCP_TOOL_TIMEOUT", "86400000");
         }
-        // In print mode the CLI stops waiting for background tasks after
-        // ten minutes by default, and kills them.
-        cmd.env("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "86400000");
+        // Once its input closes, the CLI waits this long for its background
+        // tasks, then stops them. Its input closes only when it is idle with
+        // no tasks, or when the worker is gone: then nobody reads it, so it
+        // should not go on (docs/background.md §4).
+        cmd.env("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "5000");
         cmd.current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).kill_on_drop(true);
         let mut child = cmd.spawn()?;
         let pgid = child.id().map(|id| Pid::from_raw(id as i32));
@@ -253,12 +309,23 @@ impl Process {
             notified: Vec::new(),
             idle_since: tokio::time::Instant::now(),
             registration: mcp,
+            pidfile: None,
             _output_root: output_root,
         })
     }
 
     pub fn launch(&self) -> &Launch {
         &self.launch
+    }
+
+    /// Records its process group in `dir` while it runs.
+    pub fn record_in(&mut self, dir: &Path) {
+        let Some(pg) = self.pgid else { return };
+        let path = dir.join(format!("{}.pid", self.launch.conversation));
+        match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, format!("{pg}\n{}\n", self.launch.conversation))) {
+            Ok(()) => self.pidfile = Some(path),
+            Err(e) => warn!(%e, "cannot record the Claude Code process"),
+        }
     }
 
     /// carbon6's tools it calls from now on belong to the turn `cancel` stops.
@@ -980,6 +1047,7 @@ mod tests {
     /// which tests running beside them read).
     pub(super) static BIN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -1504,5 +1572,41 @@ done
         let Some(session_event::Kind::User(u)) = &events[5].kind else { panic!() };
         assert_eq!((u.command.as_str(), u.text.as_str()), ("task-notification", "Build finished"));
         p.close().await;
+    }
+
+    /// A worker that starts after a crash stops the Claude Code processes the
+    /// last one recorded, but not a process that merely has the same id now.
+    #[tokio::test]
+    async fn orphans_are_stopped_but_not_strangers() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = dir.path().join("claude");
+        let bin = script(dir.path(), "claude-orphan", "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nwhile true; do sleep 0.1; done\n");
+        c6_testkit::runnable(&bin, &["--version"]).await;
+        let orphan = std::process::Command::new(&bin).args(["--resume", "conv-1"]).process_group(0).spawn().unwrap();
+        let mut stranger = std::process::Command::new("sleep").arg("300").process_group(0).spawn().unwrap();
+        std::fs::create_dir_all(&records).unwrap();
+        std::fs::write(records.join("conv-1.pid"), format!("{}\nconv-1\n", orphan.id())).unwrap();
+        std::fs::write(records.join("conv-2.pid"), format!("{}\nconv-2\n", stranger.id())).unwrap();
+        let mut orphan = orphan;
+        sweep_orphans(&records).await;
+        assert!(orphan.wait().unwrap().signal().is_some(), "the orphan is stopped");
+        assert!(stranger.try_wait().unwrap().is_none(), "another program with a recorded id is left alone");
+        assert_eq!(std::fs::read_dir(&records).unwrap().count(), 0, "the records are gone");
+        stranger.kill().unwrap();
+        let _ = stranger.wait();
+    }
+
+    /// While it runs, a process is recorded; once it is gone, so is the record.
+    #[tokio::test]
+    async fn a_running_process_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = dir.path().join("claude");
+        let bin = live_claude(dir.path());
+        let mut p = spawn(&bin, dir.path(), "conv-9", false, None);
+        p.record_in(&records);
+        let line = std::fs::read_to_string(records.join("conv-9.pid")).unwrap();
+        assert!(line.ends_with("\nconv-9\n"), "{line:?}");
+        p.close().await;
+        assert!(!records.join("conv-9.pid").exists());
     }
 }

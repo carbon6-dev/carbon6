@@ -349,8 +349,16 @@ impl SessionManager {
         }
     }
 
+    /// Where running Claude Code processes are recorded.
+    pub(crate) fn claude_dir(&self) -> PathBuf {
+        self.state_dir.join("claude")
+    }
+
     /// Closes turns left open by a crash or kill.
     pub async fn recover(&self) -> anyhow::Result<()> {
+        // Claude Code processes the previous worker left go first: their
+        // sessions resume their conversations in processes of their own.
+        crate::claude_code::sweep_orphans(&self.claude_dir()).await;
         for (session_id, last_seq, turn) in self.journal.open_turns().await? {
             warn!(session = %session_id, turn, "closing turn interrupted by worker restart");
             // A subagent the turn was waiting on: its call gets what it did.
@@ -1606,8 +1614,11 @@ impl Actor {
                             notify: ev.notify,
                             pgid: ev.pgid.unwrap_or(0),
                         };
-                        // The agent stopped it itself: nothing to tell it.
-                        let notice = (ev.notify && !matches!(ev.state, c6_tools::TaskState::Started | c6_tools::TaskState::Stopped))
+                        // The agent stopped it itself: nothing to tell it. Claude
+                        // Code tells its agent about its own tasks, except one
+                        // lost with its process: then only we can.
+                        let lost_native = ev.kind == c6_tools::TaskKind::ClaudeCode && ev.state == c6_tools::TaskState::Lost;
+                        let notice = ((ev.notify || lost_native) && !matches!(ev.state, c6_tools::TaskState::Started | c6_tools::TaskState::Stopped))
                             .then(|| task_notice(&record, &ev.output));
                         if let Err(e) = self.task_event(record, notice, running.is_some()).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
@@ -1628,8 +1639,11 @@ impl Actor {
                         } else {
                             crate::subagent::partial(&self.spec, &crate::subagent::digest(&self.journal, &child, "lost", "").await)
                         };
+                        // Claude Code's own tasks died with its process: its agent
+                        // hears it from us.
+                        let tell = notify || kind == "claude_code";
                         let record = BackgroundTask { task_id, kind, description, state: "lost".into(), notify, ..Default::default() };
-                        let notice = notify.then(|| task_notice(&record, &report));
+                        let notice = tell.then(|| task_notice(&record, &report));
                         if let Err(e) = self.task_event(record, notice, running.is_some()).await {
                             error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
                             return;
@@ -2213,7 +2227,7 @@ impl Actor {
             spec: self.spec.clone(),
             started: self.started.clone(),
         });
-        let (mut claude, claude_stdin) = (self.claude.take(), self.claude_stdin.clone());
+        let (mut claude, claude_stdin, claude_dir) = (self.claude.take(), self.claude_stdin.clone(), self.manager.claude_dir());
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             if !claude_code {
@@ -2290,6 +2304,7 @@ impl Actor {
                     &claude_stdin,
                     &register,
                     observer,
+                    &claude_dir,
                     &inbox,
                     &sink,
                     &c,
@@ -2343,6 +2358,8 @@ async fn claude_turn(
     stdin: &crate::claude_code::Stdin,
     register: &(dyn Fn() -> Option<crate::mcp_bridge::Registration> + Send + Sync),
     observer: Arc<crate::claude_code::Observer>,
+    // Where its process is recorded while it runs.
+    claude_dir: &Path,
     inbox: &Arc<Mutex<Inbox>>,
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
@@ -2375,7 +2392,10 @@ async fn claude_turn(
                 return failed("Claude Code (`claude`) is not installed on this worker, or not on its PATH. Install it and sign in with `claude auth login`, or set C6_CLAUDE_BIN.".into()).await;
             };
             match Process::spawn(&bin, launch.clone(), conversation.resume, cwd, model, stdin.clone(), register(), Some(observer.clone())) {
-                Ok(p) => (p, Some(bin)),
+                Ok(mut p) => {
+                    p.record_in(claude_dir);
+                    (p, Some(bin))
+                }
                 Err(e) => return failed(format!("failed to start Claude Code: {e}")).await,
             }
         }
@@ -2390,7 +2410,10 @@ async fn claude_turn(
     {
         drop(p);
         p = match Process::spawn(bin, launch, false, cwd, model, stdin.clone(), register(), Some(observer)) {
-            Ok(p) => p,
+            Ok(mut p) => {
+                p.record_in(claude_dir);
+                p
+            }
             Err(e) => {
                 sink.append(session_event::Kind::Error(ErrorEvent { message: format!("failed to start Claude Code: {e}") })).await?;
                 sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
@@ -2952,6 +2975,16 @@ pub(crate) fn duration_text(secs: u64) -> String {
 }
 
 fn task_notice(t: &BackgroundTask, output: &str) -> String {
+    // One of Claude Code's own tasks, lost with its process (its id is the
+    // CLI's; Claude Code itself can no longer say what became of it).
+    if t.kind == "claude_code" {
+        return format!(
+            "<background-task kind=\"claude-code\" status=\"lost\">\nTask: {}\nIts Claude Code process stopped before it finished \
+             (the worker restarted, or the CLI exited), and it stopped with it. Files it changed stay as they are; check them, and redo \
+             the task if it is still needed.\n</background-task>",
+            t.description
+        );
+    }
     let elapsed = duration_text(t.elapsed_ms / 1000);
     let agent = t.kind == "agent";
     let status = match t.state.as_str() {
