@@ -32,6 +32,7 @@ message SessionEvent {
     SubagentSpawned subagent_spawned = 28;
     SubagentModelSet subagent_model_set = 29;
     SubagentReported subagent_reported = 30;
+    NoticeQueued notice_queued = 31;
   }
 }
 
@@ -46,6 +47,21 @@ message SubagentReported {
   string child_session_id = 3;
   // completed, interrupted, failed or lost.
   string status = 4;
+}
+
+// A notice for the agent (a background task's end, a subagent's report)
+// was queued: written before it is delivered, so a reload delivers one
+// that no turn took (a UserMessage with the same command_id), under the
+// same rule (docs/background.md §5).
+message NoticeQueued {
+  string command_id = 1;
+  // What the agent is told.
+  string text = 2;
+  // The input's command ("task-notification").
+  string command = 3;
+  // An idle session starts a turn on it (within the hourly limit); else it
+  // waits for the next input.
+  bool wake = 4;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -595,6 +611,11 @@ message CreateSession {
   // c6_api::SubagentTemplate), and the line introducing them in Task's
   // description.
   string subagent_templates_json = 30;
+  // From the subagent-limits setting: how many turns notices may start in
+  // an idle session per hour, and how long an idle Claude Code process with
+  // no background tasks stays up. 0: the defaults (20 and 15).
+  uint32 auto_turns_per_hour = 31;
+  uint32 claude_code_idle_minutes = 32;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

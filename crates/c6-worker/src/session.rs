@@ -217,11 +217,21 @@ pub(crate) enum ActorMsg {
     },
     /// How a remote subagent's turn ended (from the head, as a command).
     RemoteReport(String, Box<c6_proto::DelegationEnded>),
+    /// From the log, on reload (docs/background.md §5): when notices
+    /// started turns in the last hour, the ids of every notice recorded,
+    /// and those no turn took, to deliver again.
+    Reloaded {
+        auto_turns_ms: Vec<i64>,
+        noticed: Vec<String>,
+        pending: Vec<(PendingInput, bool)>,
+    },
 }
 
-/// Background-task notices may start this many turns per hour in an idle
-/// session; beyond that they wait for your next message.
-const AUTO_TURNS_PER_HOUR: usize = 20;
+/// Notices may start this many turns per hour in an idle session unless
+/// the subagent-limits setting says otherwise; beyond that they wait until
+/// the hour allows, or for your next message.
+const AUTO_TURNS_PER_HOUR: usize = c6_api::DEFAULT_AUTO_TURNS_PER_HOUR as usize;
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Why a rewind may not go back past a handoff (the head says the same).
 const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
@@ -756,6 +766,9 @@ impl SessionManager {
             }
         }
         let _ = tx.send(ActorMsg::Reserve(highest));
+        // Notices no turn took are delivered again.
+        let (auto_turns_ms, noticed, pending) = notices_of(&events);
+        let _ = tx.send(ActorMsg::Reloaded { auto_turns_ms, noticed, pending });
         for t in open {
             let (child, remote) = events
                 .iter()
@@ -989,6 +1002,7 @@ impl SessionManager {
             checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, if remote { &local } else { Path::new(&started_cwd) })),
             auto_turns: VecDeque::new(),
             deferred: Vec::new(),
+            noticed: HashSet::new(),
             on_behalf_of,
             waiting: Vec::new(),
             manager: self.clone(),
@@ -1176,6 +1190,52 @@ fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[Session
     }
 }
 
+/// What a log says about its notices (docs/background.md §5): when notices
+/// started turns (a turn whose inputs were all notices), the id of every
+/// notice recorded, and the notices no turn took, with whether each wakes
+/// the session.
+fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingInput, bool)>) {
+    let events = c6_agent::effective_events(events);
+    let mut noticed = HashSet::new();
+    let mut taken = HashSet::new();
+    for e in &events {
+        match &e.kind {
+            Some(session_event::Kind::NoticeQueued(n)) => {
+                noticed.insert(n.command_id.clone());
+            }
+            Some(session_event::Kind::User(u)) => {
+                taken.insert(u.command_id.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut auto_turns = Vec::new();
+    let mut inputs: Vec<&str> = Vec::new();
+    for e in &events {
+        match &e.kind {
+            Some(session_event::Kind::User(u)) => inputs.push(&u.command_id),
+            Some(session_event::Kind::TurnStarted(_)) => {
+                if !inputs.is_empty() && inputs.iter().all(|i| noticed.contains(*i)) {
+                    auto_turns.push(e.ts_ms);
+                }
+                inputs.clear();
+            }
+            _ => {}
+        }
+    }
+    let pending = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Some(session_event::Kind::NoticeQueued(n)) if !taken.contains(&n.command_id) => Some((
+                PendingInput { command_id: n.command_id.clone(), text: n.text.clone(), command: n.command.clone(), ..Default::default() },
+                n.wake,
+            )),
+            _ => None,
+        })
+        .collect();
+    (auto_turns, noticed.into_iter().collect(), pending)
+}
+
 /// Sets a spec's default for its subagents (`None`: the session's own
 /// model).
 fn set_subagent_default(spec: &mut CreateSession, model: Option<ModelSpec>) {
@@ -1328,8 +1388,11 @@ struct Actor {
     checkpoints: Arc<Checkpoints>,
     /// When background-task notices started turns (for the hourly limit).
     auto_turns: VecDeque<std::time::Instant>,
-    /// Notices held back by that limit, delivered with your next message.
-    deferred: Vec<PendingInput>,
+    /// Notices held for your next message, and whether each would start a
+    /// turn (those held by the hourly limit go once the hour allows).
+    deferred: Vec<(PendingInput, bool)>,
+    /// Every notice recorded in the log (`NoticeQueued`), by command id.
+    noticed: HashSet<String>,
     /// The session secrets and head calls are asked for on behalf of: its
     /// own, or a subagent's top-level session.
     on_behalf_of: String,
@@ -1382,7 +1445,10 @@ impl Actor {
                 running = Some(self.start_turn());
                 self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let idle_until = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.idle_until());
+            let idle_until = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.idle_until(self.claude_idle()));
+            // Notices the hourly limit held: once the hour allows.
+            let retry_at = (running.is_none() && self.deferred.iter().any(|(_, wake)| *wake))
+                .then(|| self.auto_turns.front().map_or_else(std::time::Instant::now, |t| *t + HOUR));
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -1433,9 +1499,9 @@ impl Actor {
                             r.0.push(input.text.clone());
                             r.1 |= input.wake;
                         }
-                        let held: Vec<PendingInput> = std::mem::take(&mut self.deferred);
+                        let held = std::mem::take(&mut self.deferred);
                         let mut inbox = self.inbox.lock().unwrap();
-                        for n in held {
+                        for (n, _) in held {
                             inbox.push(n, None);
                         }
                         inbox.push(*input, model)
@@ -1449,9 +1515,9 @@ impl Actor {
                             None => self.report.get_or_insert_with(Default::default).0.push(String::new()),
                         }
                         // Notices held for the next input come with it.
-                        let held: Vec<PendingInput> = std::mem::take(&mut self.deferred);
+                        let held = std::mem::take(&mut self.deferred);
                         let mut inbox = self.inbox.lock().unwrap();
-                        for n in held {
+                        for (n, _) in held {
                             inbox.push(n, None);
                         }
                         inbox.push(*input, None);
@@ -1469,9 +1535,24 @@ impl Actor {
                             command: "task-notification".into(),
                             ..Default::default()
                         };
-                        if let Err(e) = self.queue_notice(input, running.is_some(), wake).await {
+                        if let Err(e) = self.notice(input, running.is_some(), wake).await {
                             error!(session = %self.writer.session_id, "queueing a subagent's report: {e:#}");
                             return;
+                        }
+                    }
+                    Some(ActorMsg::Reloaded { auto_turns_ms, noticed, pending }) => {
+                        let (now, now_ms) = (std::time::Instant::now(), c6_core::now_ms());
+                        self.auto_turns = auto_turns_ms
+                            .into_iter()
+                            .filter_map(|t| now.checked_sub(std::time::Duration::from_millis(now_ms.saturating_sub(t).max(0) as u64)))
+                            .collect();
+                        self.noticed.extend(noticed);
+                        for (input, wake) in pending {
+                            info!(session = %self.writer.session_id, notice = %input.command_id, "delivering a notice again after a reload");
+                            if let Err(e) = self.deliver_notice(input, running.is_some(), wake, false).await {
+                                error!(session = %self.writer.session_id, "delivering a notice again: {e:#}");
+                                return;
+                            }
                         }
                     }
                     Some(ActorMsg::Task(ev)) => {
@@ -1611,6 +1692,9 @@ impl Actor {
                         }
                     }
                 }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at.unwrap_or_else(std::time::Instant::now))), if retry_at.is_some() => {
+                    self.release_held();
+                }
                 // Idle long enough, with no background tasks: close it.
                 _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
                     info!(session = %self.writer.session_id, "closing an idle Claude Code process");
@@ -1713,45 +1797,105 @@ impl Actor {
             } else {
                 (format!("Subagent {sid} ended the turn your call {} waited on:\n{body}", ended.call_id), true)
             };
+            // Its id is the head's command's: a report sent again after a
+            // restart is not told twice.
             let input = PendingInput {
-                command_id: format!("subagent:{}", uuid::Uuid::now_v7()),
+                command_id: format!("subagent:{}", reported.command_id),
                 text,
                 command: "task-notification".into(),
                 ..Default::default()
             };
-            self.queue_notice(input, busy, wake).await?;
+            self.notice(input, busy, wake).await?;
         }
         self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
         Ok(())
     }
 
-    /// Queues a notice for the agent: it joins a running turn at its next
-    /// step; in an idle session it starts a turn if `wake` (within the
-    /// hourly limit), else it waits for the next input.
-    async fn queue_notice(&mut self, input: PendingInput, busy: bool, wake: bool) -> anyhow::Result<()> {
+    /// The most turns notices may start per hour.
+    fn auto_turn_limit(&self) -> usize {
+        match self.spec.auto_turns_per_hour {
+            0 => AUTO_TURNS_PER_HOUR,
+            n => n as usize,
+        }
+    }
+
+    /// How long its idle Claude Code process stays up with no tasks.
+    fn claude_idle(&self) -> std::time::Duration {
+        match self.spec.claude_code_idle_minutes {
+            0 => crate::claude_code::IDLE,
+            m => std::time::Duration::from_secs(u64::from(m) * 60),
+        }
+    }
+
+    /// Takes a turn for notices if the hour allows one.
+    fn take_auto_turn(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > HOUR) {
+            self.auto_turns.pop_front();
+        }
+        if self.auto_turns.len() >= self.auto_turn_limit() {
+            return false;
+        }
+        self.auto_turns.push_back(now);
+        true
+    }
+
+    /// The hour allows another automatic turn: the held notices start one
+    /// together.
+    fn release_held(&mut self) {
+        if self.deferred.is_empty() || !self.take_auto_turn() {
+            return;
+        }
+        let mut inbox = self.inbox.lock().unwrap();
+        for (n, _) in std::mem::take(&mut self.deferred) {
+            inbox.push(n, None);
+        }
+    }
+
+    /// A notice for the agent (docs/background.md §5). It is recorded first
+    /// (`NoticeQueued`), so a reload delivers it if no turn took it, then
+    /// delivered (`deliver_notice`). One already recorded is ignored.
+    async fn notice(&mut self, input: PendingInput, busy: bool, wake: bool) -> anyhow::Result<()> {
+        if !self.noticed.insert(input.command_id.clone()) {
+            return Ok(());
+        }
+        let queued =
+            c6_proto::NoticeQueued { command_id: input.command_id.clone(), text: input.text.clone(), command: input.command.clone(), wake };
+        self.writer.append(session_event::Kind::NoticeQueued(queued)).await?;
+        self.deliver_notice(input, busy, wake, true).await
+    }
+
+    /// Delivers a notice: it joins a running turn at its next step; in an
+    /// idle session it starts a turn if `wake` (within the hourly limit;
+    /// beyond it, once the hour allows), else it waits for the next input.
+    /// `announce`: say so in the log when the limit holds it.
+    async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
         if busy || !self.inbox.lock().unwrap().queue.is_empty() {
             self.inbox.lock().unwrap().push(input, None);
             return Ok(());
         }
         if !wake {
-            self.deferred.push(input);
+            self.deferred.push((input, false));
             return Ok(());
         }
-        let now = std::time::Instant::now();
-        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(3600)) {
-            self.auto_turns.pop_front();
-        }
-        if self.auto_turns.len() < AUTO_TURNS_PER_HOUR {
-            self.auto_turns.push_back(now);
+        if self.take_auto_turn() {
             self.inbox.lock().unwrap().push(input, None);
             return Ok(());
         }
-        warn!(session = %self.writer.session_id, "notice held: too many automatic turns this hour");
-        self.deferred.push(input);
+        warn!(session = %self.writer.session_id, notice = %input.command_id, "notice held: too many automatic turns this hour");
+        let limit = self.auto_turn_limit();
+        let what = match input.command_id.strip_prefix("task:").and_then(|t| t.split(':').next()) {
+            Some(task) => format!("Background task {task} ended."),
+            None => "A notice for the agent is waiting.".to_owned(),
+        };
+        self.deferred.push((input, true));
+        if !announce {
+            return Ok(());
+        }
         self.writer
             .append(session_event::Kind::Error(ErrorEvent {
                 message: format!(
-                    "A notice for the agent will come with your next message: notices already started {AUTO_TURNS_PER_HOUR} turns in the last hour."
+                    "{what} Notices already started {limit} turns in the last hour, so the agent hears about it once the hour allows, or with your next message."
                 ),
             }))
             .await?;
@@ -1759,47 +1903,14 @@ impl Actor {
     }
 
     /// Logs a background task's start or end and, for an end the agent
-    /// should hear about, queues the notice: it reaches a running turn at
-    /// its next step, and starts a turn in an idle session (within the
-    /// hourly limit; beyond it the notice waits for your next message).
+    /// should hear about, queues the notice (`notice`). Its id names the
+    /// task and how it ended, so the same end is never told twice.
     async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool) -> anyhow::Result<()> {
-        let task_id = record.task_id.clone();
+        let command_id = format!("task:{}:{}", record.task_id, record.state);
         self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
         let Some(text) = notice else { return Ok(()) };
-        let input = PendingInput {
-            command_id: format!("task:{}", uuid::Uuid::now_v7()),
-            text,
-            command: "task-notification".into(),
-            ..Default::default()
-        };
-        let now = std::time::Instant::now();
-        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(3600)) {
-            self.auto_turns.pop_front();
-        }
-        let held = {
-            let mut inbox = self.inbox.lock().unwrap();
-            if busy || !inbox.queue.is_empty() {
-                inbox.push(input, None);
-                None
-            } else if self.auto_turns.len() < AUTO_TURNS_PER_HOUR {
-                self.auto_turns.push_back(now);
-                inbox.push(input, None);
-                None
-            } else {
-                Some(input)
-            }
-        };
-        let Some(input) = held else { return Ok(()) };
-        warn!(session = %self.writer.session_id, task = %task_id, "background-task notice held: too many automatic turns this hour");
-        self.deferred.push(input);
-        self.writer
-            .append(session_event::Kind::Error(ErrorEvent {
-                message: format!(
-                    "Background task {task_id} ended. The agent will hear about it with your next message: notices already started {AUTO_TURNS_PER_HOUR} turns in the last hour."
-                ),
-            }))
-            .await?;
-        Ok(())
+        let input = PendingInput { command_id, text, command: "task-notification".into(), ..Default::default() };
+        self.notice(input, busy, true).await
     }
 
     /// Rewinds the conversation to before event `to_seq`, restoring files
@@ -2186,7 +2297,7 @@ async fn claude_turn(
     use crate::claude_code::Process;
     // Only a process with nothing under way: no tasks, no inputs it has
     // not taken, no turn it has begun.
-    if let Some(p) = process.take_if(|p| p.launch() != &launch && p.idle_until().is_some()) {
+    if let Some(p) = process.take_if(|p| p.launch() != &launch && p.idle_until(std::time::Duration::ZERO).is_some()) {
         p.close().await;
     }
     let inputs = inbox.lock().unwrap().drain();
@@ -3338,6 +3449,53 @@ mod label_tests {
 
 /// Switching between Claude Code and carbon6's own loop (docs/architecture.md,
 /// "Model switching"): what each runtime gets from the log.
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    fn ev(seq: u64, ts_ms: i64, kind: session_event::Kind) -> SessionEvent {
+        SessionEvent { seq, ts_ms, kind: Some(kind) }
+    }
+
+    fn queued(id: &str, wake: bool) -> session_event::Kind {
+        session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+            command_id: id.into(),
+            text: format!("about {id}"),
+            command: "task-notification".into(),
+            wake,
+        })
+    }
+
+    fn user(id: &str) -> session_event::Kind {
+        session_event::Kind::User(c6_proto::UserMessage { command_id: id.into(), ..Default::default() })
+    }
+
+    fn turn() -> session_event::Kind {
+        session_event::Kind::TurnStarted(TurnStarted::default())
+    }
+
+    /// A reload delivers the notices no turn took, and knows which turns
+    /// notices started (they count toward the hourly limit).
+    #[test]
+    fn a_log_says_which_notices_are_pending_and_which_turns_they_started() {
+        let events = [
+            ev(1, 100, queued("task:bg1:finished", true)),
+            ev(2, 110, user("task:bg1:finished")),
+            ev(3, 120, turn()),
+            ev(4, 200, queued("subagent:s", false)),
+            ev(5, 210, user("you-1")),
+            ev(6, 220, turn()),
+            ev(7, 300, queued("task:bg2:finished", true)),
+        ];
+        let (auto_turns, mut noticed, pending) = notices_of(&events);
+        assert_eq!(auto_turns, [120], "only the turn the notice alone started");
+        noticed.sort();
+        assert_eq!(noticed, ["subagent:s", "task:bg1:finished", "task:bg2:finished"]);
+        let pending: Vec<(&str, &str, bool)> = pending.iter().map(|(i, w)| (i.command_id.as_str(), i.text.as_str(), *w)).collect();
+        assert_eq!(pending, [("subagent:s", "about subagent:s", false), ("task:bg2:finished", "about task:bg2:finished", true)]);
+    }
+}
+
 #[cfg(test)]
 mod handoff_tests {
     use c6_proto::{AssistantMessage, ContentBlock, Handoff, TurnStarted, Usage, UserMessage, content_block};

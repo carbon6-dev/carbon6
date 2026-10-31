@@ -31,6 +31,7 @@ mod kitjobs;
 mod labels;
 mod m4;
 mod memory;
+mod notices;
 mod notify;
 mod operations;
 mod outputs;

@@ -70,8 +70,8 @@ pub struct ClaudeConversation {
     pub preamble: Option<String>,
 }
 
-/// How long an idle process with no background tasks stays up
-/// (docs/background.md §4).
+/// How long an idle process with no background tasks stays up, unless
+/// the subagent-limits setting says otherwise (docs/background.md §4).
 pub const IDLE: Duration = Duration::from_secs(15 * 60);
 /// How long an interrupted turn has to end before its process is killed.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
@@ -276,9 +276,10 @@ impl Process {
             .is_some_and(|o| o.tools.background.list().iter().any(|t| t.kind == c6_tools::TaskKind::ClaudeCode && t.running))
     }
 
-    /// When it may be closed for being idle; `None` while it has work.
-    pub fn idle_until(&self) -> Option<tokio::time::Instant> {
-        (self.unconfirmed.is_empty() && self.pending.is_none() && !self.tasks_running()).then_some(self.idle_since + IDLE)
+    /// When it may be closed, after `idle` with nothing to do; `None` while
+    /// it has work.
+    pub fn idle_until(&self, idle: Duration) -> Option<tokio::time::Instant> {
+        (self.unconfirmed.is_empty() && self.pending.is_none() && !self.tasks_running()).then_some(self.idle_since + idle)
     }
 
     /// The next line it wrote (`None`: it exited). For a session's actor
@@ -1437,7 +1438,7 @@ done
         }
         assert_eq!(kinds(&vec_sink), [["user", "turn_started", "assistant", "usage", "turn_ended"]; 2].concat());
         assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
-        assert!(p.idle_until().is_some(), "an idle process with no tasks may be closed later");
+        assert!(p.idle_until(IDLE).is_some(), "an idle process with no tasks may be closed later");
         p.close().await;
     }
 
@@ -1488,7 +1489,7 @@ done
         assert_eq!(end.unwrap(), TurnEnd { reason: Some(TurnEndReason::Interrupted), alive: true, no_conversation: false });
         assert_eq!(kinds(&vec_sink), ["user", "turn_started", "assistant", "usage", "turn_ended"], "an interrupt is not an error");
         assert!(p.tasks_running(), "its background task still runs");
-        assert!(p.idle_until().is_none(), "a process with a running task stays up");
+        assert!(p.idle_until(IDLE).is_none(), "a process with a running task stays up");
         // Idle: the task's end is recorded, and the turn Claude Code starts for it is the agent's.
         loop {
             let v = p.next_line().await.expect("still up");
