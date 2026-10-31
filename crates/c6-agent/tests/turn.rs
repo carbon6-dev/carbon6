@@ -623,6 +623,7 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::Question(_) => "question",
         session_event::Kind::SubagentModelSet(_) => "subagent_model_set",
         session_event::Kind::SubagentSpawned(_) => "subagent_spawned",
+        session_event::Kind::SubagentReported(_) => "subagent_reported",
     }
 }
 

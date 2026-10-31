@@ -324,7 +324,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="templates"
                         title="Templates"
                         noun="template"
-                        help="Saved ways to start a session: where (a worker, every online worker with *, or SSH hosts through a worker), how (connection, model, labels) and what to ask. Several targets make a fleet run: one session each, sharing a run: label, so mission control shows them together. Run them from the Sessions page, with c6 run -t, on a schedule or from a webhook. In the prompt, {{input}} is what the run was given, {{target}} the worker or host, {{date}} and {{time}} now."
+                        help="Saved ways to start a session: where (a worker, every online worker with *, or SSH hosts through a worker), how (connection, model, labels) and what to ask. Several targets make a fleet run: one session each, sharing a run: label, so mission control shows them together. Run them from the Sessions page, with c6 run -t, on a schedule or from a webhook. In the prompt, {{input}} is what the run was given, {{target}} the worker or host, {{date}} and {{time}} now. With Agents may start it, any session's agent can start the template as a remote subagent (Task with template): a session of its own where the template says, whose report comes back to the agent, which it can continue with SendMessage (Save as template on a session's details makes one from it)."
                         fields=TEMPLATE_FIELDS
                         examples=template_examples
                     />
@@ -2499,6 +2499,8 @@ enum FieldKind {
     Model,
     /// JSON (an object or a list), several lines.
     Json,
+    /// Yes or no (a checkbox); the placeholder says what it does.
+    Check,
 }
 
 /// A field of a list setting's items. The first is the item's name, shown
@@ -2887,10 +2889,29 @@ const TEMPLATE_FIELDS: &[Field] = &[
         kind: FieldKind::Labels,
     },
     Field { key: "cwd", label: "Folder", placeholder: "scratch workspace (or home on SSH hosts)", kind: FieldKind::Mono },
+    Field { key: "title", label: "Title", placeholder: "the template's name (or the subagent's task)", kind: FieldKind::Line },
     Field { key: "connection", label: "Connection", placeholder: "by routing rules", kind: FieldKind::Connection },
     Field { key: "model", label: "Model", placeholder: "by routing rules (Settings → Model routing)", kind: FieldKind::Model },
+    Field { key: "effort", label: "Effort", placeholder: "", kind: FieldKind::Choice(&["", "low", "medium", "high", "xhigh", "max"]) },
     Field { key: "labels", label: "Labels", placeholder: "e.g. ops, daily", kind: FieldKind::Labels },
-    Field { key: "prompt", label: "Prompt", placeholder: "Check {{target}} for … {{input}}", kind: FieldKind::Text },
+    Field {
+        key: "worktree",
+        label: "New git worktree",
+        placeholder: "Each session works in a new worktree of the folder, on a new c6/… branch",
+        kind: FieldKind::Check,
+    },
+    Field {
+        key: "agents",
+        label: "Agents may start it",
+        placeholder: "Sessions' agents may start it as a remote subagent (Task with template), on the workers, hosts or SSH targets it names; ticking it is your permission",
+        kind: FieldKind::Check,
+    },
+    Field {
+        key: "prompt",
+        label: "Prompt",
+        placeholder: "Check {{target}} for … {{input}}  (for agents: standing instructions; the task fills {{input}}, or follows)",
+        kind: FieldKind::Text,
+    },
 ];
 
 fn template_examples() -> Vec<(&'static str, serde_json::Value)> {
@@ -3227,7 +3248,16 @@ fn ListItem(
                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
-                {lines.into_iter().map(|f| if let FieldKind::Choice(options) = f.kind {
+                {lines.into_iter().map(|f| if f.kind == FieldKind::Check {
+                    let checked = move || item.with(|m| m.get(f.key).and_then(|v| v.as_bool()).unwrap_or(false));
+                    view! {
+                        <label class="flex items-start gap-2 text-sm sm:col-span-2" title=f.placeholder>
+                            <input type="checkbox" class="mt-1" prop:checked=checked
+                                on:change=move |ev| item.update(|m| { m.insert(f.key.into(), serde_json::Value::Bool(event_target_checked(&ev))); }) />
+                            <span>{f.label}<span class="block text-xs text-zinc-500">{f.placeholder}</span></span>
+                        </label>
+                    }.into_any()
+                } else if let FieldKind::Choice(options) = f.kind {
                     view! {
                         <label class="space-y-0.5">
                             <span class="text-xs text-zinc-500">{f.label}</span>

@@ -396,7 +396,7 @@ impl Mapper<'_> {
         // Its parent: the session, or the subagent that made the call.
         let (parent_id, parent_log, parent_depth) = match made_in.as_deref().and_then(|m| self.children.values().find(|c| c.id == m)) {
             Some(c) => (c.id.clone(), c.log.clone(), c.depth),
-            None => (obs.session_id.clone(), sink.clone(), obs.spec.delegation.as_ref().map_or(0, |d| d.depth)),
+            None => (obs.session_id.clone(), sink.clone(), crate::subagent::depth_of(&obs.spec)),
         };
         let id = uuid::Uuid::now_v7().to_string();
         let description = input["description"].as_str().unwrap_or("Subagent").to_owned();
@@ -409,6 +409,7 @@ impl Mapper<'_> {
                 description: description.clone(),
                 background_task_id: String::new(),
                 model: None,
+                remote: None,
             }))
             .await?;
         let started = SessionStarted {

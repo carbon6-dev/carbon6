@@ -42,6 +42,7 @@ mod providers;
 mod push;
 mod realm_pages;
 mod realms;
+mod remote_subagents;
 mod rewind;
 mod route_tools;
 mod routing;

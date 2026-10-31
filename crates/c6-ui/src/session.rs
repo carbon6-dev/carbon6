@@ -547,6 +547,22 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         seed.worktree = started.get_untracked().is_some_and(|(_, b)| !b.is_empty());
         like_this.set(Some(seed));
     };
+    // "Save as template": its place and model, for agents or you to start
+    // sessions like it (docs/remote-subagents.md §4).
+    let as_template = RwSignal::new(None::<sessions::SessionSeed>);
+    let open_as_template = move || {
+        let id = id_stored.get_value();
+        let Some(d) = detail.get_untracked().and_then(Result::ok) else { return };
+        let s = live.sessions.with_untracked(|ss| ss.iter().find(|s| s.id == id).cloned()).unwrap_or(d.session);
+        let mut seed = sessions::SessionSeed::from_session(&s);
+        let (c, m, e) = choice.current.get_untracked();
+        if !c.is_empty() {
+            (seed.connection_id, seed.model, seed.effort) = (c, m, e);
+        }
+        // The session's folder is the repository a worktree was made of.
+        seed.worktree = started.get_untracked().is_some_and(|(_, b)| !b.is_empty());
+        as_template.set(Some(seed));
+    };
     let chrome = SessionChrome {
         token: SessionChrome::next_token(),
         id: id_stored,
@@ -559,6 +575,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         details,
         find_open,
         like_this: Callback::new(move |()| open_like_this()),
+        as_template: Callback::new(move |()| open_as_template()),
         root: meta_root,
         force_open,
         col,
@@ -581,6 +598,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     view! {
         <div class="relative flex min-h-0 flex-1 flex-col">
         {move || like_this.get().map(|seed| view! { <sessions::NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
+        {move || as_template.get().map(|seed| view! { <sessions::SaveTemplateDialog seed on_close=move |()| as_template.set(None) /> })}
         {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
         {move || details.get().then(|| detail.get().and_then(Result::ok)).flatten().map(|d| {
             let worker_id = d.session.worker_id;
@@ -693,6 +711,7 @@ pub struct SessionChrome {
     details: RwSignal<bool>,
     find_open: RwSignal<bool>,
     like_this: Callback<()>,
+    as_template: Callback<()>,
     root: StoredValue<String>,
     force_open: ForceOpen,
     col: Option<ColumnCtx>,
@@ -755,7 +774,21 @@ pub fn SessionTasks(chrome: SessionChrome) -> impl IntoView {
 pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option<Callback<()>>) -> impl IntoView {
     let live = api::live();
     let SessionChrome {
-        id, detail, status, started, model_label, events, tab, details, find_open, like_this, root, force_open, col, ..
+        id,
+        detail,
+        status,
+        started,
+        model_label,
+        events,
+        tab,
+        details,
+        find_open,
+        like_this,
+        as_template,
+        root,
+        force_open,
+        col,
+        ..
     } = chrome;
     // Presentation includes work in side chats/subagents. Keep `status` and
     // `running()` elsewhere tied to this chat's own turn for Send/Stop/Esc.
@@ -852,6 +885,9 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
                             <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
                                 title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
                                 on:click=move |_| { act(); like_this.run(()) }>"New like this"</button>
+                            <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
+                                title="Save this session's worker, folder, model and labels as a template, which agents can start as a remote subagent"
+                                on:click=move |_| { act(); as_template.run(()) }>"Save as template"</button>
                         })}
                         <crate::tasks::RunningTasks session=id.get_value() events />
                         <SubagentsPill session=id.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.get_value() />
@@ -2214,15 +2250,36 @@ fn subagent_state(running: bool, end: Option<TurnEndReason>) -> (&'static str, &
 /// Where a subagent runs: "connection · model · effort" (a subagent may
 /// run on another connection than its parent's).
 fn runs_on(row: Memo<Option<Session>>, connections: LocalResource<Result<Vec<c6_api::Connection>, String>>) -> String {
+    let live = api::live();
     row.with(|r| {
         let Some(r) = r else { return String::new() };
         let model = model_label(&r.model, r.effort.as_deref().unwrap_or_default());
         let name = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|c| c.id == r.connection_id).map(|c| c.name));
-        match name {
+        let model = match name {
             Some(n) => format!("{n} · {model}"),
             None => model,
+        };
+        // A remote subagent: where it runs, too (docs/remote-subagents.md).
+        if r.remote_template.is_empty() {
+            return model;
         }
+        let worker = live.worker_name(&r.worker_id.to_string());
+        let place = match (&r.ssh, r.cwd.is_empty()) {
+            (Some(t), _) => format!("{worker} ⇄ {t}:{}", r.cwd),
+            (None, true) => worker,
+            (None, false) => format!("{worker}:{}", r.cwd),
+        };
+        format!("{place} · {model}")
     })
+}
+
+/// A subagent's name in its thread's header: its named agent, or the
+/// template a remote one was started from.
+fn subagent_name(r: &Session) -> Option<String> {
+    if !r.remote_template.is_empty() {
+        return Some(format!("▣ {}", r.remote_template));
+    }
+    Some(r.agent.clone()).filter(|a| !a.is_empty())
 }
 
 /// Scrolls the element with this id into view.
@@ -2275,7 +2332,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
                     <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
                         <span class="inline-block w-3 shrink-0 text-[9px]">"▶"</span>
                         <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
-                        {move || row.with(|r| r.as_ref().map(|r| r.agent.clone()).filter(|a| !a.is_empty())).map(|a| view! { <span class="font-mono">{a}</span> })}
+                        {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="font-mono" title="Started from this template, where it says">{a}</span> })}
                         <span class=format!("shrink-0 {tone}")>{pill}</span>
                         <span class="ml-auto shrink-0 font-mono">{move || runs_on(row, connections)}</span>
                     </button>
@@ -2340,7 +2397,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
         <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=move |ev| toggle.run(ev)>
             <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
             <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
-            {move || row.with(|r| r.as_ref().map(|r| r.agent.clone()).filter(|a| !a.is_empty())).map(|a| view! { <span class="font-mono">{a}</span> })}
+            {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="font-mono" title="Started from this template, where it says">{a}</span> })}
             {move || {
                 let (pill, tone) = subagent_state(running.get(), end.get());
                 view! { <span class=format!("shrink-0 {tone}")>{pill}</span> }

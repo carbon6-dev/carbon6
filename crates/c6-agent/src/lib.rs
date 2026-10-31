@@ -32,6 +32,17 @@ Check its changes before relying on them.";
 pub const SUBAGENT_RESUME: &str = "You were stopped partway through. Your work so far is above. Check where you left off, \
 then continue the task and finish with your report.";
 
+/// Introduces, in Task's description, the templates an agent may start as
+/// remote subagents (docs/remote-subagents.md §6: an editable prompt).
+pub const SUBAGENT_TEMPLATES: &str = "Templates (set template, and on when it lists several places): each starts the subagent as a \
+session of its own somewhere else, set up by the user: another worker, folder, repository or model, with its own tools. It cannot \
+see this conversation or your files; give it a complete prompt, and expect files it changes to stay where it runs.";
+
+/// The result of a remote subagent's call after this worker restarted
+/// while the call waited (an editable prompt).
+pub const SUBAGENT_REMOTE_REATTACH: &str = "This worker restarted while you waited, but the subagent runs elsewhere and keeps \
+working: its report will arrive as a notice when it finishes. Carry on with other work, or wait for it.";
+
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.
 #[async_trait]

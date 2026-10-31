@@ -151,6 +151,7 @@ pub async fn append(st: &HeadState, from: WorkerId, p: &Value) -> anyhow::Result
             observed: false,
             instance: String::new(),
             colour: String::new(),
+            remote_template: String::new(),
         };
         st.store.create_session(&row, &[]).await?;
         sqlx::query("INSERT INTO session_imports (session_id, source, file, imported_seq, imported_at) VALUES (?, ?, ?, 0, ?)")

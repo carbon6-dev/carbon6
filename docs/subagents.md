@@ -282,6 +282,8 @@ Native stdin and separate stdout/stderr are unavailable. When the CLI supplies a
 
 ## 14. Where a subagent runs
 
+For a subagent on another worker, folder or repository, started from a template, see docs/remote-subagents.md.
+
 A subagent may run on another connection and model than its parent: a cheap model for searches, or a GPT model under a Claude session. carbon6 runs it in its own loop whatever the parent runs on (never by starting another CLI), so it works for every main model, Claude Code included.
 
 ### Choosing

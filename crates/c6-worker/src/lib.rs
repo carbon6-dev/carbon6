@@ -27,6 +27,7 @@ use anyhow::Context;
 
 pub use conn::ConnState;
 pub use identity::Identity;
+pub use subagent::{digest_text, spawned_children, status_of};
 
 /// Idle, synced sessions stay in the journal this long.
 const JOURNAL_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;

@@ -243,6 +243,7 @@ async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &Se
         Some(session_event::Kind::Started(s)) => Some(&s.command_id),
         Some(session_event::Kind::Rewound(r)) => Some(&r.command_id),
         Some(session_event::Kind::SubagentModelSet(m)) => Some(&m.command_id),
+        Some(session_event::Kind::SubagentReported(r)) => Some(&r.command_id),
         _ => None,
     };
     if let Some(id) = command_id.filter(|id| !id.is_empty()) {

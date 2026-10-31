@@ -46,6 +46,7 @@ pub mod providers;
 pub mod push;
 pub mod realms;
 pub mod registry;
+pub mod remote;
 pub mod schema;
 pub mod search;
 pub mod secrets;

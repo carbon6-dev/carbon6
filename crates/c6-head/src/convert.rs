@@ -45,7 +45,18 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             connection_id: s.model.as_ref().map(|m| m.connection_id.clone()).unwrap_or_default(),
             model: s.model.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
             effort: s.model.as_ref().map(|m| m.effort.clone()).unwrap_or_default(),
+            remote: s.remote.as_ref().map(|r| {
+                Box::new(api::RemoteSubagent {
+                    template: r.template.clone(),
+                    worker_id: r.worker_id.clone(),
+                    worker_name: r.worker_name.clone(),
+                    target: r.target.clone(),
+                    cwd: r.cwd.clone(),
+                })
+            }),
         },
+        // A receipt: the report itself shows as the call's result.
+        Kind::SubagentReported(_) => return None,
         Kind::TurnStarted(t) => api::EventKind::TurnStarted { turn: t.turn, context_window: t.context_window },
         Kind::Assistant(a) => api::EventKind::Assistant {
             turn: a.turn,
@@ -208,6 +219,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         subagents_running: 0,
         side_chats_running: 0,
         observed: r.observed,
+        remote_template: r.remote_template.clone(),
         instance: r.instance.clone(),
         colour: r.colour.clone(),
         work: None,

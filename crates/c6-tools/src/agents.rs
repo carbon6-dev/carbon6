@@ -49,6 +49,37 @@ pub trait Subagents: Send + Sync {
 
     /// What the subagent `to` has done so far.
     async fn peek(&self, to: &str) -> Result<String, String>;
+
+    /// Starts template `template` as a remote subagent: a session of its
+    /// own that the head starts where the template says, perhaps on
+    /// another worker (`on`: which of its places). Its report comes back
+    /// as from `run` (docs/remote-subagents.md).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_template(
+        &self,
+        _parent_call_id: &str,
+        _description: &str,
+        _prompt: &str,
+        _template: &str,
+        _on: &str,
+        _background: Option<&str>,
+        _cancel: CancellationToken,
+    ) -> Result<String, String> {
+        Err("templates cannot start subagents here".into())
+    }
+}
+
+/// A template `Task` may start as a remote subagent (from the head).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplateInfo {
+    pub name: String,
+    pub description: String,
+    /// Where it runs, for the model.
+    pub place: String,
+    /// `connection · model`; empty: chosen by routing.
+    pub model: String,
+    /// Its places when it has several: what `on` picks from.
+    pub targets: Vec<String>,
 }
 
 /// The connection, model and effort a `Task` call asks its subagent to run
@@ -106,6 +137,9 @@ pub struct Task {
     claude: bool,
     agents: Arc<Vec<AgentDef>>,
     connections: Arc<Vec<ConnectionInfo>>,
+    /// Templates it may start as remote subagents, and the line that
+    /// introduces them (an editable prompt).
+    templates: Arc<(String, Vec<TemplateInfo>)>,
     /// Offer `run_in_background` (not where nothing could deliver its
     /// notice, e.g. to Claude Code over MCP).
     background: bool,
@@ -113,7 +147,7 @@ pub struct Task {
 
 impl Task {
     pub fn generic() -> Self {
-        Self { claude: false, agents: Arc::default(), connections: Arc::default(), background: true }
+        Self { claude: false, agents: Arc::default(), connections: Arc::default(), templates: Arc::default(), background: true }
     }
 
     pub fn claude() -> Self {
@@ -128,6 +162,12 @@ impl Task {
     /// The same tool, offering these connections for subagents to run on.
     pub fn with_connections(self, connections: Vec<ConnectionInfo>) -> Self {
         Self { connections: Arc::new(connections), ..self }
+    }
+
+    /// The same tool, offering these templates for remote subagents,
+    /// introduced by `intro`.
+    pub fn with_templates(self, intro: &str, templates: Vec<TemplateInfo>) -> Self {
+        Self { templates: Arc::new((intro.to_owned(), templates)), ..self }
     }
 
     /// The same tool, without `run_in_background`.
@@ -178,6 +218,24 @@ impl Tool for Task {
             names.extend(self.agents.iter().map(|a| a.name.clone()));
             properties["subagent_type"] = json!({"type": "string", "enum": names, "description": "Which agent to launch"});
         }
+        let (intro, templates) = &*self.templates;
+        if !templates.is_empty() {
+            description.push_str(&format!("\n\n{intro}\n"));
+            for t in templates {
+                let about = if t.description.is_empty() { String::new() } else { format!(": {}", t.description) };
+                let model = if t.model.is_empty() { String::new() } else { format!(", {}", t.model) };
+                description.push_str(&format!("- {} (runs on {}{model}){about}\n", t.name, t.place));
+                if !t.targets.is_empty() {
+                    description.push_str(&format!("  on: {}\n", t.targets.join(", ")));
+                }
+            }
+            let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+            properties["template"] = json!({"type": "string", "enum": names, "description": "Start the subagent from this template, where it says (then leave out subagent_type, connection, model and effort)"});
+            if templates.iter().any(|t| !t.targets.is_empty()) {
+                properties["on"] =
+                    json!({"type": "string", "description": "Which of the template's places to run on, when it lists several"});
+            }
+        }
         ToolSpec {
             name: if self.claude { "Task" } else { "task" }.into(),
             description,
@@ -206,6 +264,30 @@ impl Tool for Task {
             },
         };
         let choice = ModelChoice::from_input(&input);
+        if let Some(template) = input["template"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+            if agent.is_some() || !choice.is_empty() {
+                return ToolOutput::err(
+                    "a template sets where and on what its subagent runs: leave out subagent_type, connection, model and effort",
+                );
+            }
+            let on = input["on"].as_str().unwrap_or_default().trim().to_owned();
+            if self.background && input["run_in_background"].as_bool() == Some(true) {
+                let (id, cancel) = ctx.session.background.start_agent(description, true);
+                let (session, call_id, description, prompt, template, task) =
+                    (ctx.session.clone(), ctx.call_id.clone(), description.to_owned(), prompt.to_owned(), template.to_owned(), id.clone());
+                tokio::spawn(async move {
+                    let result = agents.run_template(&call_id, &description, &prompt, &template, &on, Some(&task), cancel).await;
+                    session.background.finish_agent(&task, result);
+                });
+                return ToolOutput::ok(format!(
+                    "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
+                ));
+            }
+            return match agents.run_template(&ctx.call_id, description, prompt, template, &on, None, ctx.cancel.clone()).await {
+                Ok(answer) => ToolOutput::limited(answer, false),
+                Err(e) => ToolOutput::err(e),
+            };
+        }
         if self.background && input["run_in_background"].as_bool() == Some(true) {
             let (id, cancel) = ctx.session.background.start_agent(description, true);
             let (session, call_id, description, prompt, agent, task) =
@@ -413,6 +495,25 @@ mod tests {
         assert!(spec.description.contains("- code-reviewer: Reviews code"));
         assert_eq!(spec.parameters["properties"]["subagent_type"]["enum"], json!(["general-purpose", "code-reviewer"]));
         assert!(spec.parameters["properties"].get("connection").is_none());
+    }
+
+    #[test]
+    fn templates_to_start() {
+        let t = |name: &str, targets: &[&str]| TemplateInfo {
+            name: name.into(),
+            description: "Infra changes".into(),
+            place: "mumuzz:~/src/infra (new worktree)".into(),
+            model: "work · sonnet".into(),
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+        };
+        let spec = Task::claude().with_templates("Templates:", vec![t("infra", &[])]).spec();
+        assert!(spec.description.contains("Templates:\n- infra (runs on mumuzz:~/src/infra (new worktree), work · sonnet): Infra changes"));
+        assert_eq!(spec.parameters["properties"]["template"]["enum"], json!(["infra"]));
+        assert!(spec.parameters["properties"].get("on").is_none());
+        let spec = Task::claude().with_templates("Templates:", vec![t("fleet", &["a", "b"])]).spec();
+        assert!(spec.description.contains("  on: a, b"));
+        assert!(spec.parameters["properties"]["on"].is_object());
+        assert!(Task::claude().spec().parameters["properties"].get("template").is_none());
     }
 
     #[test]

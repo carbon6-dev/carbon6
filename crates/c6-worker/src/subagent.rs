@@ -224,7 +224,7 @@ impl Subagents for Runner {
     ) -> Result<String, String> {
         let child_id = uuid::Uuid::now_v7().to_string();
         let p = &self.parent;
-        let depth = p.spec.delegation.as_ref().map_or(0, |d| d.depth) + 1;
+        let depth = depth_of(&p.spec) + 1;
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
         let default = p.default.lock().unwrap().clone();
         let parent_model = p.spec.model.clone().unwrap_or_default();
@@ -337,6 +337,7 @@ impl Subagents for Runner {
                 description: description.to_owned(),
                 background_task_id: background.unwrap_or_default().to_owned(),
                 model: Some(model_spec.clone()),
+                remote: None,
             }))
             .await
             .map_err(|e| format!("{e:#}"))?;
@@ -355,8 +356,64 @@ impl Subagents for Runner {
     }
 
     async fn running(&self, to: &str) -> Result<bool, String> {
-        let child = self.resolve(to).await?;
+        let (child, remote) = self.resolve(to).await?;
+        if remote {
+            let v = self.head("session.subagent_state", serde_json::json!({"to": child})).await?;
+            return Ok(v["running"].as_bool().unwrap_or(false));
+        }
         Ok(self.parent.manager.is_running(&child))
+    }
+
+    async fn run_template(
+        &self,
+        parent_call_id: &str,
+        description: &str,
+        prompt: &str,
+        template: &str,
+        on: &str,
+        background: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
+        let p = &self.parent;
+        let depth = depth_of(&p.spec);
+        if !may_delegate(&p.spec, depth) {
+            return Err("this session is as deep as subagents nest; it may not start more".into());
+        }
+        // Waiting before it starts: its first turn may end at once.
+        let rx = p.manager.wait_remote(&p.session_id, parent_call_id);
+        let params = serde_json::json!({"call_id": parent_call_id, "template": template, "on": on, "prompt": prompt,
+                                        "description": description, "depth": depth});
+        let started = match self.head("session.subagent_start", params).await {
+            Ok(v) => v,
+            Err(e) => {
+                p.manager.take_remote_wait(&p.session_id, parent_call_id);
+                return Err(e);
+            }
+        };
+        let s = |k: &str| started[k].as_str().unwrap_or_default().to_owned();
+        let child_id = s("child_session_id");
+        let remote: c6_api::RemoteSubagent = serde_json::from_value(started["remote"].clone()).unwrap_or_default();
+        let model = ModelSpec { connection_id: s("connection_id"), model: s("model"), effort: s("effort"), ..Default::default() };
+        p.log
+            .append(session_event::Kind::SubagentSpawned(SubagentSpawned {
+                call_id: parent_call_id.to_owned(),
+                child_session_id: child_id.clone(),
+                agent: String::new(),
+                description: description.to_owned(),
+                background_task_id: background.unwrap_or_default().to_owned(),
+                model: Some(model),
+                remote: Some(c6_proto::RemoteSubagent {
+                    template: remote.template,
+                    worker_id: remote.worker_id,
+                    worker_name: remote.worker_name.clone(),
+                    target: remote.target,
+                    cwd: remote.cwd,
+                }),
+            }))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        info!(parent = %p.session_id, child = %child_id, worker = %remote.worker_name, %template, "remote subagent started");
+        self.wait_remote(&child_id, parent_call_id, rx, cancel).await
     }
 
     async fn send(
@@ -368,7 +425,24 @@ impl Subagents for Runner {
         cancel: CancellationToken,
     ) -> Result<Option<String>, String> {
         let p = &self.parent;
-        let child_id = self.resolve(to).await?;
+        let (child_id, remote) = self.resolve(to).await?;
+        if remote {
+            // The head sends it; an idle subagent's turn reports to this call.
+            let rx = p.manager.wait_remote(&p.session_id, call_id);
+            let params = serde_json::json!({"to": child_id, "message": message, "call_id": call_id});
+            let sent = match self.head("session.subagent_message", params).await {
+                Ok(v) => v,
+                Err(e) => {
+                    p.manager.take_remote_wait(&p.session_id, call_id);
+                    return Err(e);
+                }
+            };
+            if sent["running"].as_bool() == Some(true) {
+                p.manager.take_remote_wait(&p.session_id, call_id);
+                return Ok(None);
+            }
+            return self.wait_remote(&child_id, call_id, rx, cancel).await.map(Some);
+        }
         let child = match p.manager.actor_for(&child_id).await {
             Ok(Some(c)) => c,
             Ok(None) => return Err(format!("subagent {to} is no longer on this worker")),
@@ -392,7 +466,11 @@ impl Subagents for Runner {
 
     async fn peek(&self, to: &str) -> Result<String, String> {
         let p = &self.parent;
-        let child_id = self.resolve(to).await?;
+        let (child_id, remote) = self.resolve(to).await?;
+        if remote {
+            let v = self.head("session.subagent_peek", serde_json::json!({"to": child_id})).await?;
+            return Ok(v["text"].as_str().unwrap_or_default().to_owned());
+        }
         let journal = p.manager.journal();
         let status = if p.manager.is_running(&child_id) {
             "running"
@@ -420,8 +498,9 @@ impl Runner {
     }
 
     /// The session id of one of this session's subagents, named by its
-    /// session id or background task id (it must have been started here).
-    async fn resolve(&self, to: &str) -> Result<String, String> {
+    /// session id or background task id (it must have been started here),
+    /// and whether it is remote.
+    async fn resolve(&self, to: &str) -> Result<(String, bool), String> {
         let p = &self.parent;
         let events = p.manager.journal().events_after(&p.session_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
         events
@@ -430,11 +509,53 @@ impl Runner {
                 Some(session_event::Kind::SubagentSpawned(sp))
                     if !to.is_empty() && (sp.child_session_id == to || sp.background_task_id == to) =>
                 {
-                    Some(sp.child_session_id.clone())
+                    Some((sp.child_session_id.clone(), sp.remote.is_some()))
                 }
                 _ => None,
             })
             .ok_or_else(|| format!("no subagent {to:?} was started in this session"))
+    }
+
+    /// Asks the head about this session's remote subagents.
+    async fn head(&self, method: &str, mut params: serde_json::Value) -> Result<serde_json::Value, String> {
+        params["session_id"] = serde_json::json!(self.parent.session_id);
+        self.parent.manager.link.call(method, params).await.map_err(|e| format!("{e:#}"))
+    }
+
+    /// Waits for the remote subagent turn a call waits on (`rx`): its
+    /// report, or (as `Err`) what it did. Stopping the call stops the
+    /// subagent's turn through the head; one whose worker is not connected
+    /// cannot be stopped, and its report comes as a notice instead.
+    async fn wait_remote(
+        &self,
+        child_id: &str,
+        call_id: &str,
+        mut rx: tokio::sync::oneshot::Receiver<c6_proto::DelegationEnded>,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
+        let p = &self.parent;
+        let mut guard = RemoteInterruptOnDrop(Some((p.manager.link.clone(), p.session_id.clone(), child_id.to_owned())));
+        let mut stopped_here = false;
+        let ended = tokio::select! {
+            r = &mut rx => r,
+            _ = cancel.cancelled() => {
+                stopped_here = true;
+                let sent = self.head("session.subagent_interrupt", serde_json::json!({"to": child_id})).await;
+                if !sent.is_ok_and(|v| v["sent"].as_bool() == Some(true)) {
+                    guard.0 = None;
+                    p.manager.take_remote_wait(&p.session_id, call_id);
+                    return Err(partial(&p.spec, &format!(
+                        "<subagent id=\"{child_id}\" status=\"running\">\nIts worker is not connected, so it could not be stopped; its report will come as a notice.\n</subagent>"
+                    )));
+                }
+                (&mut rx).await
+            }
+        };
+        guard.0 = None;
+        match ended {
+            Ok(e) => remote_outcome(&p.spec, &e, stopped_here),
+            Err(_) => Err(format!("stopped waiting for subagent {child_id}; its report will come as a notice")),
+        }
     }
 
     /// Gives the subagent `input` and waits for the turn that takes it:
@@ -482,13 +603,40 @@ impl Runner {
 }
 
 /// How a delegation's turn ended, as the digest names it.
-pub(crate) fn status_of(reason: TurnEndReason, report: &str) -> &'static str {
+pub fn status_of(reason: TurnEndReason, report: &str) -> &'static str {
     match reason {
         TurnEndReason::Completed if report.trim().is_empty() => "completed without a report",
         TurnEndReason::Completed => "completed",
         TurnEndReason::Interrupted => "interrupted",
         TurnEndReason::WorkerRestarted => "lost",
         _ => "failed",
+    }
+}
+
+/// A subagent's depth in its tree: a local subagent's from its delegation,
+/// a remote one's from the head (a top-level session is 0).
+pub(crate) fn depth_of(spec: &CreateSession) -> u32 {
+    spec.delegation.as_ref().map_or(spec.depth, |d| d.depth)
+}
+
+/// A report for a notice: the subagent's report, or (`digest` set) what it
+/// did and how to continue it.
+pub(crate) fn report_body(spec: &CreateSession, sid: &str, reason: TurnEndReason, report: &str, digest: &str) -> String {
+    if reason == TurnEndReason::Completed && !report.trim().is_empty() {
+        format!("<subagent id=\"{sid}\" status=\"completed\">\nReport:\n{}\n</subagent>", report.trim_end())
+    } else {
+        partial(spec, digest)
+    }
+}
+
+/// The notice of a subagent's turn that no call waited on: what you said
+/// to it, if you did.
+pub(crate) fn unasked_report(sid: &str, said: &[String], body: &str) -> String {
+    let said: Vec<&str> = said.iter().map(String::as_str).filter(|s| !s.trim().is_empty()).collect();
+    if said.is_empty() {
+        format!("Subagent {sid} worked on its own (no call of yours waited on it):\n{body}")
+    } else {
+        format!("The user messaged subagent {sid} directly: \"{}\"\n{body}", said.join("\" / \""))
     }
 }
 
@@ -503,6 +651,44 @@ pub(crate) fn partial(spec: &CreateSession, digest: &str) -> String {
 /// agents' edits do not show), its errors and its own subagents.
 pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: &str) -> String {
     let events = journal.events_after(child_id, 0, u32::MAX).await.unwrap_or_default();
+    let mut states = std::collections::HashMap::new();
+    for id in spawned_children(&events) {
+        let ev = journal.events_after(&id, 0, u32::MAX).await.unwrap_or_default();
+        let state = ev
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::TurnEnded(t)) => Some(status_of(TurnEndReason::try_from(t.reason).unwrap_or_default(), "x")),
+                Some(session_event::Kind::TurnStarted(_)) => Some("running"),
+                _ => None,
+            })
+            .unwrap_or("not started");
+        states.insert(id, state.to_owned());
+    }
+    digest_text(&events, child_id, status, by, &states)
+}
+
+/// The subagents a session's log says it started.
+pub fn spawned_children(events: &[c6_proto::SessionEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Some(session_event::Kind::SubagentSpawned(sp)) => Some(sp.child_session_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A subagent's digest from its log (`events`), with its own subagents'
+/// states (`states`, by session id; "not started" when missing). The head
+/// writes the same for remote subagents (docs/remote-subagents.md).
+pub fn digest_text(
+    events: &[c6_proto::SessionEvent],
+    child_id: &str,
+    status: &str,
+    by: &str,
+    states: &std::collections::HashMap<String, String>,
+) -> String {
     let mut turns = 0;
     let mut calls = 0;
     let mut last_text = String::new();
@@ -511,7 +697,7 @@ pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: 
     let mut changed: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut children: Vec<(String, String)> = Vec::new();
-    for e in &events {
+    for e in events {
         match &e.kind {
             Some(session_event::Kind::TurnStarted(_)) => turns += 1,
             Some(session_event::Kind::Assistant(a)) => {
@@ -563,20 +749,13 @@ pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: 
         out.push_str(&format!("Errors: {} (last: {})\n", errors.len(), clip(errors.last().unwrap(), 200)));
     }
     if !children.is_empty() {
-        let mut list = Vec::new();
-        for (id, description) in &children {
-            let ev = journal.events_after(id, 0, u32::MAX).await.unwrap_or_default();
-            let state = ev
-                .iter()
-                .rev()
-                .find_map(|e| match &e.kind {
-                    Some(session_event::Kind::TurnEnded(t)) => Some(status_of(TurnEndReason::try_from(t.reason).unwrap_or_default(), "x")),
-                    Some(session_event::Kind::TurnStarted(_)) => Some("running"),
-                    _ => None,
-                })
-                .unwrap_or("not started");
-            list.push(format!("{id} \"{description}\" ({state})"));
-        }
+        let list: Vec<String> = children
+            .iter()
+            .map(|(id, description)| {
+                let state = states.get(id).map(String::as_str).unwrap_or("not started");
+                format!("{id} \"{description}\" ({state})")
+            })
+            .collect();
         out.push_str(&format!("Subagents: {}\n", list.join(", ")));
     }
     out.push_str("</subagent>");
@@ -613,6 +792,38 @@ fn clip(s: &str, max: usize) -> String {
     }
     let head: String = s.chars().take(max).collect();
     format!("{head}…")
+}
+
+/// A remote subagent's turn as its parent's call returns it: its report,
+/// or (as `Err`) what it did and how to continue it.
+fn remote_outcome(spec: &CreateSession, e: &c6_proto::DelegationEnded, stopped_here: bool) -> Result<String, String> {
+    let reason = TurnEndReason::try_from(e.reason).unwrap_or(TurnEndReason::Unspecified);
+    if reason == TurnEndReason::Completed && !e.report.trim().is_empty() {
+        return Ok(format!("{}\n\n[subagent session {}]", e.report, e.child_session_id));
+    }
+    // Stopped from elsewhere than this call: by you.
+    let digest = if reason == TurnEndReason::Interrupted && !stopped_here {
+        e.digest.replacen("status=\"interrupted\"", "status=\"interrupted\" by=\"user\"", 1)
+    } else {
+        e.digest.clone()
+    };
+    Err(partial(spec, &digest))
+}
+
+/// Interrupts a remote subagent (through the head) if the call is dropped
+/// before it returns.
+struct RemoteInterruptOnDrop(Option<(Arc<crate::link::HeadLink>, String, String)>);
+
+impl Drop for RemoteInterruptOnDrop {
+    fn drop(&mut self) {
+        if let Some((link, session_id, child)) = self.0.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move {
+                let _ = link.call("session.subagent_interrupt", serde_json::json!({"session_id": session_id, "to": child})).await;
+            });
+        }
+    }
 }
 
 /// Interrupts the subagent if the call is dropped before it returns.

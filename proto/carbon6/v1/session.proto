@@ -31,7 +31,21 @@ message SessionEvent {
     Question question = 27;
     SubagentSpawned subagent_spawned = 28;
     SubagentModelSet subagent_model_set = 29;
+    SubagentReported subagent_reported = 30;
   }
+}
+
+// The head brought a remote subagent's report (DelegationEnded) to this
+// session, its parent (docs/remote-subagents.md). It marks that command
+// applied; the report itself goes to the call waiting on it, or comes as a
+// notice.
+message SubagentReported {
+  string command_id = 1;
+  // The call that waited on it; empty for a turn no call waited on.
+  string call_id = 2;
+  string child_session_id = 3;
+  // completed, interrupted, failed or lost.
+  string status = 4;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -55,6 +69,19 @@ message SubagentSpawned {
   string background_task_id = 5;
   // The connection, model and effort it runs on.
   ModelSpec model = 6;
+  // Set for a remote subagent: a session the head started from a template,
+  // perhaps on another worker (docs/remote-subagents.md).
+  RemoteSubagent remote = 7;
+}
+
+// Where a remote subagent runs.
+message RemoteSubagent {
+  string template = 1;
+  string worker_id = 2;
+  string worker_name = 3;
+  // An SSH target or host it works on through that worker, if any.
+  string target = 4;
+  string cwd = 5;
 }
 
 // The assistant asked you for inputs (a form), and what became of it.
@@ -422,7 +449,27 @@ message SessionCommand {
     Approve approve = 16;
     Answer answer = 17;
     SetSubagentModel set_subagent_model = 18;
+    DelegationEnded delegation_ended = 19;
   }
+}
+
+// How a turn of a remote subagent ended, for its parent (this session):
+// the head relays it from the subagent's log (docs/remote-subagents.md).
+message DelegationEnded {
+  // The parent's call that waited on the turn (Task or SendMessage);
+  // empty for a turn no call waited on (you messaged the subagent).
+  string call_id = 1;
+  string child_session_id = 2;
+  TurnEndReason reason = 3;
+  // The turn's final assistant text.
+  string report = 4;
+  // What it did (a <subagent …> digest), when the turn did not complete
+  // with a report.
+  string digest = 5;
+  // For a turn no call waited on: what you said to it, and whether its
+  // report should wake the parent.
+  repeated string said = 6;
+  bool wake = 7;
 }
 
 // Sets the session's default for its subagents (unset `model`: the
@@ -541,6 +588,13 @@ message CreateSession {
   string subagent_connections_json = 27;
   // Only these tools, in any profile's naming; empty: all tools.
   repeated string tools = 28;
+  // A remote subagent's depth in its tree (the head starts it from a
+  // template; `delegation` stays unset, since it is a session of its own).
+  uint32 depth = 29;
+  // Templates its agent may start as remote subagents (JSON array of
+  // c6_api::SubagentTemplate), and the line introducing them in Task's
+  // description.
+  string subagent_templates_json = 30;
 }
 
 // What makes a session a subagent: who started it, and as which agent.
@@ -589,6 +643,9 @@ message UserInput {
   // parent when its report arrives (else the parent hears with its next
   // input).
   bool wake = 8;
+  // To a remote subagent from its parent: the parent's call (the head
+  // relays Task and SendMessage calls made on another worker).
+  string delegated_by = 9;
 }
 
 message Interrupt {}

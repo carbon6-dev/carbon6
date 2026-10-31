@@ -249,6 +249,10 @@ pub struct Session {
     /// A subagent of Claude Code's, mirrored from its stream: read-only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observed: bool,
+    /// A remote subagent: the template it was started from
+    /// (docs/remote-subagents.md); empty for every other session.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote_template: String,
     /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance: String,
@@ -1965,6 +1969,10 @@ pub enum EventKind {
         model: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         effort: String,
+        /// Set for a remote subagent: a session started from a template,
+        /// perhaps on another worker (docs/remote-subagents.md).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<Box<RemoteSubagent>>,
     },
     /// A deliverable the agent published. Its content:
     /// `GET /api/v1/sessions/{id}/outputs/{seq}` (`?download=1` to save).
@@ -2720,10 +2728,60 @@ pub struct Template {
     pub labels: Vec<String>,
     /// The first message. {{input}} is what the run was given (a webhook's
     /// body), {{target}} the worker or host, {{date}} and {{time}} now.
+    /// A template agents may start may leave it empty: the subagent's task
+    /// is the first message.
+    #[serde(default)]
     pub prompt: String,
     /// Off: it cannot be run (by hand, schedule or webhook).
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Its sessions run in a new git worktree of `cwd`, on a new `c6/…`
+    /// branch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktree: bool,
+    /// Agents may start it as a remote subagent (`Task` with `template`),
+    /// and sessions may start it on the workers, hosts or SSH targets it
+    /// names: ticking it is your grant (docs/remote-subagents.md §4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agents: bool,
+    /// Its sessions' title ({{input}}, {{target}}, {{date}}, {{time}} are
+    /// filled in); empty: the template's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+}
+
+/// Where a remote subagent runs (docs/remote-subagents.md).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RemoteSubagent {
+    pub template: String,
+    pub worker_id: String,
+    pub worker_name: String,
+    /// The SSH target or host it works on through that worker, if any.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+}
+
+/// A template a session's agent may start as a remote subagent, as `Task`
+/// lists it (`CreateSession.subagent_templates_json`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SubagentTemplate {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Where it runs, for the agent: `worker:folder`, an SSH target, and
+    /// "(new worktree)".
+    pub place: String,
+    /// `connection · model`, or empty for routing to choose.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// When it names several workers, hosts or SSH targets: the names `on`
+    /// picks from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
 }
 
 /// `POST /api/v1/templates/{name}/run`.

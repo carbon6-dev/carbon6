@@ -46,6 +46,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::SUBAGENT_PARTIAL,
     },
     Prompt {
+        name: "session.subagent_templates",
+        description: "Introduces, in the Task tool's description, the templates agents may start as remote subagents (docs/remote-subagents.md).",
+        default: c6_agent::SUBAGENT_TEMPLATES,
+    },
+    Prompt {
+        name: "session.subagent_remote_reattach",
+        description: "The result of a remote subagent's call when the parent's worker restarted while it waited.",
+        default: c6_agent::SUBAGENT_REMOTE_REATTACH,
+    },
+    Prompt {
         name: "session.compact",
         description: "What a summary must hold when a conversation is compacted.",
         default: c6_agent::COMPACT_PROMPT,

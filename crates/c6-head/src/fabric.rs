@@ -120,6 +120,10 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         if session.worker_id != from.to_string() {
             return Err(bad_request("that session is not on this worker"));
         }
+        // Its own remote subagents (docs/remote-subagents.md).
+        if let Some(what) = what.strip_prefix("subagent_") {
+            return crate::remote::for_session(st, &session, what, &params).await;
+        }
         // A side chat or subagent works for its parent's conversation.
         let target = session.parent_id.clone().unwrap_or(session_id);
         return match what {

@@ -649,6 +649,116 @@ pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>)
     }
 }
 
+/// A name for a template made from a session: its folder's last part.
+fn template_name(seed: &SessionSeed) -> String {
+    let base = seed.cwd.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    let name: String = base.chars().map(|c| if c.is_alphanumeric() || "_-.".contains(c) { c } else { '-' }).collect();
+    if name.trim_matches('-').is_empty() { "session".into() } else { name }
+}
+
+/// Saves a session's place and model as a template (docs/remote-subagents.md
+/// §4): its worker, folder, SSH host, connection, model, effort and labels,
+/// so agents (with *Agents may start it*) or you can start sessions like it.
+#[component]
+pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>) -> impl IntoView {
+    let live = api::live();
+    let worker = live.worker_name(&seed.worker_id);
+    let name = RwSignal::new(template_name(&seed));
+    let description = RwSignal::new(String::new());
+    let prompt = RwSignal::new(String::new());
+    let agents = RwSignal::new(true);
+    let worktree = RwSignal::new(seed.worktree);
+    let status = RwSignal::new(None::<Result<String, String>>);
+    let place = match &seed.ssh {
+        Some(t) => format!("{worker} ⇄ {t}:{}", seed.cwd),
+        None if seed.cwd.is_empty() => format!("{worker}: a scratch folder"),
+        None => format!("{worker}:{}", seed.cwd),
+    };
+    let model = if seed.model.is_empty() { "by routing rules".to_owned() } else { seed.model.clone() };
+    let seed = StoredValue::new(seed);
+    let save = move |_| {
+        let seed = seed.get_value();
+        let template = c6_api::Template {
+            name: name.get_untracked().trim().to_owned(),
+            description: description.get_untracked().trim().to_owned(),
+            workers: vec![worker.clone()],
+            ssh: seed.ssh.clone().into_iter().collect(),
+            hosts: Vec::new(),
+            cwd: seed.cwd.clone(),
+            connection: seed.connection_id.clone(),
+            model: seed.model.clone(),
+            effort: seed.effort.clone(),
+            labels: seed.labels.clone(),
+            prompt: prompt.get_untracked(),
+            enabled: true,
+            worktree: worktree.get_untracked() && !seed.cwd.is_empty() && seed.ssh.is_none(),
+            agents: agents.get_untracked(),
+            title: String::new(),
+        };
+        spawn_local(async move {
+            let result = async {
+                let mut list = api::templates().await?;
+                if list.iter().any(|t| t.name == template.name) {
+                    return Err(format!("a template is already named {:?}", template.name));
+                }
+                let name = template.name.clone();
+                list.push(template);
+                api::put_setting("templates", serde_json::to_value(&list).map_err(|e| e.to_string())?).await?;
+                Ok(format!("Saved as {name} (Settings → Templates)"))
+            }
+            .await;
+            let done = result.is_ok();
+            status.set(Some(result));
+            if done {
+                on_close.run(());
+            }
+        });
+    };
+    view! {
+        <div class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
+            <div class="w-full max-w-xl space-y-3 rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
+                <div class="flex items-center gap-2">
+                    <h2 class="flex-1 font-medium">"Save as template"</h2>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                </div>
+                <p class="text-xs text-zinc-500">"Sessions from it run where this one does, on its model and with its labels."</p>
+                <div class="space-y-0.5 text-xs text-zinc-500">
+                    <div class="break-all font-mono">{place}</div>
+                    <div>{model}</div>
+                </div>
+                <label class="block space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <input class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                </label>
+                <label class="block space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Description (agents read it to choose the template)"</span>
+                    <input class=format!("{INPUT} py-1") prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
+                </label>
+                <label class="block space-y-0.5">
+                    <span class="text-xs text-zinc-500">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
+                    <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
+                </label>
+                <label class="flex items-start gap-2">
+                    <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
+                    <span>"Agents may start it"<span class="block text-xs text-zinc-500">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
+                </label>
+                <label class="flex items-start gap-2">
+                    <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
+                    <span>"New git worktree"<span class="block text-xs text-zinc-500">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
+                </label>
+                <div class="flex items-center justify-end gap-3">
+                    {move || status.get().map(|r| match r {
+                        Ok(m) => view! { <span class="text-xs text-emerald-600">{m}</span> }.into_any(),
+                        Err(e) => view! { <span class="text-xs text-red-600">{e}</span> }.into_any(),
+                    })}
+                    <button class=BUTTON on:click=save>"Save"</button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 /// The new-session form in a popup, with your usual choices and a first
 /// message written for you (docs/conversations.md §3.2).
 #[component]

@@ -90,6 +90,24 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
 /// or as the realm (`instance` empty). Only the head starts sessions as an
 /// instance: from its templates, triggers and operations.
 pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) -> anyhow::Result<api::Session> {
+    create_linked(st, req, instance, None).await
+}
+
+/// What makes a new session a remote subagent (docs/remote-subagents.md):
+/// whose call it works for, in which tree, and from which template.
+pub struct Link {
+    pub parent_id: String,
+    pub parent_call_id: String,
+    pub root_id: String,
+    /// Its depth in the tree (the parent's plus one).
+    pub depth: u32,
+    pub template: String,
+    pub colour: String,
+}
+
+/// A session, linked to a parent's call when `link` is set: the parent's
+/// call waits on its first turn.
+pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &str, link: Option<Link>) -> anyhow::Result<api::Session> {
     let worker_id = WorkerId(req.worker_id);
     let worker = st.store.worker(worker_id).await?.ok_or_else(|| bad_request("no such worker"))?;
     if worker.revoked_at.is_some() {
@@ -193,8 +211,21 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         observed: false,
         instance: instance.to_owned(),
         colour: String::new(),
+        remote_template: String::new(),
+    };
+    let row = match &link {
+        Some(l) => SessionRow {
+            parent_id: Some(l.parent_id.clone()),
+            parent_call_id: Some(l.parent_call_id.clone()),
+            root_id: Some(l.root_id.clone()),
+            colour: l.colour.clone(),
+            remote_template: l.template.clone(),
+            ..row
+        },
+        None => row,
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
+    spec.depth = link.as_ref().map_or(0, |l| l.depth);
     // Context from the memex, for what is known at creation.
     let mut brief_labels = labels.clone();
     brief_labels.extend(api::labels::auto_labels(
@@ -206,7 +237,12 @@ pub async fn create_as(st: &HeadState, req: api::CreateSession, instance: &str) 
         &row.ssh_target,
     ));
     spec.memex_brief = crate::memex::brief(st, &row.realm, &brief_labels, prompt.unwrap_or("")).await;
-    insert(st, row, spec, prompt.map(|p| (p, files))).await
+    let input_id = Uuid::now_v7().to_string();
+    // The parent's call waits on the turn that takes the first message.
+    if let (Some(l), Some(_)) = (&link, prompt) {
+        st.store.add_remote_delegation(&input_id, &row.id, &l.parent_id, &l.parent_call_id).await?;
+    }
+    insert(st, row, spec, prompt.map(|p| (p, files)), input_id).await
 }
 
 /// A conversation with the assistant (it runs in the head).
@@ -269,6 +305,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         observed: false,
         instance: String::new(),
         colour: String::new(),
+        remote_template: String::new(),
     };
     let spec = CreateSession {
         model: Some(ModelSpec { connection_id, model, max_output_tokens: 0, effort: String::new(), connection_kind: connection.kind }),
@@ -276,7 +313,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         labels,
         ..Default::default()
     };
-    let session = insert(st, row, spec, Some((prompt, Vec::new()))).await?;
+    let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string()).await?;
     crate::assistant::started(&session.id);
     Ok(session)
 }
@@ -344,10 +381,11 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
         instance: parent.instance.clone(),
         // A side chat has its parent's colour.
         colour: parent.colour.clone(),
+        remote_template: String::new(),
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
-    insert(st, row, spec, Some((prompt, Vec::new()))).await
+    insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string()).await
 }
 
 fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
@@ -429,6 +467,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         delegation: None,
         max_subagent_depth: limits.max_depth,
         max_running_subagents: limits.max_running,
+        depth: 0,
+        subagent_templates_json: serde_json::to_string(&crate::templates::for_subagents(st, &row.realm, &row.instance).await)?,
     })
 }
 
@@ -509,6 +549,7 @@ async fn insert(
     row: SessionRow,
     spec: CreateSession,
     first: Option<(&str, Vec<c6_proto::Attachment>)>,
+    input_id: String,
 ) -> anyhow::Result<api::Session> {
     let worker_id: WorkerId = row.worker_id.parse()?;
     let session_id = row.id.clone();
@@ -518,7 +559,6 @@ async fn insert(
     let create =
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
-    let input_id = Uuid::now_v7().to_string();
     if let Some((text, attachments)) = first {
         commands.push(NewCommand {
             id: &input_id,
@@ -785,6 +825,18 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
 }
 
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
+    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "").await
+}
+
+/// Queues an input as command `id`; `delegated_by`: a remote subagent's
+/// parent's call that sent it (docs/remote-subagents.md).
+pub async fn send_input_as(
+    st: &HeadState,
+    session_id: &str,
+    req: &api::SendMessage,
+    id: String,
+    delegated_by: &str,
+) -> anyhow::Result<api::QueuedInput> {
     let text = req.text.trim();
     let files = attachments(&req.attachments)?;
     if text.is_empty() && files.is_empty() {
@@ -806,7 +858,6 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
         _ => return Err(bad_request("a model switch needs both a connection and a model")),
     };
     let worker_id: WorkerId = session.worker_id.parse()?;
-    let id = Uuid::now_v7().to_string();
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     let shown = if names.is_empty() { text.to_owned() } else { format!("{text} [{}]", names.join(", ")).trim().to_owned() };
     // To a subagent: whether its report should wake its parent.
@@ -815,7 +866,7 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
         st,
         &session.realm,
         session.head_labels(),
-        UserInput { text: text.to_owned(), model, attachments: files, wake, ..Default::default() },
+        UserInput { text: text.to_owned(), model, attachments: files, wake, delegated_by: delegated_by.to_owned(), ..Default::default() },
     )
     .await?;
     let data = input_command(&id, session_id, input);
@@ -1471,6 +1522,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
                 Ok(c6_proto::TurnEndReason::Error) => "failed",
                 _ => "stopped",
             };
+            crate::remote::turn_ended(st, &batch.session_id, ev.seq, t.reason).await;
             crate::triggers::session_ended(st, &batch.session_id, outcome).await;
             match outcome {
                 "ok" => crate::triggers::on_session(st, &batch.session_id, "finished", "").await,
@@ -1638,6 +1690,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
     }
     if let Some(session_id) = st.store.reject_command(worker_id, &r.command_id, &r.reason).await? {
         warn!(session = %session_id, reason = %r.reason, "worker rejected command");
+        crate::remote::rejected(st, &session_id, &r.command_id, &r.reason).await;
         publish_queue(st, &session_id).await;
         st.registry.bump();
         if st.store.session(&session_id).await?.is_some_and(|s| s.status == "failed") {
@@ -1679,9 +1732,15 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         _ => Vec::new(),
     };
     let mut spec = session_spec(st, &session, false, seed).await?;
-    // A subagent's spec says whose it is; its tools and prompt come from
-    // its log.
-    if let (Some(parent), Some(call)) = (&session.parent_id, &session.parent_call_id) {
+    // A remote subagent is a session of its own; it keeps its depth.
+    if !session.remote_template.is_empty() {
+        spec.depth = match events.first().and_then(|e| e.kind.as_ref()) {
+            Some(session_event::Kind::Started(s)) => s.depth.max(1),
+            _ => 1,
+        };
+    } else if let (Some(parent), Some(call)) = (&session.parent_id, &session.parent_call_id) {
+        // A subagent's spec says whose it is; its tools and prompt come
+        // from its log.
         let depth = match events.first().and_then(|e| e.kind.as_ref()) {
             Some(session_event::Kind::Started(s)) => s.depth.max(1),
             _ => 1,
@@ -1709,6 +1768,8 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
             &NewCommand { id: &input_id, session_id, worker_id, data: input_command(&input_id, session_id, input), text: Some(&text) },
         )
         .await?;
+    // A parent's call waiting on that input waits on its copy.
+    st.store.rename_delegation(command_id, &input_id).await?;
     warn!(session = %session_id, "worker no longer had this session; restoring it from the head's log");
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);

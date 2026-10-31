@@ -496,6 +496,9 @@ pub struct SessionRow {
     /// top-level session gets the one least used among its realm's recent
     /// sessions.
     pub colour: String,
+    /// A remote subagent: the template the head started it from
+    /// (docs/remote-subagents.md); empty for every other session.
+    pub remote_template: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -563,8 +566,9 @@ impl Store {
         };
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, effort, parent_id, fork_seq, \
-             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour, subagent_connection_id, subagent_effort, tools) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             labels, worker_name, ssh_target, subagent_model, realm, root_id, instance, colour, subagent_connection_id, subagent_effort, tools, \
+             parent_call_id, agent, remote_template) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
         .bind(&s.worker_id)
@@ -589,6 +593,9 @@ impl Store {
         .bind(&s.subagent_connection_id)
         .bind(&s.subagent_effort)
         .bind(&s.tools)
+        .bind(&s.parent_call_id)
+        .bind(&s.agent)
+        .bind(&s.remote_template)
         .execute(&mut *tx)
         .await?;
         for c in commands {
@@ -596,6 +603,54 @@ impl Store {
         }
         tx.commit().await?;
         Ok(colour)
+    }
+
+    /// How many subagents of a tree are working now.
+    pub async fn running_subagents(&self, root: &str) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE root_id = ? AND parent_call_id IS NOT NULL AND status = 'running'")
+            .bind(root)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// Records that the parent's call `call_id` waits on the turn that
+    /// takes input `command_id` of remote subagent `child_id`.
+    pub async fn add_remote_delegation(&self, command_id: &str, child_id: &str, parent_id: &str, call_id: &str) -> anyhow::Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO remote_delegations (command_id, child_id, parent_id, call_id, state, created_at) VALUES (?, ?, ?, ?, 'waiting', ?)")
+            .bind(command_id)
+            .bind(child_id)
+            .bind(parent_id)
+            .bind(call_id)
+            .bind(c6_core::now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The calls still waiting on a remote subagent: (input command, call).
+    pub async fn waiting_delegations(&self, child_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT command_id, call_id FROM remote_delegations WHERE child_id = ? AND state = 'waiting' ORDER BY created_at",
+        )
+        .bind(child_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Marks a delegation reported; false if it already was.
+    pub async fn delegation_reported(&self, command_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("UPDATE remote_delegations SET state = 'reported' WHERE command_id = ? AND state = 'waiting'")
+            .bind(command_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    /// A delegation's input was sent again under a new id (a restore).
+    pub async fn rename_delegation(&self, old: &str, new: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE remote_delegations SET command_id = ? WHERE command_id = ?").bind(new).bind(old).execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn session(&self, id: &str) -> anyhow::Result<Option<SessionRow>> {
@@ -994,6 +1049,8 @@ impl Store {
                         .await?;
                 }
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
+                // A remote subagent's report reached its parent.
+                Some(Kind::SubagentReported(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(t)) => {
                     status = "idle".into();
@@ -1067,6 +1124,27 @@ impl Store {
             if start {
                 break;
             }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// The events since the turn before the one that ends at `end_seq`: the
+    /// inputs that turn took (written before its TurnStarted) and the turn.
+    pub async fn since_last_turn(&self, session_id: &str, end_seq: u64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
+        use prost::Message;
+        let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq <= ? ORDER BY seq DESC LIMIT 5000")
+            .bind(session_id)
+            .bind(end_seq as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::new();
+        for r in rows {
+            let ev = c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
+            if ev.seq < end_seq && matches!(ev.kind, Some(c6_proto::session_event::Kind::TurnEnded(_))) {
+                break;
+            }
+            out.push(ev);
         }
         out.reverse();
         Ok(out)

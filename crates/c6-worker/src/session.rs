@@ -35,6 +35,9 @@ pub struct SessionManager {
     /// The MCP server that gives Claude Code sessions carbon6's subagents
     /// (started on first use; `None` if it could not start).
     bridge: Arc<tokio::sync::OnceCell<Option<Arc<crate::mcp_bridge::Bridge>>>>,
+    /// Calls waiting on a remote subagent's turn, by `<session>/<call>`
+    /// (docs/remote-subagents.md): the head's DelegationEnded goes there.
+    remote_waits: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<c6_proto::DelegationEnded>>>>,
 }
 
 /// One delegation counted against its tree's limit until dropped.
@@ -176,6 +179,8 @@ pub(crate) enum ActorMsg {
         pgid: i32,
         /// A subagent's session.
         child: String,
+        /// That subagent is remote: it runs on without this worker.
+        remote: bool,
     },
     /// Stop a background task (the user asked).
     StopTask(String),
@@ -210,6 +215,8 @@ pub(crate) enum ActorMsg {
         text: String,
         wake: bool,
     },
+    /// How a remote subagent's turn ended (from the head, as a command).
+    RemoteReport(String, Box<c6_proto::DelegationEnded>),
 }
 
 /// Background-task notices may start this many turns per hour in an idle
@@ -224,7 +231,30 @@ impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
         prune_browser_profiles(&state_dir.join("browser"), std::time::Duration::from_secs(30 * 24 * 3600));
-        Self { journal, link, worktrees, state_dir, actors: Arc::default(), working: Arc::default(), bridge: Arc::default() }
+        Self {
+            journal,
+            link,
+            worktrees,
+            state_dir,
+            actors: Arc::default(),
+            working: Arc::default(),
+            bridge: Arc::default(),
+            remote_waits: Arc::default(),
+        }
+    }
+
+    /// Where the outcome of the remote subagent turn that `session`'s call
+    /// `call_id` waits on will arrive.
+    pub(crate) fn wait_remote(&self, session: &str, call_id: &str) -> tokio::sync::oneshot::Receiver<c6_proto::DelegationEnded> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.remote_waits.lock().unwrap().insert(format!("{session}/{call_id}"), tx);
+        rx
+    }
+
+    /// The call waiting on it, if one still does (taken: the outcome goes
+    /// there once).
+    pub(crate) fn take_remote_wait(&self, session: &str, call_id: &str) -> Option<tokio::sync::oneshot::Sender<c6_proto::DelegationEnded>> {
+        self.remote_waits.lock().unwrap().remove(&format!("{session}/{call_id}"))
     }
 
     /// The MCP server for Claude Code sessions' subagents, started on first
@@ -363,6 +393,17 @@ impl SessionManager {
                 && sp.background_task_id.is_empty()
                 && !answered.contains(sp.call_id.as_str())
             {
+                // Elsewhere, it keeps working; its report comes as a notice.
+                if let Some(r) = &sp.remote {
+                    let note = spec_prompt(&spec, "session.subagent_remote_reattach", c6_agent::SUBAGENT_REMOTE_REATTACH);
+                    out.push(c6_proto::ToolResult {
+                        call_id: sp.call_id.clone(),
+                        tool: tool_of(&sp.call_id).unwrap_or_else(|| "Task".into()),
+                        output: format!("<subagent id=\"{}\" status=\"running\" on=\"{}\"/>\n{note}", sp.child_session_id, r.worker_name),
+                        ..Default::default()
+                    });
+                    continue;
+                }
                 let digest = crate::subagent::digest(&self.journal, &sp.child_session_id, "lost", "").await;
                 out.push(c6_proto::ToolResult {
                     call_id: sp.call_id.clone(),
@@ -397,6 +438,7 @@ impl SessionManager {
                     attachments: input.attachments,
                     command: input.command,
                     wake: input.wake,
+                    delegated_by: input.delegated_by,
                     ..Default::default()
                 };
                 let choice = CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels };
@@ -453,6 +495,15 @@ impl SessionManager {
                 if let Some(actor) = self.live(&cmd.session_id) {
                     let _ = actor.send(ActorMsg::Decide { call_id: a.call_id, allow: a.allow });
                 }
+                Ok(())
+            }
+            // A remote subagent's turn ended (docs/remote-subagents.md).
+            Some(session_command::Kind::DelegationEnded(d)) => {
+                if self.journal.is_applied(&cmd.command_id).await.map_err(internal)? {
+                    return Ok(());
+                }
+                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+                let _ = actor.send(ActorMsg::RemoteReport(cmd.command_id, Box::new(d)));
                 Ok(())
             }
             Some(session_command::Kind::StopTask(t)) => {
@@ -601,6 +652,8 @@ impl SessionManager {
             home,
             ssh_target,
             system,
+            // A remote subagent's place in its tree.
+            depth: spec.depth,
             ..Default::default()
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
@@ -704,11 +757,11 @@ impl SessionManager {
         }
         let _ = tx.send(ActorMsg::Reserve(highest));
         for t in open {
-            let child = events
+            let (child, remote) = events
                 .iter()
                 .find_map(|e| match &e.kind {
                     Some(session_event::Kind::SubagentSpawned(sp)) if sp.background_task_id == t.task_id => {
-                        Some(sp.child_session_id.clone())
+                        Some((sp.child_session_id.clone(), sp.remote.is_some()))
                     }
                     _ => None,
                 })
@@ -720,6 +773,7 @@ impl SessionManager {
                 notify: t.notify,
                 pgid: t.pgid,
                 child,
+                remote,
             });
         }
         Ok(Some(handle))
@@ -1371,6 +1425,12 @@ impl Actor {
                         }
                         inbox.push(*input, None);
                     }
+                    Some(ActorMsg::RemoteReport(command_id, ended)) => {
+                        if let Err(e) = self.remote_report(command_id, *ended, running.is_some()).await {
+                            error!(session = %self.writer.session_id, "taking a remote subagent's report: {e:#}");
+                            return;
+                        }
+                    }
                     Some(ActorMsg::ChildReport { text, wake }) => {
                         let input = PendingInput {
                             command_id: format!("subagent:{}", uuid::Uuid::now_v7()),
@@ -1410,13 +1470,17 @@ impl Actor {
                             return;
                         }
                     }
-                    Some(ActorMsg::Lost { task_id, kind, description, notify, pgid, child }) => {
+                    Some(ActorMsg::Lost { task_id, kind, description, notify, pgid, child, remote }) => {
                         // It may outlive the worker (its own process group):
                         // stop it, since nothing reads its output any more.
                         stop_orphan(pgid, &description);
-                        // A subagent's log is kept: what it did so far.
+                        // A subagent's log is kept: what it did so far. A
+                        // remote one keeps working; its report comes later.
                         let report = if child.is_empty() {
                             String::new()
+                        } else if remote {
+                            let note = spec_prompt(&self.spec, "session.subagent_remote_reattach", c6_agent::SUBAGENT_REMOTE_REATTACH);
+                            format!("<subagent id=\"{child}\" status=\"running\"/>\n{note}")
                         } else {
                             crate::subagent::partial(&self.spec, &crate::subagent::digest(&self.journal, &child, "lost", "").await)
                         };
@@ -1531,18 +1595,14 @@ impl Actor {
         let report = self.report.take();
         if !told && let Some((said, wake)) = report {
             let sid = self.writer.session_id.clone();
-            let body = if outcome.reason == TurnEndReason::Completed && !outcome.report.trim().is_empty() {
-                format!("<subagent id=\"{sid}\" status=\"completed\">\nReport:\n{}\n</subagent>", outcome.report.trim_end())
+            let digest = if outcome.reason == TurnEndReason::Completed && !outcome.report.trim().is_empty() {
+                String::new()
             } else {
                 let status = crate::subagent::status_of(outcome.reason, &outcome.report);
-                crate::subagent::partial(&self.spec, &crate::subagent::digest(&self.journal, &sid, status, "").await)
+                crate::subagent::digest(&self.journal, &sid, status, "").await
             };
-            let said: Vec<String> = said.into_iter().filter(|s| !s.trim().is_empty()).collect();
-            let text = if said.is_empty() {
-                format!("Subagent {sid} worked on its own (no call of yours waited on it):\n{body}")
-            } else {
-                format!("The user messaged subagent {sid} directly: \"{}\"\n{body}", said.join("\" / \""))
-            };
+            let body = crate::subagent::report_body(&self.spec, &sid, outcome.reason, &outcome.report, &digest);
+            let text = crate::subagent::unasked_report(&sid, &said, &body);
             match self.manager.actor_for(&d.parent_session_id).await {
                 Ok(Some(parent)) => {
                     let _ = parent.send(ActorMsg::ChildReport { text, wake });
@@ -1554,6 +1614,44 @@ impl Actor {
         for (_, tx) in settled {
             let _ = tx.send(Outcome { reason: outcome.reason, report: outcome.report.clone(), error: outcome.error.clone() });
         }
+        Ok(())
+    }
+
+    /// A remote subagent's turn ended (docs/remote-subagents.md): the call
+    /// waiting on it gets the outcome. Without one (you messaged the
+    /// subagent, or this worker restarted while a call waited) it comes as a
+    /// notice, which wakes the session if a call had waited. The log then
+    /// says it came, so the head stops sending it.
+    async fn remote_report(&mut self, command_id: String, ended: c6_proto::DelegationEnded, busy: bool) -> anyhow::Result<()> {
+        let reason = TurnEndReason::try_from(ended.reason).unwrap_or(TurnEndReason::Unspecified);
+        let reported = c6_proto::SubagentReported {
+            command_id,
+            call_id: ended.call_id.clone(),
+            child_session_id: ended.child_session_id.clone(),
+            status: crate::subagent::status_of(reason, &ended.report).into(),
+        };
+        let waiter = if ended.call_id.is_empty() { None } else { self.manager.take_remote_wait(&self.writer.session_id, &ended.call_id) };
+        let unanswered = match waiter {
+            Some(tx) => tx.send(ended).err(),
+            None => Some(ended),
+        };
+        if let Some(ended) = unanswered {
+            let sid = &ended.child_session_id;
+            let body = crate::subagent::report_body(&self.spec, sid, reason, &ended.report, &ended.digest);
+            let (text, wake) = if ended.call_id.is_empty() {
+                (crate::subagent::unasked_report(sid, &ended.said, &body), ended.wake)
+            } else {
+                (format!("Subagent {sid} ended the turn your call {} waited on:\n{body}", ended.call_id), true)
+            };
+            let input = PendingInput {
+                command_id: format!("subagent:{}", uuid::Uuid::now_v7()),
+                text,
+                command: "task-notification".into(),
+                ..Default::default()
+            };
+            self.queue_notice(input, busy, wake).await?;
+        }
+        self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
         Ok(())
     }
 
@@ -1783,11 +1881,12 @@ impl Actor {
     /// `SendMessage` (no background runs: nothing could deliver their
     /// notices to Claude Code). None without a connection to run on.
     fn claude_code_subagent_tools(&self) -> Vec<Arc<dyn Tool>> {
-        let depth = self.spec.delegation.as_ref().map_or(0, |d| d.depth);
+        let depth = crate::subagent::depth_of(&self.spec);
         let connections = task_connections(&self.spec);
+        let templates = task_templates(&self.spec);
         // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
         let doc: Arc<dyn Tool> = Arc::new(c6_tools::records::Doc::new(false));
-        if connections.is_empty() || !crate::subagent::may_delegate(&self.spec, depth) {
+        if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(&self.spec, depth) {
             return vec![doc];
         }
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
@@ -1795,7 +1894,12 @@ impl Actor {
             session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
         let agents = session_agents(&self.spec, &labels);
         vec![
-            Arc::new(c6_tools::Task::with_agents(true, agents).with_connections(connections).foreground_only()),
+            Arc::new(
+                c6_tools::Task::with_agents(true, agents)
+                    .with_connections(connections)
+                    .with_templates(&templates_intro(&self.spec), templates)
+                    .foreground_only(),
+            ),
             Arc::new(c6_tools::SendMessage::claude().foreground_only()),
             doc,
         ]
@@ -2254,6 +2358,21 @@ pub(crate) fn task_connections(spec: &CreateSession) -> Vec<c6_tools::Connection
         .collect()
 }
 
+/// The templates a session's agent may start as remote subagents (from
+/// the head), as `Task` lists them.
+pub(crate) fn task_templates(spec: &CreateSession) -> Vec<c6_tools::TemplateInfo> {
+    serde_json::from_str::<Vec<c6_api::SubagentTemplate>>(&spec.subagent_templates_json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| c6_tools::TemplateInfo { name: t.name, description: t.description, place: t.place, model: t.model, targets: t.targets })
+        .collect()
+}
+
+/// The line introducing them (an editable prompt).
+fn templates_intro(spec: &CreateSession) -> String {
+    spec_prompt(spec, "session.subagent_templates", c6_agent::SUBAGENT_TEMPLATES)
+}
+
 /// Built-in tools, before MCP discovery and the session's tool list.
 fn builtin_tools(
     spec: &CreateSession,
@@ -2336,12 +2455,18 @@ fn builtin_tools(
     }
     // Named agents (from the head's settings) become Task's subagent types,
     // and it offers the connections subagents may run on.
+    // Templates it may start as remote subagents (docs/remote-subagents.md).
     let agents = session_agents(spec, labels);
     let connections = task_connections(spec);
-    if (!agents.is_empty() || !connections.is_empty())
+    let templates = task_templates(spec);
+    if (!agents.is_empty() || !connections.is_empty() || !templates.is_empty())
         && let Some(i) = tools.iter().position(|t| c6_tools::Task::is_task(&t.spec().name))
     {
-        tools[i] = Arc::new(c6_tools::Task::with_agents(profile == ToolProfile::Claude, agents).with_connections(connections));
+        tools[i] = Arc::new(
+            c6_tools::Task::with_agents(profile == ToolProfile::Claude, agents)
+                .with_connections(connections)
+                .with_templates(&templates_intro(spec), templates),
+        );
     }
 
     #[derive(serde::Deserialize)]
@@ -2427,6 +2552,10 @@ pub(crate) async fn build_tools(
         tools.extend(set.tools().await);
     }
     tools.retain(|t| c6_tools::tool_allowed(&spec.tools, &t.spec().name));
+    // At the depth limit (a remote subagent deep in its tree), no more.
+    if !crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec)) {
+        tools.retain(|t| !c6_tools::Task::is_task(&t.spec().name) && !c6_tools::SendMessage::is_send(&t.spec().name));
+    }
     if !tools.iter().any(|t| t.spec().name == SkillTool::tool_name(profile == ToolProfile::Claude)) {
         skills.clear();
     }
