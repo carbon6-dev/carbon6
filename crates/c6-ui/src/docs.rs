@@ -275,6 +275,8 @@ pub fn DocPage(id: String) -> impl IntoView {
     let exporting = RwSignal::new(false);
     let edit = RwSignal::new(None::<Editing>);
     let deck_pick = RwSignal::new(None::<String>);
+    // The block (or slide) a new comment is about ("": the tab).
+    let commenting = RwSignal::new(None::<String>);
     let draft = Draft { text: RwSignal::new(String::new()), typed: RwSignal::new(0) };
     let adding = RwSignal::new(String::new());
     let reload = move || tick.update(|t| *t += 1);
@@ -404,11 +406,11 @@ pub fn DocPage(id: String) -> impl IntoView {
                         {let k = kind.clone(); move || exporting.get().then(|| view! { <Exports id=id.get_value() kind=k.clone() /> })}
                         {move || history.get().then(|| view! { <History id=id.get_value() reload=reload_cb /> })}
                         {(kind == "deck").then(|| view! {
-                            <crate::deck::DeckView doc=d.clone() send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick />
+                            <crate::deck::DeckView doc=d.clone() send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick commenting />
                         })}
                         <article class="space-y-1" class:hidden=kind == "deck">
                             {blocks.iter().map(|b| view! {
-                                <BlockView doc_id=id b=b.clone() rev=rev kind=kind.clone() edit draft error reload=reload_cb />
+                                <BlockView doc_id=id b=b.clone() rev=rev kind=kind.clone() edit draft error reload=reload_cb commenting />
                             }).collect_view()}
                             {blocks.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"Empty. Write below to start it."</p> })}
                         </article>
@@ -421,6 +423,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_block()>"Add (⌘↵)"</button>
                             </div>
                         </div>
+                        <Comments id=id.get_value() tick commenting />
                         {move || {
                             let w = used_in.get().and_then(Result::ok).unwrap_or_default();
                             let p = in_projects.get().unwrap_or_default();
@@ -553,6 +556,7 @@ fn BlockView(
     draft: Draft,
     error: RwSignal<Option<String>>,
     reload: Callback<()>,
+    commenting: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let bid = StoredValue::new(b.id.clone());
     let block = StoredValue::new(b.clone());
@@ -627,6 +631,8 @@ fn BlockView(
                     view! { <div on:click=move |_| start() class="cursor-text"><Shown b=b kind=kind.clone() /></div> }.into_any()
                 }
             }}
+            <button class="invisible absolute -right-6 top-0.5 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
+                on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
         </div>
     }
 }
@@ -668,6 +674,134 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
             let _ = kind;
             view! { <div class="md" inner_html=crate::markdown::to_html(&chips_shown(&b.text, &b.attrs))></div> }.into_any()
         }
+    }
+}
+
+/// Comments (docs/docs.md §8): its threads, open first, each with what
+/// it's about, its comments, a reply box, "send to an agent" and Resolve; a
+/// new thread on the block or slide you picked (💬), or on the whole tab.
+#[component]
+fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>>) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let threads = LocalResource::new(move || {
+        tick.track();
+        api::doc_threads(id.get_value())
+    });
+    let shown = RwSignal::new(Vec::<c6_api::docs::DocThread>::new());
+    Effect::new(move || {
+        if let Some(Ok(t)) = threads.get() {
+            shown.set(t);
+        }
+    });
+    let error = RwSignal::new(None::<String>);
+    let (quote, text, to_agent) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(false));
+    let show_resolved = RwSignal::new(false);
+    let post = move || {
+        let Some(block) = commenting.get_untracked() else { return };
+        let t = c6_api::docs::ThreadNew {
+            anchor: c6_api::docs::Anchor { block, quote: quote.get_untracked(), tab: String::new() },
+            text: text.get_untracked(),
+            to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
+        };
+        spawn_local(async move {
+            match api::doc_thread_new(id.get_value(), &t).await {
+                Ok(_) => {
+                    commenting.set(None);
+                    quote.set(String::new());
+                    text.set(String::new());
+                    error.set(None);
+                    tick.update(|t| *t += 1);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <section class="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
+            <div class="flex items-center gap-2">
+                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">"Comments"</h2>
+                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| commenting.set(Some(String::new()))>"+ On the whole tab"</button>
+                <label class="flex items-center gap-1 text-xs text-zinc-500">
+                    <input type="checkbox" prop:checked=move || show_resolved.get() on:change=move |ev| show_resolved.set(event_target_checked(&ev)) />
+                    "Resolved"
+                </label>
+            </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || commenting.get().map(|b| view! {
+                <div class="space-y-1 rounded-md border border-violet-300 p-2 dark:border-violet-800">
+                    <div class="text-xs text-zinc-500">{if b.is_empty() { "On the whole tab".to_owned() } else { format!("On block {b}") }}</div>
+                    {(!b.is_empty()).then(|| view! {
+                        <input class=INPUT placeholder="A few of its words to point at (optional)" prop:value=move || quote.get() on:input=move |ev| quote.set(event_target_value(&ev)) />
+                    })}
+                    <textarea class=format!("{INPUT} min-h-[3rem]") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
+                    <div class="flex items-center gap-2">
+                        <label class="flex flex-1 items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400"
+                            title="The session that last wrote it gets the thread if it's idle; else a new one starts from the document's work or project">
+                            <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />
+                            "Send it to an agent"
+                        </label>
+                        <button class=BUTTON_QUIET on:click=move |_| commenting.set(None)>"Cancel"</button>
+                        <button class=BUTTON on:click=move |_| post()>"Comment"</button>
+                    </div>
+                </div>
+            })}
+            {move || shown.get().into_iter().filter(|t| show_resolved.get() || t.state == "open").map(|t| view! { <Thread t doc=id.get_value() tick /> }).collect_view()}
+            {move || shown.get().iter().all(|t| t.state != "open").then(|| view! { <p class="text-sm text-zinc-500">"No open comments. Hover a block and press 💬 to start one."</p> })}
+        </section>
+    }
+}
+
+/// One thread.
+#[component]
+fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl IntoView {
+    let (doc, tid) = (StoredValue::new(doc), StoredValue::new(t.id.clone()));
+    let reply = RwSignal::new(String::new());
+    let to_agent = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let done = move |r: Result<c6_api::docs::DocThread, String>| match r {
+        Ok(_) => {
+            reply.set(String::new());
+            tick.update(|t| *t += 1);
+        }
+        Err(e) => error.set(Some(e)),
+    };
+    let send = move || {
+        let c = c6_api::docs::CommentNew {
+            text: reply.get_untracked(),
+            to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
+        };
+        if c.text.trim().is_empty() {
+            return;
+        }
+        spawn_local(async move { done(api::doc_thread_reply(doc.get_value(), tid.get_value(), &c).await) });
+    };
+    let open = t.state == "open";
+    view! {
+        <div class=format!("space-y-1 rounded-md border p-2 text-sm {}", if t.needs_you { "border-amber-300 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-950/20" } else { "border-zinc-200 dark:border-zinc-800" })
+            data-thread=t.id.clone()>
+            <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                <span class="min-w-0 flex-1 truncate">{format!("On {}", t.about)}</span>
+                {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
+                {t.to_agent.then(|| view! { <span title=format!("Sent to {}", author_named(&format!("session:{}", t.agent)))>"→ agent"</span> })}
+                {t.needs_you.then(|| view! { <span class="font-medium text-amber-700 dark:text-amber-300">"answered: your move"</span> })}
+                {(!open).then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
+            </div>
+            {t.comments.iter().map(|c| view! {
+                <div><span class="font-medium">{author_named(&c.by)}</span>{format!(" · {}", since(c.at))}<p class="whitespace-pre-wrap">{c.text.clone()}</p></div>
+            }).collect_view()}
+            {(!t.edits.is_empty()).then(|| view! { <div class="text-xs text-zinc-500">{format!("Edits for it: {}", t.edits.iter().map(|r| format!("v{r}")).collect::<Vec<_>>().join(", "))}</div> })}
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            <div class="flex items-center gap-2">
+                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
+                    on:keydown=move |ev| if ev.key() == "Enter" { send() } />
+                <label class="flex items-center gap-1 text-xs text-zinc-500" title="Send the thread to an agent">
+                    <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />"agent"
+                </label>
+                {open.then(|| view! {
+                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
+                })}
+            </div>
+        </div>
     }
 }
 

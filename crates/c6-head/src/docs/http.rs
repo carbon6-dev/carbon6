@@ -27,6 +27,9 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/{id}/exports", get(exports))
         .route("/api/v1/docs/{id}/exports/{export}/file", get(export_file))
         .route("/api/v1/docs/import", post(import))
+        .route("/api/v1/docs/{id}/threads", get(threads).post(new_thread))
+        .route("/api/v1/docs/{id}/threads/{thread}/comments", post(reply))
+        .route("/api/v1/docs/{id}/threads/{thread}/resolve", post(resolve))
 }
 
 /// The realm's (`?realm=`, through the settings middleware).
@@ -206,4 +209,46 @@ async fn import(
     let realm = realm(&st, &caller, &r).await?;
     let (doc, applied) = super::export::import(&st, &realm, &i, &super::by_of(&caller)).await?;
     Ok(Json(serde_json::to_value(Created { doc, applied }).map_err(anyhow::Error::from)?))
+}
+
+async fn threads(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::docs::DocThread>>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::list(&st, &realm, &id).await?))
+}
+
+async fn new_thread(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(n): Json<api::docs::ThreadNew>,
+) -> ApiResult<Json<api::docs::DocThread>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::create(&st, &realm, &id, &n, &super::by_of(&caller)).await?))
+}
+
+async fn reply(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, thread)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+    Json(c): Json<api::docs::CommentNew>,
+) -> ApiResult<Json<api::docs::DocThread>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::reply(&st, &realm, &id, &thread, &c, &super::by_of(&caller)).await?))
+}
+
+async fn resolve(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, thread)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<api::docs::DocThread>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::resolve(&st, &realm, &id, &thread, &super::by_of(&caller)).await?))
 }

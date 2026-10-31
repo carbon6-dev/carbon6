@@ -1465,3 +1465,19 @@ pub async fn decks_bring_status() -> Result<serde_json::Value, String> {
 pub async fn decks_bring_in() -> Result<serde_json::Value, String> {
     json(Request::post("/api/v1/decks/bring-in").send().await).await
 }
+
+pub async fn doc_threads(id: String) -> Result<Vec<c6_api::docs::DocThread>, String> {
+    json(Request::get(&format!("/api/v1/docs/{}/threads", enc(&id))).send().await).await
+}
+
+pub async fn doc_thread_new(id: String, t: &c6_api::docs::ThreadNew) -> Result<c6_api::docs::DocThread, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/threads", enc(&id))), t).await
+}
+
+pub async fn doc_thread_reply(id: String, thread: String, c: &c6_api::docs::CommentNew) -> Result<c6_api::docs::DocThread, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/threads/{}/comments", enc(&id), enc(&thread))), c).await
+}
+
+pub async fn doc_thread_resolve(id: String, thread: String) -> Result<c6_api::docs::DocThread, String> {
+    json(Request::post(&format!("/api/v1/docs/{}/threads/{}/resolve", enc(&id), enc(&thread))).send().await).await
+}

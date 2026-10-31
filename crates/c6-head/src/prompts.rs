@@ -121,6 +121,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::DOCS_STYLE,
     },
     Prompt {
+        name: "docs.comment",
+        description: "What an agent is told when you send it a comment thread on a document (docs/docs.md §8). Placeholders: {{title}}, {{doc}}, {{thread}}, {{anchor}}, {{comments}}.",
+        default: text::DOCS_COMMENT,
+    },
+    Prompt {
         name: "decks.flow",
         description: "How a session makes a deck with the doc tool: outline as pending slides, approval, theme, build, look, fix (docs/docs.md §5).",
         default: text::DECKS_FLOW,

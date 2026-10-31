@@ -387,10 +387,11 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
         for d in &r.fields.documents {
             let (title, kind, at) =
                 crate::docs::title_of(st, &r.realm, &d.doc).await.unwrap_or_else(|| ("(gone)".into(), String::new(), 0));
-            docs.push(LiveDoc { doc: d.doc.clone(), role: d.role.clone(), title, kind, updated_at: at });
+            let answered = if kind.is_empty() { 0 } else { crate::docs::comments::answered(st, &r.realm, &d.doc).await as u32 };
+            docs.push(LiveDoc { doc: d.doc.clone(), role: d.role.clone(), title, kind, updated_at: at, answered });
         }
         docs.sort_by_key(|d| d.role != "plan");
-        let (state, why) = state_of(&r.fields, &work);
+        let (state, why) = state_of(&r.fields, &work, &docs);
         let late = late(&r.fields, &today());
         out.push(ProjectItem {
             id: r.id,
@@ -415,7 +416,7 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
 /// that needs you); moving (work moving or waiting on others); stalled (no
 /// work open: nothing advances it); gone quiet (its open work has all gone
 /// quiet); on track.
-pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork]) -> (String, String) {
+pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork], docs: &[LiveDoc]) -> (String, String) {
     let r = |state: &str, why: String| (state.to_owned(), why);
     if f.status != "active" {
         return r(&f.status, String::new());
@@ -425,6 +426,9 @@ pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork]) -> (String, Stri
     }
     if let Some((p, o)) = f.phases.iter().find_map(|p| p.offer.as_ref().map(|o| (p, o))) {
         return r("needs_you", format!("{} looks done: {}", p.title, o.evidence));
+    }
+    if let Some(d) = docs.iter().find(|d| d.answered > 0) {
+        return r("needs_you", format!("An agent answered a comment on {}", d.title));
     }
     let open: Vec<&ProjectWork> = work.iter().filter(|w| !matches!(w.state.as_str(), "done" | "dropped")).collect();
     if let Some(w) = open.iter().find(|w| w.state == "needs_you") {
@@ -851,17 +855,19 @@ mod tests {
     #[test]
     fn its_state_comes_from_its_work() {
         let f = ProjectFields { title: "p".into(), status: "active".into(), ..Default::default() };
-        let st = |work: &[ProjectWork]| state_of(&f, work).0;
+        let st = |work: &[ProjectWork]| state_of(&f, work, &[]).0;
         assert_eq!(st(&[]), "stalled");
-        assert_eq!(state_of(&f, &[w("a", "done")]), ("stalled".into(), "All its work is closed, and nothing new is open".into()));
+        assert_eq!(state_of(&f, &[w("a", "done")], &[]), ("stalled".into(), "All its work is closed, and nothing new is open".into()));
         assert_eq!(st(&[w("a", "open")]), "on_track");
         assert_eq!(st(&[w("a", "quiet"), w("b", "quiet"), w("c", "done")]), "quiet");
         assert_eq!(st(&[w("a", "quiet"), w("b", "waiting")]), "moving");
-        assert_eq!(state_of(&f, &[w("a", "moving"), w("b", "needs_you")]), ("needs_you".into(), "b: b why".into()));
+        assert_eq!(state_of(&f, &[w("a", "moving"), w("b", "needs_you")], &[]), ("needs_you".into(), "b: b why".into()));
         let offered = ProjectFields { offer: Some(api::work::WorkOffer { evidence: "shipped".into(), at: 1 }), ..f.clone() };
-        assert_eq!(state_of(&offered, &[]).0, "needs_you");
+        assert_eq!(state_of(&offered, &[], &[]).0, "needs_you");
+        let answered = LiveDoc { doc: "d".into(), title: "Plan".into(), kind: "doc".into(), answered: 1, ..Default::default() };
+        assert_eq!(state_of(&f, &[w("a", "open")], &[answered]), ("needs_you".into(), "An agent answered a comment on Plan".into()));
         let paused = ProjectFields { status: "paused".into(), ..f.clone() };
-        assert_eq!(state_of(&paused, &[]).0, "paused");
+        assert_eq!(state_of(&paused, &[], &[]).0, "paused");
         // Late: the current phase's target has passed.
         let phases = vec![
             api::projects::Phase {

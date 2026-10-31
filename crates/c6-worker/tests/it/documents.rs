@@ -650,3 +650,135 @@ async fn the_decks_apps_decks_come_in_once() {
     assert_eq!(send(M::GET, "decks/bring-in".into(), Value::Null).await["left"], 1, "the lost one is still left");
     stop.cancel();
 }
+
+/// Comments (docs/docs.md §8): a thread on a block, sent to the session
+/// that wrote it (idle, so it gets the thread as a message by
+/// `docs.comment`); it edits answering the thread and replies; the thread,
+/// and the work holding the document, need you until you resolve it.
+#[tokio::test]
+async fn comments_go_to_the_agent_that_wrote_the_part() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4})).await;
+    let conn = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await;
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    // The session writes a doc, in its work.
+    let create = json!({"action": "create", "title": "Pricing", "markdown": "# Pricing\n\nWe charge per seat.\n\nAnnual plans get two months free."});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Wrote it.".into()));
+    let s = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "write the pricing doc", "work": "new"}),
+    )
+    .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 1).await;
+    let doc = send(M::GET, "docs?q=Pricing".into(), Value::Null).await[0].clone();
+    let id = doc["id"].as_str().unwrap().to_owned();
+    let full = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    let para = full["tabs"][0]["blocks"][1]["id"].as_str().unwrap().to_owned();
+
+    // You comment on words of it; a quote that isn't there is refused.
+    let r = http
+        .post(format!("{api}/docs/{id}/threads"))
+        .json(&json!({"anchor": {"block": para, "quote": "per user"}, "text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let t = send(
+        M::POST,
+        format!("docs/{id}/threads"),
+        json!({"anchor": {"block": para, "quote": "per seat"}, "text": "Say the price: $12 a seat."}),
+    )
+    .await;
+    let tid = t["id"].as_str().unwrap().to_owned();
+    assert_eq!((t["about"].as_str(), t["needs_you"].as_bool(), t["detached"].as_bool()), (Some("“per seat”"), Some(false), Some(false)));
+    // Sent to the agent: the session that wrote it, idle, gets the thread.
+    let edit = json!({"action": "edit", "id": id, "answering": tid, "ops": [{"op": "replace", "id": para, "find": "per seat", "with": "$12 per seat a month"}]});
+    let answer = json!({"action": "comment", "id": id, "op": "reply", "thread": tid, "text": "Done: it says $12 per seat a month."});
+    let resolve = json!({"action": "comment", "id": id, "op": "resolve", "thread": tid});
+    mock.push(Reply::ToolCalls(vec![
+        ("doc".into(), edit.to_string()),
+        ("doc".into(), answer.to_string()),
+        ("doc".into(), resolve.to_string()),
+    ]));
+    mock.push(Reply::Text("Answered.".into()));
+    send(M::POST, format!("docs/{id}/threads/{tid}/comments"), json!({"text": "Please do it.", "to": "agent"})).await;
+    let ev = turns(sid.clone(), 2).await;
+    let asked =
+        mock.requests().into_iter().rev().find(|r| r["messages"].to_string().contains(&format!("Thread {tid}"))).expect("docs.comment");
+    assert!(asked["messages"].to_string().contains("Say the price"), "the thread is in it");
+    let outs: Vec<&str> = ev.iter().filter(|e| e["type"] == "tool_result").filter_map(|e| e["output"].as_str()).collect();
+    assert!(outs.last().unwrap().contains("only the user resolves a thread they wrote"), "{outs:?}");
+    let t = send(M::GET, format!("docs/{id}/threads"), Value::Null).await[0].clone();
+    assert_eq!(t["comments"].as_array().unwrap().len(), 3);
+    assert_eq!(t["comments"][2]["by"], format!("session:{sid}"));
+    assert_eq!((t["to_agent"].as_bool(), t["agent"].as_str()), (Some(true), Some(sid.as_str())));
+    assert_eq!((t["needs_you"].as_bool(), t["state"].as_str()), (Some(true), Some("open")));
+    assert_eq!(t["edits"].as_array().unwrap().len(), 1, "its edit links to the thread");
+    assert_eq!(t["detached"], false, "the words it quoted are still there");
+    // Its work needs you, for the answered comment.
+    let w = send(M::GET, format!("work/of?ref=session:{sid}"), Value::Null).await[0].clone();
+    assert_eq!(w["state"], "needs_you", "{w}");
+    assert!(w["why"].as_str().unwrap().contains("Pricing"), "{w}");
+    // You resolve it: nothing waits.
+    send(M::POST, format!("docs/{id}/threads/{tid}/resolve"), Value::Null).await;
+    let t = send(M::GET, format!("docs/{id}/threads"), Value::Null).await[0].clone();
+    assert_eq!((t["state"].as_str(), t["needs_you"].as_bool(), t["resolved_by"].as_str()), (Some("resolved"), Some(false), Some("you")));
+    let w = send(M::GET, format!("work/of?ref=session:{sid}"), Value::Null).await[0].clone();
+    assert!(!w["why"].as_str().unwrap().contains("Pricing"), "not for the comment now (its turn ended: your move): {w}");
+    // A thread on a block that goes is detached, and stays.
+    let t2 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": para}, "text": "Too long?"})).await;
+    let b = send(M::GET, format!("docs/{id}/read?view=block&id={para}"), Value::Null).await;
+    send(M::POST, format!("docs/{id}/ops"), json!({"ops": [{"op": "delete", "id": para, "ifRev": b["rev_doc"], "ifHash": b["hash"]}]}))
+        .await;
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    let t2 = all.as_array().unwrap().iter().find(|t| t["id"] == t2["id"]).unwrap().clone();
+    assert_eq!((t2["detached"].as_bool(), t2["about"].as_str()), (Some(true), Some("“We charge $12 per seat a month.”")));
+    stop.cancel();
+}

@@ -771,6 +771,10 @@ async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(
     if let Some(id) = a.reference.strip_prefix("doc:") {
         match crate::docs::title_of(st, realm, id).await {
             Some((title, _, at)) => {
+                // An agent answered a comment on it: your move.
+                if crate::docs::comments::answered(st, realm, id).await > 0 {
+                    l.state = "needs_you".into();
+                }
                 l.title = title;
                 l.at = at;
             }

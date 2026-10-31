@@ -256,6 +256,11 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
             let doc = super::get(st, &realm, &id).await?;
             Ok(json!({"did": "restored", "doc": about(&doc.summary), "rev": a.rev, "hashes": a.hashes}))
         }
+        // Comments (docs/docs.md §8): create, reply, list, resolve its own.
+        "comment" => {
+            need_id()?;
+            super::comments::for_session(st, &realm, &id, p, &by).await
+        }
         // A file of it, kept with the version (docs/docs.md §10).
         "export" => {
             need_id()?;
@@ -283,9 +288,9 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
             need_id()?;
             Ok(json!({"versions": super::history(st, &realm, &id, 50).await?}))
         }
-        other => {
-            Err(bad_request(format!("doc's actions are guide, list, create, read, edit, look, export, history and restore, not {other:?}")))
-        }
+        other => Err(bad_request(format!(
+            "doc's actions are guide, list, create, read, edit, comment, look, export, history and restore, not {other:?}"
+        ))),
     }
 }
 

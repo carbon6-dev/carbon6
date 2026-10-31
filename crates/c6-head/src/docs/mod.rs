@@ -10,6 +10,7 @@
 //! triggers, with who wrote it.
 
 pub mod bring;
+pub mod comments;
 pub mod export;
 pub mod http;
 pub mod markdown;

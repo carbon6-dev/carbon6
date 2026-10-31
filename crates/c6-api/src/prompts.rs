@@ -288,6 +288,16 @@ the edges.\n- The title states the message and fits on at most two lines.\n- Tex
 clutter; numbers are right.\n- Consistency: the same layout used the same way; titles in the same place.\nFix the slide with an edit \
 and look again until every slide passes. Then read the deck once more as a sequence: does the story flow, is anything repeated?";
 
+/// A comment thread sent to an agent (docs/docs.md §8). `{{title}}`,
+/// `{{doc}}` (its id), `{{thread}}`, `{{anchor}}` (what it's about),
+/// `{{comments}}` (the thread so far).
+pub const DOCS_COMMENT: &str = "A comment on the document \"{{title}}\" (doc:{{doc}}) is for you. Thread {{thread}}, about \
+{{anchor}}:\n\n{{comments}}\n\n\
+Read what it is about with the doc tool (action read; view block with its block, or outline). If it asks for a change, make it \
+with an edit that says answering: \"{{thread}}\", so the thread links to it; keep to what was asked. Then reply in the thread \
+(action comment, op reply, thread {{thread}}) with what you changed in a line or two, or why you didn't. Don't resolve a thread the \
+user wrote: they do.";
+
 /// How agents write documents with the `doc` tool (docs/docs.md §6).
 pub const DOCS_STYLE: &str = "How to write a carbon6 document (a doc or a deck) with the doc tool.\n\n\
 Birth first. Create it at once with its title and one pending block per section (a doc) or per slide (a deck), each with its intent \

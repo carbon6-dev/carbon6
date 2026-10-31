@@ -193,10 +193,14 @@ records_tool!(
      each with one edit. action read: id, view (outline, block with block=<id>, slide, search with q, since with rev, markdown). \
      action edit: id, ops [{op: insert|replace|delete|move|table|set|add_tab|delete_tab, ...}]; replace a whole block (markdown) or \
      delete one with ifRev and ifHash from your read; replace words with find and with. A refused guard means someone else changed it: \
-     read again. action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document. action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
+     read again. action comment: op list, create, reply or resolve threads (a thread sent to you says what to do). action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document. action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
      you made and your work's you edit freely; others need the user's OK once.",
     json!({"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "look", "export", "history", "restore"]},
+        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "comment", "look", "export", "history", "restore"]},
+        "op": {"type": "string", "description": "comment: list, create (block, quote, text), reply (thread, text), resolve (thread; only threads you began)"},
+        "thread": {"type": "string"},
+        "text": {"type": "string", "description": "comment create and reply: what you say"},
+        "quote": {"type": "string", "description": "comment create: a few words of the block"},
         "id": {"type": "string", "description": "The document (its id, or doc:<id>)"},
         "kind": {"type": "string", "enum": ["doc", "deck"]},
         "title": {"type": "string"},

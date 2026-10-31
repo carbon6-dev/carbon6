@@ -142,6 +142,9 @@ pub struct LiveDoc {
     pub kind: String,
     #[serde(default)]
     pub updated_at: UnixMs,
+    /// Comment threads an agent answered that wait for you.
+    #[serde(default)]
+    pub answered: u32,
 }
 
 /// A project as the API gives it.

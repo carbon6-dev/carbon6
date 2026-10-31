@@ -66,7 +66,13 @@ fn replace_slide(id: &str, layout: Option<String>, notes: Option<String>, hidden
 
 /// A deck in the document panel.
 #[component]
-pub fn DeckView(doc: Doc, send: Callback<Vec<DocOp>>, error: RwSignal<Option<String>>, picked: RwSignal<Option<String>>) -> impl IntoView {
+pub fn DeckView(
+    doc: Doc,
+    send: Callback<Vec<DocOp>>,
+    error: RwSignal<Option<String>>,
+    picked: RwSignal<Option<String>>,
+    commenting: RwSignal<Option<String>>,
+) -> impl IntoView {
     let id = StoredValue::new(doc.summary.id.clone());
     let themes = LocalResource::new(api::deck_themes);
     let all = slides(&doc);
@@ -243,6 +249,7 @@ pub fn DeckView(doc: Doc, send: Callback<Vec<DocOp>>, error: RwSignal<Option<Str
                             </div>
                             <div class="flex flex-wrap items-center gap-2 text-sm">
                                 <span class="text-zinc-500">{format!("Slide {} of {total}", i + 1)}</span>
+                                {let c = s.id.clone(); view! { <button class=BUTTON_QUIET title="Comment on this slide" on:click=move |_| commenting.set(Some(c.clone()))>"💬"</button> }}
                                 {(!pending).then(|| view! {
                                     <select class=format!("{INPUT} w-auto!") title="Its layout" on:change=move |ev| {
                                         send.run(vec![replace_slide(&sid, Some(event_target_value(&ev)), None, None)]);

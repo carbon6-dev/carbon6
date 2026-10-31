@@ -480,3 +480,89 @@ pub struct DocImport {
     #[serde(default)]
     pub labels: Vec<String>,
 }
+
+/// What a comment thread is about (docs/docs.md §8): quoted words in a
+/// block, a block or slide, or a whole tab.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Anchor {
+    /// The block or slide (none: the tab).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub block: String,
+    /// A few words of it, quoted (none: the whole block).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quote: String,
+    /// The tab (default: the first).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tab: String,
+}
+
+/// A comment in a thread.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocComment {
+    pub id: String,
+    /// you, session:<id>, assistant, or token:<name>.
+    pub by: String,
+    pub text: String,
+    pub at: UnixMs,
+}
+
+/// A comment thread on a document.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocThread {
+    pub id: String,
+    pub doc: String,
+    pub anchor: Anchor,
+    /// open or resolved.
+    pub state: String,
+    /// What it was anchored to is gone (the block deleted, the words
+    /// changed): it stays, showing what it had.
+    #[serde(default)]
+    pub detached: bool,
+    /// What it's about, as it read when the thread began.
+    #[serde(default)]
+    pub about: String,
+    /// It was sent to an agent, and the session it went to.
+    #[serde(default)]
+    pub to_agent: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    pub comments: Vec<DocComment>,
+    /// The versions made answering it (edits with `answering`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<i64>,
+    /// An agent answered and you haven't replied or resolved it yet.
+    #[serde(default)]
+    pub needs_you: bool,
+    pub created_by: String,
+    pub created_at: UnixMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<UnixMs>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_by: String,
+}
+
+/// `POST /api/v1/docs/{id}/threads`: a new thread with its first comment.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ThreadNew {
+    #[serde(default)]
+    pub anchor: Anchor,
+    pub text: String,
+    /// `agent`: send it to an agent (the session that last wrote that part,
+    /// if it's idle, else a new one in the document's work or project).
+    #[serde(default)]
+    pub to: String,
+}
+
+/// `POST /api/v1/docs/{id}/threads/{thread}/comments`: a reply.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CommentNew {
+    pub text: String,
+    /// `agent`: send the thread (again) to an agent.
+    #[serde(default)]
+    pub to: String,
+}
