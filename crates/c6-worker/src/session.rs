@@ -1952,8 +1952,10 @@ impl Actor {
     }
 
     /// The tools a Claude Code session gets over MCP: carbon6's `Task` and
-    /// `SendMessage` (no background runs: nothing could deliver their
-    /// notices to Claude Code). None without a connection to run on.
+    /// `SendMessage`, which can run in the background (their notices go to
+    /// the session's process, docs/background.md §4), `TaskOutput` and
+    /// `TaskStop` for those (none of these without a connection or template
+    /// to run on), and carbon6's documents (`doc`).
     fn claude_code_subagent_tools(&self) -> Vec<Arc<dyn Tool>> {
         let depth = crate::subagent::depth_of(&self.spec);
         let connections = task_connections(&self.spec);
@@ -1972,9 +1974,11 @@ impl Actor {
                 c6_tools::Task::with_agents(true, agents)
                     .with_connections(connections)
                     .with_templates(&templates_intro(&self.spec), templates)
-                    .foreground_only(),
+                    .stopped_with("mcp__carbon6__TaskStop"),
             ),
-            Arc::new(c6_tools::SendMessage::claude().foreground_only()),
+            Arc::new(c6_tools::SendMessage::claude()),
+            Arc::new(c6_tools::BashOutput::carbon6()),
+            Arc::new(c6_tools::KillShell::carbon6()),
             doc,
         ]
     }

@@ -141,13 +141,22 @@ pub struct Task {
     /// introduces them (an editable prompt).
     templates: Arc<(String, Vec<TemplateInfo>)>,
     /// Offer `run_in_background` (not where nothing could deliver its
-    /// notice, e.g. to Claude Code over MCP).
+    /// notice).
     background: bool,
+    /// The tool that stops a background one, as the model knows it.
+    kill_tool: &'static str,
 }
 
 impl Task {
     pub fn generic() -> Self {
-        Self { claude: false, agents: Arc::default(), connections: Arc::default(), templates: Arc::default(), background: true }
+        Self {
+            claude: false,
+            agents: Arc::default(),
+            connections: Arc::default(),
+            templates: Arc::default(),
+            background: true,
+            kill_tool: "the kill tool",
+        }
     }
 
     pub fn claude() -> Self {
@@ -175,6 +184,11 @@ impl Task {
         Self { background: false, ..self }
     }
 
+    /// The same tool, naming `tool` as what stops a background one.
+    pub fn stopped_with(self, tool: &'static str) -> Self {
+        Self { kill_tool: tool, ..self }
+    }
+
     pub fn is_task(name: &str) -> bool {
         name == "Task" || name == "task"
     }
@@ -195,7 +209,7 @@ impl Tool for Task {
             "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Its reasoning effort, when the user asks for one; omit for the default"}
         });
         if self.background {
-            properties["run_in_background"] = json!({"type": "boolean", "description": "Start it in the background and continue; its report arrives as a notice when it finishes (stop it with the kill tool)"});
+            properties["run_in_background"] = json!({"type": "boolean", "description": format!("Start it in the background and continue; its report arrives as a notice when it finishes (stop it with {})", self.kill_tool)});
         }
         if !self.connections.is_empty() {
             description.push_str(

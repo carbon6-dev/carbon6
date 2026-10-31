@@ -773,15 +773,23 @@ impl Background {
 pub struct BashOutput {
     name: &'static str,
     id_key: &'static str,
+    /// Only carbon6's subagents (served to Claude Code, whose own tools
+    /// read its own tasks).
+    carbon6: bool,
 }
 
 impl BashOutput {
     pub fn generic() -> Self {
-        Self { name: "bash_output", id_key: "id" }
+        Self { name: "bash_output", id_key: "id", carbon6: false }
     }
 
     pub fn claude() -> Self {
-        Self { name: "BashOutput", id_key: "bash_id" }
+        Self { name: "BashOutput", id_key: "bash_id", carbon6: false }
+    }
+
+    /// For Claude Code, over MCP: `mcp__carbon6__TaskOutput`.
+    pub fn carbon6() -> Self {
+        Self { name: "TaskOutput", id_key: "task_id", carbon6: true }
     }
 }
 
@@ -790,8 +798,13 @@ impl Tool for BashOutput {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name.into(),
-            description: "Returns new output from a background task (a command or subagent started with run_in_background), and whether it has finished. Completion is pushed automatically when notify is true (the default); do not poll just to wait.".into(),
-            parameters: json!({"type": "object", "properties": {self.id_key: {"type": "string", "description": "The background command's id"}},
+            description: if self.carbon6 {
+                "Shows what one of carbon6's background subagents (started by this server's Task or SendMessage with run_in_background) has done so far, and whether it has finished. Its report arrives as a notice when it finishes; do not poll just to wait. Your own background tasks have their own tool."
+            } else {
+                "Returns new output from a background task (a command or subagent started with run_in_background), and whether it has finished. Completion is pushed automatically when notify is true (the default); do not poll just to wait."
+            }
+            .into(),
+            parameters: json!({"type": "object", "properties": {self.id_key: {"type": "string", "description": if self.carbon6 { "The background task id (bg…) or the subagent's id" } else { "The background command's id" }}},
                 "required": [self.id_key], "additionalProperties": false}),
         }
     }
@@ -829,15 +842,22 @@ impl Tool for BashOutput {
 pub struct KillShell {
     name: &'static str,
     id_key: &'static str,
+    /// Only carbon6's subagents (see `BashOutput::carbon6`).
+    carbon6: bool,
 }
 
 impl KillShell {
     pub fn generic() -> Self {
-        Self { name: "kill_shell", id_key: "id" }
+        Self { name: "kill_shell", id_key: "id", carbon6: false }
     }
 
     pub fn claude() -> Self {
-        Self { name: "KillShell", id_key: "shell_id" }
+        Self { name: "KillShell", id_key: "shell_id", carbon6: false }
+    }
+
+    /// For Claude Code, over MCP: `mcp__carbon6__TaskStop`.
+    pub fn carbon6() -> Self {
+        Self { name: "TaskStop", id_key: "task_id", carbon6: true }
     }
 }
 
@@ -846,8 +866,13 @@ impl Tool for KillShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name.into(),
-            description: "Stops a background task: a command (with its child processes) or a subagent.".into(),
-            parameters: json!({"type": "object", "properties": {self.id_key: {"type": "string", "description": "The background command's id"}},
+            description: if self.carbon6 {
+                "Stops one of carbon6's background subagents (started by this server's Task or SendMessage with run_in_background). Its work so far is kept, and SendMessage can continue it. Your own background tasks have their own tool."
+            } else {
+                "Stops a background task: a command (with its child processes) or a subagent."
+            }
+            .into(),
+            parameters: json!({"type": "object", "properties": {self.id_key: {"type": "string", "description": if self.carbon6 { "The background task id (bg…)" } else { "The background command's id" }}},
                 "required": [self.id_key], "additionalProperties": false}),
         }
     }
@@ -859,7 +884,7 @@ impl Tool for KillShell {
     async fn call(&self, ctx: &ToolCtx, input: Value) -> ToolOutput {
         let id = input[self.id_key].as_str().unwrap_or_default();
         if ctx.session.background.native_snapshot(id).is_some() {
-            return ToolOutput::err("Claude Code owns this task; stopping individual native tasks from carbon6 is unsupported.");
+            return ToolOutput::err("Claude Code owns this task: stop it with Claude Code's own tool.");
         }
         match ctx.session.background.kill(id) {
             None => ToolOutput::err(format!("no background command {id:?}")),
