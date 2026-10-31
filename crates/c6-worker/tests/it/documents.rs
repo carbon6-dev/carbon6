@@ -335,3 +335,51 @@ async fn sessions_write_documents_with_the_doc_tool() {
     assert_eq!(b["tabs"][0]["markdown"], "Be kind and brief.");
     stop.cancel();
 }
+
+/// Deck themes are the realm's records (Paper, Night and Signal to begin
+/// with), editable; a session making a deck reads the decks.* prompts and
+/// the themes in its guide.
+#[tokio::test]
+async fn deck_themes_are_records_and_sessions_read_the_deck_guide() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let themes: Vec<c6_api::slides::DeckTheme> = http.get(format!("{api}/decks/themes")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(themes.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Paper", "Night", "Signal"]);
+    // They're records of deck_themes, with history.
+    let recs: Value = http.get(format!("{api}/collections/deck_themes/records")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(recs["records"].as_array().unwrap().len(), 3);
+    // Edit one, add one, drop one.
+    let mut t = themes.clone();
+    t[0].css = ":root { --bg: #fff; --fg: #000; --accent: #c00; }".into();
+    t.remove(1);
+    t.push(c6_api::slides::DeckTheme { name: "Brand".into(), mood: "Ours".into(), css: ":root { --accent: #6d28d9; }".into() });
+    let r = http.put(format!("{api}/decks/themes")).json(&t).send().await.unwrap();
+    assert!(r.status().is_success());
+    let now: Vec<c6_api::slides::DeckTheme> = http.get(format!("{api}/decks/themes")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(now.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Paper", "Signal", "Brand"]);
+    assert!(now[0].css.contains("#c00"));
+    for bad in [
+        json!([]),
+        json!([{"name": "A", "css": ""}]),
+        json!([{"name": "A", "css": "x"}, {"name": "a", "css": "y"}]),
+        json!([{"name": "A", "css": "</style><script>"}]),
+    ] {
+        let r = http.put(format!("{api}/decks/themes")).json(&bad).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert!(c6_head::decks::theme_css(&head.state, "home", "brand").await.contains("#6d28d9"));
+    assert!(c6_head::decks::theme_css(&head.state, "home", "gone").await.contains("#c00"), "the first theme otherwise");
+    let guide = c6_head::decks::guide(&head.state, "home").await;
+    assert!(guide.contains("## decks.flow") && guide.contains("## decks.review") && guide.contains("- Brand: Ours"), "{guide}");
+}

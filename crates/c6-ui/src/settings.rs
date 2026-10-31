@@ -57,6 +57,7 @@ const GROUPS: &[(&str, &[Page])] = &[
             ("views", "Views", "Tables, boards, charts, feeds and pages of each realm"),
             ("work", "Work", "What you've left open: guesses, notes, nudges"),
             ("docs", "Docs", "Which documents sessions write without asking"),
+            ("decks", "Decks", "Themes for decks"),
         ],
     ),
     (
@@ -297,6 +298,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         <OwnOrRoot name="docs" />
                         <DocsSetting />
                     }.into_any(),
+                    "decks" => view! { <crate::deck::ThemesSetting /> }.into_any(),
                     "suggestions" => view! {
                         <OwnOrRoot name="suggestions" />
                         <SuggestionsSetting />

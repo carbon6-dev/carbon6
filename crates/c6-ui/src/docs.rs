@@ -246,6 +246,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     let title = RwSignal::new(String::new());
     let history = RwSignal::new(false);
     let edit = RwSignal::new(None::<Editing>);
+    let deck_pick = RwSignal::new(None::<String>);
     let draft = Draft { text: RwSignal::new(String::new()), typed: RwSignal::new(0) };
     let adding = RwSignal::new(String::new());
     let reload = move || tick.update(|t| *t += 1);
@@ -372,13 +373,16 @@ pub fn DocPage(id: String) -> impl IntoView {
                             </nav>
                         })}
                         {move || history.get().then(|| view! { <History id=id.get_value() reload=reload_cb /> })}
-                        <article class="space-y-1">
+                        {(kind == "deck").then(|| view! {
+                            <crate::deck::DeckView doc=d.clone() send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick />
+                        })}
+                        <article class="space-y-1" class:hidden=kind == "deck">
                             {blocks.iter().map(|b| view! {
                                 <BlockView doc_id=id b=b.clone() rev=rev kind=kind.clone() edit draft error reload=reload_cb />
                             }).collect_view()}
                             {blocks.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"Empty. Write below to start it."</p> })}
                         </article>
-                        <div class="space-y-1">
+                        <div class="space-y-1" class:hidden=s.kind == "deck">
                             <textarea class=format!("{INPUT} min-h-[4rem] font-mono text-sm")
                                 placeholder=if s.kind == "deck" { "Add slides in Markdown (--- between slides)…" } else { "Add to the end in Markdown…" }
                                 prop:value=move || adding.get() on:input=move |ev| adding.set(event_target_value(&ev))

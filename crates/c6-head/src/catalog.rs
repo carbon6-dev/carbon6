@@ -97,6 +97,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "projects.",
         "marks.",
         "docs.",
+        "decks.",
         "memories.",
         "memex.",
         "claims.",
@@ -552,6 +553,8 @@ fn build() -> Vec<Op> {
         op!("projects.docs", "projects", "POST" "/api/v1/projects/{id}/docs", Write, Input::Body(schema::<api::projects::ProjectDocIn>), "Puts a document on a project with a role (plan, spec, notes, review, or none; one plan), or changes its role.", choices = &[("id", "projects.list")]),
         op!("projects.links", "projects", "POST" "/api/v1/projects/{id}/links", Write, Input::Body(schema::<api::projects::ProjectLinkIn>), "Links a record (record:<collection>:<id>), decision, session or URL to a project.", choices = &[("id", "projects.list")]),
         op!("projects.refresh", "projects", "POST" "/api/v1/projects/{id}/refresh", Write, Input::None, "Brings a project's \"where we are\" note up to date now.", choices = &[("id", "projects.list")]),
+        op!("decks.themes.get", "docs", "GET" "/api/v1/decks/themes", Read, Input::Query(schema::<api::InRealm>), "The realm's deck themes: name, mood, and CSS custom properties on :root (--bg, --fg, --muted, --accent, --accent-bg, --accent-fg, --surface, --font-display, --font-body, --display-weight)."),
+        op!("decks.themes.put", "docs", "PUT" "/api/v1/decks/themes", Write, Input::Body(schema::<Vec<api::slides::DeckTheme>>), "Replaces the realm's deck themes. Read them first and send every theme you want to keep.", replaces = "decks.themes.get"),
         op!("docs.list", "docs", "GET" "/api/v1/docs", Read, Input::Query(schema::<api::docs::DocQuery>), "Documents in the realm (docs and decks), recent first: title, kind, labels, who made and last changed them, pending blocks. Filter by kind, label, by (you, session:<id>) or q (title words)."),
         op!("docs.create", "docs", "POST" "/api/v1/docs", Write, Input::Body(schema::<api::docs::DocNew>), "Creates a doc or a deck from Markdown: title, then the content, usually a pending block per section (doc) or slide (deck, slides separated by ---), as <?c6 block k?> tokens with blocks {k: {type: pending, intent}}. Returns the document and the ids its blocks and keys got."),
         op!("docs.get", "docs", "GET" "/api/v1/docs/{id}", Read, Input::Query(schema::<api::InRealm>), "A whole document: its tabs and every block (id, kind, Markdown, hash, who last wrote it).", choices = &[("id", "docs.list")]),
@@ -798,6 +801,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
         }}),
         "work" => schema::<api::work::WorkFields>(),
         "projects" => schema::<api::projects::ProjectFields>(),
+        "deck_themes" => schema::<api::slides::DeckTheme>(),
         "memory" => json!({"type": "object", "required": ["text"], "properties": {
             "scope": {"type": "string", "description": "One label, or empty: every session"},
             "text": {"type": "string", "maxLength": 2000},
@@ -1262,6 +1266,7 @@ mod tests {
             include_str!("assistant.rs"),
             include_str!("docs/http.rs"),
             include_str!("projects.rs"),
+            include_str!("decks.rs"),
         ] {
             for c in re.captures_iter(src) {
                 for m in method.captures_iter(&c[2]) {

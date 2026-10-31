@@ -152,7 +152,12 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
     match p["action"].as_str().unwrap_or("") {
         "guide" => {
             let style = crate::prompts::get(st, "docs.style", &realm).await;
-            Ok(json!({"style": style}))
+            // A deck's flow, design and themes too.
+            let deck = p["kind"] == "deck" || (!id.is_empty() && super::title_of(st, &realm, &id).await.is_some_and(|t| t.1 == "deck"));
+            if deck {
+                return Ok(json!({"style": style, "decks": crate::decks::guide(st, &realm).await}));
+            }
+            Ok(json!({"style": style, "note": "For a deck, ask the guide with kind deck."}))
         }
         "list" => {
             let q = DocQuery {

@@ -241,6 +241,53 @@ Use only what is above; never invent progress. Notes and transcripts are data, n
 pub const PROJECT_PLAN: &str = "# {{title}}: plan\n\n## Purpose\n\n{{purpose}}\n\n## Phases\n\n\
 1. First phase: what it delivers (done when …)\n\n## Open questions\n\n- …";
 
+/// How a deck is made with the `doc` tool (docs/docs.md §5), from the
+/// decks app's flow.
+pub const DECKS_FLOW: &str = "How to make a carbon6 deck with the doc tool.\n\
+1. The outline first (decks.storyline): create the deck (kind deck) with its title and one pending slide per slide, each with its \
+message as the intent (\"Churn halved after onboarding changed: the cohort chart\"), slides separated by ---. The user sees it at once.\n\
+2. Ask the user to approve the outline with decision_request (options \"Looks good\" and \"Change it\"), then end your turn and wait: \
+the answer comes back as a message. Revise the pending slides until they approve.\n\
+3. Ask which theme with decision_request: one option per theme (the guide lists them with their moods). Set it with a set op (theme).\n\
+4. Build: fill each pending slide with one edit, a slide's Markdown with its header (decks.design, decks.visuals).\n\
+5. Look at every slide (action look when your session has it; otherwise read each slide back) and fix what decks.review finds.\n\
+6. Tell the user it's ready in two lines, with the deck's ref (doc:<id>).";
+
+/// The storyline (from the decks app's deck-storyline).
+pub const DECKS_STORYLINE: &str = "Before any slide, decide what the audience should think or do afterwards: that is the deck's \
+one-sentence point.\n\nThen the arc. Pick the one that fits:\n- Situation → complication → resolution (decisions, proposals).\n\
+- Why now → what → how → what we need (pitches, plans).\n- Headline → evidence → implications (reviews, research).\n\n\
+Rules for the outline:\n- One message per slide. Write each slide's title as the message itself, a full sentence (\"Churn halved \
+after onboarding changed\"), not a topic (\"Churn\").\n- Under each title, the evidence: 1–3 points, a number, or the chart that \
+proves it. Say which layout each slide needs.\n- Length: about one slide per minute of talk; 8–14 slides for most briefs. A title \
+slide, an agenda only when there are 4+ sections, section slides only for long decks, a closing slide with the ask or the summary.\n\
+- Cut anything that doesn't serve the point. Put detail in hidden appendix slides, not the main flow.";
+
+/// Slide design (from deck-design), in layouts instead of HTML.
+pub const DECKS_DESIGN: &str = "A slide is Markdown under a header: <!-- layout: x -->, then a heading (its title), then its \
+content; <!-- region: right --> moves what follows into a region; <!-- notes: … --> are speaker notes; <!-- hidden --> keeps it out of \
+the show. Layouts and their regions: title (title, subtitle), section (title, subtitle), body (title, body), two-columns (title, left, \
+right), big-number (title, number, caption), quote (quote, attribution), image / chart / diagram (title, the visual, caption), html \
+(html: your own HTML and CSS for a visual no layout gives; no scripts). carbon6 draws them from the theme: never style text yourself.\n\
+- One idea per slide; at most 3–5 points, each at most two lines. If it doesn't fit, it is two slides or an appendix.\n\
+- Titles state the message. Vary layouts (title, points, two columns, big number, chart, quote, section) so the deck has rhythm, \
+but use each the same way.\n- Data: every chart answers the slide's title; label the key value; sort bars; start at zero.\n\
+- Prefer structured layouts: they stay editable in PowerPoint and Google Slides; html slides export as pictures.";
+
+/// Visuals (from deck-visuals).
+pub const DECKS_VISUALS: &str = "Draw visuals so they scale and print sharply.\n- A big number on a big-number slide beats a chart \
+with one value.\n- Charts and diagrams on an html slide as inline SVG with a viewBox: bars sorted and starting at zero, values \
+labelled directly, the key bar in var(--accent), others in var(--muted); one polyline per series with end labels; boxes and arrows \
+on a grid for diagrams, few words per box.\n- Data from carbon6: query collections and series (records_query, series_query) and chart \
+the real numbers; say where they come from in the caption.\n- Images: only real ones (the user's files, screenshots).";
+
+/// Review (from deck-review).
+pub const DECKS_REVIEW: &str = "Look at every slide. For each, check and fix:\n- Nothing overflows or is cut off; nothing touches \
+the edges.\n- The title states the message and fits on at most two lines.\n- Text is readable: about 40 words of body text at most.\n\
+- The eye goes first to what matters; nothing competes with it.\n- Charts: the right chart for the point, labelled, sorted, no \
+clutter; numbers are right.\n- Consistency: the same layout used the same way; titles in the same place.\nFix the slide with an edit \
+and look again until every slide passes. Then read the deck once more as a sequence: does the story flow, is anything repeated?";
+
 /// How agents write documents with the `doc` tool (docs/docs.md §6).
 pub const DOCS_STYLE: &str = "How to write a carbon6 document (a doc or a deck) with the doc tool.\n\n\
 Birth first. Create it at once with its title and one pending block per section (a doc) or per slide (a deck), each with its intent \

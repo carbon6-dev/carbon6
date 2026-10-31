@@ -6,6 +6,7 @@ pub mod labels;
 pub mod marks;
 pub mod projects;
 pub mod prompts;
+pub mod slides;
 pub mod work;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

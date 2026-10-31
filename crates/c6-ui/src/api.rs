@@ -1435,3 +1435,12 @@ pub async fn project_link(id: String, reference: String, title: String) -> Resul
 pub async fn project_refresh(id: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/projects/{}/refresh", enc(&id))).send().await).await
 }
+
+/// The realm's deck themes (docs/docs.md §5).
+pub async fn deck_themes() -> Result<Vec<c6_api::slides::DeckTheme>, String> {
+    json(Request::get("/api/v1/decks/themes").send().await).await
+}
+
+pub async fn set_deck_themes(list: &[c6_api::slides::DeckTheme]) -> Result<(), String> {
+    empty(Request::put("/api/v1/decks/themes").json(&list).map_err(|e| e.to_string())?.send().await).await
+}

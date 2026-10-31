@@ -13,6 +13,7 @@ mod collections;
 mod compose;
 mod contacts;
 mod decisions;
+mod deck;
 mod details;
 mod docs;
 mod explorer;
@@ -99,6 +100,12 @@ fn Main() -> impl IntoView {
             </Routes>
         }
         .into_any();
+    }
+    // A deck presented full screen, or its presenter view (docs/docs.md §5).
+    let here = place::strip(&window().location().pathname().unwrap_or_default());
+    if let Some(id) = here.strip_prefix("/docs/").and_then(|r| r.strip_suffix("/present")) {
+        let presenter = window().location().search().unwrap_or_default().contains("presenter=1");
+        return view! { <deck::Present id=id.to_owned() presenter /> }.into_any();
     }
     let ws = workspace::Workspace::restore();
     provide_context(ws);

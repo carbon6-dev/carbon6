@@ -121,6 +121,23 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::DOCS_STYLE,
     },
     Prompt {
+        name: "decks.flow",
+        description: "How a session makes a deck with the doc tool: outline as pending slides, approval, theme, build, look, fix (docs/docs.md §5).",
+        default: text::DECKS_FLOW,
+    },
+    Prompt {
+        name: "decks.storyline",
+        description: "A deck's storyline: its point, arc and one message per slide.",
+        default: text::DECKS_STORYLINE,
+    },
+    Prompt {
+        name: "decks.design",
+        description: "Slide design: layouts, regions and the rules of a good slide.",
+        default: text::DECKS_DESIGN,
+    },
+    Prompt { name: "decks.visuals", description: "Charts, diagrams, numbers and images on slides.", default: text::DECKS_VISUALS },
+    Prompt { name: "decks.review", description: "What to check on every slide, and the deck as a whole.", default: text::DECKS_REVIEW },
+    Prompt {
         name: "memex.brief.knowledge",
         description: "What a session's brief says before its environment knowledge.",
         default: text::BRIEF_KNOWLEDGE,

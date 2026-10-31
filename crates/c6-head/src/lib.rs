@@ -14,6 +14,7 @@ pub mod config;
 mod convert;
 mod cron;
 pub mod decisions;
+pub mod decks;
 pub mod docs;
 pub mod explorer;
 mod export;
