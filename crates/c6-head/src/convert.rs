@@ -164,6 +164,9 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             let spec = m.model.clone().unwrap_or_default();
             api::EventKind::SubagentModelSet { connection_id: spec.connection_id, model: spec.model, effort: spec.effort }
         }
+        // The worker's bookkeeping: the transcript shows the notice when a
+        // turn takes it.
+        Kind::NoticeQueued(_) => return None,
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
 }

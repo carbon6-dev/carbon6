@@ -424,7 +424,9 @@ async fn your_message_to_a_subagent_reports_back() {
     eventually("subagent answered", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(()))
         .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(env.detail(&id).await.unwrap().session.last_seq, parent_seq, "nothing ran in the parent");
+    // The parent records the report for later (docs/background.md §5), but runs no turn.
+    let since: Vec<Event> = env.events(&id).await.into_iter().filter(|e| e.seq > parent_seq).collect();
+    assert!(!since.iter().any(|e| matches!(e.kind, EventKind::TurnStarted { .. })), "nothing ran in the parent: {since:?}");
 
     // Its next input brings the report.
     env.mock.push(Reply::Text("Noted.".into()));

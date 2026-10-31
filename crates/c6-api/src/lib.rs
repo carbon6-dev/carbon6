@@ -1726,7 +1726,8 @@ pub struct SendMessage {
 }
 
 /// `GET`/`PUT /api/v1/settings/subagent-limits`: how far subagents may go
-/// (docs/subagents.md §7).
+/// (docs/subagents.md §7), and how much agents do on their own
+/// (docs/background.md §4-5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SubagentLimits {
@@ -1737,10 +1738,29 @@ pub struct SubagentLimits {
     /// How many subagents may work at once below one top-level session.
     #[serde(default = "default_running_subagents")]
     pub max_running: u32,
+    /// How many turns notices (a background task's end, a subagent's
+    /// report) may start in an idle session per hour; beyond that they wait
+    /// until the hour allows, or for your next message.
+    #[serde(default = "default_auto_turns_per_hour")]
+    pub auto_turns_per_hour: u32,
+    /// How long an idle Claude Code process with no background tasks stays
+    /// up, in minutes.
+    #[serde(default = "default_claude_code_idle_minutes")]
+    pub claude_code_idle_minutes: u32,
 }
 
 pub const DEFAULT_SUBAGENT_DEPTH: u32 = 3;
 pub const DEFAULT_RUNNING_SUBAGENTS: u32 = 16;
+pub const DEFAULT_AUTO_TURNS_PER_HOUR: u32 = 20;
+pub const DEFAULT_CLAUDE_CODE_IDLE_MINUTES: u32 = 15;
+
+fn default_auto_turns_per_hour() -> u32 {
+    DEFAULT_AUTO_TURNS_PER_HOUR
+}
+
+fn default_claude_code_idle_minutes() -> u32 {
+    DEFAULT_CLAUDE_CODE_IDLE_MINUTES
+}
 
 fn default_subagent_depth() -> u32 {
     DEFAULT_SUBAGENT_DEPTH
@@ -1752,7 +1772,12 @@ fn default_running_subagents() -> u32 {
 
 impl Default for SubagentLimits {
     fn default() -> Self {
-        Self { max_depth: DEFAULT_SUBAGENT_DEPTH, max_running: DEFAULT_RUNNING_SUBAGENTS }
+        Self {
+            max_depth: DEFAULT_SUBAGENT_DEPTH,
+            max_running: DEFAULT_RUNNING_SUBAGENTS,
+            auto_turns_per_hour: DEFAULT_AUTO_TURNS_PER_HOUR,
+            claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
+        }
     }
 }
 

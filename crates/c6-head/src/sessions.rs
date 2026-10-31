@@ -477,6 +477,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         max_running_subagents: limits.max_running,
         depth: 0,
         subagent_templates_json: serde_json::to_string(&crate::templates::for_subagents(st, &row.realm, &row.instance).await)?,
+        auto_turns_per_hour: limits.auto_turns_per_hour,
+        claude_code_idle_minutes: limits.claude_code_idle_minutes,
     })
 }
 

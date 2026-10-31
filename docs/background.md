@@ -1,6 +1,6 @@
 # Background work and session messages — Design
 
-Status: draft (2026-10-30). Steps 1 and 2 (§4) are built; see §9 for what they leave to later steps.
+Status: draft (2026-10-30). Steps 1–3 (§4, §5) are built; see §9 for what they leave to later steps.
 
 The main agent stays free to talk while its work runs in the background. A background task that ends always reaches its session, whether the session is mid-turn, idle or reloaded after a restart. Sessions can also message each other within a realm, across workers, fire and forget.
 
@@ -64,7 +64,7 @@ Not goals:
 - **Restart it** when what it was started with changes and no background task would be lost: its conversation, its effort or its hooks (`claude_code::Launch`). While tasks run, the old process carries on.
 - **A handoff to carbon6's own loop** stops the process at once (`Process::stop`). Its tasks are recorded as lost.
 - **The CLI's own wait limit** is set to a day (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, as `MCP_TOOL_TIMEOUT` is for carbon6's tools), so it never kills tasks itself.
-- **The idle time** is fixed at 15 minutes (`claude_code::IDLE`) until the settings of step 3.
+- **The idle time** is the `claude_code_idle_minutes` setting (default 15).
 
 ### Inputs
 
@@ -106,21 +106,22 @@ Not goals:
 
 ### Record before deliver
 
-- When a notice is queued for a session, its actor first appends `NoticeQueued{command_id, command, text, from_session_id, wake}` to that session's log. Then it puts the notice in the inbox, or holds it.
-- Its `command_id` is fixed by what it is about:
-  - `task:<task_id>:<state>`;
-  - `subagent:<child>:<turn>`;
-  - for a session message, the head's command id.
+- When a notice is queued for a session, its actor first appends `NoticeQueued{command_id, text, command, wake}` to that session's log (`Actor::notice`). Then it delivers it: into the inbox, or held (`deliver_notice`). The head stores the event but leaves it out of the transcript, which shows the notice when a turn takes it.
+- Its `command_id`:
+  - a background task's end: `task:<task_id>:<state>`, so the same end is never recorded twice;
+  - a subagent's report: `subagent:<uuid>` (it is recorded in the parent's log before anything else, so it needs no fixed id);
+  - for a session message (step 4), the head's command id, which also gains `from_session_id`.
 - **When a turn takes the notice,** its `UserMessage` has the same `command_id`.
-- **On load** (`SessionManager::load`), every `NoticeQueued` whose `command_id` has no `UserMessage` is queued again, under the same rule as when it first arrived. That covers worker restarts and actors that stopped mid-turn.
-- **The head** treats `NoticeQueued{command_id}` as a command applied, so it doesn't resend a session message the worker has already recorded. The UI shows held notices as a pill above the message box ("2 notices for the agent · Send now").
+- **On load** (`SessionManager::load`, `notices_of`), every `NoticeQueued` whose `command_id` has no `UserMessage` is delivered again, under the same rule as when it first arrived (without announcing a hold again). That covers worker restarts and actors that stopped mid-turn. A Claude Code session's notice counts as taken once the CLI echoes it.
+- **Later (step 4):** the head treats `NoticeQueued{command_id}` as a command applied, so it doesn't resend a session message the worker has already recorded.
+- **Later:** the UI shows held notices as a pill above the message box ("2 notices for the agent · Send now"). Today the log's message says one is held.
 - **Restart order.** `recover()` already writes `lost` for background tasks open at a restart, and those `lost` ends go through the same path.
 
 ### The hourly limit
 
-- When a notice is held for the limit, the actor sets a timer for when the oldest automatic turn leaves the hour. If the session is still idle when the timer fires, all held notices start **one** turn together. Notices that arrive together already share a turn.
-- `auto_turns` is rebuilt on load from the log: the `TurnStarted` events that followed a notice in the last hour. So a restart doesn't reset the limit.
-- The limit becomes a setting: Settings → Agents, `auto_turns_per_hour`, default 20.
+- When a notice is held for the limit, the actor waits until the oldest automatic turn leaves the hour (`retry_at` in the actor's loop). If the session is still idle then, all held notices start **one** turn together (`release_held`). Notices that arrive together already share a turn.
+- `auto_turns` is rebuilt on load from the log: the turns of the last hour whose inputs were all notices. So a restart doesn't reset the limit. Claude Code's self-started turns record no `NoticeQueued`, so they don't count.
+- The limit is a setting: Settings → Agents → Limits (`subagent-limits`: `auto_turns_per_hour`, default 20; `claude_code_idle_minutes`, default 15), sent in each `CreateSession`. A session keeps the values it started with.
 - Held without `wake` (a subagent's report on a turn you started without *Wake the parent*) still means "with your next input", as in subagents.md §6. It is now recorded, so it survives a restart.
 
 ## 6. Session messages
@@ -167,8 +168,8 @@ message_session ─► HeadCall session.message {session_id, to, text, hops}
 
 | Where | Name | Default |
 |---|---|---|
-| Settings → Agents | `claude_code_idle_minutes` | 15 |
-| Settings → Agents | `auto_turns_per_hour` | 20 |
+| Settings → Agents → Limits (built) | `claude_code_idle_minutes` | 15 |
+| Settings → Agents → Limits (built) | `auto_turns_per_hour` | 20 |
 | Settings → Agents | `max_message_hops` | 4 |
 | Settings → Agents | `messages_per_hour` | 30 |
 | Settings → Prompts | `session.message_received` | how to reply, and only when needed |
@@ -183,9 +184,9 @@ message_session ─► HeadCall session.message {session_id, to, text, hops}
 
 ## 9. Steps
 
-1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Left for later: cleanup at recovery after a worker crash, and the idle-time setting (step 3).
+1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Left for later: cleanup at recovery after a worker crash. (The idle time became a setting in step 3.)
 2. **carbon6's notices and background tools under Claude Code (§4).** Built 2026-10-31: bridge registration per process (in step 1); `Task` and `SendMessage` with `run_in_background`, plus `TaskOutput` and `TaskStop`. Test: a background subagent's call returns at once, its report reaches the same process as a message, and that message's turn is logged as a `task-notification`.
-3. **Notices that are never lost (§5).** `NoticeQueued`, re-queue on load, the limit's timer and setting, the head treating it as applied, the held-notices pill.
+3. **Notices that are never lost (§5).** Built 2026-10-31: `NoticeQueued`, re-delivery on load, the limit's timer, and both settings. Tests: a log's pending notices and automatic turns (`notice_tests`); a notice held by the limit survives a worker restart and reaches the agent once, with your next message (`it/notices.rs`). Left for later: the head treating `NoticeQueued` as applied (step 4) and the held-notices pill.
 4. **Session messages (§6).** Proto fields, `session.message` and `session.list` in `fabric.rs`, the tools (including over the MCP bridge), head checks, the prompt and the UI.
 
 ## 10. Decisions (settled 2026-10-30)
