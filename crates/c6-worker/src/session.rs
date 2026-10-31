@@ -1023,6 +1023,7 @@ impl SessionManager {
             claude_code: claude_code.clone(),
             claude: None,
             claude_stdin: Arc::default(),
+            handoff_announced: false,
         };
         let handle =
             Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
@@ -1435,6 +1436,8 @@ struct Actor {
     /// §4), and that process's input.
     claude: Option<crate::claude_code::Process>,
     claude_stdin: crate::claude_code::Stdin,
+    /// The log says a switch away from Claude Code waits for its tasks.
+    handoff_announced: bool,
 }
 
 /// What a turn task gives back: the conversation, and the Claude Code
@@ -1454,8 +1457,22 @@ impl Actor {
                 error!(session = %self.writer.session_id, "rewinding: {e:#}");
                 return;
             }
-            if running.is_none() && !self.inbox.lock().unwrap().queue.is_empty() {
+            let handoff_waits = running.is_none() && self.handoff_waits();
+            if handoff_waits && !self.handoff_announced {
+                self.handoff_announced = true;
+                let message = "The switch away from Claude Code waits for its background tasks to finish (they would stop with it). \
+                               Stop them in the Tasks list to switch now; your message comes after the switch."
+                    .to_owned();
+                if let Err(e) = self.writer.append(session_event::Kind::Error(ErrorEvent { message })).await {
+                    error!(session = %self.writer.session_id, "recording a waiting switch: {e:#}");
+                    return;
+                }
+            }
+            if running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty() {
                 let switch = self.inbox.lock().unwrap().take_switch();
+                if switch.is_some() {
+                    self.handoff_announced = false;
+                }
                 if let Some(model) = switch
                     && let Err(e) = self.switch_model(model).await
                 {
@@ -1855,6 +1872,15 @@ impl Actor {
         }
         self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
         Ok(())
+    }
+
+    /// A switch away from Claude Code is next while Claude Code's own
+    /// background tasks run: it waits for them, since they would stop with
+    /// its process (docs/background.md §8).
+    fn handoff_waits(&self) -> bool {
+        let leaving =
+            self.inbox.lock().unwrap().queue.front().and_then(|(_, m)| m.as_ref()).is_some_and(|m| m.connection_kind != "claude_code");
+        leaving && self.runs_claude_code() && self.claude.as_ref().is_some_and(|p| p.tasks_running())
     }
 
     /// The most turns notices may start per hour.

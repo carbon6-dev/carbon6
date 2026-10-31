@@ -62,7 +62,7 @@ Not goals:
 - **Close it** by closing stdin, and kill the process group if it hasn't exited within 10 s. The next input starts a new process with `--resume`.
 - **The model is switched in place** with `set_model` at the next turn, so a switch keeps the process and its tasks.
 - **Restart it** when what it was started with changes and no background task would be lost: its conversation, its effort or its hooks (`claude_code::Launch`). While tasks run, the old process carries on.
-- **A handoff to carbon6's own loop** stops the process at once (`Process::stop`). Its tasks are recorded as lost.
+- **A handoff to carbon6's own loop** waits while Claude Code's own tasks run (§8), then stops the process (`Process::stop`).
 - **The CLI's own wait limit** (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`) applies only once its input is closed (tested 2026-10-31: with input open, a task outlived a 15-second limit and woke the agent). carbon6 closes it only when idle with no tasks, or when the worker is gone, so the limit is set to 5 seconds: a process whose worker crashed stops its tasks and exits instead of working on unread.
 - **The idle time** is the `claude_code_idle_minutes` setting (default 15).
 
@@ -182,7 +182,7 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 - **The target is rewound past a session message.** The message stays in the log, folded with the rewound events. The sender is not told.
 - **A Claude Code target before §4 ships.** A session message starts a turn between turns, as head input does today. §4 is built first.
 - **The CLI exits on its own** (a crash, or a sign-in that ran out). Unconfirmed inputs go back to the inbox, any open turn ends Error, and the next input starts a new process.
-- **A handoff while background tasks run.** Today the handoff stops Claude Code's process, and its tasks are recorded as lost. Later it should wait until the native tasks end, or until you stop them; the UI should say which. carbon6 background tasks continue in either runtime.
+- **A handoff while background tasks run.** A switch away from Claude Code waits while Claude Code's own tasks run (`Actor::handoff_waits`), since they would stop with its process; the log says so once, and messages after the switch wait with it. Claude Code may still wake for its tasks meanwhile. When they end, or you stop them in the Tasks list, the switch goes ahead. carbon6 background tasks continue in either runtime.
 - **Two sessions message each other at once.** Each gets the other's message as a notice. The hop count stops a loop of replies.
 
 ## 9. Steps
