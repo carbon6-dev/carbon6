@@ -1,6 +1,6 @@
 # Background work and session messages — Design
 
-Status: draft (2026-10-30). Step 1 (§4) is built; see §9 for what it leaves to later steps.
+Status: draft (2026-10-30). Steps 1 and 2 (§4) are built; see §9 for what they leave to later steps.
 
 The main agent stays free to talk while its work runs in the background. A background task that ends always reaches its session, whether the session is mid-turn, idle or reloaded after a restart. Sessions can also message each other within a realm, across workers, fire and forget.
 
@@ -10,7 +10,7 @@ The main agent stays free to talk while its work runs in the background. A backg
   - Your messages wait in the inbox until the process exits ("inputs that arrive mid-turn are left in the inbox and start the next turn").
   - Esc kills the process group, background tasks included. They are marked lost.
   - A background task that never ends, such as a server, keeps the turn open for good.
-- **carbon6's `Task` and `SendMessage` for Claude Code are foreground only,** because nothing could deliver their notices (`session.rs:1731-1747`).
+- **carbon6's `Task` and `SendMessage` for Claude Code were foreground only** (before step 2), because nothing could deliver their notices.
 - **Notices live in memory until a turn takes them.** That covers background-task ends (`task_event`), subagent reports (`ChildReport`), the inbox, `deferred` and the hourly counter `auto_turns`. The head only redelivers your own messages, so a worker restart, or an actor that stops after a failed journal write, drops any notice not yet taken.
 - **Held notices wait for your next message.** Over `AUTO_TURNS_PER_HOUR` (20), a notice goes to `deferred`, and nothing retries it when the hour frees up. A fan-out of subagents plus a few shell tasks reaches 20 quickly.
 - **Sessions cannot message each other.** `SendMessage` reaches only the caller's own subagents, in process, on the same worker (`subagent.rs:424-452`). The head can put a user message into any session on any worker, durably (`sessions::send_input`). It cannot send a notice, and no tool asks it to message another session.
@@ -95,7 +95,7 @@ Not goals:
 ### carbon6's tools and notices
 
 - **The MCP bridge registration lasts as long as the process,** not one turn (built in step 1). Its `Entry` holds the running turn's cancel token, set at each turn's start (`Registration::set_cancel`), so stopping a turn still stops its foreground subagents.
-- **`Task` and `SendMessage` drop `foreground_only`** (step 2).
+- **`Task` and `SendMessage` can run in the background** (step 2). The bridge also serves `TaskOutput` and `TaskStop` (`mcp__carbon6__…`): carbon6's `bash_output` and `kill_shell`, for carbon6's subagents only, since Claude Code's own tools don't know carbon6's ids. `Task` names `mcp__carbon6__TaskStop` as what stops one. A report reaches the process as described next: it joins a running turn or starts one, and if the process has closed in the meantime, the next one resumes the conversation and takes it.
 - **A carbon6 notice for a Claude Code session** (a background subagent's report, a session message) follows the usual rule:
   - written to stdin now if a turn is running;
   - written now if the session is idle and wakes;
@@ -184,7 +184,7 @@ message_session ─► HeadCall session.message {session_id, to, text, hops}
 ## 9. Steps
 
 1. **Long-lived Claude Code process (§4 lifecycle, inputs, turns, stopping).** Built 2026-10-30: `claude_code::Process`, `session::claude_turn` and the actor's idle branches. The fake `claude` in the tests reads stream-json from stdin. Tests: one process serves every turn; a message sent mid-turn joins the turn; Esc leaves a background task running and the turn Claude Code starts when it ends is logged as woken. Left for later: cleanup at recovery after a worker crash, and the idle-time setting (step 3).
-2. **carbon6's notices and background tools under Claude Code (§4).** Bridge registration per process; `Task` and `SendMessage` with `run_in_background`.
+2. **carbon6's notices and background tools under Claude Code (§4).** Built 2026-10-31: bridge registration per process (in step 1); `Task` and `SendMessage` with `run_in_background`, plus `TaskOutput` and `TaskStop`. Test: a background subagent's call returns at once, its report reaches the same process as a message, and that message's turn is logged as a `task-notification`.
 3. **Notices that are never lost (§5).** `NoticeQueued`, re-queue on load, the limit's timer and setting, the head treating it as applied, the held-notices pill.
 4. **Session messages (§6).** Proto fields, `session.message` and `session.list` in `fabric.rs`, the tools (including over the MCP bridge), head checks, the prompt and the UI.
 

@@ -1,5 +1,5 @@
 //! A Claude Code session delegates to carbon6's subagents (docs/subagents.md
-//! §11.5): each turn gets `Task` and `SendMessage` from a local MCP server,
+//! §11.5): its process gets `Task` and `SendMessage` from a local MCP server,
 //! and the subagent runs in carbon6's own loop on the connection asked for.
 //! A binary of its own: it sets C6_CLAUDE_BIN.
 
@@ -108,10 +108,10 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     assert_eq!(init["result"]["serverInfo"]["name"], "carbon6");
     let tools: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("tools.json")).unwrap()).unwrap();
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["Task", "SendMessage", "doc"]);
+    assert_eq!(names, ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc"]);
     let task = &tools["result"]["tools"][0]["inputSchema"]["properties"];
     assert_eq!(task["connection"]["enum"], json!(["api"]), "Claude Code is not offered to subagents");
-    assert!(task.get("run_in_background").is_none(), "{task}");
+    assert!(task["run_in_background"]["description"].as_str().unwrap().contains("mcp__carbon6__TaskStop"), "{task}");
     let call: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("call.json")).unwrap()).unwrap();
     assert_eq!(call["result"]["isError"], false, "{call}");
     assert!(call["result"]["content"][0]["text"].as_str().unwrap().starts_with("api says hi"), "{call}");
