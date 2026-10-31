@@ -564,6 +564,9 @@ fn build() -> Vec<Op> {
         op!("docs.delete", "docs", "DELETE" "/api/v1/docs/{id}", Destructive, Input::Query(schema::<api::InRealm>), "Deletes a document.", choices = &[("id", "docs.list")]),
         op!("docs.history", "docs", "GET" "/api/v1/docs/{id}/history", Read, Input::Query(schema::<crate::docs::http::HistoryQuery>), "A document's versions, newest first: who made each (you, session:<id>), when, and the blocks it added, changed and removed.", choices = &[("id", "docs.list")]),
         op!("docs.restore", "docs", "POST" "/api/v1/docs/{id}/restore", Write, Input::Body(schema::<api::docs::DocRestore>), "Brings back an earlier version of a document, or one block or slide of it, as a new change.", choices = &[("id", "docs.list")]),
+        op!("docs.export", "docs", "POST" "/api/v1/docs/{id}/export", Write, Input::Body(schema::<api::docs::DocExportIn>), "Exports a document to a file, kept with the version it was made from: md or html (made by carbon6), pdf, docx or odt for a doc, pdf, pptx, odp or png (pictures of slides) for a deck (made by the render kit on a worker with Docker or Podman). Returns where to download it.", choices = &[("id", "docs.list")]),
+        op!("docs.exports", "docs", "GET" "/api/v1/docs/{id}/exports", Read, Input::Query(schema::<api::InRealm>), "A document's past exports, newest first: format, the version, file name, size, who and when, and where to download each.", choices = &[("id", "docs.list")]),
+        op!("docs.import", "docs", "POST" "/api/v1/docs/import", Write, Input::Body(schema::<api::docs::DocImport>), "Makes a document from a file: Markdown (read by carbon6), Word, OpenDocument text, HTML or PowerPoint (read by the render kit; a PowerPoint becomes a deck). Give its name and its content in base64."),
         op!("docs.settings.get", "docs", "GET" "/api/v1/settings/docs", Read, Input::None, "How documents behave in the realm: which documents sessions may write without asking (write: work, realm or own)."),
         op!("docs.settings.put", "docs", "PUT" "/api/v1/settings/docs", Write, Input::Body(schema::<api::docs::DocsSettings>), "Changes which documents sessions may write without asking: work (those they made and their work's; others once you allow each), realm (any) or own (only those they made)."),
         op!("decisions.list", "decisions", "GET" "/api/v1/decisions", Read, Input::Query(schema::<DecisionQuery>), "Decisions (open by default): what waits first, then by priority."),
@@ -815,6 +818,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
 /// these).
 pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/v1/live", "a live WebSocket for the UI", Scope::Realm),
+    ("GET", "/api/v1/docs/{id}/exports/{export}/file", "an export's file, to download (docs.exports gives its address)", Scope::Realm),
     ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only", Scope::Admin),
     ("GET", "/api/v1/head/fs/read", "the head's own files, for the UI's file picker only", Scope::Admin),
     ("GET", "/api/v1/automations", "the old name of /api/v1/triggers", Scope::Realm),

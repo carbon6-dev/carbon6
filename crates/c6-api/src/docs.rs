@@ -431,3 +431,52 @@ impl Default for DocsSettings {
         Self { write: work() }
     }
 }
+
+/// An export of a document, kept as a file with the version it was made
+/// from (docs/docs.md §10).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocExport {
+    pub id: String,
+    pub doc: String,
+    /// md, html, pdf, docx, odt, pptx, odp or png (a zip of pictures).
+    pub format: String,
+    /// The document's version it was made from.
+    pub rev: i64,
+    /// Its file name.
+    pub name: String,
+    pub size: u64,
+    pub by: String,
+    pub at: UnixMs,
+    /// Where to download it.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// `POST /api/v1/docs/{id}/export`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocExportIn {
+    /// md, html, pdf, docx or odt for a doc; md, html, pdf, pptx, odp or
+    /// png for a deck.
+    pub format: String,
+}
+
+/// `POST /api/v1/docs/import`: a file becomes a document.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocImport {
+    /// The file's name (its extension says what it is: .docx, .odt, .pptx,
+    /// .html, .md).
+    pub name: String,
+    /// The file, in base64.
+    pub content: String,
+    /// doc or deck (default: deck for PowerPoint, else doc).
+    #[serde(default)]
+    pub kind: String,
+    /// Its title (default: the file's name).
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}

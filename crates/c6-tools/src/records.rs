@@ -193,10 +193,10 @@ records_tool!(
      each with one edit. action read: id, view (outline, block with block=<id>, slide, search with q, since with rev, markdown). \
      action edit: id, ops [{op: insert|replace|delete|move|table|set|add_tab|delete_tab, ...}]; replace a whole block (markdown) or \
      delete one with ifRev and ifHash from your read; replace words with find and with. A refused guard means someone else changed it: \
-     read again. action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
+     read again. action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document. action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
      you made and your work's you edit freely; others need the user's OK once.",
     json!({"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "history", "restore"]},
+        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "look", "export", "history", "restore"]},
         "id": {"type": "string", "description": "The document (its id, or doc:<id>)"},
         "kind": {"type": "string", "enum": ["doc", "deck"]},
         "title": {"type": "string"},
@@ -210,10 +210,13 @@ records_tool!(
         "rev": {"type": "integer"},
         "tab": {"type": "string"},
         "ops": {"type": "array", "description": "For edit: operations, applied all or none"},
-        "answering": {"type": "string"}
+        "answering": {"type": "string"},
+        "first": {"type": "integer", "description": "look: the first slide (from 1)"},
+        "last": {"type": "integer", "description": "look: the last slide (at most 12 at once)"},
+        "format": {"type": "string", "enum": ["md", "html", "pdf", "docx", "odt", "pptx", "odp", "png"]}
     }, "required": ["action"], "additionalProperties": false})
     .tap_ops(),
-    |ctx, input| { call(ctx, "session.doc", input).await }
+    |ctx, input| { doc_call(ctx, input).await }
 );
 
 /// The `doc` tool's schema, with what each of `ops` takes (too deep for
@@ -240,5 +243,31 @@ impl TapOps for Value {
             "title": {"type": "string"}, "theme": {"type": "string"}, "tab_title": {"type": "string"}
         }, "required": ["op"]});
         self
+    }
+}
+
+/// The doc tool's call: `look`'s pictures go to the model as images.
+async fn doc_call(ctx: &ToolCtx, input: Value) -> ToolOutput {
+    use base64::Engine as _;
+    let Some(head) = ctx.session.head() else { return ToolOutput::err("carbon6's head is not reachable from here") };
+    match head.call("session.doc", input).await {
+        Ok(mut v) => {
+            let images: Vec<Vec<u8>> = v
+                .get("images")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter().filter_map(|i| i.as_str()).filter_map(|i| base64::engine::general_purpose::STANDARD.decode(i).ok()).collect()
+                })
+                .unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.remove("images");
+            }
+            let mut out = ToolOutput::limited(serde_json::to_string_pretty(&v).unwrap_or_default(), false);
+            for img in images {
+                out = out.with_image("image/png", img);
+            }
+            out
+        }
+        Err(e) => ToolOutput::err(e),
     }
 }

@@ -145,6 +145,29 @@ pub fn DocsPage() -> impl IntoView {
             }
         });
     };
+    let importing = RwSignal::new(false);
+    let import_file = move |ev: leptos::ev::Event| {
+        use wasm_bindgen::JsCast;
+        let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
+        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
+        let name = file.name();
+        importing.set(true);
+        spawn_local(async move {
+            let result = async {
+                let buf =
+                    wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await.map_err(|_| "could not read the file".to_owned())?;
+                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                let content = base64_of(&bytes);
+                api::doc_import(&c6_api::docs::DocImport { name, content, ..Default::default() }).await
+            }
+            .await;
+            importing.set(false);
+            match result {
+                Ok(d) => open_doc.with_value(|f| f(d.summary.id, How::Beside)),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
     let filter = |value: &'static str, label_text: &'static str| {
         view! {
             <button class=move || format!("rounded-md px-2 py-1 text-sm {}", if kind.get() == value { "bg-zinc-200 dark:bg-zinc-800" } else { "hover:bg-zinc-100 dark:hover:bg-zinc-900" })
@@ -161,6 +184,10 @@ pub fn DocsPage() -> impl IntoView {
             <div class="flex flex-wrap items-center gap-2">
                 <button class=BUTTON on:click=move |_| making.set(Some("doc"))>"+ New doc"</button>
                 <button class=BUTTON_QUIET on:click=move |_| making.set(Some("deck"))>"+ New deck"</button>
+                <label class=format!("{BUTTON_QUIET} cursor-pointer") title="A Word, OpenDocument, PowerPoint, HTML or Markdown file becomes a doc or a deck">
+                    {move || if importing.get() { "Importing…" } else { "Import…" }}
+                    <input type="file" class="hidden" accept=".docx,.odt,.pptx,.html,.htm,.md,.markdown,.txt" on:change=import_file />
+                </label>
                 <span class="flex-1"></span>
                 {filter("", "All")}
                 {filter("doc", "Docs")}
@@ -245,6 +272,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     let renaming = RwSignal::new(false);
     let title = RwSignal::new(String::new());
     let history = RwSignal::new(false);
+    let exporting = RwSignal::new(false);
     let edit = RwSignal::new(None::<Editing>);
     let deck_pick = RwSignal::new(None::<String>);
     let draft = Draft { text: RwSignal::new(String::new()), typed: RwSignal::new(0) };
@@ -346,6 +374,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                                             on:click=move |_| { title.set(t.clone()); renaming.set(true); }>{t2.clone()}</h1>
                                     }.into_any()
                                 }}
+                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| exporting.update(|h| *h = !*h)>"Export"</button>
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| history.update(|h| *h = !*h)>
                                     {move || if history.get() { "Hide history" } else { "History" }}
                                 </button>
@@ -372,6 +401,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                                 }).collect_view()}
                             </nav>
                         })}
+                        {let k = kind.clone(); move || exporting.get().then(|| view! { <Exports id=id.get_value() kind=k.clone() /> })}
                         {move || history.get().then(|| view! { <History id=id.get_value() reload=reload_cb /> })}
                         {(kind == "deck").then(|| view! {
                             <crate::deck::DeckView doc=d.clone() send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick />
@@ -641,6 +671,67 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
     }
 }
 
+/// Export: the formats a document goes to, and the files made before
+/// (each with the version it was made from), to download again.
+#[component]
+fn Exports(id: String, kind: String) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let tick = RwSignal::new(0u32);
+    let past = LocalResource::new(move || {
+        tick.track();
+        api::doc_exports(id.get_value())
+    });
+    let busy = RwSignal::new(None::<&'static str>);
+    let error = RwSignal::new(None::<String>);
+    let formats: &'static [(&'static str, &'static str)] = if kind == "deck" {
+        &[("pdf", "PDF"), ("pptx", "PowerPoint"), ("odp", "OpenDocument"), ("png", "Pictures"), ("html", "HTML"), ("md", "Markdown")]
+    } else {
+        &[("pdf", "PDF"), ("docx", "Word"), ("odt", "OpenDocument"), ("html", "HTML"), ("md", "Markdown")]
+    };
+    let go = move |f: &'static str| {
+        busy.set(Some(f));
+        error.set(None);
+        spawn_local(async move {
+            match api::doc_export(id.get_value(), f.into()).await {
+                Ok(e) => {
+                    let _ = window().location().set_href(&api::url(&e.url));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(None);
+            tick.update(|t| *t += 1);
+        });
+    };
+    view! {
+        <section class="space-y-2 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
+            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Export"</h2>
+            <div class="flex flex-wrap gap-2">
+                {formats.iter().map(|(f, label)| {
+                    let f = *f;
+                    view! {
+                        <button class=BUTTON_QUIET disabled=move || busy.get().is_some() on:click=move |_| go(f)
+                            title=if matches!(f, "md" | "html") { "Made by carbon6" } else { "Made by the render kit on a worker with Docker or Podman" }>
+                            {move || if busy.get() == Some(f) { format!("{label}…") } else { (*label).to_owned() }}
+                        </button>
+                    }
+                }).collect_view()}
+            </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || past.get().and_then(Result::ok).filter(|p| !p.is_empty()).map(|p| view! {
+                <div class="space-y-0.5">
+                    <div class="text-xs text-zinc-500">"Made before"</div>
+                    {p.into_iter().map(|e| view! {
+                        <div class="flex items-center gap-2">
+                            <a href=api::url(&e.url) class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{e.name.clone()}</a>
+                            <span class="shrink-0 text-xs text-zinc-400">{format!("v{} · {} KB · {}", e.rev, e.size.div_ceil(1024), since(e.at))}</span>
+                        </div>
+                    }).collect_view()}
+                </div>
+            })}
+        </section>
+    }
+}
+
 /// History: changes by author run, each version openable and restorable.
 #[component]
 fn History(id: String, reload: Callback<()>) -> impl IntoView {
@@ -760,5 +851,30 @@ pub fn follow_link(ev: &web_sys::MouseEvent, col: Option<crate::workspace::Colum
     match col {
         Some(c) => c.open(to, how),
         None => ws.open(None, to, how),
+    }
+}
+
+/// Bytes as base64 (for uploads).
+fn base64_of(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_as_the_head_reads_it() {
+        assert_eq!(super::base64_of(b"Man"), "TWFu");
+        assert_eq!(super::base64_of(b"Ma"), "TWE=");
+        assert_eq!(super::base64_of(b"M"), "TQ==");
+        assert_eq!(super::base64_of(b""), "");
     }
 }

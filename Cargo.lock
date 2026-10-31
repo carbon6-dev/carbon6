@@ -609,6 +609,7 @@ dependencies = [
  "opentelemetry-proto",
  "pem",
  "prost",
+ "pulldown-cmark",
  "rand 0.10.3",
  "rcgen",
  "regex",

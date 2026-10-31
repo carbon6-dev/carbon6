@@ -23,6 +23,10 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/{id}/history", get(history))
         .route("/api/v1/docs/{id}/restore", post(restore))
         .route("/api/v1/settings/docs", get(get_settings).put(put_settings))
+        .route("/api/v1/docs/{id}/export", post(export))
+        .route("/api/v1/docs/{id}/exports", get(exports))
+        .route("/api/v1/docs/{id}/exports/{export}/file", get(export_file))
+        .route("/api/v1/docs/import", post(import))
 }
 
 /// The realm's (`?realm=`, through the settings middleware).
@@ -155,4 +159,51 @@ async fn restore(
 ) -> ApiResult<Json<DocApplied>> {
     let realm = realm(&st, &caller, &r).await?;
     Ok(Json(super::restore(&st, &realm, &id, &b, &super::by_of(&caller)).await?))
+}
+
+async fn export(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(e): Json<api::docs::DocExportIn>,
+) -> ApiResult<Json<api::docs::DocExport>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::export::export(&st, &realm, &id, e.format.trim(), &super::by_of(&caller)).await?))
+}
+
+async fn exports(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::docs::DocExport>>> {
+    let realm = realm(&st, &caller, &r).await?;
+    super::get(&st, &realm, &id).await?;
+    Ok(Json(super::export::list(&st, &realm, &id).await?))
+}
+
+async fn export_file(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, export)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let realm = realm(&st, &caller, &r).await?;
+    let (name, media, bytes) = super::export::file(&st, &realm, &id, &export).await?;
+    let disposition = format!("attachment; filename=\"{}\"", name.replace('"', ""));
+    Ok(([(axum::http::header::CONTENT_TYPE, media.to_owned()), (axum::http::header::CONTENT_DISPOSITION, disposition)], bytes)
+        .into_response())
+}
+
+async fn import(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(i): Json<api::docs::DocImport>,
+) -> ApiResult<Json<Value>> {
+    let realm = realm(&st, &caller, &r).await?;
+    let (doc, applied) = super::export::import(&st, &realm, &i, &super::by_of(&caller)).await?;
+    Ok(Json(serde_json::to_value(Created { doc, applied }).map_err(anyhow::Error::from)?))
 }

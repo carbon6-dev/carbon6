@@ -9,6 +9,7 @@
 //! changes settle (nothing new for a few seconds), `doc.changed` fires for
 //! triggers, with who wrote it.
 
+pub mod export;
 pub mod http;
 pub mod markdown;
 pub mod model;
@@ -93,6 +94,12 @@ struct Head {
     created_at: i64,
     updated_by: String,
     updated_at: i64,
+}
+
+/// A document as stored, and its version.
+pub(crate) async fn load_head(conn: &mut sqlx::SqliteConnection, id: &str) -> anyhow::Result<(State, i64)> {
+    let h = load(conn, id).await?;
+    Ok((h.state, h.rev))
 }
 
 async fn load(conn: &mut sqlx::SqliteConnection, id: &str) -> anyhow::Result<Head> {

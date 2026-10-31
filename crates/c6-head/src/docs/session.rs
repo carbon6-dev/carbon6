@@ -256,11 +256,36 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
             let doc = super::get(st, &realm, &id).await?;
             Ok(json!({"did": "restored", "doc": about(&doc.summary), "rev": a.rev, "hashes": a.hashes}))
         }
+        // A file of it, kept with the version (docs/docs.md §10).
+        "export" => {
+            need_id()?;
+            let format = p["format"].as_str().unwrap_or("").trim().to_owned();
+            let e = super::export::export(st, &realm, &id, &format, &by).await?;
+            Ok(
+                json!({"did": "exported", "export": e, "note": "Attach it to your work with the work tool (ref: the export's url) if it belongs there."}),
+            )
+        }
+        // Pictures of slides (or a doc's pages), for the model to see.
+        "look" => {
+            need_id()?;
+            let first = p["first"].as_u64().or(p["slide"].as_u64()).unwrap_or(1).max(1) as usize;
+            let last = p["last"].as_u64().or(p["slide"].as_u64()).map(|l| l as usize).unwrap_or(first + 11).max(first).min(first + 11);
+            let pics = super::export::pictures(st, &realm, &id, first, last).await?;
+            if pics.is_empty() {
+                return Err(bad_request(format!("no slides {first} to {last} (the deck counts from 1, hidden slides included)")));
+            }
+            let b64 = base64::engine::general_purpose::STANDARD;
+            use base64::Engine as _;
+            Ok(json!({"did": "looked", "first": first, "count": pics.len(),
+                      "images": pics.iter().map(|p| b64.encode(p)).collect::<Vec<_>>()}))
+        }
         "history" => {
             need_id()?;
             Ok(json!({"versions": super::history(st, &realm, &id, 50).await?}))
         }
-        other => Err(bad_request(format!("doc's actions are guide, list, create, read, edit, history and restore, not {other:?}"))),
+        other => {
+            Err(bad_request(format!("doc's actions are guide, list, create, read, edit, look, export, history and restore, not {other:?}")))
+        }
     }
 }
 

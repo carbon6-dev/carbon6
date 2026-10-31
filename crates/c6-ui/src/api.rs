@@ -1444,3 +1444,15 @@ pub async fn deck_themes() -> Result<Vec<c6_api::slides::DeckTheme>, String> {
 pub async fn set_deck_themes(list: &[c6_api::slides::DeckTheme]) -> Result<(), String> {
     empty(Request::put("/api/v1/decks/themes").json(&list).map_err(|e| e.to_string())?.send().await).await
 }
+
+pub async fn doc_export(id: String, format: String) -> Result<c6_api::docs::DocExport, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/export", enc(&id))), &c6_api::docs::DocExportIn { format }).await
+}
+
+pub async fn doc_exports(id: String) -> Result<Vec<c6_api::docs::DocExport>, String> {
+    json(Request::get(&format!("/api/v1/docs/{}/exports", enc(&id))).send().await).await
+}
+
+pub async fn doc_import(i: &c6_api::docs::DocImport) -> Result<c6_api::docs::Doc, String> {
+    send_json(Request::post("/api/v1/docs/import"), i).await
+}

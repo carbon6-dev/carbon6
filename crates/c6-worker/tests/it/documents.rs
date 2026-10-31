@@ -383,3 +383,149 @@ async fn deck_themes_are_records_and_sessions_read_the_deck_guide() {
     let guide = c6_head::decks::guide(&head.state, "home").await;
     assert!(guide.contains("## decks.flow") && guide.contains("## decks.review") && guide.contains("- Brand: Ours"), "{guide}");
 }
+
+/// Export and import (docs/docs.md §10): Markdown and HTML from the head;
+/// PDF, Word, OpenDocument, PowerPoint and pictures from the render kit
+/// (here a stand-in that records what it was given: the real kit runs in a
+/// container, built on a worker); every export kept with its version.
+#[tokio::test]
+async fn documents_export_and_import() {
+    use std::sync::{Arc, Mutex};
+    // Each run: its tool, its command, and the deck.json it was given.
+    type Runs = Arc<Mutex<Vec<(String, Vec<String>, Value)>>>;
+    let runs: Runs = Arc::default();
+    let seen = runs.clone();
+    c6_head::kitjobs::run_locally(
+        c6_head::docs::export::KIT,
+        Arc::new(move |run: c6_head::kitjobs::LocalRun| {
+            let deck = run.inputs.get("deck.json").map(|d| serde_json::from_slice::<Value>(d).unwrap()).unwrap_or(Value::Null);
+            seen.lock().unwrap().push((run.tool.clone(), run.command.clone(), deck));
+            Box::pin(async move {
+                let mut files = std::collections::BTreeMap::new();
+                match run.tool.as_str() {
+                    "slides" => {
+                        let n = run.inputs["deck.html"].windows(8).filter(|w| w == b"<section").count();
+                        let arg = |i: usize| run.command.get(i).and_then(|a| a.parse::<usize>().ok()).filter(|n| *n > 0);
+                        let (first, last) = (arg(5).unwrap_or(1), arg(6).or(arg(5)).unwrap_or(n));
+                        for i in (1..=n).filter(|i| (first..=last).contains(i)) {
+                            files.insert(format!("slides/slide-{i:02}.png"), format!("png {i}").into_bytes());
+                        }
+                    }
+                    "import" => {
+                        files.insert("doc.md".into(), b"# From Word\n\nHello from the file.".to_vec());
+                    }
+                    t => {
+                        files.insert(
+                            format!("file.{t}"),
+                            format!("{t} of {} bytes", run.inputs.values().map(Vec::len).sum::<usize>()).into_bytes(),
+                        );
+                    }
+                }
+                Ok(c6_head::kitjobs::Output { exit: Some(0), files, ..Default::default() })
+            })
+        }),
+    );
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let post = |path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.post(&url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    let bytes = |url: String| {
+        let (http, base) = (http.clone(), api.trim_end_matches("/api/v1").to_owned());
+        async move {
+            let r = http.get(format!("{base}{url}")).send().await.unwrap();
+            assert!(r.status().is_success());
+            let ct = r.headers()["content-type"].to_str().unwrap().to_owned();
+            (ct, r.bytes().await.unwrap().to_vec())
+        }
+    };
+    let doc = post(
+        "docs".into(),
+        json!({"title": "Launch plan", "markdown": "# Launch plan\n\nDue <?c6 block d?>.\n\n<?c6 block p?>\n\n<div onclick=\"x()\">raw</div>",
+               "blocks": {"d": {"type": "date", "value": "2026-11-15"}, "p": {"type": "pending", "intent": "Risks"}}}),
+    )
+    .await;
+    let id = doc["id"].as_str().unwrap().to_owned();
+
+    // Markdown and HTML: the head's own, chips as text, pending blocks left out.
+    let md = post(format!("docs/{id}/export"), json!({"format": "md"})).await;
+    assert_eq!((md["name"].as_str(), md["rev"].as_i64()), (Some("Launch plan.md"), Some(1)));
+    let (ct, body) = bytes(md["url"].as_str().unwrap().to_owned()).await;
+    assert!(ct.starts_with("text/markdown"));
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("Due 2026-11-15.") && !text.contains("<?c6") && !text.contains("Risks"), "{text}");
+    let html = post(format!("docs/{id}/export"), json!({"format": "html"})).await;
+    let (_, body) = bytes(html["url"].as_str().unwrap().to_owned()).await;
+    let page = String::from_utf8(body).unwrap();
+    assert!(page.contains("<h1>Launch plan</h1>") && page.contains("raw") && !page.contains("onclick"), "{page}");
+    assert!(runs.lock().unwrap().is_empty(), "no kit for Markdown and HTML");
+    // Word: the kit, given the Markdown.
+    let docx = post(format!("docs/{id}/export"), json!({"format": "docx"})).await;
+    let (ct, body) = bytes(docx["url"].as_str().unwrap().to_owned()).await;
+    assert!(ct.contains("wordprocessingml"), "{ct}");
+    assert!(String::from_utf8(body).unwrap().starts_with("docx of"));
+    assert_eq!(runs.lock().unwrap()[0].1, ["python3", "/opt/kit/render.py", "docx", "/work/doc.md", "/work/out/file.docx"]);
+    let r = http.post(format!("{api}/docs/{id}/export")).json(&json!({"format": "pptx"})).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "a doc isn't a deck");
+
+    // A deck: PowerPoint from deck.json, its html slides as pictures.
+    let deck = post(
+        "docs".into(),
+        json!({"kind": "deck", "title": "Q3", "markdown": "# Q3\n\n---\n\n## Numbers\n\n- up <?c6 block d?>\n\n<!-- notes: say it -->\n\n---\n\n<!-- layout: html -->\n<svg></svg>\n\n---\n\n<!-- hidden -->\n## Spare",
+               "blocks": {"d": {"type": "date", "value": "Nov 1"}}}),
+    )
+    .await;
+    let did = deck["id"].as_str().unwrap().to_owned();
+    post(format!("docs/{did}/export"), json!({"format": "pptx"})).await;
+    let (tool, _, sent) = runs.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(tool, "pptx");
+    let slides = sent["slides"].as_array().unwrap();
+    assert_eq!(slides.len(), 3, "hidden slides stay out: {sent}");
+    assert_eq!((slides[1]["regions"]["body"].as_str(), slides[1]["notes"].as_str()), (Some("- up Nov 1"), Some("say it")));
+    assert_eq!((slides[1]["picture"].as_bool(), slides[2]["picture"].as_bool()), (Some(false), Some(true)));
+    // Pictures of every slide, as a zip.
+    let png = post(format!("docs/{did}/export"), json!({"format": "png"})).await;
+    let (ct, zip) = bytes(png["url"].as_str().unwrap().to_owned()).await;
+    assert_eq!((ct.as_str(), &zip[..4]), ("application/zip", &b"PK\x03\x04"[..]));
+    // Past exports, newest first.
+    let past: Vec<Value> = http.get(format!("{api}/docs/{id}/exports")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(past.iter().map(|e| e["format"].as_str().unwrap()).collect::<Vec<_>>(), ["docx", "html", "md"]);
+
+    // An agent looks at slides: pictures for the model (hidden ones count).
+    let looked = c6_head::docs::export::pictures(&head.state, "home", &did, 2, 3).await.unwrap();
+    assert_eq!(looked, [b"png 2".to_vec(), b"png 3".to_vec()]);
+    let (_, cmd, _) = runs.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(cmd[5..], ["2".to_owned(), "3".to_owned()]);
+
+    // Import: Markdown read here; Word through the kit.
+    use base64::Engine;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let m = post("docs/import".into(), json!({"name": "notes.md", "content": b64(b"# Notes\n\n- one\n- <?c6 block x?>")})).await;
+    assert_eq!((m["title"].as_str(), m["kind"].as_str()), (Some("notes"), Some("doc")));
+    assert!(m["tabs"][0]["blocks"][2]["text"].as_str().unwrap().contains("&lt;?c6 block x?>"), "a file's text, not tokens: {m}");
+    let d = post("docs/import".into(), json!({"name": "Brief.docx", "content": b64(b"PK fake docx")})).await;
+    assert_eq!((d["title"].as_str(), d["tabs"][0]["blocks"][1]["text"].as_str()), (Some("Brief"), Some("Hello from the file.")));
+    assert_eq!(runs.lock().unwrap().last().unwrap().0, "import");
+    let p = post("docs/import".into(), json!({"name": "Deck.pptx", "content": b64(b"PK fake")})).await;
+    assert_eq!(p["kind"], "deck");
+    let r = http.post(format!("{api}/docs/import")).json(&json!({"name": "x.exe", "content": b64(b"MZ")})).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}

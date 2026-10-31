@@ -63,6 +63,13 @@ pub fn runtime_command(rt: &str) -> Command {
 pub async fn runtime() -> Option<String> {
     static FOUND: OnceLock<String> = OnceLock::new();
     static LOOKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    // One lookup at a time: a caller arriving while one runs waits for its
+    // answer, instead of taking "looked a moment ago" for "none".
+    static LOOKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    if let Some(r) = FOUND.get() {
+        return Some(r.clone());
+    }
+    let _one = LOOKING.lock().await;
     if let Some(r) = FOUND.get() {
         return Some(r.clone());
     }
