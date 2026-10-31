@@ -2108,6 +2108,18 @@ pub enum EventKind {
         #[serde(default)]
         effort: String,
     },
+    /// A notice for the agent was queued (a background task's end, a
+    /// subagent's report, a session message); a `User` event with the same
+    /// `command_id` is the turn that took it. Until then it waits
+    /// (docs/background.md §5).
+    NoticeQueued {
+        command_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        command: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        from_title: String,
+    },
 }
 
 impl EventKind {

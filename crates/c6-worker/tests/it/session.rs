@@ -248,5 +248,6 @@ fn kind(e: &Event) -> &'static str {
         EventKind::Question { .. } => "question",
         EventKind::SubagentSpawned { .. } => "subagent_spawned",
         EventKind::SubagentModelSet { .. } => "subagent_model_set",
+        EventKind::NoticeQueued { .. } => "notice_queued",
     }
 }

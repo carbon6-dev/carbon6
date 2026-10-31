@@ -477,6 +477,7 @@ message SessionCommand {
     Answer answer = 17;
     SetSubagentModel set_subagent_model = 18;
     DelegationEnded delegation_ended = 19;
+    ReleaseNotices release_notices = 20;
   }
 }
 
@@ -498,6 +499,10 @@ message DelegationEnded {
   repeated string said = 6;
   bool wake = 7;
 }
+
+// Deliver the session's held notices now (docs/background.md §5): they
+// start a turn together, whatever the hourly limit.
+message ReleaseNotices {}
 
 // Sets the session's default for its subagents (unset `model`: the
 // session's own model).
