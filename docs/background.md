@@ -111,6 +111,7 @@ Not goals:
 - Its `command_id`:
   - a background task's end: `task:<task_id>:<state>`, so the same end is never recorded twice;
   - a subagent's report: `subagent:<uuid>` (it is recorded in the parent's log before anything else, so it needs no fixed id);
+  - a remote subagent's report ([remote-subagents.md](remote-subagents.md)), which the head sends until the parent logs `SubagentReported`: `subagent:<the head's command id>`, so one sent again is not told twice;
   - for a session message (step 4), the head's command id, which also gains `from_session_id`.
 - **When a turn takes the notice,** its `UserMessage` has the same `command_id`.
 - **On load** (`SessionManager::load`, `notices_of`), every `NoticeQueued` whose `command_id` has no `UserMessage` is delivered again, under the same rule as when it first arrived (without announcing a hold again). That covers worker restarts and actors that stopped mid-turn. A Claude Code session's notice counts as taken once the CLI echoes it.
@@ -146,7 +147,7 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 ```
 
 - **Proto.**
-  - `UserInput` gains `from_session_id` (9), `from_title` (10) and `hops` (11). An input with `from_session_id` is a notice, not your message: no commands, mentions or prompt hooks.
+  - `UserInput` gains `from_session_id` (10), `from_title` (11) and `hops` (12); `UserMessage` the same fields as 9–11. An input with `from_session_id` is a notice, not your message: no commands, mentions or prompt hooks.
   - `UserMessage` carries the same fields; `NoticeQueued` carries them and the prompt.
 - **The target's worker** appends `NoticeQueued` and queues it, with `wake: true` and the hourly limit (§5). The head marks the command done when it ingests that `NoticeQueued`, so a held message isn't sent again on reconnect.
 - **The recipient sees** `<session-message from="<id>" title="<title>">…</session-message>`, followed by the realm's `session.message_received` prompt (Settings → Prompts). The prompt says how to reply with `message_session` and to reply only when an answer is needed.

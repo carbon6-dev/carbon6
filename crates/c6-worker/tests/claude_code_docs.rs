@@ -25,7 +25,7 @@ fn fake_claude(dir: &Path) -> std::path::PathBuf {
     std::fs::write(dir.join("list.json"), outline.to_string()).unwrap();
     let script = format!(
         r#"#!/bin/sh
-cat > /dev/null
+read -r line
 url=""
 while [ $# -gt 0 ]; do [ "$1" = "--mcp-config" ] && url=$(printf '%s' "$2" | sed 's/.*"url":"\([^"]*\)".*/\1/'); shift; done
 if [ -z "$url" ]; then
@@ -111,7 +111,9 @@ async fn claude_code_writes_documents_through_mcp() {
     let read = |f: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(project.path().join(f)).unwrap()).unwrap() };
     let tools = read("tools.json");
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["doc"]);
+    // With no connection for subagents: documents, and messages to other
+    // sessions (docs/background.md §6).
+    assert_eq!(names, ["doc", "MessageSession", "ListSessions"]);
     assert!(tools["result"]["tools"][0]["inputSchema"]["properties"]["action"]["enum"].to_string().contains("create"));
     let created = read("create.out");
     assert_eq!(created["result"]["isError"], false, "{created}");
