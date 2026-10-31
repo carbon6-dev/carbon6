@@ -264,3 +264,92 @@ async fn the_edge_channel_offers_builds_of_main() {
 
     head.shutdown().await.unwrap();
 }
+
+/// A worker told to update to an edge build, then (before it got the files)
+/// to a newer one, updates to the newer: CI deletes an edge build's files
+/// when it publishes the next, so the first is a 404 by then.
+#[tokio::test]
+async fn a_worker_follows_the_edge_when_it_moves_on() {
+    let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+    let public: String = key.public_key().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let (first, second) = ("9.9.8+git20261030120000.aaaaaaa", "9.9.8+git20261030130000.bbbbbbb");
+    let signed = |v: &str| {
+        let body = tgz(&[("c6w", &format!("c6w {v}"))]);
+        let sum = c6_core::update::checksum(&body);
+        let names = [
+            format!("c6w-{v}-darwin-arm64.tar.gz"),
+            format!("c6w-{v}-darwin-x86_64.tar.gz"),
+            format!("carbon6-{v}-linux-amd64.tar.gz"),
+            format!("carbon6-{v}-linux-arm64.tar.gz"),
+        ];
+        let assets: serde_json::Map<String, Value> = names.iter().map(|n| (n.clone(), json!(sum))).collect();
+        let m = serde_json::to_string(&json!({"version": v, "assets": assets})).unwrap();
+        let sig = key.sign(m.as_bytes()).as_ref().to_vec();
+        (m, sig, body)
+    };
+    let (m1, s1, _) = signed(first);
+    let (m2, s2, body2) = signed(second);
+
+    // The files: the first build's are held until the second is out, then
+    // gone; the second's are there.
+    let gone = Arc::new(tokio::sync::Notify::new());
+    let asked = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let files = format!("http://{}", listener.local_addr().unwrap());
+    let (g, a) = (gone.clone(), asked.clone());
+    let app = axum::Router::new()
+        .route(
+            "/first/{name}",
+            axum::routing::get(move || async move {
+                a.notify_one();
+                g.notified().await;
+                axum::http::StatusCode::NOT_FOUND
+            }),
+        )
+        .route("/second/{name}", axum::routing::get(move || async move { body2 }));
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let e = c6_head::api::new_enrollment(&head.state, Some("laptop")).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let c6w = bin.path().join("c6w");
+    std::fs::write(&c6w, "old c6w").unwrap();
+    *worker.overrides.lock().unwrap() = c6_worker::Overrides {
+        update_exe: Some(c6w.clone()),
+        update_keys: Some(vec![public]),
+        update_as_version: Some("9.9.8".into()),
+        ..Default::default()
+    };
+    let stop = CancellationToken::new();
+    c6_worker::update::on_start(&worker, &stop).unwrap();
+
+    let apply = async |m: &str, s: &[u8], tag: &str| {
+        let p = json!({"manifest": m, "signature": hex::encode(s), "base_url": format!("{files}/{tag}/"), "deadline_ms": 0});
+        c6_worker::update::apply(&worker, &p).await.unwrap()
+    };
+    assert_eq!(apply(&m1, &s1, "first").await["started"], true);
+    c6_testkit::within("the first build's download", asked.notified()).await;
+    // The edge moves on while the worker fetches the first build.
+    assert_eq!(apply(&m2, &s2, "second").await["started"], true);
+    assert_eq!(apply(&m1, &s1, "first").await["already"], true, "an older build changes nothing");
+    gone.notify_one();
+
+    c6_testkit::within("the restart", stop.cancelled()).await;
+    assert!(worker.update.restart_requested());
+    assert_eq!(std::fs::read_to_string(&c6w).unwrap(), format!("c6w {second}"));
+    head.shutdown().await.unwrap();
+}

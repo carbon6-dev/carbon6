@@ -22,9 +22,21 @@ use crate::Worker;
 pub struct Updating {
     /// An update asked the process to exit with the restart code.
     pub restart: AtomicBool,
-    busy: AtomicBool,
+    /// The release this worker is updating to, while it is: the newest the
+    /// head has named (a newer edge build replaces one it waits on, whose
+    /// files are gone by then).
+    target: Mutex<Option<Target>>,
     stop: Mutex<Option<CancellationToken>>,
     on_start: Mutex<Option<OnStart>>,
+}
+
+#[derive(Clone)]
+struct Target {
+    m: up::Manifest,
+    raw: String,
+    sig: Vec<u8>,
+    base: String,
+    deadline: i64,
 }
 
 impl Updating {
@@ -127,18 +139,39 @@ pub async fn apply(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
     if !up::newer(&m.version, &version(worker)) {
         anyhow::bail!("this worker runs {} already", version(worker));
     }
-    if worker.update.busy.swap(true, Ordering::SeqCst) {
-        return Ok(json!({"already": true}));
+    let t = Target { m, raw, sig, base: s("base_url"), deadline: p["deadline_ms"].as_i64().unwrap_or(0) };
+    {
+        let mut slot = worker.update.target.lock().unwrap();
+        match slot.as_ref() {
+            Some(o) if !up::newer(&t.m.version, &o.m.version) => return Ok(json!({"already": true})),
+            // Under way: it takes this one instead.
+            Some(_) => {
+                *slot = Some(t);
+                return Ok(json!({"started": true}));
+            }
+            None => *slot = Some(t),
+        }
     }
-    let (w, base, deadline) = (worker.clone(), s("base_url"), p["deadline_ms"].as_i64().unwrap_or(0));
+    let w = worker.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(&w, &m, (&raw, &sig), &base, deadline).await {
-            warn!(to = %m.version, "updating: {e:#}");
-            say(&w, &m.version, "failed", &format!("{e:#}")).await;
-            w.update.busy.store(false, Ordering::SeqCst);
+        loop {
+            let Some(t) = current(&w) else { return };
+            let Err(e) = run(&w).await else { return };
+            warn!(to = %t.m.version, "updating: {e:#}");
+            say(&w, &t.m.version, "failed", &format!("{e:#}")).await;
+            // A newer one came while this failed: try that.
+            let mut slot = w.update.target.lock().unwrap();
+            if slot.as_ref().is_none_or(|n| n.m.version == t.m.version) {
+                *slot = None;
+                return;
+            }
         }
     });
     Ok(json!({"started": true}))
+}
+
+fn current(w: &Worker) -> Option<Target> {
+    w.update.target.lock().unwrap().clone()
 }
 
 /// Tells the head how the update goes (`update.status`).
@@ -149,25 +182,29 @@ async fn say(w: &Worker, version: &str, state: &str, detail: &str) {
     }
 }
 
-async fn run(w: &Arc<Worker>, m: &up::Manifest, signed: (&str, &[u8]), base: &str, deadline: i64) -> anyhow::Result<()> {
+/// Updates to the newest target, once idle.
+async fn run(w: &Arc<Worker>) -> anyhow::Result<()> {
     let (exe, method) = exe_method(w);
-    let v = m.version.as_str();
     if method == Method::Source {
         anyhow::bail!("built from source: update it yourself");
     }
     // Idle first: no session in the middle of a turn (or the deadline).
-    let mut said = usize::MAX;
-    loop {
+    // The head may name a newer release meanwhile.
+    let mut said = (String::new(), usize::MAX);
+    let t = loop {
+        let t = current(w).ok_or_else(|| anyhow::anyhow!("no release to update to"))?;
         let busy = w.sessions.running();
-        if busy == 0 || (deadline > 0 && now_ms() >= deadline) {
-            break;
+        if busy == 0 || (t.deadline > 0 && now_ms() >= t.deadline) {
+            break t;
         }
-        if busy != said {
-            say(w, v, "waiting", &format!("{busy} session{} running", if busy == 1 { "" } else { "s" })).await;
-            said = busy;
+        if (t.m.version.as_str(), busy) != (said.0.as_str(), said.1) {
+            say(w, &t.m.version, "waiting", &format!("{busy} session{} running", if busy == 1 { "" } else { "s" })).await;
+            said = (t.m.version.clone(), busy);
         }
         tokio::time::sleep(Duration::from_secs(if cfg!(debug_assertions) { 1 } else { 15 })).await;
-    }
+    };
+    let (m, signed, base) = (&t.m, (t.raw.as_str(), t.sig.as_slice()), t.base.as_str());
+    let v = m.version.as_str();
     say(w, v, "downloading", "").await;
     let asset = match &method {
         // Homebrew installs a release itself; an edge build is put in place.
