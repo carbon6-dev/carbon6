@@ -7,6 +7,8 @@ odt     <md> <out.odt>              Markdown to OpenDocument text (pandoc)
 pptx    <deck.json> <out.pptx>      a deck to PowerPoint, text editable
 odp     <deck.json> <out.odp>       a deck to OpenDocument presentation
 import  <file> <out.md>             docx, odt, pptx or md to carbon6 Markdown
+split   <deck.html> <out.json>      an HTML deck (the decks app's): its styles
+                                    and each <section class="slide"> as HTML
 
 deck.json: {"title", "size": "16:9"|"4:3", "html": "deck.html", "slides":
 [{"layout", "hidden", "notes", "picture": bool, "regions": {name: markdown}}]}
@@ -235,6 +237,21 @@ def import_file(path, out):
     open(out, "w", encoding="utf-8").write(text)
 
 
+def split(html, out):
+    """The decks app's deck.html: its <style>s, and each slide's HTML."""
+    import lxml.html
+    tree = lxml.html.parse(html).getroot()
+    styles = "\n".join(s.text or "" for s in tree.iter("style"))
+    sections = []
+    for sec in tree.iter("section"):
+        cls = (sec.get("class") or "").split()
+        if "slide" in cls or not any("slide" in (x.get("class") or "") for x in tree.iter("section")):
+            sections.append(lxml.html.tostring(sec, encoding="unicode", method="html"))
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    json.dump({"style": styles, "sections": sections}, open(out, "w"))
+    print("%d slides" % len(sections))
+
+
 def main():
     if len(sys.argv) < 4:
         fail(__doc__)
@@ -256,6 +273,8 @@ def main():
         odp(src, out)
     elif what == "import":
         import_file(src, out)
+    elif what == "split":
+        split(src, out)
     else:
         fail("unknown: " + what)
 

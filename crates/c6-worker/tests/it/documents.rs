@@ -529,3 +529,124 @@ async fn documents_export_and_import() {
     let r = http.post(format!("{api}/docs/import")).json(&json!({"name": "x.exe", "content": b64(b"MZ")})).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Leaving the decks app (docs/docs.md §13): its decks come in once as
+/// carbon6 decks (html slides from its deck.html on a worker, split by the
+/// render kit, here a stand-in; its brief as notes; its PDF a past export),
+/// and its themes as themes.
+#[tokio::test]
+async fn the_decks_apps_decks_come_in_once() {
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    // A decks app as it was installed (its decks and themes collections).
+    const APP: &str = r#"{"package": "decks", "version": "1.2.0", "description": "Presentation decks from a brief: an outline you approve, a theme you choose, then slides built as HTML, checked by eye, and handed to you as HTML and PDF. Install it in the realm whose decks they are (home, a business).", "permissions": {}, "contents": {"collections": [{"name": "decks", "description": "Finished decks: what they are about, and their files. Handed to you by the decks app; yours to keep and change.", "handoff": true, "schema": {"type": "object", "required": ["title", "files"], "properties": {"title": {"type": "string"}, "brief": {"type": "string"}, "audience": {"type": "string"}, "theme": {"type": "string"}, "folder": {"type": "string", "description": "Where its files are made, on the worker"}, "files": {"type": "array", "items": {"type": "string"}, "description": "The published files: HTML, PDF, and PowerPoint when asked"}, "made_by": {"type": "string", "description": "What made it, e.g. decks 1.2.0"}}}, "card": {"sources": "Handed off by the decks app when a deck is delivered.", "freshness": "once per deck"}}, {"name": "themes", "description": "Looks for decks: colours, type and accents as CSS variables over the base CSS (skill deck-html).", "schema": {"type": "object", "required": ["name", "css"], "properties": {"name": {"type": "string"}, "mood": {"type": "string"}, "css": {"type": "string"}}}, "keys": ["name"], "card": {"sources": "Shipped with the decks app; add your own with its add_theme operation.", "invariants": ["each theme's name is unique", "css sets the CSS variables the base CSS uses"]}}], "records": {"themes": [{"name": "Old Paper", "mood": "The app's", "css": ":root { --bg: #fffdf8; --accent: #8a5a00; }"}]}}}"#;
+    c6_head::kitjobs::run_locally(
+        c6_head::docs::export::KIT,
+        std::sync::Arc::new(|run: c6_head::kitjobs::LocalRun| {
+            Box::pin(async move {
+                assert_eq!(run.tool, "split");
+                let html = String::from_utf8(run.inputs["deck.html"].clone()).unwrap();
+                let cut = |open: &str, close: &str| -> Vec<String> {
+                    html.split(open).skip(1).filter_map(|r| r.split_once(close).map(|(a, _)| a.to_owned())).collect()
+                };
+                let style = cut("<style>", "</style>").join("\n");
+                let sections: Vec<String> =
+                    cut("<section class=\"slide", "</section>").iter().map(|s| format!("<section class=\"slide{s}</section>")).collect();
+                let out = serde_json::to_vec(&json!({"style": style, "sections": sections})).unwrap();
+                Ok(c6_head::kitjobs::Output { exit: Some(0), files: [("split.json".to_owned(), out)].into(), ..Default::default() })
+            })
+        }),
+    );
+    let (head_dir, state, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    // Nothing to bring in without the app.
+    assert_eq!(send(M::GET, "decks/bring-in".into(), Value::Null).await["app"], false);
+    let i = send(M::POST, "apps?realm=home".into(), serde_json::from_str(APP).unwrap()).await;
+    send(M::POST, format!("decisions/{}/answer", i["decision"]), json!({"option": "Install"})).await;
+    // Its decks collection is yours (handed off), its themes its own.
+    let cols = send(M::GET, "collections?realm=home".into(), Value::Null).await;
+    let owner = |n: &str| cols.as_array().unwrap().iter().find(|c| c["name"] == n).map(|c| c["owner"].as_str().unwrap_or("").to_owned());
+    assert_eq!((owner("decks"), owner("themes")), (Some(String::new()), Some("decks".into())));
+    // A deck it made: deck.html and deck.pdf in a worker's folder.
+    let dir = folder.path().join("decks/q3");
+    std::fs::create_dir_all(&dir).unwrap();
+    let html = "<!doctype html><html><head><style>.slide { width: 1280px; background: #faf7f2; }</style></head><body>\n\
+                <section class=\"slide title\"><h1>Q3 review</h1>\n\n<p class=\"sub\">Where we are</p></section>\n\
+                <section class=\"slide\"><h2>Churn halved</h2><svg viewBox=\"0 0 10 10\"><rect width=\"5\" height=\"5\"/></svg></section></body></html>";
+    std::fs::write(dir.join("deck.html"), html).unwrap();
+    std::fs::write(dir.join("deck.pdf"), b"%PDF-1.7 the app's").unwrap();
+    let pdf = dir.join("deck.pdf").display().to_string();
+    send(
+        M::POST,
+        "collections/decks/records?realm=home".into(),
+        json!({"fields": {"title": "Q3 review", "brief": "For the board, ten minutes", "theme": "Old Paper", "folder": dir.display().to_string(),
+                          "files": [pdf]}}),
+    )
+    .await;
+    send(
+        M::POST,
+        "collections/decks/records?realm=home".into(),
+        json!({"fields": {"title": "Lost deck", "folder": "/nowhere", "files": []}}),
+    )
+    .await;
+    let s = send(M::GET, "decks/bring-in".into(), Value::Null).await;
+    assert_eq!((s["app"].as_bool(), s["decks"].as_u64(), s["left"].as_u64()), (Some(true), Some(2), Some(2)));
+
+    let r = send(M::POST, "decks/bring-in".into(), Value::Null).await;
+    assert_eq!(r["made"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["themes"], json!(["Old Paper"]));
+    assert!(r["skipped"][0]["why"].as_str().unwrap().contains("isn't on a connected worker"), "{r}");
+    let id = r["made"][0]["doc"].as_str().unwrap().to_owned();
+    let deck = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    assert_eq!(
+        (deck["kind"].as_str(), deck["title"].as_str(), deck["theme"].as_str()),
+        (Some("deck"), Some("Q3 review"), Some("Old Paper"))
+    );
+    let slides = deck["tabs"][0]["blocks"].as_array().unwrap();
+    assert_eq!(slides.len(), 2);
+    assert_eq!(slides[0]["attrs"]["layout"], "html");
+    assert_eq!(slides[0]["attrs"]["notes"], "For the board, ten minutes");
+    let first = &slides[0]["children"][0];
+    assert_eq!(first["kind"], "html", "one html block, its blank lines out: {first}");
+    assert!(first["text"].as_str().unwrap().starts_with("<style>.slide { width: 1280px"), "{first}");
+    assert!(slides[1]["children"][0]["text"].as_str().unwrap().contains("<rect width=\"5\""));
+    // Its PDF, as a past export.
+    let past = send(M::GET, format!("docs/{id}/exports"), Value::Null).await;
+    assert_eq!((past[0]["format"].as_str(), past[0]["by"].as_str()), (Some("pdf"), Some("decks app")));
+    // Its theme came in.
+    let themes = send(M::GET, "decks/themes".into(), Value::Null).await;
+    assert!(themes.as_array().unwrap().iter().any(|t| t["name"] == "Old Paper"));
+    // Again: nothing more comes in.
+    let again = send(M::POST, "decks/bring-in".into(), Value::Null).await;
+    assert!(again["made"].as_array().unwrap().is_empty());
+    assert_eq!(again["skipped"][0]["why"], "brought in already");
+    assert_eq!(send(M::GET, "decks/bring-in".into(), Value::Null).await["left"], 1, "the lost one is still left");
+    stop.cancel();
+}

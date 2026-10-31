@@ -472,3 +472,58 @@ pub fn ThemesSetting() -> impl IntoView {
         </section>
     }
 }
+
+/// Settings → Decks, while the decks app is installed: its decks come in
+/// once as carbon6 decks, its themes as themes (docs/docs.md §13).
+#[component]
+pub fn BringIn() -> impl IntoView {
+    let tick = RwSignal::new(0u32);
+    let status = LocalResource::new(move || {
+        tick.track();
+        api::realm().track();
+        api::decks_bring_status()
+    });
+    let busy = RwSignal::new(false);
+    let result = RwSignal::new(None::<Result<serde_json::Value, String>>);
+    let go = move |_| {
+        busy.set(true);
+        spawn_local(async move {
+            result.set(Some(api::decks_bring_in().await));
+            busy.set(false);
+            tick.update(|t| *t += 1);
+        });
+    };
+    move || {
+        status.get().and_then(Result::ok).filter(|s| s["app"] == true).map(|s| {
+            let (n, left) = (s["decks"].as_u64().unwrap_or(0), s["left"].as_u64().unwrap_or(0));
+            view! {
+                <section class="space-y-2 rounded-lg border border-violet-200 bg-violet-50/40 p-4 dark:border-violet-900 dark:bg-violet-950/20">
+                    <h2 class="font-medium">"Bring in decks"</h2>
+                    <p class="text-sm text-zinc-600 dark:text-zinc-400">{format!(
+                        "The decks app is installed here with {n} {}, {left} still to bring in. Each comes in once as a carbon6 deck: its slides from its deck.html (on a connected worker) as html slides, its brief as the first slide's notes, its PDFs as past exports; the app's themes become themes. Then you can remove the app (Apps).",
+                        if n == 1 { "deck" } else { "decks" }
+                    )}</p>
+                    <button class=BUTTON disabled=move || busy.get() || left == 0 on:click=go>
+                        {move || if busy.get() { "Bringing them in…" } else { "Bring in decks" }}
+                    </button>
+                    {move || result.get().map(|r| match r {
+                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                        Ok(v) => view! {
+                            <ul class="space-y-0.5 text-sm">
+                                {v["made"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
+                                    <li>{format!("✓ {}", m["title"].as_str().unwrap_or(""))}</li>
+                                }).collect_view()}
+                                {v["skipped"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
+                                    <li class="text-zinc-500">{format!("– {}: {}", m["title"].as_str().unwrap_or(""), m["why"].as_str().unwrap_or(""))}</li>
+                                }).collect_view()}
+                                {v["themes"].as_array().filter(|t| !t.is_empty()).map(|t| view! {
+                                    <li>{format!("Themes: {}", t.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))}</li>
+                                })}
+                            </ul>
+                        }.into_any(),
+                    })}
+                </section>
+            }
+        })
+    }
+}

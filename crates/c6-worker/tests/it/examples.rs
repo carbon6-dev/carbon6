@@ -8,8 +8,6 @@ use serde_json::{Value, json};
 
 const FACTORY: &str = include_str!("../../../../examples/apps/service-factory.json");
 const CRM: &str = include_str!("../../../../examples/apps/personal-crm.json");
-const DECKS: &str = include_str!("../../../../examples/apps/decks.json");
-const DECKS_RENDER: &str = include_str!("../../../../examples/packages/decks-render.json");
 
 #[tokio::test]
 async fn example_apps_install_and_work() {
@@ -43,16 +41,10 @@ async fn example_apps_install_and_work() {
         async move { http.get(format!("{api}/decisions")).send().await.unwrap().json::<Vec<Decision>>().await.unwrap() }
     };
 
-    // The kit decks requires, in the registry first.
-    let kit = ok(send(M::POST, "packages", serde_json::from_str(DECKS_RENDER).unwrap()).await).await;
-    assert_eq!(kit["roles"], json!(["kit"]));
     // Each in a realm of its own, which you make first (the packages
     // suggest them; installing never makes one).
-    // decks makes your decks, so it goes in home.
-    for (pkg, realm) in [(FACTORY, "factory"), (CRM, "crm"), (DECKS, "home")] {
-        if realm != "home" {
-            ok(send(M::POST, "realms", json!({"id": realm, "name": realm})).await).await;
-        }
+    for (pkg, realm) in [(FACTORY, "factory"), (CRM, "crm")] {
+        ok(send(M::POST, "realms", json!({"id": realm, "name": realm})).await).await;
         let p: Value = serde_json::from_str(pkg).unwrap();
         let plan: AppPlan = send(M::POST, "apps/plan", p.clone()).await.json().await.unwrap();
         assert!(plan.problems.is_empty(), "{realm}: {:?}", plan.problems);
@@ -62,35 +54,7 @@ async fn example_apps_install_and_work() {
         assert!(r.status().is_success(), "{realm}: {}", r.text().await.unwrap());
     }
 
-    // The decks app, with the kit it renders with.
-    let installs = ok(send(M::GET, "installs", json!({})).await).await;
-    let render = installs.as_array().unwrap().iter().find(|i| i["package"] == "decks-render").expect("decks-render installed with decks");
-    assert_eq!(render["state"], "installed");
-    // Its themes, skills, templates and views.
-    let themes = ok(send(M::GET, "collections/themes/records?realm=home", json!({})).await).await;
-    assert_eq!(themes["total"], 3);
-    assert!(themes["records"].as_array().unwrap().iter().all(|t| t["fields"]["css"].as_str().unwrap().contains("--accent")));
-    // Read from the app's package (its code), not copied into the realm.
     let from_app = |list: Value, app: &str| list.as_array().unwrap().iter().filter(|e| e["from"] == format!("app:{app}")).count();
-    let skills = ok(send(M::GET, "realms/home/effective/skills", json!({})).await).await;
-    assert!(skills.to_string().contains("@page { size: 1280px 720px"), "the base CSS is in deck-html");
-    assert_eq!(from_app(skills, "decks"), 5);
-    assert_eq!(from_app(ok(send(M::GET, "realms/home/effective/templates", json!({})).await).await, "decks"), 2);
-    assert_eq!(from_app(ok(send(M::GET, "realms/home/effective/views", json!({})).await).await, "decks"), 3);
-    // What it makes is handed to you: the decks collection is home's; its
-    // work in progress is its own (internal).
-    let cols = ok(send(M::GET, "collections?realm=home", json!({})).await).await;
-    let owner = |n: &str| cols.as_array().unwrap().iter().find(|c| c["name"] == n).map(|c| c["owner"].as_str().unwrap_or("").to_owned());
-    assert_eq!(
-        (owner("decks"), owner("jobs"), owner("themes")),
-        (Some(String::new()), Some("decks".into()), Some("decks".into())),
-        "{cols}"
-    );
-    let theme =
-        ok(send(M::POST, "apps/home/decks/operations/add_theme", json!({"input": {"name": "Brand", "css": ":root { --accent: #f00; }"}}))
-            .await)
-        .await;
-    assert_eq!(theme["record"]["fields"]["name"], "Brand");
 
     // Everything the factory brings is there.
     let count = |path: String| async move { ok(send(M::GET, &path, json!({})).await).await.as_array().map(Vec::len).unwrap_or(0) };

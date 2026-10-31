@@ -1456,3 +1456,12 @@ pub async fn doc_exports(id: String) -> Result<Vec<c6_api::docs::DocExport>, Str
 pub async fn doc_import(i: &c6_api::docs::DocImport) -> Result<c6_api::docs::Doc, String> {
     send_json(Request::post("/api/v1/docs/import"), i).await
 }
+
+/// The decks app's decks still to come in (docs/docs.md §13).
+pub async fn decks_bring_status() -> Result<serde_json::Value, String> {
+    json(Request::get("/api/v1/decks/bring-in").send().await).await
+}
+
+pub async fn decks_bring_in() -> Result<serde_json::Value, String> {
+    json(Request::post("/api/v1/decks/bring-in").send().await).await
+}

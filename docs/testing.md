@@ -26,7 +26,7 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
    - **Programs it writes:** a script a test writes and then runs can fail with "Text file busy" while a process another test just started still holds it open for writing. Wait with `c6_testkit::runnable(path, args)` before using it.
 6. **What a test needs from the machine, CI has.**
    - A test that needs Chrome, git or a shell says so with `c6_testkit::need(what, present)` or `have(tool)`. On a laptop without it, the test skips. In CI (`GITHUB_ACTIONS`) a missing tool fails, so coverage never disappears quietly.
-   - Tests that build container images (`C6_TEST_KITS`, `C6_TEST_DECKS_RENDER`) are opt-in and don't run in CI.
+   - Tests that build container images (`C6_TEST_KITS`) are opt-in and don't run in CI.
 7. **Only loopback.** Providers, GitHub and OAuth are fakes on `127.0.0.1` (`c6_testkit::MockLlm`, small axum servers). No test reaches the internet.
 8. **The product's own time limits must not fail a test either.** Where the code under test waits (a browser starting, a credential, an RPC), its limit is generous enough for a loaded machine. For example, the browser now gets 60 seconds and says why it didn't start.
 

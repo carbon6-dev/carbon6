@@ -390,7 +390,7 @@ Settled since the first version: mail, calendar and contacts are in the realm wh
   - It is then removed from where it was; that realm keeps its sessions and is yours to delete.
   - Its webhook triggers get new URLs.
 - **Hand-off collections:** a package's collection with `handoff: true` is made as the realm's, not the app's. It stays, and anything in the realm writes it, after the app is gone.
-- **decks 1.2.0** (`examples/apps/decks.json`): no realm of its own, so it installs in home by default. It has:
+- **decks 1.2.0** (`examples/apps/decks.json`, removed 2026-10-31: decks are part of carbon6, docs/docs.md §13): no realm of its own, so it installs in home by default. It has:
   - `jobs`: internal, the decks being made;
   - `decks`: handed off, finished decks with their files;
   - `themes`: published, with an `add_theme` write operation;

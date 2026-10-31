@@ -160,7 +160,9 @@ pub async fn guide(st: &HeadState, realm: &str) -> String {
 // --- HTTP -------------------------------------------------------------------
 
 pub fn routes() -> Router<Arc<HeadState>> {
-    Router::new().route("/api/v1/decks/themes", axum::routing::get(get_themes).put(put_themes))
+    Router::new()
+        .route("/api/v1/decks/themes", axum::routing::get(get_themes).put(put_themes))
+        .route("/api/v1/decks/bring-in", axum::routing::get(bring_status).post(bring_in))
 }
 
 async fn get_themes(
@@ -181,4 +183,22 @@ async fn put_themes(
     let realm = crate::docs::realm_for(&st, &caller, r.realm.as_deref()).await?;
     put(&st, &realm, &list, &crate::docs::by_of(&caller)).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn bring_status(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = crate::docs::realm_for(&st, &caller, r.realm.as_deref()).await?;
+    Ok(Json(crate::docs::bring::status(&st, &realm).await?))
+}
+
+async fn bring_in(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let realm = crate::docs::realm_for(&st, &caller, r.realm.as_deref()).await?;
+    Ok(Json(crate::docs::bring::bring_in(&st, &realm, &crate::docs::by_of(&caller)).await?))
 }

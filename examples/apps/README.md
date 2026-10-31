@@ -3,10 +3,9 @@
 The worked examples of the OS design (docs/os.md §6), as packages you can install: configuration only, no code.
 
 - `service-factory.json`: finds gaps in app ecosystems, builds and runs small services, with five gates you approve (realm `factory`).
-- `decks.json`: presentation decks from a brief: an outline you approve, a theme you choose, slides built as HTML and checked by eye, delivered as HTML and PDF (realm `decks`; docs/decks.md).
 - `personal-crm.json`: keeps you in touch with people, drafting check-ins through a grant on home's mail; you send (realm `crm`).
 
-`decks.json` requires the kit in `../packages/decks-render.json` (docs/packages.md): add that to the registry first (Settings → System → Packages, **Choose a file…** (on this device, on the head or on a worker), Add to registry); installing decks then installs it too, in the same decision. The kit is built on a worker the first time it's used, which needs Docker or Podman and downloads Debian packages, Chromium and fonts.
+Decks were an app here (`decks.json`, with the `decks-render` kit) until 2026-10-31; they are part of carbon6 now (docs/docs.md §5, §13), and an installed decks app's decks come in from Settings → Decks → Bring in decks.
 
 To install one: Settings → System → Packages, **Choose a file…**, Add and install…, and answer the decision. Its templates then show on the Sessions page under **Run a template**, marked with the app's realm (`c6 run -t <name>` finds them too). Or with the API:
 

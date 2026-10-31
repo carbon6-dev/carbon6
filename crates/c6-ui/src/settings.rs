@@ -298,7 +298,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         <OwnOrRoot name="docs" />
                         <DocsSetting />
                     }.into_any(),
-                    "decks" => view! { <crate::deck::ThemesSetting /> }.into_any(),
+                    "decks" => view! { <crate::deck::BringIn /> <crate::deck::ThemesSetting /> }.into_any(),
                     "suggestions" => view! {
                         <OwnOrRoot name="suggestions" />
                         <SuggestionsSetting />

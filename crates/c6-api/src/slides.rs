@@ -251,7 +251,15 @@ pub fn slide_html(s: &DocBlock, n: usize, total: usize, deck_title: &str, md: &d
             return String::new();
         }
         if layout == "html" {
-            return format!("<div class=\"region r-html\">{inner}</div>");
+            // Its own HTML and CSS, in a frame of its own: its CSS can't
+            // reach the page or other slides, and nothing in it runs.
+            let doc = format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{margin:0;width:1280px;height:720px;overflow:hidden}}</style></head><body>{inner}</body></html>"
+            );
+            return format!(
+                "<div class=\"region r-html\"><iframe sandbox=\"\" scrolling=\"no\" style=\"border:0;width:1280px;height:720px;display:block\" srcdoc=\"{}\"></iframe></div>",
+                escape(&doc)
+            );
         }
         format!("<div class=\"region r-{name}\">{inner}</div>")
     };
@@ -334,6 +342,25 @@ mod tests {
         assert!(!clean.to_lowercase().contains("script") && !clean.contains("onclick") && !clean.contains("onerror"), "{clean}");
         assert!(!clean.contains("iframe") && !clean.contains("javascript:"), "{clean}");
         assert!(clean.contains("<div class=a>") && clean.contains("<rect width=\"10\"/>") && clean.contains("<img src=x>"), "{clean}");
+    }
+
+    #[test]
+    fn html_slides_draw_in_a_frame_of_their_own() {
+        let s = DocBlock {
+            id: "h".into(),
+            kind: "slide".into(),
+            attrs: json!({"layout": "html"}),
+            children: vec![b(
+                "html",
+                "html",
+                "<style>.slide{background:red}</style><section class=\"slide\">x</section><script>1</script>",
+            )],
+            ..Default::default()
+        };
+        let h = slide_html(&s, 1, 1, "T", &|t| t.to_owned());
+        assert!(h.contains("<iframe sandbox=\"\""), "{h}");
+        assert!(h.contains("srcdoc=\"&lt;!doctype html&gt;") && h.contains("&lt;style&gt;.slide{background:red}"), "{h}");
+        assert!(!h.contains("script"), "{h}");
     }
 
     #[test]

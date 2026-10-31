@@ -178,7 +178,7 @@ fn deck_json(doc: &Doc) -> Value {
 }
 
 /// Runs one of the kit's tools; its files by path under `out/`.
-async fn run_kit(
+pub(crate) async fn run_kit(
     st: &HeadState,
     realm: &str,
     tool: &str,
@@ -340,7 +340,7 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-async fn keep(st: &HeadState, realm: &str, doc: &Doc, format: &str, bytes: Vec<u8>, by: &str) -> anyhow::Result<DocExport> {
+pub(crate) async fn keep(st: &HeadState, realm: &str, doc: &Doc, format: &str, bytes: Vec<u8>, by: &str) -> anyhow::Result<DocExport> {
     let m = crate::knowledge::get(st).ok_or_else(|| anyhow::anyhow!("the knowledge store is not open"))?;
     let rm = m.of_realm(realm).await?;
     let blob = rm.put_blob(&bytes).await?;

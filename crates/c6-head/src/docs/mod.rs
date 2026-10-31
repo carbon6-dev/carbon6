@@ -9,6 +9,7 @@
 //! changes settle (nothing new for a few seconds), `doc.changed` fires for
 //! triggers, with who wrote it.
 
+pub mod bring;
 pub mod export;
 pub mod http;
 pub mod markdown;

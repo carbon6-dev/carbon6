@@ -1,6 +1,6 @@
 {
   "package": "c6-render",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "carbon6's render kit: documents and decks to PDF, Word, OpenDocument and PowerPoint, slides to pictures, and Word, PowerPoint and Markdown files into documents.",
   "permissions": {
     "files": "session",
@@ -21,6 +21,7 @@
       {"name": "odt", "description": "A Markdown document to OpenDocument text.", "command": ["python3", "/opt/kit/render.py", "odt", "{md}", "{out}"], "args": {"md": "path", "out": "path"}},
       {"name": "pptx", "description": "A deck (deck.json, with deck.html for its pictures) to PowerPoint: titles, text, bullets and notes editable; html, chart and diagram slides as pictures.", "command": ["python3", "/opt/kit/render.py", "pptx", "{deck}", "{out}"], "args": {"deck": "path", "out": "path"}},
       {"name": "odp", "description": "A deck to OpenDocument presentation (through PowerPoint).", "command": ["python3", "/opt/kit/render.py", "odp", "{deck}", "{out}"], "args": {"deck": "path", "out": "path"}},
+      {"name": "split", "description": "An HTML deck (the decks app's deck.html) to its styles and each slide's HTML, as JSON in out.", "command": ["python3", "/opt/kit/render.py", "split", "{html}", "{out}"], "args": {"html": "path", "out": "path"}},
       {"name": "import", "description": "A Word, OpenDocument, PowerPoint or Markdown file to carbon6 Markdown (a deck's slides separated by ---) in out.", "command": ["python3", "/opt/kit/render.py", "import", "{file}", "{out}"], "args": {"file": "path", "out": "path"}}
     ]
   }
