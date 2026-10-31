@@ -5,6 +5,14 @@
    your choice in Settings → Appearance). */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* The desktop layout (tiles side by side, the header's nav, the sidebar)
+   needs height as well as width: a phone on its side is wide but short,
+   so it keeps the phone's layout (one tile, the bottom bar, the ☰ menu).
+   sm stays width-only: it sets spacing and type, not the layout. */
+@custom-variant md (@media (width >= 48rem) and (height >= 32rem));
+@custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
+@custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
+
 /* Phones: iOS zooms into fields with text under 16px when they get
    focus, which throws the layout off; give them 16px there. */
 @media (max-width: 639px) {
