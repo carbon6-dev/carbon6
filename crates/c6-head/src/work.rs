@@ -113,11 +113,12 @@ pub async fn set_project(st: &HeadState, id: &str, realm: &str, project: &str, p
     }
     let before = w.fields.project.clone();
     modify(st, id, by, None, |f| {
-        if f.project == project && f.phase == phase {
+        if f.project == project && f.phase == phase && f.project_guess == (!project.is_empty() && by.starts_with("agent:")) {
             return Ok(false);
         }
         f.project = project.to_owned();
         f.phase = if project.is_empty() { String::new() } else { phase.to_owned() };
+        f.project_guess = !project.is_empty() && by.starts_with("agent:");
         Ok(true)
     })
     .await?;
@@ -423,6 +424,30 @@ pub async fn create(st: &HeadState, caller: &Caller, w: &api::work::WorkNew, by:
     }
     let labels = crate::sessions::check_labels(&w.labels)?;
     let id = insert(st, &realm, &f, &labels, by).await?;
+    refresh(st, &id);
+    guess_project(st, &id);
+    get(st, &id, caller).await
+}
+
+/// New work made for a project (planning, an accepted proposal): no guess.
+pub(crate) async fn create_in_project(
+    st: &HeadState,
+    caller: &Caller,
+    w: &api::work::WorkNew,
+    project: &str,
+    phase: &str,
+    by: &str,
+) -> anyhow::Result<WorkItem> {
+    let realm = caller.realm_for_new(None)?;
+    let f = WorkFields {
+        title: check_title(&w.title)?,
+        done_when: w.done_when.trim().to_owned(),
+        status: "open".into(),
+        moved_at: now_ms(),
+        ..Default::default()
+    };
+    let id = insert(st, &realm, &f, &crate::sessions::check_labels(&w.labels)?, by).await?;
+    set_project(st, &id, &realm, project, phase, by).await?;
     refresh(st, &id);
     get(st, &id, caller).await
 }
@@ -735,6 +760,41 @@ async fn view_at(st: &HeadState, rows: Vec<Stored>, now: i64) -> anyhow::Result<
         });
     }
     Ok(out)
+}
+
+/// One carbon6 thing as it is now (a ref chip in a document): a session,
+/// request, decision, document, work item or project of the realm, or a
+/// URL as it is.
+pub async fn describe(st: &HeadState, realm: &str, reference: &str) -> anyhow::Result<LiveAttached> {
+    let mut requests = HashMap::new();
+    if let Some(id) = reference.strip_prefix("request:").and_then(|i| i.parse::<i64>().ok())
+        && crate::memex::has_memex(realm)
+        && let Ok(Value::Array(found)) = crate::memex::call_in(st, realm, "memex.requests.some", json!({"ids": [id]})).await
+    {
+        for q in found {
+            if let Some(id) = q["id"].as_i64() {
+                requests.insert((realm.to_owned(), id), q);
+            }
+        }
+    }
+    if let Some(id) = reference.strip_prefix("work:") {
+        let mut l = LiveAttached { reference: reference.to_owned(), title: reference.to_owned(), state: "gone".into(), at: 0 };
+        if let Some(r) = load(st, id).await?.filter(|r| r.realm == realm) {
+            let item = view(st, vec![r]).await?.remove(0);
+            (l.title, l.state, l.at) = (item.fields.title, item.state, item.fields.moved_at);
+        }
+        return Ok(l);
+    }
+    if let Some(id) = reference.strip_prefix("project:") {
+        let mut l = LiveAttached { reference: reference.to_owned(), title: reference.to_owned(), state: "gone".into(), at: 0 };
+        if let Some(r) = crate::projects::load(st, id).await?.filter(|r| r.realm == realm) {
+            let item = crate::projects::view(st, vec![r]).await?.remove(0);
+            (l.title, l.state, l.at) = (item.fields.title, item.state, item.fields.moved_at);
+        }
+        return Ok(l);
+    }
+    let a = Attached { reference: reference.to_owned(), ..Default::default() };
+    live_of(st, realm, &a, &requests).await
 }
 
 async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(String, i64), Value>) -> anyhow::Result<LiveAttached> {
@@ -1056,6 +1116,7 @@ async fn new_with(st: &HeadState, realm: &str, title: &str, done_when: &str, ref
     }
     let id = insert(st, realm, &f, &[], by).await?;
     refresh(st, &id);
+    guess_project(st, &id);
     Ok(id)
 }
 
@@ -1213,6 +1274,71 @@ async fn guess(st: &HeadState, s: &api::Session, refs: &[WorkRef], prompt: &str)
     }
     if let Some(title) = v["new"].as_str().filter(|t| !t.trim().is_empty()) {
         new_with(st, &s.realm, title, v["done_when"].as_str().unwrap_or(""), refs, "guess").await?;
+    }
+    Ok(())
+}
+
+/// Guesses a new work item's project (docs/projects.md §5), in the
+/// background, by `project.attach`: only when the realm has active
+/// projects and lets agents pick, and only if nobody has put it in one by
+/// the time the answer comes.
+pub fn guess_project(st: &HeadState, id: &str) {
+    let Some(arc) = st.arc() else { return };
+    let id = id.to_owned();
+    GUESSING.lock().unwrap().insert(id.clone());
+    tokio::spawn(async move {
+        if let Err(e) = project_guess(&arc, &id).await {
+            warn!(work = %id, "guessing its project: {e:#}");
+        }
+        GUESSING.lock().unwrap().remove(&id);
+    });
+}
+
+static GUESSING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Whether a project guess is under way (for tests).
+pub fn guessing() -> bool {
+    !GUESSING.lock().unwrap().is_empty()
+}
+
+async fn project_guess(st: &HeadState, id: &str) -> anyhow::Result<()> {
+    let Some(r) = load(st, id).await? else { return Ok(()) };
+    if !r.fields.project.is_empty() || !settings(st, &r.realm).await.guess {
+        return Ok(());
+    }
+    let projects = crate::projects::active_in(st, &r.realm).await?;
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let fallback = latest_model(st, id).await;
+    let model = match model_for_route(st, &r.realm, crate::projects::ROUTE_LABEL, None).await? {
+        Some(m) => m,
+        None => match model_for_route(st, &r.realm, ROUTE_LABEL, fallback).await? {
+            Some(m) => m,
+            None => return Ok(()),
+        },
+    };
+    let mut work =
+        format!("{}\nDone when: {}", r.fields.title, if r.fields.done_when.is_empty() { "(not said)" } else { &r.fields.done_when });
+    let from: Vec<&str> =
+        r.fields.attached.iter().map(|a| if a.title.is_empty() { a.reference.as_str() } else { a.title.as_str() }).collect();
+    if !from.is_empty() {
+        work.push_str(&format!("\nMade from: {}", from.join("; ")));
+    }
+    let lines: Vec<String> = projects
+        .iter()
+        .map(|p| {
+            let phase = p.fields.phases.iter().find(|x| x.state == "current").map(|x| x.title.as_str()).unwrap_or("no phases");
+            format!("{}: {}: {}; {phase}", p.id, p.fields.title, p.fields.purpose.replace('\n', " "))
+        })
+        .collect();
+    let template = crate::prompts::get(st, "project.attach", &r.realm).await;
+    let text = api::prompts::fill(&template, &[("work", &work), ("projects", &lines.join("\n"))]);
+    let v = ask_as(st, &r.realm, model, "projects", "project guess", &r.fields.title, text).await?;
+    let Some(pid) = v["project"].as_str().filter(|p| projects.iter().any(|x| x.id == *p)) else { return Ok(()) };
+    // Someone put it somewhere meanwhile: theirs stands.
+    if load(st, id).await?.is_some_and(|r| r.fields.project.is_empty()) {
+        set_project(st, id, &r.realm, pid, "", "agent:project.attach").await?;
     }
     Ok(())
 }

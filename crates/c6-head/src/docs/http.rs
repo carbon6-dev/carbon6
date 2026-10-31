@@ -28,6 +28,9 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/{id}/exports/{export}/file", get(export_file))
         .route("/api/v1/docs/import", post(import))
         .route("/api/v1/docs/{id}/google", get(google).post(to_google))
+        .route("/api/v1/docs/{id}/files", post(add_file))
+        .route("/api/v1/docs/{id}/files/{blob}", get(file))
+        .route("/api/v1/docs/refs", post(refs))
         .route("/api/v1/docs/google/connect", post(google_connect))
         .route("/api/v1/docs/google/accounts", get(google_accounts))
         .route("/api/v1/docs/google/accounts/{account}", axum::routing::delete(google_remove))
@@ -202,6 +205,51 @@ async fn export_file(
     let disposition = format!("attachment; filename=\"{}\"", name.replace('"', ""));
     Ok(([(axum::http::header::CONTENT_TYPE, media.to_owned()), (axum::http::header::CONTENT_DISPOSITION, disposition)], bytes)
         .into_response())
+}
+
+async fn add_file(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(f): Json<api::docs::DocFileIn>,
+) -> ApiResult<Json<api::docs::DocFile>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::files::add(&st, &realm, &id, &f, &super::by_of(&caller)).await?))
+}
+
+async fn file(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, blob)): Path<(String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let realm = realm(&st, &caller, &r).await?;
+    let (name, mime, bytes) = super::files::get(&st, &realm, &id, &blob).await?;
+    // Pictures show in the page; anything else downloads. SVG files are
+    // downloaded too: the page draws diagrams itself, sanitized.
+    let shown = matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp");
+    let disposition = format!("{}; filename=\"{}\"", if shown { "inline" } else { "attachment" }, name.replace('"', ""));
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, if shown { mime } else { "application/octet-stream".into() }),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".into()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn refs(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(r): Query<api::InRealm>,
+    Json(q): Json<api::docs::RefsIn>,
+) -> ApiResult<Json<Vec<api::work::LiveAttached>>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::files::refs(&st, &realm, &q.refs).await?))
 }
 
 async fn google(

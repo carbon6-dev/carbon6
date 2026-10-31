@@ -133,6 +133,8 @@ pub fn WorkPage() -> impl IntoView {
     let adding = RwSignal::new(false);
     let (title, done_when) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
     let proposals = RwSignal::new(None::<Vec<WorkProposal>>);
+    // Projects found in your work (docs/projects.md §5).
+    let project_proposals = RwSignal::new(Vec::<c6_api::projects::ProjectProposal>::new());
     let finding = RwSignal::new(false);
     let col = use_column();
     let active = Signal::derive(move || col.as_ref().is_none_or(|c| c.active.get()));
@@ -196,8 +198,13 @@ pub fn WorkPage() -> impl IntoView {
         finding.set(true);
         error.set(None);
         spawn_local(async move {
-            match api::work_proposals().await {
+            let (work, found) = futures::join!(api::work_proposals(), api::project_proposals());
+            match work {
                 Ok(p) => proposals.set(Some(p)),
+                Err(e) => error.set(Some(e)),
+            }
+            match found {
+                Ok(p) => project_proposals.set(p),
                 Err(e) => error.set(Some(e)),
             }
             finding.set(false);
@@ -275,6 +282,7 @@ pub fn WorkPage() -> impl IntoView {
                 </div>
             })}
             {move || proposals.get().map(|ps| view! { <Proposals ps proposals reload=Callback::new(move |()| reload()) /> })}
+            <ProjectProposals left=project_proposals reload=Callback::new(move |()| reload()) />
             {move || match list.get() {
                 None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
@@ -375,6 +383,65 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
 }
 
 /// What an agent found in what's open: accept or skip each.
+/// Projects an agent found in your work: accept one (it is made with its
+/// work) or skip it.
+#[component]
+fn ProjectProposals(left: RwSignal<Vec<c6_api::projects::ProjectProposal>>, reload: Callback<()>) -> impl IntoView {
+    let error = RwSignal::new(None::<String>);
+    let ws = use_workspace();
+    let drop_at = move |i: usize| {
+        left.update(|l| {
+            if i < l.len() {
+                l.remove(i);
+            }
+        })
+    };
+    let accept = move |i: usize| {
+        let Some(p) = left.get_untracked().get(i).cloned() else { return };
+        spawn_local(async move {
+            let n = c6_api::projects::ProjectNew {
+                title: p.title,
+                purpose: p.purpose,
+                work: p.work.into_iter().map(|(id, _)| id).collect(),
+                plan: true,
+                ..Default::default()
+            };
+            match api::project_add(&n).await {
+                Ok(made) => {
+                    drop_at(i);
+                    reload.run(());
+                    ws.open(None, View::Projects { id: made.id }, How::Beside);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        {move || (!left.get().is_empty()).then(|| view! {
+            <section class="space-y-2 rounded-lg border border-violet-200 bg-violet-50/50 p-3 dark:border-violet-900 dark:bg-violet-950/20">
+                <div class="flex items-center gap-2">
+                    <h2 class="flex-1 text-sm font-medium">"Projects found in your work"</h2>
+                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| left.set(Vec::new())>"Close"</button>
+                </div>
+                {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                {move || left.get().into_iter().enumerate().map(|(i, p)| view! {
+                    <div class="space-y-1 rounded border border-violet-200 bg-white p-2 text-sm dark:border-violet-900 dark:bg-zinc-950">
+                        <div class="flex items-center gap-2">
+                            <span class="min-w-0 flex-1 font-medium">{p.title.clone()}</span>
+                            <button class=format!("{BUTTON} text-xs") on:click=move |_| accept(i)>"Make the project"</button>
+                            <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| drop_at(i)>"Skip"</button>
+                        </div>
+                        {(!p.purpose.is_empty()).then(|| view! { <p class="text-xs text-zinc-600 dark:text-zinc-400">{p.purpose.clone()}</p> })}
+                        <ul class="list-disc pl-5 text-xs text-zinc-500">
+                            {p.work.iter().map(|(_, t)| view! { <li>{t.clone()}</li> }).collect_view()}
+                        </ul>
+                    </div>
+                }).collect_view()}
+            </section>
+        })}
+    }
+}
+
 #[component]
 fn Proposals(ps: Vec<WorkProposal>, proposals: RwSignal<Option<Vec<WorkProposal>>>, reload: Callback<()>) -> impl IntoView {
     let left = RwSignal::new(ps);
@@ -879,6 +946,17 @@ fn ProjectPick(w: WorkItem, apply: Callback<Result<WorkItem, String>>) -> impl I
             {(!current.is_empty()).then(|| view! {
                 <crate::marks::ValueGlyph key=format!("project:{current}") />
                 <Go to=View::Projects { id: current.clone() } class="text-violet-700 hover:underline dark:text-violet-400">{w.project_title.clone()}</Go>
+            })}
+            {w.fields.project_guess.then(|| {
+                let keep = current.clone();
+                view! {
+                    <span class="text-xs text-zinc-400" title="An agent's guess (project.attach)">"guessed"</span>
+                    <button class="text-xs text-zinc-500 hover:underline" title="It belongs there"
+                        on:click=move |_| {
+                            let p = WorkPatch { project: Some(keep.clone()), ..Default::default() };
+                            spawn_local(async move { apply.run(api::work_patch(id.get_value(), p).await) });
+                        }>"keep"</button>
+                }
             })}
             <select class="max-w-48 cursor-pointer rounded bg-transparent px-1 text-xs text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
                 title="Move it into a project, or out (docs/projects.md)"

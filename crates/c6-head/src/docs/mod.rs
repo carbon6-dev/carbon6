@@ -12,6 +12,7 @@
 pub mod bring;
 pub mod comments;
 pub mod export;
+pub mod files;
 pub mod google;
 pub mod http;
 pub mod markdown;
@@ -444,6 +445,7 @@ pub async fn patch(st: &HeadState, realm: &str, id: &str, p: &DocPatch, by: &str
 
 /// Deletes a document (its history goes with it from view).
 pub async fn delete(st: &HeadState, realm: &str, id: &str, by: &str) -> anyhow::Result<()> {
+    let doc = get(st, realm, id).await?;
     let pool = pool(st, realm).await?;
     let n = sqlx::query("UPDATE docs SET deleted_at = ?, updated_by = ? WHERE id = ? AND deleted_at IS NULL")
         .bind(now_ms())
@@ -456,6 +458,7 @@ pub async fn delete(st: &HeadState, realm: &str, id: &str, by: &str) -> anyhow::
         return Err(not_found(format!("no document {id}")));
     }
     changed(st, realm, id, 0, by, "deleted");
+    unmirror(st, realm, &doc).await;
     Ok(())
 }
 
@@ -754,6 +757,17 @@ pub async fn history(st: &HeadState, realm: &str, id: &str, limit: u32) -> anyho
 /// `doc.changed` for triggers.
 fn changed(st: &HeadState, realm: &str, id: &str, rev: i64, by: &str, what: &str) {
     let _ = st.docs.live.send(DocChange { id: id.to_owned(), realm: realm.to_owned(), rev, by: by.to_owned(), what: what.to_owned() });
+    // A new document is found in search at once; later changes once they settle.
+    if what == "created"
+        && let Some(arc) = st.arc()
+    {
+        let (realm, id) = (realm.to_owned(), id.to_owned());
+        tokio::spawn(async move {
+            if let Ok(doc) = get(&arc, &realm, &id).await {
+                mirror(&arc, &realm, &doc).await;
+            }
+        });
+    }
     if what != "changed" || rev == 0 {
         return;
     }
@@ -811,9 +825,58 @@ async fn settled(st: &HeadState, realm: &str, id: &str, x: Settling) {
     let event = json!({"type": "doc", "op": "changed", "doc": event_doc(&doc.summary), "authors": x.authors,
                        "from_rev": x.from_rev, "rev": x.rev});
     crate::triggers::dispatch(st, realm, "doc", "changed", event).await;
+    mirror(st, realm, &doc).await;
     // Its projects moved (their plan, spec or notes changed).
     for p in crate::projects::holding_doc(st, realm, id).await {
         crate::projects::refresh(st, &p);
+    }
+}
+
+/// Where a document's tabs are mirrored in the memex.
+pub const MIRROR_SOURCE: &str = "docs";
+
+/// Mirrors a document in the realm's memex (docs/docs.md §9), so search,
+/// the Brief and agents find it: each tab an item of kind doc or deck,
+/// rewritten when a change settles, not on every op.
+async fn mirror(st: &HeadState, realm: &str, doc: &Doc) {
+    if !crate::memex::has_memex(realm) {
+        return;
+    }
+    let state = match pool(st, realm).await {
+        Ok(p) => match p.acquire().await {
+            Ok(mut c) => match load_head(&mut c, &doc.summary.id).await {
+                Ok((s, _)) => s,
+                Err(e) => return warn!(doc = %doc.summary.id, "mirroring: {e:#}"),
+            },
+            Err(e) => return warn!(doc = %doc.summary.id, "mirroring: {e:#}"),
+        },
+        Err(e) => return warn!(doc = %doc.summary.id, "mirroring: {e:#}"),
+    };
+    let several = doc.tabs.len() > 1;
+    for t in &doc.tabs {
+        let item = c6_api::MemexItemIn {
+            kind: doc.summary.kind.clone(),
+            source: MIRROR_SOURCE.into(),
+            external_id: format!("{}#{}", doc.summary.id, t.id),
+            title: if several { format!("{} — {}", doc.summary.title, t.title) } else { doc.summary.title.clone() },
+            text: export::tab_text(&state, &t.id),
+            created_at: Some(doc.summary.created_at),
+            labels: doc.summary.labels.clone(),
+            meta: json!({"doc": doc.summary.id, "tab": t.id, "rev": doc.summary.rev, "ref": format!("doc:{}", doc.summary.id)}),
+            ..Default::default()
+        };
+        crate::memex::enqueue(st, "memex.ingest", crate::memex::in_realm(json!(item), realm)).await;
+    }
+}
+
+/// Takes a document's tabs out of the memex.
+async fn unmirror(st: &HeadState, realm: &str, doc: &Doc) {
+    if !crate::memex::has_memex(realm) {
+        return;
+    }
+    for t in &doc.tabs {
+        let params = json!({"source": MIRROR_SOURCE, "external_id": format!("{}#{}", doc.summary.id, t.id)});
+        crate::memex::enqueue(st, "memex.delete", crate::memex::in_realm(params, realm)).await;
     }
 }
 

@@ -49,6 +49,9 @@ pub struct WorkFields {
     pub project: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub phase: String,
+    /// The project is an agent's guess (one click changes it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_guess: bool,
 }
 
 /// One step of a piece of work, to start as a session later.

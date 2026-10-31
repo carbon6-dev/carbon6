@@ -126,6 +126,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::PROJECT_PLAN,
     },
     Prompt {
+        name: "project.attach",
+        description: "Which active project a new piece of work belongs to, if any (docs/projects.md §5); runs when the realm has active projects and Settings → Work lets agents pick. Placeholders: {{work}}, {{projects}}.",
+        default: text::PROJECT_ATTACH,
+    },
+    Prompt {
+        name: "project.propose",
+        description: "Projects found in your work (Find work in what's open on the Work panel), for you to accept or skip (docs/projects.md §5). Placeholders: {{work}}, {{projects}}, {{labels}}.",
+        default: text::PROJECT_PROPOSE,
+    },
+    Prompt {
         name: "project.plan_phase",
         description: "The first message of a session planning a phase (Plan the next phase, docs/projects.md §7): it proposes the phase's work and brings the plan up to date. Placeholders: {{title}}, {{purpose}}, {{phase}}, {{done_when}}, {{target}}, {{phases}}, {{plan}}, {{docs}}, {{work}}.",
         default: text::PROJECT_PLAN_PHASE,

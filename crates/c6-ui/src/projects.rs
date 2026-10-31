@@ -572,10 +572,7 @@ fn PhaseGroup(
         adding.set(false);
         new_title.set(String::new());
         spawn_local(async move {
-            match api::work_add(t, String::new(), Vec::new()).await {
-                Ok(w) => apply.run(api::project_work(project.get_value(), w.id, phase.get_value()).await),
-                Err(e) => apply.run(Err(e)),
-            }
+            apply.run(api::project_new_work(project.get_value(), t, phase.get_value()).await);
         });
     };
     let real = !phase.get_value().is_empty();

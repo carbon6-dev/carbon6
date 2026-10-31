@@ -1382,6 +1382,16 @@ pub async fn doc_create(n: &c6_api::docs::DocNew) -> Result<c6_api::docs::Doc, S
     send_json(Request::post("/api/v1/docs"), n).await
 }
 
+/// A picture or file for a document's embed.
+pub async fn doc_add_file(id: String, f: &c6_api::docs::DocFileIn) -> Result<c6_api::docs::DocFile, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/files", enc(&id))), f).await
+}
+
+/// carbon6 things as they are now, for ref chips.
+pub async fn doc_refs(refs: Vec<String>) -> Result<Vec<c6_api::work::LiveAttached>, String> {
+    send_json(Request::post("/api/v1/docs/refs"), &c6_api::docs::RefsIn { refs }).await
+}
+
 pub async fn doc_ops(id: String, b: &c6_api::docs::DocBatch) -> Result<c6_api::docs::DocApplied, String> {
     send_json(Request::post(&format!("/api/v1/docs/{}/ops", enc(&id))), b).await
 }
@@ -1424,7 +1434,25 @@ pub async fn project_patch(id: String, p: &ProjectPatch) -> Result<ProjectItem, 
 }
 
 pub async fn project_work(id: String, work: String, phase: String) -> Result<ProjectItem, String> {
-    send_json(Request::post(&format!("/api/v1/projects/{}/work", enc(&id))), &c6_api::projects::ProjectWorkIn { work, phase }).await
+    send_json(
+        Request::post(&format!("/api/v1/projects/{}/work", enc(&id))),
+        &c6_api::projects::ProjectWorkIn { work, phase, title: String::new() },
+    )
+    .await
+}
+
+/// Projects an agent finds in your work.
+pub async fn project_proposals() -> Result<Vec<c6_api::projects::ProjectProposal>, String> {
+    json(Request::post("/api/v1/projects/propose").send().await).await
+}
+
+/// A new work item, made in a project (and a phase).
+pub async fn project_new_work(id: String, title: String, phase: String) -> Result<ProjectItem, String> {
+    send_json(
+        Request::post(&format!("/api/v1/projects/{}/work", enc(&id))),
+        &c6_api::projects::ProjectWorkIn { work: String::new(), phase, title },
+    )
+    .await
 }
 
 pub async fn project_detach(id: String, d: &c6_api::projects::ProjectDetach) -> Result<ProjectItem, String> {

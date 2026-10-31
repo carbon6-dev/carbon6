@@ -273,9 +273,14 @@ pub struct ProjectPatch {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectWorkIn {
+    /// A work item's id; empty with `title`: a new work item, made in the
+    /// project.
+    #[serde(default)]
     pub work: String,
     #[serde(default)]
     pub phase: String,
+    #[serde(default)]
+    pub title: String,
 }
 
 /// `POST /api/v1/projects/{id}/detach`: what leaves it (one of them).
@@ -353,6 +358,19 @@ pub struct ProposedIn {
     pub proposal: String,
     #[serde(default)]
     pub accept: bool,
+}
+
+/// A project an agent found in your work (Find work in what's open,
+/// docs/projects.md §5): yours to accept (`POST /api/v1/projects` with its
+/// title, purpose and work) or skip.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectProposal {
+    pub title: String,
+    #[serde(default)]
+    pub purpose: String,
+    /// The work in it: (id, title).
+    pub work: Vec<(String, String)>,
 }
 
 /// The order projects are listed in, by state: what needs you first.

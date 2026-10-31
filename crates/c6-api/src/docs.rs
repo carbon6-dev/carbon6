@@ -462,6 +462,42 @@ pub struct DocExportIn {
     pub format: String,
 }
 
+/// `POST /api/v1/docs/{id}/files`: a picture or file for an image or file
+/// embed (docs/docs.md §3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocFileIn {
+    pub name: String,
+    /// The file, in base64.
+    pub content: String,
+    /// Its media type (default: from the name).
+    #[serde(default)]
+    pub mime: String,
+}
+
+/// A document's picture or file: what an image or file embed names
+/// (`{"type": "image" | "file", "blob", "name", "mime", "size"}`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DocFile {
+    pub blob: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    /// Where it is served.
+    pub url: String,
+}
+
+/// `POST /api/v1/docs/refs`: carbon6 things as they are now, for ref
+/// chips (docs/docs.md §3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RefsIn {
+    /// session:, work:, project:, decision:, request:, doc: references, or
+    /// URLs.
+    pub refs: Vec<String>,
+}
+
 /// A document's Google file (docs/docs.md §10): where it was exported to
 /// last, as a Google Doc or Google Slides.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

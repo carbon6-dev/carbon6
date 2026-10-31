@@ -417,3 +417,119 @@ async fn phases_move_on_when_you_say_and_sessions_know_their_project() {
     assert_eq!(first, "Send the invites", "only what it was given");
     stop.cancel();
 }
+
+/// How work joins projects (docs/projects.md §5): a new work item gets an
+/// agent's project guess (shown as a guess until you keep it), only when
+/// the realm has active projects; and "Find work in what's open" also
+/// finds projects in your work.
+#[tokio::test]
+async fn new_work_finds_its_project_and_projects_are_found_in_work() {
+    use c6_testkit::{MockLlm, Reply, eventually};
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            (s, r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let ok = |(s, v): (StatusCode, Value)| {
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let get = |path: String| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.get(&url).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let conn = ok(send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await);
+    ok(send(
+        M::PUT,
+        "settings/routes".into(),
+        json!([{"name": "projects", "applies_to": ["task:projects"], "connection": conn["id"], "model": "small", "enabled": true}]),
+    )
+    .await);
+    const GUESS: &str = "decide which project it belongs to";
+    let asked = |m: &MockLlm| m.requests().iter().filter(|r| r["messages"].to_string().contains(GUESS)).count();
+
+    // No active project: no guess asked.
+    let w0 = ok(send(M::POST, "work".into(), json!({"title": "Tidy the garage"})).await);
+    eventually("no guess under way", async || (!c6_head::work::guessing()).then_some(())).await;
+    assert_eq!(asked(&mock), 0);
+    assert_eq!(get(format!("work/{}", w0["id"].as_str().unwrap())).await["project"], Value::Null);
+
+    // With one, a new work item gets the agent's guess, marked as one.
+    let p = ok(send(
+        M::POST,
+        "projects".into(),
+        json!({"title": "Realms for the team", "purpose": "The team uses realms daily", "plan": false}),
+    )
+    .await);
+    let pid = p["id"].as_str().unwrap().to_owned();
+    mock.push_about(GUESS, Reply::Text(json!({"project": pid}).to_string()));
+    let w = ok(send(M::POST, "work".into(), json!({"title": "Write the realm guide"})).await);
+    let wid = w["id"].as_str().unwrap().to_owned();
+    let w = eventually("its project guessed", async || {
+        let w = get(format!("work/{wid}")).await;
+        (w["project"] == pid.as_str()).then_some(w)
+    })
+    .await;
+    assert_eq!(w["project_guess"], true);
+    let asked_text = mock.requests().iter().map(|r| r["messages"].to_string()).find(|m| m.contains(GUESS)).unwrap();
+    assert!(asked_text.contains("Write the realm guide") && asked_text.contains(&format!("{pid}: Realms for the team")), "{asked_text}");
+    // You keep it: no longer a guess.
+    let w = ok(send(M::PATCH, format!("work/{wid}"), json!({"project": pid})).await);
+    assert!(w["project_guess"].is_null(), "{w}");
+    // Made in a project: no guess at all.
+    let before = asked(&mock);
+    ok(send(M::POST, format!("projects/{pid}/work"), json!({"title": "Invite the team"})).await);
+    eventually("no guess under way", async || (!c6_head::work::guessing()).then_some(())).await;
+    assert_eq!(asked(&mock), before);
+    // A guess naming no project of the realm changes nothing.
+    mock.push_about(GUESS, Reply::Text(json!({"project": "nope"}).to_string()));
+    let w2 = ok(send(M::POST, "work".into(), json!({"title": "Book the dentist"})).await);
+    eventually("the guess answered", async || (!c6_head::work::guessing()).then_some(())).await;
+    assert_eq!(get(format!("work/{}", w2["id"].as_str().unwrap())).await["project"], Value::Null);
+
+    // Projects found in work: only real work in no project, two or more.
+    let mut ids = Vec::new();
+    for t in ["Migrate the billing tables", "Backfill billing history", "Switch billing reads"] {
+        ids.push(ok(send(M::POST, "work".into(), json!({"title": t, "labels": ["billing"]})).await)["id"].as_str().unwrap().to_owned());
+    }
+    eventually("no guess under way", async || (!c6_head::work::guessing()).then_some(())).await;
+    const FIND: &str = "Find those groups";
+    mock.push_about(
+        FIND,
+        Reply::Text(
+            json!({"projects": [
+                {"title": "Billing migration", "purpose": "Billing runs on the new tables", "work": [ids[0], ids[1], ids[2], wid, "nope"]},
+                {"title": "Lonely", "purpose": "x", "work": [w0["id"]]}
+            ]})
+            .to_string(),
+        ),
+    );
+    let found = ok(send(M::POST, "projects/propose".into(), json!({})).await);
+    let asked_text = mock.requests().iter().map(|r| r["messages"].to_string()).find(|m| m.contains(FIND)).unwrap();
+    assert!(asked_text.contains("billing (3 pieces)") && !asked_text.contains("Write the realm guide"), "{asked_text}");
+    assert_eq!(found.as_array().unwrap().len(), 1, "one piece isn't a project: {found}");
+    assert_eq!(found[0]["title"], "Billing migration");
+    let names: Vec<&str> = found[0]["work"].as_array().unwrap().iter().map(|w| w[0].as_str().unwrap()).collect();
+    assert_eq!(names, [ids[0].as_str(), ids[1].as_str(), ids[2].as_str()], "only work in no project");
+    // You accept it: the project is made with its work.
+    let made =
+        ok(send(M::POST, "projects".into(), json!({"title": found[0]["title"], "purpose": found[0]["purpose"], "work": names})).await);
+    assert_eq!(made["work"].as_array().unwrap().len(), 3);
+}

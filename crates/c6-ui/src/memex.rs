@@ -20,8 +20,10 @@ extern "C" {
     async fn js_read_files(ev: &web_sys::Event) -> Result<JsValue, JsValue>;
 }
 
-const KINDS: [(&str, &str); 11] = [
+const KINDS: [(&str, &str); 13] = [
     ("session", "Sessions"),
+    ("doc", "Docs"),
+    ("deck", "Decks"),
     ("note", "Notes"),
     ("fact", "Facts"),
     ("web", "Web pages"),
@@ -39,7 +41,7 @@ fn kind_tone(kind: &str) -> &'static str {
         "session" => "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300",
         "note" => "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200",
         "web" => "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
-        "output" => "bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300",
+        "output" | "doc" | "deck" => "bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300",
         _ => "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
     }
 }
@@ -319,6 +321,8 @@ fn StatusLine(s: MemexStatus) -> impl IntoView {
 fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
     let id = h.id.clone();
     let session = (h.kind == "session" && h.source == "carbon6").then(|| h.external_id.clone());
+    // A document's tab (docs/docs.md §9): opens the document.
+    let doc = (h.source == "docs").then(|| h.external_id.split('#').next().unwrap_or_default().to_owned());
     view! {
         <div class="space-y-1 px-3 py-2">
             <div class="flex flex-wrap items-center gap-2">
@@ -328,6 +332,7 @@ fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
                 {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-zinc-400">{m.clone()}</span> }).collect_view()}
                 <span class="flex-1"></span>
                 {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session ↗"</Go> })}
+                {doc.map(|d| view! { <Go to=View::Docs { id: d } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document ↗"</Go> })}
                 {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page ↗"</a> })}
             </div>
             <p class="text-sm text-zinc-600 dark:text-zinc-400">{h.snippet.clone()}</p>

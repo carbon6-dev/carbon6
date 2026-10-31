@@ -65,29 +65,389 @@ pub fn DocsLink(class: &'static str) -> impl IntoView {
     view! { <Go to=View::Docs { id: String::new() } class=class title="Docs and decks: what people and agents write together">"Docs"</Go> }
 }
 
-/// Inline chips as text, for showing a block (docs/docs.md §3).
-pub fn chips_shown(text: &str, attrs: &Value) -> String {
+/// What chips and embeds in a document panel share: the document, the
+/// things its ref chips name as they are now, and the chip being changed
+/// (its block, key and value).
+#[derive(Clone, Copy)]
+struct ChipCtx {
+    doc: StoredValue<String>,
+    refs: RwSignal<std::collections::HashMap<String, c6_api::work::LiveAttached>>,
+    editing: RwSignal<Option<(String, String, Value)>>,
+    send: StoredValue<Box<dyn Fn(Vec<DocOp>) + Send + Sync>>,
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+/// A block's Markdown as HTML with its chips as small widgets (docs/docs.md
+/// §3): a date and a dropdown you click to change, a mention, and a ref
+/// with the thing's title and state as they are now.
+fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String, c6_api::work::LiveAttached>) -> String {
     let chips = attrs.get("chips").and_then(Value::as_object);
-    let mut out = String::with_capacity(text.len());
+    let mut md = String::with_capacity(text.len());
+    let mut shown = Vec::new();
     let mut rest = text;
     while let Some(i) = rest.find("<?c6 block ") {
         let after = &rest[i + 11..];
         let Some(j) = after.find("?>") else { break };
         let key = after[..j].trim();
-        out.push_str(&rest[..i]);
+        md.push_str(&rest[..i]);
         let v = chips.and_then(|c| c.get(key)).cloned().unwrap_or(Value::Null);
         let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
-        out.push_str(&match v["type"].as_str().unwrap_or("") {
-            "date" => format!("📅 {}", s("value")),
-            "mention" => format!("@{}", if s("name").is_empty() { s("user") } else { s("name") }),
-            "dropdown" => format!("▾ {}", s("value")),
-            "ref" => format!("↗ {}", if s("title").is_empty() { s("ref") } else { s("title") }),
-            _ => format!("[{key}]"),
-        });
+        const CHIP: &str = "mx-0.5 rounded px-1 py-px text-[0.92em]";
+        let html = match v["type"].as_str().unwrap_or("") {
+            "date" => format!(
+                "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">📅 {}</button>",
+                esc(key),
+                esc(&s("value"))
+            ),
+            "mention" => format!(
+                "<span class=\"{CHIP} bg-violet-50 text-violet-800 dark:bg-violet-950/40 dark:text-violet-300\">@{}</span>",
+                esc(&if s("name").is_empty() { s("user") } else { s("name") })
+            ),
+            "dropdown" => format!(
+                "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} ▾</button>",
+                esc(key),
+                esc(&s("value"))
+            ),
+            "ref" => {
+                let r = s("ref");
+                let live = refs.get(&r);
+                let title = live
+                    .map(|l| l.title.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| if s("title").is_empty() { r.clone() } else { s("title") });
+                let state = live.map(|l| l.state.clone()).unwrap_or_default();
+                format!(
+                    "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">↗ {}{}</button>",
+                    esc(&r),
+                    esc(&r),
+                    esc(&title),
+                    if state.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" <span class=\"text-[10px] uppercase tracking-wide opacity-70\">{}</span>", esc(&state.replace('_', " ")))
+                    }
+                )
+            }
+            _ => format!("[{}]", esc(key)),
+        };
+        md.push_str(&format!("\u{E000}{}\u{E001}", shown.len()));
+        shown.push(html);
         rest = &after[j + 2..];
     }
-    out.push_str(rest);
+    md.push_str(rest);
+    let mut html = crate::markdown::to_html(&md);
+    for (i, h) in shown.iter().enumerate() {
+        html = html.replace(&format!("\u{E000}{i}\u{E001}"), h);
+    }
+    html
+}
+
+/// The ref chips' references in a document.
+fn ref_chips(d: &Doc) -> Vec<String> {
+    fn walk(b: &DocBlock, out: &mut Vec<String>) {
+        for v in b.attrs.get("chips").and_then(Value::as_object).into_iter().flat_map(|c| c.values()) {
+            if v["type"] == "ref"
+                && let Some(r) = v["ref"].as_str()
+                && !out.iter().any(|x| x == r)
+            {
+                out.push(r.to_owned());
+            }
+        }
+        for c in &b.children {
+            walk(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    for t in &d.tabs {
+        for b in &t.blocks {
+            walk(b, &mut out);
+        }
+    }
     out
+}
+
+/// Where a ref chip's thing opens.
+fn ref_path(r: &str) -> Option<String> {
+    let (kind, id) = r.split_once(':')?;
+    Some(match kind {
+        "session" => format!("/sessions/{id}"),
+        "work" => format!("/work/{id}"),
+        "project" => format!("/projects/{id}"),
+        "doc" => format!("/docs/{id}"),
+        "decision" => "/decisions".to_owned(),
+        _ => return None,
+    })
+}
+
+/// A chip or ref clicked in a block: handled here (and the block isn't
+/// opened for editing).
+fn chip_clicked(
+    ev: &web_sys::MouseEvent,
+    block: &DocBlock,
+    ctx: ChipCtx,
+    col: Option<crate::workspace::ColumnCtx>,
+    ws: crate::workspace::Workspace,
+) -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(el) =
+        ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()).and_then(|e| e.closest("[data-chip],[data-ref]").ok().flatten())
+    else {
+        return false;
+    };
+    ev.prevent_default();
+    ev.stop_propagation();
+    if let Some(r) = el.get_attribute("data-ref") {
+        if r.starts_with("http://") || r.starts_with("https://") {
+            let _ = window().open_with_url_and_target(&r, "_blank");
+        } else if let Some(path) = ref_path(&r) {
+            let to = View::from_path(&path);
+            match col {
+                Some(c) => c.open(to, How::Beside),
+                None => ws.open(None, to, How::Beside),
+            }
+        }
+        return true;
+    }
+    let key = el.get_attribute("data-chip").unwrap_or_default();
+    fn find(b: &DocBlock, key: &str) -> Option<(String, Value)> {
+        if let Some(v) = b.attrs.get("chips").and_then(|c| c.get(key)) {
+            return Some((b.id.clone(), v.clone()));
+        }
+        b.children.iter().find_map(|c| find(c, key))
+    }
+    if let Some((b, v)) = find(block, &key) {
+        ctx.editing.set(Some((b, key, v)));
+    }
+    true
+}
+
+/// Changing a date or picking a dropdown's option.
+#[component]
+fn ChipEditor(block: String, key: String, value: Value, ctx: ChipCtx) -> impl IntoView {
+    let current = RwSignal::new(value["value"].as_str().unwrap_or("").to_owned());
+    let kind = value["type"].as_str().unwrap_or("").to_owned();
+    let options: Vec<String> = value["options"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    let (b, k, v) = (StoredValue::new(block), StoredValue::new(key), StoredValue::new(value));
+    let save = move |to: String| {
+        let mut nv = v.get_value();
+        nv["value"] = Value::String(to);
+        let op = DocOp::Set {
+            title: None,
+            theme: None,
+            size: None,
+            tab: None,
+            tab_title: None,
+            tabs: None,
+            block: Some(b.get_value()),
+            chip: Some(k.get_value()),
+            value: Some(nv),
+        };
+        ctx.editing.set(None);
+        ctx.send.with_value(|f| f(vec![op]));
+    };
+    view! {
+        <div class="my-1 flex flex-wrap items-center gap-2 rounded border border-zinc-200 bg-white p-2 text-sm shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
+            on:click=|ev| ev.stop_propagation()>
+            {if kind == "dropdown" {
+                options.into_iter().map(|o| {
+                    let picked = o == current.get_untracked();
+                    let o2 = o.clone();
+                    view! {
+                        <button class=format!("rounded px-2 py-0.5 {}", if picked { "bg-violet-600 text-white" } else { "bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800" })
+                            on:click=move |_| save(o2.clone())>{o}</button>
+                    }
+                }).collect_view().into_any()
+            } else if kind == "date" {
+                view! {
+                    <input type="date" class=format!("{INPUT} w-auto!") prop:value=move || current.get() on:input=move |ev| current.set(event_target_value(&ev)) />
+                    <button class=format!("{BUTTON} text-xs") on:click=move |_| save(current.get_untracked())>"Set"</button>
+                }.into_any()
+            } else {
+                view! {
+                    <input class=format!("{INPUT} w-auto!") prop:value=move || current.get() on:input=move |ev| current.set(event_target_value(&ev)) />
+                    <button class=format!("{BUTTON} text-xs") on:click=move |_| save(current.get_untracked())>"Set"</button>
+                }.into_any()
+            }}
+            <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| ctx.editing.set(None)>"Cancel"</button>
+        </div>
+    }
+}
+
+/// An embed (docs/docs.md §3): a picture, a file, a diagram, a chart drawn
+/// from its rows, or a live view of the realm.
+#[component]
+fn Embed(v: Value) -> impl IntoView {
+    let ctx = use_context::<ChipCtx>();
+    let doc = ctx.map(|c| c.doc.get_value()).unwrap_or_default();
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+    let file_url = |blob: &str| api::url(&format!("/api/v1/docs/{}/files/{}", api::enc(&doc), api::enc(blob)));
+    match v["type"].as_str().unwrap_or("") {
+        "image" => view! {
+            <figure class="my-2">
+                <img src=file_url(&s("blob")) alt=if s("alt").is_empty() { s("name") } else { s("alt") } class="max-h-[32rem] max-w-full rounded border border-zinc-200 dark:border-zinc-800" />
+                {(!s("caption").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("caption")}</figcaption> })}
+            </figure>
+        }.into_any(),
+        "file" => view! {
+            <a href=file_url(&s("blob")) class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
+                on:click=|ev| ev.stop_propagation()>
+                "📎 " {s("name")}
+                <span class="text-xs text-zinc-500">{v["size"].as_u64().map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
+            </a>
+        }.into_any(),
+        // An agent's SVG, drawn as a picture: it can't run or restyle the page.
+        "diagram" => {
+            let svg = s("svg");
+            let src = format!("data:image/svg+xml;base64,{}", base64_of(svg.as_bytes()));
+            view! {
+                <figure class="my-2">
+                    <img src=src alt=s("title") class="max-w-full" />
+                    {(!s("title").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("title")}</figcaption> })}
+                </figure>
+            }.into_any()
+        }
+        "chart" => view! { <Chart v=v.clone() /> }.into_any(),
+        "view" => view! { <EmbedView name=s("view") /> }.into_any(),
+        other => view! {
+            <div class="rounded border border-zinc-200 px-3 py-2 text-sm text-zinc-500 dark:border-zinc-800">{format!("{other} (not shown here)")}</div>
+        }.into_any(),
+    }
+}
+
+const SERIES: [&str; 6] = ["#7c3aed", "#0284c7", "#059669", "#d97706", "#db2777", "#475569"];
+
+/// A chart drawn from the rows the document keeps: {chart: bar or line,
+/// title, columns: [label, series…], rows: [[label, value…]]}. Hover a
+/// value to read it; "Data" shows the rows.
+#[component]
+fn Chart(v: Value) -> impl IntoView {
+    let kind = v["chart"].as_str().unwrap_or("bar").to_owned();
+    let title = v["title"].as_str().unwrap_or("").to_owned();
+    let columns: Vec<String> = v["columns"].as_array().into_iter().flatten().map(|c| c.as_str().unwrap_or("").to_owned()).collect();
+    let rows: Vec<Vec<Value>> = v["rows"].as_array().into_iter().flatten().filter_map(|r| r.as_array().cloned()).collect();
+    let num = |x: &Value| x.as_f64().or_else(|| x.as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(0.0);
+    let series = columns.len().saturating_sub(1).max(rows.first().map(|r| r.len().saturating_sub(1)).unwrap_or(0));
+    let values: Vec<f64> = rows.iter().flat_map(|r| r.iter().skip(1).map(num)).collect();
+    let max = values.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
+    let min = values.iter().cloned().fold(0.0_f64, f64::min);
+    let (w, h, left, bottom, top) = (640.0, 260.0, 44.0, 28.0, 10.0);
+    let plot_h = h - bottom - top;
+    let y = move |val: f64| top + plot_h * (1.0 - (val - min) / (max - min));
+    let n = rows.len().max(1) as f64;
+    let band = (w - left - 8.0) / n;
+    let mut marks = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let label = r.first().map(|l| l.as_str().map(str::to_owned).unwrap_or_else(|| l.to_string())).unwrap_or_default();
+        let x0 = left + band * i as f64;
+        marks.push(format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" text-anchor=\"middle\" fill=\"currentColor\" opacity=\"0.7\">{}</text>",
+            x0 + band / 2.0,
+            h - 10.0,
+            esc(&label)
+        ));
+        if kind != "line" {
+            let bw = (band * 0.8) / series.max(1) as f64;
+            for k in 0..series {
+                let val = r.get(k + 1).map(num).unwrap_or(0.0);
+                let (yv, y0) = (y(val), y(0.0));
+                let name = columns.get(k + 1).cloned().unwrap_or_default();
+                marks.push(format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{}\" rx=\"2\"><title>{}{}: {}</title></rect>",
+                    x0 + band * 0.1 + bw * k as f64,
+                    yv.min(y0),
+                    (bw - 2.0).max(1.0),
+                    (y0 - yv).abs().max(0.5),
+                    SERIES[k % SERIES.len()],
+                    esc(&label),
+                    if name.is_empty() { String::new() } else { format!(" · {}", esc(&name)) },
+                    val
+                ));
+            }
+        }
+    }
+    if kind == "line" {
+        for k in 0..series {
+            let pts: Vec<(f64, f64, f64)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let val = r.get(k + 1).map(num).unwrap_or(0.0);
+                    (left + band * i as f64 + band / 2.0, y(val), val)
+                })
+                .collect();
+            let path = pts.iter().map(|(x, y, _)| format!("{x:.1},{y:.1}")).collect::<Vec<_>>().join(" ");
+            marks.push(format!("<polyline points=\"{path}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2\" />", SERIES[k % SERIES.len()]));
+            for (i, (x, yv, val)) in pts.iter().enumerate() {
+                let label = rows[i].first().map(|l| l.as_str().map(str::to_owned).unwrap_or_else(|| l.to_string())).unwrap_or_default();
+                marks.push(format!(
+                    "<circle cx=\"{x:.1}\" cy=\"{yv:.1}\" r=\"3.5\" fill=\"{}\"><title>{}: {val}</title></circle>",
+                    SERIES[k % SERIES.len()],
+                    esc(&label)
+                ));
+            }
+        }
+    }
+    // The axis: zero, and the top value.
+    marks.push(format!(
+        "<line x1=\"{left}\" x2=\"{:.1}\" y1=\"{:.1}\" y2=\"{:.1}\" stroke=\"currentColor\" opacity=\"0.3\" />",
+        w - 8.0,
+        y(0.0),
+        y(0.0)
+    ));
+    for val in [max, min].into_iter().filter(|v| *v != 0.0).chain([0.0]) {
+        marks.push(format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" text-anchor=\"end\" fill=\"currentColor\" opacity=\"0.6\">{}</text>",
+            left - 6.0,
+            y(val) + 4.0,
+            if val.fract() == 0.0 { format!("{val:.0}") } else { format!("{val:.1}") }
+        ));
+    }
+    let svg = format!("<svg viewBox=\"0 0 {w} {h}\" class=\"w-full\" role=\"img\">{}</svg>", marks.join(""));
+    let data = RwSignal::new(false);
+    let legend: Vec<String> = columns.iter().skip(1).cloned().collect();
+    view! {
+        <figure class="my-2 rounded border border-zinc-200 p-2 dark:border-zinc-800" on:click=|ev| ev.stop_propagation()>
+            <div class="flex items-center gap-2 text-sm">
+                <span class="flex-1 font-medium">{title}</span>
+                {legend.iter().enumerate().map(|(k, l)| view! {
+                    <span class="flex items-center gap-1 text-xs text-zinc-500"><span class="inline-block size-2 rounded-sm" style=format!("background:{}", SERIES[k % SERIES.len()])></span>{l.clone()}</span>
+                }).collect_view()}
+                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| data.update(|d| *d = !*d)>"Data"</button>
+            </div>
+            <div class="text-zinc-700 dark:text-zinc-300" inner_html=svg></div>
+            {move || data.get().then(|| view! {
+                <table class="mt-1 w-full text-xs">
+                    <thead><tr>{columns.iter().map(|c| view! { <th class="px-1 text-left font-medium">{c.clone()}</th> }).collect_view()}</tr></thead>
+                    <tbody>{rows.iter().map(|r| view! {
+                        <tr>{r.iter().map(|c| view! { <td class="px-1">{c.as_str().map(str::to_owned).unwrap_or_else(|| c.to_string())}</td> }).collect_view()}</tr>
+                    }).collect_view()}</tbody>
+                </table>
+            })}
+        </figure>
+    }
+}
+
+/// A view of the realm, live, inside a doc (docs/os.md §4.5).
+#[component]
+fn EmbedView(name: String) -> impl IntoView {
+    let views = LocalResource::new(api::views);
+    view! {
+        <div class="my-2 rounded border border-zinc-200 p-2 dark:border-zinc-800" on:click=|ev| ev.stop_propagation()>
+            {move || views.get().map(|r| match r {
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                Ok(all) => match all.iter().find(|v| v.name == name).cloned() {
+                    None => view! { <p class="text-sm text-zinc-500">{format!("No view {name} in this realm.")}</p> }.into_any(),
+                    Some(v) => view! {
+                        <div class="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{if v.title.is_empty() { v.name.clone() } else { v.title.clone() }}</div>
+                        <crate::views::ViewBody view=v all=all />
+                    }.into_any(),
+                },
+            })}
+        </div>
+    }
 }
 
 // --- The list ---------------------------------------------------------------
@@ -293,6 +653,65 @@ pub fn DocPage(id: String) -> impl IntoView {
         });
     };
     let send = StoredValue::new(send);
+    // Chips and embeds: ref chips' things as they are now, the chip being
+    // changed, and a way to send its change.
+    let chip_ctx = ChipCtx {
+        doc: id,
+        refs: RwSignal::new(Default::default()),
+        editing: RwSignal::new(None),
+        send: StoredValue::new(Box::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops)))),
+    };
+    provide_context(chip_ctx);
+    Effect::new(move || {
+        let Some(Ok(d)) = doc.get() else { return };
+        let refs = ref_chips(&d);
+        if refs.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            if let Ok(live) = api::doc_refs(refs).await {
+                chip_ctx.refs.try_set(live.into_iter().map(|l| (l.reference.clone(), l)).collect());
+            }
+        });
+    });
+    let attaching = RwSignal::new(false);
+    let attach_file = move |ev: leptos::ev::Event| {
+        use wasm_bindgen::JsCast;
+        let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
+        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
+        let (name, mime) = (file.name(), file.type_());
+        attaching.set(true);
+        spawn_local(async move {
+            let result = async {
+                let buf =
+                    wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await.map_err(|_| "could not read the file".to_owned())?;
+                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                let f = api::doc_add_file(id.get_value(), &c6_api::docs::DocFileIn { name, content: base64_of(&bytes), mime }).await?;
+                let kind = if f.mime.starts_with("image/") && f.mime != "image/svg+xml" { "image" } else { "file" };
+                let mut blocks = Map::new();
+                blocks
+                    .insert("f".into(), serde_json::json!({"type": kind, "blob": f.blob, "name": f.name, "mime": f.mime, "size": f.size}));
+                let t = tab.get_untracked();
+                let op = DocOp::Insert {
+                    markdown: "<?c6 block f?>".into(),
+                    blocks,
+                    before: None,
+                    after: None,
+                    section: None,
+                    slide: None,
+                    region: None,
+                    tab: (!t.is_empty()).then_some(t),
+                };
+                api::doc_ops(id.get_value(), &DocBatch { ops: vec![op], answering: String::new() }).await.map(drop)
+            }
+            .await;
+            attaching.set(false);
+            match result {
+                Ok(()) => reload(),
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
     let used_in = LocalResource::new(move || {
         tick.track();
         api::work_of(format!("doc:{}", id.get_value()))
@@ -419,7 +838,11 @@ pub fn DocPage(id: String) -> impl IntoView {
                                 placeholder=if s.kind == "deck" { "Add slides in Markdown (--- between slides)…" } else { "Add to the end in Markdown…" }
                                 prop:value=move || adding.get() on:input=move |ev| adding.set(event_target_value(&ev))
                                 on:keydown=move |ev| if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { add_block() } />
-                            <div class="flex justify-end">
+                            <div class="flex items-center justify-end gap-2">
+                                <label class=format!("{BUTTON_QUIET} cursor-pointer text-xs") title="A picture shows in the doc; any other file is a link to download">
+                                    {move || if attaching.get() { "Adding…" } else { "+ Picture or file" }}
+                                    <input type="file" class="hidden" on:change=attach_file />
+                                </label>
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_block()>"Add (⌘↵)"</button>
                             </div>
                         </div>
@@ -561,6 +984,8 @@ fn BlockView(
     let bid = StoredValue::new(b.id.clone());
     let block = StoredValue::new(b.clone());
     let hover = format!("{} · last written by {} (version {})", b.kind, author_named(&b.by), b.rev);
+    let chip_ctx = use_context::<ChipCtx>();
+    let (col, ws) = (use_column(), use_workspace());
     let is_editing = move || edit.with(|e| e.as_ref().is_some_and(|e| e.id == bid.get_value()));
     let begin = move |text: String| {
         let b = block.get_value();
@@ -628,9 +1053,17 @@ fn BlockView(
                 }
                 None => {
                     let b = block.get_value();
-                    view! { <div on:click=move |_| start() class="cursor-text"><Shown b=b kind=kind.clone() /></div> }.into_any()
+                    view! {
+                        <div class="cursor-text" on:click=move |ev| {
+                            if let Some(c) = chip_ctx && chip_clicked(&ev, &block.get_value(), c, col, ws) { return; }
+                            start()
+                        }><Shown b=b kind=kind.clone() /></div>
+                    }.into_any()
                 }
             }}
+            {move || chip_ctx.and_then(|c| c.editing.get().filter(|(b, _, _)| *b == bid.get_value() || block.get_value().children.iter().any(|x| x.id == *b)).map(|(b, k, v)| view! {
+                <ChipEditor block=b key=k value=v ctx=c />
+            }))}
             <button class="invisible absolute -right-6 top-0.5 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
                 on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
         </div>
@@ -658,21 +1091,26 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
             view! {
                 <div class=format!("my-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800 {}", if hidden { "opacity-50" } else { "" })>
                     <div class="mb-1 text-[11px] uppercase tracking-wide text-zinc-400">{format!("slide · {layout}{}", if hidden { " · hidden" } else { "" })}</div>
-                    {b.children.iter().map(|c| view! { <div class="md" inner_html=crate::markdown::to_html(&chips_shown(&c.text, &c.attrs))></div> }).collect_view()}
+                    {b.children.iter().map(|c| {
+                        let refs = use_context::<ChipCtx>().map(|c| c.refs);
+                        let c = c.clone();
+                        if c.kind == "embed" {
+                            view! { <Embed v=c.attrs.clone() /> }.into_any()
+                        } else {
+                            view! { <div class="md" inner_html=move || chips_html(&c.text, &c.attrs, &refs.map(|r| r.get()).unwrap_or_default())></div> }.into_any()
+                        }
+                    }).collect_view()}
                     {(!notes.is_empty()).then(|| view! { <p class="mt-2 border-t border-zinc-100 pt-1 text-xs text-zinc-500 dark:border-zinc-900">{format!("Notes: {notes}")}</p> })}
                 </div>
             }
             .into_any()
         }
-        "embed" => view! {
-            <div class="rounded border border-zinc-200 px-3 py-2 text-sm text-zinc-500 dark:border-zinc-800">
-                {format!("{} (shown in a later step)", b.attrs["type"].as_str().unwrap_or("embed"))}
-            </div>
-        }
-        .into_any(),
+        "embed" => view! { <Embed v=b.attrs.clone() /> }.into_any(),
         _ => {
             let _ = kind;
-            view! { <div class="md" inner_html=crate::markdown::to_html(&chips_shown(&b.text, &b.attrs))></div> }.into_any()
+            let refs = use_context::<ChipCtx>().map(|c| c.refs);
+            view! { <div class="md" inner_html=move || chips_html(&b.text, &b.attrs, &refs.map(|r| r.get()).unwrap_or_default())></div> }
+                .into_any()
         }
     }
 }

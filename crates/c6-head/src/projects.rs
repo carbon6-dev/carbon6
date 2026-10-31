@@ -230,7 +230,7 @@ pub async fn create(st: &HeadState, caller: &Caller, n: &ProjectNew, by: &str) -
     }
     let id = insert(st, &realm, &f, &labels, by).await?;
     for w in &n.work {
-        add_work(st, &id, &ProjectWorkIn { work: w.clone(), phase: String::new() }, caller, by).await?;
+        add_work(st, &id, &ProjectWorkIn { work: w.clone(), ..Default::default() }, caller, by).await?;
     }
     get(st, &id, caller).await
 }
@@ -290,7 +290,12 @@ pub async fn add_work(st: &HeadState, id: &str, w: &ProjectWorkIn, caller: &Call
     if !phase.is_empty() && !p.fields.phases.iter().any(|x| x.id == phase) {
         return Err(bad_request(format!("the project has no phase {phase}")));
     }
-    crate::work::set_project(st, &w.work, &p.realm, id, phase, by).await?;
+    if w.work.trim().is_empty() {
+        let n = api::work::WorkNew { title: w.title.clone(), ..Default::default() };
+        crate::work::create_in_project(st, caller, &n, id, phase, by).await?;
+    } else {
+        crate::work::set_project(st, &w.work, &p.realm, id, phase, by).await?;
+    }
     get(st, id, caller).await
 }
 
@@ -445,6 +450,83 @@ pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork], docs: &[LiveDoc]
         return r("quiet", "Its open work has all gone quiet".to_owned());
     }
     r("on_track", if open.len() == 1 { "1 piece of work open".to_owned() } else { format!("{} pieces of work open", open.len()) })
+}
+
+/// Finds projects in your work, by `project.propose`: groups of open and
+/// recently closed work in no project (labels that already group them
+/// count), for you to accept or skip.
+pub async fn find(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::projects::ProjectProposal>> {
+    let realm = caller.realm_for_new(None)?;
+    let since = now_ms() - 30 * 24 * 3600 * 1000;
+    let mut items = crate::work::list(st, caller, false).await?;
+    items.extend(crate::work::list(st, caller, true).await?.into_iter().filter(|w| w.fields.closed_at.is_some_and(|c| c > since)));
+    items.retain(|w| w.realm == realm && w.fields.project.is_empty());
+    if items.len() < 3 {
+        return Ok(Vec::new());
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for w in &items {
+        for l in &w.labels {
+            *counts.entry(l.as_str()).or_default() += 1;
+        }
+    }
+    let labels: Vec<String> = counts.iter().filter(|(_, n)| **n >= 2).map(|(l, n)| format!("- {l} ({n} pieces)")).collect();
+    let work: Vec<String> = items
+        .iter()
+        .take(150)
+        .map(|w| format!("{}: {} [{}] {}", w.id, w.fields.title, api::work::state_label(&w.state), w.labels.join(", ")))
+        .collect();
+    let have: Vec<String> = rows(st, Some(&realm), false)
+        .await?
+        .iter()
+        .map(|p| format!("- {}: {}", p.fields.title, p.fields.purpose.replace('\n', " ")))
+        .collect();
+    let mut fallback = None;
+    for w in &items {
+        if let Some(m) = crate::work::latest_model(st, &w.id).await {
+            fallback = Some(m);
+            break;
+        }
+    }
+    let model = match crate::work::model_for_route(st, &realm, ROUTE_LABEL, None).await? {
+        Some(m) => m,
+        None => crate::work::model_for_route(st, &realm, crate::work::ROUTE_LABEL, fallback)
+            .await?
+            .ok_or_else(|| bad_request("no model to ask: start a session first, or add a routing rule for task:projects"))?,
+    };
+    let template = crate::prompts::get(st, "project.propose", &realm).await;
+    let none = |v: &[String]| if v.is_empty() { "(none)".to_owned() } else { v.join("\n") };
+    let prompt = api::prompts::fill(&template, &[("work", &work.join("\n")), ("projects", &none(&have)), ("labels", &none(&labels))]);
+    let v = crate::work::ask_as(st, &realm, model, "projects", "projects in what's open", "what's open", prompt)
+        .await
+        .map_err(|e| bad_request(format!("the model couldn't find projects: {e:#}")))?;
+    let titles: std::collections::HashMap<&str, &str> = items.iter().map(|w| (w.id.as_str(), w.fields.title.as_str())).collect();
+    let mut used = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for p in v["projects"].as_array().into_iter().flatten().take(5) {
+        let title: String = p["title"].as_str().unwrap_or("").trim().chars().take(MAX_TITLE).collect();
+        let work: Vec<(String, String)> = p["work"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|id| titles.contains_key(id) && used.insert(id.to_string()))
+            .map(|id| (id.to_owned(), titles[id].to_owned()))
+            .collect();
+        if !title.is_empty() && work.len() >= 2 {
+            out.push(api::projects::ProjectProposal {
+                title,
+                purpose: p["purpose"].as_str().unwrap_or("").trim().chars().take(MAX_PURPOSE).collect(),
+                work,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A realm's active projects.
+pub(crate) async fn active_in(st: &HeadState, realm: &str) -> anyhow::Result<Vec<Stored>> {
+    Ok(rows(st, Some(realm), false).await?.into_iter().filter(|r| r.fields.status == "active").collect())
 }
 
 /// Today, in the head's time zone, as YYYY-MM-DD.
@@ -723,8 +805,7 @@ pub async fn plan(
         );
         (format!("Plan {}", ph.title), ph.id.clone(), text)
     };
-    let w = crate::work::create(st, caller, &api::work::WorkNew { title, ..Default::default() }, by).await?;
-    crate::work::set_project(st, &w.id, &item.realm, id, &phase, by).await?;
+    let w = crate::work::create_in_project(st, caller, &api::work::WorkNew { title, ..Default::default() }, id, &phase, by).await?;
     let seed = latest_session(st, id).await?;
     Ok(api::projects::ProjectStart { work: w.id, text, seed })
 }
@@ -773,15 +854,9 @@ pub async fn proposed(st: &HeadState, id: &str, q: &api::projects::ProposedIn, c
     let one =
         p.fields.proposed.iter().find(|x| x.id == q.proposal).cloned().ok_or_else(|| not_found(format!("no proposal {}", q.proposal)))?;
     if q.accept {
-        let w = crate::work::create(
-            st,
-            caller,
-            &api::work::WorkNew { title: one.title.clone(), done_when: one.done_when.clone(), ..Default::default() },
-            by,
-        )
-        .await?;
         let phase = if p.fields.phases.iter().any(|x| x.id == one.phase) { one.phase.as_str() } else { "" };
-        crate::work::set_project(st, &w.id, &p.realm, id, phase, by).await?;
+        let n = api::work::WorkNew { title: one.title.clone(), done_when: one.done_when.clone(), ..Default::default() };
+        crate::work::create_in_project(st, caller, &n, id, phase, by).await?;
     }
     modify(st, id, by, None, |f| {
         f.proposed.retain(|x| x.id != one.id);
@@ -1129,6 +1204,14 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/projects/{id}/phases", post(phases_project))
         .route("/api/v1/projects/{id}/plan", post(plan_project))
         .route("/api/v1/projects/{id}/proposed", post(proposed_project))
+        .route("/api/v1/projects/propose", post(propose_projects))
+}
+
+async fn propose_projects(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<Vec<api::projects::ProjectProposal>>> {
+    Ok(Json(find(&st, &caller).await?))
 }
 
 async fn phases_project(

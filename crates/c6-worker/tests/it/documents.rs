@@ -921,3 +921,113 @@ async fn comments_go_to_the_agent_that_wrote_the_part() {
     assert_eq!((t2["detached"].as_bool(), t2["about"].as_str()), (Some(true), Some("“We charge $12 per seat a month.”")));
     stop.cancel();
 }
+
+/// Chips, embeds and search (docs/docs.md §3, §9): a document's tabs are
+/// found in the memex once a change settles (and gone when it's deleted),
+/// pictures are kept for the document that holds them, chips change with
+/// `set`, and ref chips read things as they are now.
+#[tokio::test]
+async fn documents_are_found_in_search_and_hold_pictures_and_live_refs() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            (s, r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let ok = |(s, v): (StatusCode, Value)| {
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let get = |path: String| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.get(&url).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let work = ok(send(M::POST, "work".into(), json!({"title": "Ship the zebrafish release"})).await);
+    let wid = work["id"].as_str().unwrap().to_owned();
+    let doc = ok(send(
+        M::POST,
+        "docs".into(),
+        json!({"title": "Quokka tracker", "markdown": "# Quokka tracker\n\nDue <?c6 block d?>, status <?c6 block s?>, for <?c6 block r?>.\n\n<?c6 block c?>",
+               "blocks": {"d": {"type": "date", "value": "2026-11-15"},
+                          "s": {"type": "dropdown", "value": "Not started", "options": ["Not started", "In progress", "Done"]},
+                          "r": {"type": "ref", "ref": format!("work:{wid}")},
+                          "c": {"type": "chart", "chart": "bar", "columns": ["Quarter", "Revenue"], "rows": [["Q1", 12], ["Q2", 15]]}}}),
+    )
+    .await);
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(doc["tabs"][0]["blocks"][2]["kind"], "embed");
+    assert_eq!(doc["tabs"][0]["blocks"][2]["attrs"]["rows"][1][1], 15);
+
+    // Found in search once it settles: an item per tab, of kind doc.
+    let hit = eventually("the document in search", async || {
+        let hits = get("memex/search?q=quokka%20tracker".into()).await;
+        hits.as_array()?.iter().find(|h| h["source"] == "docs").cloned()
+    })
+    .await;
+    assert_eq!(hit["kind"], "doc");
+    assert!(hit["external_id"].as_str().unwrap().starts_with(&format!("{id}#")), "{hit}");
+
+    // A chip changes with set: the dropdown's option.
+    let para = doc["tabs"][0]["blocks"][1].clone();
+    let chip = para["attrs"]["chips"].as_object().unwrap().iter().find(|(_, v)| v["type"] == "dropdown").map(|(k, _)| k.clone()).unwrap();
+    let mut v = para["attrs"]["chips"][&chip].clone();
+    v["value"] = json!("In progress");
+    ok(send(M::POST, format!("docs/{id}/ops"), json!({"ops": [{"op": "set", "block": para["id"], "chip": chip, "value": v}]})).await);
+    let d = get(format!("docs/{id}")).await;
+    assert_eq!(d["tabs"][0]["blocks"][1]["attrs"]["chips"][&chip]["value"], "In progress");
+
+    // Ref chips read things as they are now.
+    let live = ok(send(M::POST, "docs/refs".into(), json!({"refs": [format!("work:{wid}"), format!("doc:{id}"), "work:nope"]})).await);
+    assert_eq!((live[0]["title"].as_str(), live[0]["state"].as_str()), (Some("Ship the zebrafish release"), Some("open")));
+    assert_eq!((live[1]["title"].as_str(), live[2]["state"].as_str()), (Some("Quokka tracker"), Some("gone")));
+
+    // A picture, kept for this document only.
+    use base64::Engine;
+    let png = b"\x89PNG\r\n\x1a\nfake".to_vec();
+    let f = ok(send(
+        M::POST,
+        format!("docs/{id}/files"),
+        json!({"name": "chart.png", "content": base64::engine::general_purpose::STANDARD.encode(&png)}),
+    )
+    .await);
+    assert_eq!((f["mime"].as_str(), f["size"].as_u64()), (Some("image/png"), Some(png.len() as u64)));
+    let base = api.trim_end_matches("/api/v1");
+    let r = http.get(format!("{base}{}", f["url"].as_str().unwrap())).send().await.unwrap();
+    assert_eq!(r.headers()["content-type"], "image/png");
+    assert!(r.headers()["content-disposition"].to_str().unwrap().starts_with("inline"));
+    assert_eq!(r.bytes().await.unwrap().to_vec(), png);
+    let other = ok(send(M::POST, "docs".into(), json!({"title": "Other"})).await);
+    let r = http.get(format!("{api}/docs/{}/files/{}", other["id"].as_str().unwrap(), f["blob"].as_str().unwrap())).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND, "only through the document that holds it");
+    let svg = ok(send(
+        M::POST,
+        format!("docs/{id}/files"),
+        json!({"name": "x.svg", "content": base64::engine::general_purpose::STANDARD.encode(b"<svg/>")}),
+    )
+    .await);
+    let r = http.get(format!("{base}{}", svg["url"].as_str().unwrap())).send().await.unwrap();
+    assert!(r.headers()["content-disposition"].to_str().unwrap().starts_with("attachment"), "an SVG file downloads");
+
+    // Deleted: gone from search.
+    assert!(send(M::DELETE, format!("docs/{id}"), json!({})).await.0.is_success());
+    eventually("the document out of search", async || {
+        let hits = get("memex/search?q=quokka%20tracker".into()).await;
+        (!hits.as_array()?.iter().any(|h| h["source"] == "docs")).then_some(())
+    })
+    .await;
+}

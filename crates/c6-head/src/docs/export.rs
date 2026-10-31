@@ -75,8 +75,23 @@ fn media_type(format: &str) -> &'static str {
 pub fn plain_markdown(state: &super::model::State) -> String {
     let mut out = Vec::new();
     for t in state.tabs_in_order() {
+        let text = tab_text(state, &t.id);
+        if state.tabs.len() > 1 {
+            out.push(format!("# {}\n\n{}", t.title, text.trim()));
+        } else {
+            out.push(text.trim().to_owned());
+        }
+    }
+    out.join("\n\n").replace("\n\n\n\n", "\n\n") + "\n"
+}
+
+/// A tab's Markdown as plain text: chips as their text, embeds by their
+/// kind, pending blocks left out.
+pub fn tab_text(state: &super::model::State, tab: &str) -> String {
+    {
+        let t_id = tab;
         let mut blocks = serde_json::Map::new();
-        let md = state.markdown(&t.id, &mut blocks);
+        let md = state.markdown(t_id, &mut blocks);
         let md = super::markdown::rename_tokens(&md, |_| None);
         let mut text = String::new();
         let mut rest = md.as_str();
@@ -103,13 +118,8 @@ pub fn plain_markdown(state: &super::model::State) -> String {
             rest = &after[j + 2..];
         }
         text.push_str(rest);
-        if state.tabs.len() > 1 {
-            out.push(format!("# {}\n\n{}", t.title, text.trim()));
-        } else {
-            out.push(text.trim().to_owned());
-        }
+        text
     }
-    out.join("\n\n").replace("\n\n\n\n", "\n\n") + "\n"
 }
 
 /// Markdown to HTML for files (raw HTML in a doc is sanitized).

@@ -3732,11 +3732,13 @@ pub struct SessionMatch {
 
 /// What kinds of items there are. Sessions see the default kinds, plus what
 /// their scope rules add.
-pub const MEMEX_KINDS: [&str; 14] =
-    ["session", "output", "web", "note", "document", "paper", "fact", "record", "email", "chat", "event", "photo", "video", "spam"];
+pub const MEMEX_KINDS: [&str; 16] = [
+    "session", "output", "web", "note", "document", "paper", "fact", "record", "email", "chat", "event", "photo", "video", "spam", "doc",
+    "deck",
+];
 /// What every session may search unless a scope rule says more (facts:
 /// environment knowledge, for every session).
-pub const MEMEX_DEFAULT_SCOPE: [&str; 8] = ["session", "output", "web", "note", "document", "paper", "fact", "record"];
+pub const MEMEX_DEFAULT_SCOPE: [&str; 10] = ["session", "output", "web", "note", "document", "paper", "fact", "record", "doc", "deck"];
 
 /// An item to store (head → memex `memex.ingest`). The same source and
 /// external id again replaces it.
