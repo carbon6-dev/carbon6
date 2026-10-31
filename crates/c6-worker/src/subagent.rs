@@ -193,6 +193,9 @@ fn filter_tools(
             // What a subagent finds goes back to its parent, not into task cards.
             !(delegates && !may_delegate(spec, depth))
                 && !c6_tools::knowledge::is_task_card(&name)
+                // Nor into messages to other sessions, sent in its top-level
+                // session's name (docs/background.md §6).
+                && !c6_tools::messages::is_message_tool(&name)
                 && agent.is_none_or(|a| a.allows(&name))
                 && parent.is_none_or(|(tools, search)| {
                     tools.iter().any(|t| c6_tools::tool_allowed(&[t.spec().name], &name))

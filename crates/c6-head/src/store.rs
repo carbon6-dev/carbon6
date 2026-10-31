@@ -681,6 +681,18 @@ impl Store {
         .await?)
     }
 
+    /// The most recently active side chats of one realm (not subagents).
+    pub async fn side_chats(&self, realm: &str, limit: i64) -> anyhow::Result<Vec<SessionRow>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM sessions WHERE archived = 0 AND parent_id IS NOT NULL AND parent_call_id IS NULL AND fork_seq IS NOT NULL \
+             AND realm = ? ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(realm)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Running descendants for display, in one batch for list/feed and detail.
     /// Side chats count for each ancestor; subagents retain their top-level
     /// root semantics. Never follow a relationship into a different realm.

@@ -1,7 +1,8 @@
 //! Messages between sessions (docs/background.md §6): an agent finds a
 //! session of its realm on another worker and sends it a message; that
 //! session's agent wakes with it, as a message from that session; a reply
-//! beyond the chain limit is refused.
+//! beyond the chain limit is refused. Side chats are listed under their
+//! sessions.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -91,6 +92,20 @@ async fn a_session_messages_another_on_another_worker() {
     mock.push_about("Bob: be ready", Reply::Text("Ready.".into()));
     let b = create(&worker_b, dir_b.path(), "Bob", Some("Bob: be ready")).await;
     idle(&b, 1).await;
+    // A side chat of B, which A sees under B.
+    mock.push_about("Bob's side question", Reply::Text("Side answer.".into()));
+    let anchor = events(&b).await.last().unwrap().seq;
+    let side: Value = http
+        .post(format!("{api}/sessions/{b}/side-chats"))
+        .json(&json!({"anchor_seq": anchor, "connection_id": conn["id"], "model": "m", "prompt": "Bob's side question"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let side = side["id"].as_str().unwrap().to_owned();
+    idle(&side, 1).await;
     let a = create(&worker_a, dir_a.path(), "Alice", None).await;
 
     // A finds B and asks it something.
@@ -115,6 +130,11 @@ async fn a_session_messages_another_on_another_worker() {
     let listed = &tool_results(&a_events)[0];
     assert!(listed.contains(&b) && listed.contains("\"Bob\""), "{listed}");
     assert!(!listed.contains(&a), "not itself: {listed}");
+    let side_line = listed.lines().find(|l| l.contains(&side)).unwrap_or_else(|| panic!("the side chat is listed: {listed}"));
+    assert!(side_line.starts_with("  - ") && side_line.contains(r#"side chat of "Bob""#), "{listed}");
+    let lines: Vec<&str> = listed.lines().collect();
+    let at = |id: &str| lines.iter().position(|l| l.contains(id)).unwrap();
+    assert_eq!(at(&side), at(&b) + 1, "under B: {listed}");
     let b_events = events(&b).await;
     let got = b_events.iter().find_map(|e| match &e.kind {
         EventKind::User { text, command, from_session_id, from_title, .. } if command == "session-message" => {
