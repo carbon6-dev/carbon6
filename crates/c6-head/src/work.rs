@@ -1297,8 +1297,20 @@ pub fn guess_project(st: &HeadState, id: &str) {
 static GUESSING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 /// Whether a project guess is under way (for tests).
-pub fn guessing() -> bool {
-    !GUESSING.lock().unwrap().is_empty()
+pub async fn guessing(st: &HeadState) -> bool {
+    let ids: Vec<String> = GUESSING.lock().unwrap().iter().cloned().collect();
+    any_here(st, ids).await
+}
+
+/// Whether any of these work items is this head's (the sets above are the
+/// process's, and tests run several heads side by side).
+async fn any_here(st: &HeadState, ids: Vec<String>) -> bool {
+    for id in ids {
+        if load(st, &id).await.ok().flatten().is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 async fn project_guess(st: &HeadState, id: &str) -> anyhow::Result<()> {
@@ -1373,9 +1385,10 @@ pub fn refresh(st: &HeadState, id: &str) {
     });
 }
 
-/// Whether a note is being written for any item (for tests).
-pub fn writing() -> bool {
-    !WRITING.lock().unwrap().0.is_empty()
+/// Whether one of this head's work items has its note being written (for tests).
+pub async fn writing(st: &HeadState) -> bool {
+    let ids: Vec<String> = WRITING.lock().unwrap().0.iter().cloned().collect();
+    any_here(st, ids).await
 }
 
 /// Writes "where was I", and an offer if it looks done, by `work.summary`.

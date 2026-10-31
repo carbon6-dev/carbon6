@@ -1034,9 +1034,15 @@ pub fn refresh(st: &HeadState, id: &str) {
     });
 }
 
-/// Whether a project's note is being written (for tests).
-pub fn writing() -> bool {
-    !WRITING.lock().unwrap().0.is_empty()
+/// Whether one of this head's projects has its note being written (for tests).
+pub async fn writing(st: &HeadState) -> bool {
+    let ids: Vec<String> = WRITING.lock().unwrap().0.iter().cloned().collect();
+    for id in ids {
+        if load(st, &id).await.ok().flatten().is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The routing label a rule names for projects' agent steps (else work's).

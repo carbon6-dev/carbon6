@@ -126,7 +126,8 @@ async fn work_follows_what_belongs_to_it() {
             m.contains(NOTE) && m.contains("Fixed the off-by-one")
         });
         let w = item(w.id.clone()).await;
-        (read_it && w.fields.note.as_ref().is_some_and(|n| n.next == "Fix the footer") && !c6_head::work::writing()).then_some(w)
+        (read_it && w.fields.note.as_ref().is_some_and(|n| n.next == "Fix the footer") && !c6_head::work::writing(&head.state).await)
+            .then_some(w)
     })
     .await;
     assert_eq!(w.state, "needs_you", "{}", w.why);

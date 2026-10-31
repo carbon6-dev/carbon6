@@ -395,7 +395,9 @@ async fn documents_export_and_import() {
     type Runs = Arc<Mutex<Vec<(String, Vec<String>, Value)>>>;
     let runs: Runs = Arc::default();
     let seen = runs.clone();
-    c6_head::kitjobs::run_locally(
+    let head_dir = tempfile::tempdir().unwrap();
+    c6_head::kitjobs::run_locally_in(
+        head_dir.path(),
         c6_head::docs::export::KIT,
         Arc::new(move |run: c6_head::kitjobs::LocalRun| {
             let deck = run.inputs.get("deck.json").map(|d| serde_json::from_slice::<Value>(d).unwrap()).unwrap_or(Value::Null);
@@ -425,7 +427,6 @@ async fn documents_export_and_import() {
             })
         }),
     );
-    let head_dir = tempfile::tempdir().unwrap();
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
@@ -678,7 +679,9 @@ async fn the_decks_apps_decks_come_in_once() {
     use c6_worker::{ConnState, Identity, Worker, conn, enroll};
     // A decks app as it was installed (its decks and themes collections).
     const APP: &str = r#"{"package": "decks", "version": "1.2.0", "description": "Presentation decks from a brief: an outline you approve, a theme you choose, then slides built as HTML, checked by eye, and handed to you as HTML and PDF. Install it in the realm whose decks they are (home, a business).", "permissions": {}, "contents": {"collections": [{"name": "decks", "description": "Finished decks: what they are about, and their files. Handed to you by the decks app; yours to keep and change.", "handoff": true, "schema": {"type": "object", "required": ["title", "files"], "properties": {"title": {"type": "string"}, "brief": {"type": "string"}, "audience": {"type": "string"}, "theme": {"type": "string"}, "folder": {"type": "string", "description": "Where its files are made, on the worker"}, "files": {"type": "array", "items": {"type": "string"}, "description": "The published files: HTML, PDF, and PowerPoint when asked"}, "made_by": {"type": "string", "description": "What made it, e.g. decks 1.2.0"}}}, "card": {"sources": "Handed off by the decks app when a deck is delivered.", "freshness": "once per deck"}}, {"name": "themes", "description": "Looks for decks: colours, type and accents as CSS variables over the base CSS (skill deck-html).", "schema": {"type": "object", "required": ["name", "css"], "properties": {"name": {"type": "string"}, "mood": {"type": "string"}, "css": {"type": "string"}}}, "keys": ["name"], "card": {"sources": "Shipped with the decks app; add your own with its add_theme operation.", "invariants": ["each theme's name is unique", "css sets the CSS variables the base CSS uses"]}}], "records": {"themes": [{"name": "Old Paper", "mood": "The app's", "css": ":root { --bg: #fffdf8; --accent: #8a5a00; }"}]}}}"#;
-    c6_head::kitjobs::run_locally(
+    let (head_dir, state, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    c6_head::kitjobs::run_locally_in(
+        head_dir.path(),
         c6_head::docs::export::KIT,
         std::sync::Arc::new(|run: c6_head::kitjobs::LocalRun| {
             Box::pin(async move {
@@ -695,7 +698,6 @@ async fn the_decks_apps_decks_come_in_once() {
             })
         }),
     );
-    let (head_dir, state, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],

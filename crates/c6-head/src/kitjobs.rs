@@ -105,9 +105,20 @@ pub fn run_locally(kit: &str, f: LocalKit) {
     LOCAL.lock().unwrap().insert(kit.to_owned(), f);
 }
 
+/// Runs this kit's jobs in this process for the head whose data is in
+/// `data_dir` only, so tests running side by side each keep their own
+/// stand-in for the same kit.
+pub fn run_locally_in(data_dir: &std::path::Path, kit: &str, f: LocalKit) {
+    LOCAL.lock().unwrap().insert(format!("{kit}@{}", data_dir.display()), f);
+}
+
 /// Runs a job on a worker that can, and returns what it made.
 pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
-    let local = LOCAL.lock().unwrap().get(job.spec["name"].as_str().unwrap_or_default()).cloned();
+    let kit = job.spec["name"].as_str().unwrap_or_default();
+    let local = {
+        let l = LOCAL.lock().unwrap();
+        l.get(&format!("{kit}@{}", st.data_dir.display())).or_else(|| l.get(kit)).cloned()
+    };
     if let Some(f) = local {
         let command = command(&job.spec, &job.tool, &job.args)?;
         return f(LocalRun { tool: job.tool, command, inputs: job.inputs, env: job.env }).await;

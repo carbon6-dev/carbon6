@@ -195,7 +195,7 @@ async fn projects_keep_their_plan_documents_and_where_they_are() {
     // 3. Where we are: written by the routed model when the project moves.
     let p = eventually("its note", async || {
         let p = get(format!("projects/{pid}")).await;
-        (p["note"]["text"] == "Phase 1: the guide is being written." && !c6_head::projects::writing()).then_some(p)
+        (p["note"]["text"] == "Phase 1: the guide is being written." && !c6_head::projects::writing(&head.state).await).then_some(p)
     })
     .await;
     let asked: Vec<Value> = mock.requests().into_iter().filter(|r| r["messages"].to_string().contains(WHERE)).collect();
@@ -348,11 +348,12 @@ async fn phases_move_on_when_you_say_and_sessions_know_their_project() {
     assert_eq!(p["note"]["text"], "The guide is out.\nNext: the pilot", "a note given as lines");
     let p = ok(send(M::POST, format!("projects/{pid}/phases"), json!({"action": "dismiss", "phase": p1})).await);
     assert!(p["phases"][0]["offer"].is_null() && p["phases"][0]["dismissed"] == "The guide was published", "{p}");
-    eventually("no note being written", async || (!c6_head::projects::writing()).then_some(())).await;
+    eventually("no note being written", async || (!c6_head::projects::writing(&head.state).await).then_some(())).await;
     let asked = |m: &MockLlm| m.requests().iter().filter(|r| r["messages"].to_string().contains(WHERE)).count();
     let before = asked(&mock);
     ok(send(M::POST, format!("projects/{pid}/refresh"), json!({})).await);
-    eventually("the note written again", async || (asked(&mock) > before && !c6_head::projects::writing()).then_some(())).await;
+    eventually("the note written again", async || (asked(&mock) > before && !c6_head::projects::writing(&head.state).await).then_some(()))
+        .await;
     assert!(get(format!("projects/{pid}")).await["phases"][0]["offer"].is_null(), "not offered again");
 
     // 4. You move on: the phase is done, the next current.
@@ -467,7 +468,7 @@ async fn new_work_finds_its_project_and_projects_are_found_in_work() {
 
     // No active project: no guess asked.
     let w0 = ok(send(M::POST, "work".into(), json!({"title": "Tidy the garage"})).await);
-    eventually("no guess under way", async || (!c6_head::work::guessing()).then_some(())).await;
+    eventually("no guess under way", async || (!c6_head::work::guessing(&head.state).await).then_some(())).await;
     assert_eq!(asked(&mock), 0);
     assert_eq!(get(format!("work/{}", w0["id"].as_str().unwrap())).await["project"], Value::Null);
 
@@ -496,12 +497,12 @@ async fn new_work_finds_its_project_and_projects_are_found_in_work() {
     // Made in a project: no guess at all.
     let before = asked(&mock);
     ok(send(M::POST, format!("projects/{pid}/work"), json!({"title": "Invite the team"})).await);
-    eventually("no guess under way", async || (!c6_head::work::guessing()).then_some(())).await;
+    eventually("no guess under way", async || (!c6_head::work::guessing(&head.state).await).then_some(())).await;
     assert_eq!(asked(&mock), before);
     // A guess naming no project of the realm changes nothing.
     mock.push_about(GUESS, Reply::Text(json!({"project": "nope"}).to_string()));
     let w2 = ok(send(M::POST, "work".into(), json!({"title": "Book the dentist"})).await);
-    eventually("the guess answered", async || (!c6_head::work::guessing()).then_some(())).await;
+    eventually("the guess answered", async || (!c6_head::work::guessing(&head.state).await).then_some(())).await;
     assert_eq!(get(format!("work/{}", w2["id"].as_str().unwrap())).await["project"], Value::Null);
 
     // Projects found in work: only real work in no project, two or more.
@@ -509,7 +510,7 @@ async fn new_work_finds_its_project_and_projects_are_found_in_work() {
     for t in ["Migrate the billing tables", "Backfill billing history", "Switch billing reads"] {
         ids.push(ok(send(M::POST, "work".into(), json!({"title": t, "labels": ["billing"]})).await)["id"].as_str().unwrap().to_owned());
     }
-    eventually("no guess under way", async || (!c6_head::work::guessing()).then_some(())).await;
+    eventually("no guess under way", async || (!c6_head::work::guessing(&head.state).await).then_some(())).await;
     const FIND: &str = "Find those groups";
     mock.push_about(
         FIND,
