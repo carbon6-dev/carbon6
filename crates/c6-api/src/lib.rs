@@ -1860,6 +1860,10 @@ pub struct QueuedInput {
     pub created_at: UnixMs,
     /// Set if the worker refused it.
     pub rejected: Option<String>,
+    /// The worker handed it to the agent, which reads it at its next step
+    /// (after the tool call or reply it is on); not just queued.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_agent: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

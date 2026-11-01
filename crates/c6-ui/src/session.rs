@@ -2910,6 +2910,8 @@ fn ToolCard(
 #[component]
 fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Callback<Vec<QueuedInput>>) -> impl IntoView {
     let rejected = q.rejected.clone();
+    // The worker handed it to the agent: it reads it at its next step.
+    let with_agent = q.with_agent;
     let text = q.text;
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -2956,7 +2958,16 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
                 }.into_any(),
                 None => view! {
                     <span class="flex items-center gap-2 text-xs text-zinc-500">
-                        "queued"
+                        {if with_agent {
+                            view! {
+                                <span title="The agent has it and reads it once its current step (a tool call or a reply) ends. Stop & send interrupts that step.">
+                                    "with the agent · read at its next step"
+                                </span>
+                            }
+                            .into_any()
+                        } else {
+                            "queued".into_any()
+                        }}
                         {move || queue_ops.get().then(|| view! {
                             <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
                                 prop:disabled=move || busy.get() on:click=move |_| do_pull()>"✎ Edit"</button>

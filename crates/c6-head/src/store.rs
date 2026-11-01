@@ -555,6 +555,8 @@ pub struct CommandRow {
     pub created_at: i64,
     pub state: String,
     pub error: Option<String>,
+    /// The worker handed it to the agent, which reads it at its next step.
+    pub with_agent: i64,
 }
 
 /// What an event batch changed.
@@ -563,6 +565,8 @@ pub struct Ingested {
     pub events: Vec<c6_proto::SessionEvent>,
     /// Commands the worker has now applied.
     pub done_commands: Vec<String>,
+    /// Commands now with the agent (`InputDelivered`).
+    pub delivered_commands: Vec<String>,
 }
 
 impl Store {
@@ -1027,6 +1031,7 @@ impl Store {
         let mut status: String = row.get("status");
         let mut stored = Vec::new();
         let mut done = Vec::new();
+        let mut delivered: Vec<String> = Vec::new();
         for ev in events {
             if ev.seq <= last {
                 continue;
@@ -1064,6 +1069,7 @@ impl Store {
                 // A session message the worker recorded as a notice is
                 // applied: it is delivered from its log from now on.
                 Some(Kind::NoticeQueued(n)) => done.push(n.command_id.clone()),
+                Some(Kind::InputDelivered(d)) => delivered.push(d.command_id.clone()),
                 Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
                 Some(Kind::Usage(u)) => crate::usage::record(&mut tx, session_id, ev.seq, ev.ts_ms, u).await?,
                 Some(Kind::Approval(a)) => {
@@ -1129,9 +1135,12 @@ impl Store {
             for id in &done {
                 sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(id).execute(&mut *tx).await?;
             }
+            for id in &delivered {
+                sqlx::query("UPDATE commands SET with_agent = 1 WHERE id = ? AND state = 'pending'").bind(id).execute(&mut *tx).await?;
+            }
         }
         tx.commit().await?;
-        Ok(Some(Ingested { last_seq: last, events: stored, done_commands: done }))
+        Ok(Some(Ingested { last_seq: last, events: stored, done_commands: done, delivered_commands: delivered }))
     }
 
     /// The events of the turn that ends at `end_seq`, from its TurnStarted.
