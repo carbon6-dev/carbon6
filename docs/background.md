@@ -23,7 +23,8 @@ The main agent stays free to talk while its work runs in the background. A backg
 - **Each turn runs from `system/init` to `result`.**
 - **It wakes itself.** A background task that ends while the process is idle gets a `task_notification`, and the CLI starts a turn of its own on it. That turn has no echoed user message.
 - **A message written mid-turn joins the running turn** at its next model call. With `--replay-user-messages` it is echoed back when the CLI takes it, not when it was written.
-- **`{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}` stops the running turn.** The CLI answers `control_response` success, then sends `result` with `error_during_execution`. Background tasks keep running and still wake the agent later. A queued message becomes the next turn.
+- **`{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}` stops the running turn.** The CLI answers `control_response` success, then sends `result` with `error_during_execution`. Background commands keep running and still wake the agent later. A queued message becomes the next turn.
+- **But an interrupt also ends Claude Code's own background agents** (tested 2026-11-01, CLI 2.1.311). An Agent-tool subagent started with `run_in_background` (`task_type: local_agent`, `is_backgrounded: true`) was still working when an interrupt arrived during a later turn. The CLI then sent `task_updated` with `patch.status: "killed"` and `task_notification` with `status: "stopped"` for it, and for the agent's own command, and `background_tasks_changed` listed no tasks. A background command (`local_bash`) survives an interrupt (tested 2026-10-30). The protocol has no known way to interrupt only the main turn.
 - **The echo carries the `uuid` we sent** (`isReplay: true`). `result` also lists the inputs that turn took (`user_message_uuids`).
 - **`set_model` switches the model in place.** It answers with the new model and echoes a local command, with a `uuid` of its own.
 - **`stop_task` with the CLI's `task_id` stops one background task.** Its `task_notification` says `stopped`.
@@ -33,7 +34,7 @@ The main agent stays free to talk while its work runs in the background. A backg
 ## 2. Goals
 
 1. Messaging a Claude Code session while it works reaches it at its next step, as in carbon6's own sessions.
-2. Esc stops the turn, not its background work.
+2. Esc stops the turn, not its background work. (Claude Code's own background agents stop with it, which carbon6 can't prevent; see §1.)
 3. Every background task that asked to notify reaches its session, through restarts and the hourly limit.
 4. carbon6's `Task` and `SendMessage` run in the background under Claude Code too.
 5. A session can send a message to another session in its realm, on any worker.
@@ -91,7 +92,7 @@ Not goals:
 
 ### Stopping
 
-- **Esc** sends the interrupt request. If no `result` arrives within 5 s, the turn falls back to SIGINT, then SIGKILL, of the process group, and marks the native tasks lost.
+- **Esc** sends the interrupt request. If no `result` arrives within 5 s, the turn falls back to SIGINT, then SIGKILL, of the process group, and marks the native tasks lost. Background commands survive the interrupt request; Claude Code's own background agents don't: the CLI stops them with the turn, and they're recorded as stopped (§1). Stop and Send now send the same request, so they stop those agents too. carbon6's own background subagents (`mcp__carbon6__Task` with `run_in_background`) run in carbon6's loop and aren't affected.
 - **Stopping one task.** The Tasks control's Stop works for Claude Code's tasks too: the worker sends `stop_task` with the CLI's id, and the task reads "stopped by you". This replaces the planned Stop all.
 - **Worker restart.** A running process is recorded in `<state>/claude/<conversation>.pid` (its process group and conversation; `Process::record_in`), and the record goes when the process does. At startup, before any session resumes, `recover()` stops every recorded process that is still a `claude` running that conversation (`sweep_orphans`; a reused process id is left alone), SIGINT then SIGKILL. Its native tasks were recorded as started without an end, so the session's reload records them lost, and the agent is told (below). The conversation resumes on the next input. A process dropped without being closed takes its process group with it.
 - **Lost Claude Code tasks are told to the agent.** Claude Code delivers its own tasks' notices, except for a task lost with its process (a worker restart, a crash of the CLI, a handoff). Then carbon6 sends the agent a notice naming the task, saying that files it changed stay and that it may need redoing. The notice wakes an idle session, within the hourly limit.
@@ -204,7 +205,7 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 1. Claude Code sessions come first; they are what the main agent mostly runs on.
 2. Session messages are fire and forget, within a realm. Grants for other realms are deferred.
 3. An idle Claude Code process closes after 15 minutes, never while a background task runs.
-4. Esc interrupts only the turn. Background work is stopped task by task (Claude Code's tasks too, with `stop_task`), rather than by the planned Stop all.
+4. Esc interrupts only the turn. Background work is stopped task by task (Claude Code's tasks too, with `stop_task`), rather than by the planned Stop all. Exception, found 2026-11-01: the CLI's interrupt also stops its own background agents (§1). Follow-ups: ask before an interrupt while background agents run, which needs the native `task_type` recorded; and steer long background work to carbon6's subagents.
 5. Session messages get their own tool, `message_session`, rather than a wider `SendMessage`.
 6. The CLI's self-started turns don't count toward the hourly limit; carbon6 only shows them.
 
