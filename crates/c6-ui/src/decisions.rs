@@ -43,10 +43,13 @@ pub fn DecisionLink(class: &'static str) -> impl IntoView {
 const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Whether you're typing (a field has the focus): a reload waits.
+/// You're typing in a decision (a reload would drop it). A field elsewhere
+/// (a session's message box in another tile, say) doesn't hold reloads.
 fn typing() -> bool {
-    document()
-        .active_element()
-        .is_some_and(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.has_attribute("contenteditable"))
+    document().active_element().is_some_and(|el| {
+        (matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.has_attribute("contenteditable"))
+            && el.closest("[data-decisions]").ok().flatten().is_some()
+    })
 }
 
 /// Loads a list again (`tick`) once sessions change, which may mean its
@@ -112,7 +115,7 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
             1 if !in_session => view! { <ErrorBox message=shown.get_untracked().and_then(Result::err).unwrap_or_default() /> }.into_any(),
             2 if !in_session => view! { <p class="text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
             3 => view! {
-                <div class=if in_session { "space-y-2" } else { "space-y-4" }>
+                <div class=if in_session { "space-y-2" } else { "space-y-4" } data-decisions="">
                 {in_session.then(|| view! { <p class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Waiting for you"</p> })}
                 <For each=move || groups.get() key=|(g, _)| g.clone() let:group>
                     <div class="space-y-2">

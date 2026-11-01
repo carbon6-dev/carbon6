@@ -857,7 +857,7 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
                                 }.into_any()
                             }
                         }}
-                        <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500">
+                        <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-600 dark:text-zinc-400">
                             <span class="flex items-center gap-1">
                                 <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
                                 {d.worker_name.clone()}
@@ -877,32 +877,39 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
                             view! { <div class="mt-1"><crate::work::SessionWork session_id=s.id.clone() title /></div> }
                         })}
                     </div>
-                    <div class="flex flex-wrap items-center gap-2">
+                    // What to look at (its tabs, Details, Find), then what to do with it
+                    // and how it is: one style each, readable in light and dark.
+                    <div class="flex flex-col gap-1.5">
+                    <div class="flex flex-wrap items-center gap-1">
                         {tabs()}
-                        <button class=move || format!("{BUTTON_QUIET} text-xs {}", if details.get() { "text-zinc-900 dark:text-zinc-100" } else { "text-zinc-500" })
+                        <button class=move || format!("rounded-md px-2.5 py-1 text-sm {}", if details.get() { "bg-zinc-200 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100" } else { "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" })
                             title="Where it runs, its context, usage and changes" on:click=move |_| { details.update(|d| *d = !*d); act() }>"Details"</button>
-                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Find in this session" on:click=move |_| {
+                        <button class=META_TAB title="Find in this session" on:click=move |_| {
                             tab.set("transcript");
                             find_open.set(true);
                             act();
                         }>"Find"</button>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-1">
                         {(!s.observed && s.instance.is_empty()).then(|| view! {
-                            <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
+                            <button class=META_ACTION
                                 title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
                                 on:click=move |_| { act(); like_this.run(()) }>"New like this"</button>
-                            <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500")
+                            <button class=META_ACTION
                                 title="Save this session's worker, folder, model and labels as a template, which agents can start as a remote subagent"
                                 on:click=move |_| { act(); as_template.run(()) }>"Save as template"</button>
                         })}
-                        <crate::tasks::RunningTasks session=id.get_value() events />
-                        <SubagentsPill session=id.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.get_value() />
-                        {move || view! { <StatusPill status=display_status.get() /> }}
-                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Archive the session and close this column" on:click=move |_| {
+                        <button class=META_ACTION title="Archive the session and close this column" on:click=move |_| {
                             act();
                             spawn_local(async move {
                                 if api::archive(id.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
                             });
                         }>"Archive"</button>
+                        <span class="flex-1"></span>
+                        <crate::tasks::RunningTasks session=id.get_value() events />
+                        <SubagentsPill session=id.get_value() tree=s.root_id.clone().unwrap_or_else(|| s.id.clone()) events force_open root=root.get_value() />
+                        {move || view! { <StatusPill status=display_status.get() /> }}
+                    </div>
                     </div>
                 </div>
             }
@@ -1108,6 +1115,17 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         }
     });
     on_sight(bottom, move || feed.later());
+    // Approvals answered (allowed, denied or expired), by call.
+    let decided = Memo::new(move |_| {
+        events.with(|evs| {
+            evs.iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::Approval { call_id, state, .. } if state != "requested" => Some(call_id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+        })
+    });
     let results = Memo::new(move |_| {
         events.with(|evs| {
             evs.iter()
@@ -1276,7 +1294,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                                         </div>
                                     }.into_any()
                                 }
-                                None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&id.get_value(), &e, results, streaming, usage)).into_any(),
+                                None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&id.get_value(), &e, results, decided, streaming, usage)).into_any(),
                             }}
                             {anchorable.then(|| view! {
                                 <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
@@ -1805,6 +1823,11 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
 /// box grown taller they stay by its last line.
 const SEND_AT: &str = "mb-[9px] h-9 shrink-0";
 
+/// The session header's Find (like its tabs) and its actions (smaller, but
+/// as readable).
+const META_TAB: &str = "rounded-md px-2.5 py-1 text-sm text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+const META_ACTION: &str = "rounded-md border border-zinc-200 px-2 py-0.5 text-xs text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+
 const CHIP: &str = "inline-flex items-center gap-1 rounded-full border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800";
 
 const SUBAGENTS_HELP: &str = "The agent starts a subagent with its Task tool when it decides a piece of work suits one (or you ask). This is the connection and model they run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.";
@@ -2093,6 +2116,7 @@ fn render_event(
     session: &str,
     e: &Event,
     results: Memo<HashMap<String, ToolResultView>>,
+    decided: Memo<std::collections::HashSet<String>>,
     streaming: RwSignal<Streaming>,
     usage: Memo<UsageStats>,
 ) -> AnyView {
@@ -2106,7 +2130,12 @@ fn render_event(
         .into_any(),
         EventKind::Output { name, title, mime, size } => crate::outputs::published_line(session, e.seq, name, title, mime, *size),
         EventKind::Approval { call_id, state, tool, input, policy, message } => match state.as_str() {
-            "requested" => view! { <ApprovalCard session=session.to_owned() call_id=call_id.clone() tool=tool.clone() input=input.clone() policy=policy.clone() message=message.clone() /> }.into_any(),
+            "requested" => {
+                // Open until the log says what became of it.
+                let call = call_id.clone();
+                let open = Signal::derive(move || !decided.with(|d| d.contains(&call)) && !results.with(|r| r.contains_key(&call)));
+                view! { <ApprovalCard session=session.to_owned() call_id=call_id.clone() tool=tool.clone() input=input.clone() policy=policy.clone() message=message.clone() open /> }.into_any()
+            }
             s => {
                 let (icon, what, tone) = match s {
                     "allowed" => ("✓", "Approved", "text-emerald-700 dark:text-emerald-400"),
@@ -3572,7 +3601,10 @@ fn Composer(
                         class=format!("{INPUT} {} min-h-[2.75rem]", crate::util::GROWS)
                         rows="2"
                         enterkeyhint=if touch { "enter" } else { "send" }
-                        placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else if touch { "Message the agent (@ to mention a file or a person, client, host…, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
+                        placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
+                            // A phone's box is narrow: a hint that fits.
+                            if running.get() { "Message: read at its next step…" } else if wake.is_some() { "Message the subagent" } else if inline { "Reply in this side chat" } else { "Message the agent" }.to_owned()
+                        } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| {
@@ -3757,12 +3789,23 @@ fn Composer(
 /// A tool call held for your approval: what it would do, and Allow / Deny
 /// while the session still waits.
 #[component]
-fn ApprovalCard(session: String, call_id: String, tool: String, input: String, policy: String, message: String) -> impl IntoView {
+fn ApprovalCard(
+    session: String,
+    call_id: String,
+    tool: String,
+    input: String,
+    policy: String,
+    message: String,
+    open: Signal<bool>,
+) -> impl IntoView {
     let live = api::live();
     let sid = StoredValue::new(session);
     let call = StoredValue::new(call_id);
     let sent = RwSignal::new(None::<Result<bool, String>>);
-    let waiting = move || live.sessions.with(|ss| ss.iter().any(|s| s.id == sid.get_value() && s.awaiting_approval));
+    // Its session's row says whether it waits; a subagent's isn't in the live
+    // list, so its log alone says (the head refuses a stale answer).
+    let waiting =
+        move || open.get() && live.sessions.with(|ss| ss.iter().find(|s| s.id == sid.get_value()).is_none_or(|s| s.awaiting_approval));
     // A shell command reads best as itself.
     let shown = serde_json::from_str::<serde_json::Value>(&input)
         .ok()

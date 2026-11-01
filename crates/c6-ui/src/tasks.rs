@@ -143,7 +143,12 @@ pub fn RunningTasks(
                         .into_any()
                     } else {
                         view! {
-                            <button class="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-300"
+                            // Bright only while something runs.
+                            <button class=move || if list.with(|tasks| tasks.iter().any(|t| t.running())) {
+                                    "rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-300"
+                                } else {
+                                    "rounded-md px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                }
                                 title=move || list.with(|tasks| format!("Background tasks: {} running · {} total", tasks.iter().filter(|t| t.running()).count(), tasks.len()))
                                 on:click=move |ev| {
                                     ev.stop_propagation();

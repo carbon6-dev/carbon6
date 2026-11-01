@@ -37,22 +37,38 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
 /// Sizes a message box to what is in it; its CSS `max-height` caps it, and
 /// past that it scrolls.
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
-    let _ = el.set_attribute("style", "height:auto");
+    // Empty, it keeps its own rows: a long hint doesn't size it.
+    if el.value().is_empty() {
+        let _ = el.set_attribute("style", "overflow-y:hidden");
+        return;
+    }
+    let _ = el.set_attribute("style", "height:auto;overflow-y:hidden");
     let border = el.offset_height() - el.client_height();
-    let _ = el.set_attribute("style", &format!("height:{}px", el.scroll_height() + border));
+    let height = el.scroll_height() + border;
+    let _ = el.set_attribute("style", &format!("height:{height}px;overflow-y:hidden"));
+    // Capped by its max-height: only then does it scroll (and show a bar).
+    if el.scroll_height() > el.client_height() + 1 {
+        let _ = el.set_attribute("style", &format!("height:{height}px;overflow-y:auto"));
+    }
 }
 
 /// Keeps a message box sized to its text as `track` changes it (typed, sent,
 /// put back to edit).
 pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static) {
-    Effect::new(move || {
-        track();
+    let refit = move || {
         request_animation_frame(move || {
             if let Some(el) = node.try_get_untracked().flatten() {
                 fit(&el);
             }
-        });
+        })
+    };
+    Effect::new(move || {
+        track();
+        refit();
     });
+    // Narrower (a phone turned, a tile resized), its text takes more lines.
+    let resized = window_event_listener(leptos::ev::resize, move |_| refit());
+    on_cleanup(move || resized.remove());
 }
 
 /// The class of a message box that grows with its text up to 40% of the

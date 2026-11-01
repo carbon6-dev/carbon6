@@ -555,7 +555,7 @@ pub fn MobileBar() -> impl IntoView {
     let counts = Memo::new(move |_| crate::labels::attention_counts(ws, live, &filter.get()));
     let count = move || counts.get().0;
     view! {
-        <nav class="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-zinc-200 bg-zinc-50 px-2 py-1.5 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
+        <nav class="flex shrink-0 items-center gap-1 overflow-x-auto [scrollbar-width:none] border-t border-zinc-200 bg-zinc-50 px-2 py-1.5 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
             {move || tiles.get().into_iter().map(|(key, label, focused)| view! {
                 <button
                     class=if focused { "max-w-36 shrink-0 truncate rounded-md bg-zinc-200 px-2.5 py-1.5 text-xs font-medium dark:bg-zinc-800" } else { "max-w-36 shrink-0 truncate rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" }

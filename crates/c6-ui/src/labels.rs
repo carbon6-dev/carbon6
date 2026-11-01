@@ -237,7 +237,7 @@ pub fn SessionLabels(session: String, labels: Vec<String>, auto_labels: Vec<Stri
                         on:blur=move |_| if draft.get_untracked().trim().is_empty() { adding.set(false) } else { add() } />
                 }.into_any()
             } else {
-                view! { <button class="rounded px-1 text-[11px] text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" on:click=move |_| adding.set(true)>"+ label"</button> }.into_any()
+                view! { <button class="rounded px-1 text-[11px] text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" on:click=move |_| adding.set(true)>"+ label"</button> }.into_any()
             }}
             {move || error.get().map(|e| view! { <span class="text-xs text-red-600">{e}</span> })}
         </div>
