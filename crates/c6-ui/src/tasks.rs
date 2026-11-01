@@ -54,6 +54,26 @@ impl Task {
     }
 }
 
+/// A task's state as a dot: running, finished, failed, stopped or lost.
+fn state_dot(state: &str, running: bool) -> &'static str {
+    match state {
+        _ if running => "animate-pulse bg-blue-500",
+        "finished" => "bg-emerald-500",
+        "failed" => "bg-red-500",
+        "lost" => "bg-amber-500",
+        _ => "bg-zinc-400",
+    }
+}
+
+/// What kind of task, in words.
+fn kind_name(kind: &str) -> &'static str {
+    match kind {
+        "claude_code" => "Claude Code",
+        "agent" => "agent",
+        _ => "shell",
+    }
+}
+
 /// Latest lifecycle record for every known task; running tasks come first.
 /// No worker request is needed, including for ended or lost tasks.
 fn lifecycle(events: &[Event]) -> Vec<Task> {
@@ -172,20 +192,25 @@ pub fn RunningTasks(
                                 let can_stop = t.can_stop();
                                 let status = t.status();
                                 let notification = t.notification();
+                                // What it is first, in words; its id and how its
+                                // end is reported on hover.
+                                let about = format!("{} · {notification}", t.id);
                                 view! {
-                                    <div class="flex flex-wrap items-center gap-2 border-t border-zinc-100 pt-2 dark:border-zinc-800">
-                                        <span class="min-w-0 max-w-40 truncate font-mono text-zinc-500" title=t.id.clone()>{t.id.clone()}</span>
-                                        <span class="min-w-0 flex-1 truncate font-mono" title=t.description.clone()>
-                                            {if t.kind == "agent" { format!("agent: {}", t.description) } else { t.description.clone() }}
-                                        </span>
-                                        <span class="text-zinc-500">{status}</span>
-                                        <span class="text-zinc-500">{notification}</span>
-                                        <span class="text-zinc-500">{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
-                                        <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") on:click=move |_| {
-                                            selected.set(Some(inspect_id.clone()));
-                                            at.set(None);
-                                        }>"Inspect"</button>
-                                        {can_stop.then(|| view! { <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs text-red-600") on:click=move |_| {
+                                    <div class="space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+                                        <div class="flex items-start gap-2" title=about>
+                                            <span class=format!("mt-1 h-2 w-2 shrink-0 rounded-full {}", state_dot(&t.state, running))></span>
+                                            <span class="line-clamp-2 min-w-0 flex-1 text-[13px] text-zinc-800 dark:text-zinc-100">{t.description.clone()}</span>
+                                        </div>
+                                        <div class="flex flex-wrap items-center gap-2 pl-4 text-zinc-600 dark:text-zinc-400">
+                                            <span class="rounded bg-zinc-100 px-1 text-[10px] dark:bg-zinc-800">{kind_name(&t.kind)}</span>
+                                            <span>{status}</span>
+                                            <span>{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
+                                            <span class="flex-1"></span>
+                                            <button class="rounded-md border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" on:click=move |_| {
+                                                selected.set(Some(inspect_id.clone()));
+                                                at.set(None);
+                                            }>"Inspect"</button>
+                                            {can_stop.then(|| view! { <button class="rounded-md border border-red-200 px-2 py-0.5 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950" on:click=move |_| {
                                             let id = id.clone();
                                             spawn_local(async move {
                                                 if let Err(e) = api::stop_task(session.get_value(), id).await {
@@ -193,6 +218,7 @@ pub fn RunningTasks(
                                                 }
                                             });
                                         }>"Stop"</button> })}
+                                        </div>
                                     </div>
                                 }
                             }).collect_view()}
@@ -307,8 +333,7 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
         view! {
             <p class=format!("flex items-center gap-2 text-xs {tone}")>
                 <span>"⚙"</span>
-                <span class="max-w-24 shrink-0 truncate font-mono" title=task_id.to_owned()>{task_id.to_owned()}</span>
-                <span class="min-w-0 truncate font-mono" title=title>{label}</span>
+                <span class="min-w-0 truncate" title=format!("{title} · {task_id}")>{label}</span>
                 <span class="shrink-0">{format!("{icon} {what}{time}")}</span>
             </p>
         }
