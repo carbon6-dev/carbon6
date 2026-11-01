@@ -387,7 +387,7 @@ Channels (**Settings → Notifications**) tell you about your sessions while you
 - **iPhone and iPad:** add carbon6 to the Home Screen (Share → Add to Home Screen) and open it from there; iOS only allows web push for home-screen apps.
 - **Devices:** listed with when they last got a message. A subscription the push service says is gone is removed.
 
-**On a phone:** the head works as a home-screen app (manifest, icon, standalone). Fields use 16px text so iOS doesn't zoom in on them, the composer folds its model picker away, and Usage and mission control fit small screens.
+**On a phone:** the head works as a home-screen app (manifest, icon, standalone). Fields use 16px text so iOS doesn't zoom in on them, the composer shows its model as a chip, and Usage and mission control fit small screens.
 
 ### Hosts
 
@@ -608,11 +608,12 @@ Hooks are shell commands that run on the worker at set points in every session. 
 
 ### Workspace
 
-The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ › back and forward, its name, ⧉, ✕). Up to four sit side by side; more stack in those four columns in turn: the fifth halves the first column (the other three stay full height), the sixth the second, and so on, until the ninth makes the first column three high. In a column of three or more, the tile you last used there takes half the height and the others share the rest (it grows when your click finishes, so what you clicked doesn't move away).
+The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ › back and forward, its name, ⧉, minimize, ⛶ focus, ✕). Up to four sit side by side; more stack in those four columns in turn: the fifth halves the first column (the other three stay full height), the sixth the second, and so on, until the ninth makes the first column three high. In a column of three or more, the tile you last used there takes half the height and the others share the rest (it grows when your click finishes, so what you clicked doesn't move away).
 
 - **Inside a tile:** at most two panes, a list and the item opened from it. Clicking anything inside a tile opens it in that tile's right pane, beside the list, replacing what was there. ‹ and › (⌘[ / ⌘]) step through the tile's own history.
-- **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–9 focus a tile. A session that is already open is shown where it is instead of opening twice.
-- **A session's tile** wears the session's colour on its bar, with its state (idle, running, starting, failed, needs approval). Each session gets a colour when it starts (the one its realm's recent sessions use least; side chats and subagents take their parent's); click the dot in the bar (or the palette in the rail's card) to change it. `PUT /api/v1/sessions/{id}/colour`.
+- **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–9 focus a tile, numbered in reading order (the columns left to right, each top to bottom); a session open in a tile shows that number on its rows in the dock. A session that is already open is shown where it is instead of opening twice.
+- **Minimize** (the bar's — beside ⛶) hides a tile, still loaded, keeping its column, its place in it, its history and where it was scrolled; the others take its room. The dock's **Minimized** group brings it back, as does opening its session from anywhere or its ⌘ number. The last tile shown can't be minimized.
+- **A session's tile** has the session's mark as a stripe along the top of its bar (the bar keeps the panel's own colours, so it reads whatever the mark), with its state (idle, running, starting, failed, needs approval). Double-click its name in the bar to rename it. Each session gets a colour when it starts (the one its realm's recent sessions use least; side chats and subagents take their parent's); click the dot in the bar (or the palette in the rail's card) to change it. `PUT /api/v1/sessions/{id}/colour`.
 - **⋯ in a session tile's bar** opens the session's header as a popover (where it runs, labels, Transcript / Changes / Files / Terminal / Outputs / Config, Details, Find, New like this, Archive), so it is at hand however far down the transcript you are.
 - **The header's navigation** (Sessions, Decisions, Settings…) replaces what the focused tile shows. Back brings it back.
 - **Activity dock** (left, on wide screens), in sections:
@@ -621,13 +622,17 @@ The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ ›
   - **Finished** (green, red when failed): sessions that ended while not on screen, until you open them. ✕ lets one go, **clear** all of them; the latest 20 are kept;
   - **Pinned** (☆ in a session's header).
 
+  Hide the dock with **«** in it (or ⌘\\): a strip stays at the left edge, and pointing at it slides the dock out over the tiles until you move away. **»** keeps it open again.
+
   Below it, **Sessions**: every session (with the label filter's labels), one narrow row each in its colour, grouped as the session list is (**group ▾**; the grouping is the same setting) with groups you fold remembered. Hovering a row pops out its full title, state, worker, folder, model, labels and colour, with **Open**, **New tile** and **New like this**. Both sections fold.
 
   **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
 - **Session details:** **Details** in a session's header opens a card at its top right with where it runs (worker, folder, branch, worktree, model), how full its context is (with **Compact now**), its usage, and the lines it changed (**Review** opens Changes). It stays open or closed as you leave it.
 - **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, nothing of any other realm. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces this, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
 - **Light or dark:** Settings → Appearance: follow the system, or always light or dark (kept in each browser).
-- **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; one pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰.
+- **Phones:** one tile at a time with a switcher, Inbox and **+** at the bottom; one pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰. A phone on its side keeps this layout: the desktop one needs 512px of height as well as width. On a touch screen Return is a new line in a message box; ⌘/Ctrl+Enter sends everywhere.
+- **The message box** grows with what you type, up to 40% of the window, then scrolls. An image pasted, dropped or attached opens full size when you click it, before you send. The session's model and its subagents' model are chips under the box, each opening its pickers; a change waiting for Send shows beside them.
+- **Start session** (the Sessions page) opens the new session in place of the form's tile (‹ goes back to it); one started from a popup (New like this, or from work or mail) gets a tile of its own. The session opens at once: the memex's brief for it is fetched afterwards, before its worker gets it.
 - The workspace is saved in the browser; the address bar shows the focused pane, so links and reloads land in the right place.
 
 ### Search

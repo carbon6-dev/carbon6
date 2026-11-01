@@ -10,7 +10,7 @@ Status: built (2026-10-30). Decided with you:
 
 A mark is a colour (`sky`, `navy`…) or a colour in a pattern (`navy/dots`). The colours: sky, emerald, amber, rose, violet, teal, orange, indigo, lime, pink, cyan, fuchsia (the original twelve), then red, yellow, blue, brown, navy, olive, maroon and slate. The patterns: `hstripes`, `vstripes`, `diagonal`, `dots`, drawn in the colour on a pale tint of it. New things take marks in order, all plain colours before any pattern (`c6_api::marks::all`), the one least used first.
 
-A session's own mark is its `colour` (any mark now; old sessions keep theirs). Its tile's bar is a tint of the colour with the pattern faint over it; its dot, its rail row, its dock line and its list row wear the mark itself.
+A session's own mark is its `colour` (any mark now; old sessions keep theirs). Its tile's bar has the mark as a stripe along its top (the bar keeps the panel's own colours, so its text reads whatever the mark); its dot, its rail row, its dock line and its list row wear the mark itself.
 
 ## 2. Aspects and shapes
 
