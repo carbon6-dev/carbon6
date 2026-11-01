@@ -492,7 +492,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             // Back at the end: what you scrolled back to goes again.
             feed.trim();
             request_animation_frame(move || {
-                if let Some(el) = scroller.get_untracked() {
+                if let Some(el) = scroller.try_get_untracked().flatten() {
                     crate::workspace::glide_to_end(&el);
                 }
             });
@@ -1425,6 +1425,8 @@ fn on_sight(el: NodeRef<leptos::html::Div>, f: impl Fn() + Clone + 'static) {
 #[component]
 fn RewindPanel(session: String, seq: u64, text: String, edit: bool, on_done: Callback<()>) -> impl IntoView {
     let draft = RwSignal::new(text);
+    let draft_box = NodeRef::<leptos::html::Textarea>::new();
+    crate::util::autosize(draft_box, move || draft.track());
     let restore = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -1454,7 +1456,7 @@ fn RewindPanel(session: String, seq: u64, text: String, edit: bool, on_done: Cal
         <div class="space-y-2 rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/30">
             {if edit {
                 view! {
-                    <textarea class=format!("{INPUT} min-h-[3rem] resize-y") prop:value=move || draft.get()
+                    <textarea node_ref=draft_box class=format!("{INPUT} {} min-h-[3rem]", crate::util::GROWS) prop:value=move || draft.get()
                         on:input=move |ev| draft.set(event_target_value(&ev))
                         on:keydown=move |ev| {
                             if crate::util::sends(&ev) { ev.prevent_default(); go(); }
@@ -1724,7 +1726,8 @@ const HANDOFF_HELP: &str = "Claude Code and carbon6's agent are different runtim
     ones shortened) as context. Hidden reasoning, provider-side state and unfinished tool calls do not carry over, and you cannot rewind to \
     before the handoff.";
 
-const SMALL_INPUT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900";
+const SMALL_INPUT: &str =
+    "rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100";
 
 /// The question box that starts a side chat after `anchor_seq`.
 #[component]
@@ -1758,6 +1761,7 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
         });
     };
     let input = NodeRef::<leptos::html::Textarea>::new();
+    crate::util::autosize(input, move || text.track());
     Effect::new(move || {
         if let Some(el) = input.get() {
             let _ = el.focus();
@@ -1767,7 +1771,7 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
         <div class="ml-2 space-y-2 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/30">
             <textarea
                 node_ref=input
-                class=format!("{INPUT} min-h-[2.75rem] resize-y")
+                class=format!("{INPUT} {} min-h-[2.75rem]", crate::util::GROWS)
                 rows="2"
                 placeholder=if crate::util::touch_first() { "Ask about this in a side chat" } else { "Ask about this in a side chat (Enter to send, Esc to cancel)" }
                 prop:value=move || text.get()
@@ -1789,6 +1793,30 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
 }
 
 /// "model · effort", or just the model when it runs at its default effort.
+const CHIP: &str = "inline-flex items-center gap-1 rounded-full border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800";
+
+const SUBAGENTS_HELP: &str = "The agent starts a subagent with its Task tool when it decides a piece of work suits one (or you ask). This is the connection and model they run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.";
+
+/// A model change waiting for Send, as (what it does, more about it).
+fn switch_note(m: ModelChoice, kinds: Vec<c6_api::Connection>) -> Option<(String, String)> {
+    let _ = (m.connection.get(), m.model.get(), m.effort.get(), m.current.get());
+    let (to, model, effort) = m.switch()?;
+    if to.trim().is_empty() || model.is_empty() {
+        return Some(("choose a connection and model before sending".to_owned(), String::new()));
+    }
+    // Into or out of Claude Code: a handoff, not a switch.
+    let is_cc = |id: &str| kinds.iter().any(|c| c.id == id && c.kind == "claude_code");
+    let (from_cc, to_cc) = (is_cc(&m.current.get_untracked().0), is_cc(&to));
+    if from_cc == to_cc {
+        return Some((format!("→ {} on send", model_label(&model, &effort)), String::new()));
+    }
+    let (to, from) = if to_cc { ("Claude Code", "carbon6's agent") } else { ("carbon6's agent", "Claude Code") };
+    Some((
+        format!("hands over to {to} on send ⓘ"),
+        format!("It gets a transcript of the conversation, not {from}'s reasoning or tool state. {HANDOFF_HELP}"),
+    ))
+}
+
 fn model_label(model: &str, effort: &str) -> String {
     if effort.is_empty() { model.to_owned() } else { format!("{model} · {effort}") }
 }
@@ -2777,7 +2805,7 @@ fn ToolCard(
         live_output.track();
         if live_tail.get_value() {
             request_animation_frame(move || {
-                if let Some(el) = live_box.get_untracked() {
+                if let Some(el) = live_box.try_get_untracked().flatten() {
                     el.set_scroll_top(el.scroll_height());
                 }
             });
@@ -3135,9 +3163,12 @@ fn Composer(
     });
     let shown_next = move || next.get().filter(|_| text.with(String::is_empty) && !running.get()).map(|s| s.text);
     // The model row, on phones (always shown on wider screens).
-    let model_open = RwSignal::new(false);
+    // Which chip's pickers are open: "model" or "subagents".
+    let picking = RwSignal::new(None::<&'static str>);
+    let toggle = move |which: &'static str| picking.update(|p| *p = if *p == Some(which) { None } else { Some(which) });
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
+    crate::util::autosize(area, move || text.track());
     // One path for a tap and Tab: fill the draft, never send it. Focus in the
     // gesture handler itself so a phone can open its software keyboard.
     let accept_next = move || {
@@ -3361,7 +3392,8 @@ fn Composer(
         stop(ev);
         set_timeout(
             move || {
-                if stopping.get_untracked() {
+                // Not if the box has gone meanwhile.
+                if stopping.try_get_untracked() == Some(true) {
                     stopping.set(false);
                     send();
                 }
@@ -3465,13 +3497,17 @@ fn Composer(
                     <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                     <textarea
                         node_ref=area
-                        class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
+                        class=format!("{INPUT} {} min-h-[2.75rem]", crate::util::GROWS)
                         rows="2"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else if touch { "Message the agent (@ to mention a file or a person, client, host…, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
-                        on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
+                        on:input=move |ev| {
+                            text.set(event_target_value(&ev));
+                            update_mention();
+                            if let Some(el) = area.get_untracked() { crate::util::fit(&el); }
+                        }
                         on:click=move |_| update_mention()
                         on:paste=move |ev| {
                             let ev: web_sys::Event = ev.into();
@@ -3551,68 +3587,70 @@ fn Composer(
                         "Use suggestion"<span class="hidden sm:inline">" · Tab"</span>
                     </button>
                 })}
-                {model.map(|m| view! {
-                    // Folded away on phones until asked for.
-                    <button class="self-start text-xs text-zinc-500 sm:hidden" class:hidden=move || model_open.get()
-                        on:click=move |_| model_open.set(true)>
-                        {move || format!("Model: {} ▾", m.model.get())}
-                    </button>
-                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500 sm:flex" class:hidden=move || !model_open.get()>
-                        <span>"Model"</span>
-                        <ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code />
-                        {move || {
-                            let _ = (m.connection.get(), m.model.get(), m.effort.get());
-                            m.switch().map(|(to, model, _)| {
-                                if to.trim().is_empty() || model.is_empty() {
-                                    return view! { <span class="text-amber-600 dark:text-amber-400">"choose a connection and model before sending"</span> }.into_any();
-                                }
-                                // Into or out of Claude Code: a handoff, not a switch.
-                                let kinds = kinds.get().and_then(Result::ok).unwrap_or_default();
-                                let is_cc = |id: &str| kinds.iter().any(|c| c.id == id && c.kind == "claude_code");
-                                let (from_cc, to_cc) = (is_cc(&m.current.get_untracked().0), is_cc(&to));
-                                if from_cc == to_cc {
-                                    view! { <span class="text-amber-600 dark:text-amber-400">"switches on send"</span> }.into_any()
-                                } else {
-                                    let (to, from) = if to_cc { ("Claude Code", "carbon6's agent") } else { ("carbon6's agent", "Claude Code") };
-                                    view! {
-                                        <span class="text-amber-600 dark:text-amber-400" title=HANDOFF_HELP>
-                                            {format!("hands over to {to} on send: it gets a transcript of the conversation, not {from}'s reasoning or tool state ⓘ")}
-                                        </span>
-                                    }.into_any()
-                                }
-                            })
-                        }}
-                    </div>
-                })}
-                {subagents.map(|s| {
-                    let set = move |req: c6_api::SetSubagentModel| {
-                        spawn_local(async move {
-                            if let Err(e) = api::set_subagent_model(subagent_id.get_value(), req).await {
-                                error.set(Some(e));
-                            }
-                        });
-                    };
-                    view! {
-                    <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500 sm:flex" class:hidden=move || !model_open.get()
-                        title="The connection and model the Task tool's subagents run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.">
-                        <span>"Subagents"</span>
-                        <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=true />
-                        {move || s.change().map(|req| view! {
-                            <button class="text-violet-700 hover:underline dark:text-violet-400" on:click=move |_| set(req.clone())>"Set"</button>
+                // The model, and its subagents': one line of chips, each opening
+                // its pickers above it. A change waiting for Send shows beside.
+                {(model.is_some() || subagents.is_some()).then(|| view! {
+                    <div class="relative flex flex-wrap items-center gap-1.5 text-xs">
+                        {model.map(|m| view! {
+                            <button class=CHIP title="The model this session runs on: change it" on:click=move |_| toggle("model")>
+                                <span class="text-zinc-500 dark:text-zinc-400">"Model"</span>
+                                <span class="font-medium">{move || { let (_, mm, e) = m.current.get(); model_label(&mm, &e) }}</span>
+                                <span class="text-zinc-400">"▾"</span>
+                            </button>
+                            {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
+                                <button class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-950 dark:text-amber-300" title=title on:click=move |_| toggle("model")>{text}</button>
+                            })}
                         })}
-                        {move || {
-                            let (_, m, _) = s.current.get();
-                            if m.is_empty() {
-                                view! { <span>"(the session's model)"</span> }.into_any()
-                            } else {
-                                view! {
-                                    <button class="hover:underline" title="Run them on the session's own model"
-                                        on:click=move |_| set(c6_api::SetSubagentModel::default())>"Use the session's"</button>
-                                }.into_any()
-                            }
-                        }}
+                        {subagents.map(|s| view! {
+                            <button class=CHIP title=SUBAGENTS_HELP on:click=move |_| toggle("subagents")>
+                                <span class="text-zinc-500 dark:text-zinc-400">"Subagents"</span>
+                                <span class="font-medium">{move || {
+                                    let (_, mm, e) = s.current.get();
+                                    if mm.is_empty() { "the session's".to_owned() } else { model_label(&mm, &e) }
+                                }}</span>
+                                <span class="text-zinc-400">"▾"</span>
+                            </button>
+                        })}
+                        {move || picking.get().map(|which| view! {
+                            <div class="fixed inset-0 z-30" on:click=move |_| picking.set(None)></div>
+                            <div class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(None) }>
+                                {match which {
+                                    "model" => model.map(|m| view! {
+                                        <div class="font-medium">"Model"</div>
+                                        <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code /></div>
+                                        {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
+                                            <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-zinc-500 dark:text-zinc-400">{title}</span> })}</p>
+                                        })}
+                                        <p class="text-zinc-500 dark:text-zinc-400">"It switches when you send your next message."</p>
+                                    }.into_any()),
+                                    _ => subagents.map(|s| {
+                                        let set = move |req: c6_api::SetSubagentModel| {
+                                            spawn_local(async move {
+                                                if let Err(e) = api::set_subagent_model(subagent_id.get_value(), req).await {
+                                                    error.set(Some(e));
+                                                }
+                                            });
+                                        };
+                                        view! {
+                                            <div class="font-medium">"Subagents"</div>
+                                            <p class="max-w-md text-zinc-500 dark:text-zinc-400">{SUBAGENTS_HELP}</p>
+                                            <div class="flex flex-wrap items-center gap-2">
+                                                <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=true />
+                                                {move || s.change().map(|req| view! {
+                                                    <button class="rounded-md bg-violet-600 px-2 py-1 text-white hover:bg-violet-700" on:click=move |_| set(req.clone())>"Set"</button>
+                                                })}
+                                                {move || (!s.current.get().1.is_empty()).then(|| view! {
+                                                    <button class="hover:underline" title="Run them on the session's own model"
+                                                        on:click=move |_| set(c6_api::SetSubagentModel::default())>"Use the session's"</button>
+                                                })}
+                                            </div>
+                                        }.into_any()
+                                    }),
+                                }}
+                            </div>
+                        })}
                     </div>
-                    }
                 })}
                 {wake.map(|w| view! {
                     <label class="flex items-center gap-1.5 self-start text-xs text-zinc-500"

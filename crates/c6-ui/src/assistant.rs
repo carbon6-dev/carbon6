@@ -37,6 +37,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let area = NodeRef::<leptos::html::Textarea>::new();
+    crate::util::autosize(area, move || text.track());
     Effect::new(move || {
         if let Some(el) = area.get() {
             let _ = el.focus();
@@ -71,7 +72,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                     <h2 class="font-medium">"Ask carbon6"</h2>
                     <span class="text-xs text-zinc-500">"anything you can do in the UI, or about your setup"</span>
                 </div>
-                <textarea node_ref=area class=format!("{INPUT} min-h-24")
+                <textarea node_ref=area class=format!("{INPUT} {} min-h-24", crate::util::GROWS)
                     placeholder="e.g. What can I do in carbon6? · Which models are set up for vision? · Create an enrollment token for a new worker"
                     prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
                     on:keydown=move |ev| {
