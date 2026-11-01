@@ -127,7 +127,7 @@ pub fn WorkerPage(id: String) -> impl IntoView {
 pub fn TabButton(tab: RwSignal<&'static str>, label: &'static str, value: &'static str) -> impl IntoView {
     view! {
         <button
-            class=move || if tab.get() == value { "rounded-md bg-zinc-200 px-2.5 py-1 text-sm dark:bg-zinc-800" } else { "rounded-md px-2.5 py-1 text-sm text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-900" }
+            class=move || if tab.get() == value { "rounded-md bg-zinc-200 px-2.5 py-1 text-sm text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100" } else { "rounded-md px-2.5 py-1 text-sm text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" }
             on:click=move |_| tab.set(value)
         >
             {label}

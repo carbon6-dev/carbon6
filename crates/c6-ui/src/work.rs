@@ -898,7 +898,7 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
         });
     };
     view! {
-        <span class="inline-flex min-w-0 items-center gap-1 text-xs text-zinc-500">
+        <span class="inline-flex min-w-0 items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400">
             <span>"Work:"</span>
             {move || current().map(|w| view! {
                 {(!w.fields.project.is_empty()).then(|| view! {
@@ -914,7 +914,7 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
                 </Go>
                 <StatePill state=w.state.clone() />
             })}
-            <select class="max-w-40 cursor-pointer rounded bg-transparent px-1 text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+            <select class="max-w-40 cursor-pointer rounded bg-transparent px-1 text-zinc-600 hover:bg-zinc-200/60 dark:text-zinc-400 dark:hover:bg-zinc-800"
                 title="The work this session serves (docs/work.md)"
                 prop:value=move || { all.track(); mine.track(); String::new() }
                 on:change=move |ev| { let to = event_target_value(&ev); if !to.is_empty() { change(to) } }>

@@ -517,7 +517,7 @@ fn Brand() -> impl IntoView {
             <span class="shrink-0" inner_html=MARK></span>
             <span class="hidden font-semibold tracking-tight sm:inline">"carbon6"</span>
             {move || v.now.get().map(|full| view! {
-                <span class="rounded bg-zinc-200/70 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" title=format!("carbon6 {full}")>
+                <span class="hidden rounded bg-zinc-200/70 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 sm:inline dark:bg-zinc-800 dark:text-zinc-400" title=format!("carbon6 {full}")>
                     {short_version(&full)}
                 </span>
             })}
