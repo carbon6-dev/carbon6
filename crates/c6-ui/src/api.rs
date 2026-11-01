@@ -1188,6 +1188,12 @@ pub async fn suggestion_seen(id: String, for_seq: i64, accepted: bool) {
     }
 }
 
+/// You've seen how a session stands (it's shown): its finished turn stops
+/// making its work need you.
+pub async fn session_seen(id: String) {
+    let _ = empty(Request::post(&format!("/api/v1/sessions/{id}/seen")).send().await).await;
+}
+
 /// A session's open decisions (not its approvals and questions: those are in its log).
 pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await
@@ -1338,6 +1344,11 @@ pub async fn work_merge(id: String, from: String) -> Result<WorkItem, String> {
 
 pub async fn work_refresh(id: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/work/{id}/refresh")).send().await).await
+}
+
+/// You've seen how its sessions stand: their finished turns stop asking.
+pub async fn work_seen(id: String) -> Result<WorkItem, String> {
+    json(Request::post(&format!("/api/v1/work/{id}/seen")).send().await).await
 }
 
 pub async fn work_proposals() -> Result<Vec<WorkProposal>, String> {

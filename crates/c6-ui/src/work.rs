@@ -22,6 +22,19 @@ fn waiting(items: &[WorkItem]) -> usize {
     items.iter().filter(|w| matches!(w.state.as_str(), "needs_you" | "quiet")).count()
 }
 
+/// Whether a session's finished turn (or failure) you haven't seen makes
+/// it need you: what Mark seen clears (an open decision, a reply you owe
+/// or "looks done" asks until answered).
+fn unseen(w: &WorkItem) -> bool {
+    w.state == "needs_you"
+        && w.live.iter().any(|l| l.reference.starts_with("session:") && matches!(l.state.as_str(), "idle" | "failed") && !l.seen)
+}
+
+/// You've seen how a piece of work's sessions stand, then `after`.
+fn mark_seen(id: String, after: impl Fn(Result<WorkItem, String>) + 'static) {
+    spawn_local(async move { after(api::work_seen(id).await) });
+}
+
 /// Loads open work again when sessions change (at most every 10 s, not
 /// while you type) and every half minute.
 fn open_work() -> (LocalResource<Result<Vec<WorkItem>, String>>, RwSignal<u32>) {
@@ -210,7 +223,8 @@ pub fn WorkPage() -> impl IntoView {
             finding.set(false);
         });
     };
-    // The keys: J/K move, Enter opens, E done, H tomorrow, # drop, R resume.
+    // The keys: J/K move, Enter opens, E done, H tomorrow, # drop, R resume,
+    // S seen.
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         let in_field = ev
             .target()
@@ -228,6 +242,7 @@ pub fn WorkPage() -> impl IntoView {
             "e" => settle(w.id, WorkPatch { status: Some("done".into()), ..Default::default() }, done),
             "h" => settle(w.id, WorkPatch { snooze_until: Some(tomorrow()), ..Default::default() }, done),
             "#" => settle(w.id, WorkPatch { status: Some("dropped".into()), ..Default::default() }, done),
+            "s" => mark_seen(w.id, done),
             "r" => {
                 if !resume(&w) {
                     error.set(Some("Nothing to resume: no session belongs to it yet. Pick it up instead.".into()));
@@ -250,8 +265,16 @@ pub fn WorkPage() -> impl IntoView {
                         (n, w) => format!("{n} open · {w} need a look"),
                     }
                 }}</span>
+                {move || {
+                    let these: Vec<String> = items.get().into_iter().filter(unseen).map(|w| w.id).collect();
+                    (!these.is_empty()).then(|| view! {
+                        <button class="text-xs text-zinc-500 underline"
+                            title="You've seen how their sessions stand: finished turns stop asking for you until they finish another (open decisions and replies you owe still ask)"
+                            on:click=move |_| { for id in these.clone() { mark_seen(id, done) } }>"Mark all seen"</button>
+                    })
+                }}
                 <span class="flex-1"></span>
-                <span class="hidden text-xs text-zinc-400 sm:inline">"J/K move · Enter open · E done · H tomorrow · # drop · R resume"</span>
+                <span class="hidden text-xs text-zinc-400 sm:inline">"J/K move · Enter open · E done · H tomorrow · # drop · R resume · S seen"</span>
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap gap-2">
@@ -669,6 +692,11 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                             <div class="flex flex-wrap items-center gap-2 text-sm">
                                 <StatePill state=w.state.clone() />
                                 <span class="text-zinc-600 dark:text-zinc-400">{w.why.clone()}</span>
+                                {unseen(&w).then(|| view! {
+                                    <button class=format!("{BUTTON_QUIET} text-xs")
+                                        title="You've seen how its sessions stand: their finished turns stop asking for you until they finish another (S in the list)"
+                                        on:click=move |_| mark_seen(id.get_value(), apply)>"Mark seen"</button>
+                                })}
                             </div>
                             <ProjectPick w=w.clone() apply=Callback::new(apply) />
                         </header>
@@ -802,7 +830,11 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 view! {
                                     <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
                                         <AttachedLink l=l.clone() />
-                                        {(!l.state.is_empty()).then(|| view! { <span class="shrink-0 text-xs text-zinc-500">{l.state.replace('_', " ")}</span> })}
+                                        {(!l.state.is_empty()).then(|| view! {
+                                            <span class="shrink-0 text-xs text-zinc-500" title=l.seen.then_some("You've seen it since")>
+                                                {format!("{}{}", l.state.replace('_', " "), if l.seen { " · seen" } else { "" })}
+                                            </span>
+                                        })}
                                         {(!detail.is_empty()).then(|| view! { <span class="max-w-48 shrink truncate text-xs text-zinc-400" title=detail.clone()>{detail.clone()}</span> })}
                                         {(by == "guess").then(|| view! { <span class="shrink-0 text-[11px] text-zinc-400" title="An agent put it here; take it off if it doesn't belong">"guessed"</span> })}
                                         {(l.at > 0).then(|| view! { <span class="shrink-0 text-xs text-zinc-400">{since(l.at)}</span> })}
@@ -1080,5 +1112,19 @@ mod tests {
         assert_eq!(attached_view("session:abc"), Some(View::session("abc")));
         assert_eq!(attached_view("decision:7"), Some(View::Decisions));
         assert_eq!(attached_view("https://example.com/issue/1"), None);
+    }
+
+    #[test]
+    fn mark_seen_is_offered_for_a_turn_end_you_have_not_seen() {
+        let live =
+            |r: &str, state: &str, seen: bool| LiveAttached { reference: r.into(), title: r.into(), state: state.into(), at: 1, seen };
+        let w = |state: &str, live: Vec<LiveAttached>| WorkItem { state: state.into(), live, ..Default::default() };
+        assert!(unseen(&w("needs_you", vec![live("session:a", "idle", false)])));
+        assert!(unseen(&w("needs_you", vec![live("session:a", "failed", false)])));
+        // Only a decision asks: seen doesn't answer it.
+        assert!(!unseen(&w("needs_you", vec![live("session:a", "idle", true), live("decision:1", "open", false)])));
+        assert!(!unseen(&w("quiet", vec![live("session:a", "idle", false)])));
+        // The Work link counts what needs you, not what you've seen.
+        assert_eq!(waiting(&[w("needs_you", vec![]), w("open", vec![live("session:a", "idle", true)]), w("quiet", vec![])]), 2);
     }
 }

@@ -83,6 +83,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message))
+        .route("/api/v1/sessions/{id}/seen", post(seen_session))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
@@ -178,6 +179,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/work/{id}/detach", post(detach_work))
         .route("/api/v1/work/{id}/merge", post(merge_work))
         .route("/api/v1/work/{id}/refresh", post(refresh_work))
+        .route("/api/v1/work/{id}/seen", post(seen_work))
         .route("/api/v1/work/{id}/pickup", get(pickup_work))
         .route("/api/v1/work/{id}/todos", post(add_work_todo))
         .route("/api/v1/work/{id}/todos/{todo}", axum::routing::patch(edit_work_todo).delete(remove_work_todo))
@@ -1629,7 +1631,25 @@ async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<api::SendMessage>,
 ) -> ApiResult<Json<api::QueuedInput>> {
-    Ok(Json(crate::sessions::send_input(&st, &id, &req).await?))
+    // You answered: you'd seen how it stood (docs/work.md §3), not the
+    // turn this starts.
+    let at = now_ms();
+    let queued = crate::sessions::send_input(&st, &id, &req).await?;
+    // The message is queued: failing to note this mustn't make the send
+    // look failed (and get it sent twice).
+    if let Err(e) = crate::work::seen_session(&st, &id, at).await {
+        tracing::warn!(session = %id, "noting it seen: {e:#}");
+    }
+    Ok(Json(queued))
+}
+
+/// You've seen how a session stands: its last turn end stops asking for you.
+async fn seen_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    if st.store.session(&id).await?.is_none() {
+        return Err(ApiErr(StatusCode::NOT_FOUND, "no such session".into()));
+    }
+    crate::work::seen_session(&st, &id, now_ms()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// An attachment of a user message, as sent.
@@ -4028,6 +4048,14 @@ async fn refresh_work(
     crate::work::get(&st, &id, &caller).await?;
     crate::work::refresh(&st, &id);
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn seen_work(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(crate::work::seen(&st, &id, &caller).await?))
 }
 
 async fn pickup_work(

@@ -677,6 +677,25 @@ impl Store {
         Ok(sqlx::query_as("SELECT * FROM sessions WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
 
+    /// When a session's last turn ended (or it failed) and when you last
+    /// saw it (docs/work.md §3); 0 for never.
+    pub async fn turn_seen(&self, id: &str) -> anyhow::Result<(i64, i64)> {
+        let r = sqlx::query("SELECT turn_ended_at, seen_at FROM sessions WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
+        Ok(r.map(|r| (r.get("turn_ended_at"), r.get("seen_at"))).unwrap_or_default())
+    }
+
+    /// You've seen how a session stands, at `at`: a turn that ended before
+    /// no longer asks for you. Whether it had one you hadn't seen.
+    pub async fn mark_seen(&self, id: &str, at: i64) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE sessions SET seen_at = ? WHERE id = ? AND seen_at < turn_ended_at AND turn_ended_at <= ?")
+            .bind(at)
+            .bind(id)
+            .bind(at)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
     /// The most recently active top-level sessions, of one realm (or
     /// every realm's): a realm's own, so a busy realm can't crowd another
     /// out of its list.
@@ -1121,9 +1140,11 @@ impl Store {
                         Ok(c6_proto::TurnEndReason::WorkerRestarted) => "worker_restarted",
                         _ => "error",
                     };
-                    // Nothing waits past its turn.
-                    sqlx::query("UPDATE sessions SET awaiting = 0, end_reason = ? WHERE id = ?")
+                    // Nothing waits past its turn; when it ended, for
+                    // whether you've seen it (docs/work.md §3).
+                    sqlx::query("UPDATE sessions SET awaiting = 0, end_reason = ?, turn_ended_at = ? WHERE id = ?")
                         .bind(reason)
+                        .bind(c6_core::now_ms())
                         .bind(session_id)
                         .execute(&mut *tx)
                         .await?;
@@ -1398,9 +1419,11 @@ impl Store {
     /// Fails a session whose commands are held, and them with it.
     pub async fn fail_held(&self, session_id: &str, reason: &str) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+        let now = c6_core::now_ms();
+        sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ?, turn_ended_at = ? WHERE id = ?")
             .bind(reason)
-            .bind(c6_core::now_ms())
+            .bind(now)
+            .bind(now)
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
@@ -1469,9 +1492,11 @@ impl Store {
         };
         let session_id: String = row.get("session_id");
         if row.get::<Option<String>, _>("text").is_none() {
-            sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+            let now = c6_core::now_ms();
+            sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ?, turn_ended_at = ? WHERE id = ?")
                 .bind(reason)
-                .bind(c6_core::now_ms())
+                .bind(now)
+                .bind(now)
                 .bind(&session_id)
                 .execute(&mut *tx)
                 .await?;
@@ -1631,5 +1656,21 @@ mod tests {
         assert_eq!((queued.len(), queued[0].state.as_str()), (1, "rejected"));
         assert!(store.held_sessions().await.unwrap().is_empty());
         assert!(store.pending_commands(w, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_seen_once_you_look_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let w = WorkerId::new();
+        store.create_session(&session("a", w), &[command("a-create", "a", w, None)], true).await.unwrap();
+        assert_eq!(store.turn_seen("a").await.unwrap(), (0, 0));
+        assert!(!store.mark_seen("a", c6_core::now_ms()).await.unwrap(), "nothing ended yet");
+        store.fail_held("a", "could not hand it to its worker").await.unwrap();
+        let (ended, seen) = store.turn_seen("a").await.unwrap();
+        assert!(ended > 0 && seen == 0, "{ended} {seen}");
+        assert!(store.mark_seen("a", ended).await.unwrap());
+        assert!(!store.mark_seen("a", ended + 5).await.unwrap(), "already seen");
+        assert_eq!(store.turn_seen("a").await.unwrap(), (ended, ended));
     }
 }

@@ -356,3 +356,127 @@ async fn todos_become_sessions_later() {
     assert_eq!(r.status(), 404);
     stop.cancel();
 }
+
+/// Seen (docs/work.md §3): a session's finished turn makes its work need
+/// you until you've seen it (shown, sent a message, or the work marked
+/// seen), and a later turn end asks again; an open decision asks until
+/// it's answered, seen or not.
+#[tokio::test]
+async fn a_turn_end_you_have_seen_stops_needing_you() {
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let conn: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // No agent steps of work's own: every model call here is the session's.
+    let r = http.put(format!("{api}/settings/work")).json(&json!({"guess": false, "notes": false})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let send = |req: reqwest::RequestBuilder| async move {
+        let r = req.send().await.unwrap();
+        let status = r.status();
+        let body: Value = if status == 204 { Value::Null } else { r.json().await.unwrap() };
+        assert!(status.is_success(), "{status}: {body}");
+        body
+    };
+    let idle = |id: String, turns: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= turns).then_some(())
+            })
+            .await
+        }
+    };
+    let w: WorkItem = serde_json::from_value(send(http.post(format!("{api}/work")).json(&json!({"title": "Improve C6"}))).await).unwrap();
+    let item = async || serde_json::from_value::<WorkItem>(send(http.get(format!("{api}/work/{}", w.id))).await).unwrap();
+    // What the Work link counts: work that needs you or went quiet.
+    let counted = async || {
+        let all: Vec<WorkItem> = serde_json::from_value(send(http.get(format!("{api}/work"))).await).unwrap();
+        all.iter().filter(|w| matches!(w.state.as_str(), "needs_you" | "quiet")).count()
+    };
+
+    // 1. A session's turn ends: your move, counted.
+    mock.push(Reply::Text("The pager is fixed.".into()));
+    let s: Session = serde_json::from_value(
+        send(http.post(format!("{api}/sessions")).json(&json!({
+            "worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn.id, "model": "m",
+            "title": "Pager", "prompt": "fix the pager", "work": w.id,
+        })))
+        .await,
+    )
+    .unwrap();
+    idle(s.id.clone(), 1).await;
+    let now = item().await;
+    assert_eq!((now.state.as_str(), now.why.as_str()), ("needs_you", "Pager finished its turn: your move"));
+    assert_eq!(counted().await, 1);
+
+    // 2. You answer it: you'd seen that turn end; the next one you haven't.
+    let gate = mock.push_gated(Reply::Text("And the footer.".into()));
+    send(http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "and the footer"}))).await;
+    let (ended, seen) = head.state.store.turn_seen(&s.id).await.unwrap();
+    assert!(ended > 0 && seen >= ended, "sending counts as seen: ended {ended}, seen {seen}");
+    // Its next turn ends after that.
+    eventually("the clock to pass the message", async || (c6_core::now_ms() > seen).then_some(())).await;
+    gate.notify_one();
+    idle(s.id.clone(), 2).await;
+    assert_eq!(item().await.state, "needs_you", "a newer turn end asks again");
+    assert_eq!(counted().await, 1);
+
+    // 3. Shown: seen, and no longer counted.
+    send(http.post(format!("{api}/sessions/{}/seen", s.id))).await;
+    let now = item().await;
+    assert_eq!((now.state.as_str(), now.why.as_str()), ("open", "Pager finished its turn (seen)"));
+    assert!(now.live[0].seen, "{:?}", now.live);
+    assert_eq!(counted().await, 0);
+
+    // 4. Another turn, and you mark the work seen.
+    mock.push(Reply::Text("Tests pass.".into()));
+    send(http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "run the tests"}))).await;
+    idle(s.id.clone(), 3).await;
+    assert_eq!(item().await.state, "needs_you");
+    let now: WorkItem = serde_json::from_value(send(http.post(format!("{api}/work/{}/seen", w.id))).await).unwrap();
+    assert_eq!(now.state, "open", "{}", now.why);
+    assert_eq!(counted().await, 0);
+
+    // 5. An open decision isn't cleared by seen: it asks until answered.
+    let d: Value =
+        send(http.post(format!("{api}/decisions")).json(&json!({"title": "Ship it?", "options": [{"label": "yes"}, {"label": "no"}]})))
+            .await;
+    send(http.post(format!("{api}/work/{}/attach", w.id)).json(&json!({"ref": format!("decision:{}", d["id"])}))).await;
+    let now: WorkItem = serde_json::from_value(send(http.post(format!("{api}/work/{}/seen", w.id))).await).unwrap();
+    assert_eq!((now.state.as_str(), now.why.as_str()), ("needs_you", "Decide: Ship it?"));
+    assert_eq!(counted().await, 1);
+    send(http.post(format!("{api}/decisions/{}/answer", d["id"])).json(&json!({"option": "yes"}))).await;
+    let now = item().await;
+    assert_eq!((now.state.as_str(), now.why.as_str()), ("open", "Pager finished its turn (seen)"));
+    assert_eq!(counted().await, 0);
+    stop.cancel();
+}

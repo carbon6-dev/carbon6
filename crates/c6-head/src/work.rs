@@ -559,6 +559,34 @@ pub async fn detach(st: &HeadState, id: &str, r: &WorkRef, caller: &Caller) -> a
     get(st, id, caller).await
 }
 
+/// You've seen how a session stood at `at` (you opened it, or sent it a
+/// message): a turn end or failure before then no longer makes its work
+/// need you.
+pub async fn seen_session(st: &HeadState, session_id: &str, at: i64) -> anyhow::Result<()> {
+    if st.store.mark_seen(session_id, at).await? {
+        st.registry.bump();
+    }
+    Ok(())
+}
+
+/// Marks a piece of work seen: each of its sessions' last turn end or
+/// failure. What else asks (a question, an open decision, a reply you owe,
+/// "looks done", an answered comment) still does, until it's answered.
+pub async fn seen(st: &HeadState, id: &str, caller: &Caller) -> anyhow::Result<WorkItem> {
+    let r = visible(st, id, caller).await?;
+    let now = now_ms();
+    let mut any = false;
+    for a in &r.fields.attached {
+        if let Some(s) = a.reference.strip_prefix("session:") {
+            any |= st.store.mark_seen(s, now).await?;
+        }
+    }
+    if any {
+        st.registry.bump();
+    }
+    get(st, id, caller).await
+}
+
 /// `from` joins `id`: what's attached to it, and its done-when if `id` has
 /// none; `from` is gone (its history stays).
 pub async fn merge(st: &HeadState, id: &str, from: &str, caller: &Caller) -> anyhow::Result<WorkItem> {
@@ -778,7 +806,8 @@ pub async fn describe(st: &HeadState, realm: &str, reference: &str) -> anyhow::R
         }
     }
     if let Some(id) = reference.strip_prefix("work:") {
-        let mut l = LiveAttached { reference: reference.to_owned(), title: reference.to_owned(), state: "gone".into(), at: 0 };
+        let mut l =
+            LiveAttached { reference: reference.to_owned(), title: reference.to_owned(), state: "gone".into(), ..Default::default() };
         if let Some(r) = load(st, id).await?.filter(|r| r.realm == realm) {
             let item = view(st, vec![r]).await?.remove(0);
             (l.title, l.state, l.at) = (item.fields.title, item.state, item.fields.moved_at);
@@ -786,7 +815,8 @@ pub async fn describe(st: &HeadState, realm: &str, reference: &str) -> anyhow::R
         return Ok(l);
     }
     if let Some(id) = reference.strip_prefix("project:") {
-        let mut l = LiveAttached { reference: reference.to_owned(), title: reference.to_owned(), state: "gone".into(), at: 0 };
+        let mut l =
+            LiveAttached { reference: reference.to_owned(), title: reference.to_owned(), state: "gone".into(), ..Default::default() };
         if let Some(r) = crate::projects::load(st, id).await?.filter(|r| r.realm == realm) {
             let item = crate::projects::view(st, vec![r]).await?.remove(0);
             (l.title, l.state, l.at) = (item.fields.title, item.state, item.fields.moved_at);
@@ -798,7 +828,7 @@ pub async fn describe(st: &HeadState, realm: &str, reference: &str) -> anyhow::R
 }
 
 async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(String, i64), Value>) -> anyhow::Result<LiveAttached> {
-    let mut l = LiveAttached { reference: a.reference.clone(), title: a.title.clone(), state: a.status.clone(), at: 0 };
+    let mut l = LiveAttached { reference: a.reference.clone(), title: a.title.clone(), state: a.status.clone(), ..Default::default() };
     if let Some(id) = a.reference.strip_prefix("session:") {
         match st.store.session(id).await? {
             Some(s) => {
@@ -815,6 +845,11 @@ async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(
                 } else {
                     "idle".into()
                 };
+                // Its turn ended (or it failed) before you last saw it.
+                if matches!(l.state.as_str(), "idle" | "failed") {
+                    let (ended, seen) = st.store.turn_seen(id).await?;
+                    l.seen = ended <= seen;
+                }
             }
             None => l.state = "gone".into(),
         }
@@ -873,7 +908,8 @@ async fn asks(st: &HeadState, session_id: &str) -> anyhow::Result<bool> {
 /// Its state and why, first that holds: closed; snoozed; something asks
 /// you (looks done, a question, a failure, a reply you owe); a session
 /// runs; others are on it; nothing moved for a while (gone quiet); an
-/// agent finished its turn (your move); else open.
+/// agent finished its turn (your move); else open. A failure or a turn end
+/// you've seen since doesn't ask any more; the rest ask until answered.
 fn state_of(f: &WorkFields, live: &[LiveAttached], now: i64, s: &WorkSettings) -> (String, String) {
     let r = |state: &str, why: String| (state.to_owned(), why);
     if f.status != "open" {
@@ -889,7 +925,7 @@ fn state_of(f: &WorkFields, live: &[LiveAttached], now: i64, s: &WorkSettings) -
     if let Some(l) = live.iter().find(|l| l.state == "needs_you") {
         return r("needs_you", format!("{} waits for your answer", l.title));
     }
-    if let Some(l) = live.iter().find(|l| l.state == "failed") {
+    if let Some(l) = live.iter().find(|l| l.state == "failed" && !l.seen) {
         return r("needs_you", format!("{} failed", l.title));
     }
     if let Some(l) = live.iter().find(|l| l.reference.starts_with("request:") && l.state == "open") {
@@ -913,13 +949,23 @@ fn state_of(f: &WorkFields, live: &[LiveAttached], now: i64, s: &WorkSettings) -
         let days = (now - last) / DAY;
         return r("quiet", format!("Nothing has moved for {days} days"));
     }
-    if let Some(l) = live.iter().filter(|l| l.reference.starts_with("session:") && l.state == "idle").max_by_key(|l| l.at) {
+    let ended = |seen: bool| {
+        live.iter().filter(move |l| l.reference.starts_with("session:") && l.state == "idle" && l.seen == seen).max_by_key(|l| l.at)
+    };
+    if let Some(l) = ended(false) {
         return r("needs_you", format!("{} finished its turn: your move", l.title));
     }
     let open: Vec<&Todo> = f.todos.iter().filter(|t| t.done_at.is_none()).collect();
     if let Some(next) = open.first() {
         let left = if open.len() == 1 { "1 to-do left".to_owned() } else { format!("{} of {} to-dos left", open.len(), f.todos.len()) };
         return r("open", format!("{left}: {}", next.text));
+    }
+    // Seen: still your move, but nothing new asks.
+    if let Some(l) = live.iter().find(|l| l.state == "failed") {
+        return r("open", format!("{} failed (seen)", l.title));
+    }
+    if let Some(l) = ended(true) {
+        return r("open", format!("{} finished its turn (seen)", l.title));
     }
     r("open", if f.attached.is_empty() { "Nothing started yet".into() } else { String::new() })
 }
@@ -1846,7 +1892,7 @@ mod tests {
     use super::*;
 
     fn live(reference: &str, state: &str, at: i64) -> LiveAttached {
-        LiveAttached { reference: reference.into(), title: reference.into(), state: state.into(), at }
+        LiveAttached { reference: reference.into(), title: reference.into(), state: state.into(), at, ..Default::default() }
     }
 
     #[test]
@@ -1891,6 +1937,31 @@ mod tests {
         assert_eq!(state_of(&snoozed, &[live("session:a", "idle", now)], now, &s).0, "snoozed");
         let done = WorkFields { status: "done".into(), ..f };
         assert_eq!(state_of(&done, &[live("session:a", "running", now)], now, &s).0, "done");
+    }
+
+    #[test]
+    fn a_turn_end_you_have_seen_stops_asking() {
+        let s = WorkSettings::default();
+        let now = 100 * DAY;
+        let f = WorkFields { title: "x".into(), status: "open".into(), moved_at: now - 1000, ..Default::default() };
+        let seen = |reference: &str, state: &str| LiveAttached { seen: true, ..live(reference, state, now) };
+        // Unseen: your move. Seen: still open, saying so.
+        assert_eq!(state_of(&f, &[live("session:a", "idle", now)], now, &s).0, "needs_you");
+        assert_eq!(state_of(&f, &[seen("session:a", "idle")], now, &s), ("open".into(), "session:a finished its turn (seen)".into()));
+        assert_eq!(state_of(&f, &[seen("session:a", "failed")], now, &s), ("open".into(), "session:a failed (seen)".into()));
+        // Another session's turn you haven't seen still asks.
+        let two = [seen("session:a", "idle"), live("session:b", "idle", now - 5)];
+        assert_eq!(state_of(&f, &two, now, &s), ("needs_you".into(), "session:b finished its turn: your move".into()));
+        // A question, an open decision and a reply you owe ask until answered.
+        assert_eq!(state_of(&f, &[seen("session:a", "idle"), live("session:b", "needs_you", now)], now, &s).0, "needs_you");
+        assert_eq!(state_of(&f, &[seen("session:a", "idle"), live("decision:1", "open", now)], now, &s).0, "needs_you");
+        assert_eq!(state_of(&f, &[seen("session:a", "idle"), live("request:1", "open", now)], now, &s).0, "needs_you");
+        let offered = WorkFields { offer: Some(WorkOffer { evidence: "merged".into(), at: now }), ..f.clone() };
+        assert_eq!(state_of(&offered, &[seen("session:a", "idle")], now, &s).0, "needs_you");
+        // Open to-dos say what's next.
+        let mut listed = f.clone();
+        add_todo_to(&mut listed, new_todo("Split the config", "", "you").unwrap()).unwrap();
+        assert_eq!(state_of(&listed, &[seen("session:a", "idle")], now, &s), ("open".into(), "1 to-do left: Split the config".into()));
     }
 
     #[test]

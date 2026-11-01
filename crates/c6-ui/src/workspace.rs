@@ -15,7 +15,8 @@
 //!
 //! The layout is saved in the browser; the URL shows the focused column.
 //! It also tracks attention: sessions that finished or failed while not
-//! shown, and pinned sessions, for the dock, the inbox and mission control.
+//! shown, and pinned sessions, for the dock, the inbox and mission control;
+//! and it tells the head which finished sessions you've seen (for Work).
 
 use std::collections::{HashMap, HashSet};
 
@@ -1101,6 +1102,30 @@ impl Workspace {
             let visible = ws.layout.with(Layout::visible_sessions);
             if ws.attention.with_untracked(|a| a.iter().any(|id| visible.contains(id))) {
                 ws.attention.update(|a| a.retain(|id| !visible.contains(id)));
+            }
+        });
+        // A session shown while its turn has ended (or it failed), with the
+        // page in view: you've seen it, and the head stops counting it for
+        // its work (docs/work.md §3). Told again when it changes.
+        let page = RwSignal::new(!document().hidden());
+        // It lives as long as the page does.
+        let _ = window_event_listener_untyped("visibilitychange", move |_| page.set(!document().hidden()));
+        let told = StoredValue::new(HashMap::<String, i64>::new());
+        Effect::new(move || {
+            let sessions = live.sessions.get();
+            let visible = ws.layout.with(Layout::visible_sessions);
+            if !page.get() {
+                return;
+            }
+            for s in sessions.iter().filter(|s| visible.contains(&s.id) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed))
+            {
+                if told.with_value(|t| t.get(&s.id) == Some(&s.updated_at)) {
+                    continue;
+                }
+                told.update_value(|t| {
+                    t.insert(s.id.clone(), s.updated_at);
+                });
+                leptos::task::spawn_local(api::session_seen(s.id.clone()));
             }
         });
     }
