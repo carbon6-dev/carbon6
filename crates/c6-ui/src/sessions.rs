@@ -67,7 +67,7 @@ pub fn SessionsPage() -> impl IntoView {
                                     || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
                                     || s.title.to_lowercase().contains(&q)
                                     || s.cwd.to_lowercase().contains(&q)
-                                    || live.worker_name(&s.worker_id.to_string()).to_lowercase().contains(&q)
+                                    || live.session_worker(s).to_lowercase().contains(&q)
                             })
                             .collect();
                         if sessions.is_empty() {
@@ -334,7 +334,7 @@ pub(crate) fn SessionMenu(id: String, #[prop(optional)] dismiss: Option<Callback
 #[component]
 fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let live = api::live();
-    let worker = live.worker_name(&s.worker_id.to_string());
+    let worker = live.session_worker(&s);
     let updated = s.updated_at;
     let status = s.display_status();
     let (mark, chips) = (crate::marks::fill(&crate::marks::of(&s)), s.clone());
@@ -532,7 +532,7 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
     let ws = use_workspace();
     let live = api::live();
     let now = clock();
-    let worker = live.worker_name(&s.worker_id.to_string());
+    let worker = live.session_worker(&s);
     let updated = s.updated_at;
     let (open_id, tile_id) = (s.id.clone(), s.id.clone());
     let seed = SessionSeed::from_session(&s);

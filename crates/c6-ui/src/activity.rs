@@ -262,7 +262,7 @@ pub(crate) fn tile_badge(n: usize) -> impl IntoView {
 fn DockItem(s: Session, t: Tracked) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let worker = live.worker_name(&s.worker_id.to_string());
+    let worker = live.session_worker(&s);
     let id = s.id.clone();
     let number = {
         let id = id.clone();
@@ -346,7 +346,7 @@ pub fn InboxPage() -> impl IntoView {
 fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let worker = live.worker_name(&s.worker_id.to_string());
+    let worker = live.session_worker(&s);
     let (dismiss_id, pin_id) = (s.id.clone(), s.id.clone());
     view! {
         <div class="flex items-center gap-3 px-4 py-3">
@@ -505,7 +505,7 @@ fn MissionCard(id: String) -> impl IntoView {
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
                 </Go>
                 <span class="shrink-0 text-[11px] text-zinc-500">
-                    {move || session.get().map(|s| format!("{} · {}", live.worker_name(&s.worker_id.to_string()), ago(now_ms() - s.updated_at)))}
+                    {move || session.get().map(|s| format!("{} · {}", live.session_worker(&s), ago(now_ms() - s.updated_at)))}
                 </span>
                 <crate::sessions::SessionMenu id=open_id.clone() />
             </div>

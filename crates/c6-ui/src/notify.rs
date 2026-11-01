@@ -51,7 +51,7 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
                         } else {
                             "Finished"
                         },
-                        live.worker_name(&s.worker_id.to_string())
+                        live.session_worker(s)
                     ));
                     opts.set_tag(&s.id);
                     if let Ok(n) = Notification::new_with_options(&s.title, &opts) {

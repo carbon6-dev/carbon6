@@ -74,6 +74,12 @@ impl LiveFeed {
     pub fn worker_name(&self, id: &str) -> String {
         self.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id).map(|w| w.name.clone()).unwrap_or_else(|| "unknown".into()))
     }
+
+    /// Where a session runs: its worker's name, or carbon6 for the sessions
+    /// the head runs itself (the assistant, Ask), which have no worker.
+    pub fn session_worker(&self, s: &c6_api::Session) -> String {
+        if s.on_head { "carbon6".into() } else { self.worker_name(&s.worker_id.to_string()) }
+    }
 }
 
 pub fn live() -> LiveFeed {
