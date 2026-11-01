@@ -641,6 +641,13 @@ message CreateSession {
   // no background tasks stays up. 0: the defaults (20 and 15).
   uint32 auto_turns_per_hour = 31;
   uint32 claude_code_idle_minutes = 32;
+  // carbon6's tools its Claude Code gets over the MCP bridge (Settings →
+  // Agents; names in any profile's naming); empty: the defaults (the
+  // subagent tools, documents and session messages).
+  repeated string claude_code_tools = 33;
+  // `claude_code_tools` is the choice (an empty one: none); unset (an
+  // older head): the defaults.
+  bool claude_code_tools_chosen = 34;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

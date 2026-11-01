@@ -831,9 +831,12 @@ impl SessionManager {
     /// actor if needed (after a restart, a subagent may be loaded first).
     /// None for a Claude Code parent: carbon6 runs none of its tools, so
     /// its subagents work with hooks, policies and sinks of their own.
-    fn parent_tools<'a>(&'a self, parent_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<Arc<SessionTools>>>> {
+    fn parent_tools<'a>(&'a self, parent_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<ParentTools>>> {
         Box::pin(async move {
-            Ok(self.load(parent_id).await?.filter(|h| !h.claude_code.load(std::sync::atomic::Ordering::SeqCst)).map(|h| h.tools))
+            Ok(self.load(parent_id).await?.map(|h| {
+                let claude_code = h.claude_code.load(std::sync::atomic::Ordering::SeqCst);
+                (h.tools, claude_code)
+            }))
         })
     }
 
@@ -917,28 +920,34 @@ impl SessionManager {
         let mut policies = None;
         // A subagent works with its parent's tool hooks and policies (held
         // calls wait in the parent), publisher, memory, notices and way to
-        // the head. Without its parent here (it was trimmed), its own.
-        let parent = match &delegation {
-            Some(d) => self.parent_tools(&d.parent_session_id).await.unwrap_or_else(|e| {
-                warn!(session = %session_id, parent = %d.parent_session_id, "a subagent without its parent: {e:#}");
-                None
-            }),
-            None => None,
+        // the head. Without its parent here (it was trimmed), its own. A
+        // Claude Code parent's hooks run in its CLI, not in carbon6: a
+        // subagent of one runs the head's hooks and policies itself, but
+        // what it publishes, remembers and notifies is still its parent's.
+        let (parent, parent_claude_code) = match &delegation {
+            Some(d) => match self.parent_tools(&d.parent_session_id).await {
+                Ok(Some((tools, claude_code))) => (Some(tools), claude_code),
+                Ok(None) => (None, false),
+                Err(e) => {
+                    warn!(session = %session_id, parent = %d.parent_session_id, "a subagent without its parent: {e:#}");
+                    (None, false)
+                }
+            },
+            None => (None, false),
         };
         if let Some(parent) = &parent {
-            session_tools.set_hooks(parent.hooks().map(|h| Arc::new(crate::subagent::SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
+            if !parent_claude_code {
+                session_tools.set_hooks(parent.hooks().map(|h| Arc::new(crate::subagent::SubagentHooks(h)) as Arc<dyn c6_tools::Hooks>));
+            }
             session_tools.set_publisher(parent.publisher());
             session_tools.set_memory(parent.memory());
             session_tools.set_notices(parent.notices());
             session_tools.set_head(parent.head());
         } else {
-            hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
             session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: on_behalf_of.clone() })));
         }
-        // What carbon6's tools report goes to the actor, whichever runtime
-        // the session runs on now: a handoff can change that, and in Claude
-        // Code these stay quiet (it runs its own tools).
-        if parent.is_none() {
+        if parent.is_none() || parent_claude_code {
+            hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
             // Policies first (a denial wins), then your hooks; installed
             // only while carbon6's loop runs the tools (`own_loop_hooks`).
             let (ap_tx, mut ap_rx) = mpsc::unbounded_channel();
@@ -954,6 +963,11 @@ impl SessionManager {
             if started.tool_profile != crate::claude_code::PROFILE {
                 session_tools.set_hooks(own_loop_hooks(&policies, &hooks));
             }
+        }
+        // What carbon6's tools report goes to the actor, whichever runtime
+        // the session runs on now: a handoff can change that, and in Claude
+        // Code these stay quiet (it runs its own tools).
+        if parent.is_none() {
             // Memory changes go to the actor, which logs them (the head
             // applies them).
             let (mem_tx, mut mem_rx) = mpsc::unbounded_channel();
@@ -1447,6 +1461,9 @@ struct Actor {
     /// The log says a switch away from Claude Code waits for its tasks.
     handoff_announced: bool,
 }
+
+/// A subagent's parent's tools, and whether the parent runs Claude Code.
+type ParentTools = (Arc<SessionTools>, bool);
 
 /// What a turn task gives back: the conversation, and the Claude Code
 /// process if it is still up. `None`: the turn failed to record itself.
@@ -2182,24 +2199,30 @@ impl Actor {
     /// to run on), carbon6's documents (`doc`), and the session-message
     /// tools its tool list allows.
     fn claude_code_subagent_tools(&self) -> Vec<Arc<dyn Tool>> {
-        let depth = crate::subagent::depth_of(&self.spec);
-        let connections = task_connections(&self.spec);
-        let templates = task_templates(&self.spec);
-        // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9), and
-        // messages to other sessions (docs/background.md §6), on every
-        // connection.
-        let mut tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(c6_tools::records::Doc::new(false)),
-            Arc::new(c6_tools::messages::MessageSession::new(true)),
-            Arc::new(c6_tools::messages::ListSessions::new(true)),
-        ];
-        tools.retain(|t| t.spec().name == "doc" || c6_tools::tool_allowed(&self.spec.tools, &t.spec().name));
-        if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(&self.spec, depth) {
-            return tools;
-        }
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
         let labels =
             session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
+        // The ones chosen for Claude Code sessions (Settings → Agents; by
+        // default the subagent tools, documents and session messages), of
+        // those this session has. A routing rule's tool list narrows them,
+        // except the subagent tools and documents, which it never did.
+        let chosen = claude_code_choice(&self.spec);
+        let narrowed = |name: &str| matches!(name, "doc") || c6_tools::tool_allowed(&self.spec.tools, name);
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
+            Arc::new(c6_tools::records::Doc::new(false)),
+        ];
+        tools.extend(claude_code_extras(&self.spec, &labels, c6_tools::browser::find_chrome()));
+        tools.retain(|t| {
+            let name = t.spec().name;
+            is_chosen(&chosen, &name) && narrowed(&name)
+        });
+        let depth = crate::subagent::depth_of(&self.spec);
+        let connections = task_connections(&self.spec);
+        let templates = task_templates(&self.spec);
+        if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(&self.spec, depth) {
+            return tools;
+        }
         let agents = session_agents(&self.spec, &labels);
         let mut all: Vec<Arc<dyn Tool>> = vec![
             Arc::new(
@@ -2212,8 +2235,19 @@ impl Actor {
             Arc::new(c6_tools::BashOutput::carbon6()),
             Arc::new(c6_tools::KillShell::carbon6()),
         ];
+        all.retain(|t| is_chosen(&chosen, &t.spec().name));
         all.extend(tools);
         all
+    }
+
+    /// What a Claude Code session is told about carbon6's tools it gets
+    /// (the bridge's MCP instructions): carbon6's own guidance for those
+    /// that need it, which carbon6's system prompt carries in its own loop.
+    fn claude_code_instructions(&self, tools: &[Arc<dyn Tool>]) -> String {
+        let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
+        let labels =
+            session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
+        claude_code_guidance(&self.spec, &labels, tools)
     }
 
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
@@ -2272,6 +2306,7 @@ impl Actor {
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
         // carbon6's subagents, offered to Claude Code over MCP.
         let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
+        let bridge_instructions = if claude_code { self.claude_code_instructions(&bridge_tools) } else { String::new() };
         let (manager, journal) = (self.manager.clone(), self.journal.clone());
         // Claude Code's own subagents are mirrored into sessions of their own.
         let observer = Arc::new(crate::claude_code::Observer {
@@ -2334,6 +2369,7 @@ impl Actor {
                             journal: journal.clone(),
                             matched: Mutex::default(),
                             policies: policies.clone(),
+                            instructions: bridge_instructions.clone(),
                         })
                     })
                 };
@@ -2921,6 +2957,88 @@ fn builtin_tools(
     }
 
     (tools, skills)
+}
+
+/// carbon6's tools a Claude Code session gets over its MCP bridge unless
+/// Settings → Agents says otherwise (docs/background.md §4): its subagents,
+/// documents and session messages.
+pub const CLAUDE_CODE_DEFAULT_TOOLS: &[&str] = &["Task", "SendMessage", "TaskOutput", "TaskStop", "doc", "MessageSession", "ListSessions"];
+
+/// The tools chosen for the session's Claude Code (`CreateSession`'s; from
+/// an older head that sends none: the defaults).
+fn claude_code_choice(spec: &CreateSession) -> Vec<String> {
+    if spec.claude_code_tools_chosen {
+        spec.claude_code_tools.clone()
+    } else {
+        CLAUDE_CODE_DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+    }
+}
+
+/// `name` is one of `chosen` (in any profile's naming; none chosen: none).
+fn is_chosen(chosen: &[String], name: &str) -> bool {
+    chosen.iter().any(|c| c6_tools::tool_allowed(std::slice::from_ref(c), name))
+}
+
+/// carbon6's tools that may be offered to Claude Code beyond its subagents
+/// and documents: carbon6's own, without those Claude Code has equivalents
+/// of (files, shell, web, plan, skills, its own background tasks), in
+/// Claude Code's naming.
+fn claude_code_extras(spec: &CreateSession, labels: &[String], chrome: Option<PathBuf>) -> Vec<Arc<dyn Tool>> {
+    let own: HashSet<String> = c6_tools::tools_for(ToolProfile::Claude).iter().map(|t| t.spec().name).collect();
+    let (tools, _) = builtin_tools(spec, ToolProfile::Claude, labels, chrome);
+    tools
+        .into_iter()
+        .filter(|t| {
+            let name = t.spec().name;
+            !own.contains(&name) && !matches!(name.as_str(), "WebSearch" | "Skill" | "Doc")
+        })
+        .collect()
+}
+
+/// Every carbon6 tool a Claude Code session may be given (for Settings →
+/// Agents), with its description's first sentence, the defaults first.
+pub fn claude_code_tool_names() -> Vec<(String, String)> {
+    let spec = CreateSession { memex_tools: true, memex_mail: true, memex_chat: true, memex_calendar: true, ..Default::default() };
+    let first = |d: &str| d.split(". ").next().unwrap_or(d).trim_end_matches('.').to_owned() + ".";
+    let mut out: Vec<(String, String)> = vec![
+        ("Task".into(), "Starts carbon6 subagents, on any connection and model the session may use.".into()),
+        ("SendMessage".into(), "Continues or steers one of its carbon6 subagents.".into()),
+        ("TaskOutput".into(), "Shows what a background carbon6 subagent has done so far.".into()),
+        ("TaskStop".into(), "Stops a background carbon6 subagent.".into()),
+    ];
+    let doc: Arc<dyn Tool> = Arc::new(c6_tools::records::Doc::new(false));
+    for t in std::iter::once(doc).chain(claude_code_extras(&spec, &[], Some(PathBuf::new()))) {
+        let s = t.spec();
+        out.push((s.name, first(&s.description)));
+    }
+    // The defaults first, in their order.
+    out.sort_by_key(|(n, _)| CLAUDE_CODE_DEFAULT_TOOLS.iter().position(|d| d == n).unwrap_or(usize::MAX));
+    out
+}
+
+/// carbon6's guidance for the tools a Claude Code session gets, which its
+/// own system prompt carries in carbon6's loop: memory (with the notes),
+/// task cards, the memex brief.
+fn claude_code_guidance(spec: &CreateSession, labels: &[String], tools: &[Arc<dyn Tool>]) -> String {
+    let mut out =
+        "carbon6 runs these tools: subagents in its own loop, on any connection and model the session may use; documents, messages to \
+         other sessions and the rest in carbon6, for this session."
+            .to_owned();
+    if has_tool(tools, "remember") || has_tool(tools, "forget") {
+        out.push_str(&memory_section(spec, labels, tools));
+    }
+    if has_tool(tools, "task_propose") && has_tool(tools, "task_withdraw") {
+        let guidance = spec_prompt(spec, "session.task_cards", "");
+        if !guidance.trim().is_empty() {
+            out.push_str(TASK_CARDS_HEADING);
+            out.push_str(guidance.trim());
+        }
+    }
+    if (has_tool(tools, "memex_search") || has_tool(tools, "memex_get")) && !spec.memex_brief.trim().is_empty() {
+        out.push_str("\n\n# Memex\n\n");
+        out.push_str(spec.memex_brief.trim());
+    }
+    out
 }
 
 /// Every built-in name in a profile, including tools needing optional
@@ -3596,6 +3714,65 @@ mod label_tests {
 
 /// Switching between Claude Code and carbon6's own loop (docs/architecture.md,
 /// "Model switching"): what each runtime gets from the log.
+#[cfg(test)]
+mod claude_code_tools_tests {
+    use super::*;
+
+    /// Claude Code is offered carbon6's own tools, not copies of its own,
+    /// with the defaults first.
+    #[test]
+    fn claude_code_is_offered_carbon6s_own_tools() {
+        let names: Vec<String> = claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            &names[..CLAUDE_CODE_DEFAULT_TOOLS.len()],
+            ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc", "MessageSession", "ListSessions"]
+        );
+        for offered in ["PublishFile", "Remember", "Forget", "TodoAdd", "TaskPropose", "TaskWithdraw", "MemexSearch", "MailSend"] {
+            assert!(names.iter().any(|n| n == offered), "{offered} in {names:?}");
+        }
+        for own in [
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Grep",
+            "Glob",
+            "WebFetch",
+            "WebSearch",
+            "TodoWrite",
+            "Skill",
+            "BashOutput",
+            "KillShell",
+            "Doc",
+        ] {
+            assert!(!names.iter().any(|n| n == own), "{own} is Claude Code's own");
+        }
+    }
+
+    /// The guidance carbon6's loop gives in its system prompt goes with the
+    /// tools that need it, and only with them.
+    #[test]
+    fn guidance_follows_the_tools() {
+        let spec = CreateSession {
+            memories_json: r#"[{"id":"n1","scope":"","text":"The build runs on thalassa.","updated_at":1}]"#.into(),
+            prompts_json: r#"{"session.task_cards":"Propose useful work."}"#.into(),
+            ..Default::default()
+        };
+        let pick = |names: &[&str]| -> Vec<Arc<dyn Tool>> {
+            let chosen: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+            claude_code_extras(&spec, &[], None).into_iter().filter(|t| is_chosen(&chosen, &t.spec().name)).collect()
+        };
+        let none = claude_code_guidance(&spec, &[], &pick(&[]));
+        assert!(!none.contains("# Memory") && !none.contains("# Task cards"), "{none}");
+        let all = claude_code_guidance(&spec, &[], &pick(&["remember", "forget", "task_propose", "task_withdraw"]));
+        assert!(
+            all.contains("# Memory") && all.contains("The build runs on thalassa.") && all.contains("save it with the remember"),
+            "{all}"
+        );
+        assert!(all.contains("# Task cards\n\nPropose useful work."), "{all}");
+    }
+}
+
 #[cfg(test)]
 mod notice_tests {
     use super::*;

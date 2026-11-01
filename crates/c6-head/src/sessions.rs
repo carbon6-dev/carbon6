@@ -480,6 +480,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         subagent_templates_json: serde_json::to_string(&crate::templates::for_subagents(st, &row.realm, &row.instance).await)?,
         auto_turns_per_hour: limits.auto_turns_per_hour,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
+        claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?,
+        claude_code_tools_chosen: true,
     })
 }
 
@@ -1311,6 +1313,23 @@ pub async fn sessions_for(st: &HeadState, from: &SessionRow, params: &Value) -> 
         out.push(row(s, parent.as_ref()));
     }
     Ok(json!({"sessions": out}))
+}
+
+/// The claude-code-tools setting.
+pub const CLAUDE_CODE_TOOLS: &str = "claude_code_tools";
+
+/// The carbon6 tools Claude Code sessions in `realm` get (its own setting,
+/// else root's, else the defaults), or in the realm of the Settings request
+/// (`None`).
+pub async fn claude_code_tools(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let raw = match realm {
+        Some(r) => st.store.setting_for(CLAUDE_CODE_TOOLS, r).await?,
+        None => st.store.setting(CLAUDE_CODE_TOOLS).await?,
+    };
+    Ok(raw
+        .and_then(|raw| serde_json::from_str::<api::ClaudeCodeTools>(&raw).ok())
+        .map(|t| t.tools)
+        .unwrap_or_else(|| c6_worker::session::CLAUDE_CODE_DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()))
 }
 
 /// The subagent-limits setting.

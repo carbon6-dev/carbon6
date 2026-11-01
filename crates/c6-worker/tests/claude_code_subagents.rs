@@ -79,14 +79,17 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     let api_conn = add(json!({"name": "api", "base_url": mock.base_url(), "default_model": "m2"})).await;
     let r = http
         .put(format!("{api}/settings/routes"))
-        .json(&json!([{"name": "cc with limited carbon6 tools", "connection": "cc", "model": "opus", "tools": ["Read"]}]))
+        .json(&json!([{"name": "cc with limited carbon6 tools", "connection": "cc", "model": "opus", "tools": ["Read", "publish_file"]}]))
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success());
+    // The subagent publishes a report, then answers.
+    mock.push(Reply::ToolCalls(vec![("publish_file".into(), r#"{"path":"report.md","title":"The report"}"#.into())]));
     mock.push(Reply::Text("api says hi".into()));
 
     let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("report.md"), "# Findings\n").unwrap();
     let s: Value = http
         .post(format!("{api}/sessions"))
         .json(&json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": project.path().display().to_string(),
@@ -118,10 +121,10 @@ async fn claude_code_delegates_to_carbon6_subagents() {
 
     // carbon6 ran it, on the API connection's default model, under the call.
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs.len(), 2);
     assert_eq!(reqs[0]["model"], "m2");
     let names: Vec<&str> = reqs[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read"], "carbon6 subagents inherit a Claude Code parent's list");
+    assert_eq!(names, ["read", "publish_file"], "carbon6 subagents inherit a Claude Code parent's list");
     assert!(!reqs[0].to_string().contains("Claude Code's own system prompt"), "a carbon6 prompt of its own");
     let children: Vec<Session> = http.get(format!("{api}/sessions/{id}/children")).send().await.unwrap().json().await.unwrap();
     assert_eq!(children.len(), 1);
@@ -129,6 +132,12 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     assert!(!child.observed, "carbon6's own, not mirrored");
     assert_eq!(child.parent_call_id.as_deref(), Some("toolu_m1"));
     assert_eq!((child.connection_id.as_str(), child.model.as_str()), (api_conn["id"].as_str().unwrap(), "m2"));
+    // What it published is the parent's, where you look (docs/subagents.md §7).
+    let outputs = |evs: &[c6_api::Event]| evs.iter().filter(|e| matches!(&e.kind, c6_api::EventKind::Output { .. })).count();
+    let parent_events: Vec<c6_api::Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap();
+    let child_events: Vec<c6_api::Event> =
+        http.get(format!("{api}/sessions/{}/events", child.id)).send().await.unwrap().json().await.unwrap();
+    assert_eq!((outputs(&parent_events), outputs(&child_events)), (1, 0), "in the parent's Outputs");
 
     // Handing the parent to carbon6 applies the same saved list.
     mock.push(Reply::Text("handed over".into()));
@@ -145,9 +154,9 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     })
     .await;
     let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
-    let names: Vec<&str> = requests[1]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read"]);
+    assert_eq!(requests.len(), 3);
+    let names: Vec<&str> = requests[2]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["read", "publish_file"]);
     stop.cancel();
     head.shutdown().await.unwrap();
 }

@@ -272,6 +272,8 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     />
                         <OwnOrRoot name="subagent-limits" />
                         <SubagentLimitsSetting />
+                        <OwnOrRoot name="claude-code-tools" />
+                        <ClaudeCodeToolsSetting />
                     }.into_any(),
                     "skills" => view! {
                     <ListSetting
@@ -3572,6 +3574,72 @@ fn SubagentLimitsSetting() -> impl IntoView {
                         prop:value=move || setting.with(|s| s.messages_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.messages_per_hour = number(&ev)) />
                 </label>
             </div>
+            <div class="flex items-center justify-end gap-3">
+                {move || status.get().map(|r| match r {
+                    Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
+                    Err(e) => view! { <span class="text-sm text-red-600">{e}</span> }.into_any(),
+                })}
+                <button class=BUTTON on:click=save>"Save"</button>
+            </div>
+        </section>
+    }
+}
+
+/// Settings: carbon6's tools that Claude Code sessions get over carbon6's
+/// MCP server (docs/background.md §4).
+#[component]
+fn ClaudeCodeToolsSetting() -> impl IntoView {
+    let setting = RwSignal::new(None::<c6_api::ClaudeCodeTools>);
+    let loaded = LocalResource::new(move || api::get_setting("claude-code-tools"));
+    Effect::new(move || {
+        if let Some(Ok(v)) = loaded.get() {
+            setting.set(serde_json::from_value(v).ok());
+        }
+    });
+    let status = RwSignal::new(None::<Result<&'static str, String>>);
+    let save = move |_| {
+        let Some(mut v) = setting.get_untracked() else { return };
+        v.available.clear();
+        let v = serde_json::to_value(v).unwrap_or_default();
+        spawn_local(async move {
+            status.set(Some(api::put_setting("claude-code-tools", v).await.map(|_| "Saved. New Claude Code sessions will get them.")));
+        });
+    };
+    let toggle = move |name: String, on: bool| {
+        setting.update(|s| {
+            if let Some(s) = s {
+                s.tools.retain(|t| *t != name);
+                if on {
+                    s.tools.push(name);
+                }
+            }
+        })
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <div>
+                <h2 class="font-medium">"carbon6 tools in Claude Code sessions"</h2>
+                <p class="text-sm text-zinc-500">
+                    "Claude Code brings its own tools for files, the shell and the web. These are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them comes along. A routing rule's tool list narrows them further. New sessions pick up changes."
+                </p>
+            </div>
+            {move || setting.get().map(|s| {
+                let chosen = s.tools.clone();
+                view! {
+                    <div class="grid gap-1 sm:grid-cols-2">
+                        {s.available.into_iter().map(|t| {
+                            let on = chosen.iter().any(|c| c.eq_ignore_ascii_case(&t.name) || c.replace('_', "").eq_ignore_ascii_case(&t.name));
+                            let name = t.name.clone();
+                            view! {
+                                <label class="flex items-start gap-2 text-sm" title=t.description.clone()>
+                                    <input type="checkbox" class="mt-1" prop:checked=on on:change=move |ev| toggle(name.clone(), event_target_checked(&ev)) />
+                                    <span><span class="font-mono text-xs">{t.name.clone()}</span>" "<span class="text-xs text-zinc-500">{t.description.clone()}</span></span>
+                                </label>
+                            }
+                        }).collect_view()}
+                    </div>
+                }
+            })}
             <div class="flex items-center justify-end gap-3">
                 {move || status.get().map(|r| match r {
                     Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),

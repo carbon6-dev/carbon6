@@ -36,6 +36,9 @@ pub(crate) struct Entry {
     /// The session's policies: Claude Code doesn't know them, so its calls
     /// of carbon6's tools are held or denied here, as in carbon6's own loop.
     pub policies: Option<Arc<crate::policy::Policies>>,
+    /// What Claude Code is told about these tools (MCP `instructions`):
+    /// carbon6's guidance for them, which its own loop's prompt carries.
+    pub instructions: String,
 }
 
 type Entries = Arc<Mutex<HashMap<String, Arc<Entry>>>>;
@@ -133,7 +136,7 @@ async fn handle(
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": SERVER, "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "carbon6 runs these subagents in its own loop, on any connection and model the session may use."
+                    "instructions": entry.instructions
                 }),
             )
         }
