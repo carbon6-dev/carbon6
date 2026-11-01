@@ -425,6 +425,10 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 fn home_realm() -> String {
     "home".to_owned()
 }
@@ -2026,6 +2030,9 @@ pub enum EventKind {
         cache_read_tokens: u64,
         cache_write_tokens: u64,
         reasoning_tokens: u64,
+        /// The window of the model that made the call, when known; 0: unknown.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        context_window: u64,
     },
     TurnEnded {
         turn: u64,

@@ -294,6 +294,8 @@ impl Process {
             calls: HashMap::new(),
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
+            call_usage: HashMap::new(),
+            per_call: false,
         };
         Ok(Self {
             child,
@@ -722,6 +724,15 @@ struct Mapper {
     mcp_calls: HashSet<String>,
     /// Mirrored subagents, by the call that started each.
     children: HashMap<String, Child>,
+    /// Each conversation's model call so far, by whose it is (`None`: the
+    /// session's; else the call that started a subagent): its message id,
+    /// model and usage. Claude Code sends a message per content block, each
+    /// with its call's usage to date; a call is recorded once the next one
+    /// starts, its results come back, or the turn ends.
+    call_usage: HashMap<Option<String>, (String, String, Value)>,
+    /// The session's own calls this turn said their usage: the turn's total
+    /// (`result`) is not recorded on top.
+    per_call: bool,
 }
 
 impl Drop for Mapper {
@@ -733,6 +744,44 @@ impl Drop for Mapper {
 }
 
 impl Mapper {
+    /// Notes a model call's usage to date from one of its messages; the call
+    /// before it in the same conversation is recorded once this one starts.
+    async fn note_usage(&mut self, who: Option<&str>, message: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        let (Some(id), u) = (message["id"].as_str(), &message["usage"]) else { return Ok(()) };
+        if !u.is_object() {
+            return Ok(());
+        }
+        let key = who.map(str::to_owned);
+        if self.call_usage.get(&key).is_some_and(|(open, _, _)| open != id) {
+            self.record_usage(who, sink).await?;
+        }
+        let model = message["model"].as_str().unwrap_or_default().to_owned();
+        self.call_usage.insert(key, (id.to_owned(), model, u.clone()));
+        if who.is_none() {
+            self.per_call = true;
+        }
+        Ok(())
+    }
+
+    /// Records a conversation's open model call, in the session's log or its
+    /// subagent's mirror.
+    async fn record_usage(&mut self, who: Option<&str>, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        let Some((_, model, u)) = self.call_usage.remove(&who.map(str::to_owned)) else { return Ok(()) };
+        let window = window_of(&model);
+        let event = session_event::Kind::Usage(usage(model, &u, window));
+        match who {
+            None => {
+                sink.append(event).await?;
+            }
+            Some(call) => {
+                if let Some((_, log)) = self.child(call, sink).await? {
+                    log.append(event).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Official SDKTaskStarted/Progress/Notification/UpdatedMessage protocol:
     /// https://code.claude.com/docs/en/agent-sdk/typescript#sdktaskstartedmessage
     /// Process these before parent_tool_use_id routing: nested tasks belong
@@ -897,6 +946,7 @@ impl Mapper {
         let Some((id, log)) = self.child(call, sink).await? else { return Ok(()) };
         match v["type"].as_str().unwrap_or("") {
             "assistant" => {
+                self.note_usage(Some(call), &v["message"], sink).await?;
                 self.note_calls(&v["message"]["content"], Some(&id));
                 let blocks: Vec<ContentBlock> =
                     v["message"]["content"].as_array().map(|a| a.iter().filter_map(assistant_block).collect()).unwrap_or_default();
@@ -906,6 +956,7 @@ impl Mapper {
                 }
             }
             "user" => {
+                self.record_usage(Some(call), sink).await?;
                 let content = &v["message"]["content"];
                 // Its task (text), or results of its own calls.
                 let text = match content {
@@ -965,6 +1016,7 @@ impl Mapper {
                 }
             }
             "assistant" => {
+                self.note_usage(None, &v["message"], sink).await?;
                 self.note_calls(&v["message"]["content"], None);
                 let blocks: Vec<ContentBlock> =
                     v["message"]["content"].as_array().map(|a| a.iter().filter_map(assistant_block).collect()).unwrap_or_default();
@@ -974,6 +1026,7 @@ impl Mapper {
                 }
             }
             "user" => {
+                self.record_usage(None, sink).await?;
                 for b in v["message"]["content"].as_array().into_iter().flatten() {
                     if b["type"] != "tool_result" {
                         continue;
@@ -985,16 +1038,18 @@ impl Mapper {
                 }
             }
             "result" => {
-                let u = &v["usage"];
-                sink.append(session_event::Kind::Usage(Usage {
-                    model: v["modelUsage"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default(),
-                    input_tokens: u["input_tokens"].as_u64().unwrap_or(0),
-                    output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
-                    cache_read_tokens: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
-                    cache_write_tokens: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-                    reasoning_tokens: 0,
-                }))
-                .await?;
+                let open: Vec<Option<String>> = self.call_usage.keys().cloned().collect();
+                for who in open {
+                    self.record_usage(who.as_deref(), sink).await?;
+                }
+                // A Claude Code that doesn't say each call's usage: the turn's
+                // total stands in (its context then reads high).
+                if !std::mem::take(&mut self.per_call) {
+                    let u = &v["usage"];
+                    let model = v["modelUsage"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
+                    let window = v["modelUsage"][&model]["contextWindow"].as_u64().unwrap_or_else(|| window_of(&model));
+                    sink.append(session_event::Kind::Usage(usage(model, u, window))).await?;
+                }
                 if v["is_error"].as_bool().unwrap_or(false) && self.interrupted {
                     self.result = Some(TurnEndReason::Interrupted);
                 } else if v["is_error"].as_bool().unwrap_or(false) {
@@ -1009,6 +1064,26 @@ impl Mapper {
         }
         Ok(())
     }
+}
+
+/// A model call's usage (Anthropic's names, as Claude Code reports them).
+fn usage(model: String, u: &Value, context_window: u64) -> Usage {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    Usage {
+        model,
+        input_tokens: n("input_tokens"),
+        output_tokens: n("output_tokens"),
+        cache_read_tokens: n("cache_read_input_tokens"),
+        cache_write_tokens: n("cache_creation_input_tokens"),
+        reasoning_tokens: 0,
+        context_window,
+    }
+}
+
+/// The window of the model a call says it ran on (`claude-opus-5-5`, not
+/// the session's alias, `opus`); 0 when it doesn't say.
+fn window_of(model: &str) -> u64 {
+    if model.is_empty() { 0 } else { c6_llm::window::built_in("anthropic", model) }
 }
 
 /// A `tool_result` content block as a tool result event.
@@ -1113,6 +1188,8 @@ mod tests {
             calls: HashMap::new(),
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
+            call_usage: HashMap::new(),
+            per_call: false,
         };
         // Shapes from the official SDKTask*Message definitions. Lifecycle
         // routing precedes subagent traffic routing, including nested tasks.
@@ -1321,6 +1398,57 @@ cat <<'EOF'
 EOF
 "#;
         script(dir, "claude", script_body)
+    }
+
+    /// Usage is recorded per model call, from its messages (the last says the
+    /// most), with its model's window; the turn's total isn't added on top.
+    #[tokio::test]
+    async fn usage_is_recorded_per_model_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            dir.path(),
+            "claude",
+            r#"#!/bin/sh
+read -r prompt
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5-5"}
+{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5-5","content":[{"type":"text","text":"Listing."}],"usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":50,"output_tokens":5}},"parent_tool_use_id":null}
+{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":50,"output_tokens":30}},"parent_tool_use_id":null}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.txt"}]},"parent_tool_use_id":null}
+{"type":"assistant","message":{"id":"msg_2","model":"claude-opus-5-5","content":[{"type":"text","text":"Done."}],"stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":1080,"output_tokens":7}},"parent_tool_use_id":null}
+{"type":"result","subtype":"success","is_error":false,"result":"Done.","usage":{"input_tokens":13,"output_tokens":37,"cache_read_input_tokens":2080,"cache_creation_input_tokens":50},"modelUsage":{"claude-opus-5-5":{}}}
+EOF
+"#,
+        );
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let launch = Launch { conversation: "0199-usage".into(), effort: None, settings: None };
+        let mut p = Process::spawn(&bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let more = tokio::sync::Notify::new();
+        let end =
+            p.turn(1, vec![input("c1", "list")], false, None, "opus", &sink, &Vec::new, &more, &CancellationToken::new()).await.unwrap();
+        assert_eq!(end.reason, Some(TurnEndReason::Completed));
+        let events = vec_sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().map(kind).collect::<Vec<_>>(),
+            ["user", "turn_started", "assistant", "assistant", "usage", "tool_result", "assistant", "usage", "turn_ended"]
+        );
+        let usage: Vec<&Usage> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::Usage(u)) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            usage.iter().map(|u| (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens, u.output_tokens)).collect::<Vec<_>>(),
+            [(10, 1000, 50, 30), (3, 1080, 0, 7)],
+            "each call once, with its own numbers (the first's last message says its output)"
+        );
+        assert!(
+            usage.iter().all(|u| u.model == "claude-opus-5-5" && u.context_window == 1_000_000),
+            "the real model's window, not the alias's"
+        );
     }
 
     #[tokio::test]
@@ -1655,6 +1783,8 @@ done
             calls: HashMap::new(),
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
+            call_usage: HashMap::new(),
+            per_call: false,
         };
         for line in [
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_m","name":"mcp__carbon6__Task","input":{"description":"Publish demo outputs","prompt":"p"}}]},"parent_tool_use_id":null}"#,

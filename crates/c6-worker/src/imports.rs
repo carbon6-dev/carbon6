@@ -274,6 +274,7 @@ pub fn claude_code(text: &str) -> Imported {
                         cache_read_tokens: n("cache_read_input_tokens"),
                         cache_write_tokens: n("cache_creation_input_tokens"),
                         reasoning_tokens: 0,
+                        context_window: 0,
                     };
                     b.usage(&mid, usage);
                 }
@@ -394,6 +395,7 @@ pub fn codex(text: &str) -> Imported {
                         cache_read_tokens: n("cached_input_tokens"),
                         cache_write_tokens: 0,
                         reasoning_tokens: n("reasoning_output_tokens"),
+                        context_window: 0,
                     };
                     b.usage(&step.to_string(), usage);
                     b.flush();

@@ -460,6 +460,7 @@ impl Turn<'_> {
                 cache_read_tokens: u.cache_read_tokens,
                 cache_write_tokens: u.cache_write_tokens,
                 reasoning_tokens: u.reasoning_tokens,
+                context_window: 0,
             }))
             .await?;
         Ok(())

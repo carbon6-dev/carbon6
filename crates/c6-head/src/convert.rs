@@ -103,6 +103,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             cache_read_tokens: u.cache_read_tokens,
             cache_write_tokens: u.cache_write_tokens,
             reasoning_tokens: u.reasoning_tokens,
+            context_window: u.context_window,
         },
         Kind::TurnEnded(t) => api::EventKind::TurnEnded {
             turn: t.turn,
