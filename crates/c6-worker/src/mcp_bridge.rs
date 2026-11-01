@@ -33,6 +33,9 @@ pub(crate) struct Entry {
     pub journal: Arc<Journal>,
     /// Tool calls of the session already matched to an MCP call.
     pub matched: Mutex<HashSet<String>>,
+    /// The session's policies: Claude Code doesn't know them, so its calls
+    /// of carbon6's tools are held or denied here, as in carbon6's own loop.
+    pub policies: Option<Arc<crate::policy::Policies>>,
 }
 
 type Entries = Arc<Mutex<HashMap<String, Arc<Entry>>>>;
@@ -153,13 +156,27 @@ async fn handle(
                 None => rpc_error(id, -32602, &format!("no tool {name:?}")),
                 Some(tool) => {
                     let call_id = call_id_for(&entry, &name, &input).await;
-                    let ctx = ToolCtx {
-                        session: entry.session.clone(),
-                        cancel: entry.cancel.lock().unwrap().child_token(),
-                        output: Arc::new(|_: &str| {}),
-                        call_id,
+                    let cancel = entry.cancel.lock().unwrap().child_token();
+                    // A policy may deny the call or hold it for your approval
+                    // (an interrupt ends the wait), as in carbon6's own loop.
+                    let blocked = match &entry.policies {
+                        Some(p) => {
+                            let full = format!("mcp__{SERVER}__{name}");
+                            let names = [name.as_str(), full.as_str()];
+                            tokio::select! {
+                                r = p.check(&call_id, &names, &input) => r,
+                                _ = cancel.cancelled() => Some("not run: the turn was interrupted".into()),
+                            }
+                        }
+                        None => None,
                     };
-                    let out = tool.call(&ctx, input).await;
+                    let out = match blocked {
+                        Some(reason) => c6_tools::ToolOutput::err(format!("Blocked: {reason}")),
+                        None => {
+                            let ctx = ToolCtx { session: entry.session.clone(), cancel, output: Arc::new(|_: &str| {}), call_id };
+                            tool.call(&ctx, input).await
+                        }
+                    };
                     rpc_result(id, json!({"content": [{"type": "text", "text": out.content}], "isError": out.is_error}))
                 }
             }

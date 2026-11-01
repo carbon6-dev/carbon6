@@ -1326,6 +1326,7 @@ EOF
             cancel: Default::default(),
             journal: Arc::new(futures::executor::block_on(crate::journal::Journal::open(&dir.path().join("journal.db"))).unwrap()),
             matched: Default::default(),
+            policies: None,
         };
         let more = tokio::sync::Notify::new();
         // A later turn tries --resume first; the fake has no conversation...
