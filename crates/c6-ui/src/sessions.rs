@@ -895,7 +895,12 @@ fn SessionForm(
     let effort = RwSignal::new(if seeded { seed.effort.clone() } else { storage_get("c6.effort").unwrap_or_default() });
     let worktree =
         RwSignal::new(if seeded { seed.worktree && seed.ssh.is_none() } else { storage_get("c6.worktree").as_deref() == Some("1") });
-    let prompt = RwSignal::new(first_message.unwrap_or_default());
+    // A fresh form keeps what you typed until the session starts.
+    let prompt = match first_message {
+        Some(m) => RwSignal::new(m),
+        None if !seeded => crate::util::draft("new"),
+        None => RwSignal::new(String::new()),
+    };
     // Your labels for the session (remembered per folder).
     let labels = RwSignal::new(seed.labels.join(", "));
     let seed_realm = StoredValue::new(seed.realm.clone());
@@ -1053,6 +1058,9 @@ fn SessionForm(
                 // The new session takes the form's tile (Back returns to
                 // the form); from a popup, a tile of its own.
                 Ok(s) => {
+                    if !seeded {
+                        crate::util::forget_draft("new");
+                    }
                     if let Some(f) = on_session {
                         f.run(s.clone());
                     }

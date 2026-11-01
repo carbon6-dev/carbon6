@@ -3339,7 +3339,7 @@ fn Composer(
     let claude_off = Signal::derive(move || claude_check.get().flatten().and_then(|c| (!c.available).then_some(c.reason)));
     // Connection kinds: a switch into or out of Claude Code is a handoff.
     let kinds = LocalResource::new(api::connections);
-    let text = RwSignal::new(String::new());
+    let text = crate::util::draft(&id);
     let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
     // What you'd likely type next (docs/suggestions.md): fetched when a turn
     // ends, shown faintly while the box is empty, taken with a tap or Tab.

@@ -107,6 +107,27 @@ pub fn storage_set(key: &str, value: &str) {
     storage_set_global(&placed_key(key), value);
 }
 
+pub fn storage_remove(key: &str) {
+    if let Ok(Some(s)) = window().local_storage() {
+        let _ = s.remove_item(&placed_key(key));
+    }
+}
+
+/// A message box's text, kept in this browser until it's sent
+/// (`c6.draft.<key>`): a panel that shows something else for a moment, or a
+/// popup closed by mistake, gives it back as it was.
+pub fn draft(key: &str) -> RwSignal<String> {
+    let key = format!("c6.draft.{key}");
+    let text = RwSignal::new(storage_get(&key).unwrap_or_default());
+    Effect::new(move || text.with(|t| if t.is_empty() { storage_remove(&key) } else { storage_set(&key, t) }));
+    text
+}
+
+/// Drops a draft that was sent, from code that may outlive its box.
+pub fn forget_draft(key: &str) {
+    storage_remove(&format!("c6.draft.{key}"));
+}
+
 fn placed_key(key: &str) -> String {
     match (crate::place::header(), key.strip_prefix("c6.")) {
         (Some(p), Some(rest)) => format!("c6.{p}.{rest}"),

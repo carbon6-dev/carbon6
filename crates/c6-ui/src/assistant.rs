@@ -33,7 +33,7 @@ pub fn AskButton() -> impl IntoView {
 fn AskBox(on_close: Callback<()>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let text = RwSignal::new(String::new());
+    let text = crate::util::draft("ask");
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let area = NodeRef::<leptos::html::Textarea>::new();
@@ -56,6 +56,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match api::ask_assistant(prompt, ctx).await {
                 Ok(s) => {
+                    crate::util::forget_draft("ask");
                     on_close.run(());
                     ws.open(None, View::session(s.id), How::Beside);
                 }
