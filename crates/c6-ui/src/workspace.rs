@@ -365,7 +365,7 @@ impl View {
             View::Projects { id } if id.is_empty() => "Projects".into(),
             View::Projects { .. } => "Project".into(),
             View::Docs { id } if id.is_empty() => "Docs".into(),
-            View::Docs { .. } => "Document".into(),
+            View::Docs { id } => crate::docs::title_of(id).unwrap_or_else(|| "Document".into()),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
             View::Realms => "Realms".into(),

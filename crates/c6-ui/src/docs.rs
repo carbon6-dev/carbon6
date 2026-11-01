@@ -28,6 +28,57 @@ pub fn author(by: &str) -> String {
     }
 }
 
+thread_local! {
+    /// Documents' titles as last seen, kept in this browser: tile labels
+    /// come from the live feed, which carries sessions but not documents.
+    static TITLES: (Owner, RwSignal<std::collections::HashMap<String, String>>) = {
+        let owner = Owner::new_root(None);
+        let saved = crate::util::storage_get_global(TITLES_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let signal = owner.with(|| RwSignal::new(saved));
+        (owner, signal)
+    };
+}
+
+const TITLES_KEY: &str = "c6.doc_titles";
+
+/// A document's title as last seen here, if it has been.
+pub fn title_of(id: &str) -> Option<String> {
+    TITLES.with(|t| t.1.with(|m| m.get(id).cloned())).filter(|t| !t.trim().is_empty())
+}
+
+fn remember_titles<'a>(docs: impl IntoIterator<Item = &'a DocSummary>) {
+    TITLES.with(|t| {
+        let titles = t.1;
+        let changed: Vec<_> = titles.with_untracked(|m| {
+            docs.into_iter().filter(|d| m.get(&d.id) != Some(&d.title)).map(|d| (d.id.clone(), d.title.clone())).collect()
+        });
+        if !changed.is_empty() {
+            titles.update(|m| m.extend(changed));
+            crate::util::storage_set_global(TITLES_KEY, &titles.with_untracked(|m| serde_json::to_string(m).unwrap_or_default()));
+        }
+    });
+}
+
+/// The session a document came from: its mark, and a link to it.
+#[component]
+fn FromSession(id: String) -> impl IntoView {
+    let live = api::live();
+    let session = {
+        let id = id.clone();
+        move || live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())
+    };
+    let s2 = session.clone();
+    view! {
+        <span class="inline-flex min-w-0 items-center gap-1">
+            "from "
+            {move || session().map(|s| view! { <span class="h-2 w-2 shrink-0 rounded-sm" style=crate::marks::fill(&crate::marks::of(&s))></span> })}
+            <Go to=View::session(id.clone()) class="truncate hover:underline" stop=true>
+                {move || s2().map(|s| s.title).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "a session".into())}
+            </Go>
+        </span>
+    }
+}
+
 /// A session's title for `session:<id>`, from the live feed.
 fn author_named(by: &str) -> String {
     if let Some(id) = by.strip_prefix("session:") {
@@ -578,6 +629,7 @@ pub fn DocsPage() -> impl IntoView {
                     <p class="text-sm text-zinc-500">"No documents yet. Make one above, or ask a session to write one (it gets the doc tool)."</p>
                 }.into_any(),
                 Some(Ok(l)) => view! {
+                    {remember_titles(&l)}
                     <div class="divide-y divide-zinc-100 dark:divide-zinc-900">
                         {l.into_iter().map(|d| {
                             let id = d.id.clone();
@@ -597,7 +649,10 @@ pub fn DocsPage() -> impl IntoView {
                                         </span>
                                     })}
                                     {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-zinc-500">{format!("#{l}")}</span> }).collect_view()}
-                                    <span class="max-w-[40%] shrink truncate text-xs text-zinc-400">{format!("{} · {}", author_named(&d.updated_by), since(d.updated_at))}</span>
+                                    // The session it came from, else who changed it last.
+                                    <span class="max-w-[40%] shrink truncate text-xs text-zinc-400">
+                                        {format!("{} · {}", if d.created_by.starts_with("session:") { format!("from {}", author_named(&d.created_by)) } else { author_named(&d.updated_by) }, since(d.updated_at))}
+                                    </span>
                                 </a>
                             }
                         }).collect_view()}
@@ -624,6 +679,9 @@ pub fn DocPage(id: String) -> impl IntoView {
     let doc = RwSignal::new(None::<Result<Doc, String>>);
     Effect::new(move || {
         if let Some(r) = loaded.get() {
+            if let Ok(d) = &r {
+                remember_titles([&d.summary]);
+            }
             doc.set(Some(r));
         }
     });
@@ -802,7 +860,8 @@ pub fn DocPage(id: String) -> impl IntoView {
                                     {move || if history.get() { "Hide history" } else { "History" }}
                                 </button>
                             </div>
-                            <p class="text-xs text-zinc-500">
+                            <p class="flex flex-wrap items-center gap-x-1 text-xs text-zinc-500">
+                                {s.created_by.strip_prefix("session:").map(|id| view! { <FromSession id=id.to_owned() />" · " })}
                                 {format!("Version {} · changed {} by {}", s.rev, since(s.updated_at), author_named(&s.updated_by))}
                                 {(!s.labels.is_empty()).then(|| format!(" · {}", s.labels.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(" ")))}
                             </p>
