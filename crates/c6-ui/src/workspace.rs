@@ -1542,8 +1542,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let details_at = RwSignal::new(None::<(f64, f64)>);
     let rename_at = RwSignal::new(None::<(f64, f64)>);
+    let renamable = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
-    let btn = "rounded px-1.5 py-0.5 text-zinc-500 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-white/10 dark:hover:text-zinc-100";
+    let btn = "rounded px-1.5 py-0.5 text-zinc-600 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-100";
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
     let section = NodeRef::<leptos::html::Section>::new();
@@ -1610,12 +1611,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             })}
             // The tile's own bar: its history, its name (and a session's
             // colour and state), and what you can do to the whole tile.
-            // Dragged by its bar to another place or column.
-            <div class=move || format!(
-                "@container flex h-9 shrink-0 cursor-grab items-center gap-1 border-b px-2 text-xs active:cursor-grabbing {}",
-                if colour.get().is_some() { crate::marks::BAR } else { "bg-zinc-50 border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800" },
-            )
-                style=move || colour.get().map(|c| crate::marks::bar_style(&c)).unwrap_or_default()
+            // Dragged by its bar to another place or column. Always the
+            // panel's own colours, so it reads whatever the mark; the mark
+            // is a stripe along its top.
+            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -1630,6 +1629,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     ws.drop_at.set(None);
                 }
             >
+                {move || colour.get().map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 h-1" style=crate::marks::fill(&c)></div> })}
                 <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
                 <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
                 {move || colour.get().map(|c| view! {
@@ -1637,11 +1637,12 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         <crate::marks::Glyph mark=Signal::stored(c) shape=crate::marks::Shape::Circle size=12 />
                     </button>
                 })}
-                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-700 dark:text-zinc-200" title=move || title.get()>{title}</span>
+                // A session of your own is renamed by double-clicking its name
+                // (or from ⋯).
+                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
+                    title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
+                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_at.set(Some(below(&ev, 320.0))) }>{title}</span>
                 <crate::aspects::AspectStrip session=session />
-                {move || session.get().filter(|s| s.parent_id.is_none() && !s.observed).map(|_| view! {
-                    <button class=btn title="Rename this session" on:click=move |ev| { ev.stop_propagation(); rename_at.set(Some(below(&ev, 320.0))) }>"✎"</button>
-                })}
                 {move || session.get().map(|s| {
                     let (cls, label) = status_pill(&s);
                     view! {
