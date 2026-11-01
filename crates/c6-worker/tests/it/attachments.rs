@@ -60,6 +60,7 @@ async fn attachments_and_mentions_reach_the_model() {
         .json()
         .await
         .unwrap();
+    assert!(!s.on_head, "a worker runs it");
     eventually("first turn", async || (mock.requests().len() == 1).then_some(())).await;
     mock.push(Reply::Text("seen".into()));
     let r = http

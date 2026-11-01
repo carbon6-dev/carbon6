@@ -327,6 +327,10 @@ async fn assistant_in_a_realm_stays_there() {
         .await
         .unwrap();
     assert_eq!(s.realm, "crm");
+    // It runs in the head, not on a worker: the UI must not call it offline.
+    assert!(s.on_head);
+    let listed: Vec<Session> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
+    assert!(listed.iter().any(|x| x.id == s.id && x.on_head), "the list says so too");
     let results = eventually("its three calls", async || {
         let es: Vec<Event> = http.get(format!("{api}/sessions/{}/events?after=0", s.id)).send().await.ok()?.json().await.ok()?;
         let outs: Vec<(String, bool)> = es

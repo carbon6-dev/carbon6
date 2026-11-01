@@ -802,7 +802,7 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
         .map(|r| {
             // Subagents and side chats serve their tree's work.
             let tag = work.get(&r.id).or_else(|| r.root_id.as_ref().and_then(|root| work.get(root)));
-            api::Session { work: tag.cloned(), ..crate::convert::session_with_activity(r, working.get(&r.id)) }
+            api::Session { work: tag.cloned(), ..crate::convert::session_with_activity(r, working.get(&r.id), st.assistant.head_id()) }
         })
         .collect())
 }
@@ -1070,7 +1070,7 @@ async fn search(
     Extension(caller): Extension<Caller>,
     Query(q): Query<api::SearchQuery>,
 ) -> ApiResult<Json<api::SearchResponse>> {
-    let mut found = crate::search::search(&st.store, &q).await?;
+    let mut found = crate::search::search(&st.store, &q, st.assistant.head_id()).await?;
     found.results.retain(|r| caller.sees(&r.session.realm));
     Ok(Json(found))
 }
@@ -1085,7 +1085,7 @@ async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
     };
     let queued = st.store.queued_inputs(&id).await?.iter().map(crate::convert::queued).collect();
     Ok(Json(api::SessionDetail {
-        session: crate::convert::session_with_activity(&row, working.get(&row.id)),
+        session: crate::convert::session_with_activity(&row, working.get(&row.id), st.assistant.head_id()),
         worker_name: worker.map(|w| w.name).unwrap_or_else(|| "(removed)".into()),
         worker_online: worker_id.is_some_and(|w| st.registry.get(w).is_some()),
         queued,
@@ -1177,7 +1177,7 @@ async fn session_children(
 ) -> ApiResult<Json<Vec<api::Session>>> {
     let tree = matches!(q.tree.as_str(), "1" | "true");
     let rows = if tree { st.store.descendant_sessions(&id).await? } else { st.store.child_sessions(&id).await? };
-    Ok(Json(rows.iter().map(crate::convert::session).collect()))
+    Ok(Json(rows.iter().map(|r| crate::convert::session(r, st.assistant.head_id())).collect()))
 }
 
 /// MCP servers and skills are stored as validated JSON arrays and included in

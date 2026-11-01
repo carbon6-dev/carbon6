@@ -601,8 +601,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         {move || as_template.get().map(|seed| view! { <sessions::SaveTemplateDialog seed on_close=move |()| as_template.set(None) /> })}
         {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
         {move || details.get().then(|| detail.get().and_then(Result::ok)).flatten().map(|d| {
-            let worker_id = d.session.worker_id;
-            let online = Signal::derive(move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online)));
+            let on = d.session.clone();
+            let online = Signal::derive(move || live.workers.with(|ws| !worker_offline(&on, ws)));
             view! {
                 <crate::details::DetailsCard session=d.session worker_name=d.worker_name online events usage started model_label
                     running=Signal::derive(running) tab open=details />
@@ -615,8 +615,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(d) => {
                         let s = d.session.clone();
-                        let worker_id = s.worker_id;
-                        let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
+                        let on = s.clone();
+                        let online = move || live.workers.with(|ws| !worker_offline(&on, ws));
                         view! {
                             <SessionMeta chrome />
                             <SessionStats usage />
@@ -822,8 +822,8 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
     move || {
         detail.get().and_then(Result::ok).map(|d| {
             let s = d.session.clone();
-            let worker_id = s.worker_id;
-            let online = move || live.workers.with(|ws| ws.iter().any(|w| w.id == worker_id && w.status == c6_api::WorkerStatus::Online));
+            let on = s.clone();
+            let online = move || live.workers.with(|ws| !worker_offline(&on, ws));
             view! {
                 <div class=if popover { "flex flex-col gap-3" } else { "mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 pb-3 dark:border-zinc-800" }>
                     <div class="min-w-0">
@@ -1935,6 +1935,12 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
 fn bound(evs: &[Event], at: u64) -> Option<u64> {
     let i = evs.partition_point(|e| e.seq < at) + TAIL as usize;
     evs.get(i..)?.iter().find(|e| matches!(e.kind, EventKind::User { .. })).map(|e| e.seq)
+}
+
+/// The session's worker is away, so it can't run there now. Never for one
+/// the head runs itself (the assistant): it has no worker.
+pub(crate) fn worker_offline(s: &Session, workers: &[c6_api::Worker]) -> bool {
+    !s.on_head && !workers.iter().any(|w| w.id == s.worker_id && w.status == c6_api::WorkerStatus::Online)
 }
 
 /// The nearest ancestor that scrolls.
@@ -3832,6 +3838,39 @@ mod tests {
         }
         assert_eq!(tool_kind("mcp__carbon6__ListSessions"), "list_sessions");
         assert_eq!(summarize("mcp__carbon6__TaskStop", &serde_json::json!({"task_id": "bg3"})), "bg3");
+    }
+
+    fn session(worker: &str, on_head: bool) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": "s", "worker_id": worker, "title": "t", "cwd": "", "connection_id": "c", "model": "m",
+            "status": "running", "error": null, "created_at": 0, "updated_at": 0, "last_seq": 0, "on_head": on_head
+        }))
+        .unwrap()
+    }
+
+    fn worker(id: &str, status: &str) -> c6_api::Worker {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "w", "hostname": "w", "os": "linux", "arch": "x86_64", "version": null,
+            "status": status, "enrolled_at": 0, "last_seen": null, "connected_since": null, "rtt_us": null
+        }))
+        .unwrap()
+    }
+
+    const W: &str = "00000000-0000-0000-0000-000000000001";
+    const HEAD: &str = "00000000-0000-0000-0000-0000000000ff";
+
+    #[test]
+    fn a_session_the_head_runs_is_never_offline() {
+        // The head's own worker is not in the workers list at all.
+        assert!(!worker_offline(&session(HEAD, true), &[worker(W, "online")]));
+        assert!(!worker_offline(&session(HEAD, true), &[]));
+    }
+
+    #[test]
+    fn a_session_whose_worker_is_away_is_offline() {
+        assert!(worker_offline(&session(W, false), &[worker(W, "offline")]));
+        assert!(worker_offline(&session(W, false), &[]), "not listed: not connected");
+        assert!(!worker_offline(&session(W, false), &[worker(W, "online")]));
     }
 
     fn log(users: &[u64], n: u64) -> Vec<Event> {
