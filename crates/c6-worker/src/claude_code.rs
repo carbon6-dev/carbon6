@@ -3,7 +3,7 @@
 //! output is mapped onto carbon6 session events. Claude Code runs its own
 //! agent loop and tools and keeps its own transcript, resumed by session id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -292,6 +292,7 @@ impl Process {
             interrupted: false,
             observer,
             calls: HashMap::new(),
+            mcp_calls: HashSet::new(),
             children: HashMap::new(),
         };
         Ok(Self {
@@ -715,6 +716,10 @@ struct Mapper {
     /// Tool calls seen, by id: the subagent they were made in (`None`: the
     /// session itself) and their input.
     calls: HashMap<String, (Option<String>, Value)>,
+    /// Calls of carbon6's own tools over its MCP server: what Claude Code
+    /// says under them is not one of its subagents (carbon6 shows a
+    /// subagent such a call starts itself).
+    mcp_calls: HashSet<String>,
     /// Mirrored subagents, by the call that started each.
     children: HashMap<String, Child>,
 }
@@ -799,6 +804,9 @@ impl Mapper {
         for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
             if let Some(id) = b["id"].as_str() {
                 self.calls.insert(id.to_owned(), (made_in.map(str::to_owned), b["input"].clone()));
+                if b["name"].as_str().is_some_and(|n| n.starts_with("mcp__")) {
+                    self.mcp_calls.insert(id.to_owned());
+                }
             }
         }
     }
@@ -931,6 +939,10 @@ impl Mapper {
         // A subagent's traffic goes to its mirror (its report also comes as
         // the call's tool result).
         if let Some(call) = v["parent_tool_use_id"].as_str() {
+            // Progress of an MCP tool's call, not a subagent of Claude Code's.
+            if self.mcp_calls.contains(call) {
+                return Ok(());
+            }
             return self.handle_child(call, v, sink).await;
         }
         self.saw_output = true;
@@ -1099,6 +1111,7 @@ mod tests {
             interrupted: false,
             observer: Some(observer),
             calls: HashMap::new(),
+            mcp_calls: HashSet::new(),
             children: HashMap::new(),
         };
         // Shapes from the official SDKTask*Message definitions. Lifecycle
@@ -1327,6 +1340,7 @@ EOF
             journal: Arc::new(futures::executor::block_on(crate::journal::Journal::open(&dir.path().join("journal.db"))).unwrap()),
             matched: Default::default(),
             policies: None,
+            instructions: String::new(),
         };
         let more = tokio::sync::Notify::new();
         // A later turn tries --resume first; the fake has no conversation...
@@ -1620,5 +1634,36 @@ done
         assert!(line.ends_with("\nconv-9\n"), "{line:?}");
         p.close().await;
         assert!(!records.join("conv-9.pid").exists());
+    }
+
+    /// What Claude Code says under a call of one of carbon6's MCP tools (its
+    /// progress) is not one of its own subagents: no mirror session.
+    #[tokio::test]
+    async fn mcp_tool_calls_are_not_mirrored_as_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut mapper = Mapper {
+            turn: 1,
+            scope: "s".into(),
+            output_root: None,
+            saw_output: false,
+            result: None,
+            interrupted: false,
+            observer: Some(observer(dir.path(), tools).await),
+            calls: HashMap::new(),
+            mcp_calls: HashSet::new(),
+            children: HashMap::new(),
+        };
+        for line in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_m","name":"mcp__carbon6__Task","input":{"description":"Publish demo outputs","prompt":"p"}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"progress"}]},"parent_tool_use_id":"toolu_m"}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_m","content":"done"}]},"parent_tool_use_id":null}"#,
+        ] {
+            mapper.handle(&serde_json::from_str(line).unwrap(), &sink).await.unwrap();
+        }
+        assert!(mapper.children.is_empty(), "no mirror for carbon6's own subagent");
+        assert_eq!(kinds(&vec_sink), ["assistant", "tool_result"]);
     }
 }

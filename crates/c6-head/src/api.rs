@@ -77,6 +77,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/web-search", get(get_web_search).put(put_web_search))
         .route("/api/v1/settings/brief", get(get_brief).put(put_brief))
         .route("/api/v1/settings/subagent-limits", get(get_subagent_limits).put(put_subagent_limits))
+        .route("/api/v1/settings/claude-code-tools", get(get_claude_code_tools).put(put_claude_code_tools))
         .route("/api/v1/settings/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
@@ -947,6 +948,7 @@ fn per_realm_key(name: &str) -> ApiResult<&'static str> {
         "web-search" => Ok(crate::sessions::WEB_SEARCH),
         "assistant" => Ok(crate::assistant::SETTING),
         "subagent-limits" => Ok(crate::sessions::SUBAGENT_LIMITS),
+        "claude-code-tools" => Ok(crate::sessions::CLAUDE_CODE_TOOLS),
         "brief" => Ok(crate::memex::BRIEF),
         "work" => Ok(crate::work::SETTING),
         "docs" => Ok(crate::docs::session::SETTING),
@@ -1375,6 +1377,30 @@ async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api:
         _ => return bad("the provider is brave, tavily or searxng"),
     }
     st.store.set_setting(crate::sessions::WEB_SEARCH, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_claude_code_tools(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::ClaudeCodeTools>> {
+    let available =
+        c6_worker::session::claude_code_tool_names().into_iter().map(|(name, description)| api::ToolChoice { name, description }).collect();
+    Ok(Json(api::ClaudeCodeTools { tools: crate::sessions::claude_code_tools(&st, None).await?, available }))
+}
+
+async fn put_claude_code_tools(State(st): State<Arc<HeadState>>, Json(t): Json<api::ClaudeCodeTools>) -> ApiResult<StatusCode> {
+    let known: Vec<String> = c6_worker::session::claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
+    let unknown: Vec<&String> = t.tools.iter().filter(|n| !known.iter().any(|k| c6_tools::tool_allowed(&[(*n).clone()], k))).collect();
+    if !unknown.is_empty() {
+        return Err(ApiErr(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "not carbon6 tools Claude Code sessions can get: {}. They are: {}",
+                unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                known.join(", ")
+            ),
+        ));
+    }
+    let v = api::ClaudeCodeTools { tools: t.tools, available: Vec::new() };
+    st.store.set_setting(crate::sessions::CLAUDE_CODE_TOOLS, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

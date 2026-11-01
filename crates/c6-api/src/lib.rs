@@ -1804,6 +1804,26 @@ impl Default for SubagentLimits {
     }
 }
 
+/// `GET`/`PUT /api/v1/settings/claude-code-tools`: carbon6's tools that
+/// Claude Code sessions get over carbon6's MCP server (docs/background.md
+/// §4). A routing rule's tool list narrows them further.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ClaudeCodeTools {
+    /// Their names (as Claude Code knows them, without `mcp__carbon6__`).
+    pub tools: Vec<String>,
+    /// Every tool that may be chosen, with what it does (ignored when set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available: Vec<ToolChoice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolChoice {
+    pub name: String,
+    pub description: String,
+}
+
 /// `POST /api/v1/sessions/{id}/resume`: continue a subagent whose turn did
 /// not finish, with the realm's `session.subagent_resume` prompt.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
