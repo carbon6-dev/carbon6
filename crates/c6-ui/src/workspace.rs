@@ -411,6 +411,10 @@ pub struct Tile {
     /// when it opens and moved by dragging its bar.
     #[serde(default)]
     pub stack: Option<usize>,
+    /// Minimized: hidden (still loaded), keeping its column and its place
+    /// in it for when it comes back.
+    #[serde(default)]
+    pub minimized: bool,
 }
 
 /// How far back a tile remembers.
@@ -471,6 +475,7 @@ impl Layout {
             back: Vec::new(),
             forward: Vec::new(),
             stack: None,
+            minimized: false,
         }
     }
 
@@ -483,8 +488,9 @@ impl Layout {
             if self.tiles[i].stack.is_some() {
                 continue;
             }
+            // A column only minimized tiles hold is free.
             let mut count = [0usize; COLUMNS];
-            for t in &self.tiles {
+            for t in self.tiles.iter().filter(|t| !t.minimized) {
                 if let Some(c) = t.stack.filter(|&c| c < COLUMNS) {
                     count[c] += 1;
                 }
@@ -516,8 +522,8 @@ impl Layout {
             return;
         }
         let Some(target_stack) = self.tile(target).and_then(|t| t.stack) else { return };
-        let columns = self.tiles.iter().filter_map(|t| t.stack).collect::<HashSet<_>>().len();
-        let alone = self.tiles.iter().filter(|t| t.stack == self.tiles[from].stack).count() == 1;
+        let columns = self.tiles.iter().filter(|t| !t.minimized).filter_map(|t| t.stack).collect::<HashSet<_>>().len();
+        let alone = self.tiles.iter().filter(|t| !t.minimized && t.stack == self.tiles[from].stack).count() == 1;
         let mut tile = self.tiles.remove(from);
         match to {
             Drop::Above(_) | Drop::Below(_) => {
@@ -555,6 +561,86 @@ impl Layout {
         }
     }
 
+    /// The tiles in reading order: the columns left to right, each top to
+    /// bottom. Minimized tiles keep their places in it (and so their
+    /// numbers: ⌘1–9, the dock's).
+    pub fn reading_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.tiles.len()).collect();
+        order.sort_by_key(|&i| self.tiles[i].stack.unwrap_or(0));
+        order
+    }
+
+    /// Where each tile shown goes. Columns only minimized tiles hold take
+    /// no room; in focus mode the focused tile takes all of it.
+    pub fn rects(&self) -> HashMap<u64, Rect> {
+        let shown: Vec<&Tile> = self.tiles.iter().filter(|t| !t.minimized).collect();
+        let mut columns: Vec<usize> = shown.iter().map(|t| t.stack.unwrap_or(0)).collect();
+        columns.sort_unstable();
+        columns.dedup();
+        let placed: Vec<(usize, u64)> =
+            shown.iter().map(|t| (columns.iter().position(|&c| c == t.stack.unwrap_or(0)).unwrap_or(0), t.used)).collect();
+        let mut rects: HashMap<u64, Rect> = shown.iter().map(|t| t.key).zip(arrange(&placed)).collect();
+        if self.full
+            && let Some(t) = self.tiles.get(self.focus)
+        {
+            rects.insert(t.key, Rect { left: 0.0, top: 0.0, width: 1.0, height: 1.0 });
+        }
+        rects
+    }
+
+    /// Hides tile `ti`, unless it is the last one shown; the focus goes to
+    /// the tile shown that was used last, and focus mode ends with it.
+    fn minimize(&mut self, ti: usize) {
+        if ti >= self.tiles.len() || self.tiles.iter().filter(|t| !t.minimized).count() <= 1 {
+            return;
+        }
+        self.tiles[ti].minimized = true;
+        if self.focus == ti {
+            self.full = false;
+        }
+        self.settle_focus();
+    }
+
+    /// Brings tile `ti` back (if minimized) and focuses it.
+    fn show(&mut self, ti: usize) {
+        if let Some(t) = self.tiles.get_mut(ti) {
+            t.minimized = false;
+            self.focus = ti;
+            self.touch(ti);
+        }
+    }
+
+    /// The focus on a tile shown: the one used last (bringing that one back
+    /// if every tile is minimized).
+    fn settle_focus(&mut self) {
+        if self.tiles.get(self.focus).is_some_and(|t| !t.minimized) {
+            return;
+        }
+        let last =
+            |minimized: bool| (0..self.tiles.len()).filter(|&i| self.tiles[i].minimized == minimized).max_by_key(|&i| self.tiles[i].used);
+        match last(false).or_else(|| last(true)) {
+            Some(i) => {
+                self.tiles[i].minimized = false;
+                self.focus = i;
+            }
+            None => self.focus = 0,
+        }
+    }
+
+    /// Closes tile `ti`; the focus stays where it was, or goes to the tile
+    /// shown that was used last. The last tile closing leaves the home view.
+    fn remove_tile(&mut self, ti: usize) {
+        if self.tiles.len() == 1 {
+            *self = Layout::new(View::home());
+            return;
+        }
+        let focused = self.tiles.get(self.focus).map(|t| t.key).filter(|_| self.focus != ti);
+        self.tiles.remove(ti);
+        self.place();
+        self.focus = focused.and_then(|k| self.tiles.iter().position(|t| t.key == k)).unwrap_or(usize::MAX);
+        self.settle_focus();
+    }
+
     /// Where a session is open: (tile index, column index).
     fn find_session(&self, id: &str) -> Option<(usize, usize)> {
         self.tiles
@@ -571,8 +657,7 @@ impl Layout {
         let t = &mut self.tiles[ti];
         t.cursor = ci;
         t.active = t.columns[ci].key;
-        self.focus = ti;
-        self.touch(ti);
+        self.show(ti);
         true
     }
 
@@ -603,7 +688,7 @@ impl Layout {
     /// Session ids shown now (in any tile's panes).
     pub fn visible_sessions(&self) -> HashSet<String> {
         let mut out = HashSet::new();
-        for t in &self.tiles {
+        for t in self.tiles.iter().filter(|t| !t.minimized) {
             for c in &t.columns {
                 if let View::Session { id, .. } = &c.view {
                     out.insert(id.clone());
@@ -630,6 +715,8 @@ pub enum How {
     /// In a tile of its own: the one already showing it, or a new one (the
     /// Apps menu).
     OwnTile,
+    /// In place of everything its tile shows (Back returns to it).
+    Instead,
 }
 
 /// Where a dragged tile was dropped, by the tile it was dropped on.
@@ -690,6 +777,7 @@ impl Workspace {
             None => Layout::new(here.clone()),
             Some(mut l) => {
                 l.place();
+                l.settle_focus();
                 l
             }
         };
@@ -745,16 +833,21 @@ impl Workspace {
                 }
                 t.cursor = ci;
                 t.active = t.columns[ci].key;
-                l.focus = ti;
-                l.touch(ti);
+                l.show(ti);
                 return;
             }
             if how == How::OwnTile
                 && let Some(ti) = l.tiles.iter().position(|t| t.columns[0].view == view)
             {
                 l.tiles[ti].settle();
-                l.focus = ti;
-                l.touch(ti);
+                l.show(ti);
+                return;
+            }
+            if how == How::Instead {
+                let key = l.key();
+                l.tiles[origin].go(vec![Column { key, view }]);
+                l.focus = origin;
+                l.touch(origin);
                 return;
             }
             if how != How::Beside {
@@ -845,27 +938,57 @@ impl Workspace {
                 t.go(rest);
                 return;
             }
-            if l.tiles.len() == 1 {
-                *l = Layout::new(View::home());
-            } else {
-                l.tiles.remove(ti);
-                l.place();
-                l.focus = l.focus.min(l.tiles.len() - 1);
-            }
+            l.remove_tile(ti);
         });
     }
 
     pub fn close_tile(&self, tile: u64) {
         self.layout.update(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
-            if l.tiles.len() == 1 {
-                *l = Layout::new(View::home());
-            } else {
-                l.tiles.remove(ti);
-                l.place();
-                l.focus = l.focus.min(l.tiles.len() - 1);
+            l.remove_tile(ti);
+        });
+    }
+
+    /// Minimizes a tile (not the last one shown).
+    pub fn minimize(&self, tile: u64) {
+        self.layout.update(|l| {
+            if let Some(ti) = l.tiles.iter().position(|t| t.key == tile) {
+                l.minimize(ti);
             }
         });
+    }
+
+    /// Brings a tile back, if minimized, and focuses it.
+    pub fn show_tile(&self, tile: u64) {
+        self.layout.update(|l| {
+            if let Some(ti) = l.tiles.iter().position(|t| t.key == tile) {
+                l.show(ti);
+            }
+        });
+    }
+
+    /// The number of the tile a session is open in (1 for the first in
+    /// reading order), if it is.
+    pub fn tile_number(&self, id: &str) -> Option<usize> {
+        self.layout
+            .with(|l| {
+                l.reading_order()
+                    .iter()
+                    .position(|&ti| l.tiles[ti].columns.iter().any(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)))
+            })
+            .map(|n| n + 1)
+    }
+
+    /// Minimized tiles in reading order: (key, number, what it shows).
+    pub fn minimized(&self) -> Vec<(u64, usize, Vec<View>)> {
+        self.layout.with(|l| {
+            l.reading_order()
+                .into_iter()
+                .enumerate()
+                .filter(|(_, ti)| l.tiles[*ti].minimized)
+                .map(|(n, ti)| (l.tiles[ti].key, n + 1, l.tiles[ti].columns.iter().map(|c| c.view.clone()).collect()))
+                .collect()
+        })
     }
 
     /// Moves a dragged tile to where it was dropped.
@@ -882,8 +1005,7 @@ impl Workspace {
     pub fn set_full(&self, key: Option<u64>) {
         self.layout.update(|l| {
             if let Some(i) = key.and_then(|k| l.tiles.iter().position(|t| t.key == k)) {
-                l.focus = i;
-                l.touch(i);
+                l.show(i);
             }
             l.full = key.is_some();
         });
@@ -893,13 +1015,13 @@ impl Workspace {
         self.layout.with(|l| l.full)
     }
 
-    pub fn focus_tile(&self, index: usize) {
-        self.layout.update(|l| {
-            if index < l.tiles.len() && l.focus != index {
-                l.focus = index;
-                l.touch(index);
-            }
-        });
+    /// Focuses the `n`th tile in reading order (from 0), bringing it back
+    /// if minimized.
+    pub fn focus_tile(&self, n: usize) {
+        let Some(ti) = self.layout.with_untracked(|l| l.reading_order().get(n).copied()) else { return };
+        if self.layout.with_untracked(|l| l.focus != ti || l.tiles[ti].minimized) {
+            self.layout.update(|l| l.show(ti));
+        }
     }
 
     /// Focuses a tile you pressed on, without growing it yet: that waits
@@ -1154,7 +1276,7 @@ pub fn ScrollBox(
                     && follow.get_untracked()
                     && el.client_height() > 0
                 {
-                    el.set_scroll_top(el.scroll_height());
+                    glide_to_end(&el);
                 }
             });
             if let Ok(obs) = web_sys::ResizeObserver::new(to_end.as_ref().unchecked_ref()) {
@@ -1231,6 +1353,21 @@ pub fn ScrollBox(
 }
 
 /// Whether a scrolling area is at (or within a line or two of) its end.
+/// Follows the end of a scroll box: a short glide down to what just arrived
+/// (rather than a jump for each line), straight there when it is more than
+/// a screen away (as when it opens) or motion is reduced.
+pub fn glide_to_end(el: &web_sys::Element) {
+    let gap = el.scroll_height() - el.scroll_top() - el.client_height();
+    if gap <= 0 {
+        return;
+    }
+    let reduced = window().match_media("(prefers-reduced-motion: reduce)").ok().flatten().is_some_and(|m| m.matches());
+    let opts = web_sys::ScrollToOptions::new();
+    opts.set_top(el.scroll_height() as f64);
+    opts.set_behavior(if reduced || gap > el.client_height() { web_sys::ScrollBehavior::Instant } else { web_sys::ScrollBehavior::Smooth });
+    el.scroll_to_with_scroll_to_options(&opts);
+}
+
 pub fn at_end(el: &web_sys::Element) -> bool {
     el.scroll_height() - el.scroll_top() - el.client_height() < 120
 }
@@ -1296,18 +1433,7 @@ pub fn Tiles() -> impl IntoView {
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).
-    let rects = Memo::new(move |_| {
-        ws.layout.with(|l| {
-            let placed: Vec<(usize, u64)> = l.tiles.iter().map(|t| (t.stack.unwrap_or(0), t.used)).collect();
-            let mut rects = l.tiles.iter().map(|t| t.key).zip(arrange(&placed)).collect::<HashMap<u64, Rect>>();
-            if l.full
-                && let Some(t) = l.tiles.get(l.focus)
-            {
-                rects.insert(t.key, Rect { left: 0.0, top: 0.0, width: 1.0, height: 1.0 });
-            }
-            rects
-        })
-    });
+    let rects = Memo::new(move |_| ws.layout.with(Layout::rects));
     // Tiles are cards with room between them, placed by `arrange` (so one
     // moving to another column keeps what it shows); on a phone, one fills
     // the screen.
@@ -1377,7 +1503,8 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
     // Focus mode: this tile alone, or hidden behind the one that is.
     let full = Memo::new(move |_| ws.layout.with(|l| l.full));
-    let many = Memo::new(move |_| ws.layout.with(|l| l.tiles.len() > 1 && !l.full));
+    let many = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().filter(|t| !t.minimized).count() > 1 && !l.full));
+    let minimized = Memo::new(move |_| ws.layout.with(|l| l.tile(key).is_some_and(|t| t.minimized)));
     let tile = Memo::new(move |_| ws.layout.with(|l| l.tile(key).cloned()));
     let cols = Memo::new(move |_| tile.get().map(|t| t.columns.iter().map(|c| c.key).collect::<Vec<_>>()).unwrap_or_default());
     // The tile's name: what it was opened on, and the item open in it.
@@ -1442,8 +1569,8 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         <div
             class=move || format!(
                 "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {} {}",
-                if focused.get() { "flex" } else { "hidden" },
-                if full.get() && !focused.get() { "md:hidden" } else { "md:flex" },
+                if focused.get() && !minimized.get() { "flex" } else { "hidden" },
+                if minimized.get() || (full.get() && !focused.get()) { "md:hidden" } else { "md:flex" },
                 if dim.get() { "opacity-35" } else { "" },
             )
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
@@ -1538,6 +1665,14 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 })}
                 {move || two().then(|| view! {
                     <button class=format!("{btn} hidden md:inline") title="Move the open item to a tile of its own (or ⌘-click a link)" on:click=move |_| ws.detach(key)>"⧉"</button>
+                })}
+                {move || many.get().then(|| view! {
+                    <button class=format!("{btn} hidden md:inline") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
+                        aria-label="Minimize" on:click=move |ev| { ev.stop_propagation(); ws.minimize(key) }>
+                        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                            <path d="M3 12h10" />
+                        </svg>
+                    </button>
                 })}
                 <button class=format!("{btn} hidden md:inline") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
@@ -1657,6 +1792,103 @@ mod tests {
 
     fn stacks(l: &Layout) -> Vec<usize> {
         l.tiles.iter().map(|t| t.stack.unwrap()).collect()
+    }
+
+    fn widths(l: &Layout) -> Vec<Option<f64>> {
+        let r = l.rects();
+        l.tiles.iter().map(|t| r.get(&t.key).map(|x| x.width)).collect()
+    }
+
+    #[test]
+    fn a_minimized_tile_gives_up_its_room_and_comes_back_to_its_place() {
+        let mut l = opened(3);
+        l.minimize(1);
+        assert_eq!(widths(&l), vec![Some(0.5), None, Some(0.5)], "its column takes no room");
+        assert_eq!(stacks(&l), [0, 1, 2], "it keeps its column");
+        l.show(1);
+        assert_eq!(widths(&l), vec![Some(1.0 / 3.0); 3]);
+        assert_eq!(l.rects()[&l.tiles[1].key].left, 1.0 / 3.0, "back in the middle");
+        assert_eq!(l.focus, 1);
+    }
+
+    #[test]
+    fn a_minimized_tile_returns_to_its_place_in_a_stack() {
+        let mut l = opened(5); // four columns; the fifth tile stacks under the first
+        assert_eq!(stacks(&l), [0, 1, 2, 3, 0]);
+        l.minimize(4);
+        assert_eq!(l.rects()[&l.tiles[0].key].height, 1.0, "the other takes the column");
+        l.show(4);
+        let r = l.rects();
+        assert_eq!((r[&l.tiles[0].key].top, r[&l.tiles[4].key].top), (0.0, 0.5), "below it again");
+    }
+
+    #[test]
+    fn the_last_tile_shown_stays() {
+        let mut l = opened(2);
+        l.minimize(0);
+        l.minimize(1);
+        assert!(!l.tiles[1].minimized);
+        assert_eq!(l.focus, 1);
+    }
+
+    #[test]
+    fn minimizing_the_focused_tile_moves_the_focus_and_ends_focus_mode() {
+        let mut l = opened(3);
+        l.touch(0);
+        l.focus = 2;
+        l.full = true;
+        l.minimize(2);
+        assert!(!l.full);
+        assert_eq!(l.focus, 0, "to the tile used last");
+        l.full = true;
+        l.focus = 1;
+        l.minimize(0);
+        assert!(l.full, "another tile's minimizing leaves focus mode on");
+    }
+
+    #[test]
+    fn closing_keeps_a_tile_shown_and_the_focus_where_it_was() {
+        let mut l = opened(3);
+        l.minimize(0);
+        l.focus = 2;
+        l.remove_tile(1);
+        assert_eq!(l.focus, 1, "the same tile, now second");
+        l.remove_tile(1);
+        assert_eq!(l.tiles.len(), 1);
+        assert!(!l.tiles[0].minimized, "the minimized one comes back rather than none showing");
+    }
+
+    #[test]
+    fn a_new_tile_takes_a_column_only_minimized_tiles_hold() {
+        let mut l = opened(4);
+        l.minimize(3);
+        l.open_tile(View::home());
+        assert_eq!(stacks(&l), [0, 1, 2, 3, 3]);
+        assert_eq!(widths(&l)[4], Some(0.25));
+        l.show(3);
+        assert_eq!(l.rects()[&l.tiles[3].key].height, 0.5, "they share it");
+    }
+
+    #[test]
+    fn tiles_are_numbered_in_reading_order() {
+        let mut l = opened(3);
+        // Moved: the third tile under the first, the first column on the right.
+        for (t, c) in l.tiles.iter_mut().zip([1, 0, 1]) {
+            t.stack = Some(c);
+        }
+        assert_eq!(l.reading_order(), [1, 0, 2], "left column first, then top to bottom");
+        l.minimize(0);
+        assert_eq!(l.reading_order(), [1, 0, 2], "a minimized tile keeps its number");
+    }
+
+    #[test]
+    fn a_layout_saved_before_minimizing_loads_with_every_tile_shown() {
+        let l = opened(2);
+        let mut v = serde_json::to_value(&l).unwrap();
+        for t in v["tiles"].as_array_mut().unwrap() {
+            t.as_object_mut().unwrap().remove("minimized");
+        }
+        assert!(serde_json::from_value::<Layout>(v).unwrap().tiles.iter().all(|t| !t.minimized));
     }
 
     #[test]

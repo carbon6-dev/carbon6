@@ -493,7 +493,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             feed.trim();
             request_animation_frame(move || {
                 if let Some(el) = scroller.get_untracked() {
-                    el.set_scroll_top(el.scroll_height());
+                    crate::workspace::glide_to_end(&el);
                 }
             });
         }
@@ -1199,6 +1199,20 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         }
     });
 
+    let stream_text = Memo::new(move |_| streaming.with(|s| s.text.clone()));
+    let stream_thinking = Memo::new(move |_| streaming.with(|s| s.thinking.clone()));
+    let stream_status = Memo::new(move |_| streaming.with(|s| s.status.clone()));
+    let has_text = Memo::new(move |_| stream_text.with(|t| !t.is_empty()));
+    let has_thinking = Memo::new(move |_| stream_thinking.with(|t| !t.is_empty()));
+    // What arrives once the transcript is drawn fades in (not what it opens with).
+    let arrived = Arrived(StoredValue::new(false));
+    provide_context(arrived);
+    Effect::new(move || {
+        if feed.synced.get() {
+            request_animation_frame(move || arrived.0.set_value(true));
+        }
+    });
+
     view! {
         <div class="space-y-4">
             // Events are append-only: keyed by seq, each renders once, so
@@ -1227,10 +1241,12 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                         }
                         _ => None,
                     };
+                    // A reply's text was already showing as it streamed; its tool cards fade in themselves.
+                    let arrive = if matches!(e.kind, EventKind::Assistant { .. }) { "" } else { Arrived::class() };
                     view! {
                         <div
                             id=format!("{}-e{seq}", id.get_value())
-                            class=move || format!("group relative {} {} {}",
+                            class=move || format!("group relative {arrive} {} {} {}",
                                 if anchorable { "pb-7" } else { "" },
                                 if hidden() { "hidden" } else { "" },
                                 if by().is_some() { "opacity-50" } else { "" })
@@ -1294,16 +1310,20 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             })}
             <crate::decisions::SessionDecisions session=id.get_value() />
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
-            {move || streaming.with(|s| (!s.thinking.is_empty() || !s.text.is_empty()).then(|| view! {
+            // What streams in: the same elements, their text growing (not
+            // drawn again for every token).
+            {move || (has_thinking.get() || has_text.get()).then(|| view! {
                 <div class="space-y-2">
-                    {(!s.thinking.is_empty()).then(|| view! { <Thinking text=s.thinking.clone() open=true /> })}
-                    {(!s.text.is_empty()).then(|| view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=markdown::to_html(&s.text)></div> })}
+                    {move || has_thinking.get().then(|| view! { <Thinking text=stream_thinking open=true /> })}
+                    {move || has_text.get().then(|| view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=move || markdown::to_html(&stream_text.get())></div> })}
                 </div>
-            }))}
-            {move || (running.get() && streaming.with(|s| s.text.is_empty() && s.thinking.is_empty())).then(|| view! {
+            })}
+            // Through the whole turn, so the end of the page doesn't come and
+            // go as text starts and stops streaming.
+            {move || running.get().then(|| view! {
                 <div class="flex items-center gap-2 text-sm text-zinc-500">
                     <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
-                    {move || streaming.with(|s| if s.status.is_empty() { "Working…".to_owned() } else { s.status.clone() })}
+                    {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
                 </div>
             })}
             {move || running.get().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
@@ -1437,7 +1457,7 @@ fn RewindPanel(session: String, seq: u64, text: String, edit: bool, on_done: Cal
                     <textarea class=format!("{INPUT} min-h-[3rem] resize-y") prop:value=move || draft.get()
                         on:input=move |ev| draft.set(event_target_value(&ev))
                         on:keydown=move |ev| {
-                            if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); go(); }
+                            if crate::util::sends(&ev) { ev.prevent_default(); go(); }
                             if ev.key() == "Escape" { on_done.run(()); }
                         }></textarea>
                 }.into_any()
@@ -1749,11 +1769,11 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
                 node_ref=input
                 class=format!("{INPUT} min-h-[2.75rem] resize-y")
                 rows="2"
-                placeholder="Ask about this in a side chat (Enter to send, Esc to cancel)"
+                placeholder=if crate::util::touch_first() { "Ask about this in a side chat" } else { "Ask about this in a side chat (Enter to send, Esc to cancel)" }
                 prop:value=move || text.get()
                 on:input=move |ev| text.set(event_target_value(&ev))
                 on:keydown=move |ev| {
-                    if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); send(); }
+                    if crate::util::sends(&ev) { ev.prevent_default(); send(); }
                     if ev.key() == "Escape" { on_done.run(None); }
                 }
             ></textarea>
@@ -1944,6 +1964,19 @@ struct Reach(RwSignal<HashMap<String, u64>>);
 /// The page follows the end of the transcript (you haven't scrolled up).
 #[derive(Clone, Copy)]
 struct Follow(RwSignal<bool>);
+
+/// The transcript has drawn what it opened with: what is drawn now has
+/// just arrived (and fades in).
+#[derive(Clone, Copy)]
+struct Arrived(StoredValue<bool>);
+
+impl Arrived {
+    /// The class for something drawn now: `c6-arrive` once the transcript
+    /// is drawn.
+    fn class() -> &'static str {
+        if use_context::<Arrived>().is_some_and(|a| a.0.get_value()) { "c6-arrive" } else { "" }
+    }
+}
 
 /// Reveals a search hit once its element exists (events render in batches).
 fn reveal_when_rendered(root: String, id: String, terms: String, tries: u32) {
@@ -2169,10 +2202,12 @@ fn render_event(
                         ContentBlock::Text { text } => view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=markdown::to_html(text)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
+                            // Memos: a card redraws for its own result and output, not
+                            // for every other call's (or every streamed token).
                             let (out_id, res_id) = (id.clone(), id.clone());
-                            let live_output = Signal::derive(move || streaming.with(|s| s.tool_output.get(&out_id).cloned()));
-                            let result = Signal::derive(move || results.with(|r| r.get(&res_id).cloned()));
-                            view! { <ToolCard name=name.clone() input_json=input_json.clone() call_id=id.clone() result live_output /> }.into_any()
+                            let live_output = Memo::new(move |_| streaming.with(|s| s.tool_output.get(&out_id).cloned()));
+                            let result = Memo::new(move |_| results.with(|r| r.get(&res_id).cloned()));
+                            view! { <ToolCard name=name.clone() input_json=input_json.clone() call_id=id.clone() result=result.into() live_output=live_output.into() /> }.into_any()
                         }
                     }).collect_view()}
                     {interrupted.then(|| view! { <p class="text-xs italic text-zinc-500">"(response cut off)"</p> })}
@@ -2239,11 +2274,11 @@ fn render_event(
 }
 
 #[component]
-fn Thinking(text: String, open: bool) -> impl IntoView {
+fn Thinking(#[prop(into)] text: Signal<String>, open: bool) -> impl IntoView {
     view! {
         <details class="border-l-2 border-zinc-300 pl-3 text-sm text-zinc-500 dark:border-zinc-700" open=open>
             <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
-            <div class="mt-1 whitespace-pre-wrap text-xs">{text}</div>
+            <div class="mt-1 whitespace-pre-wrap text-xs">{move || text.get()}</div>
         </details>
     }
 }
@@ -2729,11 +2764,24 @@ fn ToolCard(
         let title = Memo::new(move |_| result.get().filter(|r| !r.is_error).and_then(|r| r.output.split('"').nth(1).map(str::to_owned)));
         (to, title)
     });
+    let live_shown = Memo::new(move |_| result.with(Option::is_none) && live_output.with(Option::is_some));
+    let live_box = NodeRef::<leptos::html::Pre>::new();
+    let live_tail = StoredValue::new(true);
+    Effect::new(move || {
+        live_output.track();
+        if live_tail.get_value() {
+            request_animation_frame(move || {
+                if let Some(el) = live_box.get_untracked() {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            });
+        }
+    });
     // Where a search hit in this call's output scrolls to.
     let dom_id = format!("call-{call_id}");
     let started_open = plan.is_some();
     view! {
-        <div id=dom_id class="rounded-md border border-zinc-200 text-sm dark:border-zinc-800">
+        <div id=dom_id class=format!("rounded-md border border-zinc-200 text-sm dark:border-zinc-800 {}", Arrived::class())>
         <details class="group" open=started_open>
             <summary class="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5">
                 {move || {
@@ -2804,9 +2852,13 @@ fn ToolCard(
                 }).collect_view()}
             </div>
         })}
-        // Live output of a running tool, visible without expanding the card.
-        {move || result.with(Option::is_none).then(|| live_output.get()).flatten().map(|o| view! {
-            <pre class="mx-3 mb-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">{o}</pre>
+        // Live output of a running tool, visible without expanding the card:
+        // one box whose text grows, following its end unless you scroll up in it.
+        {move || live_shown.get().then(|| view! {
+            <pre node_ref=live_box class="mx-3 mb-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900"
+                on:scroll=move |_| if let Some(el) = live_box.get_untracked() { live_tail.set_value(el.scroll_height() - el.scroll_top() - el.client_height() < 24) }>
+                {move || live_output.get().unwrap_or_default()}
+            </pre>
         })}
         {thread.map(|(s, child)| {
             let waiting = Signal::derive(move || result.with(Option::is_none));
@@ -3295,7 +3347,38 @@ fn Composer(
             }
         });
     };
+    // Stop & send: the message waits in the box until the turn has stopped,
+    // then starts the next one (sent anyway if stopping takes long: it queues).
+    let stopping = RwSignal::new(false);
+    let stop_and_send = move |ev| {
+        stopping.set(true);
+        stop(ev);
+        set_timeout(
+            move || {
+                if stopping.get_untracked() {
+                    stopping.set(false);
+                    send();
+                }
+            },
+            std::time::Duration::from_secs(15),
+        );
+    };
+    Effect::new(move || {
+        if stopping.get() && !running.get() {
+            stopping.set(false);
+            send();
+        }
+    });
+    let has_text = Memo::new(move |_| !text.with(|t| t.trim().is_empty()) || !attachments.with(Vec::is_empty));
+    // On Claude Code a message sent mid-turn waits for the turn to end; carbon6's
+    // own agent reads it at its next step.
+    let queues = Memo::new(move |_| {
+        let Some(m) = model else { return false };
+        let (c, _, _) = m.current.get();
+        kinds.get().and_then(Result::ok).is_some_and(|ks| ks.iter().any(|k| k.id == c && k.kind == "claude_code"))
+    });
     let picker = NodeRef::<leptos::html::Input>::new();
+    let touch = crate::util::touch_first();
     view! {
         <div
             class=if inline { "" } else { "shrink-0 border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" }
@@ -3378,7 +3461,8 @@ fn Composer(
                         node_ref=area
                         class=format!("{INPUT} max-h-60 min-h-[2.75rem] resize-y")
                         rows="2"
-                        placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
+                        enterkeyhint=if touch { "enter" } else { "send" }
+                        placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else if touch { "Message the agent (@ to mention a file or a person, client, host…, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| { text.set(event_target_value(&ev)); update_mention(); }
@@ -3402,7 +3486,7 @@ fn Composer(
                                             Suggestion::File(path, dir) => complete(path, dir),
                                             Suggestion::Thing(key, _, _) => complete(format!("memex:{key}"), false),
                                             // Enter on a command already typed in full sends it.
-                                            Suggestion::Command(c) if ev.key() == "Enter" && command.get_untracked().as_deref() == Some(c.name.as_str()) => {
+                                            Suggestion::Command(c) if crate::util::sends(&ev) && command.get_untracked().as_deref() == Some(c.name.as_str()) => {
                                                 ev.prevent_default();
                                                 command.set(None);
                                                 send();
@@ -3427,11 +3511,26 @@ fn Composer(
                                 }
                                 return;
                             }
-                            if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() { ev.prevent_default(); send(); }
+                            if crate::util::sends(&ev) { ev.prevent_default(); send(); }
                         }
                         on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { update_mention() }
                     ></textarea>
-                    {move || if running.get() {
+                    {move || if stopping.get() {
+                        view! { <button class=format!("{BUTTON} py-2") disabled=true>"Stopping…"</button> }.into_any()
+                    } else if running.get() && has_text.get() {
+                        let (label, title) = if queues.get() {
+                            ("Queue", "Queue it: it starts the next turn, once this one ends")
+                        } else {
+                            ("Send", "Send it now: the agent reads it at its next step")
+                        };
+                        view! {
+                            <div class="flex shrink-0 flex-col gap-1">
+                                <button class=format!("{BUTTON} py-1.5") title=title prop:disabled=move || disabled.get() on:click=move |_| send()>{label}</button>
+                                <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                                    title="Stop this turn; your message starts the next one" on:click=stop_and_send>"Stop & send"</button>
+                            </div>
+                        }.into_any()
+                    } else if running.get() {
                         view! { <button class="rounded-md border border-zinc-300 px-3 py-2 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" on:click=stop>"Stop"</button> }.into_any()
                     } else {
                         view! { <button class=format!("{BUTTON} py-2") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()

@@ -489,6 +489,11 @@ impl Hover {
 #[component]
 fn RailRow(s: Session, hover: Hover) -> impl IntoView {
     let id = s.id.clone();
+    let ws = use_workspace();
+    let number = {
+        let id = id.clone();
+        Memo::new(move |_| ws.tile_number(&id))
+    };
     let colour = crate::marks::of(&s);
     let glyphs = s.clone();
     let state = if s.awaiting_approval {
@@ -514,6 +519,7 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
                 <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
                 <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=glyphs /></span>
                 <span class=state></span>
+                {move || number.get().map(crate::activity::tile_badge)}
             </Go>
         </div>
     }
@@ -617,7 +623,7 @@ fn NewSession(connections: Vec<Connection>) -> impl IntoView {
 }
 
 /// A popup with the new-session form, filled in from `seed`: change what
-/// you like and start it. The new session opens beside the current one.
+/// you like and start it. The new session opens in a tile of its own.
 #[component]
 pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
@@ -1040,14 +1046,16 @@ fn SessionForm(
         pending.set(true);
         spawn_local(async move {
             match api::create_session(req).await {
-                // Beside the form, so another can start right away.
+                // The new session takes the form's tile (Back returns to
+                // the form); from a popup, a tile of its own.
                 Ok(s) => {
                     if let Some(f) = on_session {
                         f.run(s.clone());
                     }
+                    let how = if on_cancel.is_some() { How::NewTile } else { How::Instead };
                     match col {
-                        Some(c) => c.open(View::session(s.id), How::Beside),
-                        None => ws.open(None, View::session(s.id), How::Beside),
+                        Some(c) => c.open(View::session(s.id), how),
+                        None => ws.open(None, View::session(s.id), how),
                     }
                     if let Some(f) = on_started {
                         f.run(());
@@ -1193,7 +1201,10 @@ fn SessionForm(
                     "New git worktree"
                 </label>
                 {on_cancel.map(|c| view! { <button class=BUTTON_QUIET on:click=move |_| c.run(())>"Cancel"</button> })}
-                <button class=BUTTON disabled=move || pending.get() on:click=move |_| submit_click()>"Start session"</button>
+                <button class=format!("{BUTTON} inline-flex items-center gap-2") disabled=move || pending.get() on:click=move |_| submit_click()>
+                    {move || pending.get().then(|| view! { <span class="h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"></span> })}
+                    {move || if pending.get() { "Starting…" } else { "Start session" }}
+                </button>
             </div>
         </section>
     }
