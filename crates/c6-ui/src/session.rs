@@ -2145,6 +2145,69 @@ fn SessionStats(usage: Memo<UsageStats>) -> impl IntoView {
     }
 }
 
+/// A button on the dark backdrop behind a full-size image.
+const FULL_BUTTON: &str = "rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10";
+
+/// An image full size over the page, focused so Esc closes it, as Close or
+/// a click outside it does. `info` (its size, say) shows by its name, and
+/// `children` (more buttons) before Close.
+#[component]
+fn FullImage(
+    src: String,
+    name: String,
+    #[prop(optional, into)] info: String,
+    #[prop(into)] close: Callback<()>,
+    #[prop(optional)] children: Option<Children>,
+) -> impl IntoView {
+    let el = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        if let Some(el) = el.get() {
+            let _ = el.focus();
+        }
+    });
+    view! {
+        <div node_ref=el tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/75 p-4 outline-none"
+            on:click=move |_| close.run(())
+            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close.run(()) }>
+            <img class="max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" src=src alt=name.clone() on:click=|ev| ev.stop_propagation() />
+            <div class="flex items-center gap-3 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
+                <span class="max-w-[60vw] truncate">{name}</span>
+                {(!info.is_empty()).then(|| view! { <span class="text-zinc-400">{info}</span> })}
+                {children.map(|c| c())}
+                <button class=FULL_BUTTON title="Close (Esc)" on:click=move |_| close.run(())>"Close"</button>
+            </div>
+        </div>
+    }
+}
+
+/// An image sent in the transcript: a click shows it full size, and ⌘-,
+/// Ctrl-, Shift- or middle-click opens it in a new tab as a link would.
+#[component]
+fn TranscriptImage(src: String, name: String) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let (full, title) = (src.clone(), name.clone());
+    let (href, hover) = (src.clone(), name.clone());
+    view! {
+        <a href=href target="_blank" title=hover
+            on:click=move |ev: web_sys::MouseEvent| {
+                if ev.button() == 0 && !(ev.meta_key() || ev.ctrl_key() || ev.shift_key() || ev.alt_key()) {
+                    ev.prevent_default();
+                    open.set(true);
+                }
+            }>
+            <img src=src alt=name class="max-h-40 max-w-60 rounded-lg border border-zinc-300 object-cover dark:border-zinc-700" />
+        </a>
+        {move || open.get().then(|| {
+            let href = full.clone();
+            view! {
+                <FullImage src=full.clone() name=title.clone() close=move |_| open.set(false)>
+                    <a class=FULL_BUTTON href=href target="_blank" on:click=move |_| open.set(false)>"Open in a new tab"</a>
+                </FullImage>
+            }
+        })}
+    }
+}
+
 fn render_event(
     session: &str,
     e: &Event,
@@ -2261,12 +2324,7 @@ fn render_event(
                 .enumerate()
                 .map(|(i, a)| {
                     if a.mime.starts_with("image/") {
-                        view! {
-                            <a href=url(i) target="_blank" title=a.name.clone()>
-                                <img src=url(i) alt=a.name.clone() class="max-h-40 max-w-60 rounded-lg border border-zinc-300 object-cover dark:border-zinc-700" />
-                            </a>
-                        }
-                        .into_any()
+                        view! { <TranscriptImage src=url(i) name=a.name.clone() /> }.into_any()
                     } else {
                         view! {
                             <a href=url(i) target="_blank" title=format!("{} bytes", a.size)
@@ -3593,14 +3651,8 @@ fn Composer(
     });
     let picker = NodeRef::<leptos::html::Input>::new();
     let touch = crate::util::touch_first();
-    // A pending image shown full size (its index), focused so Esc closes it.
+    // A pending image shown full size (its index).
     let preview = RwSignal::new(None::<usize>);
-    let preview_box = NodeRef::<leptos::html::Div>::new();
-    Effect::new(move || {
-        if let Some(el) = preview_box.get() {
-            let _ = el.focus();
-        }
-    });
     view! {
         <div
             class=if inline { "" } else { "shrink-0 border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" }
@@ -3642,19 +3694,10 @@ fn Composer(
                     let size = a.data.len() * 3 / 4;
                     let size = if size >= 1 << 20 { format!("{:.1} MB", size as f64 / (1 << 20) as f64) } else { format!("{} KB", size.div_ceil(1024)) };
                     view! {
-                        <div node_ref=preview_box tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/75 p-4 outline-none"
-                            on:click=move |_| preview.set(None)
-                            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); preview.set(None) }>
-                            <img class="max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" src=format!("data:{};base64,{}", a.mime, a.data) alt=a.name.clone()
-                                on:click=|ev| ev.stop_propagation() />
-                            <div class="flex items-center gap-3 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
-                                <span class="max-w-[60vw] truncate">{a.name.clone()}</span>
-                                <span class="text-zinc-400">{size}</span>
-                                <button class="rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10"
-                                    on:click=move |_| { attachments.update(|v| { if i < v.len() { v.remove(i); } }); preview.set(None) }>"Remove"</button>
-                                <button class="rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10" title="Close (Esc)" on:click=move |_| preview.set(None)>"Close"</button>
-                            </div>
-                        </div>
+                        <FullImage src=format!("data:{};base64,{}", a.mime, a.data) name=a.name.clone() info=size close=move |_| preview.set(None)>
+                            <button class=FULL_BUTTON
+                                on:click=move |_| { attachments.update(|v| { if i < v.len() { v.remove(i); } }); preview.set(None) }>"Remove"</button>
+                        </FullImage>
                     }
                 })}
                 <div class="relative flex items-end gap-2">
