@@ -380,6 +380,9 @@ message Usage {
   uint64 cache_read_tokens = 4;
   uint64 cache_write_tokens = 5;
   uint64 reasoning_tokens = 6;
+  // The window of the model that made the call, when the runtime reports
+  // which one it was (Claude Code); 0: unknown.
+  uint64 context_window = 7;
 }
 
 enum TurnEndReason {

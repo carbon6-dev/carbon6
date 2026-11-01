@@ -115,7 +115,12 @@ impl UsageStats {
                 }
                 EventKind::Compaction { .. } => st.context = None,
                 EventKind::ModelSwitched { context_window, .. } => st.context_window = *context_window,
-                EventKind::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, .. } => {
+                EventKind::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, context_window, .. } => {
+                    // The model that made the call says its window (Claude Code's
+                    // aliases don't).
+                    if *context_window > 0 {
+                        st.context_window = *context_window;
+                    }
                     st.total.add(&e.kind);
                     let ctx = input_tokens + cache_read_tokens + cache_write_tokens + output_tokens;
                     st.context = Some(ctx);
@@ -3994,6 +3999,30 @@ mod tests {
         assert!(worker_offline(&session(W, false), &[worker(W, "offline")]));
         assert!(worker_offline(&session(W, false), &[]), "not listed: not connected");
         assert!(!worker_offline(&session(W, false), &[worker(W, "online")]));
+    }
+
+    #[test]
+    fn a_calls_model_sets_the_window() {
+        let ev = |seq: u64, v: serde_json::Value| -> Event {
+            let mut e = serde_json::json!({"seq": seq, "ts": 0});
+            e.as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
+            serde_json::from_value(e).unwrap()
+        };
+        let usage = |window: u64| {
+            serde_json::json!({"type": "usage", "model": "claude-opus-5-5", "input_tokens": 10, "output_tokens": 5,
+                "cache_read_tokens": 300_000, "cache_write_tokens": 0, "reasoning_tokens": 0, "context_window": window})
+        };
+        // An older worker's usage says no window: the session's stays.
+        let u = UsageStats::from_events(&[
+            ev(1, serde_json::json!({"type": "turn_started", "turn": 1, "context_window": 128_000})),
+            ev(2, usage(0)),
+        ]);
+        assert_eq!((u.context, u.context_window), (Some(300_015), 128_000));
+        let u = UsageStats::from_events(&[
+            ev(1, serde_json::json!({"type": "turn_started", "turn": 1, "context_window": 128_000})),
+            ev(2, usage(1_000_000)),
+        ]);
+        assert_eq!((u.context, u.context_window), (Some(300_015), 1_000_000));
     }
 
     fn log(users: &[u64], n: u64) -> Vec<Event> {
