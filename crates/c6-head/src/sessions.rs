@@ -608,7 +608,7 @@ async fn insert(
         None => st.registry.deliver(worker_id),
     }
     st.registry.bump();
-    Ok(convert::session(&SessionRow { colour, ..row }))
+    Ok(convert::session(&SessionRow { colour, ..row }, st.assistant.head_id()))
 }
 
 /// Runs `hand_over` in the background, as the request would have: with its
@@ -802,7 +802,7 @@ pub async fn set_colour(st: &HeadState, session_id: &str, colour: &str) -> anyho
     }
     st.registry.bump();
     let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    Ok(crate::convert::session(&row))
+    Ok(crate::convert::session(&row, st.assistant.head_id()))
 }
 
 /// Sets the default for a session's subagents from now on: its row (for
@@ -849,7 +849,7 @@ pub async fn set_subagent_model(st: &HeadState, session_id: &str, req: &api::Set
     st.registry.deliver(worker_id);
     st.registry.bump();
     let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    Ok(crate::convert::session(&row))
+    Ok(crate::convert::session(&row, st.assistant.head_id()))
 }
 
 /// Replaces the labels you attached to a session (and its side chats keep
@@ -861,7 +861,7 @@ pub async fn set_labels(st: &HeadState, session_id: &str, labels: &[String]) -> 
     }
     st.registry.bump();
     let row = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    Ok(crate::convert::session(&row))
+    Ok(crate::convert::session(&row, st.assistant.head_id()))
 }
 
 /// What applies to a session now: the head's current settings matched

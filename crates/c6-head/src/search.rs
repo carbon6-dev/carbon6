@@ -383,7 +383,8 @@ pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow
 }
 
 /// Searches; sessions ordered by their best match.
-pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api::SearchResponse> {
+/// `head`: the head's own worker, for the sessions it runs.
+pub async fn search(store: &Store, req: &api::SearchQuery, head: Option<c6_core::WorkerId>) -> anyhow::Result<api::SearchResponse> {
     let (expr, terms, ignored) = fts_query(&req.q)?;
     let kinds: Vec<String> =
         req.kind.as_deref().unwrap_or("").split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned).collect();
@@ -455,7 +456,7 @@ pub async fn search(store: &Store, req: &api::SearchQuery) -> anyhow::Result<api
         };
         let (hits, total_hits) = groups.remove(&sid).unwrap_or_default();
         let open_in = open_in(store, &row).await?;
-        results.push(api::SearchResult { session: crate::convert::session(&row), worker_name, hits, total_hits, open_in });
+        results.push(api::SearchResult { session: crate::convert::session(&row, head), worker_name, hits, total_hits, open_in });
     }
     Ok(api::SearchResponse { results, terms, ignored, truncated })
 }

@@ -4,6 +4,7 @@ use c6_api as api;
 use c6_proto::{SessionEvent, content_block, ephemeral_event, session_event};
 
 use crate::store::{CommandRow, SessionRow};
+use c6_core::WorkerId;
 
 pub fn event(ev: &SessionEvent) -> Option<api::Event> {
     use session_event::Kind;
@@ -189,7 +190,9 @@ pub fn ephemeral(kind: &ephemeral_event::Kind) -> api::StreamMsg {
     }
 }
 
-pub fn session(r: &SessionRow) -> api::Session {
+/// A session as the API shows it. `head`: the head's own worker (its
+/// sessions run in the head: the assistant's).
+pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
     api::Session {
         id: r.id.clone(),
         worker_id: r.worker_id.parse().unwrap_or_default(),
@@ -229,6 +232,7 @@ pub fn session(r: &SessionRow) -> api::Session {
         side_chats_running: 0,
         observed: r.observed,
         remote_template: r.remote_template.clone(),
+        on_head: head.is_some_and(|h| h.to_string() == r.worker_id),
         instance: r.instance.clone(),
         colour: r.colour.clone(),
         work: None,
@@ -238,9 +242,9 @@ pub fn session(r: &SessionRow) -> api::Session {
     }
 }
 
-pub fn session_with_activity(r: &SessionRow, activity: Option<&crate::store::SessionActivity>) -> api::Session {
+pub fn session_with_activity(r: &SessionRow, activity: Option<&crate::store::SessionActivity>, head: Option<WorkerId>) -> api::Session {
     let activity = activity.copied().unwrap_or_default();
-    api::Session { subagents_running: activity.subagents_running, side_chats_running: activity.side_chats_running, ..session(r) }
+    api::Session { subagents_running: activity.subagents_running, side_chats_running: activity.side_chats_running, ..session(r, head) }
 }
 
 pub fn queued(c: &CommandRow) -> api::QueuedInput {

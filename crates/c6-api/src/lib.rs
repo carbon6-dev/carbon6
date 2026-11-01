@@ -270,6 +270,10 @@ pub struct Session {
     /// (docs/remote-subagents.md); empty for every other session.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub remote_template: String,
+    /// It runs in the head itself (the assistant), not on a worker: there
+    /// is no worker to be offline.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_head: bool,
     /// The app instance it acts as (docs/apps.md §5.3); empty: the realm.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance: String,
