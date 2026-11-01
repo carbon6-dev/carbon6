@@ -1066,7 +1066,9 @@ fn BlockView(
             {move || chip_ctx.and_then(|c| c.editing.get().filter(|(b, _, _)| *b == bid.get_value() || block.get_value().children.iter().any(|x| x.id == *b)).map(|(b, k, v)| view! {
                 <ChipEditor block=b key=k value=v ctx=c />
             }))}
-            <button class="invisible absolute -right-6 top-0.5 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
+            // Flush against the block's right edge: with a gap between them,
+            // the pointer left the block on its way and the button hid.
+            <button class="invisible absolute left-full top-0 px-1.5 py-0.5 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
                 on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
         </div>
     }
