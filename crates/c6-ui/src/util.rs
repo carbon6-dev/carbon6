@@ -34,6 +34,31 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
     view! { <span class=format!("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {cls}")>{label}</span> }
 }
 
+/// Sizes a message box to what is in it; its CSS `max-height` caps it, and
+/// past that it scrolls.
+pub fn fit(el: &web_sys::HtmlTextAreaElement) {
+    let _ = el.set_attribute("style", "height:auto");
+    let border = el.offset_height() - el.client_height();
+    let _ = el.set_attribute("style", &format!("height:{}px", el.scroll_height() + border));
+}
+
+/// Keeps a message box sized to its text as `track` changes it (typed, sent,
+/// put back to edit).
+pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static) {
+    Effect::new(move || {
+        track();
+        request_animation_frame(move || {
+            if let Some(el) = node.try_get_untracked().flatten() {
+                fit(&el);
+            }
+        });
+    });
+}
+
+/// The class of a message box that grows with its text up to 40% of the
+/// window, then scrolls.
+pub const GROWS: &str = "max-h-[40dvh] resize-none overflow-y-auto";
+
 /// A touch screen is the main way in (a phone or tablet): there, Return
 /// in a message box is a new line, as on a phone's keyboard.
 pub fn touch_first() -> bool {

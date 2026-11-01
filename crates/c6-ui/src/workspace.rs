@@ -1254,8 +1254,8 @@ pub fn ScrollBox(
             if c.visible.get() {
                 let (top, end) = c.scroll.get_value();
                 request_animation_frame(move || {
-                    if let Some(el) = node.get_untracked() {
-                        if end || follow.is_some_and(|f| f.get_untracked()) {
+                    if let Some(el) = node.try_get_untracked().flatten() {
+                        if end || follow.is_some_and(|f| f.try_get_untracked() == Some(true)) {
                             el.set_scroll_top(el.scroll_height());
                         } else if top > 0 {
                             el.set_scroll_top(top);
@@ -1272,8 +1272,9 @@ pub fn ScrollBox(
         Effect::new(move || {
             let Some(el) = node.get() else { return };
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
-                if let Some(el) = node.get_untracked()
-                    && follow.get_untracked()
+                // A last resize may come after the box has gone.
+                if let Some(el) = node.try_get_untracked().flatten()
+                    && follow.try_get_untracked() == Some(true)
                     && el.client_height() > 0
                 {
                     glide_to_end(&el);
