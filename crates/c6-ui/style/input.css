@@ -35,9 +35,12 @@
   .md pre { @apply overflow-x-auto rounded-md bg-zinc-100 p-3 dark:bg-zinc-900; }
   .md pre code { @apply bg-transparent p-0; }
   .md blockquote { @apply border-l-2 border-zinc-300 pl-3 text-zinc-600 dark:border-zinc-700 dark:text-zinc-400; }
-  /* A wide table scrolls within itself, not the whole transcript. */
-  .md table { @apply block max-w-full overflow-x-auto border-collapse text-xs; }
+  /* A wide table scrolls within itself, not the whole transcript. Its
+     words don't break: wrapping anywhere would let a narrow screen squeeze
+     a column to a letter or two rather than widen the table. */
+  .md table { @apply block max-w-full overflow-x-auto border-collapse text-xs; overflow-wrap: normal; }
   .md th, .md td { @apply border border-zinc-300 px-2 py-1 dark:border-zinc-700; }
+  .md th { @apply whitespace-nowrap; }
 }
 
 /* Search: every match on the page, the current one stronger, and a flash
