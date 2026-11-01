@@ -221,6 +221,11 @@ pub struct LiveAttached {
     /// When it last moved (0: unknown).
     #[serde(default)]
     pub at: UnixMs,
+    /// A session that finished its turn (or failed) and that you've seen
+    /// since: you opened it, sent it a message or marked its work seen. It
+    /// no longer makes its work need you, until its next turn ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seen: bool,
 }
 
 /// `POST /api/v1/work`.
