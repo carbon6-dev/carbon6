@@ -419,9 +419,13 @@ impl Turn<'_> {
             }
             user_blocks.extend(images);
 
-            for input in pending() {
-                self.sink.append(input.event()).await?;
-                user_blocks.extend(input.blocks());
+            // Interrupted: what was sent meanwhile starts the next turn rather
+            // than going into this one, which ends here (Send now relies on it).
+            if !self.cancel.is_cancelled() {
+                for input in pending() {
+                    self.sink.append(input.event()).await?;
+                    user_blocks.extend(input.blocks());
+                }
             }
             // A Stop hook can send the model back to work, a few times.
             if user_blocks.is_empty()

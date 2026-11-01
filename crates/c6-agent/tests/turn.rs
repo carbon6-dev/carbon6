@@ -149,6 +149,42 @@ async fn tool_call_then_answer_with_mid_turn_input() {
     assert_eq!(rebuilt, conv.history);
 }
 
+/// A message sent while a tool runs, when the turn is then interrupted, is
+/// not taken into the turn that stops: it waits for the next one.
+#[tokio::test]
+async fn an_interrupted_turn_leaves_waiting_input_for_the_next() {
+    let mock = MockLlm::start().await;
+    mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"until false; do sleep 0.05; done"}"#.into())]));
+    let dir = tempfile::tempdir().unwrap();
+    let client = OpenAiChat::new(&mock.base_url(), "test-key", HashMap::new()).unwrap();
+    let vec_sink = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = vec_sink.clone();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let mut conv = Conversation { history: vec![Message::user_text("run it")], context_tokens: 0 };
+    let queued = Arc::new(std::sync::Mutex::new(vec![PendingInput {
+        command_id: "c2".into(),
+        text: "stop and do this".into(),
+        ..Default::default()
+    }]));
+    let waiting = queued.clone();
+    let mut pending = move || std::mem::take(&mut *waiting.lock().unwrap());
+    let cancel = CancellationToken::new();
+    let stop = async {
+        // Once the command runs.
+        c6_testkit::eventually("the tool to run", async || {
+            vec_sink.events.lock().unwrap().iter().any(|e| kind_name(e) == "assistant").then_some(())
+        })
+        .await;
+        cancel.cancel();
+    };
+    let (cfg, tools) = (cfg(), default_tools());
+    let (reason, ()) = tokio::join!(run_turn(1, &cfg, &client, &tools, &session, &sink, &mut conv, &mut pending, &cancel), stop);
+    assert_eq!(reason.unwrap(), TurnEndReason::Interrupted);
+    assert_eq!(queued.lock().unwrap().len(), 1, "it waits for the next turn");
+    let kinds: Vec<&str> = vec_sink.events.lock().unwrap().iter().map(|e| kind_name(e)).collect();
+    assert!(!kinds.contains(&"user"), "not taken into the stopped turn: {kinds:?}");
+}
+
 #[tokio::test]
 async fn interrupt_mid_stream_keeps_partial_text() {
     let mock = MockLlm::start().await;
