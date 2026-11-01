@@ -1793,6 +1793,11 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
 }
 
 /// "model · effort", or just the model when it runs at its default effort.
+/// The message box's buttons: one height, centred on the box at its resting
+/// two lines (54px: 2 × 20px, padding, border), so they and 📎 line up; on a
+/// box grown taller they stay by its last line.
+const SEND_AT: &str = "mb-[9px] h-9 shrink-0";
+
 const CHIP: &str = "inline-flex items-center gap-1 rounded-full border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800";
 
 const SUBAGENTS_HELP: &str = "The agent starts a subagent with its Task tool when it decides a piece of work suits one (or you ask). This is the connection and model they run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.";
@@ -3517,7 +3522,7 @@ fn Composer(
                             </div>
                         })
                     }}
-                    <button class="shrink-0 self-center rounded-md px-1.5 py-1 text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    <button class="mb-[9px] flex h-9 shrink-0 items-center rounded-md px-1.5 text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="Attach images or files (or paste / drop them)" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>"📎"</button>
                     <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                     <textarea
@@ -3583,7 +3588,7 @@ fn Composer(
                         on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { update_mention() }
                     ></textarea>
                     {move || if stopping.get() {
-                        view! { <button class=format!("{BUTTON} py-2") disabled=true>"Stopping…"</button> }.into_any()
+                        view! { <button class=format!("{BUTTON} {SEND_AT}") disabled=true>"Stopping…"</button> }.into_any()
                     } else if running.get() && has_text.get() {
                         // Both runtimes take it into the running turn (Claude Code's
                         // process stays up: docs/background.md §4).
@@ -3596,9 +3601,9 @@ fn Composer(
                             </div>
                         }.into_any()
                     } else if running.get() {
-                        view! { <button class="rounded-md border border-zinc-300 px-3 py-2 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" on:click=stop>"Stop"</button> }.into_any()
+                        view! { <button class=format!("rounded-md border border-zinc-300 px-3 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800 {SEND_AT}") on:click=stop>"Stop"</button> }.into_any()
                     } else {
-                        view! { <button class=format!("{BUTTON} py-2") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()
+                        view! { <button class=format!("{BUTTON} {SEND_AT}") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()
                     }}
                 </div>
                 {move || shown_next().map(|_| view! {
