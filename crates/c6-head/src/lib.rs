@@ -295,6 +295,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     });
     let _ = state.me.set(Arc::downgrade(&state));
     updates::after_open(&state).await;
+    // Sessions it stopped starting.
+    sessions::release_held(&state).await;
 
     let mut tasks = JoinSet::new();
 

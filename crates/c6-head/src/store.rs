@@ -566,9 +566,10 @@ pub struct Ingested {
 }
 
 impl Store {
-    /// Creates a session and enqueues its commands atomically. Returns its
-    /// colour (picked here when `s` has none).
-    pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>]) -> anyhow::Result<String> {
+    /// Creates a session and enqueues its commands atomically: `held` ones
+    /// wait for `release_held`. Returns its colour (picked here when `s`
+    /// has none).
+    pub async fn create_session(&self, s: &SessionRow, commands: &[NewCommand<'_>], held: bool) -> anyhow::Result<String> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let colour = match (s.colour.is_empty(), &s.parent_id) {
             (true, None) => least_used_colour(&mut tx, &s.realm).await?,
@@ -609,7 +610,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         for c in commands {
-            insert_command(&mut tx, c).await?;
+            insert_command(&mut tx, c, held).await?;
         }
         tx.commit().await?;
         Ok(colour)
@@ -1296,23 +1297,81 @@ pub struct NewCommand<'a> {
     pub text: Option<&'a str>,
 }
 
-async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .bind(c.id)
-        .bind(c.session_id)
-        .bind(c.worker_id.to_string())
-        .bind(&c.data)
-        .bind(c.text)
-        .bind(c6_core::now_ms())
-        .execute(&mut *tx)
-        .await?;
+/// Queues `c`: held when asked or while its session has held commands (so
+/// it stays behind them), else pending.
+async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>, held: bool) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+         CASE WHEN ?7 OR EXISTS (SELECT 1 FROM commands WHERE session_id = ?2 AND state = 'held') THEN 'held' ELSE 'pending' END)",
+    )
+    .bind(c.id)
+    .bind(c.session_id)
+    .bind(c.worker_id.to_string())
+    .bind(&c.data)
+    .bind(c.text)
+    .bind(c6_core::now_ms())
+    .bind(held)
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
 impl Store {
     pub async fn enqueue_command(&self, c: &NewCommand<'_>) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await?;
-        insert_command(&mut conn, c).await
+        insert_command(&mut conn, c, false).await
+    }
+
+    /// Sessions whose commands are held.
+    pub async fn held_sessions(&self) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT DISTINCT session_id FROM commands WHERE state = 'held'").fetch_all(&self.pool).await?)
+    }
+
+    /// Hands a session's held commands to delivery, in their order, with
+    /// `create` (its Create's id and new data) replacing that one. They are
+    /// queued anew, after anything a worker's connection was already sent.
+    /// Returns how many there were.
+    pub async fn release_held(&self, session_id: &str, create: Option<(&str, &[u8])>) -> anyhow::Result<usize> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut held: Vec<CommandRow> = sqlx::query_as("DELETE FROM commands WHERE session_id = ? AND state = 'held' RETURNING *")
+            .bind(session_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        held.sort_by_key(|c| c.seq);
+        for c in &held {
+            let data = match create {
+                Some((id, data)) if id == c.id => data,
+                _ => &c.data,
+            };
+            sqlx::query("INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+                .bind(&c.id)
+                .bind(&c.session_id)
+                .bind(&c.worker_id)
+                .bind(data)
+                .bind(&c.text)
+                .bind(c.created_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(held.len())
+    }
+
+    /// Fails a session whose commands are held, and them with it.
+    pub async fn fail_held(&self, session_id: &str, reason: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+            .bind(reason)
+            .bind(c6_core::now_ms())
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE commands SET state = 'rejected', error = 'session failed to start' WHERE session_id = ? AND state = 'held'")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Pending commands for a worker after `after_seq`, in delivery order.
@@ -1402,8 +1461,8 @@ impl Store {
     pub async fn replace_with_restore(&self, old_id: &str, restore: &NewCommand<'_>, input: &NewCommand<'_>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(old_id).execute(&mut *tx).await?;
-        insert_command(&mut tx, restore).await?;
-        insert_command(&mut tx, input).await?;
+        insert_command(&mut tx, restore, false).await?;
+        insert_command(&mut tx, input, false).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1434,5 +1493,105 @@ impl Store {
     pub async fn cancel_pending_command(&self, id: &str) -> anyhow::Result<bool> {
         let r = sqlx::query("UPDATE commands SET state = 'done' WHERE id = ? AND state = 'pending'").bind(id).execute(&self.pool).await?;
         Ok(r.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str, worker_id: WorkerId) -> SessionRow {
+        SessionRow {
+            id: id.into(),
+            worker_id: worker_id.to_string(),
+            title: "t".into(),
+            cwd: String::new(),
+            connection_id: "c".into(),
+            model: "m".into(),
+            status: "starting".into(),
+            error: None,
+            effort: None,
+            parent_id: None,
+            parent_call_id: None,
+            fork_seq: None,
+            created_at: 0,
+            updated_at: 0,
+            last_seq: 0,
+            archived: 0,
+            labels: "[]".into(),
+            worker_name: "w".into(),
+            repo: String::new(),
+            folder: String::new(),
+            home: String::new(),
+            ssh_target: String::new(),
+            awaiting: 0,
+            subagent_model: String::new(),
+            subagent_connection_id: String::new(),
+            subagent_effort: String::new(),
+            tools: "[]".into(),
+            realm: "home".into(),
+            agent: String::new(),
+            end_reason: String::new(),
+            root_id: None,
+            observed: false,
+            instance: String::new(),
+            colour: String::new(),
+            remote_template: String::new(),
+        }
+    }
+
+    fn command<'a>(id: &'a str, session_id: &'a str, worker_id: WorkerId, text: Option<&'a str>) -> NewCommand<'a> {
+        NewCommand { id, session_id, worker_id, data: id.as_bytes().to_vec(), text }
+    }
+
+    #[tokio::test]
+    async fn held_commands_wait_and_then_come_after_what_was_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let w = WorkerId::new();
+        let ids = |rows: &[CommandRow]| rows.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+
+        store
+            .create_session(&session("a", w), &[command("a-create", "a", w, None), command("a-input", "a", w, Some("hi"))], true)
+            .await
+            .unwrap();
+        // Queued behind a held start: held too.
+        store.enqueue_command(&command("a-more", "a", w, Some("and"))).await.unwrap();
+        // Another session's, sent while a's are held.
+        store.create_session(&session("b", w), &[command("b-create", "b", w, None)], false).await.unwrap();
+        let sent = store.pending_commands(w, 0).await.unwrap();
+        assert_eq!(ids(&sent), ["b-create"]);
+        assert_eq!(ids(&store.queued_inputs("a").await.unwrap()), ["a-input", "a-more"], "held inputs show as queued");
+        assert_eq!(store.held_sessions().await.unwrap(), ["a"]);
+
+        let created_at = store.queued_inputs("a").await.unwrap()[0].created_at;
+        assert_eq!(store.release_held("a", Some(("a-create", b"with brief"))).await.unwrap(), 3);
+        let after = store.pending_commands(w, sent[0].seq).await.unwrap();
+        assert_eq!(ids(&after), ["a-create", "a-input", "a-more"], "in order, after what was sent");
+        assert_eq!(after[0].data, b"with brief");
+        assert_eq!(after[1].data, b"a-input");
+        assert_eq!(after[1].created_at, created_at);
+        assert!(store.held_sessions().await.unwrap().is_empty());
+        assert_eq!(store.release_held("a", None).await.unwrap(), 0, "released once");
+        store.enqueue_command(&command("a-later", "a", w, None)).await.unwrap();
+        assert_eq!(store.pending_commands(w, after[2].seq).await.unwrap()[0].id, "a-later", "no longer held");
+    }
+
+    #[tokio::test]
+    async fn a_failed_hand_over_fails_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let w = WorkerId::new();
+        store
+            .create_session(&session("a", w), &[command("a-create", "a", w, None), command("a-input", "a", w, Some("hi"))], true)
+            .await
+            .unwrap();
+        store.fail_held("a", "could not hand it to its worker: disk full").await.unwrap();
+        let s = store.session("a").await.unwrap().unwrap();
+        assert_eq!((s.status.as_str(), s.error.as_deref()), ("failed", Some("could not hand it to its worker: disk full")));
+        let queued = store.queued_inputs("a").await.unwrap();
+        assert_eq!((queued.len(), queued[0].state.as_str()), (1, "rejected"));
+        assert!(store.held_sessions().await.unwrap().is_empty());
+        assert!(store.pending_commands(w, 0).await.unwrap().is_empty());
     }
 }
