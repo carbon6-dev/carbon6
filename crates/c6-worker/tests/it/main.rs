@@ -17,6 +17,7 @@ mod collections;
 mod commands;
 mod context_window;
 mod decisions;
+mod delivery;
 mod documents;
 mod examples;
 mod explorer;

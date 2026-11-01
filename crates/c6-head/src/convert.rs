@@ -167,6 +167,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             let spec = m.model.clone().unwrap_or_default();
             api::EventKind::SubagentModelSet { connection_id: spec.connection_id, model: spec.model, effort: spec.effort }
         }
+        // Shown in the queue (as with the agent), not the transcript.
+        Kind::InputDelivered(_) => return None,
         // Shown when a turn takes it; until then, it waits.
         Kind::NoticeQueued(n) => api::EventKind::NoticeQueued {
             command_id: n.command_id.clone(),
@@ -253,5 +255,6 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
         text: c.text.clone().unwrap_or_default(),
         created_at: c.created_at,
         rejected: (c.state == "rejected").then(|| c.error.clone().unwrap_or_default()),
+        with_agent: c.with_agent != 0 && c.state == "pending",
     }
 }

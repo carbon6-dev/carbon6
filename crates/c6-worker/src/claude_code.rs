@@ -514,7 +514,13 @@ impl Process {
                     }
                     _ = more.notified() => {
                         for input in feed() {
-                            alive &= self.send(input, None, false).await.is_ok();
+                            let command_id = input.command_id.clone();
+                            let sent = self.send(input, None, false).await.is_ok();
+                            alive &= sent;
+                            // It is with the agent now: it reads it at its next step.
+                            if sent && !command_id.is_empty() {
+                                sink.append(session_event::Kind::InputDelivered(c6_proto::InputDelivered { command_id })).await?;
+                            }
                         }
                         continue;
                     }
@@ -1395,6 +1401,7 @@ JSON
             session_event::Kind::TurnEnded(_) => "turn_ended",
             session_event::Kind::SubagentSpawned(_) => "subagent_spawned",
             session_event::Kind::Usage(_) => "usage",
+            session_event::Kind::InputDelivered(_) => "input_delivered",
             _ => "other",
         }
     }
@@ -1531,8 +1538,12 @@ done
         };
         let (end, ()) = tokio::join!(turn, send);
         assert_eq!(end.unwrap().reason, Some(TurnEndReason::Completed));
-        assert_eq!(kinds(&vec_sink), ["user", "turn_started", "assistant", "user", "assistant", "usage", "turn_ended"]);
-        let Some(session_event::Kind::User(u)) = &vec_sink.0.lock().unwrap()[3].kind else { panic!() };
+        // With the agent once written, logged as yours once it takes it.
+        assert_eq!(kinds(&vec_sink), ["user", "turn_started", "assistant", "input_delivered", "user", "assistant", "usage", "turn_ended"]);
+        let events = vec_sink.0.lock().unwrap().clone();
+        let Some(session_event::Kind::InputDelivered(d)) = &events[3].kind else { panic!() };
+        assert_eq!(d.command_id, "c2");
+        let Some(session_event::Kind::User(u)) = &events[4].kind else { panic!() };
         assert_eq!((u.command_id.as_str(), u.text.as_str()), ("c2", "and this"));
     }
 

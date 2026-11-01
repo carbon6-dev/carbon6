@@ -33,7 +33,16 @@ message SessionEvent {
     SubagentModelSet subagent_model_set = 29;
     SubagentReported subagent_reported = 30;
     NoticeQueued notice_queued = 31;
+    InputDelivered input_delivered = 32;
   }
+}
+
+// One of your messages reached the agent while it was working: it is in
+// the session's inbox, or written to its Claude Code process, and the
+// agent reads it at its next step (its UserMessage then). Until then the
+// head shows it as with the agent rather than queued.
+message InputDelivered {
+  string command_id = 1;
 }
 
 // The head brought a remote subagent's report (DelegationEnded) to this

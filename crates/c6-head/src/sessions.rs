@@ -982,7 +982,7 @@ pub async fn send_input_as(
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
-    Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None })
+    Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None, with_agent: false })
 }
 
 /// A session that takes input (the checks `send_input` and the queue
@@ -1095,7 +1095,7 @@ pub async fn edit_queued(st: &HeadState, session_id: &str, command_id: &str, tex
     }
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
-    Ok(api::QueuedInput { command_id: command_id.to_owned(), text: shown, created_at, rejected: None })
+    Ok(api::QueuedInput { command_id: command_id.to_owned(), text: shown, created_at, rejected: None, with_agent: false })
 }
 
 /// Cancels a queued input before it is delivered: it is never sent. 409
@@ -1185,7 +1185,7 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
         .into_iter()
         .filter_map(|row| {
             let text = row.text?;
-            Some(api::QueuedInput { command_id: row.id, text, created_at: row.created_at, rejected: None })
+            Some(api::QueuedInput { command_id: row.id, text, created_at: row.created_at, rejected: None, with_agent: false })
         })
         .collect())
 }
@@ -1351,7 +1351,7 @@ pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) 
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&text) }).await?;
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
-    Ok(api::QueuedInput { command_id: id, text, created_at: now_ms(), rejected: None })
+    Ok(api::QueuedInput { command_id: id, text, created_at: now_ms(), rejected: None, with_agent: false })
 }
 
 /// Queues a rewind (applied after a running turn is interrupted). Commands
@@ -1746,7 +1746,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
             st.hub.publish(&batch.session_id, api::StreamMsg::Event { event });
         }
     }
-    if !ing.done_commands.is_empty() {
+    if !ing.done_commands.is_empty() || !ing.delivered_commands.is_empty() {
         publish_queue(st, &batch.session_id).await;
     }
     if !ing.events.is_empty() {

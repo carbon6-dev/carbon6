@@ -1565,11 +1565,24 @@ impl Actor {
                             r.1 |= input.wake;
                         }
                         let held = std::mem::take(&mut self.deferred);
-                        let mut inbox = self.inbox.lock().unwrap();
-                        for (n, _) in held {
-                            inbox.push(n, None);
+                        let command_id = input.command_id.clone();
+                        {
+                            let mut inbox = self.inbox.lock().unwrap();
+                            for (n, _) in held {
+                                inbox.push(n, None);
+                            }
+                            inbox.push(*input, model);
                         }
-                        inbox.push(*input, model)
+                        // A running turn of carbon6's own loop takes it at its next
+                        // step: it is with the agent. (A Claude Code turn says so
+                        // when it writes it to its process.)
+                        if running.is_some() && !self.runs_claude_code() {
+                            let delivered = c6_proto::InputDelivered { command_id };
+                            if let Err(e) = self.writer.append(session_event::Kind::InputDelivered(delivered)).await {
+                                error!(session = %self.writer.session_id, "recording a delivered input: {e:#}");
+                                return;
+                            }
+                        }
                     }
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }

@@ -626,6 +626,7 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::SubagentSpawned(_) => "subagent_spawned",
         session_event::Kind::SubagentReported(_) => "subagent_reported",
         session_event::Kind::NoticeQueued(_) => "notice_queued",
+        session_event::Kind::InputDelivered(_) => "input_delivered",
     }
 }
 
