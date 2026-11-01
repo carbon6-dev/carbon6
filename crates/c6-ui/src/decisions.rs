@@ -17,13 +17,7 @@ use crate::workspace::{Go, How, View, use_workspace};
 #[component]
 pub fn DecisionLink(class: &'static str) -> impl IntoView {
     let live = api::live();
-    let tick = RwSignal::new(0u32);
-    let handle = set_interval_with_handle(move || tick.update(|t| *t += 1), std::time::Duration::from_secs(30)).ok();
-    on_cleanup(move || {
-        if let Some(h) = handle {
-            h.clear();
-        }
-    });
+    let tick = ticking();
     let count = LocalResource::new(move || {
         tick.track();
         live.sessions.track();
@@ -37,6 +31,20 @@ pub fn DecisionLink(class: &'static str) -> impl IntoView {
             })}
         </Go>
     }
+}
+
+/// A tick every 30 seconds while the view that asks lives: what waits on you
+/// (a decision, something in another realm) can change without the live
+/// feed saying so.
+pub(crate) fn ticking() -> RwSignal<u32> {
+    let tick = RwSignal::new(0u32);
+    let handle = set_interval_with_handle(move || tick.update(|t| *t += 1), std::time::Duration::from_secs(30)).ok();
+    on_cleanup(move || {
+        if let Some(h) = handle {
+            h.clear();
+        }
+    });
+    tick
 }
 
 /// How long a change in the live feed waits before the list loads again.

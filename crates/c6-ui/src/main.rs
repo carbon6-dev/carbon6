@@ -332,8 +332,13 @@ fn RealmGlyph(#[prop(into)] id: String) -> impl IntoView {
 /// page loads, so the router must not handle them in the page.
 #[component]
 fn PlaceMenu() -> impl IntoView {
+    // Loaded again as things change, like the Decisions count: an update
+    // offer, say, waits in the console while you're in a realm.
+    let (live, tick) = (api::live(), decisions::ticking());
     let places = LocalResource::new(move || {
         api::realms_changed().track();
+        tick.track();
+        live.sessions.track();
         api::elsewhere()
     });
     let menu = NodeRef::<leptos::html::Details>::new();
