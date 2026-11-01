@@ -49,27 +49,83 @@ pub fn Dock() -> impl IntoView {
     let activity = section_open("c6.dock.activity");
     let sessions = section_open("c6.dock.sessions");
     let fold = FOLD;
+    // Hidden, the dock leaves a strip at the left edge: pointing at it slides
+    // the dock out over the tiles, and it goes again once you move away.
+    let kept = section_open("c6.dock.kept");
+    let peek = RwSignal::new(false);
+    let timer = StoredValue::new(None::<TimeoutHandle>);
+    let after = move |ms: u64, show: bool| {
+        if let Some(t) = timer.get_value() {
+            t.clear();
+        }
+        let t = set_timeout_with_handle(move || peek.set(show), std::time::Duration::from_millis(ms)).ok();
+        timer.set_value(t);
+    };
+    let toggle = Callback::new(move |()| {
+        kept.update(|k| *k = !*k);
+        peek.set(false);
+    });
+    // ⌘\ (Ctrl+\) hides it or keeps it open.
+    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && ev.key() == "\\" {
+            ev.prevent_default();
+            toggle.run(());
+        }
+    });
     view! {
-        <aside class="hidden w-60 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 lg:flex dark:border-zinc-800 dark:bg-zinc-950">
-            <div class=move || if !activity.get() { "flex shrink-0 flex-col" } else if sessions.get() { "flex max-h-[45%] min-h-0 shrink-0 flex-col" } else { "flex min-h-0 flex-1 flex-col" }>
-                <DockActivity open=activity fold />
-            </div>
-            <div class=move || if sessions.get() { "flex min-h-0 flex-1 flex-col border-t border-zinc-200 dark:border-zinc-800" } else { "flex shrink-0 flex-col border-t border-zinc-200 dark:border-zinc-800" }>
-                <crate::sessions::SessionsRail open=sessions />
-            </div>
-        </aside>
+        <div class=move || if kept.get() { "hidden w-60 shrink-0 lg:flex" } else { "relative z-30 hidden w-2 shrink-0 lg:block" }
+            on:mouseenter=move |_| if !kept.get_untracked() { after(80, true) }
+            on:mouseleave=move |_| if !kept.get_untracked() { after(250, false) }>
+            {move || (!kept.get()).then(|| view! {
+                <button class="absolute inset-0 border-r border-zinc-200 bg-zinc-50 hover:bg-zinc-200 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-800"
+                    title="Show the sidebar (⌘\\ keeps it open)" aria-label="Show the sidebar" on:click=move |_| toggle.run(())></button>
+            })}
+            <aside class=move || {
+                let at = if kept.get() {
+                    "w-full"
+                } else if peek.get() {
+                    "absolute inset-y-0 left-0 w-60 translate-x-0 shadow-xl"
+                } else {
+                    "pointer-events-none invisible absolute inset-y-0 left-0 w-60 -translate-x-full"
+                };
+                format!("flex flex-col border-r border-zinc-200 bg-zinc-50 transition-[translate,visibility] duration-150 ease-out motion-reduce:transition-none dark:border-zinc-800 dark:bg-zinc-950 {at}")
+            }>
+                <div class=move || if !activity.get() { "flex shrink-0 flex-col" } else if sessions.get() { "flex max-h-[45%] min-h-0 shrink-0 flex-col" } else { "flex min-h-0 flex-1 flex-col" }>
+                    <DockActivity open=activity fold kept toggle />
+                </div>
+                <div class=move || if sessions.get() { "flex min-h-0 flex-1 flex-col border-t border-zinc-200 dark:border-zinc-800" } else { "flex shrink-0 flex-col border-t border-zinc-200 dark:border-zinc-800" }>
+                    <crate::sessions::SessionsRail open=sessions />
+                </div>
+            </aside>
+        </div>
     }
 }
 
 #[component]
-fn DockActivity(open: RwSignal<bool>, fold: &'static str) -> impl IntoView {
+fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, toggle: Callback<()>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let filter = crate::labels::use_filter().0;
     let all = Memo::new(move |_| ws.tracked(&live));
+    let hidden = Memo::new(move |_| ws.minimized());
+    // A minimized session shows in Minimized, not again below.
+    let minimized_sessions = Memo::new(move |_| {
+        hidden.with(|h| {
+            h.iter()
+                .flat_map(|(_, _, views)| views.iter())
+                .filter_map(|v| match v {
+                    View::Session { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+        })
+    });
     let items = Memo::new(move |_| {
         let f = filter.get();
-        all.get().into_iter().filter(|(s, _)| crate::labels::matches(s, &f)).collect::<Vec<_>>()
+        all.get()
+            .into_iter()
+            .filter(|(s, _)| crate::labels::matches(s, &f) && !minimized_sessions.with(|m| m.contains(&s.id)))
+            .collect::<Vec<_>>()
     });
     view! {
             <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
@@ -82,7 +138,14 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str) -> impl IntoView {
                         <span class="rounded-full bg-zinc-200 px-1.5 font-normal tabular-nums dark:bg-zinc-800">{items.with(Vec::len)}</span>
                     })}
                 </span>
-                <Go to=View::Mission class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mission control">"⊞ all"</Go>
+                <span class="flex items-center gap-2">
+                    <Go to=View::Mission class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mission control">"⊞ all"</Go>
+                    <button class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100"
+                        title=move || if kept.get() { "Hide the sidebar: it slides out when you point at the left edge (⌘\\)" } else { "Keep the sidebar open (⌘\\)" }
+                        on:click=move |_| toggle.run(())>
+                        {move || if kept.get() { "«" } else { "»" }}
+                    </button>
+                </span>
             </div>
             <Show when=move || open.get()>
             {move || (!filter.with(Vec::is_empty)).then(|| {
@@ -98,9 +161,13 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str) -> impl IntoView {
                 }
             })}
             <div class="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3">
+                {move || hidden.with(|h| (!h.is_empty()).then(|| view! {
+                    <div class="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">"Minimized"</div>
+                    {h.iter().map(|(key, n, views)| view! { <MinimizedItem key=*key n=*n views=views.clone() /> }).collect_view()}
+                }))}
                 {move || {
                     let items = items.get();
-                    if items.is_empty() {
+                    if items.is_empty() && hidden.with(Vec::is_empty) {
                         let msg = if filter.with(Vec::is_empty) {
                             "Running sessions, ones that finish while you're elsewhere, and ones you pin (☆) show here."
                         } else {
@@ -135,12 +202,72 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str) -> impl IntoView {
     }
 }
 
+/// A minimized tile: what it shows (a session's colour and state), and
+/// bringing it back or closing it.
+#[component]
+fn MinimizedItem(key: u64, n: usize, views: Vec<View>) -> impl IntoView {
+    let ws = use_workspace();
+    let live = api::live();
+    let views = StoredValue::new(views);
+    let label = move || views.with_value(|vs| vs.iter().map(|v| v.label(&live)).collect::<Vec<_>>().join("  ›  "));
+    let session = Memo::new(move |_| {
+        views.with_value(|vs| match vs.last() {
+            Some(View::Session { id, .. }) => live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).cloned()),
+            _ => None,
+        })
+    });
+    let state = move || {
+        session.get().map(|s| {
+            let seen = !ws.attention.with(|a| a.contains(&s.id));
+            let t = if s.awaiting_approval {
+                Tracked::Approval
+            } else if seen {
+                Tracked::Pinned
+            } else {
+                Tracked::Attention
+            };
+            (crate::marks::fill(&crate::marks::of(&s)), dot(s.display_status(), t), what(s.display_status(), t))
+        })
+    };
+    view! {
+        <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
+            <span class="h-6 w-1 shrink-0 rounded-sm" style=move || state().map(|(fill, _, _)| fill).unwrap_or_default()></span>
+            <span class=move || state().map_or("h-2 w-2 shrink-0", |(_, d, _)| d)></span>
+            <button class="min-w-0 flex-1 text-left" title=tile_title(n, "Bring it back") on:click=move |_| ws.show_tile(key)>
+                <div class="truncate text-sm">{label}</div>
+                <div class="truncate text-[11px] text-zinc-500">{move || state().map_or("minimized", |(_, _, w)| w)}</div>
+            </button>
+            {tile_badge(n)}
+            <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                title="Close this tile" aria-label="Close" on:click=move |_| ws.close_tile(key)>"✕"</button>
+        </div>
+    }
+}
+
+/// What a tile number means, for its title (⌘ and the number reach the
+/// first nine).
+fn tile_title(n: usize, what: &str) -> String {
+    if n <= 9 { format!("{what}: tile {n} (⌘{n})") } else { format!("{what}: tile {n}") }
+}
+
+/// The number of the tile a session is open in.
+pub(crate) fn tile_badge(n: usize) -> impl IntoView {
+    view! {
+        <span class="shrink-0 rounded bg-zinc-200 px-1 font-mono text-[10px] tabular-nums text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+            title=tile_title(n, "Open")>{n}</span>
+    }
+}
+
 #[component]
 fn DockItem(s: Session, t: Tracked) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let worker = live.worker_name(&s.worker_id.to_string());
     let id = s.id.clone();
+    let number = {
+        let id = id.clone();
+        Memo::new(move |_| ws.tile_number(&id))
+    };
     let dismissable = t == Tracked::Attention;
     view! {
         <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
@@ -153,6 +280,7 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
                 </div>
                 <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
             </Go>
+            {move || number.get().map(tile_badge)}
             {dismissable.then(|| {
                 let id = id.clone();
                 view! { <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" title="Dismiss" aria-label="Dismiss" on:click=move |_| ws.dismiss(&id)>"✕"</button> }
@@ -411,12 +539,15 @@ fn MissionCard(id: String) -> impl IntoView {
 pub fn MobileBar() -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
+    // In reading order, as ⌘1–9 and the dock number them.
     let tiles = Memo::new(move |_| {
         ws.layout.with(|l| {
-            l.tiles
-                .iter()
-                .enumerate()
-                .map(|(i, t)| (i, t.columns.get(t.cursor).map(|c| c.view.label(&live)).unwrap_or_default(), i == l.focus))
+            l.reading_order()
+                .into_iter()
+                .map(|i| {
+                    let t = &l.tiles[i];
+                    (t.key, t.columns.get(t.cursor).map(|c| c.view.label(&live)).unwrap_or_default(), i == l.focus)
+                })
                 .collect::<Vec<_>>()
         })
     });
@@ -425,10 +556,10 @@ pub fn MobileBar() -> impl IntoView {
     let count = move || counts.get().0;
     view! {
         <nav class="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-zinc-200 bg-zinc-50 px-2 py-1.5 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
-            {move || tiles.get().into_iter().map(|(i, label, focused)| view! {
+            {move || tiles.get().into_iter().map(|(key, label, focused)| view! {
                 <button
                     class=if focused { "max-w-36 shrink-0 truncate rounded-md bg-zinc-200 px-2.5 py-1.5 text-xs font-medium dark:bg-zinc-800" } else { "max-w-36 shrink-0 truncate rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" }
-                    on:click=move |_| ws.focus_tile(i)
+                    on:click=move |_| ws.show_tile(key)
                 >{label}</button>
             }).collect_view()}
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>

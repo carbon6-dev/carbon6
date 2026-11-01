@@ -34,6 +34,19 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
     view! { <span class=format!("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {cls}")>{label}</span> }
 }
 
+/// A touch screen is the main way in (a phone or tablet): there, Return
+/// in a message box is a new line, as on a phone's keyboard.
+pub fn touch_first() -> bool {
+    window().match_media("(pointer: coarse)").ok().flatten().is_some_and(|m| m.matches())
+}
+
+/// The key that sends a message box: Enter (Shift+Enter for a new line);
+/// on a touch screen only ⌘/Ctrl+Enter, Return being a new line. ⌘/Ctrl+Enter
+/// sends everywhere.
+pub fn sends(ev: &web_sys::KeyboardEvent) -> bool {
+    ev.key() == "Enter" && !ev.is_composing() && (ev.meta_key() || ev.ctrl_key() || (!ev.shift_key() && !touch_first()))
+}
+
 /// This browser's saved state, kept per place (docs/realms-ux.md §4):
 /// `c6.x` is `c6.<realm>.x` (or `c6.admin.x`). Home falls back to what was
 /// saved before realms had their own pages.

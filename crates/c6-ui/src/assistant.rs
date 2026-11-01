@@ -75,7 +75,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                     placeholder="e.g. What can I do in carbon6? · Which models are set up for vision? · Create an enrollment token for a new worker"
                     prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
                     on:keydown=move |ev| {
-                        if ev.key() == "Enter" && !ev.shift_key() { ev.prevent_default(); send(); }
+                        if crate::util::sends(&ev) { ev.prevent_default(); send(); }
                         if ev.key() == "Escape" { on_close.run(()); }
                     }></textarea>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}

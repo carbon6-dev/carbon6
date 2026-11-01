@@ -49,6 +49,17 @@
   animation: c6-flash 2.5s ease-out;
 }
 
+/* What arrives in a running session's transcript: a short fade up, so
+   new tool calls and messages settle in rather than pop. */
+@keyframes c6-arrive {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.c6-arrive { animation: c6-arrive 180ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .c6-arrive { animation: none; }
+}
+
 /* Chart series (the dataviz reference palette's first slots, stepped
    separately for light and dark surfaces). */
 .viz {
