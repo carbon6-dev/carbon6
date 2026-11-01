@@ -382,3 +382,42 @@ pub fn ErrorBox(message: String) -> impl IntoView {
         </div>
     }
 }
+
+/// One of a few answers, each shown whole as a row to tap: a drop-down
+/// shows only the chosen one and cuts long ones off. More than 8 fall back
+/// to a drop-down. `optional`: tapping the chosen row again clears it.
+/// Rows aren't buttons, so a `<label>` around them doesn't pick the first.
+#[component]
+pub fn Choices(choices: Vec<(String, String)>, value: RwSignal<String>, #[prop(optional)] optional: bool) -> impl IntoView {
+    if choices.len() > 8 {
+        return view! {
+            <select class=format!("{INPUT} py-1 text-sm") prop:value=move || value.get() on:change=move |ev| value.set(event_target_value(&ev))>
+                {optional.then(|| view! { <option value="">"—"</option> })}
+                {choices.into_iter().map(|(v, l)| view! { <option value=v>{l}</option> }).collect_view()}
+            </select>
+        }
+        .into_any();
+    }
+    view! {
+        <div role="radiogroup" class="space-y-1">
+            {choices.into_iter().map(|(v, l)| {
+                let v = StoredValue::new(v);
+                let on = Memo::new(move |_| value.with(|x| v.with_value(|v| x == v)));
+                let pick = move || value.update(|x| *x = if optional && v.with_value(|v| x == v) { String::new() } else { v.get_value() });
+                view! {
+                    <div role="radio" tabindex="0" aria-checked=move || on.get().to_string()
+                        class=move || format!(
+                            "flex w-full cursor-pointer items-start gap-2 rounded-md border px-2.5 py-1.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 {}",
+                            if on.get() { "border-sky-500 bg-sky-100 dark:bg-sky-900/40" } else { "border-zinc-300 bg-white hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500" },
+                        )
+                        on:click=move |ev| { ev.prevent_default(); pick() }
+                        on:keydown=move |ev| if ev.key() == "Enter" || ev.key() == " " { ev.prevent_default(); pick() }>
+                        <span class=move || format!("mt-1 h-3 w-3 shrink-0 rounded-full border {}", if on.get() { "border-sky-600 bg-sky-600" } else { "border-zinc-400 dark:border-zinc-500" })></span>
+                        <span class="min-w-0 flex-1">{l}</span>
+                    </div>
+                }
+            }).collect_view()}
+        </div>
+    }
+    .into_any()
+}

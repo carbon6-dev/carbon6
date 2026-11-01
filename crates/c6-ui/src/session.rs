@@ -2818,6 +2818,7 @@ fn tool_kind(name: &str) -> &str {
         "KillShell" | "mcp__carbon6__TaskStop" => "kill_shell",
         "Skill" => "load_skill",
         "doc" | "Doc" | "mcp__carbon6__doc" => "doc",
+        "c6_ask" | "mcp__carbon6__ask" => "ask",
         other => other,
     }
 }
@@ -2863,6 +2864,11 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             let what = s("action");
             let title = s("title");
             if title.is_empty() { format!("{what} {}", s("id")) } else { format!("{what} \"{title}\"") }
+        }
+        // Its title, else its first question.
+        "ask" => {
+            let first = input.pointer("/fields/0/label").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            Some(s("title")).filter(|t| !t.is_empty()).unwrap_or(first)
         }
         "plan" => {
             let items = plan_items(input);
@@ -4066,12 +4072,10 @@ fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_
                     {values.get_value().into_iter().map(|(f, v)| {
                         let label = if f.label.is_empty() { f.name.clone() } else { f.label.clone() };
                         let input = match f.r#type.as_str() {
-                            "choice" => view! {
-                                <select class=format!("{INPUT} py-1 text-sm") prop:value=move || v.get() on:change=move |ev| v.set(event_target_value(&ev))>
-                                    {(!f.required).then(|| view! { <option value="">"—"</option> })}
-                                    {f.choices.iter().map(|c| view! { <option value=c.value.clone()>{if c.label.is_empty() { c.value.clone() } else { c.label.clone() }}</option> }).collect_view()}
-                                </select>
-                            }.into_any(),
+                            "choice" => {
+                                let choices = f.choices.iter().map(|c| (c.value.clone(), if c.label.is_empty() { c.value.clone() } else { c.label.clone() })).collect();
+                                view! { <crate::util::Choices choices value=v optional=!f.required /> }.into_any()
+                            }
                             "boolean" => view! {
                                 <input type="checkbox" prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) />
                             }.into_any(),

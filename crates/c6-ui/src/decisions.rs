@@ -326,12 +326,8 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 {values.get_value().into_iter().map(|(f, v)| {
                     let label = format!("{}{}", if f.label.is_empty() { f.name.clone() } else { f.label.clone() }, if f.required { " *" } else { "" });
                     let input = if !f.choices.is_empty() {
-                        view! {
-                            <select class=INPUT prop:value=move || v.get() on:change=move |ev| v.set(event_target_value(&ev))>
-                                <option value="">"—"</option>
-                                {f.choices.iter().map(|c| view! { <option value=c.clone()>{c.clone()}</option> }).collect_view()}
-                            </select>
-                        }.into_any()
+                        let choices = f.choices.iter().map(|c| (c.clone(), c.clone())).collect();
+                        view! { <crate::util::Choices choices value=v optional=true /> }.into_any()
                     } else if f.kind == "long" {
                         view! { <textarea class=format!("{INPUT} h-20 text-sm") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev))></textarea> }.into_any()
                     } else {
