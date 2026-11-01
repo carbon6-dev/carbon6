@@ -487,12 +487,11 @@ pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -
             }
         }
     };
-    let own = one(realm).await;
-    // What commons knows about the same things (docs/os.md §3.3).
-    if !crate::grants::reads_commons(st, realm).await {
-        return own;
-    }
-    match one(crate::realms::COMMONS).await {
+    // What commons knows about the same things (docs/os.md §3.3), asked
+    // alongside.
+    let commons = async { if crate::grants::reads_commons(st, realm).await { Some(one(crate::realms::COMMONS).await) } else { None } };
+    let (own, commons) = tokio::join!(one(realm), commons);
+    match commons.unwrap_or_default() {
         c if c.trim().is_empty() => own,
         c if own.trim().is_empty() => format!("From commons (shared by every realm):\n{c}"),
         c => format!("{own}\n\nFrom commons (shared by every realm):\n{c}"),

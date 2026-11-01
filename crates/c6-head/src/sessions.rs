@@ -237,13 +237,13 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
         "",
         &row.ssh_target,
     ));
-    spec.memex_brief = crate::memex::brief(st, &row.realm, &brief_labels, prompt.unwrap_or("")).await;
     let input_id = Uuid::now_v7().to_string();
     // The parent's call waits on the turn that takes the first message.
     if let (Some(l), Some(_)) = (&link, prompt) {
         st.store.add_remote_delegation(&input_id, &row.id, &l.parent_id, &l.parent_call_id).await?;
     }
-    insert(st, row, spec, prompt.map(|p| (p, files)), input_id).await
+    let brief = Brief { labels: brief_labels, text: prompt.unwrap_or("").to_owned() };
+    insert(st, row, spec, prompt.map(|p| (p, files)), input_id, Some(brief)).await
 }
 
 /// A conversation with the assistant (it runs in the head).
@@ -321,7 +321,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         labels,
         ..Default::default()
     };
-    let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string()).await?;
+    let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await?;
     crate::assistant::started(&session.id);
     Ok(session)
 }
@@ -393,7 +393,7 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
-    insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string()).await
+    insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await
 }
 
 fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
@@ -562,14 +562,23 @@ async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::R
     Ok(seed)
 }
 
+/// What a new session's memex brief is about.
+struct Brief {
+    labels: Vec<String>,
+    text: String,
+}
+
 /// Stores a new session with its Create command (and first input) and
-/// tells the worker.
+/// tells the worker. With a `brief` to ask the memex for, its commands are
+/// held until that is in the Create, in the background, so creating it
+/// doesn't wait on the memex.
 async fn insert(
     st: &HeadState,
     row: SessionRow,
     spec: CreateSession,
     first: Option<(&str, Vec<c6_proto::Attachment>)>,
     input_id: String,
+    brief: Option<Brief>,
 ) -> anyhow::Result<api::Session> {
     let worker_id: WorkerId = row.worker_id.parse()?;
     let session_id = row.id.clone();
@@ -592,11 +601,84 @@ async fn insert(
             text: Some(text),
         });
     }
-    let colour = st.store.create_session(&row, &commands).await?;
+    let colour = st.store.create_session(&row, &commands, brief.is_some()).await?;
     st.hub.owners.lock().unwrap().insert(session_id.clone(), worker_id);
-    st.registry.deliver(worker_id);
+    match brief {
+        Some(brief) => hand_over_later(st, worker_id, create, &realm, brief).await,
+        None => st.registry.deliver(worker_id),
+    }
     st.registry.bump();
     Ok(convert::session(&SessionRow { colour, ..row }))
+}
+
+/// Runs `hand_over` in the background, as the request would have: with its
+/// settings realm and memex scope.
+async fn hand_over_later(st: &HeadState, worker_id: WorkerId, create: SessionCommand, realm: &str, brief: Brief) {
+    let Some(arc) = st.arc() else { return hand_over(st, worker_id, create, realm, brief).await };
+    let settings_realm = crate::store::SETTINGS_REALM.try_with(Clone::clone).ok();
+    let scope = crate::memex::SCOPE.try_with(Clone::clone).ok();
+    let realm = realm.to_owned();
+    tokio::spawn(async move {
+        let run = hand_over(&arc, worker_id, create, &realm, brief);
+        let run = async {
+            match scope {
+                Some(s) => crate::memex::SCOPE.scope(s, run).await,
+                None => run.await,
+            }
+        };
+        match settings_realm {
+            Some(r) => crate::store::SETTINGS_REALM.scope(r, run).await,
+            None => run.await,
+        }
+    });
+}
+
+/// Puts the memex's brief in a held session's Create and hands the
+/// session to its worker. If that can't be stored, the session fails.
+async fn hand_over(st: &HeadState, worker_id: WorkerId, mut create: SessionCommand, realm: &str, brief: Brief) {
+    let session_id = create.session_id.clone();
+    if let Some(session_command::Kind::Create(spec)) = &mut create.kind {
+        spec.memex_brief = crate::memex::brief(st, realm, &brief.labels, &brief.text).await;
+    }
+    match st.store.release_held(&session_id, Some((&create.command_id, &create.encode_to_vec()))).await {
+        Ok(_) => st.registry.deliver(worker_id),
+        Err(e) => {
+            warn!(session = %session_id, "handing the session to its worker: {e:#}");
+            match st.store.fail_held(&session_id, &format!("could not hand it to its worker: {e:#}")).await {
+                Ok(()) => {
+                    publish_queue(st, &session_id).await;
+                    crate::triggers::session_ended(st, &session_id, "failed").await;
+                }
+                // Left held: the next start hands it over.
+                Err(e) => warn!(session = %session_id, "failing the session: {e:#}"),
+            }
+        }
+    }
+    st.registry.bump();
+}
+
+/// Hands over the sessions the head stopped starting (while it asked the
+/// memex for their brief), without one. At start-up, before workers
+/// connect.
+pub async fn release_held(st: &HeadState) {
+    let ids = match st.store.held_sessions().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("finding sessions left starting: {e:#}");
+            return;
+        }
+    };
+    for id in ids {
+        match st.store.release_held(&id, None).await {
+            Ok(_) => info!(session = %id, "handed a session left starting to its worker, without a memex brief"),
+            Err(e) => {
+                warn!(session = %id, "handing a session left starting to its worker: {e:#}");
+                if let Err(e) = st.store.fail_held(&id, &format!("could not hand it to its worker: {e:#}")).await {
+                    warn!(session = %id, "failing the session: {e:#}");
+                }
+            }
+        }
+    }
 }
 
 fn default_title(prompt: Option<&str>) -> String {
@@ -2007,7 +2089,8 @@ async fn live_session(st: &HeadState, worker_id: WorkerId, session_id: &str) -> 
 
 /// The connections a session's tree uses: each session's (its subagents
 /// run on its connection), and those of model switches not yet reported
-/// (the worker asks for the new connection before the head sees the switch).
+/// (the worker asks for the new connection before the head sees the switch),
+/// held ones too.
 async fn connections_used(st: &HeadState, root: &str) -> anyhow::Result<std::collections::HashSet<String>> {
     let mut used: std::collections::HashSet<String> =
         sqlx::query_scalar("SELECT connection_id FROM sessions WHERE id = ?1 OR root_id = ?1")
@@ -2017,7 +2100,7 @@ async fn connections_used(st: &HeadState, root: &str) -> anyhow::Result<std::col
             .into_iter()
             .collect();
     let pending: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT data FROM commands WHERE state = 'pending' AND session_id IN (SELECT id FROM sessions WHERE id = ?1 OR root_id = ?1)",
+        "SELECT data FROM commands WHERE state IN ('pending', 'held') AND session_id IN (SELECT id FROM sessions WHERE id = ?1 OR root_id = ?1)",
     )
     .bind(root)
     .fetch_all(&st.store.pool)
@@ -2062,7 +2145,7 @@ async fn some_session_may_use(st: &HeadState, worker_id: WorkerId, conn: &crate:
     }
     let roots: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT COALESCE(root_id, id) FROM sessions WHERE worker_id = ?1 AND status != 'failed' \
-         AND (connection_id = ?2 OR id IN (SELECT session_id FROM commands WHERE worker_id = ?1 AND state = 'pending'))",
+         AND (connection_id = ?2 OR id IN (SELECT session_id FROM commands WHERE worker_id = ?1 AND state IN ('pending', 'held')))",
     )
     .bind(worker_id.to_string())
     .bind(&conn.id)
