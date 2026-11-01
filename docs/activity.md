@@ -51,9 +51,9 @@ While model calls are in flight or a sync is under way, a pulsing dot in the top
 
 ## Session indicators
 
-A session's displayed status includes its side chats and subagents: an idle main chat still shows **running** while any of them is working. The tile bar, session list and rail, Activity/Mission views, running filters/counts and desktop completion notifications use this aggregate. Once the last running chat finishes, it returns to idle; starting or failed main-chat states and approval warnings retain their precedence.
+A session's displayed status includes its side chats, subagents and background tasks: an idle main chat still shows **running** while any of them is working. Background tasks count when they tell the agent they ended (and all of Claude Code's own); servers and watchers started with `notify: false` don't ([background.md](background.md) §4). The tile bar, session list and rail, Activity/Mission views, running filters/counts and desktop completion notifications use this aggregate. Once the last running chat finishes, it returns to idle; starting or failed main-chat states and approval warnings retain their precedence.
 
-This is presentation, not a change to the main chat's execution state. You can still send a message to an idle main chat while a side chat runs, and its Send/Stop/Esc controls apply only to its own turn. The API retains that raw `status` and exposes `side_chats_running` and `subagents_running` separately.
+This is presentation, not a change to the main chat's execution state. You can still send a message to an idle main chat while a side chat runs, and its Send/Stop/Esc controls apply only to its own turn. The API retains that raw `status` and exposes `side_chats_running`, `subagents_running`, `tasks_running` and `servers_running` separately.
 
 ## API
 

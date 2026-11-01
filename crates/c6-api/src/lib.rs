@@ -263,6 +263,14 @@ pub struct Session {
     /// How many descendant side chats are running, excluding subagents.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub side_chats_running: u32,
+    /// Its background tasks running now that keep it showing as running
+    /// (those that tell the agent when they end, and Claude Code's own).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tasks_running: u32,
+    /// Its servers and watchers running now (background tasks started with
+    /// notify: false): listed, but they don't keep it showing as running.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub servers_running: u32,
     /// A subagent of Claude Code's, mirrored from its stream: read-only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observed: bool,
@@ -302,7 +310,9 @@ impl Session {
     /// keep their status even when descendants are active.
     pub fn display_status(&self) -> SessionStatus {
         match self.status {
-            SessionStatus::Idle if self.side_chats_running > 0 || self.subagents_running > 0 => SessionStatus::Running,
+            SessionStatus::Idle if self.side_chats_running > 0 || self.subagents_running > 0 || self.tasks_running > 0 => {
+                SessionStatus::Running
+            }
             status => status,
         }
     }
@@ -338,6 +348,19 @@ mod session_tests {
         let wire = serde_json::to_value(&s).unwrap();
         assert_eq!(wire["side_chats_running"], 3);
         assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
+    }
+
+    /// Background tasks that tell the agent keep an idle session showing as
+    /// running; servers and watchers don't (docs/background.md §4).
+    #[test]
+    fn background_tasks_keep_an_idle_session_running() {
+        let mut s = session();
+        s.servers_running = 2;
+        assert_eq!(s.display_status(), SessionStatus::Idle, "a server alone");
+        s.tasks_running = 1;
+        assert_eq!(s.display_status(), SessionStatus::Running);
+        s.status = SessionStatus::Failed;
+        assert_eq!(s.display_status(), SessionStatus::Failed, "a failed session stays failed");
     }
 
     #[test]

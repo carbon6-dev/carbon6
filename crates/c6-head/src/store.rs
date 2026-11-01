@@ -516,6 +516,10 @@ pub struct SessionRow {
 pub struct SessionActivity {
     pub subagents_running: u32,
     pub side_chats_running: u32,
+    /// Its background tasks that keep it showing as running, and the
+    /// servers and watchers that don't.
+    pub tasks_running: u32,
+    pub servers_running: u32,
 }
 
 impl SessionRow {
@@ -711,11 +715,15 @@ impl Store {
                  SELECT p.id, p.realm, a.child_id FROM side_ancestors a JOIN sessions s ON s.id = a.id \
                  JOIN sessions p ON p.id = s.parent_id AND p.realm = a.realm\
              ), activity AS (\
-                 SELECT id, 0 AS subagents, COUNT(*) AS side_chats FROM side_ancestors GROUP BY id \
+                 SELECT id, 0 AS subagents, COUNT(*) AS side_chats, 0 AS tasks, 0 AS servers FROM side_ancestors GROUP BY id \
                  UNION ALL \
-                 SELECT p.id, COUNT(*), 0 FROM sessions s JOIN sessions p ON p.id = s.root_id AND p.realm = s.realm \
-                 WHERE s.parent_call_id IS NOT NULL AND s.status = 'running' AND (?1 IS NULL OR s.realm = ?1) GROUP BY p.id\
-             ) SELECT id, SUM(subagents) AS subagents, SUM(side_chats) AS side_chats FROM activity GROUP BY id",
+                 SELECT p.id, COUNT(*), 0, 0, 0 FROM sessions s JOIN sessions p ON p.id = s.root_id AND p.realm = s.realm \
+                 WHERE s.parent_call_id IS NOT NULL AND s.status = 'running' AND (?1 IS NULL OR s.realm = ?1) GROUP BY p.id \
+                 UNION ALL \
+                 SELECT t.session_id, 0, 0, SUM(t.counted), SUM(1 - t.counted) FROM running_tasks t JOIN sessions s ON s.id = t.session_id \
+                 WHERE (?1 IS NULL OR s.realm = ?1) GROUP BY t.session_id\
+             ) SELECT id, SUM(subagents) AS subagents, SUM(side_chats) AS side_chats, SUM(tasks) AS tasks, SUM(servers) AS servers \
+             FROM activity GROUP BY id",
         )
         .bind(realm)
         .fetch_all(&self.pool)
@@ -728,6 +736,8 @@ impl Store {
                     SessionActivity {
                         subagents_running: r.get::<i64, _>("subagents") as u32,
                         side_chats_running: r.get::<i64, _>("side_chats") as u32,
+                        tasks_running: r.get::<i64, _>("tasks") as u32,
+                        servers_running: r.get::<i64, _>("servers") as u32,
                     },
                 )
             })
@@ -1071,6 +1081,24 @@ impl Store {
                 // applied: it is delivered from its log from now on.
                 Some(Kind::NoticeQueued(n)) => done.push(n.command_id.clone()),
                 Some(Kind::InputDelivered(d)) => delivered.push(d.command_id.clone()),
+                // Its background tasks while they run. One that tells the
+                // agent when it ends (and every one of Claude Code's own) keeps
+                // the session showing as running; a server or watcher doesn't.
+                Some(Kind::BackgroundTask(t)) if t.state == "started" => {
+                    sqlx::query("INSERT OR REPLACE INTO running_tasks (session_id, task_id, counted) VALUES (?, ?, ?)")
+                        .bind(session_id)
+                        .bind(&t.task_id)
+                        .bind((t.notify || t.kind == "claude_code") as i64)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                Some(Kind::BackgroundTask(t)) => {
+                    sqlx::query("DELETE FROM running_tasks WHERE session_id = ? AND task_id = ?")
+                        .bind(session_id)
+                        .bind(&t.task_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
                 Some(Kind::Usage(u)) => crate::usage::record(&mut tx, session_id, ev.seq, ev.ts_ms, u).await?,
                 Some(Kind::Approval(a)) => {

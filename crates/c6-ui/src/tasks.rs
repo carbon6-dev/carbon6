@@ -90,29 +90,74 @@ pub fn elapsed(ms: i64) -> String {
 }
 
 /// Session task history, with a prominent running count and an inspector.
+/// What's running now: the tasks that keep the session showing as running
+/// (those that tell the agent when they end, and Claude Code's own), and
+/// the servers and watchers that don't.
+pub fn running_counts(events: &[Event]) -> (usize, usize) {
+    lifecycle(events)
+        .iter()
+        .filter(|t| t.running())
+        .fold((0, 0), |(tasks, servers), t| if t.notify || t.kind == "claude_code" { (tasks + 1, servers) } else { (tasks, servers + 1) })
+}
+
+/// The line for the bottom of a transcript: "⏳ 1 task running · 1 server".
+pub fn running_line(tasks: usize, servers: usize) -> String {
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    match (tasks, servers) {
+        (0, s) => format!("⏳ {} running", plural(s, "server", "servers")),
+        (t, 0) => format!("⏳ {} running", plural(t, "background task", "background tasks")),
+        (t, s) => format!("⏳ {} running · {}", plural(t, "task", "tasks"), plural(s, "server", "servers")),
+    }
+}
+
+/// `line`: a quiet line for the bottom of the transcript, shown only while
+/// something runs (docs/background.md §4), instead of the bar's button.
 #[component]
-pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>, #[prop(optional)] compact: bool) -> impl IntoView {
+pub fn RunningTasks(
+    session: String,
+    events: RwSignal<Vec<Event>>,
+    #[prop(optional)] compact: bool,
+    #[prop(optional)] line: bool,
+) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
+    let counts = Memo::new(move |_| events.with(|e| running_counts(e)));
     let at = RwSignal::new(None::<(f64, f64)>);
     let selected = RwSignal::new(None::<String>);
     let now = clock();
     let error = RwSignal::new(None::<String>);
+    let shown = move || if line { counts.with(|(t, s)| t + s > 0) } else { !list.with(Vec::is_empty) };
     view! {
-        <Show when=move || !list.with(Vec::is_empty)>
+        <Show when=shown>
                 <div>
-                    <button class="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-300"
-                        title=move || list.with(|tasks| format!("Background tasks: {} running · {} total", tasks.iter().filter(|t| t.running()).count(), tasks.len()))
-                        on:click=move |ev| {
-                            ev.stop_propagation();
-                            at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
-                        }>
-                        <strong>{move || list.with(|tasks| {
-                            let n = tasks.iter().filter(|t| t.running()).count();
-                            if compact { format!("⚙ {n}") } else { format!("⚙ {n} running") }
-                        })}</strong>
-                        {(!compact).then_some(move || list.with(|tasks| format!(" · {} tasks", tasks.len())))}
-                    </button>
+                    {if line {
+                        view! {
+                            <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
+                                }>
+                                {move || counts.with(|(t, s)| format!("{} ›", running_line(*t, *s)))}
+                            </button>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <button class="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-300"
+                                title=move || list.with(|tasks| format!("Background tasks: {} running · {} total", tasks.iter().filter(|t| t.running()).count(), tasks.len()))
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
+                                }>
+                                <strong>{move || list.with(|tasks| {
+                                    let n = tasks.iter().filter(|t| t.running()).count();
+                                    if compact { format!("⚙ {n}") } else { format!("⚙ {n} running") }
+                                })}</strong>
+                                {(!compact).then_some(move || list.with(|tasks| format!(" · {} tasks", tasks.len())))}
+                            </button>
+                        }
+                        .into_any()
+                    }}
                     <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
                             <p class="text-zinc-500">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
                             {move || list.get().into_iter().map(|t| {
@@ -389,5 +434,28 @@ mod tests {
             assert!(!tasks[0].can_stop());
         }
         assert_eq!(lifecycle(&[event(1, "shell", "finished")])[0].status(), "finished · exit 7");
+    }
+
+    #[test]
+    fn the_transcript_line_counts_tasks_and_servers_apart() {
+        let with = |task: &str, state: &str, kind: &str, notify: bool| {
+            let mut e = event(1, task, state);
+            if let EventKind::BackgroundTask { kind: k, notify: n, .. } = &mut e.kind {
+                *k = kind.into();
+                *n = notify;
+            }
+            e
+        };
+        let evs = [
+            with("build", "started", "shell", true),
+            with("server", "started", "shell", false),
+            with("native", "started", "claude_code", false),
+            with("done", "started", "shell", true),
+            with("done", "finished", "shell", true),
+        ];
+        assert_eq!(running_counts(&evs), (2, 1), "Claude Code's own count as tasks");
+        assert_eq!(running_line(2, 1), "⏳ 2 tasks running · 1 server");
+        assert_eq!(running_line(1, 0), "⏳ 1 background task running");
+        assert_eq!(running_line(0, 2), "⏳ 2 servers running");
     }
 }
