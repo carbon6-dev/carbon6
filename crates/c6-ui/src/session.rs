@@ -613,7 +613,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     running=Signal::derive(running) tab open=details />
             }
         })}
-        <ScrollBox node_ref=scroller follow=stick>
+        // Only up and down: what's wider (code, a table) scrolls within itself.
+        <ScrollBox node_ref=scroller follow=stick class="overflow-x-hidden">
         <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
@@ -1237,7 +1238,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
     });
 
     view! {
-        <div class="space-y-4">
+        // A long unbroken string (a path, a URL) wraps instead of widening it.
+        <div class="space-y-4 [overflow-wrap:anywhere]">
             // Events are append-only: keyed by seq, each renders once, so
             // expanded cards stay open while the turn continues.
             {move || feed.more().then(|| view! {
