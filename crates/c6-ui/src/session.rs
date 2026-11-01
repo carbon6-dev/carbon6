@@ -3410,6 +3410,14 @@ fn Composer(
     let has_text = Memo::new(move |_| !text.with(|t| t.trim().is_empty()) || !attachments.with(Vec::is_empty));
     let picker = NodeRef::<leptos::html::Input>::new();
     let touch = crate::util::touch_first();
+    // A pending image shown full size (its index), focused so Esc closes it.
+    let preview = RwSignal::new(None::<usize>);
+    let preview_box = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        if let Some(el) = preview_box.get() {
+            let _ = el.focus();
+        }
+    });
     view! {
         <div
             class=if inline { "" } else { "shrink-0 border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950" }
@@ -3431,7 +3439,11 @@ fn Composer(
                             view! {
                                 <div class="group relative flex items-center gap-1.5 rounded-md border border-zinc-200 bg-white p-1 pr-2 text-xs dark:border-zinc-700 dark:bg-zinc-900">
                                     {if image {
-                                        view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
+                                        view! {
+                                            <button class="shrink-0 rounded focus-visible:ring-2 focus-visible:ring-blue-500" title="See it full size" on:click=move |_| preview.set(Some(i))>
+                                                <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) />
+                                            </button>
+                                        }.into_any()
                                     } else {
                                         view! { <span class="px-1">"📄"</span> }.into_any()
                                     }}
@@ -3441,6 +3453,26 @@ fn Composer(
                             }
                         }).collect_view()}
                     </div>
+                })}
+                // An image waiting to go, full size: Esc or a click outside closes it.
+                {move || preview.get().and_then(|i| attachments.with(|v| v.get(i).cloned()).map(|a| (i, a))).map(|(i, a)| {
+                    let size = a.data.len() * 3 / 4;
+                    let size = if size >= 1 << 20 { format!("{:.1} MB", size as f64 / (1 << 20) as f64) } else { format!("{} KB", size.div_ceil(1024)) };
+                    view! {
+                        <div node_ref=preview_box tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/75 p-4 outline-none"
+                            on:click=move |_| preview.set(None)
+                            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); preview.set(None) }>
+                            <img class="max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" src=format!("data:{};base64,{}", a.mime, a.data) alt=a.name.clone()
+                                on:click=|ev| ev.stop_propagation() />
+                            <div class="flex items-center gap-3 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
+                                <span class="max-w-[60vw] truncate">{a.name.clone()}</span>
+                                <span class="text-zinc-400">{size}</span>
+                                <button class="rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10"
+                                    on:click=move |_| { attachments.update(|v| { if i < v.len() { v.remove(i); } }); preview.set(None) }>"Remove"</button>
+                                <button class="rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10" title="Close (Esc)" on:click=move |_| preview.set(None)>"Close"</button>
+                            </div>
+                        </div>
+                    }
                 })}
                 <div class="relative flex items-end gap-2">
                     // @-mention suggestions, above the box.
