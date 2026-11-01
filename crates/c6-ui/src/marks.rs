@@ -55,27 +55,6 @@ pub fn fill(mark: &str) -> String {
     }
 }
 
-/// A tile bar in a mark: a tint of its colour (from [`BAR`]), with its
-/// pattern faint over it, so the text on it reads in light and dark.
-pub fn bar_style(mark: &str) -> String {
-    let (colour, pattern) = m::parse(mark).unwrap_or(("", ""));
-    let c = hex(colour);
-    let ink = format!("color-mix(in srgb,{c} 20%,transparent)");
-    let image = match pattern {
-        "hstripes" => format!(";background-image:repeating-linear-gradient(0deg,{ink} 0 3px,transparent 3px 7px)"),
-        "vstripes" => format!(";background-image:repeating-linear-gradient(90deg,{ink} 0 3px,transparent 3px 7px)"),
-        "diagonal" => format!(";background-image:repeating-linear-gradient(45deg,{ink} 0 3px,transparent 3px 7px)"),
-        "dots" => format!(";background-image:radial-gradient(circle,{ink} 1.6px,transparent 2px);background-size:7px 7px"),
-        _ => String::new(),
-    };
-    format!("--mark:{c}{image}")
-}
-
-/// A tile bar's background and border, from its `--mark` ([`bar_style`]).
-// Whole class names, so Tailwind finds them in the source.
-pub const BAR: &str = "bg-[color-mix(in_srgb,var(--mark)_16%,white)] border-[color-mix(in_srgb,var(--mark)_32%,white)] \
-                       dark:bg-[color-mix(in_srgb,var(--mark)_24%,#09090b)] dark:border-[color-mix(in_srgb,var(--mark)_38%,#09090b)]";
-
 /// A session's mark: the one it has, or (sessions from before colours) one
 /// from its id.
 pub fn of(s: &Session) -> String {
