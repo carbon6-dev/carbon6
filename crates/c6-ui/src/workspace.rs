@@ -1563,7 +1563,8 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     });
     let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
     let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
-    // Its work's mark, as a stripe down the tile's left edge.
+    // Its work's mark, as a stripe down the tile's left edge (not on a
+    // phone, where the tile bar names the work and tiles don't sit side by side).
     let work_mark = Memo::new(move |_| session.get().and_then(|s| s.work).map(|w| crate::marks::live_mark(&format!("work:{}", w.id))));
     // Pointing at a value in some tile's bar dims the tiles without it.
     let spot = crate::aspects::use_spotlight();
@@ -1634,7 +1635,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             }
         >
             {move || work_mark.get().map(|m| view! {
-                <div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-[3px]" style=crate::marks::fill(&m)></div>
+                <div class="pointer-events-none absolute inset-y-0 left-0 z-10 hidden w-[3px] md:block" style=crate::marks::fill(&m)></div>
             })}
             {move || hint().map(|at| view! {
                 <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
