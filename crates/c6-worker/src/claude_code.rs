@@ -248,8 +248,11 @@ impl Process {
             cmd.args(["--settings", s]);
         }
         if let Some(m) = &mcp {
-            // A subagent may work for a long time: Claude Code waits for it.
-            cmd.args(["--mcp-config", &m.mcp_config()]).env("MCP_TOOL_TIMEOUT", "86400000");
+            // A subagent may work for hours without a word on the bridge:
+            // Claude Code waits for it (its idle timeout is 5 minutes).
+            cmd.args(["--mcp-config", &m.mcp_config()])
+                .env("MCP_TOOL_TIMEOUT", "86400000")
+                .env("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", "86400000");
         }
         // Once its input closes, the CLI waits this long for its background
         // tasks, then stops them. Its input closes only when it is idle with
@@ -1385,7 +1388,7 @@ case "$*" in *"--input-format stream-json"*) ;; *) echo "missing stream-json inp
 read -r prompt
 pwd > cwd.txt
 printf '%s' "$CLAUDE_CODE_TMPDIR" > output-root.txt
-while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--mcp-config" ] && printf '%s %s' "$2" "$MCP_TOOL_TIMEOUT" > mcp.txt; shift; done
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--mcp-config" ] && printf '%s %s %s' "$2" "$MCP_TOOL_TIMEOUT" "$CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT" > mcp.txt; shift; done
 printf '%s' "$prompt" > prompt.txt
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"s","tools":["Bash"],"model":"claude-opus-5-5"}
@@ -1486,7 +1489,7 @@ EOF
         assert_eq!(std::fs::read_to_string(dir.path().join("settings.txt")).unwrap(), r#"{"hooks":{}}"#, "the head's hooks are passed on");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("mcp.txt")).unwrap(),
-            format!("{mcp} 86400000"),
+            format!("{mcp} 86400000 86400000"),
             "carbon6's subagents are offered over MCP, with time to finish"
         );
         let line: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("prompt.txt")).unwrap()).unwrap();
