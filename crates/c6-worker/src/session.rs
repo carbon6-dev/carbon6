@@ -2283,6 +2283,8 @@ impl Actor {
             started: self.started.clone(),
         });
         let (mut claude, claude_stdin, claude_dir) = (self.claude.take(), self.claude_stdin.clone(), self.manager.claude_dir());
+        // Claude Code's calls of carbon6's tools are held to the session's policies.
+        let policies = self.policies.clone();
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             if !claude_code {
@@ -2331,6 +2333,7 @@ impl Actor {
                             cancel: Mutex::default(),
                             journal: journal.clone(),
                             matched: Mutex::default(),
+                            policies: policies.clone(),
                         })
                     })
                 };

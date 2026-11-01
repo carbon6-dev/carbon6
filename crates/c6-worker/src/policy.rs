@@ -87,35 +87,22 @@ impl Policies {
         }
     }
 
-    fn rule_for(&self, tool: &str, input: &Value) -> Option<&Rule> {
+    /// The first rule for a call of a tool known by any of `names`.
+    fn rule_for(&self, names: &[&str], input: &Value) -> Option<&Rule> {
         let text = input.to_string();
-        self.rules
-            .iter()
-            .find(|r| (r.tools.is_empty() || crate::hooks::matches(&r.tools, tool)) && r.pattern.as_ref().is_none_or(|p| p.is_match(&text)))
+        self.rules.iter().find(|r| {
+            (r.tools.is_empty() || names.iter().any(|n| crate::hooks::matches(&r.tools, n)))
+                && r.pattern.as_ref().is_none_or(|p| p.is_match(&text))
+        })
     }
-}
 
-/// Clears a wait however it ends; one that ends unanswered is logged as
-/// expired.
-struct Waiting<'a> {
-    policies: &'a Policies,
-    event: ApprovalEvent,
-    answered: bool,
-}
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.policies.pending.lock().unwrap().remove(&self.event.call_id);
-        if !self.answered {
-            let _ = self.policies.log.send(ApprovalEvent { state: "expired", ..self.event.clone() });
-        }
-    }
-}
-
-#[async_trait]
-impl c6_tools::Hooks for Policies {
-    async fn pre_tool_use(&self, call_id: &str, tool: &str, input: &Value) -> Option<String> {
-        let rule = self.rule_for(tool, input)?;
+    /// Before a call of a tool known by any of `names` (carbon6's tools
+    /// over Claude Code's MCP bridge are `doc` and `mcp__carbon6__doc`):
+    /// `Some(reason)` if a rule denies it, or you did, or no answer came.
+    /// It waits for your approval when a rule asks for it.
+    pub async fn check(&self, call_id: &str, names: &[&str], input: &Value) -> Option<String> {
+        let tool = names.first().copied().unwrap_or_default();
+        let rule = self.rule_for(names, input)?;
         let why = if rule.message.is_empty() { String::new() } else { format!(": {}", rule.message) };
         if rule.deny {
             return Some(format!("Denied by policy \"{}\"{why}", rule.name));
@@ -148,6 +135,30 @@ impl c6_tools::Hooks for Policies {
             }
             _ => Some(format!("Not run: it needs your approval (policy \"{}\"), and none came in time.", rule.name)),
         }
+    }
+}
+
+/// Clears a wait however it ends; one that ends unanswered is logged as
+/// expired.
+struct Waiting<'a> {
+    policies: &'a Policies,
+    event: ApprovalEvent,
+    answered: bool,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.policies.pending.lock().unwrap().remove(&self.event.call_id);
+        if !self.answered {
+            let _ = self.policies.log.send(ApprovalEvent { state: "expired", ..self.event.clone() });
+        }
+    }
+}
+
+#[async_trait]
+impl c6_tools::Hooks for Policies {
+    async fn pre_tool_use(&self, call_id: &str, tool: &str, input: &Value) -> Option<String> {
+        self.check(call_id, &[tool], input).await
     }
 
     async fn post_tool_use(&self, _: &str, _: &Value, _: &str, _: bool) -> Option<String> {
