@@ -232,6 +232,8 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
         root_id: r.root_id.clone(),
         subagents_running: 0,
         side_chats_running: 0,
+        tasks_running: 0,
+        servers_running: 0,
         observed: r.observed,
         remote_template: r.remote_template.clone(),
         on_head: head.is_some_and(|h| h.to_string() == r.worker_id),
@@ -246,7 +248,13 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
 
 pub fn session_with_activity(r: &SessionRow, activity: Option<&crate::store::SessionActivity>, head: Option<WorkerId>) -> api::Session {
     let activity = activity.copied().unwrap_or_default();
-    api::Session { subagents_running: activity.subagents_running, side_chats_running: activity.side_chats_running, ..session(r, head) }
+    api::Session {
+        subagents_running: activity.subagents_running,
+        side_chats_running: activity.side_chats_running,
+        tasks_running: activity.tasks_running,
+        servers_running: activity.servers_running,
+        ..session(r, head)
+    }
 }
 
 pub fn queued(c: &CommandRow) -> api::QueuedInput {

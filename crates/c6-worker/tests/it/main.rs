@@ -49,6 +49,7 @@ mod remote_subagents;
 mod rewind;
 mod route_tools;
 mod routing;
+mod running_tasks;
 mod runs;
 mod scratch;
 mod search;

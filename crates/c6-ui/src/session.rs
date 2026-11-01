@@ -1332,6 +1332,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
             {move || (!running.get()).then(|| view! { <WaitingNotices events session_id=id.get_value() /> })}
+            // What still runs in the background, while or after it works.
+            <crate::tasks::RunningTasks session=id.get_value() events line=true />
         </div>
     }
 }
