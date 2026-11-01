@@ -72,6 +72,13 @@ pub fn sends(ev: &web_sys::KeyboardEvent) -> bool {
     ev.key() == "Enter" && !ev.is_composing() && (ev.meta_key() || ev.ctrl_key() || (!ev.shift_key() && !touch_first()))
 }
 
+/// The key for Send now while the agent works (stop its current step, then
+/// send): ⌘/Ctrl+Shift+Enter, on every device (on a touch screen ⌘/Ctrl+Enter
+/// is the only plain Send).
+pub fn sends_now(ev: &web_sys::KeyboardEvent) -> bool {
+    ev.key() == "Enter" && !ev.is_composing() && (ev.meta_key() || ev.ctrl_key()) && ev.shift_key()
+}
+
 /// This browser's saved state, kept per place (docs/realms-ux.md §4):
 /// `c6.x` is `c6.<realm>.x` (or `c6.admin.x`). Home falls back to what was
 /// saved before realms had their own pages.

@@ -2948,7 +2948,14 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
     };
     view! {
         <div class="flex flex-col items-end gap-1">
-            <div class=if rejected.is_some() { "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-red-300 px-4 py-2 text-sm opacity-70 dark:border-red-900" } else { "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-zinc-500 dark:border-zinc-700" }>
+            // Queued at the head: dashed; with the agent: solid, as good as sent.
+            <div class=if rejected.is_some() {
+                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-red-300 px-4 py-2 text-sm opacity-70 dark:border-red-900"
+            } else if with_agent {
+                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-zinc-300 px-4 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
+            } else {
+                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-zinc-500 dark:border-zinc-700"
+            }>
                 {text.get_value()}
             </div>
             {match rejected {
@@ -2958,18 +2965,24 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
                         <button class="underline" on:click=move |_| { let id = session_id.get_value(); spawn_local(async move { let _ = api::dismiss_rejected(id).await; }); }>"Dismiss"</button>
                     </span>
                 }.into_any(),
+                // With the agent already: it reads it at its next step; Send now
+                // stops that step, and the agent takes it as its next turn.
+                None if with_agent => view! {
+                    <span class="flex items-center gap-2 text-xs text-zinc-500">
+                        <button class=UBTN title="Stop the agent's current step; it reads this right after (as its next turn)"
+                            prop:disabled=move || busy.get() on:click=move |_| {
+                                busy.set(true);
+                                let id = session_id.get_value();
+                                spawn_local(async move {
+                                    if let Err(e) = api::interrupt(id).await { error.set(Some(e)); }
+                                    busy.set(false);
+                                });
+                            }>"⏵ Send now"</button>
+                    </span>
+                }.into_any(),
                 None => view! {
                     <span class="flex items-center gap-2 text-xs text-zinc-500">
-                        {if with_agent {
-                            view! {
-                                <span title="The agent has it and reads it once its current step (a tool call or a reply) ends. Stop & send interrupts that step.">
-                                    "with the agent · read at its next step"
-                                </span>
-                            }
-                            .into_any()
-                        } else {
-                            "queued".into_any()
-                        }}
+                        "queued"
                         {move || queue_ops.get().then(|| view! {
                             <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
                                 prop:disabled=move || busy.get() on:click=move |_| do_pull()>"✎ Edit"</button>
@@ -3395,19 +3408,24 @@ fn Composer(
             }
         });
     };
-    let stop = move |_| {
+    let interrupt = move || {
         spawn_local(async move {
             if let Err(e) = api::interrupt(id.get_value()).await {
                 error.set(Some(e));
             }
         });
     };
-    // Stop & send: the message waits in the box until the turn has stopped,
-    // then starts the next one (sent anyway if stopping takes long: it queues).
+    let stop = move |_| interrupt();
+    // Send now (stop and send): the message waits in the box until the turn
+    // has stopped, then starts the next one (sent anyway if stopping takes
+    // long: it queues).
     let stopping = RwSignal::new(false);
-    let stop_and_send = move |ev| {
+    // The ▾ beside Send while the agent works.
+    let send_menu = RwSignal::new(false);
+    let stop_and_send = move || {
+        send_menu.set(false);
         stopping.set(true);
-        stop(ev);
+        interrupt();
         set_timeout(
             move || {
                 // Not if the box has gone meanwhile.
@@ -3426,6 +3444,12 @@ fn Composer(
         }
     });
     let has_text = Memo::new(move |_| !text.with(|t| t.trim().is_empty()) || !attachments.with(Vec::is_empty));
+    // The ▾ menu goes with the buttons it belongs to.
+    Effect::new(move || {
+        if !(running.get() && has_text.get()) {
+            send_menu.set(false);
+        }
+    });
     let picker = NodeRef::<leptos::html::Input>::new();
     let touch = crate::util::touch_first();
     // A pending image shown full size (its index), focused so Esc closes it.
@@ -3596,7 +3620,14 @@ fn Composer(
                                 }
                                 return;
                             }
-                            if crate::util::sends(&ev) { ev.prevent_default(); send(); }
+                            // While the agent works, ⌘/Ctrl+Shift+Enter is Send now.
+                            if crate::util::sends_now(&ev) && running.get_untracked() && has_text.get_untracked() {
+                                ev.prevent_default();
+                                stop_and_send();
+                            } else if crate::util::sends(&ev) {
+                                ev.prevent_default();
+                                send();
+                            }
                         }
                         on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { update_mention() }
                     ></textarea>
@@ -3605,12 +3636,25 @@ fn Composer(
                     } else if running.get() && has_text.get() {
                         // Both runtimes take it into the running turn (Claude Code's
                         // process stays up: docs/background.md §4).
+                        // One button: Send (the agent reads it at its next step),
+                        // and ▾ for Send now (stop that step and send).
                         view! {
-                            <div class="flex shrink-0 flex-col gap-1">
-                                <button class=format!("{BUTTON} py-1.5") title="Send it now: the agent reads it at its next step"
+                            <div class=format!("relative flex {SEND_AT}")>
+                                <button class=format!("{BUTTON} rounded-r-none") title="Send: the agent reads it at its next step"
                                     prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button>
-                                <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                                    title="Stop this turn; your message starts the next one" on:click=stop_and_send>"Stop & send"</button>
+                                <button class=format!("{BUTTON} rounded-l-none border-l border-l-white/30 px-2") title="More ways to send"
+                                    aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string()
+                                    on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>"▾"</button>
+                                {move || send_menu.get().then(|| view! {
+                                    <div class="fixed inset-0 z-30" on:click=move |_| send_menu.set(false)></div>
+                                    <div role="menu" class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                                        <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                            title="Stop the agent's current step; your message starts the next one" on:click=move |_| stop_and_send()>
+                                            <span>"Send now"</span>
+                                            <span class="text-xs text-zinc-400">"⌘/Ctrl ⇧ ↵"</span>
+                                        </button>
+                                    </div>
+                                })}
                             </div>
                         }.into_any()
                     } else if running.get() {

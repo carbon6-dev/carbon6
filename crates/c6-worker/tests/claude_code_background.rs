@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 /// after that (the notice): it records it and answers.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
+[ "$1" = --version ] && exit 0
 echo $$ >> spawns.txt
 url=""
 while [ $# -gt 0 ]; do [ "$1" = "--mcp-config" ] && url=$(printf '%s' "$2" | sed 's/.*"url":"\([^"]*\)".*/\1/'); shift; done
