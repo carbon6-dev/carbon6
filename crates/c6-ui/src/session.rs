@@ -2653,7 +2653,7 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
                                 }
                                 ContentBlock::ToolUse { name, input_json, .. } => {
                                     let input = serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
-                                    out.push(("▸", format!("{name} {}", summarize(name, &input))));
+                                    out.push(("▸", format!("{} {}", tool_label(name).0, summarize(name, &input))));
                                 }
                                 _ => {}
                             }
@@ -2680,6 +2680,35 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
 }
 
 /// Normalizes tool names across profiles (Claude, Codex, generic).
+/// A tool's name as people read it: an MCP server's tool
+/// (`mcp__carbon6__SendMessage`) as its words ("Send message") and its
+/// server ("carbon6"); any other tool as it's named.
+fn tool_label(name: &str) -> (String, Option<String>) {
+    let Some(rest) = name.strip_prefix("mcp__") else { return (name.to_owned(), None) };
+    let Some((server, tool)) = rest.split_once("__") else { return (name.to_owned(), None) };
+    let server = server.strip_prefix("claude_ai_").unwrap_or(server).replace('_', " ");
+    (words(tool), Some(server))
+}
+
+/// `SendMessage` or `send_message` as "Send message".
+fn words(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_lower = false;
+    for c in s.chars() {
+        if c == '_' || c == '-' {
+            out.push(' ');
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            out.push(' ');
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        out.extend(if out.is_empty() { c.to_uppercase().collect::<Vec<_>>() } else { c.to_lowercase().collect() });
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn tool_kind(name: &str) -> &str {
     match name {
         "Bash" | "shell" => "bash",
@@ -2867,7 +2896,13 @@ fn ToolCard(
                     };
                     view! { <span class=format!("text-xs {cls}")>{icon}</span> }
                 }}
-                <span class="font-mono text-xs font-semibold">{name.clone()}</span>
+                {
+                    let (label, server) = tool_label(&name);
+                    view! {
+                        <span class="text-xs font-semibold" title=name.clone()>{label}</span>
+                        {server.map(|s| view! { <span class="rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400" title=name.clone()>{s}</span> })}
+                    }
+                }
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
                 {sent_to.map(|(to, title)| view! {
                     <Go to=View::session(to.clone()) class="shrink-0 text-[11px] text-sky-700 hover:underline dark:text-sky-400" stop=true>
@@ -4066,6 +4101,15 @@ mod tests {
             ev(2, usage(1_000_000)),
         ]);
         assert_eq!((u.context, u.context_window), (Some(300_015), 1_000_000));
+    }
+
+    #[test]
+    fn mcp_tools_read_as_words() {
+        assert_eq!(tool_label("mcp__carbon6__SendMessage"), ("Send message".to_owned(), Some("carbon6".to_owned())));
+        assert_eq!(tool_label("mcp__claude_ai_Slack__slack_read_channel"), ("Slack read channel".to_owned(), Some("Slack".to_owned())));
+        assert_eq!(tool_label("mcp__carbon6__doc"), ("Doc".to_owned(), Some("carbon6".to_owned())));
+        assert_eq!(tool_label("Bash"), ("Bash".to_owned(), None), "other tools as named");
+        assert_eq!(tool_label("web_fetch"), ("web_fetch".to_owned(), None));
     }
 
     fn log(users: &[u64], n: u64) -> Vec<Event> {
