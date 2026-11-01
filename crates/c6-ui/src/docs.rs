@@ -771,7 +771,9 @@ pub fn DocPage(id: String) -> impl IntoView {
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
                 Some(Ok(d)) => {
                     let s = d.summary.clone();
-                    let current = if d.tabs.iter().any(|t| t.id == tab.get_untracked()) { tab.get_untracked() } else { d.tabs.first().map(|t| t.id.clone()).unwrap_or_default() };
+                    // Tracked: choosing a tab draws it (not only the next reload).
+                    let chosen = tab.get();
+                    let current = if d.tabs.iter().any(|t| t.id == chosen) { chosen } else { d.tabs.first().map(|t| t.id.clone()).unwrap_or_default() };
                     let blocks = d.tabs.iter().find(|t| t.id == current).map(|t| t.blocks.clone()).unwrap_or_default();
                     let rev = s.rev;
                     let kind = s.kind.clone();
