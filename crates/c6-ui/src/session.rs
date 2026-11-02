@@ -3529,7 +3529,8 @@ fn Composer(
         }
         let Some(s) = shown_next() else { return };
         let Some(n) = next.get_untracked() else { return };
-        next.set(None);
+        // Kept: emptying the box again brings it back (until the next turn,
+        // or Esc).
         text.set(s.clone());
         if let Some(el) = area.get_untracked() {
             el.set_value(&s);
@@ -3747,6 +3748,8 @@ fn Composer(
             return;
         }
         text.set(String::new());
+        // Sent: the suggestion was for before this message.
+        next.set(None);
         attachments.set(Vec::new());
         mention.set(None);
         command.set(None);
@@ -3915,7 +3918,7 @@ fn Composer(
                     <div class="relative min-w-0 flex-1">
                     <textarea
                         node_ref=area
-                        class=move || format!("{INPUT} {} min-h-[2.75rem] {}", crate::util::GROWS, if shown_next().is_some() { "pr-9 placeholder:italic" } else { "" })
+                        class=move || format!("{INPUT} {} min-h-[2.75rem] {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
                         rows="2"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
@@ -3987,14 +3990,20 @@ fn Composer(
                         }
                         on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { update_mention() }
                     ></textarea>
-                    {move || shown_next().map(|_| view! {
+                    // Touch screens only (a keyboard has Tab): drawn, not a ⇥
+                    // character, which a phone may show as a coloured emoji.
+                    {move || (touch && shown_next().is_some()).then(|| view! {
                         <button type="button"
-                            class="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded border border-sky-300 bg-sky-50 text-xs text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900"
-                            title="Use the suggestion (Tab): it goes in the box to edit or send, not sent" aria-label="Use the suggestion"
+                            class="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded border border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900"
+                            title="Use the suggestion: it goes in the box to edit or send, not sent" aria-label="Use the suggestion"
                             prop:disabled=move || disabled.get()
                             // Keep the box's focus (and a phone's keyboard) as it's tapped.
                             on:mousedown=|ev| ev.prevent_default()
-                            on:click=move |_| accept_next()>"⇥"</button>
+                            on:click=move |_| accept_next()>
+                            <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M2 8h9M8 4.5 11.5 8 8 11.5M13.5 3.5v9" />
+                            </svg>
+                        </button>
                     })}
                     </div>
                     {move || if stopping.get() {
