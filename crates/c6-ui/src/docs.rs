@@ -1261,19 +1261,23 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
         <section class="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
             <div class="flex items-center gap-2">
                 <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">"Comments"</h2>
-                {move || (unsent.get() > 0).then(|| view! {
-                    <button class="rounded-md border border-violet-300 px-2 py-0.5 text-xs text-violet-700 hover:bg-violet-50 disabled:opacity-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
-                        title="Your open comments that haven't gone to an agent, in one message to one session, which answers each in its thread"
-                        disabled=move || sending.get() on:click=send_all>
-                        {move || match unsent.get() { 1 => "Send 1 comment to an agent".to_owned(), n => format!("Send {n} comments to an agent") }}
-                    </button>
-                })}
                 <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| { expect_context::<ThreadsCtx>().focus.set(Some(String::new())); commenting.set(Some(String::new())) }>"+ On the whole tab"</button>
                 <label class="flex items-center gap-1 text-xs text-zinc-500">
                     <input type="checkbox" prop:checked=move || show_resolved.get() on:change=move |ev| show_resolved.set(event_target_checked(&ev)) />
                     "Resolved"
                 </label>
             </div>
+            // On a row of its own: as it goes, nothing slides under the
+            // pointer (in the header, "+ On the whole tab" did).
+            {move || (unsent.get() > 0).then(|| view! {
+                <div class="flex justify-end">
+                    <button class="rounded-md border border-violet-300 px-2 py-0.5 text-xs text-violet-700 hover:bg-violet-50 disabled:opacity-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
+                        title="Your open comments that haven't gone to an agent, in one message to one session, which answers each in its thread"
+                        disabled=move || sending.get() on:click=send_all>
+                        {move || match unsent.get() { 1 => "Send 1 comment to an agent".to_owned(), n => format!("Send {n} comments to an agent") }}
+                    </button>
+                </div>
+            })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             // A comment on the whole tab is written here; one on a block,
             // under that block (BlockView).
@@ -1309,22 +1313,35 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
         }
     });
     let post = move || {
+        let (said, quoted) = (text.get_untracked(), quote.get_untracked());
         let t = c6_api::docs::ThreadNew {
-            anchor: c6_api::docs::Anchor { block: block.get_value(), quote: quote.get_untracked(), tab: String::new() },
-            text: text.get_untracked(),
+            anchor: c6_api::docs::Anchor { block: block.get_value(), quote: quoted.clone(), tab: String::new() },
+            text: said.clone(),
             to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
         };
+        // The draft goes as it's sent, not when the answer comes: posting
+        // reloads the document, and a box drawn again in between would
+        // otherwise find the draft and keep it.
+        keys.with_value(|(t, q)| {
+            crate::util::forget_draft(t);
+            crate::util::forget_draft(q);
+        });
         spawn_local(async move {
             match api::doc_thread_new(doc.get_value(), &t).await {
                 Ok(_) => {
-                    keys.with_value(|(t, q)| {
-                        crate::util::forget_draft(t);
-                        crate::util::forget_draft(q);
-                    });
                     commenting.set(None);
                     posted.run(());
                 }
-                Err(e) => error.set(Some(e)),
+                // Not posted: what you wrote comes back.
+                Err(e) => {
+                    keys.with_value(|(t, q)| {
+                        crate::util::storage_set(t, &said);
+                        crate::util::storage_set(q, &quoted);
+                    });
+                    let _ = text.try_set(said);
+                    let _ = quote.try_set(quoted);
+                    let _ = error.try_set(Some(e));
+                }
             }
         });
     };
@@ -1363,7 +1380,7 @@ fn WithAgent(session: String, waiting: bool) -> impl IntoView {
         }
     };
     view! {
-        <Go to=View::session(session) class="inline-flex min-w-0 items-center gap-1 hover:underline" stop=true>
+        <Go to=View::session(session) class="inline-flex min-w-0 max-w-[55%] items-center gap-1 hover:underline" stop=true>
             {move || {
                 let (title, running) = found().unwrap_or_else(|| ("an agent".into(), false));
                 let title = if title.trim().is_empty() { "an agent".to_owned() } else { title };
@@ -1410,7 +1427,7 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
         <div class=format!("space-y-1 rounded-md border p-2 text-sm {}", if t.needs_you { "border-amber-300 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-950/20" } else { "border-zinc-200 dark:border-zinc-800" })
             data-thread=t.id.clone()>
             <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-                <span class="min-w-0 flex-1 truncate">{format!("On {}", t.about)}</span>
+                <span class="min-w-[40%] flex-1 truncate">{format!("On {}", t.about)}</span>
                 {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
                 {t.to_agent.then(|| {
                     // Waiting on the agent: the last word isn't its.
