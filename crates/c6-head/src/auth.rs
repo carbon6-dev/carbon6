@@ -258,7 +258,7 @@ impl Store {
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
             sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
         }
-        Ok(Some(crate::realms::Caller { realm: row.get("realm"), browser: false }))
+        Ok(Some(crate::realms::Caller { realm: row.get("realm"), browser: false, console: false }))
     }
 
     async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
@@ -354,7 +354,7 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
     // its conversation works in: there, as that realm's token would.
     if let Some(call) = req.extensions().get::<crate::assistant::InternalCall>().cloned() {
         if let Some(realm) = call.realm {
-            let caller = Caller::in_realm(&realm);
+            let caller = Caller { console: call.console, ..Caller::in_realm(&realm) };
             if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), req.uri().path()).await {
                 return (status, Json(api::ApiError { error })).into_response();
             }

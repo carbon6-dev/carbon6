@@ -24,15 +24,18 @@ pub struct Caller {
     /// Your browser (a realm's page or the console), not a token: it may
     /// learn what waits in other realms (docs/realms-ux.md §6).
     pub browser: bool,
+    /// The console's assistant, acting in this realm with your approval
+    /// (docs/assistant.md §Realms): what it writes is the console's.
+    pub console: bool,
 }
 
 impl Caller {
     pub fn root() -> Self {
-        Self { realm: None, browser: false }
+        Self { realm: None, browser: false, console: false }
     }
 
     pub fn in_realm(realm: &str) -> Self {
-        Self { realm: Some(realm.to_owned()), browser: false }
+        Self { realm: Some(realm.to_owned()), browser: false, console: false }
     }
 
     /// Whose decisions and the like a caller lists: its realm's; the

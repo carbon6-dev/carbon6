@@ -47,6 +47,8 @@ const MODEL_LIMITS: c6_llm::limit::Limits = c6_llm::limit::Limits { total: Durat
 #[derive(Clone, Default)]
 pub struct InternalCall {
     pub realm: Option<String>,
+    /// The console's assistant, acting in `realm` with your approval.
+    pub console: bool,
 }
 
 #[derive(Default)]
@@ -857,21 +859,24 @@ impl Tool for Call {
         let mut ask: Option<(String, String)> = None;
         // What the approval shows (else the operation and its input).
         let mut asked: Option<String> = None;
-        // From root, a session starts in a realm, as that realm, only once
-        // you approve its realm and first message.
-        let mut elsewhere: Option<String> = None;
-        if op.name == "sessions.create" && self.env.realm == crate::realms::ROOT {
-            if serde_json::to_string(&args).unwrap_or_default() != shown {
-                return ToolOutput::err("a secret you were given cannot go into a session in another realm");
-            }
-            match start_in_realm(st, &mut args).await {
-                Ok(s) => {
-                    ask = Some(("assistant: a session in another realm".into(), s.said));
-                    asked = Some(s.prompt);
-                    elsewhere = Some(s.realm);
+        // From root, what goes into a realm (a session, a message, a
+        // trigger…) goes as that realm's, only once you approve the realm
+        // and exactly what goes there.
+        let mut elsewhere: Option<IntoRealm> = None;
+        if self.env.realm == crate::realms::ROOT {
+            let unsealed = serde_json::to_string(&args).unwrap_or_default() != shown;
+            match into_realm(st, op, &mut args, unsealed).await {
+                Ok(Some(i)) => {
+                    ask = Some((INTO_REALM.into(), i.said.clone()));
+                    asked = Some(i.shown.clone());
+                    elsewhere = Some(i);
                 }
+                Ok(None) => {}
                 Err(e) => return ToolOutput::err(e),
             }
+        }
+        if elsewhere.is_some() {
+            // Asked for above.
         } else if op.effect == Effect::Destructive {
             ask = Some(("assistant: destructive operations".into(), format!("{}: {}", op.name, op.summary)));
         } else if op.replaces.is_some() {
@@ -924,8 +929,7 @@ impl Tool for Call {
             }
         }
         let result = match &elsewhere {
-            // As that realm's API token would, with none of root's.
-            Some(realm) => execute(st, op, args, "assistant", Some(realm)).await,
+            Some(i) => i.run(st, op, args, &self.env.session_id).await,
             None => crate::memex::SCOPE.scope(scope, execute(st, op, args, "assistant", Some(&self.env.realm))).await,
         };
         match result {
@@ -980,17 +984,275 @@ fn secret_note(op: &Op) -> &'static str {
 
 /// The label of a session the assistant started from root (the console).
 pub const STARTED_FROM_CONSOLE: &str = "started-by:console";
-/// The longest first message the assistant may start a session in another
-/// realm with: what you approve is shown in full, also in the decision.
+/// Who wrote what the assistant in root put in a realm (documents,
+/// records, knowledge), and what started a workflow run there.
+pub const BY_CONSOLE: &str = "console";
+/// Whom a message the assistant in root sent a realm's session is from, as
+/// the session reads it.
+pub const FROM_CONSOLE: &str = "Ask in the console";
+/// The most the assistant may put in another realm from root at once (a
+/// first message, a message, an operation's input): what you approve is
+/// shown in full, also in the decision.
 const PROMPT_SHOWN: usize = 4000;
+/// The approval's policy for whatever the assistant in root does in a realm.
+const INTO_REALM: &str = "assistant: into another realm";
+const SECRET_STAYS: &str = "a secret you were given cannot go into another realm";
+/// Operations that put a file in a realm: the approval cannot show it.
+const FILES: &[&str] = &["docs.import", "docs.add_file", "memex.upload", "memex.ingest"];
 
-/// A session the assistant in root would start in a realm.
-struct InRealm {
+/// Something the assistant in root would do in a realm, once you approve it.
+struct IntoRealm {
     realm: String,
-    /// Where and how, in words.
+    /// What and where, in words.
     said: String,
-    /// Its first message, as it goes.
-    prompt: String,
+    /// What goes there, exactly as it goes.
+    shown: String,
+    /// A message for this session, from the console (else the operation
+    /// runs as the realm).
+    message: Option<(String, String)>,
+}
+
+impl IntoRealm {
+    /// Does it as that realm's API token would, with none of root's, marked
+    /// as the console's; a message goes as one from this conversation.
+    async fn run(&self, st: &HeadState, op: &Op, args: Value, conversation: &str) -> anyhow::Result<Value> {
+        if let Some((to, text)) = &self.message {
+            return crate::sessions::message_from_console(st, to, text, conversation).await;
+        }
+        let v = execute_as(st, op, args, BY_CONSOLE, Some(&self.realm), true).await?;
+        // A side chat says where it came from, as a session does.
+        if op.name == "sessions.side_chat"
+            && let Some(id) = v["id"].as_str()
+            && let Some(row) = st.store.session(id).await?
+        {
+            let mut labels = row.user_labels();
+            labels.push(STARTED_FROM_CONSOLE.to_owned());
+            return Ok(serde_json::to_value(crate::sessions::set_labels(st, id, &labels).await?)?);
+        }
+        Ok(v)
+    }
+}
+
+/// Where an operation the assistant in root asks you for finds its realm.
+/// These are what carry text or data into a realm's agents or data, or
+/// start something there (docs/assistant.md §Realms); administration and
+/// housekeeping are root's own.
+#[derive(Clone, Copy)]
+enum Reach {
+    /// The session path parameter `id` names.
+    Session,
+    /// The object path parameter `id` names: a row of `table`, or a record
+    /// of `collection`.
+    Object { table: &'static str, collection: &'static str, noun: &'static str },
+    /// A template's: the realm named (body.realm), else the one that has it.
+    Template,
+    /// The realm path parameter `realm` names.
+    PathRealm,
+    /// The realm named (body.realm, else realm), else home: where root's
+    /// new things, documents and knowledge go.
+    Named,
+}
+
+fn reach(op: &str) -> Option<Reach> {
+    use Reach::*;
+    let record = |collection: &'static str, noun: &'static str| Object { table: "records", collection, noun };
+    Some(match op {
+        "sessions.send" | "sessions.side_chat" | "sessions.queue.edit" => Session,
+        "templates.run" => Template,
+        "apps.operations.call" => PathRealm,
+        "triggers.update" | "triggers.run" => Object { table: "triggers", collection: "", noun: "trigger" },
+        "decisions.answer" | "decisions.session" => Object { table: "decisions", collection: "", noun: "decision" },
+        "memories.update" => record(crate::lists::MEMORY, "memory note"),
+        "work.edit" | "work.attach" | "work.todos.add" | "work.todos.edit" => record(crate::work::WORK, "work item"),
+        "projects.edit" | "projects.work" | "projects.links" | "projects.phases" => record(crate::projects::PROJECTS, "project"),
+        "workflows.run"
+        | "triggers.create"
+        | "decisions.add"
+        | "memories.create"
+        | "work.add"
+        | "projects.add"
+        | "docs.create"
+        | "docs.edit"
+        | "docs.rename"
+        | "docs.comment"
+        | "docs.reply"
+        | "collections.create"
+        | "collections.update"
+        | "records.create"
+        | "records.put"
+        | "series.create"
+        | "series.update"
+        | "series.record"
+        | "views.act"
+        | "memex.notes.create"
+        | "memex.trails.append"
+        | "memex.trails.update"
+        | "memex.relations.write"
+        | "claims.add"
+        | "things.create"
+        | "knowledge.record"
+        | "knowledge.set"
+        | "mail.drafts.set" => Named,
+        _ => return None,
+    })
+}
+
+/// What the assistant in root would do in a realm, for you to approve, or
+/// why it cannot; `None`: nothing goes into a realm (or it goes into root
+/// itself). What it carries is shown in full, so nothing that could hide
+/// more goes: no files or attachments, no secret you gave it, nothing over
+/// PROMPT_SHOWN characters. `unsealed`: a secret was put in its input.
+async fn into_realm(st: &HeadState, op: &Op, args: &mut Value, unsealed: bool) -> Result<Option<IntoRealm>, String> {
+    if op.name == "sessions.create" {
+        if unsealed {
+            return Err(SECRET_STAYS.into());
+        }
+        return start_in_realm(st, args).await.map(Some);
+    }
+    if FILES.contains(&op.name) {
+        return Err(format!(
+            "from root, {} cannot put a file in a realm: the user approves in full what goes there, and a file cannot be shown. \
+             They can add it in that realm itself",
+            op.name
+        ));
+    }
+    let Some(reach) = reach(op.name) else { return Ok(None) };
+    let param = |p: &str| match &args[p] {
+        Value::String(s) => s.trim().to_owned(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    };
+    let named = [&args["body"]["realm"], &args["realm"]]
+        .into_iter()
+        .find_map(|r| r.as_str().map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned));
+    let text = |k: &str| args["body"][k].as_str().map(str::trim).unwrap_or("").to_owned();
+    let (name, id) = (param("name"), param("id"));
+    // Its realm, and what it acts on.
+    let (realm, what) = match reach {
+        Reach::Session => {
+            let row = st.store.session(&id).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no session {id:?}"))?;
+            if op.name == "sessions.send" && row.realm != crate::realms::ROOT {
+                crate::sessions::takes_messages(&row).map_err(|e| format!("{e:#}"))?;
+            }
+            (row.realm, format!("the session “{}”", if row.title.is_empty() { &id } else { &row.title }))
+        }
+        Reach::Object { table, collection, noun } => {
+            let (realm, title) = object(st, table, collection, &id).await.ok_or_else(|| format!("no {noun} {id:?}"))?;
+            (realm, format!("the {noun} “{}”", if title.is_empty() { id.clone() } else { crate::util_clip(&title, 80) }))
+        }
+        Reach::Template => {
+            let realm = match named {
+                Some(r) => r,
+                None => crate::templates::realm_of(st, &name).await.map_err(|e| format!("{e:#}"))?,
+            };
+            (realm, format!("the template “{name}”"))
+        }
+        Reach::PathRealm => (param("realm"), String::new()),
+        Reach::Named => (named.unwrap_or_else(|| crate::realms::HOME.to_owned()), String::new()),
+    };
+    if realm == crate::realms::ROOT {
+        return Ok(None);
+    }
+    if realm.is_empty() || !crate::realms::exists(st, &realm).await.map_err(|e| format!("{e:#}"))? {
+        return Err(format!("no realm {realm:?}: name one from realms.list"));
+    }
+    if unsealed {
+        return Err(SECRET_STAYS.into());
+    }
+    let place = realm_name(st, &realm).await;
+    let or_none = |s: String, none: &str| if s.is_empty() { none.to_owned() } else { s };
+    let (said, shown, message) = match op.name {
+        "sessions.send" => {
+            let req: api::SendMessage =
+                serde_json::from_value(args["body"].clone()).map_err(|e| format!("sessions.send needs a body (c6_describe it): {e}"))?;
+            if !req.attachments.is_empty() || req.connection_id.is_some() || req.model.is_some() || req.effort.is_some() {
+                return Err("from root a message carries its text only: no attachments or model switch".into());
+            }
+            let body = req.text.trim().to_owned();
+            if body.is_empty() {
+                return Err("the message is empty".into());
+            }
+            let said = format!(
+                "Send {what} in {place} a message. Its agent gets it as a message from “{FROM_CONSOLE}” (not from you), under \
+                 {place}'s own rules. The message:"
+            );
+            (said, body.clone(), Some((id.clone(), body)))
+        }
+        "sessions.side_chat" => {
+            let model = or_none(text("model"), "its model");
+            let said = format!(
+                "Start a side chat off {what} in {place}, with {model}, labelled {STARTED_FROM_CONSOLE}, under {place}'s own rules. \
+                 Its first message:"
+            );
+            (said, text("prompt"), None)
+        }
+        "sessions.queue.edit" => (format!("Change a message waiting to go to {what} in {place} to read:"), text("text"), None),
+        "templates.run" => {
+            let input = text("input");
+            args["body"]["realm"] = json!(realm);
+            let said = format!(
+                "Start {what} in {place}: its sessions run under {place}'s own rules, labelled {STARTED_FROM_CONSOLE}. {}",
+                if input.is_empty() { "It has no input." } else { "Its input:" }
+            );
+            (said, or_none(input, "(no input)"), None)
+        }
+        "workflows.run" => {
+            let input = text("input");
+            let said = format!(
+                "Run the workflow “{name}” in {place}, under {place}'s own rules, started by the console. {}",
+                if input.is_empty() { "It has no input." } else { "Its input:" }
+            );
+            (said, or_none(input, "(no input)"), None)
+        }
+        _ => {
+            // The memex takes no realm: it is the realm it runs as.
+            if matches!(op.via, Via::Memex { .. })
+                && let Some(o) = args.as_object_mut()
+            {
+                o.remove("realm");
+            }
+            let on = if what.is_empty() { String::new() } else { format!(" on {what}") };
+            let said = format!(
+                "{}{on} in {place}: {} It runs as {place}'s, under its rules and with nothing of root's, written by the console. \
+                 What goes there, exactly:",
+                op.name, op.summary
+            );
+            (said, format!("{} {}", op.name, serde_json::to_string_pretty(&*args).unwrap_or_default()), None)
+        }
+    };
+    let long = shown.chars().count();
+    if long > PROMPT_SHOWN {
+        return Err(format!(
+            "that is too long to approve in full ({long} characters; at most {PROMPT_SHOWN}): make it shorter, or do it in parts"
+        ));
+    }
+    Ok(Some(IntoRealm { realm, said, shown, message }))
+}
+
+/// The realm and title of a trigger, a decision, or a record of a
+/// collection (a work item, project or memory note), if there is one.
+async fn object(st: &HeadState, table: &str, collection: &str, id: &str) -> Option<(String, String)> {
+    let query = match table {
+        "triggers" => sqlx::query("SELECT realm, name AS title FROM triggers WHERE id = ?"),
+        "decisions" => sqlx::query("SELECT realm, title FROM decisions WHERE id = ?"),
+        _ => sqlx::query(
+            "SELECT realm, COALESCE(json_extract(fields, '$.title'), json_extract(fields, '$.text'), '') AS title FROM records \
+             WHERE collection = ? AND id = ?",
+        )
+        .bind(collection.to_owned()),
+    };
+    use sqlx::Row;
+    let row = query.bind(id.to_owned()).fetch_optional(&st.store.pool).await.ok().flatten()?;
+    Some((row.try_get("realm").ok()?, row.try_get::<String, _>("title").unwrap_or_default()))
+}
+
+/// A realm as you read it: its name, with its id when that differs.
+async fn realm_name(st: &HeadState, realm: &str) -> String {
+    crate::realms::list(st, &crate::realms::Caller::root())
+        .await
+        .ok()
+        .and_then(|rs| rs.into_iter().find(|r| r.id == realm))
+        .map_or_else(|| realm.to_owned(), |r| if r.name == realm { realm.to_owned() } else { format!("{} ({realm})", r.name) })
 }
 
 /// What starting a session from root asks you, or why it cannot: the
@@ -998,7 +1260,7 @@ struct InRealm {
 /// first message is the one way root's knowledge reaches the realm, so
 /// nothing else that could carry it is passed (attachments, work, to-dos).
 /// Labels the call `started-by:console`.
-async fn start_in_realm(st: &HeadState, args: &mut Value) -> Result<InRealm, String> {
+async fn start_in_realm(st: &HeadState, args: &mut Value) -> Result<IntoRealm, String> {
     let req: api::CreateSession =
         serde_json::from_value(args["body"].clone()).map_err(|e| format!("sessions.create needs a body (c6_describe it): {e}"))?;
     let realm = req.realm.as_deref().map(str::trim).unwrap_or("").to_owned();
@@ -1020,11 +1282,7 @@ async fn start_in_realm(st: &HeadState, args: &mut Value) -> Result<InRealm, Str
     if !crate::realms::available(&worker.realms, &realm) {
         return Err(format!("{} is not available to realm {realm}", worker.name));
     }
-    let name = crate::realms::list(st, &crate::realms::Caller::root())
-        .await
-        .ok()
-        .and_then(|rs| rs.into_iter().find(|r| r.id == realm))
-        .map_or_else(|| realm.clone(), |r| if r.name == realm { realm.clone() } else { format!("{} ({realm})", r.name) });
+    let name = realm_name(st, &realm).await;
     let mut said = format!("Start a session in {name} on {}", worker.name);
     if let Some(ssh) = req.ssh.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         said.push_str(&format!(" over SSH to {ssh}"));
@@ -1057,7 +1315,7 @@ async fn start_in_realm(st: &HeadState, args: &mut Value) -> Result<InRealm, Str
     labels.push(STARTED_FROM_CONSOLE.to_owned());
     args["body"]["labels"] = json!(labels);
     args["body"]["realm"] = json!(realm);
-    Ok(InRealm { realm, said, prompt: if prompt.is_empty() { "(no first message)".into() } else { prompt } })
+    Ok(IntoRealm { realm, said, shown: if prompt.is_empty() { "(no first message)".into() } else { prompt }, message: None })
 }
 
 /// The first of your policies (ask or deny) that applies to this call.
@@ -1093,7 +1351,13 @@ async fn removed_entries(st: &HeadState, op: &Op, args: &Value, realm: &str) -> 
 /// the memex (memex ops).
 /// Runs an operation as you, within `realm` when given (root or none:
 /// every realm, with administration).
-pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str, realm: Option<&str>) -> anyhow::Result<Value> {
+pub async fn execute(st: &HeadState, op: &Op, args: Value, made_by: &str, realm: Option<&str>) -> anyhow::Result<Value> {
+    execute_as(st, op, args, made_by, realm, false).await
+}
+
+/// `execute`; `console`: as the console's assistant, in `realm` with your
+/// approval (what it writes is the console's).
+async fn execute_as(st: &HeadState, op: &Op, mut args: Value, made_by: &str, realm: Option<&str>, console: bool) -> anyhow::Result<Value> {
     if !args.is_object() {
         args = json!({});
     }
@@ -1152,7 +1416,7 @@ pub async fn execute(st: &HeadState, op: &Op, mut args: Value, made_by: &str, re
                 .uri(&uri)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(body)?;
-            req.extensions_mut().insert(InternalCall { realm: realm.map(str::to_owned) });
+            req.extensions_mut().insert(InternalCall { realm: realm.map(str::to_owned), console });
             use tower::ServiceExt;
             let resp = router.oneshot(req).await?;
             let status = resp.status();
@@ -1655,10 +1919,14 @@ when this realm needs another's data, suggest a grant.
 use c6_delegate: it runs one of the templates the user lets agents start and waits for its report, which you then answer from. \
 With no template for the place, tell the user to add one (Settings → Templates, \"Agents may start it\"), or start a session on a \
 worker (sessions.create) and tell the user. Sessions never run in root: from root, start it in the realm the work belongs to \
-(body.realm; ask if that is unclear), never send the user to another realm for it. The user approves each such start, seeing the \
-realm and the first message, so write in it only what that realm should know. Then follow the session (sessions.get, \
+(body.realm; ask if that is unclear), never send the user to another realm for it. Then follow the session (sessions.get, \
 sessions.events) and report. For a quick look at a file or the git state on a worker, the workers' file and git operations do. \
 For something recurring, create a trigger or workflow.
+- From root, whatever you put in a realm waits for the user's approval each time, showing the realm and exactly what goes there: \
+starting a session, a message to a session, a side chat, a template, a workflow, triggers, decisions and answers, work, projects, \
+documents, records, memory notes and knowledge. For something new, name its realm with realm in the input (or body.realm), else it \
+goes to home; what exists already is in its own. \
+Write only what that realm should know; files cannot go. If the user does not approve, do not try another way.
 - The user may just want to talk: answer from what you know, and use operations only when the question is about their setup or \
 asks for something done.
 - What the user @-mentions comes after their message in <mentioned> blocks, read for this conversation only: use it, and say \
@@ -1740,6 +2008,68 @@ mod mention_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the assistant in root asks you for before it goes into a realm
+    /// (docs/assistant.md §Realms) is these operations, each one that
+    /// exists and writes: a renamed operation must not slip out of it.
+    #[test]
+    fn what_goes_into_a_realm_from_root_is_asked_for() {
+        let asked = [
+            "sessions.send",
+            "sessions.side_chat",
+            "sessions.queue.edit",
+            "templates.run",
+            "workflows.run",
+            "triggers.create",
+            "triggers.update",
+            "triggers.run",
+            "decisions.add",
+            "decisions.answer",
+            "decisions.session",
+            "memories.create",
+            "memories.update",
+            "work.add",
+            "work.edit",
+            "work.attach",
+            "work.todos.add",
+            "work.todos.edit",
+            "projects.add",
+            "projects.edit",
+            "projects.work",
+            "projects.links",
+            "projects.phases",
+            "docs.create",
+            "docs.edit",
+            "docs.rename",
+            "docs.comment",
+            "docs.reply",
+            "collections.create",
+            "collections.update",
+            "records.create",
+            "records.put",
+            "series.create",
+            "series.update",
+            "series.record",
+            "views.act",
+            "apps.operations.call",
+            "memex.notes.create",
+            "memex.trails.append",
+            "memex.trails.update",
+            "memex.relations.write",
+            "claims.add",
+            "things.create",
+            "knowledge.record",
+            "knowledge.set",
+            "mail.drafts.set",
+        ];
+        for name in asked.iter().chain(FILES).chain(&["sessions.create"]) {
+            let op = catalog::find(name).unwrap_or_else(|| panic!("no operation {name}"));
+            assert_ne!(op.effect, Effect::Read, "{name}");
+        }
+        let gated: Vec<&str> = catalog::ops().iter().map(|o| o.name).filter(|n| reach(n).is_some()).collect();
+        assert_eq!(gated.len(), asked.len(), "{gated:?}");
+        assert!(asked.iter().all(|n| gated.contains(n)), "{gated:?}");
+    }
 
     #[tokio::test]
     async fn a_corrupt_assistant_does_not_block_startup_or_other_recovery() {

@@ -1581,7 +1581,9 @@ async fn run_template(
         None if caller.realm.is_none() => crate::templates::realm_of(&st, &name).await?,
         None => caller.realm_for_new(None)?,
     };
-    Ok(Json(crate::templates::run(&st, &name, &body.input, &[], &realm).await?))
+    // The console's assistant's: its sessions say so.
+    let labels = if caller.console { vec![crate::assistant::STARTED_FROM_CONSOLE.to_owned()] } else { Vec::new() };
+    Ok(Json(crate::templates::run(&st, &name, &body.input, &labels, &realm).await?))
 }
 
 async fn all_templates(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmTemplate>>> {
@@ -2611,7 +2613,8 @@ async fn run_workflow(
     Json(r): Json<api::RunWorkflow>,
 ) -> ApiResult<Json<api::WorkflowRun>> {
     let realm = caller.realm_for_new(None)?;
-    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual", &realm).await?))
+    let trigger = if caller.console { crate::assistant::BY_CONSOLE } else { "manual" };
+    Ok(Json(crate::workflows::start(&st, &name, &r.input, trigger, &realm).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -3227,6 +3230,7 @@ async fn reach(st: &HeadState, caller: &Caller, asked: &api::InRealm, name: &str
 /// Who a write is by, for history.
 fn writer(caller: &Caller) -> String {
     match &caller.realm {
+        _ if caller.console => crate::assistant::BY_CONSOLE.into(),
         Some(r) => format!("token:{r}"),
         None => "you".into(),
     }

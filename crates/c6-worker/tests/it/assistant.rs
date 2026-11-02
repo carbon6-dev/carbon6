@@ -667,3 +667,226 @@ async fn assistant_in_root_starts_sessions_in_a_realm_you_approve() {
     assert!(!own.labels.contains(&"started-by:console".to_owned()), "{:?}", own.labels);
     head.shutdown().await.unwrap();
 }
+
+/// Whatever else the assistant in root puts in a realm (a message to a
+/// session there, a template's run, a trigger) waits for your approval too,
+/// showing the realm and exactly what goes there (docs/assistant.md
+/// §Realms): approved, it goes as that realm's and says it came from the
+/// console; denied, nothing goes. A realm's own assistant does the same in
+/// its realm without asking, as before.
+#[tokio::test]
+async fn assistant_in_root_puts_things_in_a_realm_only_as_you_approve() {
+    use prost::Message as _;
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let conn: Connection = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    http.put(format!("{api}/settings/assistant")).json(&json!({"model": {"connection": "m", "model": "mock-1"}})).send().await.unwrap();
+    http.post(format!("{api}/realms")).json(&json!({"id": "lab", "name": "Lab"})).send().await.unwrap();
+    // A worker the head knows (no process: what goes to it waits in its queue).
+    let worker = c6_core::WorkerId(uuid::Uuid::now_v7());
+    let w = c6_head::store::NewWorker {
+        id: worker,
+        name: "thalassa",
+        hostname: "thalassa",
+        os: "linux",
+        arch: "x86_64",
+        version: "0",
+        cert_serial: "thalassa",
+    };
+    head.state.store.insert_worker(&w, "", 0).await.unwrap();
+    head.state.store.set_worker_role(worker, "worker").await.unwrap();
+    // A session in lab, and a template of lab's.
+    let audit: Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": worker.0, "cwd": "/srv/app", "realm": "lab", "title": "Disk audit", "prompt": "Audit the disks",
+                      "connection_id": conn.id, "model": "mock-1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let put = http
+        .put(format!("{api}/settings/templates?realm=lab"))
+        .json(&json!([{"name": "disk", "workers": ["thalassa"], "cwd": "/srv", "connection": "m", "model": "mock-1",
+                      "prompt": "Check the disk under {{input}}"}]))
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success());
+
+    let call = |op: &str, input: Value| ("c6_call".to_owned(), json!({"op": op, "input": input}).to_string());
+    let send = |text: &str| call("sessions.send", json!({"id": audit.id, "body": {"text": text}}));
+    let run = |input: &str| call("templates.run", json!({"name": "disk", "body": {"realm": "lab", "input": input}}));
+    let events = |id: String| {
+        let (http, api) = (http.clone(), api.clone());
+        async move { http.get(format!("{api}/sessions/{id}/events?after=0")).send().await.unwrap().json::<Vec<Event>>().await.unwrap() }
+    };
+    let on_thalassa = async || {
+        let all: Vec<Session> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
+        all.into_iter().filter(|s| s.worker_id == worker.0).collect::<Vec<_>>()
+    };
+    // The messages waiting for the audit's agent (its worker is away).
+    let messages = async || -> Vec<c6_proto::UserInput> {
+        let rows = head.state.store.queued_inputs(&audit.id).await.unwrap();
+        rows.into_iter()
+            .filter_map(|row| match c6_proto::SessionCommand::decode(row.data.as_slice()).ok()?.kind? {
+                c6_proto::session_command::Kind::Input(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    };
+    let triggers = async || -> Vec<Value> { http.get(format!("{api}/triggers?realm=lab")).send().await.unwrap().json().await.unwrap() };
+    // The tool results once `turns` turns have ended.
+    let results = |id: String, turns: usize| async move {
+        eventually("the turn's end", async || {
+            let es = events(id.clone()).await;
+            let ended = es.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count();
+            (ended == turns).then(|| {
+                es.into_iter()
+                    .filter_map(|e| match e.kind {
+                        EventKind::ToolResult { output, is_error, .. } => Some((output, is_error)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+    };
+    // The `n`th approval asked for: (call id, what it shows, what it says).
+    let approval = |id: String, n: usize| async move {
+        eventually("an approval request", async || {
+            events(id.clone())
+                .await
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    EventKind::Approval { call_id, state, input, message, .. } if state == "requested" => Some((call_id, input, message)),
+                    _ => None,
+                })
+                .nth(n)
+        })
+        .await
+    };
+    let answer = |id: String, call_id: String, allow: bool| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            let r = http.post(format!("{api}/sessions/{id}/approvals/{call_id}")).json(&json!({"allow": allow})).send().await.unwrap();
+            assert!(r.status().is_success());
+        }
+    };
+
+    // A message to a session in lab: nothing goes until you approve it, then
+    // it goes word for word, as a message from the console.
+    mock.push(Reply::ToolCalls(vec![send("Is the audit done? Root says thalassa is due for a reboot.")]));
+    mock.push(Reply::Text("Asked.".into()));
+    let s: Session = http
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "ask the disk audit how it is going"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s.realm, "root");
+    let (call_id, input, message) = approval(s.id.clone(), 0).await;
+    assert_eq!(input, "Is the audit done? Root says thalassa is due for a reboot.", "the message, as it goes");
+    assert!(message.contains("the session “Disk audit” in Lab (lab)") && message.contains("Ask in the console"), "{message}");
+    let before = messages().await;
+    assert!(before.iter().all(|m| !m.text.contains("reboot")), "nothing goes before you approve: {before:?}");
+    answer(s.id.clone(), call_id, true).await;
+    let out = results(s.id.clone(), 1).await;
+    assert!(!out[0].1, "{out:?}");
+    let sent: Vec<_> = messages().await.into_iter().filter(|m| m.text.contains("reboot")).collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].text, "Is the audit done? Root says thalassa is due for a reboot.");
+    assert_eq!(sent[0].from_session_id, s.id, "from the console's conversation");
+    assert_eq!(sent[0].from_title, "Ask in the console");
+
+    // Denied, neither another message nor a template's run goes.
+    mock.push(Reply::ToolCalls(vec![send("Delete the old logs too."), run("/var/log")]));
+    mock.push(Reply::Text("Not done.".into()));
+    http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "and clean up"})).send().await.unwrap();
+    let (call_id, input, _) = approval(s.id.clone(), 1).await;
+    assert_eq!(input, "Delete the old logs too.");
+    answer(s.id.clone(), call_id, false).await;
+    let (call_id, input, message) = approval(s.id.clone(), 2).await;
+    assert_eq!(input, "/var/log", "the template's input, as it goes");
+    assert!(message.contains("Start the template “disk” in Lab (lab)") && message.contains("started-by:console"), "{message}");
+    answer(s.id.clone(), call_id, false).await;
+    let out = results(s.id.clone(), 2).await;
+    assert!(out[1].1 && out[1].0.contains("did not approve"), "{out:?}");
+    assert!(out[2].1 && out[2].0.contains("did not approve"), "{out:?}");
+    assert!(messages().await.iter().all(|m| !m.text.contains("logs")));
+    assert_eq!(on_thalassa().await.len(), 1, "no template's session started");
+
+    // Approved, the template's session starts in lab saying it came from the
+    // console, and a trigger is made in lab, with its input shown in full.
+    let nightly = json!({"name": "nightly disk", "template": "disk", "trigger": "schedule", "cron": "0 3 * * *", "input": "/srv"});
+    mock.push(Reply::ToolCalls(vec![run("/srv"), call("triggers.create", json!({"realm": "lab", "body": nightly}))]));
+    mock.push(Reply::Text("Done.".into()));
+    http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "check /srv now and every night"})).send().await.unwrap();
+    let (call_id, input, _) = approval(s.id.clone(), 3).await;
+    assert_eq!(input, "/srv");
+    assert_eq!(on_thalassa().await.len(), 1, "nothing starts before you approve");
+    answer(s.id.clone(), call_id, true).await;
+    let (call_id, input, message) = approval(s.id.clone(), 4).await;
+    assert!(input.starts_with("triggers.create {") && input.contains("nightly disk") && input.contains("0 3 * * *"), "{input}");
+    assert!(message.contains("triggers.create in Lab (lab)") && message.contains("written by the console"), "{message}");
+    assert!(triggers().await.is_empty(), "no trigger before you approve");
+    answer(s.id.clone(), call_id, true).await;
+    let out = results(s.id.clone(), 3).await;
+    assert!(!out[3].1 && !out[4].1, "{out:?}");
+    let started: Vec<Session> = on_thalassa().await.into_iter().filter(|x| x.id != audit.id).collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0].realm, "lab");
+    assert!(started[0].labels.contains(&"started-by:console".to_owned()), "{:?}", started[0].labels);
+    let made = triggers().await;
+    assert!(made.len() == 1 && made[0]["name"] == "nightly disk", "{made:?}");
+
+    // A realm's assistant messages its realm's sessions and runs its
+    // templates without asking, as itself, as before.
+    mock.push(Reply::ToolCalls(vec![
+        send("How far along are you?"),
+        call("templates.run", json!({"name": "disk", "body": {"input": "/tmp"}})),
+    ]));
+    mock.push(Reply::Text("Asked and started.".into()));
+    let own: Session = http
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "check on the audit", "realm": "lab"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let out = results(own.id.clone(), 1).await;
+    assert!(!out[0].1 && !out[1].1, "{out:?}");
+    assert!(events(own.id.clone()).await.iter().all(|e| !matches!(e.kind, EventKind::Approval { .. })), "no approval asked");
+    let plain: Vec<_> = messages().await.into_iter().filter(|m| m.text == "How far along are you?").collect();
+    assert!(plain.len() == 1 && plain[0].from_session_id.is_empty(), "{plain:?}");
+    let theirs: Vec<Session> = on_thalassa().await.into_iter().filter(|x| x.id != audit.id && x.id != started[0].id).collect();
+    assert_eq!(theirs.len(), 1, "{theirs:?}");
+    assert!(theirs[0].realm == "lab" && !theirs[0].labels.contains(&"started-by:console".to_owned()), "{:?}", theirs[0]);
+    head.shutdown().await.unwrap();
+}

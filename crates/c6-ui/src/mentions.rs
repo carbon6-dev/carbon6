@@ -373,6 +373,7 @@ fn by_whom(by: &str) -> String {
         "" => "someone".into(),
         "you" => "you".into(),
         "assistant" => "Ask".into(),
+        "console" => "Ask in the console".into(),
         _ => match by.split_once(':') {
             Some(("session", id)) => known(Kind::Session, id).title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "a session".into()),
             Some((_, name)) => name.to_owned(),

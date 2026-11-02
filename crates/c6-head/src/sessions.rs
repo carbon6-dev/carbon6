@@ -1245,15 +1245,7 @@ pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> 
     if to.realm != from.realm {
         return Err(bad_request("that session is in another realm: messages go only to sessions in this one"));
     }
-    if to.archived != 0 {
-        return Err(bad_request("that session is archived"));
-    }
-    if to.observed || to.parent_call_id.is_some() {
-        return Err(bad_request("that is a subagent: only the agent that started it talks to it"));
-    }
-    if to.status == "failed" {
-        return Err(bad_request("that session failed to start"));
-    }
+    takes_messages(&to)?;
     let limits = subagent_limits(st, Some(&from.realm)).await?;
     if hops > limits.max_message_hops {
         return Err(bad_request(format!(
@@ -1276,22 +1268,58 @@ pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> 
         }
         times.push_back(now);
     }
+    enqueue_message(st, &to, text, &from.id, &from.title, hops).await
+}
+
+/// The console's assistant messages a session in a realm, once you approve
+/// it (docs/assistant.md §Realms): as a message from that conversation, so
+/// its agent knows it is not yours, under the session's realm's budgets.
+pub async fn message_from_console(st: &HeadState, to_id: &str, text: &str, from_id: &str) -> anyhow::Result<Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(bad_request("the message is empty"));
+    }
+    let to = st.store.session(to_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_messages(&to)?;
+    if let Some(why) = crate::usage::blocked(st, &to.all_labels(), &to.realm).await? {
+        return Err(bad_request(format!("not sent: {why}")));
+    }
+    enqueue_message(st, &to, text, from_id, crate::assistant::FROM_CONSOLE, 1).await
+}
+
+/// A session another session's agent (or the console's) may message.
+pub fn takes_messages(to: &SessionRow) -> anyhow::Result<()> {
+    if to.archived != 0 {
+        return Err(bad_request("that session is archived"));
+    }
+    if to.observed || to.parent_call_id.is_some() {
+        return Err(bad_request("that is a subagent: only the agent that started it talks to it"));
+    }
+    if to.status == "failed" {
+        return Err(bad_request("that session failed to start"));
+    }
+    Ok(())
+}
+
+/// Queues a message from another session for `to`'s agent, through the
+/// command queue to its worker, which delivers it as a notice.
+async fn enqueue_message(st: &HeadState, to: &SessionRow, text: &str, from_id: &str, from_title: &str, hops: u32) -> anyhow::Result<Value> {
     let worker_id: WorkerId = to.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
     let input = UserInput {
         text: text.to_owned(),
         labels: to.head_labels(),
-        from_session_id: from.id.clone(),
-        from_title: from.title.clone(),
+        from_session_id: from_id.to_owned(),
+        from_title: from_title.to_owned(),
         hops,
         ..Default::default()
     };
-    let shown = format!("from \"{}\": {text}", from.title);
+    let shown = format!("from \"{from_title}\": {text}");
     let data = input_command(&id, &to.id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id: &to.id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, &to.id).await;
     st.registry.deliver(worker_id);
-    info!(from = %from.id, to = %to.id, hops, "session message");
+    info!(from = %from_id, to = %to.id, hops, "session message");
     Ok(json!({"to": to.id, "title": to.title, "queued": st.registry.get(worker_id).is_none()}))
 }
 

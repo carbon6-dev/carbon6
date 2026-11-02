@@ -24,6 +24,8 @@ pub fn author(by: &str) -> String {
     match by {
         "you" => "you".into(),
         "assistant" => "the assistant".into(),
+        // The console's assistant, in a realm with your approval.
+        "console" => "Ask in the console".into(),
         b if b.starts_with("session:") => "a session".into(),
         b if b.starts_with("token:") => "an API token".into(),
         b => b.to_owned(),

@@ -143,6 +143,42 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
   - **Allow:** the session starts in that realm as that realm's API token would start it, under the realm's policies, routes, connections and workers and none of root's. It is labelled `started-by:console`. The assistant gets the session back, with its id, and can follow it, since root reads every realm.
   - **Deny** (or no answer): nothing starts, and the assistant is told not to try another way.
   - In any other realm nothing changes: the assistant starts sessions only in its own realm, without asking.
+- **Whatever else it puts in a realm from root waits for your approval the same way.** Root reads every realm, so anything the assistant there writes into a realm could carry what that realm should not know (another realm's data, root's administration). Each such call asks first: the approval names the realm and what it acts on (the session's title, the template, the trigger, the decision, the work item…) and shows exactly what goes there, in full: a message's or side chat's text, a template's or workflow's input, else the operation and its whole input as JSON. It refuses what the approval could not show: files, attachments, a model switch with a message, a secret you gave the assistant, more than 4,000 characters.
+  - **Its realm:** an existing object's own (a session, trigger, decision, memory note, work item or project); for anything new, documents and knowledge, the realm the call names (`realm` in its input, or `body.realm`), else home, where root's new things have always gone. Into root itself nothing is asked: that is root's own.
+  - **Allow:** it runs as that realm's API token would, under the realm's rules and settings and none of root's, and is marked as the console's where carbon6 records who did something: a message reaches the session's agent as a message from “Ask in the console” (that conversation, like another session's, not yours); a side chat and a template's sessions are labelled `started-by:console`; a workflow run's trigger is `console`; documents, project changes and records are written by `console`.
+  - **Deny** (or no answer): nothing happens, and the assistant is told not to try another way.
+  - In any other realm nothing changes: its assistant acts in its own realm without asking, as before.
+- **What asks, and why.**
+
+  | Operations | Why it asks |
+  |---|---|
+  | `sessions.create`, `sessions.send`, `sessions.side_chat`, `sessions.queue.edit` | text goes to a realm's agent, or a session starts there |
+  | `templates.run`, `workflows.run`, `triggers.run`, `decisions.session` | starts sessions or runs in the realm (a template's or workflow's input is text for its agents) |
+  | `triggers.create`, `triggers.update` | a trigger acts in the realm later, with the input and action parameters you approved |
+  | `decisions.add`, `decisions.answer` | a decision's text, or an answer's values and note, which go to the agent waiting on it |
+  | `memories.create`, `memories.update` | memory notes are what the realm's sessions start with |
+  | `work.add`, `work.edit`, `work.attach`, `work.todos.add`, `work.todos.edit` | work items and to-dos (a to-do's prompt is a session's first message) |
+  | `projects.add`, `projects.edit`, `projects.work`, `projects.links`, `projects.phases` | a project's title, purpose, phases, links |
+  | `docs.create`, `docs.edit`, `docs.rename`, `docs.comment`, `docs.reply` | documents and comments the realm's agents read and answer |
+  | `collections.create`, `collections.update`, `records.create`, `records.put`, `series.create`, `series.update`, `series.record`, `views.act` | the realm's data (a view's action may also start its template) |
+  | `apps.operations.call` | an app's operation writes its data or starts its session, as the app |
+  | `memex.notes.create`, `memex.trails.append`, `memex.trails.update`, `memex.relations.write`, `claims.add`, `things.create`, `knowledge.record`, `knowledge.set`, `mail.drafts.set` | knowledge the realm's agents search (from root, home's), and a reply box's draft a session may pick up |
+  | `docs.import`, `docs.add_file`, `memex.upload`, `memex.ingest` | refused from root: a file cannot be shown in the approval; add it in the realm itself |
+
+- **What does not ask, and why.**
+
+  | Operations | Why not |
+  |---|---|
+  | `settings.*` (skills, prompts, agents, templates, workflows, policies, routes…), `realms.*`, `grants.*`, `connections.*`, `workers.*`, `apps.install`/`upgrade`/`remove`, `installs.*`, `packages.*`, `google.client.put`, `google.connect`, `google.install`, `slack.client.put`/`install`/`connect`/`sync`, `docs.google_connect`, `decks.themes.put`, `work.settings.put`, `docs.settings.put` | administration, root's own job (from root these write root's settings, which realms inherit); installs ask through their own decision |
+  | Reads of every kind | root may read every realm |
+  | `sessions.update`, `sessions.labels.set`, `sessions.colour.set`, `sessions.subagent_model.set`, `sessions.seen`, `sessions.viewed`, `sessions.suggestion.seen`, `marks.set`, `attention.seen`, `work.seen`, `decisions.edit` | housekeeping (a title, labels, a mark, seen, snooze or dismiss) that carries nothing to an agent |
+  | `sessions.interrupt`, `sessions.resume`, `sessions.notices.deliver`, `sessions.queue.dismiss`, `sessions.queue.pull`, `work.refresh`, `projects.refresh` | steers a session or note with what is already in the realm (a resume uses the realm's own prompt) |
+  | `sessions.approvals.decide`, `workflows.steps.decide` | an allow or deny with no text; the same as in any realm |
+  | `work.detach`, `work.merge`, `projects.detach`, `projects.merge`, `projects.docs`, `projects.plan`, `projects.proposed`, `projects.propose`, `projects.sessions.*`, `docs.restore`, `docs.export`, `docs.resolve`, `docs.comments.send`, `decks.bring_in` | rearranges or sends on what is already in the realm |
+  | `memex.summarize`, `memex.review.decide`, `memex.commitment.set`, `memex.scan`, `google.sync`, `mail.requests.*`, `mail.triage.*`, `mail.drafts.link`, `mail.drafts.clear` | made from the realm's own knowledge, or a status |
+  | `mail.draft`, `mail.modify`, `calendar.*`, `contacts.*`, `chat.*` | your own Google and Slack accounts, outside carbon6; sending mail and deleting ask already (destructive) |
+  | `workers.fs.mkdir`, `workers.terminals.open`, `notifications.test` | a machine's folder, a terminal you use yourself, a test notification |
+  | Destructive operations (deletes, `sessions.rewind`, `mail.send`…) | ask already, as everywhere |
 
 ## 9. Open questions
 
