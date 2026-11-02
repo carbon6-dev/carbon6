@@ -355,6 +355,13 @@ pub fn Present(id: String, presenter: bool) -> impl IntoView {
             }
         });
         on.forget();
+        // Closed with the page: open, it went on listening for good.
+        on_cleanup(move || {
+            if let Some(Some(c)) = channel.try_get_value() {
+                c.set_onmessage(None);
+                c.close();
+            }
+        });
     }
     let shown = move || -> Vec<DocBlock> {
         doc.get().and_then(Result::ok).map(|d| slides(&d).into_iter().filter(|s| s.attrs["hidden"] != true).collect()).unwrap_or_default()

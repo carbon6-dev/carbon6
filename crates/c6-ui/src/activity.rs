@@ -66,12 +66,13 @@ pub fn Dock() -> impl IntoView {
         peek.set(false);
     });
     // ⌘\ (Ctrl+\) hides it or keeps it open.
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && ev.key() == "\\" {
             ev.prevent_default();
-            toggle.run(());
+            toggle.try_run(());
         }
     });
+    on_cleanup(move || keys.remove());
     view! {
         <div class=move || if kept.get() { "hidden w-60 shrink-0 lg:flex" } else { "relative z-30 hidden w-2 shrink-0 lg:block" }
             on:mouseenter=move |_| if !kept.get_untracked() { after(80, true) }

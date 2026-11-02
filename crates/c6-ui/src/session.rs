@@ -400,9 +400,11 @@ impl Feed {
                 let (a, b) = (evs.partition_point(|e| e.seq < start), evs.partition_point(|e| e.seq < before));
                 evs.splice(a..b, page);
             });
-            // A jump: drawn from there.
-            if let Some(at) = at {
-                self.to.set(self.events.with_untracked(|evs| bound(evs, at)));
+            // A jump: drawn from there (not if the session has gone meanwhile).
+            if let Some(at) = at
+                && let Some(to) = self.events.try_with_untracked(|evs| bound(evs, at))
+            {
+                self.to.set(to);
             }
             self.from.set(start);
             request_animation_frame(then);
@@ -466,7 +468,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let live = api::live();
     let col = use_column();
     // Keyboard shortcuts only act in the active column.
-    let active = move || col.is_none_or(|c| c.active.get_untracked());
+    let active = move || col.is_none_or(|c| c.active.try_get_untracked() == Some(true));
     let root = col.map(|c| c.root_id()).unwrap_or_default();
     // A document this session starts opens in a tile of its own (the
     // session stays), so you watch it being written (docs/docs.md §6).
@@ -697,7 +699,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let guard =
         StopGuard { agents: Memo::new(move |_| events.with(|e| crate::tasks::background_agents(e))), confirm: RwSignal::new(false) };
     provide_context(guard);
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+    // Removed when the session goes: left behind, it read its disposed
+    // signals on every key, a panic each, until the app ran out of stack.
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !active() {
             return;
         }
@@ -728,7 +732,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     esc_armed.set(Some(now));
                     set_timeout(
                         move || {
-                            if esc_armed.get_untracked() == Some(now) {
+                            // Not if the session has gone meanwhile.
+                            if esc_armed.try_get_untracked() == Some(Some(now)) {
                                 esc_armed.set(None)
                             }
                         },
@@ -748,6 +753,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             _ => {}
         }
     });
+    on_cleanup(move || keys.remove());
     // The tile's bar offers this session's panes and actions, wherever you
     // are in the transcript.
     if let Some(c) = col {
@@ -929,6 +935,10 @@ fn watch_width(el: NodeRef<leptos::html::Div>, wide: RwSignal<bool>) {
     let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
     Effect::new(move || {
         let Some(node) = el.get() else { return };
+        // One at a time: an element drawn anew isn't watched twice.
+        if let Some(o) = observer.try_get_value().flatten() {
+            o.disconnect();
+        }
         let measure = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
             // A last resize may come after the pane has gone; hidden (a
             // phone's other pane), it keeps what it was.
@@ -2430,12 +2440,16 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
     };
     // Leaving the page (or closing the bar) stops highlighting.
     on_cleanup(move || js_clear_highlights(&root.get_value()));
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key().eq_ignore_ascii_case("g") && (ev.meta_key() || ev.ctrl_key()) && col.is_none_or(|c| c.active.get_untracked()) {
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key().eq_ignore_ascii_case("g")
+            && (ev.meta_key() || ev.ctrl_key())
+            && col.is_none_or(|c| c.active.try_get_untracked() == Some(true))
+        {
             ev.prevent_default();
             step(if ev.shift_key() { -1 } else { 1 });
         }
     });
+    on_cleanup(move || keys.remove());
     let input = NodeRef::<leptos::html::Input>::new();
     Effect::new(move || {
         if let Some(el) = input.get()
@@ -4131,7 +4145,7 @@ fn Composer(
         text.set(insert + &rest);
         command.set(None);
         request_animation_frame(move || {
-            if let Some(el) = area.get_untracked() {
+            if let Some(el) = area.try_get_untracked().flatten() {
                 let _ = el.focus();
                 let _ = el.set_selection_range(caret, caret);
             }
@@ -4148,7 +4162,7 @@ fn Composer(
         text.set(new);
         mention.set(None);
         request_animation_frame(move || {
-            if let Some(el) = area.get_untracked() {
+            if let Some(el) = area.try_get_untracked().flatten() {
                 let _ = el.focus();
                 let _ = el.set_selection_range(caret, caret);
             }

@@ -139,7 +139,12 @@ pub fn TabButton(tab: RwSignal<&'static str>, label: &'static str, value: &'stat
 pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
     // Ticks so "last seen" stays fresh between snapshots.
     let now = RwSignal::new(now_ms());
-    set_interval(move || now.set(now_ms()), Duration::from_secs(5));
+    let tick = set_interval_with_handle(move || now.set(now_ms()), Duration::from_secs(5)).ok();
+    on_cleanup(move || {
+        if let Some(t) = tick {
+            t.clear();
+        }
+    });
     let error = RwSignal::new(None::<String>);
 
     let online = move || workers.with(|ws| ws.iter().filter(|w| w.status == WorkerStatus::Online).count());

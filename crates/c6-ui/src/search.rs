@@ -52,15 +52,16 @@ pub fn SearchBox() -> impl IntoView {
     let ws = use_workspace();
     let text = RwSignal::new(String::new());
     let input = NodeRef::<leptos::html::Input>::new();
-    let _hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
+    let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "k" && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
-            if let Some(el) = input.get_untracked() {
+            if let Some(el) = input.try_get_untracked().flatten() {
                 let _ = el.focus();
                 el.select();
             }
         }
     });
+    on_cleanup(move || hotkey.remove());
     view! {
         <input
             node_ref=input

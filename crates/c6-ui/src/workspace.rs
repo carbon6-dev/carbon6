@@ -1445,6 +1445,10 @@ pub fn ScrollBox(
         let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
         Effect::new(move || {
             let Some(el) = node.get() else { return };
+            // One at a time: a box drawn anew isn't watched twice.
+            if let Some(o) = observer.try_get_value().flatten() {
+                o.disconnect();
+            }
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
                 // A last resize may come after the box has gone.
                 if let Some(el) = node.try_get_untracked().flatten()
@@ -1585,7 +1589,7 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !(ev.meta_key() || ev.ctrl_key()) || ev.alt_key() {
             return;
         }
@@ -1605,6 +1609,7 @@ pub fn Tiles() -> impl IntoView {
             _ => {}
         }
     });
+    on_cleanup(move || keys.remove());
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).

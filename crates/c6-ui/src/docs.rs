@@ -1771,7 +1771,9 @@ fn BlockView(
                 if draft.typed.try_get_untracked() == Some(n)
                     && edit.try_with_untracked(|e| e.as_ref().is_some_and(|e| e.id == id)) == Some(true)
                 {
-                    save(doc, edit, draft, true, error, move || reload.run(()));
+                    save(doc, edit, draft, true, error, move || {
+                        reload.try_run(());
+                    });
                 }
             },
             std::time::Duration::from_millis(1500),

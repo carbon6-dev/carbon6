@@ -14,12 +14,13 @@ use crate::workspace::{How, View, use_workspace};
 #[component]
 pub fn AskButton() -> impl IntoView {
     let open = RwSignal::new(false);
-    let _hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
+    let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key().eq_ignore_ascii_case("j") && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
             open.set(true);
         }
     });
+    on_cleanup(move || hotkey.remove());
     view! {
         <button class="rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
             title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>"✦ Ask"</button>

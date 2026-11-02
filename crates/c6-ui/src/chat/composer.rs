@@ -165,7 +165,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
             let _ = el.focus();
             set_timeout(
                 move || {
-                    if let Some(el) = area.get_untracked() {
+                    if let Some(el) = area.try_get_untracked().flatten() {
                         let _ = el.set_selection_range(at as u32, at as u32);
                     }
                 },
@@ -187,7 +187,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
         let (s, e) = ((a + left.len()) as u32, (b + left.len()) as u32);
         set_timeout(
             move || {
-                if let Some(el) = area.get_untracked() {
+                if let Some(el) = area.try_get_untracked().flatten() {
                     let _ = el.set_selection_range(s, e);
                 }
             },

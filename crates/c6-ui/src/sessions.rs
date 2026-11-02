@@ -1152,7 +1152,12 @@ fn SessionForm(
                     // Closing a dialog disposes this form: on the next tick,
                     // once what it set has been drawn.
                     if let Some(f) = on_started {
-                        set_timeout(move || f.run(()), std::time::Duration::ZERO);
+                        set_timeout(
+                            move || {
+                                f.try_run(());
+                            },
+                            std::time::Duration::ZERO,
+                        );
                     }
                 }
                 Err(e) => {

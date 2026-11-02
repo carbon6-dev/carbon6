@@ -95,10 +95,10 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
         });
     });
     let load_older = move || {
-        if loading_older.get_untracked() || older_done.get_untracked() {
+        if loading_older.try_get_untracked() != Some(false) || older_done.try_get_untracked() != Some(false) {
             return;
         }
-        let Some(before) = msgs.with_untracked(|l| l.last().and_then(|m| m["created_at"].as_i64())) else { return };
+        let Some(before) = msgs.try_with_untracked(|l| l.last().and_then(|m| m["created_at"].as_i64())).flatten() else { return };
         loading_older.set(true);
         let p = mp.clone();
         spawn_local(async move {
@@ -140,6 +140,10 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
     let lo = load_older.clone();
     Effect::new(move || {
         if let Some(el) = top.get() {
+            // One at a time: one left observing would load for a list gone.
+            if let Some(o) = observer.try_get_value().flatten() {
+                o.disconnect();
+            }
             let lo = lo.clone();
             let cb = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |entries: js_sys::Array| {
                 if entries.iter().any(|e| e.unchecked_into::<web_sys::IntersectionObserverEntry>().is_intersecting()) {

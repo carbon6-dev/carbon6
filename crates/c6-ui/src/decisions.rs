@@ -90,7 +90,10 @@ fn later(due: StoredValue<bool>, tick: RwSignal<u32>) {
     due.set_value(true);
     set_timeout(
         move || {
-            due.set_value(false);
+            // Not once the view that asked has gone.
+            if due.try_set_value(false).is_some() {
+                return;
+            }
             if typing() { later(due, tick) } else { tick.update(|t| *t += 1) }
         },
         QUIET,

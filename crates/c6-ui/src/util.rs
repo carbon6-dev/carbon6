@@ -16,10 +16,16 @@ pub fn today() -> String {
     format!("{:04}-{:02}-{:02}", d.get_full_year(), d.get_month() + 1, d.get_date())
 }
 
-/// A signal that ticks every few seconds, for relative times.
+/// A signal that ticks every few seconds, for relative times, while its
+/// view lives (each hover card has one: never cleared, they piled up).
 pub fn clock() -> RwSignal<i64> {
     let now = RwSignal::new(now_ms());
-    set_interval(move || now.set(now_ms()), std::time::Duration::from_secs(5));
+    let tick = set_interval_with_handle(move || now.set(now_ms()), std::time::Duration::from_secs(5)).ok();
+    on_cleanup(move || {
+        if let Some(t) = tick {
+            t.clear();
+        }
+    });
     now
 }
 

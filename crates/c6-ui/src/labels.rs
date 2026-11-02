@@ -184,7 +184,7 @@ pub fn SessionLabels(session: String, labels: Vec<String>, auto_labels: Vec<Stri
     Effect::new(move || {
         if adding.get() {
             request_animation_frame(move || {
-                if let Some(el) = field.get_untracked() {
+                if let Some(el) = field.try_get_untracked().flatten() {
                     let _ = el.focus();
                 }
             });

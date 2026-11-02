@@ -60,8 +60,21 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 use workspace::{Go, View};
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// js/crash.js: the banner that offers a reload.
+    #[wasm_bindgen(catch, js_name = c6Crashed)]
+    fn js_crashed() -> Result<(), wasm_bindgen::JsValue>;
+}
+
 fn main() {
-    console_error_panic_hook::set_once();
+    // A panic leaves the app broken (WebAssembly doesn't unwind: what it
+    // held stays held, and its stack is never given back), so beyond the
+    // console's "panicked at …" the page says so and offers a reload.
+    std::panic::set_hook(Box::new(|info| {
+        console_error_panic_hook::hook(info);
+        let _ = js_crashed();
+    }));
     // Each page is one realm's app or the console (docs/realms-ux.md).
     if place::resolve() {
         leptos::mount::mount_to_body(App);
