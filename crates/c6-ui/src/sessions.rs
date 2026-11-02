@@ -346,7 +346,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="mt-0.5 flex items-center gap-2"><crate::aspects::AspectChips s=chips /></div>
                 <div class="truncate text-xs text-zinc-500">
-                    {worker} " · " <span class="font-mono">{match (&s.ssh, s.cwd.is_empty()) {
+                    <span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " <span class="font-mono">{match (&s.ssh, s.cwd.is_empty()) {
                         (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
                         (None, true) => "scratch workspace".to_owned(),
                         (None, false) => s.cwd.clone(),
@@ -556,7 +556,7 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-zinc-500">
-                <div class="truncate">{worker} " · " {s.model.clone()}</div>
+                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {s.model.clone()}</div>
                 <div class="break-all font-mono">{place}</div>
                 <div>{move || format!("active {}", ago(now.get() - updated))}</div>
             </div>

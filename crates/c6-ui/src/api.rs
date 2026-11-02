@@ -75,12 +75,17 @@ impl LiveFeed {
         self.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id).map(|w| w.name.clone()).unwrap_or_else(|| "unknown".into()))
     }
 
-    /// Where a session runs: its worker's name, or carbon6 for the sessions
+    /// Where a session runs: its worker's name, or "head" for the sessions
     /// the head runs itself (the assistant, Ask), which have no worker.
     pub fn session_worker(&self, s: &c6_api::Session) -> String {
-        if s.on_head { "carbon6".into() } else { self.worker_name(&s.worker_id.to_string()) }
+        if s.on_head { HEAD.into() } else { self.worker_name(&s.worker_id.to_string()) }
     }
 }
+
+/// Where a session the head runs itself is, in place of a worker's name.
+pub const HEAD: &str = "head";
+/// Its hover: what running in the head means.
+pub const HEAD_TITLE: &str = "Runs in carbon6's head, not on a worker: carbon6's own tools only, no shell or files";
 
 pub fn live() -> LiveFeed {
     expect_context::<LiveFeed>()

@@ -880,10 +880,16 @@ pub fn SessionMeta(chrome: SessionChrome, #[prop(optional, into)] on_act: Option
                             }
                         }}
                         <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-600 dark:text-zinc-400">
-                            <span class="flex items-center gap-1">
-                                <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
-                                {d.worker_name.clone()}
-                            </span>
+                            {if s.on_head {
+                                view! { <span title=api::HEAD_TITLE>{api::HEAD}</span> }.into_any()
+                            } else {
+                                view! {
+                                    <span class="flex items-center gap-1">
+                                        <span class=move || if online() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
+                                        {d.worker_name.clone()}
+                                    </span>
+                                }.into_any()
+                            }}
                             {s.ssh.clone().map(|t| view! { <span class="rounded bg-sky-100 px-1 font-mono text-sky-800 dark:bg-sky-950 dark:text-sky-300" title="Working on this machine over SSH, through the worker">{format!("⇄ {t}")}</span> })}
                             <span class="break-all font-mono">{{ let cwd = s.cwd.clone(); move || started.get().map(|(c, _)| c).unwrap_or_else(|| cwd.clone()) }}</span>
                             {move || started.get().map(|(_, b)| b).filter(|b| !b.is_empty()).map(|b| view! {

@@ -109,11 +109,15 @@ pub fn DetailsCard(
     let environment = view! {
         {row(
             "▣",
-            view! {
-                <span class="inline-flex items-center gap-1.5">
-                    <span class=move || if online.get() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
-                    {worker_name}
-                </span>
+            if s.with_value(|s| s.on_head) {
+                view! { <span>{crate::api::HEAD_TITLE}</span> }.into_any()
+            } else {
+                view! {
+                    <span class="inline-flex items-center gap-1.5">
+                        <span class=move || if online.get() { "h-1.5 w-1.5 rounded-full bg-emerald-500" } else { "h-1.5 w-1.5 rounded-full bg-zinc-400" }></span>
+                        {worker_name}
+                    </span>
+                }.into_any()
             },
             s.with_value(|s| s.ssh.clone().map(|t| format!("⇄ {t}"))),
         )}

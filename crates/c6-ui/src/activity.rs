@@ -278,7 +278,7 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
                     <span class="min-w-0 flex-1 truncate text-sm">{s.title.clone()}</span>
                     <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=s.clone() /></span>
                 </div>
-                <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
+                <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
             </Go>
             {move || number.get().map(tile_badge)}
             {dismissable.then(|| {
@@ -353,7 +353,7 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
             <span class=dot(s.display_status(), t)></span>
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
-                <div class="truncate text-xs text-zinc-500">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
+                <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-xs text-zinc-500">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-1">
                         {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}

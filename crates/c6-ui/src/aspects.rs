@@ -55,8 +55,11 @@ impl Aspect {
 pub fn of(s: &Session) -> Vec<Aspect> {
     let live = api::live();
     let mut out = Vec::new();
-    let worker = s.worker_id.to_string();
-    out.push(Aspect { aspect: "worker", label: live.session_worker(s), key: format!("worker:{worker}") });
+    // A session the head runs has no worker, so no worker chip.
+    if !s.on_head {
+        let worker = s.worker_id.to_string();
+        out.push(Aspect { aspect: "worker", label: live.worker_name(&worker), key: format!("worker:{worker}") });
+    }
     if let Some(w) = &s.work {
         // A quick session (docs/projects.md §3.1) has a project and no work.
         if !w.id.is_empty() {
