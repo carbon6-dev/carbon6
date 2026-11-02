@@ -644,6 +644,12 @@ pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String
     json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
 }
 
+/// A settings list's own entries in `realm` (the console, choosing which
+/// realm's rules it edits; "root": the defaults every realm inherits).
+pub async fn get_setting_in(name: &'static str, realm: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/settings/{name}?realm={}", enc(&realm))).send().await).await
+}
+
 pub async fn analytics(days: u32, labels: Vec<String>, by: String) -> Result<c6_api::AnalyticsReport, String> {
     let (labels, by) = (js_sys::encode_uri_component(&labels.join(",")), js_sys::encode_uri_component(&by));
     json(Request::get(&format!("/api/v1/analytics?days={days}&labels={labels}&by={by}")).send().await).await
@@ -919,6 +925,12 @@ pub async fn test_channel(name: String) -> Result<(), String> {
 
 pub async fn put_setting(name: &'static str, value: serde_json::Value) -> Result<(), String> {
     empty(Request::put(&format!("/api/v1/settings/{name}{}", in_realm('?'))).json(&value).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// Replaces a settings list's own entries in `realm` (see `get_setting_in`).
+pub async fn put_setting_in(name: &'static str, realm: String, value: serde_json::Value) -> Result<(), String> {
+    let url = format!("/api/v1/settings/{name}?realm={}", enc(&realm));
+    empty(Request::put(&url).json(&value).map_err(|e| e.to_string())?.send().await).await
 }
 
 pub async fn fs_mkdir(worker: String, path: String) -> Result<serde_json::Value, String> {

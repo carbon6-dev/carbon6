@@ -130,6 +130,8 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
     let first = GROUPS.iter().flat_map(|(_, pages)| pages.iter()).map(|p| p.0).find(|id| here(id)).unwrap_or("appearance");
     let current = RwSignal::new(if page(&section).is_some() && here(&section) { section } else { first.to_owned() });
     let note = StoredValue::new(note);
+    // Whose routing rules the console edits: root's, or one realm's own.
+    let routes_realm = RwSignal::new("root".to_owned());
     // Switching pages keeps this column and updates its address.
     let go = move |id: String| {
         current.set(id.clone());
@@ -206,13 +208,15 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         <crate::push::PushSetting />
                     }.into_any(),
                     "routing" => view! {
+                    <RulesFor realm=routes_realm />
                     <ListSetting
                         name="routes"
                         title="Model routing"
                         noun="rule"
-                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names."
+                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names. A rule for task:suggest picks the model for suggested next messages (on a connection the session's realm may use). Rules for a realm are its own: its sessions use them before root's."
                         fields=ROUTE_FIELDS
                         examples=route_examples
+                        realm=routes_realm
                     />
                     }.into_any(),
                     "assistant" => view! {
@@ -501,14 +505,26 @@ fn OwnOrRoot(name: &'static str) -> impl IntoView {
     .into_any()
 }
 
-/// In a realm, root's entries of a list it uses as well as its own
-/// (read-only here: the console edits them). A realm's own entry of the
-/// same name replaces root's, so those aren't listed.
+/// In a realm (or one the console picked, `realm`), root's entries of a
+/// list it uses as well as its own (read-only here: they are edited as
+/// root's). A realm's own entry of the same name replaces root's, so those
+/// aren't listed.
 #[component]
-fn Inherited(name: &'static str) -> impl IntoView {
-    let Some(realm) = crate::place::realm() else { return ().into_any() };
+fn Inherited(name: &'static str, #[prop(optional_no_strip)] realm: Option<RwSignal<String>>) -> impl IntoView {
+    let picked = move || realm.map(|r| r.get()).filter(|r| r != "root");
+    if realm.is_none() && crate::place::realm().is_none() {
+        return ().into_any();
+    }
     let key = name.replace('-', "_");
-    let entries = LocalResource::new(move || api::effective_list(realm.clone(), key.clone()));
+    let entries = LocalResource::new(move || {
+        let (realm, key) = (picked().or_else(crate::place::realm), key.clone());
+        async move {
+            match realm {
+                Some(r) => api::effective_list(r, key).await,
+                None => Ok(Vec::new()),
+            }
+        }
+    });
     let label = |e: &serde_json::Value| {
         ["name", "model", "title", "event"]
             .iter()
@@ -527,7 +543,10 @@ fn Inherited(name: &'static str) -> impl IntoView {
             (!from_root.is_empty()).then(|| view! {
                 <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700">
                     <summary class="cursor-pointer text-zinc-600 dark:text-zinc-400">
-                        {format!("Also in use, from root ({}): set in the console", from_root.len())}
+                        {match realm {
+                            Some(_) => format!("Also in use, from root ({}): edit them under root", from_root.len()),
+                            None => format!("Also in use, from root ({}): set in the console", from_root.len()),
+                        }}
                     </summary>
                     <ul class="mt-2 space-y-1">
                         {from_root.into_iter().map(|x| {
@@ -549,6 +568,38 @@ fn Inherited(name: &'static str) -> impl IntoView {
         })}
     }
     .into_any()
+}
+
+/// Which realm's own routing rules the console edits: root's (every
+/// realm's defaults) or one realm's, which it uses before root's and no
+/// other realm sees.
+#[component]
+fn RulesFor(realm: RwSignal<String>) -> impl IntoView {
+    let realms = LocalResource::new(move || {
+        crate::api::realms_changed().track();
+        crate::api::realms()
+    });
+    view! {
+        <div class="flex flex-wrap items-center gap-3 text-sm">
+            <label class="text-zinc-600 dark:text-zinc-400" for="routes-realm">"Rules for"</label>
+            <select id="routes-realm" class=format!("{INPUT} w-auto!") prop:value=move || realm.get()
+                on:change=move |ev| realm.set(event_target_value(&ev))>
+                <option value="root">"root: every realm's defaults"</option>
+                {move || realms.get().and_then(Result::ok).unwrap_or_default().into_iter()
+                    .filter(|r| r.id != "root" && r.id != "commons")
+                    .map(|r| {
+                        let text = if r.name == r.id { r.id.clone() } else { format!("{} ({})", r.id, r.name) };
+                        view! { <option value=r.id.clone()>{text}</option> }
+                    })
+                    .collect_view()}
+            </select>
+            {move || (realm.get() != "root").then(|| view! {
+                <p class="w-full rounded-md bg-sky-50 px-3 py-2 text-sky-900 dark:bg-sky-950 dark:text-sky-200">
+                    {format!("Rules here are realm {}'s own: its sessions use them before root's, and no other realm sees them.", realm.get())}
+                </p>
+            })}
+        </div>
+    }
 }
 
 /// Realms (docs/os.md §3): yours, and which workers and connections serve
@@ -2898,6 +2949,7 @@ fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
         ("Remote hosts on a fast model", r("Ops over SSH", &["host:"], "claude-sonnet-5-5", "low", "")),
         ("Research at high effort", r("Research", &["research"], "claude-opus-5-5", "high", "claude-sonnet-5-5")),
         ("A template on a local model", r("Triage locally", &["template:triage"], "qwen3.6:27b", "", "")),
+        ("Suggested next messages on a small model", r("Suggestions", &["task:suggest"], "claude-haiku-4-5", "", "")),
     ]
 }
 
@@ -3160,7 +3212,8 @@ fn skill_examples() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 /// A list setting (commands, agents, skills) edited item by item and saved
-/// to the head, which checks it.
+/// to the head, which checks it. `realm`: in the console, whose own list
+/// it edits (root's, or one realm's); else this page's.
 #[component]
 fn ListSetting(
     name: &'static str,
@@ -3169,6 +3222,7 @@ fn ListSetting(
     help: &'static str,
     fields: &'static [Field],
     examples: fn() -> Vec<(&'static str, serde_json::Value)>,
+    #[prop(optional)] realm: Option<RwSignal<String>>,
 ) -> impl IntoView {
     let rows = RwSignal::new(Vec::<(u64, RwSignal<serde_json::Map<String, serde_json::Value>>)>::new());
     let next = StoredValue::new(0u64);
@@ -3179,7 +3233,15 @@ fn ListSetting(
         rows.update(|r| r.push((id, RwSignal::new(m))));
     };
     let status = RwSignal::new(None::<Result<&'static str, String>>);
-    let loaded = LocalResource::new(move || api::get_setting(name));
+    let loaded = LocalResource::new(move || {
+        let chosen = realm.map(|r| r.get());
+        async move {
+            match chosen {
+                Some(r) => api::get_setting_in(name, r).await,
+                None => api::get_setting(name).await,
+            }
+        }
+    });
     Effect::new(move || {
         if let Some(Ok(serde_json::Value::Array(items))) = loaded.get() {
             rows.set(Vec::new());
@@ -3191,9 +3253,14 @@ fn ListSetting(
     let save = move |_| {
         let items: Vec<serde_json::Value> =
             rows.get_untracked().iter().map(|(_, m)| serde_json::Value::Object(m.get_untracked())).collect();
+        let chosen = realm.map(|r| r.get_untracked());
         spawn_local(async move {
-            let r = api::put_setting(name, serde_json::Value::Array(items)).await.map(|_| "Saved.");
-            status.set(Some(r));
+            let value = serde_json::Value::Array(items);
+            let r = match chosen {
+                Some(r) => api::put_setting_in(name, r, value).await,
+                None => api::put_setting(name, value).await,
+            };
+            status.set(Some(r.map(|_| "Saved.")));
         });
     };
     let picked = RwSignal::new(String::new());
@@ -3203,7 +3270,7 @@ fn ListSetting(
                 <h2 class="font-medium">{title}</h2>
                 <p class="text-sm text-zinc-500">{help}</p>
             </div>
-            <Inherited name />
+            <Inherited name realm />
             <div class="space-y-3">
                 <For each=move || rows.get() key=|(id, _)| *id let:row>
                     <ListItem item=row.1 fields on_remove=move || rows.update(|r| r.retain(|(id, _)| *id != row.0)) />
