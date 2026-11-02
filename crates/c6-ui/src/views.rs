@@ -503,7 +503,7 @@ fn PageView(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
         let Some(j) = rest[i..].find("}}") else { break };
         let before = &rest[..i];
         if !before.trim().is_empty() {
-            parts.push(view! { <div class="md text-sm" inner_html=crate::markdown::to_html(before)></div> }.into_any());
+            parts.push(view! { <div class="md text-sm" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(before)></div> }.into_any());
         }
         let name = rest[i + 7..i + j].trim();
         // A page embeds other views, not pages (no loops).
@@ -525,7 +525,10 @@ fn PageView(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
         rest = &rest[i + j + 2..];
     }
     if !rest.trim().is_empty() {
-        parts.push(view! { <div class="md text-sm" inner_html=crate::markdown::to_html(rest)></div> }.into_any());
+        parts.push(
+            view! { <div class="md text-sm" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(rest)></div> }
+                .into_any(),
+        );
     }
     view! { <div class="space-y-4">{parts}</div> }
 }

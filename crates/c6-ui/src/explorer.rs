@@ -613,7 +613,7 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                             </dl>
                         })}
                         {chart.map(|v| view! { <crate::views::ViewBody view=v all=Vec::new() /> })}
-                        {(!o.body.is_empty()).then(|| view! { <div class="md max-h-96 overflow-y-auto text-sm" inner_html=crate::markdown::to_html(&o.body)></div> })}
+                        {(!o.body.is_empty()).then(|| view! { <div class="md max-h-96 overflow-y-auto text-sm" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&o.body)></div> })}
                         <div class="flex items-center gap-2 border-t border-zinc-200 pt-2 dark:border-zinc-800">
                             <h3 class="text-sm font-medium">"Connected"</h3>
                             <button class="text-xs text-zinc-500 underline" on:click=move |_| graph.update(|g| *g = !*g)>{move || if graph.get() { "as lists" } else { "as a graph" }}</button>

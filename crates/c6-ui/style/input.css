@@ -43,6 +43,28 @@
   .md th { @apply whitespace-nowrap; }
 }
 
+/* A carbon6 thing named in Markdown (markdown.rs, mentions.rs): its mark
+   and title on a faint tint of its colour (--m), the text a shade of it
+   that reads on the page. No underline (web links keep theirs). */
+.c6-mention {
+  padding: 0 0.3em;
+  border-radius: 0.3em;
+  background: color-mix(in srgb, var(--m) 16%, transparent);
+  color: color-mix(in srgb, var(--m) 62%, black);
+  text-decoration: none;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  -webkit-touch-callout: none;
+}
+.dark .c6-mention { color: color-mix(in srgb, var(--m) 45%, white); }
+.c6-mention:hover { background: color-mix(in srgb, var(--m) 26%, transparent); }
+.c6-mention-dot { display: inline-block; margin-right: 0.3em; vertical-align: 0.02em; }
+.c6-mention-doc { margin-right: 0.25em; font-size: 0.9em; opacity: 0.8; }
+/* A long press shows its card, not a text selection. */
+@media (hover: none) {
+  .c6-mention { -webkit-user-select: none; user-select: none; }
+}
+
 /* Search: every match on the page, the current one stronger, and a flash
    on the current match's block. */
 ::highlight(c6-search) {

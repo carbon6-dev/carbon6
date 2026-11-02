@@ -126,7 +126,7 @@ fn Preview(url: String, mime: String) -> impl IntoView {
         let markdown = mime == "text/markdown";
         view! {
             {move || text.get().map(|r| match r {
-                Ok(t) if markdown => view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" inner_html=crate::markdown::to_html(&t)></div> }.into_any(),
+                Ok(t) if markdown => view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&t)></div> }.into_any(),
                 Ok(t) => view! { <pre class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-3 font-mono text-xs dark:border-zinc-800">{t}</pre> }.into_any(),
                 Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
             })}

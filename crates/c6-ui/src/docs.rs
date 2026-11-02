@@ -263,16 +263,21 @@ fn chip_clicked(
     else {
         return false;
     };
+    // A mention (a link) middle- or shift-clicked: the browser's.
+    if el.tag_name() == "A" && (ev.button() != 0 || ev.shift_key() || ev.alt_key()) {
+        return true;
+    }
     ev.prevent_default();
     ev.stop_propagation();
     if let Some(r) = el.get_attribute("data-ref") {
         if r.starts_with("http://") || r.starts_with("https://") {
             let _ = window().open_with_url_and_target(&r, "_blank");
         } else if let Some(path) = ref_path(&r) {
-            let to = View::from_path(&path);
+            // Beside, or on ⌘/Ctrl-click in a new tile.
+            let (to, how) = (View::from_path(&path), How::from_mouse(ev));
             match col {
-                Some(c) => c.open(to, How::Beside),
-                None => ws.open(None, to, How::Beside),
+                Some(c) => c.open(to, how),
+                None => ws.open(None, to, how),
             }
         }
         return true;
@@ -1139,6 +1144,7 @@ fn BlockView(
                     view! {
                         <div class="cursor-text" on:click=move |ev| {
                             if let Some(c) = chip_ctx && chip_clicked(&ev, &block.get_value(), c, col, ws) { return; }
+                            if crate::mentions::follow_link(&ev, col, ws) { return; }
                             start()
                         }><Shown b=b kind=kind.clone() /></div>
                     }.into_any()
@@ -1701,30 +1707,6 @@ fn Version(id: String, rev: i64, restore: Callback<(i64, Option<String>)>) -> im
                 }
             })}
         </div>
-    }
-}
-
-/// Follows a link to a document (or another carbon6 view) inside Markdown
-/// that carbon6 rendered: it opens beside, as any link in a panel does.
-pub fn follow_link(ev: &web_sys::MouseEvent, col: Option<crate::workspace::ColumnCtx>, ws: crate::workspace::Workspace) {
-    use wasm_bindgen::JsCast;
-    if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
-        return;
-    }
-    let Some(a) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()).and_then(|e| e.closest("a[href]").ok().flatten()) else {
-        return;
-    };
-    let href = a.get_attribute("href").unwrap_or_default();
-    let path = crate::place::strip(&href);
-    if !path.starts_with("/docs/") {
-        return;
-    }
-    ev.prevent_default();
-    let to = View::from_path(&path);
-    let how = How::from_mouse(ev);
-    match col {
-        Some(c) => c.open(to, how),
-        None => ws.open(None, to, how),
     }
 }
 

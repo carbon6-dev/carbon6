@@ -27,6 +27,7 @@ mod mail_html;
 mod markdown;
 mod marks;
 mod memex;
+mod mentions;
 mod models;
 mod monitor;
 mod needs;
@@ -128,6 +129,7 @@ fn Main() -> impl IntoView {
         // whole page, header gone and the right edge cut off).
         <div class="flex h-dvh flex-col overflow-hidden">
             <util::NoticeHost />
+            <mentions::Peek />
             <header class="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-950">
                 <Brand />
                 <MobileMenu attention=Signal::derive(attention) />

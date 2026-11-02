@@ -303,7 +303,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 {(d.count > 1).then(|| view! { <span class="text-xs text-zinc-500">{format!("raised {}×", d.count)}</span> })}
                 <span class="text-xs text-zinc-500">{ago(now_ms() - d.updated_at)}</span>
             </div>
-            {(!d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" inner_html=crate::markdown::to_html(&d.document)></div> })}
+            {(!d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&d.document)></div> })}
             // A task card: exactly what the new session would be told.
             {(d.kind == "task").then(|| d.context["prompt"].as_str().map(str::to_owned)).flatten().map(|p| view! {
                 <details class="text-xs">

@@ -801,7 +801,7 @@ fn Apps() -> impl IntoView {
             <h2 class="font-medium">"Packages"</h2>
             <p class="text-sm text-zinc-500">"Everything you install is a package: an app (it owns data: collections, triggers, settings), a library (configuration that owns nothing), or a kit (software that workers build and run in a sandbox, with tools for agents). An app or library is installed in a realm you choose, as an instance with a name; one package can be installed many times. Its code is its package's and changes only by upgrading (or switching to a fork); what it owns is written only by it. Installing asks you once for everything it and what it requires need. The registry below is local to this head."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {move || note.get().map(|n| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&n)></div> })}
+            {move || note.get().map(|n| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&n)></div> })}
             <h3 class="text-sm font-medium">"Installed"</h3>
             {move || installed.get().and_then(Result::ok).map(|list| {
                 if list.is_empty() {

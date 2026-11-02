@@ -684,7 +684,7 @@ fn ThingKnowledge(label: String) -> impl IntoView {
             let (current, old): (Vec<_>, Vec<_>) = facts.into_iter().partition(|f| f.valid_to.is_none());
             view! {
                 <h3 class="text-xs font-medium uppercase text-zinc-500">"What sessions learned"</h3>
-                {(!page.is_empty()).then(|| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" inner_html=crate::markdown::to_html(&page)></div> })}
+                {(!page.is_empty()).then(|| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&page)></div> })}
                 <ul class="space-y-2">
                     {current.into_iter().map(|f| view! { <crate::decisions::FactRow f on_change=Callback::new(move |()| tick.update(|t| *t += 1)) /> }).collect_view()}
                 </ul>

@@ -114,7 +114,7 @@ fn FileViewer(worker_id: String, path: String) -> impl IntoView {
                         view! {
                             {truncated.then(|| view! { <p class="text-xs text-amber-600">"Showing the first 2 MB."</p> })}
                             {move || if rendered.get() {
-                                view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" inner_html=crate::markdown::to_html(&text)></div> }.into_any()
+                                view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&text)></div> }.into_any()
                             } else {
                                 view! { <CodeView text=text.clone() /> }.into_any()
                             }}

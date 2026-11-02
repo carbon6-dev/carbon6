@@ -1405,7 +1405,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             {move || (has_thinking.get() || has_text.get()).then(|| view! {
                 <div class="space-y-2">
                     {move || has_thinking.get().then(|| view! { <Thinking text=stream_thinking open=true /> })}
-                    {move || has_text.get().then(|| view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=move || markdown::to_html(&stream_text.get())></div> })}
+                    {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::to_html(&stream_text.get())></div> })}
                 </div>
             })}
             // Through the whole turn, so the end of the page doesn't come and
@@ -2504,7 +2504,7 @@ fn render_event(
                         ContentBlock::ServerTool { label } => view! {
                             <p class="flex items-center gap-2 text-xs text-zinc-500"><span>"⌕"</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
-                        ContentBlock::Text { text } => view! { <div class="md" on:click={ let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace()); move |ev| crate::docs::follow_link(&ev, col, ws) } inner_html=markdown::to_html(text)></div> }.into_any(),
+                        ContentBlock::Text { text } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::to_html(text)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
                             // Memos: a card redraws for its own result and output, not
@@ -2553,7 +2553,7 @@ fn render_event(
                 <summary class="cursor-pointer select-none">
                     {format!("Context compacted ({} tokens summarized); the model continues from this summary", tokens(*tokens_before))}
                 </summary>
-                <div class="md mt-2 text-zinc-700 dark:text-zinc-300" inner_html=markdown::to_html(summary)></div>
+                <div class="md mt-2 text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=markdown::to_html(summary)></div>
             </details>
         }
         .into_any(),

@@ -121,7 +121,7 @@ impl Shape {
     }
 
     /// Its size and outline as CSS, for a glyph `px` high.
-    fn css(self, px: u32) -> String {
+    pub fn css(self, px: u32) -> String {
         let (w, clip, radius) = match self {
             Shape::Circle => (px, "", "9999px"),
             Shape::Square => (px, "", "2px"),
