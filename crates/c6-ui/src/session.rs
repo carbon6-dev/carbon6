@@ -3376,7 +3376,7 @@ fn subagent_state(running: bool, end: Option<TurnEndReason>) -> (&'static str, &
     match (running, end) {
         (true, _) => ("● running", "text-blue-600 dark:text-blue-400"),
         (false, Some(TurnEndReason::Completed)) => ("✓ done", "text-emerald-700 dark:text-emerald-400"),
-        (false, Some(TurnEndReason::Interrupted)) => ("⏸ interrupted", "text-amber-700 dark:text-amber-400"),
+        (false, Some(TurnEndReason::Interrupted)) => ("interrupted", "text-amber-700 dark:text-amber-400"),
         (false, Some(TurnEndReason::WorkerRestarted)) => ("⚠ lost", "text-amber-700 dark:text-amber-400"),
         (false, Some(_)) => ("✕ failed", "text-red-600 dark:text-red-400"),
         (false, None) => ("○ starting", "text-muted"),
@@ -4158,7 +4158,7 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
                                     if let Err(e) = api::send_queued_now(id, cid).await { error.set(Some(e)); }
                                     busy.set(false);
                                 });
-                            }>"⏵ Send now"</button>
+                            }>"Send now"</button>
                     </span>
                 }.into_any(),
                 None => view! {
