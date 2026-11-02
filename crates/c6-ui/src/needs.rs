@@ -13,15 +13,12 @@ use crate::place::{self, Place};
 use crate::util::now_ms;
 use crate::workspace::{How, View, use_workspace};
 
-/// What the pill's number starts with (none for now; "@", say).
-const PREFIX: &str = "";
-
 /// How long a ping from the live feed waits for more before it loads.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// The pill's text: its prefix and the number, if there is one.
+/// The pill's number, if there is one (beside its bell).
 fn pill(n: usize) -> String {
-    if n == 0 { PREFIX.to_owned() } else { format!("{PREFIX}{n}") }
+    if n == 0 { String::new() } else { n.to_string() }
 }
 
 /// The pill's accessible name and hover.
@@ -153,7 +150,7 @@ pub fn NeedsYou() -> impl IntoView {
     on_cleanup(move || keys.remove());
     let counts = move || shown.with(|a| (a.waiting.len(), a.worth.len()));
     let pill_class = move || {
-        let base = "inline-flex h-5 min-w-6 items-center justify-center rounded-full px-1.5 text-[11px] font-semibold";
+        let base = "inline-flex h-5 items-center justify-center gap-0.5 rounded-full px-1.5 text-[11px] font-semibold";
         match counts() {
             (w, _) if w > 0 => format!("{base} bg-amber-500 text-white"),
             (_, l) if l > 0 => format!("{base} border border-zinc-400 text-zinc-600 dark:border-zinc-500 dark:text-zinc-300"),
@@ -177,7 +174,14 @@ pub fn NeedsYou() -> impl IntoView {
                 aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
                 aria-label=move || { let (w, l) = counts(); label(w, l) } title=move || { let (w, l) = counts(); label(w, l) }
                 on:click=move |_| open.update(|o| *o = !*o)>
-                <span class=pill_class>{number}</span>
+                // A small bell, tight against its number.
+                <span class=pill_class>
+                    <svg viewBox="0 0 12 12" class="h-2.5 w-2.5 shrink-0" fill="currentColor" aria-hidden="true">
+                        <path d="M2 9h8l-1.4-2V5a2.6 2.6 0 0 0-5.2 0v2z" />
+                        <circle cx="6" cy="10.4" r="1.1" />
+                    </svg>
+                    {number}
+                </span>
             </button>
             <Show when=move || open.get()>
                 // A click outside closes it (on a phone the page dims).
@@ -305,8 +309,8 @@ mod tests {
         assert_eq!(label(3, 0), "What needs you: 3 waiting");
         assert_eq!(label(0, 2), "What needs you: 2 worth a look");
         assert_eq!(label(0, 0), "What needs you: nothing");
-        assert_eq!(pill(0), PREFIX);
-        assert_eq!(pill(4), format!("{PREFIX}4"));
+        assert_eq!(pill(0), "");
+        assert_eq!(pill(4), "4");
     }
 
     #[test]
