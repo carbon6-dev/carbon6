@@ -686,6 +686,8 @@ pub(crate) mod tests {
             exit_code,
             elapsed_ms: 10,
             notify: true,
+            native_type: String::new(),
+            foreground: false,
         }
     }
 
