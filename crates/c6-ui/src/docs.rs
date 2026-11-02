@@ -1102,7 +1102,7 @@ fn BlockView(
         );
     };
     view! {
-        <div class="group relative rounded px-2 py-0.5 hover:bg-zinc-50 dark:hover:bg-zinc-900/60" title=hover data-block=b.id.clone()>
+        <div class="group relative rounded py-0.5 pl-2 pr-8 hover:bg-zinc-50 dark:hover:bg-zinc-900/60" title=hover data-block=b.id.clone()>
             {move || match edit.get().filter(|e| e.id == bid.get_value()) {
                 Some(_) => {
                     view! {
@@ -1125,11 +1125,15 @@ fn BlockView(
             {move || chip_ctx.and_then(|c| c.editing.get().filter(|(b, _, _)| *b == bid.get_value() || block.get_value().children.iter().any(|x| x.id == *b)).map(|(b, k, v)| view! {
                 <ChipEditor block=b key=k value=v ctx=c />
             }))}
-            // Flush against the block's right edge: with a gap between them,
-            // the pointer left the block on its way and the button hid.
-            <button class="invisible absolute left-full top-0 px-1.5 py-0.5 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
+            // Inside the block, in its right padding: outside it, the
+            // pointer left the block on its way and the button hid, and at
+            // the panel's edge it sat over the scrollbar.
+            <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
                 on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
         </div>
+        {move || (commenting.get() == Some(bid.get_value())).then(|| view! {
+            <NewComment doc=doc_id block=bid.get_value() commenting posted=reload />
+        })}
     }
 }
 
@@ -1194,29 +1198,7 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
             shown.set(t);
         }
     });
-    let error = RwSignal::new(None::<String>);
-    let (quote, text, to_agent) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(false));
     let show_resolved = RwSignal::new(false);
-    let post = move || {
-        let Some(block) = commenting.get_untracked() else { return };
-        let t = c6_api::docs::ThreadNew {
-            anchor: c6_api::docs::Anchor { block, quote: quote.get_untracked(), tab: String::new() },
-            text: text.get_untracked(),
-            to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
-        };
-        spawn_local(async move {
-            match api::doc_thread_new(id.get_value(), &t).await {
-                Ok(_) => {
-                    commenting.set(None);
-                    quote.set(String::new());
-                    text.set(String::new());
-                    error.set(None);
-                    tick.update(|t| *t += 1);
-                }
-                Err(e) => error.set(Some(e)),
-            }
-        });
-    };
     view! {
         <section class="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
             <div class="flex items-center gap-2">
@@ -1227,28 +1209,66 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
                     "Resolved"
                 </label>
             </div>
-            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {move || commenting.get().map(|b| view! {
-                <div class="space-y-1 rounded-md border border-violet-300 p-2 dark:border-violet-800">
-                    <div class="text-xs text-zinc-500">{if b.is_empty() { "On the whole tab".to_owned() } else { format!("On block {b}") }}</div>
-                    {(!b.is_empty()).then(|| view! {
-                        <input class=INPUT placeholder="A few of its words to point at (optional)" prop:value=move || quote.get() on:input=move |ev| quote.set(event_target_value(&ev)) />
-                    })}
-                    <textarea class=format!("{INPUT} min-h-[3rem]") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
-                    <div class="flex items-center gap-2">
-                        <label class="flex flex-1 items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400"
-                            title="The session that last wrote it gets the thread if it's idle; else a new one starts from the document's work or project">
-                            <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />
-                            "Send it to an agent"
-                        </label>
-                        <button class=BUTTON_QUIET on:click=move |_| commenting.set(None)>"Cancel"</button>
-                        <button class=BUTTON on:click=move |_| post()>"Comment"</button>
-                    </div>
-                </div>
+            // A comment on the whole tab is written here; one on a block,
+            // under that block (BlockView).
+            {move || (commenting.get().as_deref() == Some("")).then(|| view! {
+                <NewComment doc=id block=String::new() commenting posted=Callback::new(move |()| tick.update(|t| *t += 1)) />
             })}
             {move || shown.get().into_iter().filter(|t| show_resolved.get() || t.state == "open").map(|t| view! { <Thread t doc=id.get_value() tick /> }).collect_view()}
             {move || shown.get().iter().all(|t| t.state != "open").then(|| view! { <p class="text-sm text-zinc-500">"No open comments. Hover a block and press 💬 to start one."</p> })}
         </section>
+    }
+}
+
+/// Writing a new comment: on a block (`block`, shown just under it, so the
+/// page stays where you were) or on the whole tab (`block` empty).
+#[component]
+fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Option<String>>, posted: Callback<()>) -> impl IntoView {
+    let error = RwSignal::new(None::<String>);
+    let (quote, text, to_agent) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(false));
+    let on_block = !block.is_empty();
+    let block = StoredValue::new(block);
+    let writing = NodeRef::<leptos::html::Textarea>::new();
+    Effect::new(move || {
+        if let Some(el) = writing.get() {
+            let _ = el.focus();
+        }
+    });
+    let post = move || {
+        let t = c6_api::docs::ThreadNew {
+            anchor: c6_api::docs::Anchor { block: block.get_value(), quote: quote.get_untracked(), tab: String::new() },
+            text: text.get_untracked(),
+            to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
+        };
+        spawn_local(async move {
+            match api::doc_thread_new(doc.get_value(), &t).await {
+                Ok(_) => {
+                    commenting.set(None);
+                    posted.run(());
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    view! {
+        <div class="my-1 space-y-1 rounded-md border border-violet-300 p-2 dark:border-violet-800">
+            <div class="text-xs text-zinc-500">{if on_block { "Comment on this block" } else { "Comment on the whole tab" }}</div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {on_block.then(|| view! {
+                <input class=INPUT placeholder="A few of its words to point at (optional)" prop:value=move || quote.get() on:input=move |ev| quote.set(event_target_value(&ev)) />
+            })}
+            <textarea node_ref=writing class=format!("{INPUT} min-h-[3rem]") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
+                on:keydown=move |ev| if ev.key() == "Escape" { commenting.set(None) } else if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { post() } />
+            <div class="flex items-center gap-2">
+                <label class="flex flex-1 items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400"
+                    title="The session that last wrote it gets the thread if it's idle; else a new one starts from the document's work or project">
+                    <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />
+                    "Send it to an agent"
+                </label>
+                <button class=BUTTON_QUIET on:click=move |_| commenting.set(None)>"Cancel"</button>
+                <button class=BUTTON on:click=move |_| post()>"Comment"</button>
+            </div>
+        </div>
     }
 }
 
