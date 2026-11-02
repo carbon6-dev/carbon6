@@ -161,8 +161,9 @@ knowledge_record and re-checks with knowledge_verify; never stop to ask the user
 pub const SUGGEST: &str = "You suggest the user's next message to a coding agent, so they can accept it with one key instead of typing it. \
 Here is the end of their conversation (session \"{{title}}\"; labels: {{labels}}):\n\n{{exchanges}}\n\n\
 Reply with only the message the user is most likely to send next: one short line, in their voice, as they would type it (\"run the \
-tests again\", \"commit this\", \"yes, use eu-west\"). If the agent asked them something, answer it the way they most likely would. \
-If there is no clear next step, reply with a single -";
+tests again\", \"commit this\", \"yes, use eu-west\"). If the agent's last message asks them something or offers to do something \
+(\"Want me to deploy?\", \"Should I build it?\"), reply with the short answer they would most likely give (\"yes, deploy\", \"go ahead\"). \
+Reply with a single - only when there is no question, offer or obvious follow-up.";
 
 /// When an agent proposes a task card (docs/task-cards.md).
 pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \

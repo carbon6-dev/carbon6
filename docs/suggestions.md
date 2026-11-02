@@ -35,7 +35,7 @@ Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes
   - `{{title}}`, `{{labels}}`;
   - `{{exchanges}}`.
 
-  The default asks for one short line in the user's voice, or `-` when there's no clear next step. Then nothing is shown.
+  The default asks for one short line in the user's voice; when the agent's last message asks something or offers to do something, the likely short answer ("yes, deploy"); and `-` only when there's no question, offer or obvious follow-up. Then nothing is shown.
 - **Model.**
   1. The model-routing rule that applies to the session's labels plus `task:suggest`, in the session's realm (then root's), whose connection that realm may use (a rule naming another realm's connection is passed over). Add one to send suggestions to a small, fast model; for one realm only, add it in the console under Settings → Model routing → Rules for <realm>.
   2. Without such a rule, the session's own connection and model.
