@@ -166,19 +166,6 @@ pub fn running(events: &[Event]) -> Vec<String> {
     lifecycle(events).into_iter().filter(Task::running).map(|t| t.description).collect()
 }
 
-/// The tasks that need a look, for a session's glance: those running and
-/// those that ended badly, as (id, what it is, failed, when it started).
-pub fn needs_look(events: &[Event]) -> Vec<(String, String, bool, i64)> {
-    lifecycle(events)
-        .into_iter()
-        .filter(|t| t.running() || t.failed())
-        .map(|t| {
-            let failed = t.failed();
-            (t.id, t.description, failed, t.since)
-        })
-        .collect()
-}
-
 /// The last few tasks that failed or were stopped, beside those running.
 const RECENT: usize = 3;
 
@@ -250,22 +237,6 @@ pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoV
                 {inspector(session, list, selected)}
             </div>
         </Show>
-    }
-}
-
-/// One task as the list shows it (Inspect, and Stop while it runs), from
-/// a session's glance.
-#[component]
-pub fn TaskCard(session: String, events: RwSignal<Vec<Event>>, id: String) -> impl IntoView {
-    let session = StoredValue::new(session);
-    let list = Memo::new(move |_| events.with(|e| lifecycle(e).into_iter().filter(|t| t.id == id).collect::<Vec<_>>()));
-    let selected = RwSignal::new(None::<String>);
-    let error = RwSignal::new(None::<String>);
-    view! {
-        <div class="space-y-2 text-xs">
-            {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
-        </div>
-        {inspector(session, list, selected)}
     }
 }
 
@@ -596,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_needs_a_look_while_it_runs_or_once_it_ended_badly() {
+    fn a_task_ended_badly_when_it_failed_was_lost_or_exited_non_zero() {
         let with = |task: &str, state: &str, kind: &str, exit: i32| {
             let mut e = event(1, task, state);
             if let EventKind::BackgroundTask { kind: k, exit_code, .. } = &mut e.kind {
@@ -615,9 +586,8 @@ mod tests {
             with("broke", "failed", "shell", 0),
             with("mine", "stopped_by_user", "shell", 0),
         ];
-        let looks = needs_look(&evs);
-        let ids: Vec<(&str, bool)> = looks.iter().map(|(id, _, failed, _)| (id.as_str(), *failed)).collect();
-        assert_eq!(ids, [("build", false), ("tests", true), ("agent", true), ("gone", true), ("broke", true)]);
+        let failed: Vec<String> = lifecycle(&evs).into_iter().filter(Task::failed).map(|t| t.id).collect();
+        assert_eq!(failed, ["tests", "agent", "gone", "broke"]);
     }
 
     #[test]

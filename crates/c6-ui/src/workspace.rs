@@ -1884,12 +1884,19 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
                 {move || session.get().map(|s| {
                     let (dot, label) = status_dot(&s);
+                    // A click goes to what waits on you, else what runs in
+                    // the background, else the glance. On a phone, the dot
+                    // alone (the word for screen readers).
                     view! {
-                        // On a phone, the dot alone (the word for screen readers).
-                        <span class="flex shrink-0 items-center gap-1 pr-1 text-[11px] text-soft" title=label>
+                        <button class="flex h-7 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-soft outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:min-w-10 pointer-coarse:justify-center pointer-fine:hover:bg-black/10 dark:pointer-fine:hover:bg-white/10"
+                            title=move || match chrome() {
+                                Some(c) => format!("{label} · {}", c.status_title()),
+                                None => label.to_owned(),
+                            }
+                            on:click=move |ev| if let Some(c) = chrome() { c.status_click(&ev) }>
                             <span class=format!("size-1.5 rounded-full {dot}")></span>
                             <span class="max-sm:sr-only">{label}</span>
-                        </span>
+                        </button>
                     }
                 })}
                 // What runs in it, its panes, then its actions.

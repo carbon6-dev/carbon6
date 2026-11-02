@@ -1,11 +1,11 @@
 //! A session's glance and its details. The glance: where it runs, its
 //! worktree, branch and changes, its work and labels, how full its context
-//! is, what needs a look and its newest outputs, a line each; a column
+//! is, what waits on you and its newest outputs, a line each; a column
 //! beside the transcript when the session's column is wide, else opened
 //! from the context ring in its tile's bar. Its details (⋯ → Session
 //! details…): what it has used, and what applies to it.
 
-use c6_api::{Event, EventKind, SessionStatus};
+use c6_api::{Event, EventKind};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -62,24 +62,6 @@ fn short_path(path: &str) -> String {
     }
 }
 
-/// A task or subagent that needs a look: running, or ended badly.
-#[derive(Clone, PartialEq)]
-struct Look {
-    task: bool,
-    id: String,
-    what: String,
-    failed: bool,
-    /// When it started.
-    at: i64,
-}
-
-/// Failures first, then the newest; three at most.
-fn pick_looks(mut looks: Vec<Look>) -> Vec<Look> {
-    looks.sort_by_key(|l| (!l.failed, std::cmp::Reverse(l.at)));
-    looks.truncate(3);
-    looks
-}
-
 /// The glance: read-only, a line each; a line acts where you would
 /// (Changes opens the Changes pane, Work and Labels their editors, Context
 /// its breakdown…). `on_done`: after something it opened elsewhere (the
@@ -87,7 +69,7 @@ fn pick_looks(mut looks: Vec<Look>) -> Vec<Look> {
 #[component]
 pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Callback<()>>) -> impl IntoView {
     let live = api::live();
-    let SessionChrome { id, detail, events, usage, started, model_label, connection, git, subagents, running, col, .. } = chrome;
+    let SessionChrome { id, detail, events, usage, started, model_label, connection, git, running, col, .. } = chrome;
     // Its row in the live list (labels and work as they change), else as
     // loaded.
     let session = Memo::new(move |_| {
@@ -245,48 +227,23 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         })
     };
 
-    // What needs a look: tasks and subagents running, or ended badly.
-    let task_at = RwSignal::new(None::<(f64, f64)>);
-    let task = RwSignal::new(None::<String>);
-    let looks = Memo::new(move |_| {
-        let tasks = events.with(|e| crate::tasks::needs_look(e));
-        let mut out: Vec<Look> = tasks.into_iter().map(|(id, what, failed, at)| Look { task: true, id, what, failed, at }).collect();
-        out.extend(subagents.rows().into_iter().filter_map(|(s, _)| {
-            let running = s.status == SessionStatus::Running;
-            let failed = !running && crate::session::subagent_failed(&s);
-            (running || failed).then_some(Look { task: false, id: s.id, what: s.title, failed, at: s.created_at })
-        }));
-        pick_looks(out)
-    });
-    let needs_look = move || {
-        let list = looks.get();
+    // What waits on you (an approval, a question), each going to its card.
+    let waiting = move || {
+        let list = chrome.waiting.get();
         (!list.is_empty()).then(|| {
             view! {
-                <div class=HEADING>"Needs a look"</div>
-                {list.into_iter().map(|look| {
-                    let Look { task: is_task, id: lid, what, failed, .. } = look;
-                    let dot = if failed { "bg-red-500" } else { "animate-pulse bg-blue-500" };
-                    let state = match (is_task, failed) {
-                        (true, true) => "task failed",
-                        (true, false) => "task running",
-                        (false, true) => "subagent failed",
-                        (false, false) => "subagent running",
-                    };
+                <div class=HEADING>"Waiting on you"</div>
+                {list.into_iter().map(|w| {
+                    let seq = w.seq;
                     view! {
-                        <button class=format!("{LINE} {ACTS}") title=what.clone()
-                            on:click=move |ev| if is_task {
-                                task.set(Some(lid.clone()));
-                                task_at.set(Some(below(&ev, 384.0)));
-                            } else {
-                                subagents.go(lid.clone());
-                                done();
-                            }>
-                            <span class=format!("size-1.5 shrink-0 self-center rounded-full {dot}")></span>
-                            <span class="line-clamp-2 min-w-0 flex-1 [overflow-wrap:anywhere]">{what.clone()}</span>
-                            <span class=format!("shrink-0 text-[11px] {}", if failed { "text-red-600 dark:text-red-400" } else { "text-muted" })>{state}</span>
+                        <button class=format!("{LINE} {ACTS}") title="Go to it in the transcript"
+                            on:click=move |_| { chrome.go_waiting(seq); done(); }>
+                            <span class="size-1.5 shrink-0 self-center rounded-full bg-amber-500"></span>
+                            <span class="line-clamp-2 min-w-0 flex-1 text-amber-800 [overflow-wrap:anywhere] dark:text-amber-300">{w.what.clone()}</span>
                         </button>
                     }
                 }).collect_view()}
+                <div class="h-1"></div>
             }
         })
     };
@@ -304,6 +261,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
 
     view! {
         <div class="space-y-px">
+            {waiting}
             {runs_on}
             {place}
             {branch}
@@ -311,7 +269,6 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
             {work}
             {labels}
             {context}
-            {needs_look}
             <Show when=move || published.get()>
                 <div class=HEADING>"Newest outputs"</div>
                 <crate::outputs::Recent events on_pick=show_output />
@@ -337,9 +294,6 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
             <Context session=id.get_value() events usage running />
             <h3 class="pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">"Usage"</h3>
             <Usage usage />
-        </Popover>
-        <Popover at=task_at class="w-96 max-w-[calc(100vw-1rem)]">
-            {move || task.get().map(|t| view! { <crate::tasks::TaskCard session=id.get_value() events id=t /> })}
         </Popover>
     }
 }
@@ -460,22 +414,6 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn look(id: &str, failed: bool, at: i64) -> Look {
-        Look { task: true, id: id.into(), what: id.into(), failed, at }
-    }
-
-    #[test]
-    fn failures_come_first_then_the_newest_three() {
-        let picked = pick_looks(vec![
-            look("old run", false, 1),
-            look("old fail", true, 2),
-            look("new run", false, 9),
-            look("new fail", true, 5),
-            look("mid run", false, 4),
-        ]);
-        assert_eq!(picked.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["new fail", "old fail", "new run"]);
-    }
 
     #[test]
     fn a_folder_is_shortened_to_its_last_two_parts() {

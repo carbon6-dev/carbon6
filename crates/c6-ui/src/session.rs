@@ -609,6 +609,15 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let git = crate::details::git_state(git_at, events);
     let meta_root = StoredValue::new(root.clone());
     let subagents = SubagentTree::new(id_stored, detail, events, force_open, meta_root);
+    // What waits on you in it: approvals (while its row says it waits;
+    // a subagent's isn't in the live list) and questions.
+    let waiting = {
+        let id = id.clone();
+        Memo::new(move |_| {
+            let asks = live.sessions.with(|ss| ss.iter().find(|s| s.id == id).is_none_or(|s| s.awaiting_approval));
+            events.with(|evs| waiting_on_you(evs)).into_iter().filter(|w| asks || !w.approval).collect::<Vec<_>>()
+        })
+    };
     // What runs in its background now: subagents and tasks (servers too),
     // a line each.
     let busy = Memo::new(move |_| {
@@ -720,6 +729,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         subagents,
         running: Signal::derive(running),
         busy,
+        waiting,
+        root: meta_root,
         wide,
         glance_at,
         sheet,
@@ -1068,6 +1079,10 @@ pub struct SessionChrome {
     pub(crate) running: Signal<bool>,
     /// The background tasks and subagents that run now, a line each.
     busy: Memo<Vec<String>>,
+    /// What waits on you in it (approvals, questions), oldest first.
+    pub(crate) waiting: Memo<Vec<Waiting>>,
+    /// Its pane's root, where its transcript's events are found.
+    root: StoredValue<String>,
     /// The glance is a column beside the transcript.
     wide: RwSignal<bool>,
     /// The glance as a popover, while open.
@@ -1145,6 +1160,38 @@ impl SessionChrome {
     fn close_glance(&self) {
         self.glance_at.set(None);
         self.sheet.set(false);
+    }
+
+    /// Goes to what waits on you in the transcript (an approval's or a
+    /// question's card).
+    pub(crate) fn go_waiting(&self, seq: u64) {
+        reveal_when_rendered(self.root.get_value(), format!("{}-e{seq}", self.id.get_value()), "[]".into(), 0);
+    }
+
+    /// What a click on its state in the tile's bar does: to what waits on
+    /// you, else what runs in its background, else the glance (where it
+    /// isn't a column).
+    pub(crate) fn status_title(&self) -> &'static str {
+        if !self.waiting.with(Vec::is_empty) {
+            "Go to what waits on you"
+        } else if !self.busy.with(Vec::is_empty) {
+            "What runs in the background"
+        } else if self.wide.get() {
+            "Its own turn's state"
+        } else {
+            "The glance (⌘I)"
+        }
+    }
+
+    /// A click on its state in the tile's bar (see [`Self::status_title`]).
+    pub(crate) fn status_click(&self, ev: &web_sys::MouseEvent) {
+        if let Some(w) = self.waiting.with_untracked(|w| w.first().cloned()) {
+            self.go_waiting(w.seq);
+        } else if !self.busy.with_untracked(Vec::is_empty) {
+            self.toggle_background(ev);
+        } else {
+            self.toggle_glance(ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()));
+        }
     }
 
     /// Opens or closes what runs in its background (◌ N): under what was
@@ -2040,6 +2087,48 @@ fn Transcript(
             <crate::tasks::RunningTasks session=id.get_value() events />
         </div>
     }
+}
+
+/// Something in a session that waits on you: an approval or a question, in
+/// a line ("approval: cargo publish"), and the event whose card shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Waiting {
+    pub(crate) seq: u64,
+    pub(crate) what: String,
+    approval: bool,
+}
+
+/// What waits on you in a session's log: tool calls held for approval with
+/// no decision or result yet, and questions not answered or cancelled.
+fn waiting_on_you(evs: &[Event]) -> Vec<Waiting> {
+    let decided = decided_calls(evs);
+    let done: std::collections::HashSet<&str> = evs
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            EventKind::Question { call_id, state, .. } if state != "asked" => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let line = |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().chars().take(80).collect::<String>();
+    evs.iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Approval { call_id, state, tool, input, .. }
+                if state == "requested" && !decided.contains(call_id) && !done.contains(call_id.as_str()) =>
+            {
+                let parsed = serde_json::from_str::<serde_json::Value>(input).unwrap_or(serde_json::Value::Null);
+                let what = match parsed["command"].as_str() {
+                    Some(c) => c.to_owned(),
+                    None => Some(summarize(tool, &parsed)).filter(|s| !s.is_empty()).unwrap_or_else(|| tool_label(tool).0),
+                };
+                Some(Waiting { seq: e.seq, what: format!("approval: {}", line(&what)), approval: true })
+            }
+            EventKind::Question { call_id, title, state, .. } if state == "asked" && !done.contains(call_id.as_str()) => {
+                Some(Waiting { seq: e.seq, what: format!("question: {}", line(title)), approval: false })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// The notices no turn has taken (docs/background.md §5): from a session
@@ -5173,6 +5262,47 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_waits_on_you_is_an_open_approval_or_question() {
+        let approval = |seq: u64, call: &str, state: &str| Event {
+            seq,
+            ts: 0,
+            kind: EventKind::Approval {
+                call_id: call.into(),
+                state: state.into(),
+                tool: "bash".into(),
+                input: r#"{"command":"cargo publish\n--dry-run"}"#.into(),
+                policy: "ask".into(),
+                message: String::new(),
+            },
+        };
+        let question = |seq: u64, call: &str, state: &str| Event {
+            seq,
+            ts: 0,
+            kind: EventKind::Question {
+                call_id: call.into(),
+                title: "Which branch?".into(),
+                fields: Vec::new(),
+                state: state.into(),
+                answer: serde_json::Value::Null,
+            },
+        };
+        let evs = [
+            approval(1, "a1", "requested"),
+            question(2, "q1", "asked"),
+            approval(3, "a2", "requested"),
+            approval(4, "a2", "allowed"),
+            question(5, "q2", "asked"),
+            question(6, "q2", "answered"),
+        ];
+        let w = waiting_on_you(&evs);
+        assert_eq!(
+            w.iter().map(|w| (w.seq, w.what.as_str())).collect::<Vec<_>>(),
+            [(1, "approval: cargo publish"), (2, "question: Which branch?")]
+        );
+        assert!(w[0].approval && !w[1].approval);
+    }
 
     /// Text streamed for a turn the log says ended is already in its
     /// messages: shown again, it doubles the reply, then stands in for the
