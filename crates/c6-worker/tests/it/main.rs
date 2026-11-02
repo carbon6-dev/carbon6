@@ -10,6 +10,7 @@ mod ask;
 mod assistant;
 mod attach;
 mod attachments;
+mod attention;
 mod automations;
 mod background;
 mod cards;
