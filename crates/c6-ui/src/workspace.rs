@@ -560,6 +560,23 @@ impl Layout {
         }
     }
 
+    /// Moves tile `key` one place earlier (`by` < 0) or later in reading
+    /// order among the tiles shown, trading places with that neighbour (its
+    /// column and its place in it); the focus stays on its tile.
+    fn step_tile(&mut self, key: u64, by: isize) {
+        let order: Vec<usize> = self.reading_order().into_iter().filter(|&i| !self.tiles[i].minimized).collect();
+        let Some(at) = order.iter().position(|&i| self.tiles[i].key == key) else { return };
+        let Some(&j) = at.checked_add_signed(by.signum()).and_then(|n| order.get(n)) else { return };
+        let (i, focused) = (order[at], self.tiles.get(self.focus).map(|t| t.key));
+        self.tiles.swap(i, j);
+        let stack = self.tiles[i].stack;
+        self.tiles[i].stack = self.tiles[j].stack;
+        self.tiles[j].stack = stack;
+        if let Some(f) = focused.and_then(|k| self.tiles.iter().position(|t| t.key == k)) {
+            self.focus = f;
+        }
+    }
+
     fn touch(&mut self, ti: usize) {
         let k = self.key();
         if let Some(t) = self.tiles.get_mut(ti) {
@@ -1000,6 +1017,13 @@ impl Workspace {
     /// Moves a dragged tile to where it was dropped.
     pub fn move_tile(&self, key: u64, to: Drop) {
         self.layout.update(|l| l.move_tile(key, to));
+    }
+
+    /// Moves a tile one place left (`by` < 0) or right among the tiles
+    /// shown, in reading order (a phone's tab dragged; from a timer too,
+    /// so it may come after the page let go).
+    pub fn step_tile(&self, key: u64, by: isize) {
+        let _ = self.layout.try_update(|l| l.step_tile(key, by));
     }
 
     pub fn new_tile(&self) {
@@ -1906,6 +1930,28 @@ mod tests {
         assert_eq!(l.reading_order(), [1, 0, 2], "left column first, then top to bottom");
         l.minimize(0);
         assert_eq!(l.reading_order(), [1, 0, 2], "a minimized tile keeps its number");
+    }
+
+    #[test]
+    fn a_tile_steps_left_and_right_among_those_shown() {
+        let mut l = opened(5); // the fifth stacks under the first
+        let keys: Vec<u64> = l.tiles.iter().map(|t| t.key).collect();
+        let order = |l: &Layout| l.reading_order().into_iter().map(|i| l.tiles[i].key).collect::<Vec<_>>();
+        assert_eq!(order(&l), [keys[0], keys[4], keys[1], keys[2], keys[3]]);
+        l.focus = 2;
+        l.step_tile(keys[1], -1);
+        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "it trades places with the one before");
+        assert_eq!(l.tile(keys[1]).unwrap().stack, Some(0), "into that one's column");
+        assert_eq!(l.tile(keys[4]).unwrap().stack, Some(1));
+        assert_eq!(l.tiles[l.focus].key, keys[2], "the focus stays on its tile");
+        l.step_tile(keys[0], -1);
+        l.step_tile(keys[3], 1);
+        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "the ends stay");
+        // A minimized tile is stepped over.
+        let i = l.tiles.iter().position(|t| t.key == keys[4]).unwrap();
+        l.minimize(i);
+        l.step_tile(keys[2], -1);
+        assert_eq!(order(&l), [keys[0], keys[2], keys[4], keys[1], keys[3]]);
     }
 
     #[test]
