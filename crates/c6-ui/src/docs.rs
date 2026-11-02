@@ -1353,6 +1353,7 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
             let _ = el.focus();
         }
     });
+    crate::util::autosize(writing, move || text.track());
     let post = move || {
         let (said, quoted) = (text.get_untracked(), quote.get_untracked());
         let t = c6_api::docs::ThreadNew {
@@ -1393,14 +1394,12 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
             {on_block.then(|| view! {
                 <input class=INPUT placeholder="A few of its words to point at (optional)" prop:value=move || quote.get() on:input=move |ev| quote.set(event_target_value(&ev)) />
             })}
-            <textarea node_ref=writing class=format!("{INPUT} min-h-[3rem]") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
-                on:keydown=move |ev| if ev.key() == "Escape" { commenting.set(None) } else if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { post() } />
+            <textarea node_ref=writing rows="1" class=format!("{INPUT} {COMMENT_GROWS}") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
+                on:keydown=move |ev| if ev.key() == "Escape" { commenting.set(None) } else if crate::util::sends(&ev) { ev.prevent_default(); post() } />
             <div class="flex items-center gap-2">
-                <label class="flex flex-1 items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400"
-                    title="The session that last wrote it gets the thread if it's idle; else a new one starts from the document's work or project">
-                    <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />
-                    "Send it to an agent"
-                </label>
+                <div class="flex-1">
+                    <AgentSwitch on=to_agent title="The session that last wrote it gets the thread (queued if busy), else the newest one of the document's work or project" />
+                </div>
                 <button class=BUTTON_QUIET on:click=move |_| commenting.set(None)>"Cancel"</button>
                 <button class=BUTTON on:click=move |_| post()>"Comment"</button>
             </div>
@@ -1408,44 +1407,115 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
     }
 }
 
-/// The agent a thread was sent to, live: working on it, or yet to start,
-/// while the thread waits on it; else just who has it. Linked.
+/// A comment box: one line, growing with its text to about eight, then
+/// scrolling.
+const COMMENT_GROWS: &str = "block max-h-44 resize-none overflow-y-auto";
+
+/// "Send to agent", as a switch: what you write goes on to an agent.
 #[component]
-fn WithAgent(session: String, waiting: bool) -> impl IntoView {
-    let live = api::live();
-    let found = {
-        let id = session.clone();
-        move || {
-            live.sessions
-                .with(|ss| ss.iter().find(|s| s.id == id).map(|s| (s.title.clone(), s.display_status() == c6_api::SessionStatus::Running)))
-        }
-    };
+fn AgentSwitch(on: RwSignal<bool>, #[prop(optional, into)] title: String) -> impl IntoView {
     view! {
-        <Go to=View::session(session) class="inline-flex min-w-0 max-w-[55%] items-center gap-1 hover:underline" stop=true>
-            {move || {
-                let (title, running) = found().unwrap_or_else(|| ("an agent".into(), false));
-                let title = if title.trim().is_empty() { "an agent".to_owned() } else { title };
-                match (waiting, running) {
-                    (true, true) => view! {
-                        <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-500"></span>
-                        <span class="truncate text-sky-700 dark:text-sky-300">{format!("{title} is working on it…")}</span>
-                    }.into_any(),
-                    (true, false) => view! { <span class="truncate">{format!("→ sent to {title} (idle)")}</span> }.into_any(),
-                    _ => view! { <span class="truncate">{format!("→ {title}")}</span> }.into_any(),
-                }
-            }}
-        </Go>
+        <button type="button" role="switch" aria-checked=move || on.get().to_string() title=title
+            class="inline-flex items-center gap-1.5 rounded text-xs text-zinc-600 dark:text-zinc-400" on:click=move |_| on.update(|v| *v = !*v)>
+            <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
+                <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
+            </span>
+            "Send to agent"
+        </button>
     }
 }
 
-/// One thread.
+/// A thread waiting on its agent, live: working on it, or yet to start.
+/// (Who the agent is shows on its comments.)
+#[component]
+fn AgentOnIt(session: String) -> impl IntoView {
+    let live = api::live();
+    let running =
+        move || live.sessions.with(|ss| ss.iter().any(|s| s.id == session && s.display_status() == c6_api::SessionStatus::Running));
+    move || {
+        if running() {
+            view! {
+                <span class="inline-flex items-center gap-1 text-sky-700 dark:text-sky-300">
+                    <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-500"></span>"agent is on it…"
+                </span>
+            }
+            .into_any()
+        } else {
+            view! { <span>"sent to the agent"</span> }.into_any()
+        }
+    }
+}
+
+/// A session's mark, kept when it has left the live list.
+fn session_mark(id: &str) -> String {
+    crate::marks::of_id(id).unwrap_or_else(|| c6_api::marks::hashed(id).to_owned())
+}
+
+/// An agent's name on its comments: its session's mark and title, short,
+/// linked to the session.
+#[component]
+fn AgentName(id: String) -> impl IntoView {
+    let live = api::live();
+    let (mid, tid) = (id.clone(), id.clone());
+    let title = move || {
+        live.sessions
+            .with(|ss| ss.iter().find(|s| s.id == tid).map(|s| s.title.clone()))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "an agent".into())
+    };
+    view! {
+        <span class="h-2 w-2 shrink-0 rounded-full" style=move || crate::marks::fill(&session_mark(&mid))></span>
+        <Go to=View::session(id) class="min-w-0 max-w-48 truncate hover:underline" stop=true>{title}</Go>
+    }
+}
+
+/// One comment: yours on the right, in sky; an agent's on the left, grey,
+/// edged in its session's colour and named by it; anyone else's on the
+/// left, plain. `under`: what goes beneath it (the edits it made).
+fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
+    let when = since(c.at).trim_end_matches(" ago").to_owned();
+    let text = c.text.clone();
+    if c.by == "you" {
+        return view! {
+            <div class="flex flex-col items-end">
+                <div class="mb-0.5 text-xs text-zinc-500">{format!("You · {when}")}</div>
+                <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-sky-100 px-3 py-1.5 text-sky-950 dark:bg-sky-900/50 dark:text-sky-50">{text}</p>
+                {under}
+            </div>
+        }
+        .into_any();
+    }
+    let session = c.by.strip_prefix("session:").map(str::to_owned);
+    let who = match session.clone() {
+        Some(id) => view! { <AgentName id /> }.into_any(),
+        None => view! { <span class="truncate">{author(&c.by)}</span> }.into_any(),
+    };
+    let edge = session.is_some();
+    view! {
+        <div class="flex flex-col items-start">
+            <div class="mb-0.5 flex max-w-full items-center gap-1 text-xs text-zinc-500">
+                {who}<span class="shrink-0">{format!("· {when}")}</span>
+            </div>
+            <p class=format!("max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800 {}", if edge { "border-l-[3px]" } else { "" })
+                style=move || session.as_deref().map(|id| format!("border-left-color:{}", crate::marks::colour_hex(&session_mark(id)))).unwrap_or_default()>
+                {text}
+            </p>
+            {under}
+        </div>
+    }
+    .into_any()
+}
+
+/// One thread: a conversation (yours on the right, an agent's on the
+/// left), the newest last, just above the box to reply.
 #[component]
 fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl IntoView {
     let (doc, tid) = (StoredValue::new(doc), StoredValue::new(t.id.clone()));
     // A draft: the thread redraws as comments come in.
     let key = StoredValue::new(format!("reply.{}.{}", doc.get_value(), tid.get_value()));
     let reply = crate::util::draft(&key.get_value());
-    let to_agent = RwSignal::new(false);
+    // With an agent already, a reply goes on to it unless you say not.
+    let to_agent = RwSignal::new(t.to_agent && !t.agent.is_empty());
     let error = RwSignal::new(None::<String>);
     let done = move |r: Result<c6_api::docs::DocThread, String>| match r {
         Ok(_) => {
@@ -1490,46 +1560,92 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
             }
         });
     };
+    let area = NodeRef::<leptos::html::Textarea>::new();
+    crate::util::autosize(area, move || reply.track());
+    // Drawn again whenever comments come in: scrolled to the newest.
+    let list = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        if list.get().is_some() {
+            request_animation_frame(move || {
+                if let Some(el) = list.try_get_untracked().flatten() {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            });
+        }
+    });
+    // The version an edit chip shows, and bringing it (or a block of it) back.
+    let showing = RwSignal::new(None::<i64>);
+    let restore = Callback::new(move |(rev, block): (i64, Option<String>)| {
+        spawn_local(async move {
+            match api::doc_restore(doc.get_value(), &DocRestore { rev, block }).await {
+                Ok(_) => {
+                    let _ = showing.try_set(None);
+                    let _ = tick.try_update(|t| *t += 1);
+                }
+                Err(e) => {
+                    let _ = error.try_set(Some(e));
+                }
+            }
+        });
+    });
+    // Which comment made which edit isn't kept: they go under the agent's
+    // newest comment (after them all if it hasn't written one).
+    let mut chips = (!t.edits.is_empty()).then(|| {
+        view! {
+            <div class="mt-1 flex flex-wrap items-center gap-1 text-xs text-zinc-500">
+                "edited"
+                {t.edits.iter().map(|&rev| view! {
+                    <button class=move || format!("rounded-full px-1.5 {}", if showing.get() == Some(rev) { "bg-sky-100 text-sky-800 dark:bg-sky-900/50 dark:text-sky-200" } else { "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700" })
+                        title=format!("The document as it was at version {rev}") on:click=move |_| showing.update(|s| *s = if *s == Some(rev) { None } else { Some(rev) })>
+                        {format!("v{rev}")}
+                    </button>
+                }).collect_view()}
+            </div>
+        }
+        .into_any()
+    });
+    let last_agent = t.comments.iter().rposition(|c| c.by.starts_with("session:"));
+    let comments =
+        t.comments.iter().enumerate().map(|(i, c)| said(c, if Some(i) == last_agent { chips.take() } else { None })).collect_view();
+    // Waiting on the agent: the last word isn't its.
+    let waiting = t.to_agent && !t.needs_you && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent));
     let unsent = t.unsent;
     let open = t.state == "open";
     view! {
-        <div class=format!("space-y-1 rounded-md border p-2 text-sm {}", if t.needs_you { "border-amber-300 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-950/20" } else { "border-zinc-200 dark:border-zinc-800" })
+        <div class=format!("space-y-2 rounded-md border border-zinc-200 p-2 text-sm dark:border-zinc-800 {}", if t.needs_you { "border-l-2 border-l-amber-500 dark:border-l-amber-500" } else { "" })
             data-thread=t.id.clone()>
             <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                 <span class="min-w-[40%] flex-1 truncate">{format!("On {}", t.about)}</span>
                 {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
-                {t.to_agent.then(|| {
-                    // Waiting on the agent: the last word isn't its.
-                    let waiting = !t.needs_you && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent));
-                    view! { <WithAgent session=t.agent.clone() waiting /> }
-                })}
-                {t.needs_you.then(|| view! { <span class="font-medium text-amber-700 dark:text-amber-300">"answered: your move"</span> })}
+                {waiting.then(|| view! { <AgentOnIt session=t.agent.clone() /> })}
                 {unsent.then(|| view! {
                     <button class="rounded border border-violet-300 px-1.5 text-violet-700 hover:bg-violet-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
-                        title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send to agent"</button>
+                        title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
                 })}
                 {(!open).then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
+                {t.needs_you.then(|| view! { <span class="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-300">"Your move"</span> })}
             </div>
-            {t.comments.iter().map(|c| view! {
-                <div><span class="font-medium">{author_named(&c.by)}</span>{format!(" · {}", since(c.at))}<p class="whitespace-pre-wrap">{c.text.clone()}</p></div>
-            }).collect_view()}
-            {(!t.edits.is_empty()).then(|| view! { <div class="text-xs text-zinc-500">{format!("Edits for it: {}", t.edits.iter().map(|r| format!("v{r}")).collect::<Vec<_>>().join(", "))}</div> })}
+            <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">
+                {comments}
+                {chips}
+            </div>
+            {move || showing.get().map(|rev| view! { <Version id=doc.get_value() rev restore /> })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            <div class="flex items-center gap-2">
-                <input class=format!("{INPUT} min-w-0 flex-1") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
-                    on:keydown=move |ev| if ev.key() == "Enter" { send() } />
+            <div class="relative">
+                <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS} pr-9") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
+                    on:keydown=move |ev| if crate::util::sends(&ev) { ev.prevent_default(); send() }></textarea>
                 // Send, as the message box's: a soft square, sky once there's text.
-                <button class=move || format!("flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md {}", if reply.with(|r| r.trim().is_empty()) { "bg-zinc-600 text-zinc-200" } else { "bg-sky-600 text-white" })
+                <button class=move || format!("absolute bottom-1.5 right-1.5 flex h-[22px] w-[22px] items-center justify-center rounded-md {}", if reply.with(|r| r.trim().is_empty()) { "bg-zinc-600 text-zinc-200" } else { "bg-sky-600 text-white" })
                     title="Send the reply (Enter)" aria-label="Send the reply" on:click=move |_| send()>
                     <svg viewBox="0 0 16 16" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" />
                     </svg>
                 </button>
-                <label class="flex items-center gap-1 text-xs text-zinc-500" title="Send the thread to an agent">
-                    <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />"agent"
-                </label>
+            </div>
+            <div class="flex items-center gap-2">
+                <div class="flex-1"><AgentSwitch on=to_agent title="Send the thread to an agent" /></div>
                 {open.then(|| view! {
-                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
+                    <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
                 })}
             </div>
         </div>
