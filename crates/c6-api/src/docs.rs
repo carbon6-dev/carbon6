@@ -654,13 +654,14 @@ pub struct ThreadNew {
     pub anchor: Anchor,
     pub text: String,
     /// `agent`: send it to an agent (the session that last wrote that part,
-    /// if it's idle, else a new one in the document's work or project).
+    /// else the latest session of the document's work or project; queued
+    /// if it's busy, never a new session).
     #[serde(default)]
     pub to: String,
 }
 
-/// `POST /api/v1/docs/{id}/threads/send`: comment threads sent to an agent
-/// together, in one message to one session.
+/// `POST /api/v1/docs/{id}/threads/send`: comment threads sent to agents
+/// together, in one message per session they go to.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ThreadsSend {
@@ -675,7 +676,8 @@ pub struct ThreadsSend {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CommentNew {
     pub text: String,
-    /// `agent`: send the thread (again) to an agent.
+    /// `agent`: send the thread (again) to an agent: the session that
+    /// already answered it, if it can still take input.
     #[serde(default)]
     pub to: String,
 }

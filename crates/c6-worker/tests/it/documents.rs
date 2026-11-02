@@ -1039,6 +1039,128 @@ async fn comments_go_to_the_agent_that_wrote_the_part() {
     stop.cancel();
 }
 
+/// Comments never start a session: while the agent that answered a thread
+/// is busy, a reply in that thread goes to it (queued), and so does a new
+/// thread on a part it wrote; it takes both once its step ends.
+#[tokio::test]
+async fn comments_wait_for_their_busy_agent_rather_than_start_a_session() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4})).await;
+    let conn = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await;
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    // The session writes a doc, in its work.
+    let create = json!({"action": "create", "title": "Pricing", "markdown": "# Pricing\n\nWe charge per seat.\n\nAnnual plans get two months free."});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Wrote it.".into()));
+    let s = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "write the pricing doc", "work": "new"}),
+    )
+    .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 1).await;
+    let id = send(M::GET, "docs?q=Pricing".into(), Value::Null).await[0]["id"].as_str().unwrap().to_owned();
+    let full = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    let (b1, b2) = (full["tabs"][0]["blocks"][1]["id"].as_str().unwrap(), full["tabs"][0]["blocks"][2]["id"].as_str().unwrap());
+    // A thread it took while idle: it's the thread's agent.
+    mock.push(Reply::Text("Noted.".into()));
+    let t1 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b1}, "text": "Say the price.", "to": "agent"})).await;
+    let t1 = t1["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 2).await;
+
+    // Now it's busy: a turn that holds after its first words.
+    let gate = mock.push_gated(Reply::Text("Working on it.".into()));
+    let asked = mock.requests().len();
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "Check the numbers."})).await;
+    eventually("the turn to be running", async || {
+        let d: Value = http.get(format!("{api}/sessions/{sid}")).send().await.ok()?.json().await.ok()?;
+        (d["session"]["status"] == "running" && mock.requests().len() > asked).then_some(())
+    })
+    .await;
+    let sessions = send(M::GET, "sessions".into(), Value::Null).await.as_array().unwrap().len();
+    // A reply in its thread goes to it, queued.
+    let t = send(M::POST, format!("docs/{id}/threads/{t1}/comments"), json!({"text": "In euros, please.", "to": "agent"})).await;
+    assert_eq!((t["to_agent"].as_bool(), t["agent"].as_str()), (Some(true), Some(sid.as_str())), "{t}");
+    // A new thread on a part it wrote goes to it too.
+    let t2 =
+        send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b2}, "text": "One month, not two.", "to": "agent"})).await;
+    assert_eq!((t2["to_agent"].as_bool(), t2["agent"].as_str()), (Some(true), Some(sid.as_str())), "{t2}");
+    let t2 = t2["id"].as_str().unwrap().to_owned();
+    let queued = eventually("both to be queued for it", async || {
+        let d: Value = http.get(format!("{api}/sessions/{sid}")).send().await.ok()?.json().await.ok()?;
+        let q = d["queued"].as_array()?.clone();
+        (q.len() == 2).then_some(q)
+    })
+    .await;
+    let has = |t: &str| queued.iter().any(|q| q["text"].as_str().unwrap_or("").contains(&format!("Thread {t}")));
+    assert!(has(&t1) && has(&t2), "{queued:?}");
+    // Sent together, too: one message to it, no session started.
+    send(M::POST, format!("docs/{id}/threads/{t1}/comments"), json!({"text": "And round it."})).await;
+    send(M::POST, format!("docs/{id}/threads/{t2}/comments"), json!({"text": "Say it plainly."})).await;
+    let sent = send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    for t in sent.as_array().unwrap() {
+        assert_eq!(t["agent"].as_str(), Some(sid.as_str()), "{t}");
+    }
+    assert_eq!(send(M::GET, "sessions".into(), Value::Null).await.as_array().unwrap().len(), sessions, "no session started");
+
+    // Its step ends: it takes them.
+    mock.push(Reply::Text("Done.".into()));
+    mock.push(Reply::Text("Done.".into()));
+    mock.push(Reply::Text("Done.".into()));
+    gate.notify_one();
+    eventually("the comments to reach it", async || {
+        let m: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
+        (m.iter().any(|m| m.contains("In euros, please.")) && m.iter().any(|m| m.contains("come to you together"))).then_some(())
+    })
+    .await;
+    stop.cancel();
+}
+
 /// Chips, embeds and search (docs/docs.md §3, §9): a document's tabs are
 /// found in the memex once a change settles (and gone when it's deleted),
 /// pictures are kept for the document that holds them, chips change with
