@@ -7,7 +7,7 @@ use leptos::prelude::*;
 
 use crate::api;
 use crate::util::ErrorBox;
-use crate::workspace::{ColumnCtx, How, ScrollBox, View};
+use crate::workspace::{ColumnCtx, How, ScrollBox, View, Workspace};
 
 /// How wide a tile must be for a pane beside the transcript.
 const BESIDE_MIN: i32 = 1100;
@@ -52,27 +52,42 @@ pub fn open(col: ColumnCtx, view: View, new_tile: bool) {
     }
 }
 
-/// A session's pane: closed if it's open (anywhere), else opened.
+/// Where a session's pane is, and whether it's on screen now (tracked: its
+/// button shows it pressed while it is).
+pub fn shown(ws: Workspace, pane: Pane, id: &str) -> Option<(u64, u64, bool)> {
+    let one_pane = crate::util::phone();
+    ws.layout.with(|l| l.find_pane(pane, id).map(|(t, c)| (t, c, l.pane_shown(t, c, one_pane))))
+}
+
+/// A session's pane: closed if it's on screen, brought forward if it's
+/// open but out of sight (a phone went back to the transcript, its tile
+/// minimized), else opened.
 pub fn toggle(col: ColumnCtx, pane: Pane, id: &str, new_tile: bool) {
-    match col.ws.layout.with_untracked(|l| l.find_pane(pane, id)) {
-        Some((tile, c)) if !new_tile => col.ws.close_column(tile, c),
+    match untrack(|| shown(col.ws, pane, id)) {
+        Some((tile, c, true)) if !new_tile => col.ws.close_column(tile, c),
+        Some((tile, c, false)) if !new_tile => col.ws.reveal(tile, c),
         _ => open(col, pane.view(id.to_owned()), new_tile),
     }
 }
 
-/// A session's pane, opened unless it is already.
+/// A session's pane, opened (or brought forward) unless it's on screen.
 pub fn show(col: ColumnCtx, pane: Pane, id: &str, new_tile: bool) {
-    if new_tile || col.ws.layout.with_untracked(|l| l.find_pane(pane, id)).is_none() {
-        open(col, pane.view(id.to_owned()), new_tile);
+    match untrack(|| shown(col.ws, pane, id)) {
+        Some((_, _, true)) if !new_tile => {}
+        Some((tile, c, false)) if !new_tile => col.ws.reveal(tile, c),
+        _ => open(col, pane.view(id.to_owned()), new_tile),
     }
 }
 
-/// Its Outputs pane showing one output: the open pane turns to it, or one
-/// opens.
+/// Its Outputs pane showing one output: the open pane turns to it (and
+/// comes forward), or one opens.
 pub fn show_output(col: ColumnCtx, id: &str, output: String) {
     let view = View::SessionOutputs { id: id.to_owned(), output };
     match col.ws.layout.with_untracked(|l| l.find_pane(Pane::Outputs, id)) {
-        Some((tile, c)) => col.ws.replace(tile, c, view),
+        Some((tile, c)) => {
+            col.ws.replace(tile, c, view);
+            col.ws.reveal(tile, c);
+        }
         None => open(col, view, false),
     }
 }

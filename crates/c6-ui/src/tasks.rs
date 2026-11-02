@@ -33,6 +33,11 @@ impl Task {
         self.running()
     }
 
+    /// Stopped: by you, the agent or Claude Code.
+    fn stopped(&self) -> bool {
+        self.state.starts_with("stopped")
+    }
+
     /// It ended badly: failed, lost, or a command that exited non-zero.
     fn failed(&self) -> bool {
         match self.state.as_str() {
@@ -172,6 +177,47 @@ pub fn needs_look(events: &[Event]) -> Vec<(String, String, bool, i64)> {
             (t.id, t.description, failed, t.since)
         })
         .collect()
+}
+
+/// The last few tasks that failed or were stopped, beside those running.
+const RECENT: usize = 3;
+
+/// The tasks a session's ◌ N lists: those running, then the last few that
+/// failed or were stopped, newest first; `all`: every one.
+fn short_list(tasks: Vec<Task>, all: bool) -> Vec<Task> {
+    if all {
+        return tasks;
+    }
+    let (running, ended): (Vec<Task>, Vec<Task>) = tasks.into_iter().partition(Task::running);
+    let recent = ended.into_iter().rev().filter(|t| t.failed() || t.stopped()).take(RECENT);
+    running.into_iter().chain(recent).collect()
+}
+
+/// How many tasks the short list leaves out.
+pub fn left_out(events: &[Event]) -> usize {
+    let tasks = lifecycle(events);
+    let total = tasks.len();
+    total - short_list(tasks, false).len()
+}
+
+/// A session's tasks for its bar's ◌ N (see [`short_list`]), each with its
+/// state and time, Inspect, and Stop while it runs. Nothing when there are
+/// none to show.
+#[component]
+pub fn BackgroundTasks(session: String, events: RwSignal<Vec<Event>>, #[prop(into)] all: Signal<bool>) -> impl IntoView {
+    let session = StoredValue::new(session);
+    let list = Memo::new(move |_| short_list(events.with(|e| lifecycle(e)), all.get()));
+    let selected = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <Show when=move || !list.with(Vec::is_empty)>
+            <div class="space-y-2">
+                <p class="text-[10px] font-medium uppercase tracking-wide text-muted">"Tasks"</p>
+                {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
+            </div>
+        </Show>
+        {inspector(session, list, selected)}
+    }
 }
 
 /// A quiet line for the bottom of the transcript, shown only while
@@ -572,6 +618,23 @@ mod tests {
         let looks = needs_look(&evs);
         let ids: Vec<(&str, bool)> = looks.iter().map(|(id, _, failed, _)| (id.as_str(), *failed)).collect();
         assert_eq!(ids, [("build", false), ("tests", true), ("agent", true), ("gone", true), ("broke", true)]);
+    }
+
+    #[test]
+    fn the_short_list_has_the_running_and_the_last_few_stopped_or_failed() {
+        let evs = [
+            event(1, "old fail", "failed"),
+            event(2, "ok", "finished"),
+            event(3, "stopped", "stopped_by_user"),
+            event(4, "f2", "failed"),
+            event(5, "f3", "lost"),
+            event(6, "f4", "failed"),
+            event(7, "run", "started"),
+        ];
+        let ids = |all| short_list(lifecycle(&evs), all).into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(false), ["run", "f4", "f3", "f2"], "the newest three ended badly, after what runs");
+        assert_eq!(ids(true).len(), 7);
+        assert_eq!(left_out(&evs), 3);
     }
 
     #[test]

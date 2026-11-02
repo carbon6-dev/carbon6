@@ -792,6 +792,26 @@ impl Layout {
         self.tiles.iter().find_map(|t| t.columns.iter().find(|c| c.view.session_pane() == Some((pane, id))).map(|c| (t.key, c.key)))
     }
 
+    /// Whether pane `col` of tile `tile` is on screen: its tile shown (not
+    /// minimized, nor behind another in focus mode) and, where a tile shows
+    /// one pane at a time (`one_pane`: a phone), the pane it shows.
+    pub fn pane_shown(&self, tile: u64, col: u64, one_pane: bool) -> bool {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return false };
+        let t = &self.tiles[ti];
+        let Some(ci) = t.columns.iter().position(|c| c.key == col) else { return false };
+        !t.minimized && (!self.full || self.focus == ti) && (!one_pane || t.cursor == ci)
+    }
+
+    /// Brings pane `col` of tile `tile` forward: its tile shown and focused,
+    /// and the pane the one a phone shows.
+    fn reveal(&mut self, tile: u64, col: u64) {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
+        let Some(ci) = self.tiles[ti].columns.iter().position(|c| c.key == col) else { return };
+        self.tiles[ti].cursor = ci;
+        self.tiles[ti].active = col;
+        self.show(ti);
+    }
+
     /// Opens `view` beside pane `col` of tile `tile`, keeping that pane:
     /// the tile shows the two (a list that was beside it goes back in the
     /// tile's history).
@@ -990,6 +1010,12 @@ impl Workspace {
     /// session's Changes beside its transcript).
     pub fn open_after(&self, tile: u64, col: u64, view: View) {
         self.layout.update(|l| l.open_after(tile, col, view));
+    }
+
+    /// Brings a pane forward (its tile shown and focused; on a phone, the
+    /// pane shown).
+    pub fn reveal(&self, tile: u64, col: u64) {
+        self.layout.update(|l| l.reveal(tile, col));
     }
 
     /// Moves the item a tile shows (its right pane) into a tile of its own.
@@ -2024,6 +2050,13 @@ mod tests {
         assert_eq!(l.find_pane(Pane::Changes, "s1"), Some((tile, changes)));
         assert_eq!(l.find_pane(Pane::Terminal, "s1"), None);
         assert_eq!(l.find_pane(Pane::Changes, "s2"), None);
+        // Back to the session on a phone: the pane is there but not shown,
+        // and comes forward again.
+        l.tiles[0].cursor = 0;
+        assert!(l.pane_shown(tile, changes, false), "side by side, both show");
+        assert!(!l.pane_shown(tile, changes, true), "a phone shows the session");
+        l.reveal(tile, changes);
+        assert!(l.pane_shown(tile, changes, true));
         // Another of its panes takes that one's place.
         l.open_after(tile, key, View::SessionTerminal { id: "s1".into() });
         assert_eq!(l.tile(tile).unwrap().columns[0].key, key);
@@ -2339,7 +2372,7 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
     };
     let pinned = move || session().is_some_and(|id| ws.pinned.with(|p| p.contains(&id)));
     // 24px round a 16px glyph (the bar is 28px), 40px on a touch screen.
-    let btn = "flex size-6 shrink-0 items-center justify-center rounded text-muted hover:bg-zinc-200 hover:text-zinc-900 pointer-coarse:size-10 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    let btn = "flex size-6 shrink-0 items-center justify-center rounded text-muted outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-fine:hover:bg-zinc-200 pointer-fine:hover:text-zinc-900 pointer-coarse:size-10 dark:pointer-fine:hover:bg-zinc-800 dark:pointer-fine:hover:text-zinc-100";
     view! {
         <div class=move || format!(
             "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",

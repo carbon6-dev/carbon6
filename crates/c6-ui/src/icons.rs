@@ -121,5 +121,6 @@ pub fn minimize() -> impl IntoView {
 }
 
 /// An icon button in a bar (a tile's, a pane's, a session's strip): 28px
-/// round a 16px glyph, 40px on a touch screen.
-pub const BAR_BUTTON: &str = "flex size-7 shrink-0 items-center justify-center rounded text-zinc-600 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent pointer-coarse:size-10 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-100";
+/// round a 16px glyph, 40px on a touch screen. Hover only with a mouse (a
+/// tapped button on a phone keeps no look); a ring for the keyboard's focus.
+pub const BAR_BUTTON: &str = "flex size-7 shrink-0 items-center justify-center rounded text-zinc-600 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-30 pointer-fine:hover:bg-black/10 pointer-fine:hover:text-zinc-900 pointer-fine:disabled:hover:bg-transparent pointer-coarse:size-10 dark:text-zinc-400 dark:pointer-fine:hover:bg-white/10 dark:pointer-fine:hover:text-zinc-100";

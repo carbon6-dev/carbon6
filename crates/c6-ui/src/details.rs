@@ -262,7 +262,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         let list = looks.get();
         (!list.is_empty()).then(|| {
             view! {
-                <div id=format!("look-{}", id.get_value()) class=HEADING>"Needs a look"</div>
+                <div class=HEADING>"Needs a look"</div>
                 {list.into_iter().map(|look| {
                     let Look { task: is_task, id: lid, what, failed, .. } = look;
                     let dot = if failed { "bg-red-500" } else { "animate-pulse bg-blue-500" };
