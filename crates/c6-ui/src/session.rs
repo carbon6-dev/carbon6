@@ -3909,9 +3909,13 @@ fn Composer(
                     <button class="mb-[9px] flex h-9 shrink-0 items-center rounded-md px-1.5 text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="Attach images or files (or paste / drop them)" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>"📎"</button>
                     <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
+                    // The suggestion is the empty box's text, in italics, with a
+                    // small ⇥ at its right edge: tap it, or press Tab or →.
+                    // Any text in the box (typed, pasted) puts both away.
+                    <div class="relative min-w-0 flex-1">
                     <textarea
                         node_ref=area
-                        class=format!("{INPUT} {} min-h-[2.75rem]", crate::util::GROWS)
+                        class=move || format!("{INPUT} {} min-h-[2.75rem] {}", crate::util::GROWS, if shown_next().is_some() { "pr-9 placeholder:italic" } else { "" })
                         rows="2"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
@@ -3961,10 +3965,11 @@ fn Composer(
                                     _ => {}
                                 }
                             }
-                            // The suggested next message: Tab takes it, Esc puts it away.
-                            if shown_next().is_some() && matches!(ev.key().as_str(), "Tab" | "Escape") {
+                            // The suggested next message: Tab (or →, the box being
+                            // empty) takes it, Esc puts it away.
+                            if shown_next().is_some() && matches!(ev.key().as_str(), "Tab" | "Escape" | "ArrowRight") {
                                 ev.prevent_default();
-                                if ev.key() == "Tab" {
+                                if ev.key() != "Escape" {
                                     accept_next();
                                 } else {
                                     next.set(None);
@@ -3982,6 +3987,16 @@ fn Composer(
                         }
                         on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { update_mention() }
                     ></textarea>
+                    {move || shown_next().map(|_| view! {
+                        <button type="button"
+                            class="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded border border-sky-300 bg-sky-50 text-xs text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900"
+                            title="Use the suggestion (Tab): it goes in the box to edit or send, not sent" aria-label="Use the suggestion"
+                            prop:disabled=move || disabled.get()
+                            // Keep the box's focus (and a phone's keyboard) as it's tapped.
+                            on:mousedown=|ev| ev.prevent_default()
+                            on:click=move |_| accept_next()>"⇥"</button>
+                    })}
+                    </div>
                     {move || if stopping.get() {
                         view! { <button class=format!("{BUTTON} {SEND_AT}") disabled=true>"Stopping…"</button> }.into_any()
                     } else if running.get() && has_text.get() {
@@ -4014,15 +4029,6 @@ fn Composer(
                         view! { <button class=format!("{BUTTON} {SEND_AT}") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()
                     }}
                 </div>
-                {move || shown_next().map(|_| view! {
-                    <button type="button"
-                        class="min-h-11 rounded-md px-3 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                        title="Put the suggested message in the box to edit or send; does not send it"
-                        prop:disabled=move || disabled.get()
-                        on:click=move |_| accept_next()>
-                        "Use suggestion"<span class="hidden sm:inline">" · Tab"</span>
-                    </button>
-                })}
                 // The model, and its subagents': one line of chips, each opening
                 // its pickers above it. A change waiting for Send shows beside.
                 {(model.is_some() || subagents.is_some()).then(|| view! {
