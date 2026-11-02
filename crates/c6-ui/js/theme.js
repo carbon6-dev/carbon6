@@ -1,25 +1,23 @@
-// Light or dark: "system" (default) follows the OS; "light", "dark", or
-// the softer darks "dim" and "soft" (dark, with lighter backgrounds:
-// style/input.css), is kept in this browser. Loaded before the page
-// renders, so it never flashes.
+// Light or dark: "system" (default) follows the OS; "light" or "dark" is
+// kept in this browser. Loaded before the page renders, so it never flashes.
+// "dim" and "soft", tried for a while, are dark now (dark took dim's greys:
+// style/input.css).
 window.c6Theme = (() => {
   const KEY = "c6.theme";
   const media = window.matchMedia("(prefers-color-scheme: dark)");
   const get = () => {
-    try { return localStorage.getItem(KEY) || "system"; } catch (_) { return "system"; }
+    let choice = "system";
+    try { choice = localStorage.getItem(KEY) || "system"; } catch (_) {}
+    return choice === "dim" || choice === "soft" ? "dark" : choice;
   };
   const apply = () => {
     const choice = get();
-    const softer = choice === "dim" || choice === "soft";
-    const dark = choice === "dark" || softer || (choice === "system" && media.matches);
+    const dark = choice === "dark" || (choice === "system" && media.matches);
     const root = document.documentElement;
     root.classList.toggle("dark", dark);
-    root.classList.toggle("dim", choice === "dim");
-    root.classList.toggle("soft", choice === "soft");
     root.style.colorScheme = dark ? "dark" : "light";
     const meta = document.querySelector('meta[name="theme-color"]');
-    const page = { dim: "#141417", soft: "#1c1d21" }[choice] || (dark ? "#09090b" : "#fafafa");
-    if (meta) meta.setAttribute("content", page);
+    if (meta) meta.setAttribute("content", dark ? "#141417" : "#fafafa");
     window.dispatchEvent(new Event("c6-theme"));
   };
   media.addEventListener("change", apply);
