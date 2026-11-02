@@ -23,14 +23,19 @@ pub fn clock() -> RwSignal<i64> {
     now
 }
 
-#[component]
-pub fn StatusPill(status: SessionStatus) -> impl IntoView {
-    let (cls, label) = match status {
+/// A session state's pill colours and word.
+pub fn status_look(status: SessionStatus) -> (&'static str, &'static str) {
+    match status {
         SessionStatus::Running => ("bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300", "running"),
         SessionStatus::Idle => ("bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300", "idle"),
         SessionStatus::Starting => ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "starting"),
         SessionStatus::Failed => ("bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300", "failed"),
-    };
+    }
+}
+
+#[component]
+pub fn StatusPill(status: SessionStatus) -> impl IntoView {
+    let (cls, label) = status_look(status);
     view! { <span class=format!("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {cls}")>{label}</span> }
 }
 

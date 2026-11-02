@@ -1262,6 +1262,16 @@ pub async fn session_seen(id: String) {
     let _ = empty(Request::post(&format!("/api/v1/sessions/{id}/seen")).send().await).await;
 }
 
+/// You viewed a session: it goes first in recently viewed, on every device.
+pub async fn session_viewed(id: String) -> bool {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/viewed")).send().await).await.is_ok()
+}
+
+/// The sessions you viewed lately in this realm, newest first.
+pub async fn recent_sessions() -> Result<Vec<c6_api::RecentView>, String> {
+    json(Request::get("/api/v1/sessions/recent").send().await).await
+}
+
 /// A session's open decisions (not its approvals and questions: those are in its log).
 pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await

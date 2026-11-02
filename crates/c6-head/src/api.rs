@@ -84,6 +84,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
         .route("/api/v1/sessions/{id}/seen", post(seen_session))
+        .route("/api/v1/sessions/{id}/viewed", post(viewed_session))
+        .route("/api/v1/sessions/recent", get(recent_sessions))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
@@ -1681,6 +1683,22 @@ async fn seen_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) 
     }
     crate::work::seen_session(&st, &id, now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// You viewed a session: it goes first in its realm's recently viewed.
+async fn viewed_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::recent::view(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The sessions you viewed lately in the caller's realm, newest first.
+async fn recent_sessions(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::RecentView>>> {
+    let realm = realm_for(&st, &caller, &q).await?;
+    Ok(Json(crate::recent::list(&st, &realm).await?))
 }
 
 /// An attachment of a user message, as sent.

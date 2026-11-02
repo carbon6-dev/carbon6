@@ -778,6 +778,8 @@ pub struct Workspace {
     /// The tile being dragged by its bar, and where it would drop.
     pub dragging: RwSignal<Option<u64>>,
     pub drop_at: RwSignal<Option<Drop>>,
+    /// Counts the views the head has taken (recently viewed loads again).
+    pub viewed: RwSignal<u32>,
 }
 
 fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
@@ -812,6 +814,7 @@ impl Workspace {
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
             dragging: RwSignal::new(None),
             drop_at: RwSignal::new(None),
+            viewed: RwSignal::new(0),
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
@@ -1155,6 +1158,23 @@ impl Workspace {
                     t.insert(s.id.clone(), s.updated_at);
                 });
                 leptos::task::spawn_local(api::session_seen(s.id.clone()));
+            }
+        });
+        // The focused session, with the page in view: you viewed it (the
+        // head keeps the list, for every device).
+        let focused = Memo::new(move |_| {
+            ws.layout.with(|l| match l.focused_view() {
+                Some(View::Session { id, .. }) => Some(id.clone()),
+                _ => None,
+            })
+        });
+        Effect::new(move || {
+            if let (Some(id), true) = (focused.get(), page.get()) {
+                leptos::task::spawn_local(async move {
+                    if api::session_viewed(id).await {
+                        let _ = ws.viewed.try_update(|n| *n += 1);
+                    }
+                });
             }
         });
     }

@@ -4757,6 +4757,15 @@ pub struct AttentionSeen {
     pub keys: Vec<String>,
 }
 
+/// A session you viewed lately (`GET /api/v1/sessions/recent`, newest
+/// first): the live feed has the rest of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecentView {
+    pub session_id: String,
+    pub at: UnixMs,
+}
+
 /// How the session list is grouped (`/api/v1/settings/session_grouping`):
 /// one level per label key, outermost first (`repo`, then `client`).
 /// Empty: one flat list.

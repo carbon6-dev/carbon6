@@ -47,6 +47,7 @@ pub mod providers;
 pub mod push;
 pub mod quotas;
 pub mod realms;
+pub mod recent;
 pub mod registry;
 pub mod remote;
 pub mod schema;

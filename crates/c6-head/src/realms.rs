@@ -148,6 +148,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         }
     };
     match segments.as_slice() {
+        // What you viewed lately is narrowed to the caller's realm itself.
+        ["sessions", "recent"] => Ok(()),
         ["sessions", id, ..] => owned("sessions", "session", (*id).to_owned()).await,
         ["decisions", id, ..] if *id != "count" => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,

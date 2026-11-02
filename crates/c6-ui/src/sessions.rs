@@ -20,9 +20,22 @@ pub fn SessionsPage() -> impl IntoView {
     let label_filter = crate::labels::use_filter().0;
     let grouping = use_grouping();
     let folded = Folded::load(Folded::PAGE);
+    let recent = use_recent(8, |_| false);
 
     view! {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-6">
+            // Not while you're looking for one by name.
+            {move || {
+                let rows = recent.get();
+                (query.with(String::is_empty) && !rows.is_empty()).then(|| view! {
+                    <section class="space-y-2">
+                        <h2 class="text-sm font-medium text-zinc-500">"Recently viewed"</h2>
+                        <div class="rounded-lg border border-zinc-200 p-1 dark:border-zinc-800">
+                            {rows.into_iter().map(|(s, at)| view! { <RecentRow s at now /> }).collect_view()}
+                        </div>
+                    </section>
+                })
+            }}
             <Suspense fallback=|| ()>
                 {move || connections.get().map(|r| match r {
                     Ok(conns) if conns.is_empty() => view! {
@@ -80,6 +93,73 @@ pub fn SessionsPage() -> impl IntoView {
                 </div>
             </section>
         </main>
+    }
+}
+
+/// The sessions you viewed lately (kept by the head, the same on every
+/// device), newest first, as the live feed has them, with when you viewed
+/// each: up to `limit`, leaving out those `skip` says.
+pub(crate) fn use_recent(limit: usize, skip: impl Fn(&str) -> bool + Send + Sync + 'static) -> Memo<Vec<(Session, i64)>> {
+    let (ws, live) = (use_workspace(), api::live());
+    let views = LocalResource::new(move || {
+        api::realm().track();
+        ws.viewed.track();
+        api::recent_sessions()
+    });
+    Memo::new(move |_| {
+        let views = views.get().and_then(Result::ok).unwrap_or_default();
+        live.sessions.with(|all| {
+            views
+                .iter()
+                .filter(|v| !skip(&v.session_id))
+                .filter_map(|v| all.iter().find(|s| s.id == v.session_id).map(|s| (s.clone(), v.at)))
+                .take(limit)
+                .collect()
+        })
+    })
+}
+
+/// A recently viewed session's state, as the Sessions list colours it:
+/// needs you (an approval waits), else running, idle, starting or failed.
+pub(crate) fn recent_state(s: &Session) -> (&'static str, &'static str) {
+    if s.awaiting_approval {
+        ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you")
+    } else {
+        crate::util::status_look(s.display_status())
+    }
+}
+
+/// A recently viewed session: its mark, title, state and when you viewed
+/// it. It opens in the focused tile (⌘/Ctrl-click: a new one), then
+/// `close` runs (the phone's sheet closes).
+#[component]
+pub(crate) fn RecentRow(s: Session, at: i64, now: RwSignal<i64>, #[prop(optional)] close: Option<Callback<()>>) -> impl IntoView {
+    let (ws, col) = (use_workspace(), use_column());
+    let to = View::session(s.id.clone());
+    let href = to.href();
+    let to = StoredValue::new(to);
+    let (pill, word) = recent_state(&s);
+    view! {
+        <a href=href class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Open (⌘-click: new tile)"
+            on:click=move |ev: web_sys::MouseEvent| {
+                if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
+                    return;
+                }
+                ev.prevent_default();
+                let how = How::from_mouse(&ev);
+                match col {
+                    Some(c) => c.open(to.get_value(), how),
+                    None => ws.open(None, to.get_value(), how),
+                }
+                if let Some(c) = close {
+                    c.run(());
+                }
+            }>
+            <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
+            <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
+            <span class=format!("inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium {pill}")>{word}</span>
+            <span class="w-14 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - at)}</span>
+        </a>
     }
 }
 
@@ -1346,5 +1426,20 @@ mod tests {
         assert_eq!(seed.labels, vec!["client:acme".to_owned()]);
         assert_eq!(seed.realm, "work");
         assert!(!seed.worktree);
+    }
+
+    #[test]
+    fn a_recent_row_says_running_idle_or_needs_you() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "s1", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "t", "cwd": "",
+            "connection_id": "", "model": "", "status": "running", "created_at": 0, "updated_at": 0, "last_seq": 0
+        }))
+        .unwrap();
+        assert_eq!(recent_state(&s).1, "running");
+        assert_eq!(recent_state(&s).0, crate::util::status_look(SessionStatus::Running).0, "the Sessions list's colours");
+        s.status = SessionStatus::Idle;
+        assert_eq!(recent_state(&s).1, "idle");
+        s.awaiting_approval = true;
+        assert_eq!(recent_state(&s), ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you"));
     }
 }

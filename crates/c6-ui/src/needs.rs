@@ -253,7 +253,7 @@ pub fn NeedsYou() -> impl IntoView {
 }
 
 #[component]
-fn Heading(text: String) -> impl IntoView {
+pub(crate) fn Heading(text: String) -> impl IntoView {
     view! { <div class="px-2 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{text}</div> }
 }
 

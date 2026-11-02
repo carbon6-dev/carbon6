@@ -585,7 +585,8 @@ struct Press {
     dragged: bool,
 }
 
-/// Phones: switch tiles, add one, and the inbox. The current tab's × closes
+/// Phones: switch tiles, add one, and every tile in a sheet (▸, with the
+/// sessions you viewed lately). The current tab's × closes
 /// its tile. A long press lifts a tab: drag it to reorder the tabs, or let
 /// go where it is for its menu.
 #[component]
@@ -605,9 +606,6 @@ pub fn MobileBar() -> impl IntoView {
                 .collect::<Vec<_>>()
         })
     });
-    let filter = crate::labels::use_filter().0;
-    let counts = Memo::new(move |_| crate::labels::attention_counts(ws, live, &filter.get()));
-    let count = move || counts.get().0;
     // Only the tabs scroll, and their edges fade where more is hidden that
     // way, so it reads as a strip to swipe; the current tab is brought
     // into view whenever it changes.
@@ -774,9 +772,13 @@ pub fn MobileBar() -> impl IntoView {
             menu.set(Some((p.key, r.left(), r.top())));
         }
     };
+    // The sheet of tiles and recently viewed sessions.
+    let sheet = RwSignal::new(false);
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" && menu.get_untracked().is_some() {
             menu.set(None);
+        } else if ev.key() == "Escape" && sheet.get_untracked() {
+            sheet.set(false);
         }
     });
     on_cleanup(move || {
@@ -820,12 +822,12 @@ pub fn MobileBar() -> impl IntoView {
                 }).collect_view()}
             </div>
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
-            <button class="relative shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400"
-                title=move || { let (s, h) = counts.get(); crate::labels::attention_title(s, h) }
-                on:click=move |_| ws.open(None, View::Inbox, How::Beside)>
-                "Inbox"
-                {move || (count() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{count()}</span> })}
-            </button>
+            <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs tabular-nums text-zinc-600 dark:text-zinc-400"
+                title="Your tiles, and the sessions you viewed lately" aria-haspopup="dialog" aria-expanded=move || sheet.get().to_string()
+                on:click=move |_| sheet.set(true)>{move || sheet_label(tiles.with(Vec::len))}</button>
+            <Show when=move || sheet.get()>
+                <TabSheet close=Callback::new(move |()| sheet.set(false)) />
+            </Show>
             {move || menu.get().map(|(key, left, top)| {
                 let alone = tiles.with(Vec::len) <= 1;
                 let close = Callback::new(move |()| menu.set(None));
@@ -871,6 +873,130 @@ fn TabMenu(at: (f64, f64), alone: bool, pick: Callback<TabAction>, close: Callba
         <div role="menu" style=style class="fixed z-50 w-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
             {item(TabAction::Close, "Close", false)}
             {item(TabAction::Minimize, "Minimize", alone)}
+        </div>
+    }
+}
+
+/// The phone bar's sheet button: ▸ and how many tiles are shown.
+fn sheet_label(open: usize) -> String {
+    format!("▸ {open}")
+}
+
+/// How far down a sheet's handle is swiped to close it.
+const SWIPE_CLOSE: f64 = 40.0;
+
+/// Whether a press on a sheet's handle went far enough down to close it.
+fn swiped_down(from: f64, to: f64) -> bool {
+    to - from > SWIPE_CLOSE
+}
+
+/// A tile, as the phone's sheet lists it.
+#[derive(Clone, Debug, PartialEq)]
+struct SheetTile {
+    key: u64,
+    /// In reading order, as ⌘1–9 and the dock number it.
+    number: usize,
+    /// The session it shows, if it shows one.
+    session: Option<String>,
+    label: String,
+    focused: bool,
+    minimized: bool,
+}
+
+/// A phone's tiles, from the bottom (as what needs you is): those shown in
+/// reading order (the current one marked), each to show or close; the
+/// minimized; the sessions you viewed lately that no tile holds; then all
+/// sessions, and a new tile. Swipe the handle down, tap outside or Esc to
+/// close it.
+#[component]
+fn TabSheet(close: Callback<()>) -> impl IntoView {
+    let (ws, live) = (use_workspace(), api::live());
+    let now = RwSignal::new(now_ms());
+    let tiles = Memo::new(move |_| {
+        ws.layout.with(|l| {
+            l.reading_order()
+                .into_iter()
+                .enumerate()
+                .map(|(n, i)| {
+                    let t = &l.tiles[i];
+                    let view = t.columns.get(t.cursor).map(|c| &c.view);
+                    SheetTile {
+                        key: t.key,
+                        number: n + 1,
+                        session: view.and_then(|v| match v {
+                            View::Session { id, .. } => Some(id.clone()),
+                            _ => None,
+                        }),
+                        label: view.map(|v| v.label(&live)).unwrap_or_default(),
+                        focused: i == l.focus,
+                        minimized: t.minimized,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+    let recent = crate::sessions::use_recent(6, move |id| ws.tile_number(id).is_some());
+    let swipe = StoredValue::new(None::<f64>);
+    let row = move |t: SheetTile| {
+        let fill = t.session.as_deref().and_then(crate::marks::of_id).map(|m| crate::marks::fill(&m)).unwrap_or_default();
+        let key = t.key;
+        view! {
+            <div class=if t.focused { "flex items-center gap-2 rounded-md bg-zinc-100 pl-2 dark:bg-zinc-800" } else { "flex items-center gap-2 rounded-md pl-2" }>
+                <span class="w-4 shrink-0 text-right font-mono text-[11px] tabular-nums text-zinc-500">{t.number}</span>
+                <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=fill></span>
+                <button class="min-w-0 flex-1 truncate py-2 text-left" class:font-medium=t.focused
+                    on:click=move |_| { ws.show_tile(key); close.run(()) }>{t.label}</button>
+                <button class="flex h-9 w-9 shrink-0 items-center justify-center text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                    title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>"×"</button>
+            </div>
+        }
+    };
+    let link = "block w-full rounded-md px-2 py-2 text-left text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800";
+    view! {
+        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
+        <div role="dialog" aria-label="Tiles"
+            class="fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+            // Its handle: swiped down, the sheet goes.
+            <div class="flex shrink-0 touch-none justify-center pb-1 pt-2"
+                on:pointerdown=move |ev: web_sys::PointerEvent| {
+                    swipe.set_value(Some(f64::from(ev.client_y())));
+                    if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
+                        let _ = el.set_pointer_capture(ev.pointer_id());
+                    }
+                }
+                on:pointermove=move |ev: web_sys::PointerEvent| {
+                    if swipe.get_value().is_some_and(|from| swiped_down(from, f64::from(ev.client_y()))) {
+                        swipe.set_value(None);
+                        close.run(());
+                    }
+                }
+                on:pointerup=move |_| swipe.set_value(None)
+                on:pointercancel=move |_| swipe.set_value(None)>
+                <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
+            </div>
+            <div class="min-h-0 overflow-y-auto p-1 pb-4">
+                {move || {
+                    let (shown, hidden): (Vec<SheetTile>, Vec<SheetTile>) = tiles.get().into_iter().partition(|t| !t.minimized);
+                    view! {
+                        <crate::needs::Heading text=format!("Open tiles · {}", shown.len()) />
+                        {shown.into_iter().map(row).collect_view()}
+                        {(!hidden.is_empty()).then(|| view! {
+                            <crate::needs::Heading text="Minimized".to_owned() />
+                            {hidden.into_iter().map(row).collect_view()}
+                        })}
+                    }
+                }}
+                {move || {
+                    let rows = recent.get();
+                    (!rows.is_empty()).then(|| view! {
+                        <crate::needs::Heading text="Recently viewed".to_owned() />
+                        {rows.into_iter().map(|(s, at)| view! { <crate::sessions::RecentRow s at now close /> }).collect_view()}
+                    })
+                }}
+                <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                <button class=link on:click=move |_| { ws.open(None, View::Sessions, How::OwnTile); close.run(()) }>"All sessions →"</button>
+                <button class=link on:click=move |_| { ws.new_tile(); close.run(()) }>"+ New tile"</button>
+            </div>
         </div>
     }
 }
@@ -923,5 +1049,13 @@ mod tests {
         assert_eq!(edge_scroll(10.0, 0.0, 300.0), -EDGE_STEP);
         assert_eq!(edge_scroll(150.0, 0.0, 300.0), 0);
         assert_eq!(edge_scroll(290.0, 0.0, 300.0), EDGE_STEP);
+    }
+
+    #[test]
+    fn the_sheet_says_how_many_tiles_and_goes_when_swiped_down() {
+        assert_eq!(sheet_label(3), "▸ 3");
+        assert!(swiped_down(100.0, 150.0));
+        assert!(!swiped_down(100.0, 120.0), "a nudge");
+        assert!(!swiped_down(100.0, 20.0), "up");
     }
 }
