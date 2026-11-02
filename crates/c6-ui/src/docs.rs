@@ -2142,9 +2142,6 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
         <div class="space-y-1 rounded-lg border border-zinc-200 p-2 dark:border-zinc-800">
             <div class="text-xs text-muted">{what}</div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {on_block.then(|| view! {
-                <input class=INPUT placeholder="A few of its words to point at (optional)" prop:value=move || quote.get() on:input=move |ev| quote.set(event_target_value(&ev)) />
-            })}
             <textarea node_ref=writing rows="1" class=format!("{INPUT} {COMMENT_GROWS}") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
                 on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); done.run(()) } else if crate::util::sends(&ev) { ev.prevent_default(); post() } />
             <div class="flex items-center gap-2">
