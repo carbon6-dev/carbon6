@@ -40,6 +40,11 @@ pub fn hex(colour: &str) -> &'static str {
     }
 }
 
+/// A mark's colour alone (for a border or a stripe).
+pub fn colour_hex(mark: &str) -> &'static str {
+    hex(m::parse(mark).map(|(c, _)| c).unwrap_or(""))
+}
+
 /// A mark as CSS for a swatch's background: the colour, or its pattern on
 /// a pale tint of it.
 pub fn fill(mark: &str) -> String {

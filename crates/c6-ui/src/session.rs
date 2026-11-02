@@ -1438,7 +1438,7 @@ fn WaitingNotices(events: RwSignal<Vec<Event>>, session_id: String) -> impl Into
                     </div>
                     <ul class="space-y-0.5 text-xs text-zinc-600 dark:text-zinc-400">
                         {w.into_iter().map(|(from, line)| view! {
-                            <li class="truncate">{if from.is_empty() { line } else { format!("✉ {from}: {line}") }}</li>
+                            <li class="truncate">{if from.is_empty() { line } else { format!("From {from}: {line}") }}</li>
                         }).collect_view()}
                     </ul>
                     {move || status.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
@@ -2164,6 +2164,45 @@ fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::AttachmentUplo
     (total > 20 * MB).then(|| format!("Too much to send in one message ({}; the limit is 20 MB in all)", mb(total)))
 }
 
+/// A message from another session's agent: not a bubble of yours but a card
+/// on the left in the sender's mark, with the sender named and linked,
+/// folded to a few lines, and what the agent was given behind a disclosure.
+#[component]
+fn SessionMessage(from: String, title: String, text: String, prompt: String) -> impl IntoView {
+    let mark = Memo::new({
+        let from = from.clone();
+        move |_| crate::marks::of_id(&from)
+    });
+    let lines = text.lines().count();
+    let long = lines > 3 || text.chars().count() > 320;
+    let open = RwSignal::new(false);
+    let name = if title.is_empty() { "another session".to_owned() } else { title };
+    view! {
+        <div class="flex flex-col items-start">
+            <div class="max-w-[85%] space-y-1 rounded-r-md border-l-4 bg-zinc-50 px-3 py-2 text-sm dark:bg-zinc-900/60"
+                style=move || format!("border-left-color:{}", mark.get().map_or("#a1a1aa", |m| crate::marks::colour_hex(&m)))>
+                <p class="flex flex-wrap items-center gap-x-1.5 text-xs text-zinc-500">
+                    {move || mark.get().map(|m| view! { <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&m)></span> })}
+                    <Go to=View::session(from.clone()) class="font-medium text-zinc-700 hover:underline dark:text-zinc-300" stop=true>{name}</Go>
+                    <span>"· message from another session"</span>
+                </p>
+                <div class=move || format!("whitespace-pre-wrap text-zinc-800 dark:text-zinc-200 {}", if long && !open.get() { "line-clamp-3" } else { "" })>{text}</div>
+                {long.then(|| view! {
+                    <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.update(|o| *o = !*o)>
+                        {move || if open.get() { "Show less".to_owned() } else { format!("Show all ({lines} lines)") }}
+                    </button>
+                })}
+                {(!prompt.is_empty()).then(|| view! {
+                    <details class="text-xs text-zinc-500">
+                        <summary class="cursor-pointer select-none">"What the agent received"</summary>
+                        <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt}</pre>
+                    </details>
+                })}
+            </div>
+        </div>
+    }
+}
+
 /// A button on the dark backdrop behind a full-size image.
 const FULL_BUTTON: &str = "rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10";
 
@@ -2318,17 +2357,13 @@ fn render_event(
             <p class="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400"><span>"↻"</span><span class="whitespace-pre-wrap">{text.clone()}</span></p>
         }
         .into_any(),
-        EventKind::User { text, attachments, command, prompt, blocked, delegated_by, from_session_id, from_title, .. } => {
+        // From another session's agent (docs/background.md §6).
+        EventKind::User { text, prompt, from_session_id, from_title, .. } if !from_session_id.is_empty() => view! {
+            <SessionMessage from=from_session_id.clone() title=from_title.clone() text=text.clone() prompt=prompt.clone() />
+        }
+        .into_any(),
+        EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } => {
             let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
-            // From another session's agent (docs/background.md §6).
-            let sender = (!from_session_id.is_empty()).then(|| {
-                let (id, title) = (from_session_id.clone(), from_title.clone());
-                view! {
-                    <p class="text-[11px] text-sky-700 dark:text-sky-400">
-                        "✉ from "<Go to=View::session(id) class="hover:underline" stop=true>{if title.is_empty() { "another session".to_owned() } else { title }}</Go>
-                    </p>
-                }
-            });
             // In a subagent: who sent it.
             let from = if !delegated_by.is_empty() {
                 Some("↘ from the agent that started it")
@@ -2357,7 +2392,6 @@ fn render_event(
                 .collect_view();
             view! {
                 <div class="flex flex-col items-end gap-1.5">
-                    {sender}
                     {from.map(|f| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{f}</p> })}
                     {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
                     {(!text.is_empty()).then(|| view! {
@@ -2747,7 +2781,7 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
                     // From the agent that started it, or from you.
                     EventKind::User { text, delegated_by, command, .. } if command != "task-notification" && !text.is_empty() => {
                         let mark = if command == "session-message" {
-                            "✉"
+                            "⇢"
                         } else if delegated_by.is_empty() {
                             "✎"
                         } else {
@@ -2867,7 +2901,19 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             s("input").lines().filter_map(|l| l.strip_prefix("*** ").filter(|r| r.contains("File:"))).collect::<Vec<_>>().join(", ")
         }
         "task" => s("description"),
-        "send_message" | "message_session" => s("message").lines().next().unwrap_or("").to_owned(),
+        "send_message" => s("message").lines().next().unwrap_or("").to_owned(),
+        // To whom (the session's title, when it's in the live list), then what.
+        "message_session" => {
+            let first = s("message").lines().next().unwrap_or("").to_owned();
+            let to = s("to");
+            let title = use_context::<crate::api::LiveFeed>()
+                .and_then(|l| l.sessions.with(|ss| ss.iter().find(|x| x.id == to).map(|x| x.title.clone())))
+                .filter(|t| !t.trim().is_empty());
+            match title {
+                Some(t) => format!("to {t}: {first}"),
+                None => first,
+            }
+        }
         "list_sessions" => s("query"),
         "web_fetch" => s("url"),
         "bash_output" | "kill_shell" => input

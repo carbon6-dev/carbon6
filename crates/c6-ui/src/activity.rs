@@ -437,7 +437,7 @@ fn MissionCard(id: String) -> impl IntoView {
                     }),
                     // From another session's agent, not you.
                     EventKind::User { text, from_title, from_session_id, .. } if !from_session_id.is_empty() => {
-                        Some(format!("✉ {from_title}: {text}"))
+                        Some(format!("From {from_title}: {text}"))
                     }
                     EventKind::User { text, .. } => Some(format!("› {text}")),
                     EventKind::Error { message } => Some(format!("Error: {message}")),
