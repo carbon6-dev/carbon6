@@ -2556,6 +2556,60 @@ pub struct AskAssistant {
     /// carbon6's administration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
+    /// Its connection and model (docs/ask.md §3); none: the assistant's
+    /// (Settings → Assistant). Not Claude Code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Let it read your mail, chat and calendar (docs/ask.md §4): the
+    /// conversation gets [`ASSISTANT_PERSONAL`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub personal: bool,
+}
+
+/// The label that lets an Ask conversation read your mail, chat and
+/// calendar (docs/ask.md §4): it adds [`PERSONAL_KINDS`] to its scope.
+pub const ASSISTANT_PERSONAL: &str = "assistant:personal";
+/// What [`ASSISTANT_PERSONAL`] adds to a conversation's knowledge scope.
+pub const PERSONAL_KINDS: [&str; 3] = ["email", "chat", "event"];
+
+/// `GET /api/v1/assistant/claude`: whether Ask can run on Claude Code here
+/// (`claude` on the head machine's PATH: docs/ask.md §3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AskClaude {
+    pub available: bool,
+    /// Why not, in a few words; empty when available.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+/// `GET /api/v1/assistant/mentionables?q=&realm=`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MentionQuery {
+    /// What you typed after @ (two characters or more).
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub realm: Option<String>,
+}
+
+/// Something to @-mention in an Ask conversation (docs/ask.md §4): read
+/// with your access when the message reaches it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Mentionable {
+    /// `item:<memex id>`, `project:<id>`, `doc:<id>` or `work:<id>`.
+    pub reference: String,
+    pub title: String,
+    /// What it is: a project, a doc, work, or an item's kind (email, chat,
+    /// event, person…).
+    pub kind: String,
+    /// A line more (who it's from, when).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 /// `GET`/`PUT /api/v1/settings/assistant`.

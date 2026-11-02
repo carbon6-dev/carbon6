@@ -166,6 +166,8 @@ pub struct HeadState {
     pub shutdown: CancellationToken,
     /// Its database, PKI and keys (never offered by `files`).
     pub data_dir: std::path::PathBuf,
+    /// HeadConfig's `claude_bin`.
+    pub(crate) claude_bin: Option<std::path::PathBuf>,
     /// The knowledge graph and its store (docs/knowledge.md), in this process.
     pub memex: std::sync::OnceLock<Arc<c6_memex::Memex>>,
     /// Credentials for calls in this process, cleared when a connection changes.
@@ -186,6 +188,11 @@ pub struct HeadState {
 }
 
 impl HeadState {
+    /// The `claude` Ask runs on a Claude Code connection (docs/ask.md §3).
+    pub(crate) fn claude_bin(&self) -> Option<std::path::PathBuf> {
+        self.claude_bin.clone().filter(|p| p.is_file()).or_else(c6_worker::hosted::claude_bin)
+    }
+
     /// The head, shared (none while it is being made or once it stopped).
     pub fn arc(&self) -> Option<Arc<HeadState>> {
         self.me.get()?.upgrade()
@@ -288,6 +295,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         assistant: Default::default(),
         shutdown: shutdown.clone(),
         data_dir: cfg.data_dir.clone(),
+        claude_bin: cfg.claude_bin.clone(),
         memex: Default::default(),
         local_link: Default::default(),
         updates: updater,

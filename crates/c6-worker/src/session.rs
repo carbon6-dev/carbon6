@@ -2429,6 +2429,7 @@ impl Actor {
                     system_prompt: bridge_prompt,
                     tools: bridge_names,
                     worker: c6_core::build().to_owned(),
+                    extra_args: Vec::new(),
                 };
                 let process = claude.take();
                 let result = claude_turn(

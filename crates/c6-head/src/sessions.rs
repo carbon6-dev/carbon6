@@ -256,17 +256,41 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
     // The realm it works in: the one you are looking at, else root (all
     // realms, with administration).
     let realm = req.realm.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or(crate::realms::ROOT).to_owned();
-    let (connection_id, model) = crate::assistant::model(st, &realm).await?;
+    // The model you picked for it, else the assistant's.
+    let picked = req.connection.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let (connection_id, model) = match picked {
+        Some(c) => {
+            let row = st
+                .store
+                .connections()
+                .await?
+                .into_iter()
+                .find(|x| x.id == c || x.name == c)
+                .ok_or_else(|| bad_request(format!("no connection {c:?}")))?;
+            let model = req.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned).or(row.default_model.clone());
+            match model {
+                Some(m) => (row.id, m),
+                None => route_for(st, &row.id, "", &[crate::assistant::LABEL.to_owned()]).await?,
+            }
+        }
+        None => crate::assistant::model(st, &realm).await?,
+    };
     let connection = st.store.connection(&connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
-    if connection.kind == "claude_code" {
+    if connection.kind == "claude_code" && st.claude_bin().is_none() {
         return Err(bad_request(
-            "the assistant calls models directly: choose an API connection for it (Settings → Assistant), not Claude Code",
+            "Ask on Claude Code runs `claude` on the head's machine, and it isn't on its PATH there: install it and sign in, or pick another model",
         ));
+    }
+    if picked.is_some() && !crate::realms::available(&connection.realms, &realm) {
+        return Err(bad_request(format!("the connection {} is not available to realm {realm}", connection.name)));
     }
     if !crate::realms::exists(st, &realm).await? || realm == crate::realms::COMMONS {
         return Err(bad_request(format!("no realm {realm:?} for the assistant")));
     }
-    let labels = vec![crate::assistant::LABEL.to_owned()];
+    let mut labels = vec![crate::assistant::LABEL.to_owned()];
+    if req.personal {
+        labels.push(api::ASSISTANT_PERSONAL.to_owned());
+    }
     if let Some(why) = crate::usage::blocked(st, &labels, &realm).await? {
         return Err(bad_request(format!("not started: {why}")));
     }
@@ -1452,7 +1476,8 @@ async fn model_switch(
         } else if !session.ssh_target.is_empty() {
             Some("Claude Code runs on the worker itself, not over SSH: this session works on another machine".to_owned())
         } else if worker.is_some() && worker == st.assistant.head_id() {
-            Some("the assistant calls models directly, not through Claude Code".to_owned())
+            // Ask runs Claude Code on the head's machine (docs/ask.md §3).
+            st.claude_bin().is_none().then(|| "Claude Code (`claude`) is not on the head machine's PATH".to_owned())
         } else {
             // A connected worker says whether it has Claude Code; one that
             // is away gets the switch with the message, and says so then.

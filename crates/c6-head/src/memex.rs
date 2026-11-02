@@ -449,6 +449,10 @@ async fn accounts_by_realm(st: &HeadState) -> Value {
 /// The kinds a session with `labels` may see.
 pub async fn scope_for(st: &HeadState, labels: &[String]) -> Vec<String> {
     let mut kinds: Vec<String> = api::MEMEX_DEFAULT_SCOPE.iter().map(|k| k.to_string()).collect();
+    // An Ask conversation you let read your mail, chat and calendar.
+    if labels.iter().any(|l| l == api::ASSISTANT_PERSONAL) {
+        kinds.extend(api::PERSONAL_KINDS.iter().map(|k| k.to_string()));
+    }
     for s in scopes(st).await.unwrap_or_default() {
         if s.enabled && api::labels::applies(&s.applies_to, labels) {
             for k in s.kinds {

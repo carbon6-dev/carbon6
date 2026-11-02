@@ -704,12 +704,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     }.into_any(),
                     None => {
                         let row = detail.get().and_then(|d| d.ok()).map(|d| d.session);
-                        // Claude Code runs on the worker itself, not over SSH.
+                        // Claude Code runs on the worker itself, not over SSH;
+                        // Ask runs it on the head's machine, if it has it.
                         let no_claude_code = row.as_ref().is_some_and(|s| s.ssh.is_some());
+                        let ask = row.as_ref().is_some_and(|s| s.on_head);
                         let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
                         let subagents = SubagentChoice::follow(events, start, choice.current);
                         view! {
-                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files subagents no_claude_code />
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files subagents no_claude_code ask />
                         }.into_any()
                     }
                 }
@@ -1723,11 +1725,15 @@ fn picker_model(kind: &str, default: Option<String>) -> String {
 /// and also takes free text. `no_claude_code`: leave Claude Code out (it
 /// cannot run there, e.g. over SSH or for subagents).
 #[component]
-fn ModelPicker(
+pub(crate) fn ModelPicker(
     connection: RwSignal<String>,
     model: RwSignal<String>,
     effort: RwSignal<String>,
     #[prop(optional)] no_claude_code: bool,
+    /// Why Claude Code can't run here (Ask on a head without `claude`):
+    /// its connections are shown, not chosen.
+    #[prop(optional)]
+    claude_off: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     // Effort only where the connection passes it on to the model.
@@ -1748,7 +1754,12 @@ fn ModelPicker(
                 .filter(|c| !(no_claude_code && c.kind == "claude_code") || connection.get_untracked() == c.id)
                 .map(|c| {
                 let id = c.id.clone();
-                view! { <option value=c.id.clone() selected=move || connection.get() == id>{crate::quota::option_label(&c.id, &c.name)}</option> }
+                let off = (c.kind == "claude_code").then(|| claude_off.and_then(|o| o.get())).flatten();
+                let label = match &off {
+                    Some(why) => format!("{} — {why}", c.name),
+                    None => crate::quota::option_label(&c.id, &c.name),
+                };
+                view! { <option value=c.id.clone() disabled=off.is_some() selected=move || connection.get() == id>{label}</option> }
             }).collect_view()}
         </select>
         <crate::quota::QuotaNote connection />
@@ -3220,6 +3231,9 @@ enum Suggestion {
     File(String, bool),
     /// A thing in the memex: (what to insert after @memex:, kind, name).
     Thing(String, String, String),
+    /// For Ask (docs/ask.md §4): (title, kind, reference): a project, doc,
+    /// work, or any memex item, read when the message reaches it.
+    Ref(String, String, String),
     Command(c6_api::CommandInfo),
 }
 
@@ -3256,8 +3270,15 @@ fn Composer(
     /// Leave Claude Code out of the model picker (an SSH session).
     #[prop(optional)]
     no_claude_code: bool,
+    /// An Ask conversation: @ also offers projects, docs, work and your
+    /// mail, chat and calendar (docs/ask.md §4).
+    #[prop(optional)]
+    ask: bool,
 ) -> impl IntoView {
     let subagent_id = StoredValue::new(id.clone());
+    // In Ask, Claude Code runs on the head's machine: why it can't, if so.
+    let claude_check = LocalResource::new(move || async move { if ask { api::ask_claude().await.ok() } else { None } });
+    let claude_off = Signal::derive(move || claude_check.get().flatten().and_then(|c| (!c.available).then_some(c.reason)));
     // Connection kinds: a switch into or out of Claude Code is a handoff.
     let kinds = LocalResource::new(api::connections);
     let text = RwSignal::new(String::new());
@@ -3333,6 +3354,16 @@ fn Composer(
             }
         }
     });
+    // In Ask: your projects, docs, work, and memex items of any kind.
+    let refs = LocalResource::new(move || {
+        let q = mention.get().map(|(_, q)| q).filter(|q| ask && q.chars().count() >= 2);
+        async move {
+            match q {
+                Some(q) => api::ask_mentionables(q).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+    });
     // Slash commands: the query, and the commands the head offers.
     let command = RwSignal::new(None::<String>);
     let commands = LocalResource::new(move || async move {
@@ -3356,6 +3387,7 @@ fn Composer(
                 let key = if t.label.is_empty() { t.id.clone() } else { t.label.clone() };
                 Suggestion::Thing(key, t.kind, t.name)
             }));
+            list.extend(refs.get().unwrap_or_default().into_iter().take(10).map(|m| Suggestion::Ref(m.title, m.kind, m.reference)));
             list
         } else {
             Vec::new()
@@ -3394,6 +3426,24 @@ fn Composer(
         let chars: Vec<char> = t.chars().collect();
         let end = (at + 1 + query.chars().count()).min(chars.len());
         let insert = format!("@{path}{} ", if dir { "/" } else { "" });
+        let new: String = chars[..at].iter().collect::<String>() + &insert + &chars[end..].iter().collect::<String>();
+        let caret = (at + insert.chars().count()) as u32;
+        text.set(new);
+        mention.set(None);
+        request_animation_frame(move || {
+            if let Some(el) = area.get_untracked() {
+                let _ = el.focus();
+                let _ = el.set_selection_range(caret, caret);
+            }
+        });
+    };
+    // A reference for Ask, as a link the head reads when it arrives.
+    let complete_ref = move |title: String, reference: String| {
+        let Some((at, query)) = mention.get_untracked() else { return };
+        let t = text.get_untracked();
+        let chars: Vec<char> = t.chars().collect();
+        let end = (at + 1 + query.chars().count()).min(chars.len());
+        let insert = format!("[@{}](c6:{reference}) ", title.replace(['[', ']'], ""));
         let new: String = chars[..at].iter().collect::<String>() + &insert + &chars[end..].iter().collect::<String>();
         let caret = (at + insert.chars().count()) as u32;
         text.set(new);
@@ -3634,6 +3684,15 @@ fn Composer(
                                                 </button>
                                             }.into_any()
                                         }
+                                        Suggestion::Ref(title, kind, reference) => {
+                                            let (t2, r2) = (title.clone(), reference.clone());
+                                            view! {
+                                                <button class=row on:mousedown=move |ev| { ev.prevent_default(); complete_ref(t2.clone(), r2.clone()); }>
+                                                    <span class="rounded bg-sky-100 px-1 text-[10px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">{kind}</span>
+                                                    <span class="ml-1">{title}</span>
+                                                </button>
+                                            }.into_any()
+                                        }
                                         Suggestion::Command(c) => {
                                             let n2 = c.name.clone();
                                             view! {
@@ -3688,6 +3747,7 @@ fn Composer(
                                         match s {
                                             Suggestion::File(path, dir) => complete(path, dir),
                                             Suggestion::Thing(key, _, _) => complete(format!("memex:{key}"), false),
+                                            Suggestion::Ref(title, _, reference) => complete_ref(title, reference),
                                             // Enter on a command already typed in full sends it.
                                             Suggestion::Command(c) if crate::util::sends(&ev) && command.get_untracked().as_deref() == Some(c.name.as_str()) => {
                                                 ev.prevent_default();
@@ -3799,7 +3859,7 @@ fn Composer(
                                 {match which {
                                     "model" => model.map(|m| view! {
                                         <div class="font-medium">"Model"</div>
-                                        <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code /></div>
+                                        <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>
                                         {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
                                             <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-zinc-500 dark:text-zinc-400">{title}</span> })}</p>
                                         })}

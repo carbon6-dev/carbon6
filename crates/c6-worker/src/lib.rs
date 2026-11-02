@@ -7,6 +7,7 @@ pub mod commands;
 pub mod conn;
 pub mod enroll;
 pub mod hooks;
+pub mod hosted;
 pub mod identity;
 pub mod imports;
 pub mod journal;

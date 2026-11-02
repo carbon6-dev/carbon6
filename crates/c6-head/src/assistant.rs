@@ -170,7 +170,12 @@ fn dispatch(st: &Arc<HeadState>, cmd: SessionCommand) {
 /// What a question or an approval waits for.
 enum Reply {
     Approve(bool),
-    Answer { values: serde_json::Map<String, Value>, cancelled: bool },
+    Answer {
+        values: serde_json::Map<String, Value>,
+        cancelled: bool,
+    },
+    /// A subagent the conversation started (`c6_delegate`) ended its turn.
+    Delegation(c6_proto::DelegationEnded),
 }
 
 type Waiters = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
@@ -215,6 +220,8 @@ struct Actor {
     env: Arc<Env>,
     /// What the model is told when the conversation is compacted.
     compact: c6_agent::CompactPrompts,
+    /// Its Claude Code process, on a Claude Code connection (docs/ask.md §3).
+    claude: Arc<tokio::sync::Mutex<c6_worker::hosted::HostedClaude>>,
 }
 
 impl Actor {
@@ -275,6 +282,7 @@ impl Actor {
             turns,
             inbox: Arc::default(),
             env,
+            claude: Arc::default(),
         };
         let mut running: Option<(tokio::task::JoinHandle<Option<Conversation>>, CancellationToken)> = None;
         loop {
@@ -321,7 +329,7 @@ impl Actor {
                         model: Some(self.model.clone()),
                         cwd: String::new(),
                         system_prompt: self.system_prompt.clone(),
-                        tools: self.env.tools().iter().map(|t| t.spec().name).collect(),
+                        tools: self.env.tools(Vec::new()).iter().map(|t| t.spec().name).collect(),
                         tool_profile: "assistant".into(),
                         context_window,
                         title: String::new(),
@@ -345,10 +353,13 @@ impl Actor {
                     }
                     self.model = m;
                 }
+                // What you @-mentioned, read with your access (docs/ask.md §4).
+                let prompt = with_mentions(&self.st, &self.env.realm, &input.text).await;
                 self.inbox.lock().unwrap().push(PendingInput {
                     command_id: cmd.command_id,
                     text: input.text,
                     attachments: input.attachments,
+                    prompt,
                     ..Default::default()
                 });
                 if running.is_none() {
@@ -369,6 +380,32 @@ impl Actor {
                 if let Some(w) = self.env.waiters.lock().unwrap().remove(&a.call_id) {
                     let values = serde_json::from_str(&a.values_json).unwrap_or_default();
                     let _ = w.send(Reply::Answer { values, cancelled: a.cancelled });
+                }
+            }
+            // A subagent it started ended a turn: the call waiting on it
+            // gets the report; with nobody waiting (the head restarted), the
+            // report starts a turn so it isn't lost (docs/ask.md §2).
+            Some(session_command::Kind::DelegationEnded(d)) => {
+                if !self.applied.insert(cmd.command_id.clone()) {
+                    return Ok(());
+                }
+                let waiter = self.env.waiters.lock().unwrap().remove(&d.call_id);
+                match waiter {
+                    Some(w) => {
+                        let _ = w.send(Reply::Delegation(d));
+                    }
+                    None if !d.call_id.is_empty() => {
+                        self.inbox.lock().unwrap().push(PendingInput {
+                            command_id: cmd.command_id,
+                            text: report_text(&d),
+                            command: "task-notification".into(),
+                            ..Default::default()
+                        });
+                        if running.is_none() {
+                            *running = Some(self.start_turn());
+                        }
+                    }
+                    None => {}
                 }
             }
             Some(_) => {
@@ -408,6 +445,18 @@ impl Actor {
         sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
         let session_id = self.session_id.clone();
         let model = self.model.clone();
+        if model.connection_kind == "claude_code" {
+            let (claude, system_prompt) = (self.claude.clone(), self.system_prompt.clone());
+            let task = tokio::spawn(async move {
+                let result = claude_turn(&st, &env, &sink, &inbox, &claude, turn, &model, &system_prompt, &c).await;
+                if let Err(e) = result {
+                    warn!(session = %session_id, "assistant turn on Claude Code failed: {e:#}");
+                }
+                // Its conversation is rebuilt from the log.
+                None
+            });
+            return (task, cancel);
+        }
         let task = tokio::spawn(async move {
             cfg.context_window = crate::pools::context_window(&st, &model, &env.realm).await;
             let dyn_sink: Arc<dyn EventSink> = sink.clone();
@@ -442,7 +491,9 @@ impl Actor {
                         return anyhow::Ok(());
                     }
                 };
-                let tools = env.tools();
+                // Where it may delegate: the templates agents may start.
+                let templates = crate::templates::for_subagents(&st, &env.realm, "").await;
+                let tools = env.tools(templates);
                 let session_tools = Arc::new(SessionTools::new(std::env::temp_dir()));
                 session_tools.set_head(Some(Arc::new(HeadCalls { env: env.clone() })));
                 let mut pending = || std::mem::take(&mut *inbox.lock().unwrap());
@@ -459,6 +510,89 @@ impl Actor {
             }
         });
         (task, cancel)
+    }
+}
+
+/// What Claude Code is told about the conversation's MCP server; its
+/// system prompt carries Ask's instructions.
+const CLAUDE_INSTRUCTIONS: &str = "carbon6's operations for this conversation: c6_discover, c6_describe, c6_call, c6_ask, c6_delegate.";
+
+/// A turn on Claude Code, run on the head's machine with Ask's tools only.
+#[allow(clippy::too_many_arguments)]
+async fn claude_turn(
+    st: &Arc<HeadState>,
+    env: &Arc<Env>,
+    sink: &Arc<Sink>,
+    inbox: &Arc<Mutex<Vec<PendingInput>>>,
+    claude: &Arc<tokio::sync::Mutex<c6_worker::hosted::HostedClaude>>,
+    turn: u64,
+    model: &c6_proto::ModelSpec,
+    system_prompt: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let inputs: Vec<PendingInput> = std::mem::take(&mut *inbox.lock().unwrap());
+    let templates = crate::templates::for_subagents(st, &env.realm, "").await;
+    let tools = env.tools(templates);
+    let session_tools = Arc::new(SessionTools::new(std::env::temp_dir()));
+    session_tools.set_head(Some(Arc::new(HeadCalls { env: env.clone() })));
+    // A folder of its own, empty: no project's instructions are read.
+    let cwd = st.data_dir.join("assistant").join(&env.session_id);
+    std::fs::create_dir_all(&cwd)?;
+    // Earlier turns (perhaps on another model), for a new Claude Code
+    // conversation.
+    let preamble = if turn > 1 {
+        let events = st.store.events_after(&env.session_id, 0, i64::MAX).await?;
+        Some(c6_agent::handoff_context(&events, "carbon6's assistant", c6_agent::HANDOFF_BUDGET))
+    } else {
+        None
+    };
+    let dyn_sink: Arc<dyn EventSink> = sink.clone();
+    let log: Arc<dyn c6_worker::hosted::EventLog> = Arc::new(StoreLog { st: st.clone() });
+    let mut c = claude.lock().await;
+    let result = c
+        .turn(c6_worker::hosted::HostedTurn {
+            bin: st.claude_bin(),
+            turn,
+            inputs,
+            session_id: &env.session_id,
+            resume: turn > 1,
+            preamble,
+            model: &model.model,
+            effort: Some(model.effort.clone()).filter(|e| !e.is_empty()),
+            system_prompt: system_prompt.to_owned(),
+            tools,
+            instructions: CLAUDE_INSTRUCTIONS.into(),
+            log,
+            session_tools,
+            cwd: &cwd,
+            sink: &dyn_sink,
+            cancel,
+        })
+        .await;
+    drop(c);
+    // Closed once idle with no turn since, as a worker's Claude Code is
+    // (the next turn starts it again, resuming).
+    let (idle, closer) = (c6_worker::claude_code::IDLE, claude.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(idle).await;
+        let mut c = closer.lock().await;
+        if c.last_turn() == turn {
+            c.close_if_idle().await;
+        }
+    });
+    result
+}
+
+/// The head's copy of a conversation's log, for the MCP bridge to match
+/// Claude Code's tool calls.
+struct StoreLog {
+    st: Arc<HeadState>,
+}
+
+#[async_trait]
+impl c6_worker::hosted::EventLog for StoreLog {
+    async fn events(&self, session_id: &str) -> Vec<c6_proto::SessionEvent> {
+        self.st.store.events_after(session_id, 0, i64::MAX).await.unwrap_or_default()
     }
 }
 
@@ -481,14 +615,24 @@ struct Env {
 }
 
 impl Env {
-    fn tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
-        let mut tools: Vec<Arc<dyn Tool>> =
-            vec![Arc::new(Discover), Arc::new(Describe), Arc::new(Call { env: self.clone() }), Arc::new(Ask { env: self.clone() })];
+    fn tools(self: &Arc<Self>, templates: Vec<api::SubagentTemplate>) -> Vec<Arc<dyn Tool>> {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(Discover),
+            Arc::new(Describe),
+            Arc::new(Call { env: self.clone() }),
+            Arc::new(Ask { env: self.clone() }),
+            Arc::new(Delegate { env: self.clone(), templates }),
+        ];
         if crate::memex::ready(&self.st) {
             tools.push(Arc::new(c6_tools::memex::MemexSearch::new(false)));
             tools.push(Arc::new(c6_tools::memex::MemexGet::new(false)));
         }
         tools
+    }
+
+    /// Its labels as they are now (they can change while it runs).
+    async fn labels_now(&self) -> Vec<String> {
+        self.st.store.session(&self.session_id).await.ok().flatten().map(|r| r.all_labels()).unwrap_or_else(|| self.labels.clone())
     }
 
     /// Starts listening for your answer to `call_id`. Called before the
@@ -646,7 +790,10 @@ impl Tool for Call {
         let st = &self.env.st;
         // What it reads of the memex (mail, chat, calendars, contacts…) is
         // this conversation's scope, as for its memex tools.
-        let scope = crate::memex::scope_for(st, &self.env.labels).await;
+        // As they are now: the conversation's switch for your mail, chat and
+        // calendar can change between calls.
+        let labels = self.env.labels_now().await;
+        let scope = crate::memex::scope_for(st, &labels).await;
         let mut ask: Option<(String, String)> = None;
         if op.effect == Effect::Destructive {
             ask = Some(("assistant: destructive operations".into(), format!("{}: {}", op.name, op.summary)));
@@ -659,7 +806,7 @@ impl Tool for Call {
                 Err(e) => return ToolOutput::err(format!("could not read the current list: {e:#}")),
             }
         }
-        match policy_for(st, &self.env.labels, &shown).await {
+        match policy_for(st, &labels, &shown).await {
             Some(p) if p.action == "deny" => {
                 return ToolOutput::err(format!(
                     "denied by policy {}{}",
@@ -975,6 +1122,326 @@ impl Tool for Ask {
 }
 
 /// A list operation's items as choices.
+/// Work on a machine (docs/ask.md §2): a remote subagent from one of the
+/// templates agents may start, waited on until its turn ends.
+struct Delegate {
+    env: Arc<Env>,
+    templates: Vec<api::SubagentTemplate>,
+}
+
+#[async_trait]
+impl Tool for Delegate {
+    fn spec(&self) -> ToolSpec {
+        let list = if self.templates.is_empty() {
+            "None yet: the user adds one in Settings → Templates and ticks \"Agents may start it\" (a worker, folder and model).".to_owned()
+        } else {
+            self.templates
+                .iter()
+                .map(|t| {
+                    let mut line = format!("- {}: {} (on {}", t.name, t.description, t.place);
+                    if !t.model.is_empty() {
+                        line.push_str(&format!("; {}", t.model));
+                    }
+                    if !t.targets.is_empty() {
+                        line.push_str(&format!("; on is one of {}", t.targets.join(", ")));
+                    }
+                    line.push(')');
+                    line
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        ToolSpec {
+            name: "c6_delegate".into(),
+            description: format!(
+                "Starts a subagent on one of the user's machines and waits for its report: for what needs a machine (running commands, \
+                 tests or builds, reading a repository in depth). It runs one of the templates the user lets agents start, which says \
+                 where (worker, folder) and on which model; you can't pick another place. prompt is all the subagent sees: make it \
+                 stand alone. Its report comes back as this call's result.\nTemplates:\n{list}"
+            ),
+            parameters: json!({"type": "object", "properties": {
+                "template": {"type": "string", "description": "The template's name"},
+                "on": {"type": "string", "description": "Which of its places, for a template with several"},
+                "prompt": {"type": "string", "description": "The task, standing on its own"},
+                "description": {"type": "string", "description": "A few words for its thread"}
+            }, "required": ["template", "prompt"], "additionalProperties": false}),
+        }
+    }
+
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Shared
+    }
+
+    async fn call(&self, ctx: &ToolCtx, input: Value) -> ToolOutput {
+        let s = |k: &str| input[k].as_str().unwrap_or_default().trim().to_owned();
+        let (template, on, prompt) = (s("template"), s("on"), s("prompt"));
+        let description = Some(s("description")).filter(|d| !d.is_empty()).unwrap_or_else(|| template.clone());
+        if template.is_empty() || prompt.is_empty() {
+            return ToolOutput::err("template and prompt are required");
+        }
+        let st = &self.env.st;
+        let row = match st.store.session(&self.env.session_id).await {
+            Ok(Some(r)) => r,
+            _ => return ToolOutput::err("this conversation is gone"),
+        };
+        // Listening before it starts, so a quick report isn't missed.
+        let rx = self.env.listen(&ctx.call_id);
+        let req = crate::templates::SubagentStart {
+            template: &template,
+            on: &on,
+            prompt: &prompt,
+            description: &description,
+            call_id: &ctx.call_id,
+            depth: 0,
+        };
+        let (child, remote) = match crate::templates::start_subagent(st, &row, &req).await {
+            Ok(x) => x,
+            Err(e) => {
+                self.env.waiters.lock().unwrap().remove(&ctx.call_id);
+                return ToolOutput::err(format!("{e:#}"));
+            }
+        };
+        let spawned = session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+            call_id: ctx.call_id.clone(),
+            child_session_id: child.id.clone(),
+            agent: String::new(),
+            description: description.clone(),
+            background_task_id: String::new(),
+            model: Some(c6_proto::ModelSpec {
+                connection_id: child.connection_id.clone(),
+                model: child.model.clone(),
+                effort: child.effort.clone().unwrap_or_default(),
+                ..Default::default()
+            }),
+            remote: Some(c6_proto::RemoteSubagent {
+                template: remote.template.clone(),
+                worker_id: remote.worker_id.clone(),
+                worker_name: remote.worker_name.clone(),
+                target: remote.target.clone(),
+                cwd: remote.cwd.clone(),
+            }),
+        });
+        if let Err(e) = self.env.sink.append(spawned).await {
+            warn!(session = %self.env.session_id, "recording a delegation: {e:#}");
+        }
+        // Until its turn ends, or you stop the conversation (it stops too).
+        let reply = tokio::select! {
+            r = rx => r.ok(),
+            _ = ctx.cancel.cancelled() => None,
+        };
+        self.env.waiters.lock().unwrap().remove(&ctx.call_id);
+        match reply {
+            Some(Reply::Delegation(d)) => {
+                let text = report_text(&d);
+                if d.reason == c6_proto::TurnEndReason::Completed as i32 { ToolOutput::ok(text) } else { ToolOutput::err(text) }
+            }
+            _ => {
+                let _ = crate::sessions::interrupt(st, &child.id).await;
+                ToolOutput::err(format!("stopped before {} reported (its session: {})", remote.worker_name, child.id))
+            }
+        }
+    }
+}
+
+/// A subagent's report as the conversation hears it.
+fn report_text(d: &c6_proto::DelegationEnded) -> String {
+    let reason = c6_proto::TurnEndReason::try_from(d.reason).unwrap_or(c6_proto::TurnEndReason::Unspecified);
+    let status = match reason {
+        c6_proto::TurnEndReason::Completed => "completed",
+        c6_proto::TurnEndReason::Interrupted => "interrupted",
+        c6_proto::TurnEndReason::WorkerRestarted => "lost",
+        _ => "failed",
+    };
+    let mut s = format!("<subagent-report session=\"{}\" status=\"{status}\">\n", d.child_session_id);
+    if !d.report.trim().is_empty() {
+        s.push_str(d.report.trim());
+        s.push('\n');
+    }
+    if !d.digest.trim().is_empty() {
+        s.push_str(d.digest.trim());
+        s.push('\n');
+    }
+    s.push_str("</subagent-report>");
+    s
+}
+
+/// The most of one mentioned item the model is given.
+const MENTION_CHARS: usize = 8_000;
+
+/// Your message with what it @-mentions after it (docs/ask.md §4): each
+/// `c6:<ref>` link read with your access, only that item; "" when it
+/// mentions nothing (the text goes as it is).
+pub async fn with_mentions(st: &HeadState, realm: &str, text: &str) -> String {
+    let refs = mention_refs(text);
+    if refs.is_empty() {
+        return String::new();
+    }
+    let mut out = text.to_owned();
+    for r in refs {
+        let (kind, title, body) = match read_mention(st, realm, &r).await {
+            Ok(x) => x,
+            Err(e) => (String::new(), String::new(), format!("(could not read it: {e:#})")),
+        };
+        let body: String =
+            if body.chars().count() > MENTION_CHARS { body.chars().take(MENTION_CHARS).collect::<String>() + "\n…" } else { body };
+        out.push_str(&format!(
+            "\n\n<mentioned ref=\"{r}\" kind=\"{kind}\" title=\"{}\" by=\"you\">\n{}\n</mentioned>",
+            title.replace('"', "'"),
+            body.trim()
+        ));
+    }
+    out
+}
+
+/// The `c6:<ref>` links in a message, each once, in order.
+pub fn mention_refs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices("(c6:") {
+        let rest = &text[i + 4..];
+        let Some(end) = rest.find(')') else { continue };
+        let r = rest[..end].trim();
+        let known = ["item:", "project:", "doc:", "work:"].iter().any(|p| r.strip_prefix(p).is_some_and(|id| !id.is_empty()));
+        if known && !r.contains(char::is_whitespace) && !out.iter().any(|o| o == r) {
+            out.push(r.to_owned());
+        }
+    }
+    out
+}
+
+/// One mentioned thing: (kind, title, text).
+async fn read_mention(st: &HeadState, realm: &str, r: &str) -> anyhow::Result<(String, String, String)> {
+    let (what, id) = r.split_once(':').ok_or_else(|| anyhow::anyhow!("not a reference"))?;
+    let realm_arg = Some(realm).filter(|r| *r != crate::realms::ROOT);
+    let run = async |op: &str, args: Value| -> anyhow::Result<Value> {
+        let op = catalog::find(op).ok_or_else(|| anyhow::anyhow!("no operation {op}"))?;
+        execute(st, op, args, "assistant", realm_arg).await
+    };
+    let str_at = |v: &Value, path: &str| v.pointer(path).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match what {
+        // Any kind: you mentioned it, so your mail, chat and calendar too.
+        "item" => {
+            let all: Vec<String> = api::MEMEX_KINDS.iter().map(|k| k.to_string()).collect();
+            let v = crate::memex::SCOPE.scope(all, run("memex.get", json!({"id": id}))).await?;
+            let item = if v["item"].is_object() { &v["item"] } else { &v };
+            let kind = str_at(item, "/kind");
+            let title = [str_at(item, "/title"), str_at(item, "/subject"), str_at(item, "/name")]
+                .into_iter()
+                .find(|t| !t.is_empty())
+                .unwrap_or_default();
+            let mut body = String::new();
+            for k in ["from", "author", "date", "when", "starts_at"] {
+                if let Some(x) = item.get(k).filter(|x| !x.is_null()) {
+                    body.push_str(&format!("{k}: {}\n", x.as_str().map(str::to_owned).unwrap_or_else(|| x.to_string())));
+                }
+            }
+            let text = [str_at(item, "/text"), str_at(item, "/body"), str_at(item, "/content"), str_at(item, "/summary")]
+                .into_iter()
+                .find(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| serde_json::to_string_pretty(item).unwrap_or_default());
+            body.push_str(&text);
+            Ok((kind, title, body))
+        }
+        "project" => {
+            let v = run("projects.get", json!({"id": id})).await?;
+            let mut body = format!("Purpose: {}\n", str_at(&v, "/purpose"));
+            let note = str_at(&v, "/note/text");
+            if !note.is_empty() {
+                body.push_str(&format!("Where it stands: {note}\n"));
+            }
+            for w in v["work"].as_array().into_iter().flatten() {
+                body.push_str(&format!("- work {}: {} ({})\n", str_at(w, "/id"), str_at(w, "/title"), str_at(w, "/state")));
+            }
+            Ok(("project".into(), str_at(&v, "/title"), body))
+        }
+        "work" => {
+            let v = run("work.get", json!({"id": id})).await?;
+            let mut body = format!("Done when: {}\nState: {} {}\n", str_at(&v, "/done_when"), str_at(&v, "/state"), str_at(&v, "/why"));
+            let note = str_at(&v, "/note/text");
+            if !note.is_empty() {
+                body.push_str(&format!("Where it stands: {note}\n"));
+            }
+            for t in v.pointer("/todos").and_then(Value::as_array).into_iter().flatten() {
+                let done = t.get("done_at").is_some_and(|d| !d.is_null());
+                body.push_str(&format!("- [{}] {}\n", if done { "x" } else { " " }, str_at(t, "/text")));
+            }
+            Ok(("work".into(), str_at(&v, "/title"), body))
+        }
+        "doc" => {
+            let v = run("docs.get", json!({"id": id})).await?;
+            let mut body = String::new();
+            for tab in v["tabs"].as_array().into_iter().flatten() {
+                for b in tab["blocks"].as_array().into_iter().flatten() {
+                    let md = str_at(b, "/markdown");
+                    if !md.is_empty() {
+                        body.push_str(&md);
+                        body.push_str("\n\n");
+                    }
+                }
+            }
+            Ok((str_at(&v, "/kind"), str_at(&v, "/title"), body))
+        }
+        _ => Err(anyhow::anyhow!("unknown reference")),
+    }
+}
+
+/// What @ offers in an Ask conversation for `q` (docs/ask.md §4): your
+/// projects, docs and work by title, and the memex's items of any kind,
+/// your mail, chat and calendar included (you are the one asking).
+pub async fn mentionables(st: &HeadState, realm: &str, q: &str) -> anyhow::Result<Vec<api::Mentionable>> {
+    let q = q.trim();
+    if q.chars().count() < 2 {
+        return Ok(Vec::new());
+    }
+    let needle = q.to_lowercase();
+    let realm_arg = Some(realm).filter(|r| *r != crate::realms::ROOT);
+    let run = async |op: &str, args: Value| -> Value {
+        match catalog::find(op) {
+            Some(op) => execute(st, op, args, "assistant", realm_arg).await.unwrap_or(Value::Null),
+            None => Value::Null,
+        }
+    };
+    let mut out = Vec::new();
+    let title_of = |v: &Value| v.get("title").and_then(Value::as_str).unwrap_or_default().to_owned();
+    for (op, what) in [("projects.list", "project"), ("work.list", "work"), ("docs.list", "doc")] {
+        let v = run(op, json!({})).await;
+        let list =
+            v.as_array().cloned().or_else(|| v["items"].as_array().cloned()).or_else(|| v["docs"].as_array().cloned()).unwrap_or_default();
+        for x in list.iter().filter(|x| title_of(x).to_lowercase().contains(&needle)).take(5) {
+            let id = x["id"].as_str().unwrap_or_default();
+            if id.is_empty() {
+                continue;
+            }
+            let kind = if what == "doc" { x["kind"].as_str().unwrap_or("doc").to_owned() } else { what.to_owned() };
+            out.push(api::Mentionable { reference: format!("{what}:{id}"), title: title_of(x), kind, detail: String::new() });
+        }
+    }
+    let all: Vec<String> = api::MEMEX_KINDS.iter().map(|k| k.to_string()).collect();
+    let found = crate::memex::SCOPE.scope(all, run("memex.search", json!({"q": q, "limit": 10}))).await;
+    let hits = found
+        .as_array()
+        .cloned()
+        .or_else(|| found["hits"].as_array().cloned())
+        .or_else(|| found["results"].as_array().cloned())
+        .or_else(|| found["items"].as_array().cloned())
+        .unwrap_or_default();
+    for h in hits.iter().take(10) {
+        let item = if h["item"].is_object() { &h["item"] } else { h };
+        let id = item["id"].as_str().map(str::to_owned).or_else(|| item["id"].as_i64().map(|n| n.to_string())).unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let title = ["title", "subject", "name"].iter().filter_map(|k| item[*k].as_str()).find(|t| !t.is_empty()).unwrap_or("(untitled)");
+        let detail = ["from", "author", "date"].iter().filter_map(|k| item[*k].as_str()).collect::<Vec<_>>().join(" · ");
+        out.push(api::Mentionable {
+            reference: format!("item:{id}"),
+            title: title.to_owned(),
+            kind: item["kind"].as_str().unwrap_or("item").to_owned(),
+            detail,
+        });
+    }
+    Ok(out)
+}
+
 async fn choices(st: &HeadState, op: &str, input: Value, realm: &str) -> anyhow::Result<Vec<api::Choice>> {
     let op = catalog::find(op).ok_or_else(|| anyhow::anyhow!("no operation {op}"))?;
     anyhow::ensure!(op.effect == Effect::Read, "{} is not a read operation", op.name);
@@ -1020,8 +1487,14 @@ drafting, vision, transcription) in settings.memex, yourself in settings.assista
 every realm. In any other realm you see and change only that realm's sessions, collections, decisions, triggers, views, series and \
 knowledge, and administration is refused: for that, the user opens the assistant with \"All realms\". Never act in another realm; \
 when this realm needs another's data, suggest a grant.
-- You cannot run commands or read files yourself. For work on a machine, start a session on a worker (sessions.create) and \
-tell the user; for something recurring, create a trigger or workflow.
+- You cannot run commands yourself. For work on a machine (running tests, builds, commands, reading a repository in depth), \
+use c6_delegate: it runs one of the templates the user lets agents start and waits for its report, which you then answer from. \
+With no template for the place, tell the user to add one (Settings → Templates, \"Agents may start it\"). For a quick look at a \
+file or the git state on a worker, the workers' file and git operations do. For something recurring, create a trigger or workflow.
+- The user may just want to talk: answer from what you know, and use operations only when the question is about their setup or \
+asks for something done.
+- What the user @-mentions comes after their message in <mentioned> blocks, read for this conversation only: use it, and say \
+where an answer came from.
 
 Areas of carbon6:
 {{areas}}
@@ -1068,8 +1541,8 @@ pub async fn check_settings(st: &HeadState, s: &api::AssistantSettings) -> anyho
             .iter()
             .find(|c| c.id == m.connection || c.name == m.connection)
             .ok_or_else(|| bad_request(format!("no connection {:?}", m.connection)))?;
-        if c.kind == "claude_code" {
-            return Err(bad_request("the assistant runs in the head and calls models directly; choose an API connection"));
+        if c.kind == "claude_code" && st.claude_bin().is_none() {
+            return Err(bad_request("Ask on Claude Code runs `claude` on the head's machine, and it isn't on its PATH there"));
         }
         if m.model.trim().is_empty() {
             return Err(bad_request("choose a model"));
@@ -1081,4 +1554,17 @@ pub async fn check_settings(st: &HeadState, s: &api::AssistantSettings) -> anyho
 /// Logs the start of a conversation (for the head's log).
 pub fn started(session_id: &str) {
     info!(session = %session_id, "assistant conversation started");
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    #[test]
+    fn mentions_are_carbon6_links_each_once() {
+        let text = "See [@Plan](c6:doc:d1) and [@Realms](c6:project:p1), again [@Plan](c6:doc:d1), a [web](https://x.y) link, \
+                    [@mail](c6:item:42), [@odd](c6:nonsense:1) and [@bad](c6:doc: spaced)";
+        assert_eq!(mention_refs(text), ["doc:d1", "project:p1", "item:42"]);
+        assert!(mention_refs("plain words").is_empty());
+    }
 }

@@ -180,8 +180,17 @@ async fn targets(
         }
         v
     };
+    // From an Ask conversation (docs/ask.md §2): it has no worker of its
+    // own, so only a template agents may start (or one a grant allows).
+    let on_head = from.is_some_and(|s| st.assistant.head_id().is_some_and(|h| h.to_string() == s.worker_id));
+    if let Some(s) = from.filter(|_| on_head) {
+        let by = format!("session:{}", s.id);
+        if !(t.agents && realm == s.realm) && !crate::grants::may_reach(st, realm, &s.realm, name, &by).await {
+            return Err(bad_request(format!("template {name:?} is not one agents may start (tick Agents may start it on the template)")));
+        }
+    }
     // From a session: its own worker, unless you let its realm reach further.
-    if let Some(s) = from {
+    if let Some(s) = from.filter(|_| !on_head) {
         let own = all
             .iter()
             .find(|w| w.id.to_string() == s.worker_id)

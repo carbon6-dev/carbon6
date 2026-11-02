@@ -6,6 +6,7 @@ mod agents;
 mod analytics;
 mod api_reference;
 mod apps;
+mod ask;
 mod assistant;
 mod attach;
 mod attachments;

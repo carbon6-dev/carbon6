@@ -97,6 +97,10 @@ pub struct Launch {
     /// The worker that started it: a new one starts it again (with what it
     /// passes now).
     pub worker: String,
+    /// More arguments: the head's Ask passes `--tools ""` and
+    /// `--strict-mcp-config`, so Claude Code has only carbon6's tools there
+    /// (docs/ask.md §3).
+    pub extra_args: Vec<String>,
 }
 
 /// Where a session's process takes its input. Shared with the session's
@@ -275,6 +279,7 @@ impl Process {
                 None => cmd.args(["--append-system-prompt", &*p]),
             };
         }
+        cmd.args(&launch.extra_args);
         if let Some(m) = &mcp {
             // A subagent may work for hours without a word on the bridge:
             // Claude Code waits for it (its idle timeout is 5 minutes).

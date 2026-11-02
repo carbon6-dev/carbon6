@@ -30,7 +30,10 @@ pub(crate) struct Entry {
     pub tools: Vec<Arc<dyn Tool>>,
     /// The running turn's: stopping it stops the subagents it started.
     pub cancel: Mutex<CancellationToken>,
-    pub journal: Arc<Journal>,
+    /// Where the session's log is read, to match an MCP call to Claude
+    /// Code's tool call: the worker's journal, or the head's store for a
+    /// conversation the head runs (docs/ask.md §3).
+    pub journal: Arc<dyn EventLog>,
     /// Tool calls of the session already matched to an MCP call.
     pub matched: Mutex<HashSet<String>>,
     /// The session's policies: Claude Code doesn't know them, so its calls
@@ -42,6 +45,19 @@ pub(crate) struct Entry {
     /// Those loaded into Claude Code's prompt up front (any profile's
     /// naming); the rest wait behind its tool search.
     pub core: Vec<String>,
+}
+
+/// A session's log, as the bridge reads it.
+#[async_trait::async_trait]
+pub trait EventLog: Send + Sync {
+    async fn events(&self, session_id: &str) -> Vec<c6_proto::SessionEvent>;
+}
+
+#[async_trait::async_trait]
+impl EventLog for Journal {
+    async fn events(&self, session_id: &str) -> Vec<c6_proto::SessionEvent> {
+        self.events_after(session_id, 0, u32::MAX).await.unwrap_or_default()
+    }
 }
 
 type Entries = Arc<Mutex<HashMap<String, Arc<Entry>>>>;
@@ -212,7 +228,7 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 async fn call_id_for(entry: &Entry, tool: &str, input: &Value) -> String {
     let full = format!("mcp__{SERVER}__{tool}");
     for _ in 0..20 {
-        let events = entry.journal.events_after(&entry.session_id, 0, u32::MAX).await.unwrap_or_default();
+        let events = entry.journal.events(&entry.session_id).await;
         let found = events.iter().find_map(|e| match &e.kind {
             Some(session_event::Kind::Assistant(a)) => a.blocks.iter().find_map(|b| match &b.block {
                 Some(content_block::Block::ToolUse(u))

@@ -873,6 +873,26 @@ pub async fn memex_scan() -> Result<serde_json::Value, String> {
     json(Request::post("/api/v1/memex/scan").send().await).await
 }
 
+/// Whether Ask can run on Claude Code here (docs/ask.md §3).
+pub async fn ask_claude() -> Result<c6_api::AskClaude, String> {
+    json(Request::get("/api/v1/assistant/claude").send().await).await
+}
+
+/// What @ offers in an Ask conversation (docs/ask.md §4).
+pub async fn ask_mentionables(q: String) -> Result<Vec<c6_api::Mentionable>, String> {
+    let realm = realm().get_untracked();
+    json(
+        Request::get(&format!(
+            "/api/v1/assistant/mentionables?q={}&realm={}",
+            js_sys::encode_uri_component(&q),
+            js_sys::encode_uri_component(&realm)
+        ))
+        .send()
+        .await,
+    )
+    .await
+}
+
 pub async fn memex_mentions(q: String) -> Result<Vec<c6_api::MemexThingRef>, String> {
     json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).send().await).await
 }
@@ -1144,7 +1164,12 @@ pub async fn decide(id: String, call_id: String, allow: bool) -> Result<(), Stri
 /// Asks the assistant (a new conversation).
 pub async fn ask_assistant(prompt: String, context: String) -> Result<c6_api::Session, String> {
     let realm = Some(realm().get_untracked()).filter(|r| !r.is_empty());
-    send_json(Request::post("/api/v1/assistant"), &c6_api::AskAssistant { prompt, context, realm }).await
+    send_json(Request::post("/api/v1/assistant"), &c6_api::AskAssistant { prompt, context, realm, ..Default::default() }).await
+}
+
+/// A new Ask conversation, with its model and personal switch.
+pub async fn ask(req: c6_api::AskAssistant) -> Result<c6_api::Session, String> {
+    send_json(Request::post("/api/v1/assistant"), &req).await
 }
 
 /// Your answers to the assistant's question.

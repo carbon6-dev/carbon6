@@ -191,6 +191,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/decisions/{id}/answer", post(answer_decision))
         .route("/api/v1/decisions/{id}/session", post(decision_session))
         .route("/api/v1/assistant", post(ask_assistant))
+        .route("/api/v1/assistant/mentionables", get(ask_mentionables))
+        .route("/api/v1/assistant/claude", get(ask_claude))
         .route("/api/v1/settings/assistant", get(get_assistant_settings).put(put_assistant_settings))
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
@@ -3103,6 +3105,24 @@ async fn ask_assistant(
         req.realm = Some(realm.clone());
     }
     Ok(Json(crate::sessions::create_assistant(&st, req).await?))
+}
+
+/// Whether Ask can run on Claude Code on this machine (docs/ask.md §3).
+async fn ask_claude(State(st): State<Arc<HeadState>>) -> Json<api::AskClaude> {
+    Json(match st.claude_bin() {
+        Some(_) => api::AskClaude { available: true, reason: String::new() },
+        None => api::AskClaude { available: false, reason: "needs `claude` on the head machine's PATH".into() },
+    })
+}
+
+/// What @ offers in an Ask conversation (docs/ask.md §4).
+async fn ask_mentionables(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<api::MentionQuery>,
+) -> ApiResult<Json<Vec<api::Mentionable>>> {
+    let realm = caller.realm.clone().or(q.realm.filter(|r| !r.trim().is_empty())).unwrap_or_else(|| crate::realms::ROOT.to_owned());
+    Ok(Json(crate::assistant::mentionables(&st, &realm, &q.q).await?))
 }
 
 async fn get_assistant_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::AssistantSettings>> {

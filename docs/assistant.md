@@ -24,7 +24,7 @@ An agent inside carbon6 that can do anything you can do in its UI, answer questi
   - Sessions are cheap and searchable, and run concurrently.
   - What should last across conversations goes to memory notes and the memex, not into an ever-growing transcript.
 - **Long-running work is delegated:** "every morning…" or "watch CI…" becomes an automation, workflow or ordinary session that the assistant creates through the same operations. The assistant does not stay running.
-- **Model:** a setting, `assistant_model` (a connection and model; default: the default session model). Model routing by label applies as usual. Any API connection works, including a ChatGPT plan. Claude Code connections do not, because the head runs the loop itself.
+- **Model:** a setting, `assistant_model` (a connection and model; default: the default session model). Model routing by label applies as usual. Any API connection works, including a ChatGPT plan, and a Claude Code connection when `claude` is on the head's machine (docs/ask.md §3). Each conversation can pick its own.
 
 ## 3. The operation catalog
 
@@ -129,7 +129,7 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
   - question forms;
   - secret cards;
   - Settings → Assistant.
-- **Not built:** the assistant does not wait for the sessions it starts (it reports that it started them).
+- **Since docs/ask.md (2026-11-02):** Ask is also carbon6's everyday chat. It waits for work it delegates to a machine (`c6_delegate`, through the templates agents may start), its conversations are listed under **Chat**, each takes its own model, Claude Code included (run on the head's machine with only Ask's tools), and mail, chat and calendar come in by a per-conversation switch or an @-mention.
 
 ### Realms (OS step 8)
 

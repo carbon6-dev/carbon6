@@ -9,6 +9,7 @@ mod auth;
 mod brief;
 mod calendar;
 mod chat;
+mod chats;
 mod collections;
 mod compose;
 mod contacts;
@@ -154,6 +155,7 @@ fn Main() -> impl IntoView {
                                 </span>
                             </Go>
                             <decisions::DecisionLink class=NAV />
+                            <chats::ChatLink class=NAV />
                             <projects::ProjectsLink class=NAV />
                             <work::WorkLink class=NAV />
                             <docs::DocsLink class=NAV />
@@ -268,6 +270,7 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <Go to=View::Sessions class=MENU>"Sessions"</Go>
                     <Go to=View::Inbox class=MENU>"Inbox"</Go>
                     <decisions::DecisionLink class=MENU />
+                    <chats::ChatLink class=MENU />
                     <projects::ProjectsLink class=MENU />
                     <work::WorkLink class=MENU />
                     <docs::DocsLink class=MENU />

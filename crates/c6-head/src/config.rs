@@ -59,6 +59,9 @@ pub struct HeadConfig {
     pub update_check_secs: u64,
     /// The version updates take this head to run (tests).
     pub update_as_version: Option<String>,
+    /// The `claude` Ask runs on a Claude Code connection, instead of the one
+    /// found on this machine (tests; docs/ask.md §3).
+    pub claude_bin: Option<PathBuf>,
 }
 
 impl Default for HeadConfig {
@@ -78,6 +81,7 @@ impl Default for HeadConfig {
             ui_tls_cert: None,
             ui_tls_key: None,
             ui_tls_head_ca: false,
+            claude_bin: None,
             memex_dirs: None,
             update_source: "https://github.com/carbon6-dev/carbon6".into(),
             update_keys: Vec::new(),
