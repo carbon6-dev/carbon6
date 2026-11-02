@@ -1,10 +1,11 @@
 //! Stop in a Claude Code session (docs/background.md §4, Stopping): what
 //! ends because you stopped the agent doesn't wake it. A turn Claude Code
-//! starts by itself right after the stop is stopped too and shows nothing;
-//! a task lost because Claude Code didn't stop (so its process was) is told
+//! starts by itself right after the stop is stopped too: no turn shows, only
+//! the notice it put into its conversation, word for word from its
+//! transcript, and a quiet line; a task lost because Claude Code didn't stop (so its process was) is told
 //! with your next message; a task that ends on its own still wakes the
 //! agent. From the API through the head and the worker to the Claude Code
-//! process. A binary of its own: it sets C6_CLAUDE_BIN.
+//! process. A binary of its own: it sets C6_CLAUDE_BIN and CLAUDE_CONFIG_DIR.
 
 use std::path::Path;
 
@@ -20,8 +21,10 @@ use tokio_util::sync::CancellationToken;
 /// - "hold": a build and an agent go to the background, the agent finishes
 ///   (Claude Code queues its notification), and a command holds the turn.
 ///   Stopped, it stops the command and, as 2.1.311 does, starts a turn by
-///   itself for what it queued. Stopped again, it waits; then the build ends
-///   on its own and it wakes for that.
+///   itself for what it queued, whose text it writes only to its transcript
+///   (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<conversation>.jsonl`). Stopped
+///   again, it says "[Request interrupted by user]" and waits; then the build
+///   ends on its own and it wakes for that.
 /// - "stubborn": a server goes to the background and a command holds the
 ///   turn; it never answers a stop, so carbon6 stops the process.
 /// - A notice (`<background-task …>`) opens a turn the message after it
@@ -36,6 +39,14 @@ init() { printf '%s\n' '{"type":"system","subtype":"init"}'; }
 done_ok() { printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'; open=""; }
 stopped() { printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"usage":{"input_tokens":1,"output_tokens":1}}'; open=""; }
 started() { printf '{"type":"system","subtype":"task_started","task_id":"%s","description":"%s","task_type":"%s","is_backgrounded":%s}\n' "$1" "$2" "$3" "$4"; }
+said() { printf '{"type":"user","uuid":"%s","message":{"role":"user","content":[{"type":"text","text":"%s"}]},"parent_tool_use_id":null}\n' "$1" "$2"; }
+sid=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = --session-id ] || [ "$prev" = --resume ]; then sid="$a"; fi
+  prev="$a"
+done
+transcript() { t="$CLAUDE_CONFIG_DIR/projects/$(pwd | sed 's/[^A-Za-z0-9]/-/g')"; mkdir -p "$t"; printf '%s\n' "$1" >> "$t/$sid.jsonl"; }
 mode=""
 open=""
 while read -r line; do
@@ -45,11 +56,16 @@ while read -r line; do
       case "$mode" in
         hold)
           printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"fg1","status":"stopped","summary":"Wait"}'
+          said u-stop "[Request interrupted by user for tool use]"
           stopped
+          transcript '{"type":"user","uuid":"u-stop","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}'
+          transcript '{"type":"user","uuid":"n-ag1","isSidechain":false,"origin":{"kind":"task-notification","producer":"session-task"},"turnOrigin":"task_notification","message":{"role":"user","content":"<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n<summary>Agent \"Review\" is waiting — on its own work</summary>\n<result>Half done: 3 of 7 files.</result>\n</task-notification>"}}'
           init
           open=1
           mode=flushed;;
         flushed)
+          said u-stop2 "[Request interrupted by user]"
+          transcript '{"type":"user","uuid":"u-stop2","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
           stopped
           sleep 0.3
           printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed","summary":"Build finished"}'
@@ -91,12 +107,20 @@ done
     path
 }
 
+/// The notice the stand-in put into its conversation.
+const QUEUED: &str = "<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n<summary>Agent \"Review\" is waiting — on its own work</summary>\n<result>Half done: 3 of 7 files.</result>\n</task-notification>";
+
 #[tokio::test]
 async fn what_ends_because_you_stopped_the_agent_does_not_wake_it() {
     let bins = tempfile::tempdir().unwrap();
     let claude = fake_claude(bins.path());
-    // SAFETY: this binary has one test; nothing else reads the variable.
-    unsafe { std::env::set_var("C6_CLAUDE_BIN", &claude) };
+    // Where Claude Code (the stand-in) keeps its transcripts.
+    let config = tempfile::tempdir().unwrap();
+    // SAFETY: this binary has one test; nothing else reads the variables.
+    unsafe {
+        std::env::set_var("C6_CLAUDE_BIN", &claude);
+        std::env::set_var("CLAUDE_CONFIG_DIR", config.path());
+    }
     c6_testkit::runnable(&claude, &["--version"]).await;
     let head_dir = tempfile::tempdir().unwrap();
     let cfg = HeadConfig {
@@ -168,7 +192,8 @@ async fn what_ends_because_you_stopped_the_agent_does_not_wake_it() {
     };
 
     // You stop it. The turn Claude Code starts by itself at once is stopped
-    // too and shows nothing; the build that then ends on its own wakes it.
+    // too: no turn shows, only the notice, as it reached the model, and a
+    // quiet line; the build that then ends on its own wakes it.
     holding(1).await;
     interrupt().await;
     let evs = eventually("the build's turn to end", async || {
@@ -187,8 +212,18 @@ async fn what_ends_because_you_stopped_the_agent_does_not_wake_it() {
         .collect();
     assert_eq!(
         users,
-        [("hold on".to_owned(), String::new()), ("Build finished".to_owned(), "task-notification".to_owned())],
-        "no turn for what Claude Code queued before the stop"
+        [
+            ("hold on".to_owned(), String::new()),
+            (QUEUED.to_owned(), "task-notification".to_owned()),
+            ("Build finished".to_owned(), "task-notification".to_owned())
+        ],
+        "what Claude Code queued before the stop is shown word for word, and gets no turn"
+    );
+    let told = evs.iter().position(|e| matches!(&e.kind, EventKind::User { text, .. } if text == QUEUED)).unwrap();
+    assert!(
+        matches!(&evs[told + 1].kind, EventKind::Notice { title, .. } if title == "Stopped before replying"),
+        "then the quiet line: {:?}",
+        evs[told + 1].kind
     );
     let turns: Vec<u64> = evs
         .iter()

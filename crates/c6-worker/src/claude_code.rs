@@ -197,8 +197,22 @@ pub(crate) struct Process {
     /// The turn about to run is one it started by itself right after your
     /// stop: it is stopped as it begins.
     quiet: bool,
-    /// The last turn was such a one and logged nothing.
+    /// The last turn was such a one, stopped before the model said
+    /// anything: it logged the notices it was for, but no turn.
     unshown: bool,
+    /// Where it runs and where Claude Code keeps its transcripts
+    /// ([`transcripts_root`]): the only place the text of a notice it starts
+    /// a turn for is written (its stream doesn't carry it).
+    cwd: PathBuf,
+    transcripts: Option<PathBuf>,
+    /// The last message of the main conversation it showed (a `user` or
+    /// `assistant` line's uuid, as in its transcript), and the tasks it
+    /// reported ended during the running turn.
+    last_uuid: Option<String>,
+    turn_tasks: Vec<(String, String)>,
+    /// Of the turn you stopped: its last message, when it ended, and the
+    /// tasks it reported ended (to find, or else name, what it queued).
+    stop_mark: Option<StopMark>,
     /// When its last turn ended (or it started).
     idle_since: tokio::time::Instant,
     /// A Send now it hasn't answered yet.
@@ -387,6 +401,11 @@ impl Process {
             after_stop: None,
             quiet: false,
             unshown: false,
+            cwd: cwd.to_owned(),
+            transcripts: transcripts_root(),
+            last_uuid: None,
+            turn_tasks: Vec::new(),
+            stop_mark: None,
             idle_since: tokio::time::Instant::now(),
             send_now: None,
             old_send_now: false,
@@ -490,10 +509,46 @@ impl Process {
     }
 
     /// Whether its last turn was one it started by itself right after your
-    /// stop, which was stopped before it showed anything and logged nothing
-    /// (so its number is free again). Asking clears it.
+    /// stop, which was stopped before the model said anything and logged no
+    /// turn (so its number is free again). Asking clears it.
     pub fn take_unshown(&mut self) -> bool {
         std::mem::take(&mut self.unshown)
+    }
+
+    /// The notices Claude Code started a turn for right after your stop, as
+    /// they reached the model. Its stream doesn't carry them (2.1.311: only
+    /// the turn's `system/init`, then the model's answer), so they are read
+    /// from its transcript, where it writes them before asking the model.
+    /// Never made up: if they can't be read, a note says so and names what
+    /// is known.
+    async fn queued_notices(&mut self) -> Vec<String> {
+        let mark = self.stop_mark.take();
+        let after = mark.as_ref().and_then(|m| m.uuid.clone());
+        let since = mark.as_ref().map_or_else(std::time::SystemTime::now, |m| m.at);
+        let file = self.transcripts.as_deref().and_then(|root| transcript_of(root, &self.cwd, &self.launch.conversation));
+        if let Some(file) = &file {
+            let until = tokio::time::Instant::now() + TRANSCRIPT_WAIT;
+            loop {
+                let text = tokio::fs::read_to_string(file).await.unwrap_or_default();
+                if let Some(texts) = queued_in(&text, after.as_deref(), since) {
+                    return texts;
+                }
+                if tokio::time::Instant::now() >= until {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let session = &self.launch.conversation;
+        warn!(%session, transcript = ?file, "the notice Claude Code started a turn for is not in its transcript");
+        let mut note = "Claude Code queued a notice we couldn't read".to_owned();
+        let tasks = mark.map(|m| m.tasks).unwrap_or_default();
+        if !tasks.is_empty() {
+            let named: Vec<String> = tasks.iter().map(|(id, status)| format!("{id} ({status})")).collect();
+            note.push_str(&format!(". In the turn you stopped it reported these tasks ended: {}", named.join(", ")));
+        }
+        note.push('.');
+        vec![note]
     }
 
     fn begins_turn(&self, v: &Value) -> bool {
@@ -523,6 +578,8 @@ impl Process {
         if v["type"] == "system" && v["subtype"] == "task_notification" && v["parent_tool_use_id"].is_null() {
             let summary = v["summary"].as_str().or(v["description"].as_str()).unwrap_or("A background task ended.");
             self.notified.push(summary.to_owned());
+            let field = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+            self.turn_tasks.push((field("task_id"), field("status")));
         }
         // An echo nobody waits for (such as a model switch's) is not a turn.
         if v["type"] == "user" && v["isReplay"].as_bool() == Some(true) {
@@ -634,19 +691,20 @@ impl Process {
     }
 
     /// Starts a turn no input of ours began: Claude Code woke on its
-    /// background tasks' notifications.
-    async fn woke(&mut self, started: &mut bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+    /// background tasks' notifications. One it started right after your stop
+    /// (`quiet`) shows the notices it was for as they reached the model.
+    async fn woke(&mut self, started: &mut bool, quiet: bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         if *started {
             return Ok(());
         }
-        let text = if self.notified.is_empty() { "A background task ended.".to_owned() } else { self.notified.join("\n") };
-        let message = UserMessage {
-            command_id: format!("task:{}", uuid::Uuid::now_v7()),
-            text,
-            command: "task-notification".into(),
-            ..Default::default()
+        let texts = if quiet {
+            self.queued_notices().await
+        } else if self.notified.is_empty() {
+            vec!["A background task ended.".to_owned()]
+        } else {
+            vec![self.notified.join("\n")]
         };
-        sink.append(session_event::Kind::User(message)).await?;
+        told(sink, texts).await?;
         sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: self.mapper.turn, ..Default::default() })).await?;
         *started = true;
         Ok(())
@@ -681,6 +739,7 @@ impl Process {
         self.mapper.interrupted = false;
         // One it started by itself right after your stop (`idle_line`).
         let quiet = std::mem::take(&mut self.quiet) && inputs.is_empty() && !opened;
+        self.turn_tasks.clear();
         let mut started = opened;
         if !inputs.is_empty() && !opened {
             for input in &inputs {
@@ -761,6 +820,12 @@ impl Process {
                 },
             };
             let main = v["parent_tool_use_id"].is_null();
+            if main
+                && matches!(v["type"].as_str(), Some("user" | "assistant"))
+                && let Some(uuid) = v["uuid"].as_str()
+            {
+                self.last_uuid = Some(uuid.to_owned());
+            }
             match v["type"].as_str().unwrap_or("") {
                 "user" if v["isReplay"].as_bool() == Some(true) => {
                     if let Some(uuid) = v["uuid"].as_str() {
@@ -782,10 +847,29 @@ impl Process {
                     // You stopped it (or it is the turn stopped right after):
                     // for a moment, what follows is the stop's doing.
                     self.after_stop = (interrupted_at.is_some() || quiet).then(|| tokio::time::Instant::now() + STOP_QUIET);
-                    // Stopped before the model said anything: nothing to show.
+                    // Where what it queues next is found (after the notices of
+                    // this turn, if it is a stopped one, are read).
+                    let mark = (interrupted_at.is_some() || quiet).then(|| StopMark {
+                        uuid: self.last_uuid.clone(),
+                        at: std::time::SystemTime::now(),
+                        tasks: std::mem::take(&mut self.turn_tasks),
+                    });
+                    // Stopped before the model said anything: no turn, only
+                    // the notices it put into the conversation, which the
+                    // agent reads with your next message.
                     self.unshown = quiet && !started;
-                    if !self.unshown {
-                        self.woke(&mut started, sink).await?;
+                    if self.unshown {
+                        let texts = self.queued_notices().await;
+                        told(sink, texts).await?;
+                        sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                            title: "Stopped before replying".into(),
+                            message: "Right after you stopped the agent, Claude Code started a turn by itself for this notice; carbon6 stopped it before the agent replied. The agent reads it with your next message.".into(),
+                            priority: "low".into(),
+                            quiet: true,
+                        }))
+                        .await?;
+                    } else {
+                        self.woke(&mut started, quiet, sink).await?;
                         self.mapper.handle(&v, sink).await?;
                     }
                     let reason = if self.mapper.interrupted {
@@ -796,12 +880,17 @@ impl Process {
                     if !self.unshown {
                         sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
                     }
+                    self.stop_mark = mark;
                     self.notified.clear();
                     self.idle_since = tokio::time::Instant::now();
                     return Ok(TurnEnd { reason: Some(reason), alive: true, no_conversation: false });
                 }
+                // In a turn stopped as it began, Claude Code's "[Request
+                // interrupted by user]" and the stream's first frames are not
+                // the model's word: only its message makes the turn show.
+                "stream_event" | "user" if main && quiet && !started => {}
                 "assistant" | "stream_event" | "user" if main => {
-                    self.woke(&mut started, sink).await?;
+                    self.woke(&mut started, quiet, sink).await?;
                     self.mapper.handle(&v, sink).await?;
                 }
                 _ => self.side_line(&v, sink).await?,
@@ -921,6 +1010,98 @@ fn is_yours(input: &PendingInput) -> bool {
 /// before creating its claude-uid/session/tasks/*.output tree. Give each
 /// process a private root instead of trusting paths into the host filesystem.
 struct OutputRoot(PathBuf);
+
+/// Of a turn you stopped: its last message Claude Code showed (`uuid`), when
+/// it ended, and the tasks it reported ended in it (id, status).
+struct StopMark {
+    uuid: Option<String>,
+    at: std::time::SystemTime,
+    tasks: Vec<(String, String)>,
+}
+
+/// How long Claude Code has to write a notice it starts a turn for into its
+/// transcript (it does so before asking the model) before carbon6 gives up
+/// reading it.
+const TRANSCRIPT_WAIT: Duration = Duration::from_secs(2);
+
+/// Where Claude Code keeps its transcripts: `$CLAUDE_CONFIG_DIR/projects`,
+/// else `~/.claude/projects` (the CLI runs with the worker's environment).
+fn transcripts_root() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+        .map(|d| d.join("projects"))
+}
+
+/// A conversation's transcript: `<root>/<cwd, each character but a letter or
+/// digit as ->/<conversation>.jsonl`, or wherever under the root a file of
+/// that name is (conversation ids are unique).
+fn transcript_of(root: &Path, cwd: &Path, conversation: &str) -> Option<PathBuf> {
+    let name = format!("{conversation}.jsonl");
+    let folder: String = cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let direct = root.join(folder).join(&name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path().join(&name)).find(|p| p.is_file())
+}
+
+/// The notices Claude Code put into its conversation to start a turn after
+/// the turn you stopped, verbatim from its transcript: the main
+/// conversation's task-notification messages after that turn's last message
+/// (`after`), or, when that message isn't there, written since it ended
+/// (`since`). `None`: none there (yet).
+fn queued_in(transcript: &str, after: Option<&str>, since: std::time::SystemTime) -> Option<Vec<String>> {
+    let entries = transcript.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok());
+    let entries: Vec<Value> = entries.filter(|v| v["isSidechain"].as_bool() != Some(true)).collect();
+    let start = match after.and_then(|u| entries.iter().position(|v| v["uuid"].as_str() == Some(u))) {
+        Some(i) => i + 1,
+        None => {
+            // Its clock and ours: allow a second.
+            let since = chrono::DateTime::<chrono::Utc>::from(since) - chrono::TimeDelta::seconds(1);
+            let after_stop =
+                |v: &Value| v["timestamp"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).is_some_and(|t| t >= since);
+            entries.iter().position(|v| is_task_notice(v) && after_stop(v))?
+        }
+    };
+    let mut texts = Vec::new();
+    for v in &entries[start..] {
+        match v["type"].as_str() {
+            // The model's answer: the notices came before it.
+            Some("assistant") => break,
+            Some("user") if is_task_notice(v) => match &v["message"]["content"] {
+                Value::String(s) => texts.push(s.clone()),
+                Value::Array(blocks) => texts.extend(blocks.iter().filter_map(|b| b["text"].as_str()).map(str::to_owned)),
+                _ => {}
+            },
+            // Something else after them (such as "[Request interrupted by user]").
+            Some("user") if !texts.is_empty() => break,
+            _ => {}
+        }
+    }
+    (!texts.is_empty()).then_some(texts)
+}
+
+/// A message Claude Code wrote into the conversation for a task's
+/// notification.
+fn is_task_notice(v: &Value) -> bool {
+    v["type"] == "user" && (v["origin"]["kind"] == "task-notification" || v["turnOrigin"] == "task_notification")
+}
+
+/// Logs what the agent was told, each as a task notification.
+async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>) -> anyhow::Result<()> {
+    for text in texts {
+        let message = UserMessage {
+            command_id: format!("task:{}", uuid::Uuid::now_v7()),
+            text,
+            command: "task-notification".into(),
+            ..Default::default()
+        };
+        sink.append(session_event::Kind::User(message)).await?;
+    }
+    Ok(())
+}
 
 /// Asks Claude Code to stop its turn (Esc). Its background agents stop with
 /// it; its background commands don't.
@@ -2289,8 +2470,11 @@ done
 
     /// A stand-in `claude` that, as 2.1.311 does, starts a turn by itself
     /// right after a turn you stopped, for its agent's notification queued
-    /// during it. It records what it reads (`stdin.txt`). Stopped too, it
-    /// waits; then its build ends on its own and it wakes for that.
+    /// during it, whose text it writes only to its transcript
+    /// (`projects/<cwd>/s.jsonl` in its folder; not with `no-transcript`
+    /// there). It records what it reads (`stdin.txt`). Stopped too, it says
+    /// "[Request interrupted by user]" and waits; then its build ends on its
+    /// own and it wakes for that.
     fn stopping_claude(dir: &Path) -> PathBuf {
         script(
             dir,
@@ -2302,6 +2486,8 @@ say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":
 init() { printf '%s\n' '{"type":"system","subtype":"init"}'; }
 done_ok() { printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}'; }
 stopped() { printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"usage":{}}'; }
+said() { printf '{"type":"user","uuid":"%s","message":{"role":"user","content":[{"type":"text","text":"%s"}]},"parent_tool_use_id":null}\n' "$1" "$2"; }
+transcript() { [ -e no-transcript ] && return; t="projects/$(pwd | sed 's/[^A-Za-z0-9]/-/g')"; mkdir -p "$t"; printf '%s\n' "$1" >> "$t/s.jsonl"; }
 stops=0
 while read -r line; do
   printf '%s\n' "$line" >> stdin.txt
@@ -2310,9 +2496,16 @@ while read -r line; do
       stops=$((stops+1))
       if [ "$stops" = 1 ]; then
         printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"fg1","status":"stopped","summary":"Wait"}'
+        said u-stop "[Request interrupted by user for tool use]"
         stopped
+        transcript '{"type":"user","uuid":"u-stop","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}'
+        transcript '{"type":"queue-operation","operation":"dequeue"}'
+        transcript '{"type":"user","uuid":"n-ag1","isSidechain":false,"origin":{"kind":"task-notification","producer":"session-task"},"turnOrigin":"task_notification","message":{"role":"user","content":"<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n<summary>Agent \"Review\" is waiting — on its own work</summary>\n</task-notification>"}}'
+        transcript '{"type":"attachment","uuid":"a-1","isSidechain":false,"attachment":{"type":"deferred_tools_delta"}}'
         init
       else
+        said u-stop2 "[Request interrupted by user]"
+        transcript '{"type":"user","uuid":"u-stop2","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
         stopped
         sleep 0.3
         printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed","summary":"Build finished"}'
@@ -2341,17 +2534,18 @@ done
         )
     }
 
-    /// The turn Claude Code starts by itself right after you stop one is
-    /// stopped as it begins and shows nothing; a task that then ends on its
-    /// own still wakes the agent.
-    #[tokio::test]
-    async fn a_turn_claude_code_starts_right_after_your_stop_is_stopped_too() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = stopping_claude(dir.path());
-        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+    /// What `stopping_claude` put into its conversation for its agent.
+    const QUEUED: &str = "<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n<summary>Agent \"Review\" is waiting — on its own work</summary>\n</task-notification>";
+
+    /// Stops `stopping_claude`'s first turn, then runs the turn it starts by
+    /// itself at once; the events logged from there.
+    async fn stop_then_flush(dir: &Path) -> (Process, Arc<VecSink>, Vec<SessionEvent>) {
+        let bin = stopping_claude(dir);
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.to_owned()));
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
-        let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools).await));
+        let mut p = spawn(&bin, dir, "s", false, Some(observer(dir, tools).await));
+        p.transcripts = Some(dir.join("projects"));
         let cancel = CancellationToken::new();
         let more = tokio::sync::Notify::new();
         let turn = p.turn(1, vec![input("c1", "hold on")], false, None, "opus", &sink, &Joining::default, &more, &cancel);
@@ -2361,11 +2555,52 @@ done
         };
         let (end, ()) = tokio::join!(turn, stop);
         assert_eq!(end.unwrap().reason, Some(TurnEndReason::Interrupted));
-        let shown = kinds(&vec_sink);
-        // It starts one by itself at once: stopped as it begins, logged nowhere.
+        let before = vec_sink.0.lock().unwrap().len();
         assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
         assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Interrupted));
         assert!(p.take_unshown() && !p.take_unshown(), "said once");
+        let flushed = vec_sink.0.lock().unwrap()[before..].to_vec();
+        (p, vec_sink, flushed)
+    }
+
+    /// The notices a stopped turn logged, and its quiet line.
+    fn told_then_stopped(events: &[SessionEvent]) -> Vec<String> {
+        let told: Vec<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::User(u)) => {
+                    assert_eq!(u.command, "task-notification");
+                    Some(u.text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let notices: Vec<&c6_proto::Notice> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::Notice(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(notices.len() == 1 && notices[0].quiet && notices[0].title == "Stopped before replying", "{notices:?}");
+        assert!(matches!(events.last().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::Notice(_))), "the line comes last");
+        assert!(
+            !events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::TurnStarted(_) | session_event::Kind::TurnEnded(_)))),
+            "no turn"
+        );
+        told
+    }
+
+    /// The turn Claude Code starts by itself right after you stop one is
+    /// stopped as it begins: no turn shows, only the notice it put into the
+    /// conversation, word for word as its transcript has it, and a quiet line
+    /// saying the agent reads it with your next message. A task that then
+    /// ends on its own still wakes the agent.
+    #[tokio::test]
+    async fn a_turn_claude_code_starts_right_after_your_stop_is_stopped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut p, vec_sink, flushed) = stop_then_flush(dir.path()).await;
+        assert_eq!(told_then_stopped(&flushed), [QUEUED], "the notice as it reached the model");
         let interrupts = std::fs::read_to_string(dir.path().join("stdin.txt"))
             .unwrap()
             .lines()
@@ -2373,19 +2608,71 @@ done
             .count();
         assert_eq!(interrupts, 2, "yours, then the one for its own turn");
         // Then its build ends on its own: it wakes for that, as before.
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let before = vec_sink.0.lock().unwrap().len();
         assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
         assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
         assert!(!p.take_unshown());
-        let events = vec_sink.0.lock().unwrap().clone();
-        let after: Vec<&str> =
-            events.iter().map(kind).filter(|k| *k != "other").skip(shown.iter().filter(|k| **k != "other").count()).collect();
-        assert_eq!(after, ["user", "turn_started", "assistant", "usage", "turn_ended"], "only the turn for the build shows");
-        let woke = events.iter().rev().find_map(|e| match &e.kind {
-            Some(session_event::Kind::User(u)) => Some(u.text.clone()),
-            _ => None,
-        });
-        assert_eq!(woke.as_deref(), Some("Build finished"));
+        let events = vec_sink.0.lock().unwrap()[before..].to_vec();
+        let shown: Vec<&str> = events.iter().map(kind).filter(|k| *k != "other").collect();
+        assert_eq!(shown, ["user", "turn_started", "assistant", "usage", "turn_ended"]);
+        let Some(session_event::Kind::User(u)) = &events.iter().find(|e| kind(e) == "user").unwrap().kind else { panic!() };
+        assert_eq!(u.text, "Build finished");
         p.close().await;
+    }
+
+    /// When its transcript doesn't have the notice, nothing is made up: the
+    /// log says a notice couldn't be read, and names the tasks it reported.
+    #[tokio::test]
+    async fn a_notice_that_cannot_be_read_is_said_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("no-transcript"), "").unwrap();
+        let (p, _, flushed) = stop_then_flush(dir.path()).await;
+        assert_eq!(
+            told_then_stopped(&flushed),
+            [
+                "Claude Code queued a notice we couldn't read. In the turn you stopped it reported these tasks ended: ag1 (completed), fg1 (stopped)."
+            ]
+        );
+        p.close().await;
+    }
+
+    /// The notices come from the transcript after the stopped turn's last
+    /// message, up to what follows them; failing that, by when they were
+    /// written. Subagents' messages are not the conversation's.
+    #[test]
+    fn queued_notices_are_read_after_the_stopped_turn() {
+        let notice = |uuid: &str, text: &str, at: &str| {
+            serde_json::json!({"type": "user", "uuid": uuid, "timestamp": at, "isSidechain": false,
+                "origin": {"kind": "task-notification"}, "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        let transcript = [
+            notice("old", "an older notice", "2026-11-02T22:00:00.000Z"),
+            serde_json::json!({"type": "user", "uuid": "stop", "message": {"content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}}).to_string(),
+            serde_json::json!({"type": "queue-operation", "operation": "dequeue"}).to_string(),
+            notice("n1", "first", "2026-11-02T22:52:16.815Z"),
+            serde_json::json!({"type": "user", "uuid": "side", "isSidechain": true, "origin": {"kind": "task-notification"}, "message": {"content": "a subagent's"}}).to_string(),
+            notice("n2", "second", "2026-11-02T22:52:16.816Z"),
+            serde_json::json!({"type": "user", "uuid": "stop2", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}).to_string(),
+            notice("later", "a later one", "2026-11-02T22:53:00.000Z"),
+        ]
+        .join("\n");
+        let at = |t: &str| std::time::SystemTime::from(chrono::DateTime::parse_from_rfc3339(t).unwrap());
+        let long_ago = at("2026-11-01T00:00:00Z");
+        assert_eq!(queued_in(&transcript, Some("stop"), long_ago).unwrap(), ["first", "second"]);
+        assert_eq!(queued_in(&transcript, Some("gone"), at("2026-11-02T22:52:16.900Z")).unwrap(), ["first", "second"], "by time");
+        assert_eq!(queued_in(&transcript, Some("stop2"), long_ago).unwrap(), ["a later one"]);
+        assert!(queued_in(&transcript, Some("later"), long_ago).is_none(), "nothing after it");
+        assert!(queued_in("", None, long_ago).is_none());
+        let folder = Path::new("/home/me/my project");
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("-home-me-my-project").join("c1.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(transcript_of(root.path(), folder, "c1"), Some(file.clone()));
+        assert_eq!(transcript_of(root.path(), Path::new("/elsewhere"), "c1"), Some(file), "found by its name");
+        assert_eq!(transcript_of(root.path(), folder, "c2"), None);
     }
 
     /// A worker that starts after a crash stops the Claude Code processes the
