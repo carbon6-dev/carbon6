@@ -4912,7 +4912,7 @@ fn Composer(
                     })}
                     </div>
                     // The toolbar: +, the model (its chip opening one menu above it
-                    // for the model and its subagents', a change waiting for Send
+                    // for the plan's limits, the model and its subagents', a change waiting for Send
                     // beside), and Send.
                     <div class="flex items-center gap-1 px-1 pb-1">
                         // Drawn, not an emoji, so it matches the other icons.
@@ -4938,8 +4938,8 @@ fn Composer(
                                     <button class=CHIP title="The model this session and its subagents run on: change them" aria-label=format!("Model: {label}, change it")
                                         aria-expanded=move || picking.get().to_string() data-pop=picking_pop.get_value() on:click=move |_| toggle()>
                                         <span class="min-w-0 truncate">{label.clone()}</span>
-                                        // What's left of its plan, when it has one.
-                                        <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
+                                        // What's left of its plan, when it has one: "· 90%".
+                                        <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) chip=true />
                                         <span class="text-muted">"▾"</span>
                                     </button>
                                 }
@@ -4961,6 +4961,8 @@ fn Composer(
                         })}
                         {move || picking.get().then(|| view! {
                             <div data-pop=picking_pop.get_value() class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
+                                // The plan's windows first, when it has one.
+                                {model.map(|m| view! { <crate::quota::PlanMenu connection=Signal::derive(move || m.current.get().0) /> })}
                                 {model.map(|m| view! {
                                     <div class="font-medium">"Model"</div>
                                     <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>

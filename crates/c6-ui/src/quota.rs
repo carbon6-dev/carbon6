@@ -49,10 +49,12 @@ pub fn of(connection: &str) -> Option<ConnectionQuota> {
     q.0.with(|v| v.iter().find(|q| q.connection_id == connection && !q.windows.is_empty()).cloned())
 }
 
-/// How it reads: fine, getting low, or out.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// How much is left, by level: more than half (quiet grey), half down to
+/// a fifth (yellow), a fifth down to 5% (amber), under 5% (red).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tone {
-    Fine,
+    Plenty,
+    Half,
     Low,
     Out,
 }
@@ -60,115 +62,228 @@ pub enum Tone {
 impl Tone {
     pub fn class(self) -> &'static str {
         match self {
-            Tone::Fine => "text-muted",
+            Tone::Plenty => "text-muted",
+            Tone::Half => "text-yellow-600 dark:text-yellow-300",
             Tone::Low => "text-amber-600 dark:text-amber-400",
-            Tone::Out => "font-medium text-red-600 dark:text-red-400",
+            Tone::Out => "text-red-600 dark:text-red-400",
         }
     }
 
     pub fn bar(self) -> &'static str {
         match self {
-            Tone::Fine => "bg-emerald-500",
+            Tone::Plenty => "bg-zinc-500 dark:bg-zinc-400",
+            Tone::Half => "bg-yellow-400",
             Tone::Low => "bg-amber-500",
             Tone::Out => "bg-red-500",
         }
     }
 }
 
-pub fn tone(w: &QuotaWindow) -> Tone {
-    if w.status == "rejected" || w.used_percent >= 100.0 {
+/// The level for `left` percent left: over 50 plenty, 20 to 50 half, 5 to
+/// 20 low, under 5 out. The provider's own word counts too: used up
+/// ("rejected") is out, near its limit ("warning") at least low.
+pub fn level(left: f64, status: &str) -> Tone {
+    let t = if left < 5.0 {
         Tone::Out
-    } else if w.status == "warning" || w.used_percent >= 80.0 {
+    } else if left <= 20.0 {
         Tone::Low
+    } else if left <= 50.0 {
+        Tone::Half
     } else {
-        Tone::Fine
-    }
-}
-
-/// When it starts afresh, short: "40m", "2h", "Thu" (`day` names the
-/// weekday a time falls on).
-fn renews(at: i64, now: i64, day: &dyn Fn(i64) -> String) -> String {
-    let m = ((at - now) / 60_000).max(0);
-    match m {
-        0 => "now".into(),
-        m if m < 60 => format!("{m}m"),
-        m if m < 24 * 60 => format!("{}h", (m + 30) / 60),
-        _ => day(at),
-    }
-}
-
-/// "in 2h 10m", "Thu 09:00".
-fn renews_long(at: i64, now: i64, when: &dyn Fn(i64) -> String) -> String {
-    let m = ((at - now) / 60_000).max(0);
-    match m {
-        0 => "now".into(),
-        m if m < 24 * 60 => format!("in {}h {}m", m / 60, m % 60).replace("in 0h ", "in "),
-        _ => when(at),
-    }
-}
-
-/// The tightest window, short, for a picker: "66% left · renews 2h",
-/// "week 29% left · Thu", "5h used up · renews 40m".
-pub fn compact_at(q: &ConnectionQuota, now: i64, day: &dyn Fn(i64) -> String) -> Option<(String, Tone)> {
-    let w = q.tightest()?;
-    let t = tone(w);
-    let left = (100.0 - w.used_percent).clamp(0.0, 100.0);
-    let what = if t == Tone::Out { format!("{} used up", w.name) } else { format!("{} {left:.0}% left", w.name) };
-    let text = match w.resets_at {
-        Some(at) => format!("{what} · renews {}", renews(at, now, day)),
-        None => what,
+        Tone::Plenty
     };
-    Some((text, t))
-}
-
-/// One window, for Settings and the Usage page: "5h: 34% used · resets in 2h 10m".
-pub fn line_at(w: &QuotaWindow, now: i64, when: &dyn Fn(i64) -> String) -> String {
-    let used = if tone(w) == Tone::Out { "used up".to_owned() } else { format!("{:.0}% used", w.used_percent) };
-    match w.resets_at {
-        Some(at) => format!("{}: {used} · resets {}", w.name, renews_long(at, now, when)),
-        None => format!("{}: {used}", w.name),
+    match status {
+        "rejected" => Tone::Out,
+        "warning" => t.max(Tone::Low),
+        _ => t,
     }
 }
 
-fn weekday(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.get_day() as usize % 7].to_owned()
+/// Percent of a window left, whole (the number shown, so its level
+/// matches what reads).
+pub fn left(w: &QuotaWindow) -> f64 {
+    (100.0 - w.used_percent).clamp(0.0, 100.0).round()
 }
 
-fn weekday_time(ms: i64) -> String {
-    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
-    format!("{} {:02}:{:02}", weekday(ms), d.get_hours(), d.get_minutes())
+pub fn tone(w: &QuotaWindow) -> Tone {
+    level(left(w), &w.status)
 }
 
-pub fn compact(q: &ConnectionQuota) -> Option<(String, Tone)> {
-    compact_at(q, now_ms(), &weekday)
+/// The tightest window's percent left and its level: what the message
+/// box's model chip shows.
+pub fn tightest_left(q: &ConnectionQuota) -> Option<(f64, Tone)> {
+    q.tightest().map(|w| (left(w), tone(w)))
+}
+
+/// Used up: nothing left, or the provider says so.
+fn used_up(w: &QuotaWindow) -> bool {
+    left(w) == 0.0 || w.status == "rejected"
+}
+
+/// A window's name to read: "5h" "5-hour", "30m" "30-minute", "week
+/// (Opus)" "Week (Opus)".
+pub fn window_label(name: &str) -> String {
+    let count = |unit: char| name.strip_suffix(unit).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if let Some(n) = count('h') {
+        return format!("{n}-hour");
+    }
+    if let Some(n) = count('m') {
+        return format!("{n}-minute");
+    }
+    let mut c = name.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+const DAY_MS: i64 = 86_400_000;
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Month and day of the month of a day counted from 1970-01-01 (Howard
+/// Hinnant's civil_from_days).
+fn month_day(days: i64) -> (usize, i64) {
+    let doe = (days + 719_468).rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (month as usize, doy - (153 * mp + 2) / 5 + 1)
+}
+
+/// Minutes into the day on a 12-hour clock: "3:40 pm", "12:05 am".
+fn clock(minutes: i64) -> String {
+    let (h, m) = (minutes / 60, minutes % 60);
+    format!("{}:{m:02} {}", if h % 12 == 0 { 12 } else { h % 12 }, if h < 12 { "am" } else { "pm" })
+}
+
+/// When a window starts afresh, in local time (`at_east` and `now_east`:
+/// the zone's minutes east of UTC then and now), to the nearest minute:
+/// "today 3:40 pm", "tomorrow 9:00 am", or "Sun Nov 8" then `sep` then
+/// "9:00 am"; "now" once it's past.
+pub fn resets_at(at: i64, now: i64, at_east: i64, now_east: i64, sep: &str) -> String {
+    if at <= now {
+        return "now".into();
+    }
+    let local = (at + 30_000).div_euclid(60_000) * 60_000 + at_east * 60_000;
+    let day = local.div_euclid(DAY_MS);
+    let today = (now + now_east * 60_000).div_euclid(DAY_MS);
+    let time = clock(local.rem_euclid(DAY_MS) / 60_000);
+    match day - today {
+        0 => format!("today {time}"),
+        1 => format!("tomorrow {time}"),
+        _ => {
+            let (month, d) = month_day(day);
+            format!("{} {} {d}{sep}{time}", WEEKDAYS[(day + 4).rem_euclid(7) as usize], MONTHS[month - 1])
+        }
+    }
+}
+
+/// One window as a sentence, for a hover: "Week: 90% left, resets Sun Nov
+/// 8, 9:00 am" (`when` gives the reset's phrase).
+pub fn sentence_at(w: &QuotaWindow, when: &dyn Fn(i64) -> String) -> String {
+    let what = if used_up(w) { "used up".to_owned() } else { format!("{:.0}% left", left(w)) };
+    match w.resets_at {
+        Some(at) => format!("{}: {what}, resets {}", window_label(&w.name), when(at)),
+        None => format!("{}: {what}", window_label(&w.name)),
+    }
+}
+
+/// One window, for Settings and the Usage page: "5-hour: 34% used · resets
+/// today 3:40 pm".
+pub fn line_at(w: &QuotaWindow, when: &dyn Fn(i64) -> String) -> String {
+    let used = if used_up(w) { "used up".to_owned() } else { format!("{:.0}% used", w.used_percent) };
+    match w.resets_at {
+        Some(at) => format!("{}: {used} · resets {}", window_label(&w.name), when(at)),
+        None => format!("{}: {used}", window_label(&w.name)),
+    }
+}
+
+/// Minutes east of UTC in the browser's zone at `ms`.
+fn east(ms: i64) -> i64 {
+    -js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64)).get_timezone_offset() as i64
+}
+
+/// When a window starts afresh, in the browser's local time.
+pub fn resets(at: i64, sep: &str) -> String {
+    let now = now_ms();
+    resets_at(at, now, east(at), east(now), sep)
+}
+
+pub fn sentence(w: &QuotaWindow) -> String {
+    sentence_at(w, &|at| resets(at, ", "))
 }
 
 pub fn line(w: &QuotaWindow) -> String {
-    line_at(w, now_ms(), &weekday_time)
+    line_at(w, &|at| resets(at, ", "))
 }
 
 /// The option text for a connection in a picker: its name, and what's left
-/// of its plan.
+/// of its plan's tightest window ("Max · 90% left").
 pub fn option_label(id: &str, name: &str) -> String {
-    match of(id).as_ref().and_then(compact) {
-        Some((left, _)) => format!("{name} — {left}"),
+    match of(id).as_ref().and_then(tightest_left) {
+        Some((left, _)) => format!("{name} · {left:.0}% left"),
         None => name.to_owned(),
     }
 }
 
-/// What's left of the chosen connection's plan, beside a picker.
+/// What's left of the chosen connection's plan: beside a picker "90% left"
+/// (every window on hover), or `chip`, after the model in the message
+/// box's chip, "· 90%" (the tightest window on hover). Nothing without a
+/// plan.
 #[component]
-pub fn QuotaNote(#[prop(into)] connection: Signal<String>) -> impl IntoView {
+pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chip: bool) -> impl IntoView {
     move || {
         let q = of(&connection.get())?;
-        let (text, t) = compact(&q)?;
-        let title = q.windows.iter().map(line).collect::<Vec<_>>().join("\n");
-        Some(view! { <span class=format!("whitespace-nowrap text-xs {}", t.class()) title=title>{text}</span> })
+        let w = q.tightest()?;
+        let t = tone(w);
+        Some(if chip {
+            view! {
+                <span class="text-muted" aria-hidden="true">"·"</span>
+                <span class=format!("whitespace-nowrap {}", t.class()) title=sentence(w)>{format!("{:.0}%", left(w))}</span>
+            }
+            .into_any()
+        } else {
+            let title = q.windows.iter().map(sentence).collect::<Vec<_>>().join("\n");
+            view! { <span class=format!("whitespace-nowrap text-xs {}", t.class()) title=title>{format!("{:.0}% left", left(w))}</span> }
+                .into_any()
+        })
     }
 }
 
-/// A connection's windows as bars, for Settings and the Usage page.
+/// The model menu's Plan section, above its Model section: each window's
+/// bar of what's left and when it starts afresh, then a divider. Nothing
+/// without a plan.
+#[component]
+pub fn PlanMenu(#[prop(into)] connection: Signal<String>) -> impl IntoView {
+    move || {
+        let q = of(&connection.get())?;
+        let error = (!q.error.is_empty()).then(|| q.error.clone());
+        Some(view! {
+            <div class="space-y-2 border-b border-zinc-200 pb-2 dark:border-zinc-700">
+                <div class="font-medium uppercase tracking-wide text-muted">"Plan"</div>
+                {q.windows.iter().map(|w| {
+                    let t = tone(w);
+                    let pct = left(w);
+                    view! {
+                        <div class="w-72 max-w-full" title=sentence(w)>
+                            <div class="flex items-center gap-2">
+                                <span class="w-28 shrink-0 truncate">{window_label(&w.name)}</span>
+                                <div class="h-1 min-w-0 flex-1 overflow-hidden rounded bg-zinc-200 dark:bg-zinc-800">
+                                    <div class=format!("h-full {}", t.bar()) style=format!("width:{pct:.0}%")></div>
+                                </div>
+                                <span class=format!("shrink-0 whitespace-nowrap {}", t.class())>{format!("{pct:.0}% left")}</span>
+                            </div>
+                            {w.resets_at.map(|at| view! { <div class="text-muted">{format!("resets {}", resets(at, " · "))}</div> })}
+                        </div>
+                    }
+                }).collect_view()}
+                {error.map(|e| view! { <div class="text-muted" title=e>"Last read failed; showing the last numbers seen."</div> })}
+            </div>
+        })
+    }
+}
+
+/// A connection's windows as bars of what's used, for Settings and the
+/// Usage page.
 #[component]
 pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
     let error = (!q.error.is_empty()).then(|| q.error.clone());
@@ -177,12 +292,14 @@ pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
             {q.windows.iter().map(|w| {
                 let t = tone(w);
                 let pct = w.used_percent.clamp(0.0, 100.0);
+                // The words stay grey until it's low.
+                let text = if t >= Tone::Low { t.class() } else { "text-muted" };
                 view! {
                     <div class="flex items-center gap-2 text-xs">
                         <div class="h-1.5 w-28 shrink-0 overflow-hidden rounded bg-zinc-200 dark:bg-zinc-800">
                             <div class=format!("h-full {}", t.bar()) style=format!("width:{pct:.1}%")></div>
                         </div>
-                        <span class=t.class()>{line(w)}</span>
+                        <span class=text>{line(w)}</span>
                     </div>
                 }
             }).collect_view()}
@@ -200,29 +317,104 @@ mod tests {
     }
 
     #[test]
-    fn pickers_show_the_tightest_window() {
-        let day = |_: i64| "Thu".to_owned();
+    fn levels_by_what_is_left() {
+        assert_eq!(level(100.0, ""), Tone::Plenty);
+        assert_eq!(level(51.0, ""), Tone::Plenty);
+        assert_eq!(level(50.0, ""), Tone::Half);
+        assert_eq!(level(21.0, ""), Tone::Half);
+        assert_eq!(level(20.0, ""), Tone::Low);
+        assert_eq!(level(5.0, ""), Tone::Low);
+        assert_eq!(level(4.0, ""), Tone::Out);
+        assert_eq!(level(0.0, ""), Tone::Out);
+        // The provider's word.
+        assert_eq!(level(90.0, "warning"), Tone::Low);
+        assert_eq!(level(3.0, "warning"), Tone::Out);
+        assert_eq!(level(40.0, "rejected"), Tone::Out);
+        assert_eq!(level(90.0, "allowed"), Tone::Plenty);
+        // The number shown decides: 4.6% left reads 5%, low.
+        assert_eq!(tone(&w("5h", 95.4, None, "")), Tone::Low);
+        assert_eq!(tone(&w("5h", 95.6, None, "")), Tone::Out);
+    }
+
+    #[test]
+    fn plenty_is_quiet_grey_then_yellow_amber_red() {
+        let colours = |left: f64| (level(left, "").class(), level(left, "").bar());
+        assert_eq!(colours(90.0), ("text-muted", "bg-zinc-500 dark:bg-zinc-400"));
+        assert_eq!(colours(40.0), ("text-yellow-600 dark:text-yellow-300", "bg-yellow-400"));
+        assert_eq!(colours(10.0), ("text-amber-600 dark:text-amber-400", "bg-amber-500"));
+        assert_eq!(colours(2.0), ("text-red-600 dark:text-red-400", "bg-red-500"));
+    }
+
+    #[test]
+    fn the_chip_shows_the_tightest_window() {
         let q = ConnectionQuota {
-            windows: vec![w("5h", 34.0, Some(2 * 3_600_000), ""), w("week", 71.0, Some(5 * 86_400_000), "")],
+            windows: vec![w("5h", 34.0, None, ""), w("week", 71.0, None, ""), w("week (Opus)", 12.0, None, "")],
             ..Default::default()
         };
-        assert_eq!(compact_at(&q, 0, &day), Some(("week 29% left · renews Thu".into(), Tone::Fine)));
-        let q = ConnectionQuota {
-            windows: vec![w("5h", 100.0, Some(40 * 60_000), "rejected"), w("week", 96.0, None, "warning")],
-            ..Default::default()
-        };
-        assert_eq!(compact_at(&q, 0, &day), Some(("5h used up · renews 40m".into(), Tone::Out)));
-        let q = ConnectionQuota { windows: vec![w("week", 85.0, None, "")], ..Default::default() };
-        assert_eq!(compact_at(&q, 0, &day), Some(("week 15% left".into(), Tone::Low)));
-        assert_eq!(compact_at(&ConnectionQuota::default(), 0, &day), None);
+        assert_eq!(tightest_left(&q), Some((29.0, Tone::Half)));
+        let q = ConnectionQuota { windows: vec![w("5h", 80.0, None, "rejected"), w("week", 96.0, None, "")], ..Default::default() };
+        assert_eq!(tightest_left(&q), Some((20.0, Tone::Out)));
+        assert_eq!(tightest_left(&ConnectionQuota::default()), None);
+    }
+
+    #[test]
+    fn windows_read_by_name() {
+        assert_eq!(window_label("5h"), "5-hour");
+        assert_eq!(window_label("30m"), "30-minute");
+        assert_eq!(window_label("week"), "Week");
+        assert_eq!(window_label("week (Opus)"), "Week (Opus)");
+        assert_eq!(window_label("overage"), "Overage");
+        assert_eq!(window_label(""), "");
+    }
+
+    // Mon Nov 2 2026, 10:15 am UTC.
+    const NOW: i64 = 1_793_614_500_000;
+    const MIN: i64 = 60_000;
+
+    #[test]
+    fn resets_today_tomorrow_or_on_a_date() {
+        assert_eq!(resets_at(NOW + (5 * 60 + 25) * MIN, NOW, 0, 0, " · "), "today 3:40 pm");
+        assert_eq!(resets_at(NOW + (22 * 60 + 45) * MIN, NOW, 0, 0, " · "), "tomorrow 9:00 am");
+        let sun = NOW + 5 * DAY_MS + (22 * 60 + 45) * MIN;
+        assert_eq!(resets_at(sun, NOW, 0, 0, " · "), "Sun Nov 8 · 9:00 am");
+        assert_eq!(resets_at(sun, NOW, 0, 0, ", "), "Sun Nov 8, 9:00 am");
+        // To the nearest minute.
+        assert_eq!(resets_at(NOW + (5 * 60 + 25) * MIN - 20_000, NOW, 0, 0, ""), "today 3:40 pm");
+        assert_eq!(resets_at(NOW, NOW, 0, 0, ""), "now");
+        // Across a month and a year.
+        assert_eq!(resets_at(NOW + 26 * DAY_MS + (13 * 60 + 45) * MIN, NOW, 0, 0, " "), "Sun Nov 29 12:00 am");
+        assert_eq!(resets_at(NOW + 59 * DAY_MS + (13 * 60 + 45) * MIN, NOW, 0, 0, " "), "Fri Jan 1 12:00 am");
+    }
+
+    #[test]
+    fn resets_in_local_time() {
+        // 10:15 am UTC is 2:15 am in UTC-8; 11:00 pm UTC is 3:00 pm there.
+        assert_eq!(resets_at(NOW + (12 * 60 + 45) * MIN, NOW, -480, -480, ""), "today 3:00 pm");
+        // 11:30 pm UTC is 1:30 am tomorrow in UTC+2.
+        assert_eq!(resets_at(NOW + (13 * 60 + 15) * MIN, NOW, 120, 120, ""), "tomorrow 1:30 am");
+        // 12:30 am UTC Tuesday is still Monday, 4:30 pm, in UTC-8.
+        assert_eq!(resets_at(NOW + (14 * 60 + 15) * MIN, NOW, -480, -480, ""), "today 4:30 pm");
+        // Daylight saving ending in between: the zone at the reset counts.
+        assert_eq!(resets_at(NOW + (12 * 60 + 45) * MIN, NOW, -480, -420, ""), "today 3:00 pm");
+    }
+
+    #[test]
+    fn twelve_hour_clock() {
+        assert_eq!(clock(0), "12:00 am");
+        assert_eq!(clock(5), "12:05 am");
+        assert_eq!(clock(9 * 60), "9:00 am");
+        assert_eq!(clock(12 * 60), "12:00 pm");
+        assert_eq!(clock(15 * 60 + 40), "3:40 pm");
+        assert_eq!(clock(23 * 60 + 59), "11:59 pm");
     }
 
     #[test]
     fn a_window_reads_with_its_reset() {
-        let when = |_: i64| "Thu 09:00".to_owned();
-        assert_eq!(line_at(&w("5h", 34.4, Some(130 * 60_000), ""), 0, &when), "5h: 34% used · resets in 2h 10m");
-        assert_eq!(line_at(&w("5h", 34.0, Some(20 * 60_000), ""), 0, &when), "5h: 34% used · resets in 20m");
-        assert_eq!(line_at(&w("week", 71.0, Some(3 * 86_400_000), ""), 0, &when), "week: 71% used · resets Thu 09:00");
-        assert_eq!(line_at(&w("week", 100.0, None, "rejected"), 0, &when), "week: used up");
+        let when = |_: i64| "Sun Nov 8, 9:00 am".to_owned();
+        assert_eq!(sentence_at(&w("week", 10.0, Some(1), ""), &when), "Week: 90% left, resets Sun Nov 8, 9:00 am");
+        assert_eq!(sentence_at(&w("5h", 100.0, Some(1), "rejected"), &when), "5-hour: used up, resets Sun Nov 8, 9:00 am");
+        assert_eq!(sentence_at(&w("week", 71.0, None, ""), &when), "Week: 29% left");
+        assert_eq!(line_at(&w("5h", 34.4, Some(1), ""), &when), "5-hour: 34% used · resets Sun Nov 8, 9:00 am");
+        assert_eq!(line_at(&w("week", 100.0, None, "rejected"), &when), "Week: used up");
     }
 }
