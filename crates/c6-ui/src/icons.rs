@@ -48,3 +48,78 @@ pub fn package() -> impl IntoView {
         <path d="m7.5 4.27 9 5.15" />
     })
 }
+
+/// Lucide `chevron-left`: back.
+pub fn chevron_left() -> impl IntoView {
+    icon(view! { <path d="m15 18-6-6 6-6" /> })
+}
+
+/// Lucide `chevron-right`: forward.
+pub fn chevron_right() -> impl IntoView {
+    icon(view! { <path d="m9 18 6-6-6-6" /> })
+}
+
+/// Lucide `x`: close.
+pub fn x() -> impl IntoView {
+    icon(view! {
+        <path d="M18 6 6 18" />
+        <path d="m6 6 12 12" />
+    })
+}
+
+/// Lucide `ellipsis`: a menu of actions.
+pub fn ellipsis() -> impl IntoView {
+    icon(view! {
+        <circle cx="12" cy="12" r="1" />
+        <circle cx="19" cy="12" r="1" />
+        <circle cx="5" cy="12" r="1" />
+    })
+}
+
+/// Lucide `star`, filled when `on` (pinned).
+pub fn star(on: bool) -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 24 24" class="size-4 shrink-0" fill=if on { "currentColor" } else { "none" } stroke="currentColor" stroke-width="2.25"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+        </svg>
+    }
+}
+
+/// Lucide `square-arrow-out-up-right`: into a tile of its own.
+pub fn square_arrow_out() -> impl IntoView {
+    icon(view! {
+        <path d="M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6" />
+        <path d="m21 3-9 9" />
+        <path d="M15 3h6v6" />
+    })
+}
+
+/// Lucide `minus`: minimize.
+pub fn minus() -> impl IntoView {
+    icon(view! { <path d="M5 12h14" /> })
+}
+
+/// Lucide `maximize`: focus (fill the screen).
+pub fn maximize() -> impl IntoView {
+    icon(view! {
+        <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+        <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
+        <path d="M3 16v3a2 2 0 0 0 2 2h3" />
+        <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+    })
+}
+
+/// Lucide `minimize`: out of focus, back to the tiles.
+pub fn minimize() -> impl IntoView {
+    icon(view! {
+        <path d="M8 3v3a2 2 0 0 1-2 2H3" />
+        <path d="M21 8h-3a2 2 0 0 1-2-2V3" />
+        <path d="M3 16h3a2 2 0 0 1 2 2v3" />
+        <path d="M16 21v-3a2 2 0 0 1 2-2h3" />
+    })
+}
+
+/// An icon button in a bar (a tile's, a pane's, a session's strip): 28px
+/// round a 16px glyph, 40px on a touch screen.
+pub const BAR_BUTTON: &str = "flex size-7 shrink-0 items-center justify-center rounded text-zinc-600 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent pointer-coarse:size-10 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-100";

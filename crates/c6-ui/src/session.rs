@@ -768,7 +768,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
         </div>
         <Show when=move || wide.get()>
-            <aside class="sticky top-0 max-h-[calc(100dvh-8rem)] w-72 shrink-0 overflow-y-auto pb-4 pt-4">
+            <aside class=format!("sticky top-0 max-h-[calc(100dvh-8rem)] overflow-y-auto pb-4 pt-4 {GLANCE_COLUMN}")>
                 <crate::details::Glance chrome />
             </aside>
         </Show>
@@ -853,10 +853,15 @@ const READING_ROW: &str = "flex justify-center gap-6";
 /// glance and a 16px margin on either side.
 const GLANCE_COLUMN_MIN: i32 = 896 + 24 + GLANCE_WIDTH as i32 + 2 * 16;
 
+/// The glance as a column: 288px where it starts, growing to 380px with
+/// what the session's column has left after the reading column (56rem),
+/// the gap (1.5rem) and the margins (1rem each): 100% − 59.5rem.
+const GLANCE_COLUMN: &str = "w-[clamp(18rem,calc(100%_-_59.5rem),23.75rem)] shrink-0";
+
 /// Where the glance is beside the transcript: the room it and the gap
 /// take, so what lines up with the transcript keeps its left edge.
 fn glance_room(beside: RwSignal<bool>) -> impl IntoView {
-    move || beside.get().then(|| view! { <div class="w-72 shrink-0" aria-hidden="true"></div> })
+    move || beside.get().then(|| view! { <div class=GLANCE_COLUMN aria-hidden="true"></div> })
 }
 
 /// The glance is beside the transcript (for the message box, to line up
@@ -1111,13 +1116,13 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
     }
 }
 
-/// An icon button of a session's: 24px square, filled while what it opens
-/// is open.
+/// An icon button of a session's: 28px square round a 16px icon (40px on
+/// a touch screen), filled while what it opens is open.
 fn icon_class(open: bool) -> &'static str {
     if open {
-        "flex h-6 min-w-6 shrink-0 items-center justify-center gap-0.5 rounded px-1 bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100"
+        "flex h-7 min-w-7 shrink-0 items-center justify-center gap-0.5 rounded px-1.5 pointer-coarse:h-10 pointer-coarse:min-w-10 bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100"
     } else {
-        "flex h-6 min-w-6 shrink-0 items-center justify-center gap-0.5 rounded px-1 text-muted hover:bg-zinc-200/70 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+        "flex h-7 min-w-7 shrink-0 items-center justify-center gap-0.5 rounded px-1.5 pointer-coarse:h-10 pointer-coarse:min-w-10 text-muted hover:bg-zinc-200/70 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
     }
 }
 
@@ -1159,15 +1164,17 @@ pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
         {move || {
             let lines = chrome.busy.get();
             let n = lines.len();
+            // A spinner and the count: what they are on hover.
+            let what = format!("{n} running in the background:");
             (n > 0).then(|| view! {
-                <button class="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-blue-600 hover:bg-zinc-200/70 dark:text-blue-400 dark:hover:bg-zinc-800"
-                    title=lines.join("\n")
+                <button class="flex h-7 shrink-0 items-center gap-1 rounded px-1.5 text-xs text-blue-600 hover:bg-zinc-200/70 pointer-coarse:h-10 pointer-coarse:px-2 dark:text-blue-400 dark:hover:bg-zinc-800"
+                    title=format!("{what}\n{}", lines.join("\n")) aria-label=format!("{what} {}", lines.join("; "))
                     on:click=move |ev| chrome.show_looks(&ev)>
-                    <svg viewBox="0 0 16 16" class="size-3 shrink-0 animate-spin" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" class="size-3.5 shrink-0 animate-spin" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <circle cx="8" cy="8" r="6" stroke-opacity="0.3" />
                         <path d="M14 8a6 6 0 0 0-6-6" />
                     </svg>
-                    <span class="tabular-nums">{format!("{n} in background")}</span>
+                    <span class="tabular-nums">{n}</span>
                 </button>
             })
         }}
@@ -1212,15 +1219,15 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     // view's).
     let rename_from = StoredValue::new((8.0, 48.0));
     view! {
-        <div class="flex h-8 shrink-0 items-center justify-end gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs dark:border-zinc-800 dark:bg-zinc-900/60">
+        <div class="flex h-9 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
             <SessionControls chrome />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
-            <button class="rounded px-1.5 py-0.5 text-zinc-600 hover:bg-zinc-200/70 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+            <button class=crate::icons::BAR_BUTTON aria-label="Actions"
                 title="Actions: rename, find, files, outputs, details, new like this, save as template, archive"
                 on:click=move |ev| {
                     rename_from.set_value(below(&ev, 320.0));
                     menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) });
-                }>"⋯"</button>
+                }>{crate::icons::ellipsis()}</button>
             <Popover at=menu_at class="w-60">
                 <SessionMenu chrome on_rename=move |()| rename_at.set(Some(rename_from.get_value())) on_done=move |()| menu_at.set(None) />
             </Popover>
@@ -1250,7 +1257,7 @@ fn GlanceSheet(chrome: SessionChrome) -> impl IntoView {
         <div class="fixed inset-0 z-40 bg-black/30" on:click=move |ev| { ev.stop_propagation(); close() }></div>
         <div class="fixed inset-x-0 bottom-0 z-50 flex max-h-[50dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
-            <div class="relative flex h-7 shrink-0 touch-none items-center justify-center"
+            <div class="relative flex h-9 shrink-0 touch-none items-center justify-center pointer-coarse:h-12"
                 on:pointerdown=move |ev: web_sys::PointerEvent| pulled_from.set_value(Some(ev.client_y()))
                 on:pointerup=move |ev: web_sys::PointerEvent| {
                     if pulled_from.get_value().is_some_and(|y| ev.client_y() - y > 40) {
@@ -1259,8 +1266,7 @@ fn GlanceSheet(chrome: SessionChrome) -> impl IntoView {
                     pulled_from.set_value(None);
                 }>
                 <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
-                <button class="absolute right-2 top-1 rounded px-1.5 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                    title="Close" on:click=move |_| close()>"✕"</button>
+                <button class=format!("{} absolute right-1 top-1", crate::icons::BAR_BUTTON) title="Close" aria-label="Close" on:click=move |_| close()>{crate::icons::x()}</button>
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
                 <crate::details::Glance chrome on_done=move |()| close() />

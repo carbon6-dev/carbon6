@@ -1724,7 +1724,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         let el: Option<web_sys::Element> = title_el.get_untracked().map(Into::into);
         rename_at.set(Some(below_element(el.as_ref(), 320.0)));
     };
-    let btn = "rounded px-1.5 py-0.5 text-zinc-600 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-100";
+    let btn = crate::icons::BAR_BUTTON;
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
     let section = NodeRef::<leptos::html::Section>::new();
@@ -1790,8 +1790,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
-            // is a stripe along its top.
-            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
+            // is a stripe along its top. Taller on a touch screen, for its
+            // buttons' 40px.
+            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-0.5 pointer-coarse:h-11 pointer-coarse:gap-0 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -1807,10 +1808,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 }
             >
                 {move || colour.get().map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 h-1" style=crate::marks::fill(&c)></div> })}
-                <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
-                <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
+                <button class=btn title="Back (⌘[)" aria-label="Back" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>{crate::icons::chevron_left()}</button>
+                <button class=btn title="Forward (⌘])" aria-label="Forward" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>{crate::icons::chevron_right()}</button>
                 {move || colour.get().map(|c| view! {
-                    <button class="ml-0.5 flex shrink-0 hover:scale-125" title="This session's mark: change it" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
+                    <button class=format!("{btn} hover:[&>*]:scale-125") title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
                         <crate::marks::Glyph mark=Signal::stored(c) shape=crate::marks::Shape::Circle size=12 />
                     </button>
                 })}
@@ -1822,9 +1823,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || session.get().map(|s| {
                     let (dot, label) = status_dot(&s);
                     view! {
-                        <span class="flex shrink-0 items-center gap-1 pr-1 text-[11px] text-soft">
+                        // On a phone, the dot alone (the word for screen readers).
+                        <span class="flex shrink-0 items-center gap-1 pr-1 text-[11px] text-soft" title=label>
                             <span class=format!("size-1.5 rounded-full {dot}")></span>
-                            {label}
+                            <span class="max-sm:sr-only">{label}</span>
                         </span>
                     }
                 })}
@@ -1832,42 +1834,36 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || chrome().map(|c| view! {
                     <crate::session::SessionControls chrome=c />
                     <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
-                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, archive"
-                        on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>"⋯"</button>
+                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, archive" aria-label="Actions"
+                        on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
                 })}
                 {move || pinnable().map(|id| {
                     let (a, b) = (StoredValue::new(id.clone()), id.clone());
                     let on = move || ws.pinned.with(|p| p.contains(&a.get_value()));
                     view! {
-                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } on:click=move |_| ws.toggle_pin(&b)>
-                            {move || if on() { "★" } else { "☆" }}
+                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } aria-label=move || if on() { "Unpin" } else { "Pin" }
+                            on:click=move |_| ws.toggle_pin(&b)>
+                            {move || crate::icons::star(on())}
                         </button>
                     }
                 })}
                 {move || two().then(|| view! {
-                    <button class=format!("{btn} hidden md:inline") title="Move the open item to a tile of its own (or ⌘-click a link)" on:click=move |_| ws.detach(key)>"⧉"</button>
+                    <button class=format!("{btn} hidden md:flex") title="Move the open item to a tile of its own (or ⌘-click a link)" aria-label="Into a tile of its own"
+                        on:click=move |_| ws.detach(key)>{crate::icons::square_arrow_out()}</button>
                 })}
                 {move || many.get().then(|| view! {
-                    <button class=format!("{btn} hidden md:inline") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
+                    <button class=format!("{btn} hidden md:flex") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
                         aria-label="Minimize" on:click=move |ev| { ev.stop_propagation(); ws.minimize(key) }>
-                        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-                            <path d="M3 12h10" />
-                        </svg>
+                        {crate::icons::minus()}
                     </button>
                 })}
-                <button class=format!("{btn} hidden md:inline") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
+                <button class=format!("{btn} hidden md:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
                     // Corners pointing out (focus) or in (back to the tiles).
-                    <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d=move || if full.get() {
-                            "M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4"
-                        } else {
-                            "M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"
-                        } />
-                    </svg>
+                    {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
                 </button>
-                <button class=btn title="Close this tile" on:click=move |_| ws.close_tile(key)>"✕"</button>
+                <button class=btn title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
             </div>
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
@@ -2306,23 +2302,25 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
         _ => None,
     };
     let pinned = move || session().is_some_and(|id| ws.pinned.with(|p| p.contains(&id)));
-    let btn = "rounded px-1 text-muted hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    // 24px round a 16px glyph (the bar is 28px), 40px on a touch screen.
+    let btn = "flex size-6 shrink-0 items-center justify-center rounded text-muted hover:bg-zinc-200 hover:text-zinc-900 pointer-coarse:size-10 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
         <div class=move || format!(
-            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] dark:border-zinc-900 {}",
+            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
             if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
             {move || pos.get().filter(|p| p.index == 1).map(|_| view! {
-                <button class=format!("{btn} md:hidden") title="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>"‹"</button>
+                <button class=format!("{btn} md:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
             })}
             <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {
-                <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } on:click=move |_| ws.toggle_pin(&id)>
-                    {move || if pinned() { "★" } else { "☆" }}
+                <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } aria-label=move || if pinned() { "Unpin" } else { "Pin" }
+                    on:click=move |_| ws.toggle_pin(&id)>
+                    {move || crate::icons::star(pinned())}
                 </button>
             })}
             {move || pos.get().filter(|p| p.len == 2).map(|_| view! {
-                <button class=btn title="Close this pane" on:click=move |_| ctx.close()>"×"</button>
+                <button class=btn title="Close this pane" aria-label="Close this pane" on:click=move |_| ctx.close()>{crate::icons::x()}</button>
             })}
         </div>
     }

@@ -18,7 +18,7 @@ use crate::workspace::{Popover, View, below};
 /// How wide the glance is, as a column or a popover.
 pub const GLANCE_WIDTH: f64 = 288.0;
 
-const LINE: &str = "flex w-full min-w-0 items-baseline gap-2 rounded px-1.5 py-1 text-left text-xs";
+const LINE: &str = "flex w-full min-w-0 items-baseline gap-2 rounded px-1.5 py-1.5 text-left text-xs leading-snug";
 const ACTS: &str = "hover:bg-zinc-100 dark:hover:bg-zinc-800";
 const LABEL: &str = "w-[4.5rem] shrink-0 text-[10px] font-medium uppercase tracking-wide text-muted";
 const HEADING: &str = "px-1.5 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted";
@@ -42,11 +42,11 @@ pub fn git_state(at: Memo<Option<(String, String)>>, events: RwSignal<Vec<Event>
     })
 }
 
-/// A line of the glance: a small label, what it says, and what clicking
-/// it does.
+/// A line of the glance: a small label, what it says (wrapping rather than
+/// cut short), and what clicking it does.
 fn line(label: &'static str, body: impl IntoView + 'static, act: Option<Callback<web_sys::MouseEvent>>) -> AnyView {
     let label = view! { <span class=LABEL>{label}</span> };
-    let body = view! { <span class="min-w-0 flex-1 truncate">{body}</span> };
+    let body = view! { <span class="min-w-0 flex-1 [overflow-wrap:anywhere]">{body}</span> };
     match act {
         Some(f) => view! { <button class=format!("{LINE} {ACTS}") on:click=move |ev| f.run(ev)>{label}{body}</button> }.into_any(),
         None => view! { <div class=LINE>{label}{body}</div> }.into_any(),
@@ -282,7 +282,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
                                 done();
                             }>
                             <span class=format!("size-1.5 shrink-0 self-center rounded-full {dot}")></span>
-                            <span class="min-w-0 flex-1 truncate">{what.clone()}</span>
+                            <span class="line-clamp-2 min-w-0 flex-1 [overflow-wrap:anywhere]">{what.clone()}</span>
                             <span class=format!("shrink-0 text-[11px] {}", if failed { "text-red-600 dark:text-red-400" } else { "text-muted" })>{state}</span>
                         </button>
                     }
@@ -445,7 +445,7 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
                 class="w-full max-w-2xl space-y-4 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">"Session details"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=crate::icons::BAR_BUTTON title="Close (Esc)" aria-label="Close" on:click=move |_| on_close.run(())>{crate::icons::x()}</button>
                 </div>
                 <section class="space-y-1">
                     <h3 class="text-sm font-medium">"Usage"</h3>

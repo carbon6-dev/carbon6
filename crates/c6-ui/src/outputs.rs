@@ -131,9 +131,9 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
                 let latest = vs.last().cloned().expect("a version");
                 let pick = name.clone();
                 view! {
-                    <button class="flex w-full min-w-0 items-baseline gap-2 rounded px-1.5 py-1 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
+                    <button class="flex w-full min-w-0 items-baseline gap-2 rounded px-1.5 py-1.5 text-left text-xs leading-snug hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
                         on:click=move |_| on_pick.run(Some(pick.clone()))>
-                        <span class="min-w-0 flex-1 truncate">{latest.title.clone()}</span>
+                        <span class="line-clamp-2 min-w-0 flex-1 [overflow-wrap:anywhere]">{latest.title.clone()}</span>
                         <span class="shrink-0 text-[11px] text-muted">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</span>
                     </button>
                 }
