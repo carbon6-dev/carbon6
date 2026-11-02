@@ -1274,6 +1274,9 @@ pub fn DocPage(id: String) -> impl IntoView {
                         on:click=move |_| panel.update(|p| *p = !*p)>
                         {move || match open_n.get() { 0 => "💬".to_owned(), n => format!("💬 {n} open") }}
                     </button>
+                    // A comment on the whole doc, wherever you've scrolled to.
+                    <button data-opens="comments" class=BAR title="Comment on the whole doc"
+                        on:click=move |_| { panel.set(true); threads.focus.set(Some(String::new())); threads.commenting.set(Some(String::new())); }>"+ Comment"</button>
                     {move || (unsent.get() > 0).then(|| send_all_button(threads, true))}
                     {move || (!is_deck.get()).then(|| view! {
                         <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
@@ -2075,7 +2078,9 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
     // drawn again.
     let keys = StoredValue::new((format!("comment.{}.{block}", doc.get_value()), format!("comment-quote.{}.{block}", doc.get_value())));
     let (text, quote) = keys.with_value(|(t, q)| (crate::util::draft(t), crate::util::draft(q)));
-    let to_agent = RwSignal::new(false);
+    // Sticky: as you last left it, for the next comment too.
+    let to_agent = RwSignal::new(crate::util::storage_get("comment.to_agent").as_deref() == Some("1"));
+    Effect::new(move || crate::util::storage_set("comment.to_agent", if to_agent.get() { "1" } else { "0" }));
     let on_block = !block.is_empty();
     let what = if !on_block {
         "Comment on the whole tab"
