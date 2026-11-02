@@ -120,6 +120,10 @@ pub fn use_facets() -> Facets {
 #[derive(Clone, Copy)]
 pub struct Spotlight(pub RwSignal<Option<String>>);
 
+/// How long the pointer rests on a value before the other tiles dim:
+/// passing over a bar on the way somewhere else doesn't flicker the screen.
+const SPOTLIGHT_DWELL_MS: u64 = 400;
+
 pub fn use_spotlight() -> Spotlight {
     expect_context::<Spotlight>()
 }
@@ -129,6 +133,29 @@ pub fn use_spotlight() -> Spotlight {
 #[component]
 pub fn AspectStrip(#[prop(into)] session: Signal<Option<Session>>) -> impl IntoView {
     let spot = use_spotlight();
+    // Set once the pointer has rested on a value; leaving cancels it and
+    // clears what it lit.
+    let timer = StoredValue::new(None::<TimeoutHandle>);
+    let rest_on = move |key: Option<String>| {
+        if let Some(t) = timer.get_value() {
+            t.clear();
+        }
+        timer.set_value(None);
+        match key {
+            Some(k) => timer
+                .set_value(set_timeout_with_handle(move || spot.0.set(Some(k)), std::time::Duration::from_millis(SPOTLIGHT_DWELL_MS)).ok()),
+            None => {
+                if spot.0.get_untracked().is_some() {
+                    spot.0.set(None);
+                }
+            }
+        }
+    };
+    on_cleanup(move || {
+        if let Some(t) = timer.try_get_value().flatten() {
+            t.clear();
+        }
+    });
     let open = RwSignal::new(None::<(f64, f64)>);
     let picked = RwSignal::new(None::<Aspect>);
     let aspects = Memo::new(move |_| session.get().map(|s| shown(&s)).unwrap_or_default());
@@ -141,9 +168,9 @@ pub fn AspectStrip(#[prop(into)] session: Signal<Option<Session>>) -> impl IntoV
                     view! {
                         <button class="flex min-w-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-zinc-600 hover:bg-black/10 dark:text-zinc-300 dark:hover:bg-white/10"
                             title=format!("{}: {}", a.what(), a.label)
-                            on:mouseenter=move |_| spot.0.set(Some(enter.clone()))
-                            on:mouseleave=move |_| spot.0.set(None)
-                            on:click=move |ev| { ev.stop_propagation(); spot.0.set(None); picked.set(Some(click.clone())); open.set(Some(below(&ev, 380.0))) }>
+                            on:mouseenter=move |_| rest_on(Some(enter.clone()))
+                            on:mouseleave=move |_| rest_on(None)
+                            on:click=move |ev| { ev.stop_propagation(); rest_on(None); picked.set(Some(click.clone())); open.set(Some(below(&ev, 380.0))) }>
                             <Glyph mark shape=a.shape() size=10 />
                             <span class="hidden max-w-28 truncate @2xl:inline">{a.label.clone()}</span>
                         </button>
