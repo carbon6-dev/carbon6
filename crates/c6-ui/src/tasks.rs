@@ -130,21 +130,28 @@ pub fn running_line(tasks: usize, servers: usize) -> String {
     }
 }
 
+/// How many tasks the session has run or runs now.
+pub fn count(events: &[Event]) -> usize {
+    lifecycle(events).len()
+}
+
 /// `line`: a quiet line for the bottom of the transcript, shown only while
 /// something runs (docs/background.md §4), instead of the bar's button.
+/// `on_open`: the button opens that (the session's details) instead of its
+/// list.
 #[component]
 pub fn RunningTasks(
     session: String,
     events: RwSignal<Vec<Event>>,
     #[prop(optional)] compact: bool,
     #[prop(optional)] line: bool,
+    #[prop(optional, into)] on_open: Option<Callback<()>>,
 ) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
     let counts = Memo::new(move |_| events.with(|e| running_counts(e)));
     let at = RwSignal::new(None::<(f64, f64)>);
     let selected = RwSignal::new(None::<String>);
-    let now = clock();
     let error = RwSignal::new(None::<String>);
     let shown = move || if line { counts.with(|(t, s)| t + s > 0) } else { !list.with(Vec::is_empty) };
     view! {
@@ -172,7 +179,10 @@ pub fn RunningTasks(
                                 title=move || list.with(|tasks| format!("Background tasks: {} running · {} total", tasks.iter().filter(|t| t.running()).count(), tasks.len()))
                                 on:click=move |ev| {
                                     ev.stop_propagation();
-                                    at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
+                                    match on_open {
+                                        Some(f) => f.run(()),
+                                        None => at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) }),
+                                    }
                                 }>
                                 <strong>{move || list.with(|tasks| {
                                     let n = tasks.iter().filter(|t| t.running()).count();
@@ -185,51 +195,92 @@ pub fn RunningTasks(
                     }}
                     <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
                             <p class="text-zinc-500">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
-                            {move || list.get().into_iter().map(|t| {
-                                let id = t.id.clone();
-                                let inspect_id = t.id.clone();
-                                let running = t.running();
-                                let can_stop = t.can_stop();
-                                let status = t.status();
-                                let notification = t.notification();
-                                // What it is first, in words; its id and how its
-                                // end is reported on hover.
-                                let about = format!("{} · {notification}", t.id);
-                                view! {
-                                    <div class="space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
-                                        <div class="flex items-start gap-2" title=about>
-                                            <span class=format!("mt-1 h-2 w-2 shrink-0 rounded-full {}", state_dot(&t.state, running))></span>
-                                            <span class="line-clamp-2 min-w-0 flex-1 text-[13px] text-zinc-800 dark:text-zinc-100">{t.description.clone()}</span>
-                                        </div>
-                                        <div class="flex flex-wrap items-center gap-2 pl-4 text-zinc-600 dark:text-zinc-400">
-                                            <span class="rounded bg-zinc-100 px-1 text-[10px] dark:bg-zinc-800">{kind_name(&t.kind)}</span>
-                                            <span>{status}</span>
-                                            <span>{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
-                                            <span class="flex-1"></span>
-                                            <button class="rounded-md border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" on:click=move |_| {
-                                                selected.set(Some(inspect_id.clone()));
-                                                at.set(None);
-                                            }>"Inspect"</button>
-                                            {can_stop.then(|| view! { <button class="rounded-md border border-red-200 px-2 py-0.5 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950" on:click=move |_| {
-                                            let id = id.clone();
-                                            spawn_local(async move {
-                                                if let Err(e) = api::stop_task(session.get_value(), id).await {
-                                                    error.set(Some(e));
-                                                }
-                                            });
-                                        }>"Stop"</button> })}
-                                        </div>
-                                    </div>
-                                }
-                            }).collect_view()}
-                            {move || error.get().map(|e| view! { <p class="text-red-600">{e}</p> })}
+                            {task_rows(session, list, error, Callback::new(move |id| {
+                                selected.set(Some(id));
+                                at.set(None);
+                            }))}
                     </Popover>
-                    {move || selected.get().map(|id| {
-                        let task = Memo::new(move |_| list.with(|tasks| tasks.iter().find(|t| t.id == id).cloned()));
-                        view! { <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) /> }
-                    })}
+                    {inspector(session, list, selected)}
                 </div>
         </Show>
+    }
+}
+
+/// A session's background tasks listed in place (in its details), running
+/// first; nothing when it has none.
+#[component]
+pub fn TaskHistory(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
+    let session = StoredValue::new(session);
+    let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
+    let selected = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <Show when=move || !list.with(Vec::is_empty)>
+            <div class="space-y-2 text-xs">
+                {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
+            </div>
+        </Show>
+        {inspector(session, list, selected)}
+    }
+}
+
+/// The tasks, each with what it is, how it stands, Inspect and (while it
+/// runs) Stop.
+fn task_rows(
+    session: StoredValue<String>,
+    list: Memo<Vec<Task>>,
+    error: RwSignal<Option<String>>,
+    inspect: Callback<String>,
+) -> impl IntoView {
+    let now = clock();
+    view! {
+        {move || list.get().into_iter().map(|t| {
+            let id = t.id.clone();
+            let inspect_id = t.id.clone();
+            let running = t.running();
+            let can_stop = t.can_stop();
+            let status = t.status();
+            let notification = t.notification();
+            // What it is first, in words; its id and how its
+            // end is reported on hover.
+            let about = format!("{} · {notification}", t.id);
+            view! {
+                <div class="space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+                    <div class="flex items-start gap-2" title=about>
+                        <span class=format!("mt-1 h-2 w-2 shrink-0 rounded-full {}", state_dot(&t.state, running))></span>
+                        <span class="line-clamp-2 min-w-0 flex-1 text-[13px] text-zinc-800 dark:text-zinc-100">{t.description.clone()}</span>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 pl-4 text-zinc-600 dark:text-zinc-400">
+                        <span class="rounded bg-zinc-100 px-1 text-[10px] dark:bg-zinc-800">{kind_name(&t.kind)}</span>
+                        <span>{status}</span>
+                        <span>{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
+                        <span class="flex-1"></span>
+                        <button class="rounded-md border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" on:click=move |_| {
+                            inspect.run(inspect_id.clone());
+                        }>"Inspect"</button>
+                        {can_stop.then(|| view! { <button class="rounded-md border border-red-200 px-2 py-0.5 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950" on:click=move |_| {
+                        let id = id.clone();
+                        spawn_local(async move {
+                            if let Err(e) = api::stop_task(session.get_value(), id).await {
+                                error.set(Some(e));
+                            }
+                        });
+                    }>"Stop"</button> })}
+                    </div>
+                </div>
+            }
+        }).collect_view()}
+        {move || error.get().map(|e| view! { <p class="text-red-600">{e}</p> })}
+    }
+}
+
+/// The inspector of the task chosen, while one is.
+fn inspector(session: StoredValue<String>, list: Memo<Vec<Task>>, selected: RwSignal<Option<String>>) -> impl IntoView {
+    move || {
+        selected.get().map(|id| {
+            let task = Memo::new(move |_| list.with(|tasks| tasks.iter().find(|t| t.id == id).cloned()));
+            view! { <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) /> }
+        })
     }
 }
 

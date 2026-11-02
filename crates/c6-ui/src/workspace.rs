@@ -769,8 +769,8 @@ pub struct Workspace {
     pub layout: RwSignal<Layout>,
     /// A request to open, consumed by the active Brief. Never part of its view.
     pub brief_request: RwSignal<Option<i64>>,
-    /// What each session pane offers its tile's bar (its details), by pane
-    /// key, while it is shown.
+    /// What each session pane offers its tile's bar (its actions, ⋯), by
+    /// pane key, while it is shown.
     pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
@@ -1257,6 +1257,13 @@ impl ColumnCtx {
     pub fn close(&self) {
         self.ws.close_column(self.tile, self.col);
     }
+
+    /// Whether it's its tile's last column, the one the tile's bar speaks
+    /// for (tracked: a column opened or closed beside it changes it).
+    pub fn is_last(&self) -> bool {
+        let (tile, col) = (self.tile, self.col);
+        self.ws.layout.with(|l| l.tile(tile).and_then(|t| t.columns.last()).map(|c| c.key) == Some(col))
+    }
 }
 
 pub fn use_column() -> Option<ColumnCtx> {
@@ -1538,10 +1545,13 @@ fn status_pill(s: &Session) -> (&'static str, &'static str) {
 
 /// Where a popover opens: below the element clicked, kept on screen.
 pub fn below(ev: &web_sys::MouseEvent, width: f64) -> (f64, f64) {
-    let rect = ev
-        .current_target()
-        .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
-        .map(|el| el.get_bounding_client_rect());
+    let el = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
+    below_element(el.as_ref(), width)
+}
+
+/// Where a popover opens: below an element, kept on screen.
+pub fn below_element(el: Option<&web_sys::Element>, width: f64) -> (f64, f64) {
+    let rect = el.map(|el| el.get_bounding_client_rect());
     let vw = window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1200.0);
     match rect {
         Some(r) => ((r.left()).min(vw - width - 8.0).max(8.0), r.bottom() + 4.0),
@@ -1612,10 +1622,16 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let dim =
         Memo::new(move |_| spot.0.get().is_some_and(|k| !session.get().is_some_and(|s| crate::aspects::of(&s).iter().any(|a| a.key == k))));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
-    let details_at = RwSignal::new(None::<(f64, f64)>);
+    let menu_at = RwSignal::new(None::<(f64, f64)>);
     let rename_at = RwSignal::new(None::<(f64, f64)>);
     let renamable = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
+    // The rename box opens under the name (from ⋯ as from a double-click).
+    let title_el = NodeRef::<leptos::html::Span>::new();
+    let rename_under_title = move || {
+        let el: Option<web_sys::Element> = title_el.get_untracked().map(Into::into);
+        rename_at.set(Some(below_element(el.as_ref(), 320.0)));
+    };
     let btn = "rounded px-1.5 py-0.5 text-zinc-600 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-100";
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
@@ -1708,9 +1724,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 })}
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
-                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
+                <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
                     title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
-                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_at.set(Some(below(&ev, 320.0))) }>{title}</span>
+                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
                 <crate::aspects::AspectStrip session=session />
                 {move || session.get().map(|s| {
                     let (cls, label) = status_pill(&s);
@@ -1721,9 +1737,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         </span>
                     }
                 })}
-                {move || chrome().map(|c| view! { <crate::session::SessionTasks chrome=c /> })}
                 {move || chrome().is_some().then(|| view! {
-                    <button class=btn title="Details: where it runs, labels, transcript, changes, files, terminal…" on:click=move |ev| details_at.set(Some(below(&ev, 560.0)))>"⋯"</button>
+                    <button class=btn title="Actions: rename, find, new like this, save as template, archive"
+                        on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>"⋯"</button>
                 })}
                 {move || pinnable().map(|id| {
                     let (a, b) = (StoredValue::new(id.clone()), id.clone());
@@ -1769,8 +1785,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     view! { <crate::session::RenameForm session=id title on_done=move |()| rename_at.set(None) /> }
                 })}
             </Popover>
-            <Popover at=details_at class="w-[min(35rem,calc(100vw-1rem))] p-3">
-                {move || chrome().map(|c| view! { <crate::session::SessionMeta chrome=c on_act=move |()| details_at.set(None) /> })}
+            <Popover at=menu_at class="w-60">
+                {move || chrome().map(|c| view! {
+                    <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
+                })}
             </Popover>
             <div class="flex min-h-0 flex-1">
                 <For each=move || cols.get() key=|k| *k let:col>

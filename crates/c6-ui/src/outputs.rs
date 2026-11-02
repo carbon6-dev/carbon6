@@ -45,13 +45,22 @@ fn size(n: u64) -> String {
     }
 }
 
-/// The Outputs tab.
+/// What kind of file an output is, in a word: its extension (else its
+/// type's).
+fn kind(name: &str, mime: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() && ext.len() <= 5 => ext.to_uppercase(),
+        _ => mime.rsplit('/').next().unwrap_or(mime).to_owned(),
+    }
+}
+
+/// The Outputs tab. `chosen`: the output shown (by name; the newest when
+/// `None`), which the session's details can set before opening the tab.
 #[component]
-pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
+pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<Option<String>>) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| outputs(e)));
     // The chosen output (by name) and version (by seq); default the newest.
-    let chosen = RwSignal::new(None::<String>);
     let version = RwSignal::new(None::<u64>);
     let current = Memo::new(move |_| {
         let l = list.get();
@@ -104,6 +113,40 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
                 }
             })}
         </div>
+    }
+}
+
+/// The newest outputs, for the session's details: `on_pick` with an
+/// output's name, or `None` for all of them (the Outputs tab).
+#[component]
+pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Option<String>>) -> impl IntoView {
+    let list = Memo::new(move |_| {
+        let mut l = events.with(|e| outputs(e));
+        // Newest published (or republished) first.
+        l.sort_by_key(|(_, vs)| std::cmp::Reverse(vs.last().map_or(0, |v| v.seq)));
+        l
+    });
+    move || {
+        let l = list.get();
+        if l.is_empty() {
+            return view! { <p class="py-1 text-xs text-zinc-500">"Nothing yet"</p> }.into_any();
+        }
+        let n = l.len();
+        view! {
+            {l.into_iter().take(5).map(|(name, vs)| {
+                let latest = vs.last().cloned().expect("a version");
+                let pick = name.clone();
+                view! {
+                    <button class="block w-full rounded px-1 py-0.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
+                        on:click=move |_| on_pick.run(Some(pick.clone()))>
+                        <div class="truncate text-sm">{latest.title.clone()}</div>
+                        <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</div>
+                    </button>
+                }
+            }).collect_view()}
+            <button class="px-1 pt-1 text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| on_pick.run(None)>{format!("Show all {n}")}</button>
+        }
+        .into_any()
     }
 }
 
