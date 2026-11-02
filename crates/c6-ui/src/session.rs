@@ -1894,18 +1894,42 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
     }
 }
 
-/// "model · effort", or just the model when it runs at its default effort.
-/// The message box's buttons: one height, centred on the box at its resting
-/// two lines (54px: 2 × 20px, padding, border), so they and 📎 line up; on a
-/// box grown taller they stay by its last line.
-const SEND_AT: &str = "mb-[9px] h-9 shrink-0";
+/// The message box's Send: a small soft square (`rounded-full` makes it a
+/// circle), quiet while there's nothing to send, sky once there is.
+const SEND_SHAPE: &str = "rounded-md";
+const SEND: &str = "flex size-5.5 shrink-0 items-center justify-center disabled:opacity-50";
+const SEND_EMPTY: &str = "bg-zinc-600 text-zinc-200";
+const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
+
+/// Stop: a thin ring, a small square in it.
+const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-zinc-400 hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
+
+/// Send's icon, an arrow up: its one path, to change it.
+const SEND_ICON: &str = "M8 13V3M3.5 7.5 8 3l4.5 4.5";
+
+fn send_icon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 16 16" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d=SEND_ICON />
+        </svg>
+    }
+}
+
+fn stop_icon() -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 16 16" class="h-2 w-2" fill="currentColor" aria-hidden="true">
+            <rect x="1" y="1" width="14" height="14" rx="2.5" />
+        </svg>
+    }
+}
 
 /// The session header's Find (like its tabs) and its actions (smaller, but
 /// as readable).
 const META_TAB: &str = "rounded-md px-2.5 py-1 text-sm text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 const META_ACTION: &str = "rounded-md border border-zinc-200 px-2 py-0.5 text-xs text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
-const CHIP: &str = "inline-flex items-center gap-1 rounded-full border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800";
+/// The message box's model and subagents chips: small filled pills.
+const CHIP: &str = "inline-flex h-6 max-w-full items-center gap-1 rounded-full bg-zinc-100 px-2 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700";
 
 const SUBAGENTS_HELP: &str = "The agent starts a subagent with its Task tool when it decides a piece of work suits one (or you ask). This is the connection and model they run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.";
 
@@ -1929,6 +1953,7 @@ fn switch_note(m: ModelChoice, kinds: Vec<c6_api::Connection>) -> Option<(String
     ))
 }
 
+/// "model · effort", or just the model when it runs at its default effort.
 fn model_label(model: &str, effort: &str) -> String {
     if effort.is_empty() { model.to_owned() } else { format!("{model} · {effort}") }
 }
@@ -3808,6 +3833,9 @@ fn Composer(
     });
     let picker = NodeRef::<leptos::html::Input>::new();
     let touch = crate::util::touch_first();
+    let send_label = if touch { "Send" } else { "Send (Enter)" };
+    // Esc stops the session the page shows (not a side chat's).
+    let stop_label = if touch || inline { "Stop" } else { "Stop (Esc)" };
     // A pending image shown full size (its index).
     let preview = RwSignal::new(None::<usize>);
     view! {
@@ -3822,10 +3850,13 @@ fn Composer(
                 }
             }
         >
-            <div class=if inline { "space-y-2" } else { "mx-auto max-w-4xl space-y-2 px-4 py-3" }>
+            <div class=if inline { "space-y-2" } else { "mx-auto max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                // One box: what's attached, the text, and a toolbar along its
+                // bottom edge (📎, the chips, Send).
+                <div class="relative rounded-xl border border-zinc-300 bg-white has-[textarea:focus]:border-zinc-400 has-[textarea:focus]:ring-2 has-[textarea:focus]:ring-zinc-300/60 dark:border-zinc-700 dark:bg-zinc-900 dark:has-[textarea:focus]:border-zinc-500 dark:has-[textarea:focus]:ring-zinc-700/60">
                 {move || (!attachments.with(Vec::is_empty)).then(|| view! {
-                    <div class="flex flex-wrap gap-2">
+                    <div class="flex flex-wrap gap-2 px-2 pt-2">
                         {attachments.get().into_iter().enumerate().map(|(i, a)| {
                             let image = a.mime.starts_with("image/");
                             view! {
@@ -3857,7 +3888,6 @@ fn Composer(
                         </FullImage>
                     }
                 })}
-                <div class="relative flex items-end gap-2">
                     // @-mention suggestions, above the box.
                     {move || {
                         let list = suggestions();
@@ -3909,17 +3939,14 @@ fn Composer(
                             </div>
                         })
                     }}
-                    <button class="mb-[9px] flex h-9 shrink-0 items-center rounded-md px-1.5 text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                        title="Attach images or files (or paste / drop them)" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>"📎"</button>
-                    <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                     // The suggestion is the empty box's text, in italics, with a
                     // small ⇥ at its right edge: tap it, or press Tab or →.
                     // Any text in the box (typed, pasted) puts both away.
-                    <div class="relative min-w-0 flex-1">
+                    <div class="relative">
                     <textarea
                         node_ref=area
-                        class=move || format!("{INPUT} {} min-h-[2.75rem] {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
-                        rows="2"
+                        class=move || format!("block w-full bg-transparent px-3 pt-2 text-sm outline-none {} {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
+                        rows="1"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
                             // A phone's box is narrow: a hint that fits.
@@ -3994,7 +4021,7 @@ fn Composer(
                     // character, which a phone may show as a coloured emoji.
                     {move || (touch && shown_next().is_some()).then(|| view! {
                         <button type="button"
-                            class="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded border border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900"
+                            class="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded border border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900"
                             title="Use the suggestion: it goes in the box to edit or send, not sent" aria-label="Use the suggestion"
                             prop:disabled=move || disabled.get()
                             // Keep the box's focus (and a phone's keyboard) as it's tapped.
@@ -4006,63 +4033,36 @@ fn Composer(
                         </button>
                     })}
                     </div>
-                    {move || if stopping.get() {
-                        view! { <button class=format!("{BUTTON} {SEND_AT}") disabled=true>"Stopping…"</button> }.into_any()
-                    } else if running.get() && has_text.get() {
-                        // Both runtimes take it into the running turn (Claude Code's
-                        // process stays up: docs/background.md §4).
-                        // One button: Send (the agent reads it at its next step),
-                        // and ▾ for Send now (stop that step and send).
-                        view! {
-                            <div class=format!("relative flex {SEND_AT}")>
-                                <button class=format!("{BUTTON} rounded-r-none") title="Send: the agent reads it at its next step"
-                                    prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button>
-                                <button class=format!("{BUTTON} rounded-l-none border-l border-l-white/30 px-2") title="More ways to send"
-                                    aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string()
-                                    on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>"▾"</button>
-                                {move || send_menu.get().then(|| view! {
-                                    <div class="fixed inset-0 z-30" on:click=move |_| send_menu.set(false)></div>
-                                    <div role="menu" class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-                                        <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                            title="Stop the agent's current step; your message starts the next one" on:click=move |_| stop_and_send()>
-                                            <span>"Send now"</span>
-                                            <span class="text-xs text-zinc-400">"⌘/Ctrl ⇧ ↵"</span>
-                                        </button>
-                                    </div>
-                                })}
-                            </div>
-                        }.into_any()
-                    } else if running.get() {
-                        view! { <button class=format!("rounded-md border border-zinc-300 px-3 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800 {SEND_AT}") on:click=stop>"Stop"</button> }.into_any()
-                    } else {
-                        view! { <button class=format!("{BUTTON} {SEND_AT}") prop:disabled=move || disabled.get() on:click=move |_| send()>"Send"</button> }.into_any()
-                    }}
-                </div>
-                // The model, and its subagents': one line of chips, each opening
-                // its pickers above it. A change waiting for Send shows beside.
+                    // The toolbar: 📎, the model and its subagents' (each chip
+                    // opening its pickers above it, a change waiting for Send
+                    // beside), and Send.
+                    <div class="flex items-center gap-1 px-1 pb-1">
+                        <button class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                            title="Attach images or files (or paste / drop them)" aria-label="Attach images or files" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>"📎"</button>
+                        <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                 {(model.is_some() || subagents.is_some()).then(|| view! {
-                    <div class="relative flex flex-wrap items-center gap-1.5 text-xs">
+                    <div class="relative flex min-w-0 flex-1 flex-wrap items-center gap-1 text-xs">
                         {model.map(|m| view! {
-                            <button class=CHIP title="The model this session runs on: change it" on:click=move |_| toggle("model")>
-                                <span class="text-zinc-500 dark:text-zinc-400">"Model"</span>
-                                <span class="font-medium">{move || { let (_, mm, e) = m.current.get(); model_label(&mm, &e) }}</span>
-                                // What's left of its plan, when it has one.
-                                <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
-                                <span class="text-zinc-400">"▾"</span>
-                            </button>
+                            {move || { let (_, mm, e) = m.current.get(); let label = model_label(&mm, &e); view! {
+                                <button class=CHIP title="The model this session runs on: change it" aria-label=format!("Model: {label}, change it") on:click=move |_| toggle("model")>
+                                    <span class="min-w-0 truncate">{label.clone()}</span>
+                                    // What's left of its plan, when it has one.
+                                    <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
+                                    <span class="text-zinc-400">"▾"</span>
+                                </button>
+                            } }}
                             {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
                                 <button class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-950 dark:text-amber-300" title=title on:click=move |_| toggle("model")>{text}</button>
                             })}
                         })}
                         {subagents.map(|s| view! {
-                            <button class=CHIP title=SUBAGENTS_HELP on:click=move |_| toggle("subagents")>
-                                <span class="text-zinc-500 dark:text-zinc-400">"Subagents"</span>
-                                <span class="font-medium">{move || {
-                                    let (_, mm, e) = s.current.get();
-                                    if mm.is_empty() { "the session's".to_owned() } else { model_label(&mm, &e) }
-                                }}</span>
-                                <span class="text-zinc-400">"▾"</span>
-                            </button>
+                            // "subagents" alone: they run on the session's model.
+                            {move || { let (_, mm, e) = s.current.get(); let label = (!mm.is_empty()).then(|| model_label(&mm, &e)); view! {
+                                <button class=CHIP title=SUBAGENTS_HELP aria-label=format!("Subagents' model: {}, change it", label.as_deref().unwrap_or("the session's")) on:click=move |_| toggle("subagents")>
+                                    <span class="min-w-0 truncate">{match &label { Some(l) => format!("subagents: {l}"), None => "subagents".to_owned() }}</span>
+                                    <span class="text-zinc-400">"▾"</span>
+                                </button>
+                            } }}
                         })}
                         {move || picking.get().map(|which| view! {
                             <div class="fixed inset-0 z-30" on:click=move |_| picking.set(None)></div>
@@ -4105,6 +4105,45 @@ fn Composer(
                         })}
                     </div>
                 })}
+                        <div class="ml-auto flex shrink-0 items-center gap-0.5">
+                        {move || if stopping.get() {
+                            view! { <button class=format!("{STOP} animate-pulse") disabled=true title="Stopping…" aria-label="Stopping…">{stop_icon()}</button> }.into_any()
+                        } else if running.get() && has_text.get() {
+                            // Both runtimes take it into the running turn (Claude Code's
+                            // process stays up: docs/background.md §4).
+                            // Send (the agent reads it at its next step), and ▾
+                            // beside it for Send now (stop that step and send).
+                            view! {
+                                <div class="relative flex items-center gap-0.5">
+                                    <button class="flex h-5.5 items-center rounded-md px-1 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                        title="More ways to send" aria-label="More ways to send"
+                                        aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string()
+                                        on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>"▾"</button>
+                                    <button class=format!("{SEND} {SEND_SHAPE} {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
+                                        prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
+                                    {move || send_menu.get().then(|| view! {
+                                        <div class="fixed inset-0 z-30" on:click=move |_| send_menu.set(false)></div>
+                                        <div role="menu" class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                                            <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                                title="Stop the agent's current step; your message starts the next one" on:click=move |_| stop_and_send()>
+                                                <span>"Send now"</span>
+                                                <span class="text-xs text-zinc-400">"⌘/Ctrl ⇧ ↵"</span>
+                                            </button>
+                                        </div>
+                                    })}
+                                </div>
+                            }.into_any()
+                        } else if running.get() {
+                            view! { <button class=STOP title=stop_label aria-label="Stop" on:click=stop>{stop_icon()}</button> }.into_any()
+                        } else {
+                            view! {
+                                <button class=move || format!("{SEND} {SEND_SHAPE} {}", if has_text.get() { SEND_READY } else { SEND_EMPTY })
+                                    title=send_label aria-label=send_label prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
+                            }.into_any()
+                        }}
+                        </div>
+                    </div>
+                </div>
                 {wake.map(|w| view! {
                     <label class="flex items-center gap-1.5 self-start text-xs text-zinc-500"
                         title="Its report reaches the agent that started it at that agent's next step if it is working; otherwise with its next message, unless this wakes it now.">
