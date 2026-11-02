@@ -554,16 +554,50 @@ pub fn MobileBar() -> impl IntoView {
     let filter = crate::labels::use_filter().0;
     let counts = Memo::new(move |_| crate::labels::attention_counts(ws, live, &filter.get()));
     let count = move || counts.get().0;
+    // Only the tabs scroll, and their edges fade where more is hidden that
+    // way, so it reads as a strip to swipe; the current tab is brought
+    // into view whenever it changes.
+    let strip = NodeRef::<leptos::html::Div>::new();
+    let edges = RwSignal::new((false, false));
+    let measure = move || {
+        if let Some(el) = strip.get_untracked() {
+            let (left, max) = (el.scroll_left(), el.scroll_width() - el.client_width());
+            edges.set((left > 2, left < max - 2));
+        }
+    };
+    Effect::new(move || {
+        let focused = tiles.with(|t| t.iter().position(|(_, _, f)| *f));
+        request_animation_frame(move || {
+            if let (Some(el), Some(i)) = (strip.try_get_untracked().flatten(), focused)
+                && let Some(tab) = el.children().item(i as u32)
+            {
+                let (box_, tab) = (el.get_bounding_client_rect(), tab.get_bounding_client_rect());
+                if tab.left() < box_.left() {
+                    el.set_scroll_left(el.scroll_left() - (box_.left() - tab.left()) as i32 - 16);
+                } else if tab.right() > box_.right() {
+                    el.set_scroll_left(el.scroll_left() + (tab.right() - box_.right()) as i32 + 16);
+                }
+            }
+            measure();
+        });
+    });
+    let fade = move || match edges.get() {
+        (true, true) => "[mask-image:linear-gradient(to_right,transparent,black_24px,black_calc(100%-24px),transparent)]",
+        (true, false) => "[mask-image:linear-gradient(to_right,transparent,black_24px)]",
+        (false, true) => "[mask-image:linear-gradient(to_left,transparent,black_24px)]",
+        (false, false) => "",
+    };
     view! {
-        <nav class="flex shrink-0 items-center gap-1 overflow-x-auto [scrollbar-width:none] border-t border-zinc-200 bg-zinc-50 px-2 py-1.5 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
-            {move || tiles.get().into_iter().map(|(key, label, focused)| view! {
-                <button
-                    class=if focused { "max-w-36 shrink-0 truncate rounded-md bg-zinc-200 px-2.5 py-1.5 text-xs font-medium dark:bg-zinc-800" } else { "max-w-36 shrink-0 truncate rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" }
-                    on:click=move |_| ws.show_tile(key)
-                >{label}</button>
-            }).collect_view()}
+        <nav class="flex shrink-0 items-center gap-1 border-t border-zinc-200 bg-zinc-50 px-2 py-1.5 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
+            <div node_ref=strip class=move || format!("flex min-w-0 flex-1 gap-1 overflow-x-auto [scrollbar-width:none] {}", fade()) on:scroll=move |_| measure()>
+                {move || tiles.get().into_iter().map(|(key, label, focused)| view! {
+                    <button
+                        class=if focused { "max-w-36 shrink-0 truncate rounded-md bg-zinc-200 px-2.5 py-1.5 text-xs font-medium dark:bg-zinc-800" } else { "max-w-36 shrink-0 truncate rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" }
+                        on:click=move |_| ws.show_tile(key)
+                    >{label}</button>
+                }).collect_view()}
+            </div>
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
-            <span class="flex-1"></span>
             <button class="relative shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400"
                 title=move || { let (s, h) = counts.get(); crate::labels::attention_title(s, h) }
                 on:click=move |_| ws.open(None, View::Inbox, How::Beside)>
