@@ -1620,12 +1620,14 @@ pub fn Tiles() -> impl IntoView {
     }
 }
 
-/// A session's state, as its tile's bar shows it: (its dot, its word).
+/// A session's own turn, as its tile's bar shows it: (its dot, its word).
+/// What runs in its background (subagents, side chats, tasks) doesn't
+/// count: the bar says that apart.
 fn status_dot(s: &Session) -> (&'static str, &'static str) {
     if s.awaiting_approval {
         return ("bg-amber-500", "needs you");
     }
-    match s.display_status() {
+    match s.status {
         SessionStatus::Running => ("animate-pulse bg-blue-500", "running"),
         SessionStatus::Idle => ("bg-zinc-400 dark:bg-zinc-500", "idle"),
         SessionStatus::Starting => ("bg-amber-400", "starting"),
@@ -1897,7 +1899,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tile_status_includes_side_chat_activity_without_changing_the_main_turn() {
+    fn tile_status_is_the_sessions_own_turn_not_what_runs_beside_it() {
         let mut session: Session = serde_json::from_value(serde_json::json!({
             "id": "main", "worker_id": "00000000-0000-0000-0000-000000000000",
             "title": "Main", "cwd": "", "connection_id": "", "model": "",
@@ -1905,8 +1907,13 @@ mod tests {
             "side_chats_running": 1
         }))
         .unwrap();
+        assert_eq!(status_dot(&session).1, "idle", "a side chat runs, not its turn");
+        session.subagents_running = 2;
+        session.tasks_running = 1;
+        assert_eq!(status_dot(&session).1, "idle", "subagents and tasks are its background");
+        session.status = SessionStatus::Running;
         assert_eq!(status_dot(&session).1, "running");
-        assert_eq!(session.status, SessionStatus::Idle, "the main composer must remain available");
+        session.status = SessionStatus::Idle;
         session.awaiting_approval = true;
         assert_eq!(status_dot(&session).1, "needs you");
         session.awaiting_approval = false;

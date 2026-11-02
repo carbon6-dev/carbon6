@@ -562,10 +562,12 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let git = crate::details::git_state(git_at, events);
     let meta_root = StoredValue::new(root.clone());
     let subagents = SubagentTree::new(id_stored, detail, events, force_open, meta_root);
-    // What runs in it now: background tasks (servers too) and subagents.
+    // What runs in its background now: subagents and tasks (servers too),
+    // a line each.
     let busy = Memo::new(move |_| {
-        let (tasks, servers) = events.with(|e| crate::tasks::running_counts(e));
-        tasks + servers + subagents.running()
+        let subagents = subagents.running_titles().into_iter().map(|t| format!("Subagent: {t}"));
+        let tasks = events.with(|e| crate::tasks::running(e)).into_iter().map(|t| format!("Task: {t}"));
+        subagents.chain(tasks).collect::<Vec<_>>()
     });
 
     let find_root = root.clone();
@@ -924,8 +926,8 @@ pub struct SessionChrome {
     pub(crate) subagents: SubagentTree,
     /// A turn is running.
     pub(crate) running: Signal<bool>,
-    /// How many background tasks and subagents run now.
-    busy: Memo<usize>,
+    /// The background tasks and subagents that run now, a line each.
+    busy: Memo<Vec<String>>,
     /// The glance is a column beside the transcript.
     wide: RwSignal<bool>,
     /// The glance as a popover, while open.
@@ -1134,8 +1136,9 @@ fn context_ring(pct: Option<u64>) -> impl IntoView {
     }
 }
 
-/// What runs in a session and its panes, for its tile's bar (or its own
-/// strip): "N running" while a background task or subagent runs, then
+/// What runs in a session's background and its panes, for its tile's bar
+/// (or its own strip): "N in background" while a task or subagent runs
+/// (each named on hover), then
 /// Changes (with how many files changed), Terminal, and the context ring
 /// while the glance isn't a column.
 #[component]
@@ -1154,16 +1157,17 @@ pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
     };
     view! {
         {move || {
-            let n = chrome.busy.get();
+            let lines = chrome.busy.get();
+            let n = lines.len();
             (n > 0).then(|| view! {
                 <button class="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-blue-600 hover:bg-zinc-200/70 dark:text-blue-400 dark:hover:bg-zinc-800"
-                    title="Background tasks and subagents running: what needs a look"
+                    title=lines.join("\n")
                     on:click=move |ev| chrome.show_looks(&ev)>
                     <svg viewBox="0 0 16 16" class="size-3 shrink-0 animate-spin" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <circle cx="8" cy="8" r="6" stroke-opacity="0.3" />
                         <path d="M14 8a6 6 0 0 0-6-6" />
                     </svg>
-                    <span class="tabular-nums">{format!("{n} running")}</span>
+                    <span class="tabular-nums">{format!("{n} in background")}</span>
                 </button>
             })
         }}
@@ -1375,9 +1379,9 @@ impl SubagentTree {
         self.list.get()
     }
 
-    /// How many of them work now.
-    pub(crate) fn running(&self) -> usize {
-        self.list.with(|l| l.iter().filter(|(s, _)| s.status == SessionStatus::Running).count())
+    /// The titles of those that work now.
+    pub(crate) fn running_titles(&self) -> Vec<String> {
+        self.list.with(|l| l.iter().filter(|(s, _)| s.status == SessionStatus::Running).map(|(s, _)| s.title.clone()).collect())
     }
 
     /// Goes to a subagent's thread in the transcript.

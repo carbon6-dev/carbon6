@@ -138,6 +138,11 @@ pub fn running_line(tasks: usize, servers: usize) -> String {
     }
 }
 
+/// What the tasks running now are, servers and watchers too.
+pub fn running(events: &[Event]) -> Vec<String> {
+    lifecycle(events).into_iter().filter(Task::running).map(|t| t.description).collect()
+}
+
 /// The tasks that need a look, for a session's glance: those running and
 /// those that ended badly, as (id, what it is, failed, when it started).
 pub fn needs_look(events: &[Event]) -> Vec<(String, String, bool, i64)> {

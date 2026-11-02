@@ -7,9 +7,9 @@ Status: second step built (2026-11-02), for review live. The first step (2026-11
 
 ## 1. The tile bar
 
-Left to right: back and forward, the session's mark, its title (double-click to rename), its state as a dot and a word (idle, running, starting, failed, needs you), **◌ N running** while any background task or subagent of it runs, the icons, a divider, then **⋯**, ☆ pin, ⧉ detach, minimize, focus, ✕.
+Left to right: back and forward, the session's mark, its title (double-click to rename), its own turn's state as a dot and a word (idle, running, starting, failed, needs you; what runs in its background doesn't count), **◌ N in background** while any task or subagent of it runs, the icons, a divider, then **⋯**, ☆ pin, ⧉ detach, minimize, focus, ✕.
 
-- **N running** is the only count in the bar: nothing when nothing runs, no done or failed counts, no ⚙ or ◆. It opens the glance (scrolled to *Needs a look* when the glance is a column).
+- **N in background** is the only count in the bar: nothing when nothing runs, no done or failed counts, no ⚙ or ◆. Its hover names each ("Subagent: …", "Task: …"), a line each. It opens the glance (scrolled to *Needs a look* when the glance is a column).
 - **The icons:** 24px squares, filled while their pane is open. **Changes** (with how many files changed), **Terminal**, and the **context ring** (filling with the context used, amber from 80%, the figure in its title) while the glance isn't a column. Not over SSH: no Changes.
 - **⋯:** Rename… · Find in session (⌘F) · Files · Outputs · Session details… (usage, and what applies: labels, slash commands, agents, skills, hooks) · New like this… · Save as template… · Archive.
 - With another view beside the session in its tile (a doc), the bar speaks for that view; the session's icons and ⋯ are in a slim strip at the top of the session. A pane of its own beside it leaves the bar the session's.
@@ -28,7 +28,7 @@ One line each, read-only: **Runs on** (worker, online dot, model and effort, run
 - Icons: Lucide (ISC), inline.
 - A pane opens beside the session when its tile is at least ~1100px wide, else in a tile of its own; on a phone beside (it fills the screen, ‹ goes back).
 - The glance is a column (288px) 24px to the right of the transcript, which keeps its reading width (56rem); the two are centred together in the session's column, the glance stays in sight as the transcript scrolls, and the message box and the find bar line up with the transcript. That needs the session's column to be at least 1240px wide (896 + 24 + 288 and 16px either side); narrower, the glance is behind the context ring: a popover, a sheet from the bottom on a phone. ⌘I opens and closes it there; Esc closes it.
-- The bar's only count is *N running*.
+- The bar's only count is *N in background*; the state word is the session's own turn.
 - The branch has no "based on" yet.
 
 ## 5. Not yet
