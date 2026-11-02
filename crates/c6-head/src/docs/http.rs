@@ -37,6 +37,7 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/{id}/threads", get(threads).post(new_thread))
         .route("/api/v1/docs/{id}/threads/{thread}/comments", post(reply))
         .route("/api/v1/docs/{id}/threads/{thread}/resolve", post(resolve))
+        .route("/api/v1/docs/{id}/threads/send", post(send_threads))
 }
 
 /// The realm's (`?realm=`, through the settings middleware).
@@ -346,6 +347,17 @@ async fn reply(
 ) -> ApiResult<Json<api::docs::DocThread>> {
     let realm = realm(&st, &caller, &r).await?;
     Ok(Json(super::comments::reply(&st, &realm, &id, &thread, &c, &super::by_of(&caller)).await?))
+}
+
+async fn send_threads(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(s): Json<api::docs::ThreadsSend>,
+) -> ApiResult<Json<Vec<api::docs::DocThread>>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::send_many(&st, &realm, &id, &s.threads, &super::by_of(&caller)).await?))
 }
 
 async fn resolve(

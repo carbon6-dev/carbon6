@@ -792,6 +792,104 @@ async fn the_decks_apps_decks_come_in_once() {
     stop.cancel();
 }
 
+/// Comments sent together: two threads left unsent go to the document's
+/// writer (idle) in one message, both noted as with it; then nothing is
+/// left to send.
+#[tokio::test]
+async fn comments_go_to_an_agent_together() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4})).await;
+    let conn = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await;
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    let create = json!({"action": "create", "title": "Pricing", "markdown": "# Pricing\n\nWe charge per seat.\n\nAnnual plans get two months free."});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Wrote it.".into()));
+    let s = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "write the pricing doc", "work": "new"}),
+    )
+    .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 1).await;
+    let id = send(M::GET, "docs?q=Pricing".into(), Value::Null).await[0]["id"].as_str().unwrap().to_owned();
+    let full = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    let (b1, b2) = (full["tabs"][0]["blocks"][1]["id"].as_str().unwrap(), full["tabs"][0]["blocks"][2]["id"].as_str().unwrap());
+    // Two comments, left unsent while you read on.
+    let t1 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b1}, "text": "Say the price."})).await;
+    let t2 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b2}, "text": "Is it two months or one?"})).await;
+    let (t1, t2) = (t1["id"].as_str().unwrap().to_owned(), t2["id"].as_str().unwrap().to_owned());
+    assert_ne!(t1, t2);
+    // Sent together: one message to the writer, both threads with it.
+    mock.push(Reply::Text("On it.".into()));
+    let sent = send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    let sent = sent.as_array().unwrap();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for t in sent {
+        assert_eq!((t["to_agent"].as_bool(), t["agent"].as_str()), (Some(true), Some(sid.as_str())), "{t}");
+    }
+    turns(sid.clone(), 2).await;
+    let asked: Vec<Value> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| {
+            let m = r["messages"].to_string();
+            m.contains(&format!("Thread {t1}")) || m.contains(&format!("Thread {t2}"))
+        })
+        .collect();
+    let first = asked.first().expect("the comments reached the agent")["messages"].to_string();
+    assert!(first.contains(&format!("Thread {t1}")) && first.contains(&format!("Thread {t2}")), "both in one message: {first}");
+    assert!(first.contains("come to you together"), "{first}");
+    // Nothing left to send.
+    let r = http.post(format!("{api}/docs/{id}/threads/send")).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    stop.cancel();
+}
+
 /// Comments (docs/docs.md §8): a thread on a block, sent to the session
 /// that wrote it (idle, so it gets the thread as a message by
 /// `docs.comment`); it edits answering the thread and replies; the thread,

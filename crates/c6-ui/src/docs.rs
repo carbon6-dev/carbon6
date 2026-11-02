@@ -82,8 +82,11 @@ fn FromSession(id: String) -> impl IntoView {
 /// A session's title for `session:<id>`, from the live feed.
 fn author_named(by: &str) -> String {
     if let Some(id) = by.strip_prefix("session:") {
+        // Untracked: called while the document draws, it must not make
+        // the whole document redraw (dropping an open comment box and
+        // what's typed in it) whenever any session changes.
         let live = api::live();
-        let title = live.sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.title.clone()));
+        let title = live.sessions.with_untracked(|ss| ss.iter().find(|s| s.id == id).map(|s| s.title.clone()));
         return match title.filter(|t| !t.trim().is_empty()) {
             Some(t) if t.chars().count() > 32 => format!("session {}…", t.chars().take(30).collect::<String>().trim_end()),
             Some(t) => format!("session {t}"),
@@ -133,6 +136,10 @@ struct ChipCtx {
 struct ThreadsCtx {
     shown: RwSignal<Vec<c6_api::docs::DocThread>>,
     tick: RwSignal<u32>,
+    /// The new-comment box to put the cursor in, once, as you open it
+    /// (its block, "" for the whole tab); never on a redraw, which would
+    /// take the cursor from wherever you're typing.
+    focus: RwSignal<Option<String>>,
 }
 
 fn esc(s: &str) -> String {
@@ -728,7 +735,7 @@ pub fn DocPage(id: String) -> impl IntoView {
         send: StoredValue::new(Box::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops)))),
     };
     provide_context(chip_ctx);
-    provide_context(ThreadsCtx { shown: RwSignal::new(Vec::new()), tick });
+    provide_context(ThreadsCtx { shown: RwSignal::new(Vec::new()), tick, focus: RwSignal::new(None) });
     Effect::new(move || {
         let Some(Ok(d)) = doc.get() else { return };
         let refs = ref_chips(&d);
@@ -1148,7 +1155,7 @@ fn BlockView(
             {move || match open_threads.with(Vec::len) {
                 0 => view! {
                     <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
-                        on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
+                        on:click=move |_| { threads.focus.set(Some(bid.get_value())); commenting.set(Some(bid.get_value())) }>"💬"</button>
                 }.into_any(),
                 n => view! {
                     <button class="absolute right-0.5 top-0.5 rounded px-1 text-xs font-medium text-violet-700 hover:bg-violet-100 dark:text-violet-300 dark:hover:bg-violet-950"
@@ -1160,7 +1167,7 @@ fn BlockView(
         {move || (showing.get() && !open_threads.with(Vec::is_empty)).then(|| view! {
             <div class="my-1 space-y-2 border-l-2 border-violet-300 pl-3 dark:border-violet-800">
                 {open_threads.get().into_iter().map(|t| view! { <Thread t doc=doc_id.get_value() tick=threads.tick /> }).collect_view()}
-                <button class="text-xs text-violet-700 hover:underline dark:text-violet-300" on:click=move |_| commenting.set(Some(bid.get_value()))>"+ Another comment"</button>
+                <button class="text-xs text-violet-700 hover:underline dark:text-violet-300" on:click=move |_| { threads.focus.set(Some(bid.get_value())); commenting.set(Some(bid.get_value())) }>"+ Another comment"</button>
             </div>
         })}
         {move || (commenting.get() == Some(bid.get_value())).then(|| view! {
@@ -1231,16 +1238,43 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
         }
     });
     let show_resolved = RwSignal::new(false);
+    // Your open comments not sent to an agent yet: sent together, in one
+    // message to one session (each can also go on its own, as you write it).
+    let unsent =
+        Memo::new(move |_| shown.with(|ts| ts.iter().filter(|t| t.state == "open" && !t.to_agent && t.created_by == "you").count()));
+    let sending = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let send_all = move |_| {
+        sending.set(true);
+        spawn_local(async move {
+            match api::doc_threads_send(id.get_value(), Vec::new()).await {
+                Ok(_) => {
+                    error.set(None);
+                    tick.update(|t| *t += 1);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            sending.set(false);
+        });
+    };
     view! {
         <section class="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
             <div class="flex items-center gap-2">
                 <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">"Comments"</h2>
-                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| commenting.set(Some(String::new()))>"+ On the whole tab"</button>
+                {move || (unsent.get() > 0).then(|| view! {
+                    <button class="rounded-md border border-violet-300 px-2 py-0.5 text-xs text-violet-700 hover:bg-violet-50 disabled:opacity-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
+                        title="Your open comments that haven't gone to an agent, in one message to one session, which answers each in its thread"
+                        disabled=move || sending.get() on:click=send_all>
+                        {move || match unsent.get() { 1 => "Send 1 comment to an agent".to_owned(), n => format!("Send {n} comments to an agent") }}
+                    </button>
+                })}
+                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| { expect_context::<ThreadsCtx>().focus.set(Some(String::new())); commenting.set(Some(String::new())) }>"+ On the whole tab"</button>
                 <label class="flex items-center gap-1 text-xs text-zinc-500">
                     <input type="checkbox" prop:checked=move || show_resolved.get() on:change=move |ev| show_resolved.set(event_target_checked(&ev)) />
                     "Resolved"
                 </label>
             </div>
+            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             // A comment on the whole tab is written here; one on a block,
             // under that block (BlockView).
             {move || (commenting.get().as_deref() == Some("")).then(|| view! {
@@ -1257,12 +1291,20 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
 #[component]
 fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Option<String>>, posted: Callback<()>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
-    let (quote, text, to_agent) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(false));
+    // Kept as drafts: the document redraws its blocks, and this box with
+    // them, whenever it changes (an agent writing, another comment).
+    let keys = StoredValue::new((format!("comment.{}.{block}", doc.get_value()), format!("comment-quote.{}.{block}", doc.get_value())));
+    let (text, quote) = keys.with_value(|(t, q)| (crate::util::draft(t), crate::util::draft(q)));
+    let to_agent = RwSignal::new(false);
     let on_block = !block.is_empty();
     let block = StoredValue::new(block);
     let writing = NodeRef::<leptos::html::Textarea>::new();
+    let focus = expect_context::<ThreadsCtx>().focus;
     Effect::new(move || {
-        if let Some(el) = writing.get() {
+        if let Some(el) = writing.get()
+            && focus.get_untracked().is_some_and(|b| block.with_value(|x| *x == b))
+        {
+            focus.set(None);
             let _ = el.focus();
         }
     });
@@ -1275,6 +1317,10 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
         spawn_local(async move {
             match api::doc_thread_new(doc.get_value(), &t).await {
                 Ok(_) => {
+                    keys.with_value(|(t, q)| {
+                        crate::util::forget_draft(t);
+                        crate::util::forget_draft(q);
+                    });
                     commenting.set(None);
                     posted.run(());
                 }
@@ -1304,11 +1350,42 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
     }
 }
 
+/// The agent a thread was sent to, live: working on it, or yet to start,
+/// while the thread waits on it; else just who has it. Linked.
+#[component]
+fn WithAgent(session: String, waiting: bool) -> impl IntoView {
+    let live = api::live();
+    let found = {
+        let id = session.clone();
+        move || {
+            live.sessions
+                .with(|ss| ss.iter().find(|s| s.id == id).map(|s| (s.title.clone(), s.display_status() == c6_api::SessionStatus::Running)))
+        }
+    };
+    view! {
+        <Go to=View::session(session) class="inline-flex min-w-0 items-center gap-1 hover:underline" stop=true>
+            {move || {
+                let (title, running) = found().unwrap_or_else(|| ("an agent".into(), false));
+                let title = if title.trim().is_empty() { "an agent".to_owned() } else { title };
+                match (waiting, running) {
+                    (true, true) => view! {
+                        <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-500"></span>
+                        <span class="truncate text-sky-700 dark:text-sky-300">{format!("{title} is working on it…")}</span>
+                    }.into_any(),
+                    (true, false) => view! { <span class="truncate">{format!("→ sent to {title} (idle)")}</span> }.into_any(),
+                    _ => view! { <span class="truncate">{format!("→ {title}")}</span> }.into_any(),
+                }
+            }}
+        </Go>
+    }
+}
+
 /// One thread.
 #[component]
 fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl IntoView {
     let (doc, tid) = (StoredValue::new(doc), StoredValue::new(t.id.clone()));
-    let reply = RwSignal::new(String::new());
+    // A draft: the thread redraws as comments come in.
+    let reply = crate::util::draft(&format!("reply.{}.{}", doc.get_value(), tid.get_value()));
     let to_agent = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let done = move |r: Result<c6_api::docs::DocThread, String>| match r {
@@ -1335,7 +1412,11 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
             <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                 <span class="min-w-0 flex-1 truncate">{format!("On {}", t.about)}</span>
                 {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
-                {t.to_agent.then(|| view! { <span title=format!("Sent to {}", author_named(&format!("session:{}", t.agent)))>"→ agent"</span> })}
+                {t.to_agent.then(|| {
+                    // Waiting on the agent: the last word isn't its.
+                    let waiting = !t.needs_you && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent));
+                    view! { <WithAgent session=t.agent.clone() waiting /> }
+                })}
                 {t.needs_you.then(|| view! { <span class="font-medium text-amber-700 dark:text-amber-300">"answered: your move"</span> })}
                 {(!open).then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
             </div>

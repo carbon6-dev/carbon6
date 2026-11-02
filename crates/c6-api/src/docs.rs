@@ -655,6 +655,17 @@ pub struct ThreadNew {
     pub to: String,
 }
 
+/// `POST /api/v1/docs/{id}/threads/send`: comment threads sent to an agent
+/// together, in one message to one session.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ThreadsSend {
+    /// The threads; empty: every open thread you began that hasn't been
+    /// sent to an agent.
+    #[serde(default)]
+    pub threads: Vec<String>,
+}
+
 /// `POST /api/v1/docs/{id}/threads/{thread}/comments`: a reply.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

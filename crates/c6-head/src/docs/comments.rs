@@ -308,13 +308,74 @@ async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str, _by: &str) -
     let t = one(st, realm, doc, thread).await?;
     let (session, start, work) = pick(st, realm, doc, &t.anchor).await?;
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
+    let text = told(st, realm, doc, &title, &t).await;
+    deliver(st, realm, &title, &[t.id], (session, start, work), &text).await
+}
+
+/// Comment threads sent to an agent together: one message to one session
+/// (the document's last writer if it's idle, else one from its work or
+/// project), which answers each in its thread. `ids` empty: every open
+/// thread `by` began that hasn't been sent to an agent.
+pub async fn send_many(st: &HeadState, realm: &str, doc: &str, ids: &[String], by: &str) -> anyhow::Result<Vec<DocThread>> {
+    let all = list(st, realm, doc).await?;
+    let chosen: Vec<DocThread> = all
+        .into_iter()
+        .filter(|t| t.state == "open")
+        .filter(|t| if ids.is_empty() { !t.to_agent && t.created_by == by } else { ids.contains(&t.id) })
+        .collect();
+    if chosen.is_empty() {
+        return Err(bad_request("no open comment threads to send"));
+    }
+    let picked = pick(st, realm, doc, &Anchor::default()).await?;
+    let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
+    let mut parts = Vec::new();
+    for t in &chosen {
+        parts.push(told(st, realm, doc, &title, t).await);
+    }
+    let text = if parts.len() == 1 {
+        parts.remove(0)
+    } else {
+        format!(
+            "{} comments on the document \"{title}\" (doc:{doc}) come to you together. Take each in turn and answer it in its own thread, as it says.\n\n{}",
+            parts.len(),
+            parts.join("\n\n---\n\n")
+        )
+    };
+    let threads: Vec<String> = chosen.iter().map(|t| t.id.clone()).collect();
+    deliver(st, realm, &title, &threads, picked, &text).await?;
+    let _ = st.docs.live.send(c6_api::docs::DocChange {
+        id: doc.to_owned(),
+        realm: realm.to_owned(),
+        rev: 0,
+        by: by.to_owned(),
+        what: "commented".into(),
+    });
+    let now = list(st, realm, doc).await?;
+    Ok(now.into_iter().filter(|t| threads.contains(&t.id)).collect())
+}
+
+/// What an agent is told about one thread (the prompt `docs.comment`).
+async fn told(st: &HeadState, realm: &str, doc: &str, title: &str, t: &DocThread) -> String {
     let comments: String = t.comments.iter().map(|c| format!("- {}: {}\n", who(&c.by), c.text)).collect();
     let template = crate::prompts::get(st, "docs.comment", realm).await;
     let anchor = if t.anchor.block.is_empty() { t.about.clone() } else { format!("{} (block {})", t.about, t.anchor.block) };
-    let text = c6_api::prompts::fill(
+    c6_api::prompts::fill(
         &template,
-        &[("title", &title), ("doc", doc), ("thread", thread), ("anchor", &anchor), ("comments", comments.trim_end())],
-    );
+        &[("title", title), ("doc", doc), ("thread", &t.id), ("anchor", &anchor), ("comments", comments.trim_end())],
+    )
+}
+
+/// Sends `text` to the picked session (or a new one started like it) and
+/// notes the threads as with it.
+async fn deliver(
+    st: &HeadState,
+    realm: &str,
+    title: &str,
+    threads: &[String],
+    (session, start, work): (String, bool, Option<String>),
+    text: &str,
+) -> anyhow::Result<()> {
+    let text = text.to_owned();
     let sent_to = if start {
         let seed = st.store.session(&session).await?.ok_or_else(|| not_found("its session is gone"))?;
         let labels: Vec<String> = serde_json::from_str(&seed.labels).unwrap_or_default();
@@ -332,7 +393,9 @@ async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str, _by: &str) -
         session
     };
     let pool = super::pool(st, realm).await?;
-    sqlx::query("UPDATE doc_threads SET to_agent = 1, agent = ? WHERE id = ?").bind(&sent_to).bind(thread).execute(&pool).await?;
+    for thread in threads {
+        sqlx::query("UPDATE doc_threads SET to_agent = 1, agent = ? WHERE id = ?").bind(&sent_to).bind(thread).execute(&pool).await?;
+    }
     Ok(())
 }
 

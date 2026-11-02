@@ -1639,6 +1639,12 @@ pub async fn doc_thread_reply(id: String, thread: String, c: &c6_api::docs::Comm
     send_json(Request::post(&format!("/api/v1/docs/{}/threads/{}/comments", enc(&id), enc(&thread))), c).await
 }
 
+/// Sends comment threads to an agent together (`threads` empty: all your
+/// open ones not sent yet).
+pub async fn doc_threads_send(id: String, threads: Vec<String>) -> Result<Vec<c6_api::docs::DocThread>, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/threads/send", enc(&id))), &c6_api::docs::ThreadsSend { threads }).await
+}
+
 pub async fn doc_thread_resolve(id: String, thread: String) -> Result<c6_api::docs::DocThread, String> {
     json(Request::post(&format!("/api/v1/docs/{}/threads/{}/resolve", enc(&id), enc(&thread))).send().await).await
 }
