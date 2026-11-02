@@ -104,6 +104,11 @@ fn under(i: &AttentionItem, here: &str, now: i64) -> String {
     [Some(i.detail.as_str()).filter(|d| !d.is_empty()), realm, Some(when.as_str())].into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
+/// Why the list isn't there (it says so, rather than nothing needing you).
+fn load_error(e: &str) -> String {
+    format!("Couldn't load what needs you: {e}")
+}
+
 /// Another realm's row.
 fn elsewhere_text(e: &AttentionElsewhere) -> String {
     let name = if e.id == "root" { "the console" } else { e.name.as_str() };
@@ -119,13 +124,25 @@ pub fn NeedsYou() -> impl IntoView {
         api::realm().track();
         api::attention()
     });
-    // The last list loaded, kept while the next one comes.
+    // The last list loaded, kept while the next one comes; why the last
+    // load failed, if it did.
     let shown = RwSignal::new(Attention::default());
-    Effect::new(move || {
-        if let Some(Ok(a)) = list.get() {
-            shown.set(a);
+    let loaded = RwSignal::new(false);
+    let failed = RwSignal::new(None::<String>);
+    Effect::new(move || match list.get() {
+        Some(Ok(a)) => {
+            failed.set(None);
+            loaded.set(true);
+            // The same list again draws nothing again: a busy realm pings
+            // often, and a row drawn anew under the pointer loses its click.
+            if shown.with_untracked(|s| *s != a) {
+                shown.set(a);
+            }
         }
+        Some(Err(e)) => failed.set(Some(e)),
+        None => {}
     });
+    let retry = move || tick.update(|t| *t += 1);
     // A ping (and the feed coming back, having missed some) loads it again,
     // once a burst has settled.
     let due = StoredValue::new(false);
@@ -146,12 +163,13 @@ pub fn NeedsYou() -> impl IntoView {
         );
     });
     let open = RwSignal::new(false);
-    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" && open.get_untracked() {
-            open.set(false);
-        }
-    });
-    on_cleanup(move || keys.remove());
+    // Escape closes it, wherever focus is, and puts focus back on the pill.
+    let pop = StoredValue::new(crate::util::escapable(
+        move || open.get(),
+        move || {
+            open.try_set(false);
+        },
+    ));
     let counts = move || shown.with(|a| (a.waiting.len(), a.worth.len()));
     let pill_class = move || {
         let base = "inline-flex h-5 items-center justify-center gap-0.5 rounded-full px-1.5 text-[11px] font-semibold";
@@ -172,12 +190,24 @@ pub fn NeedsYou() -> impl IntoView {
         });
     };
     let close = Callback::new(move |()| open.set(false));
+    let title = move || {
+        let (w, l) = counts();
+        match failed.get() {
+            Some(e) if !loaded.get() => load_error(&e),
+            _ => label(w, l),
+        }
+    };
     view! {
         <div class="relative shrink-0">
             <button class="flex items-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
-                aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
-                aria-label=move || { let (w, l) = counts(); label(w, l) } title=move || { let (w, l) = counts(); label(w, l) }
-                on:click=move |_| open.update(|o| *o = !*o)>
+                aria-haspopup="dialog" aria-expanded=move || open.get().to_string() aria-label=title title=title data-pop=pop.get_value()
+                on:click=move |_| {
+                    // Opened after a failed load, it tries again.
+                    if !open.get_untracked() && failed.get_untracked().is_some() {
+                        retry();
+                    }
+                    open.update(|o| *o = !*o);
+                }>
                 // A small bell, tight against its number.
                 <span class=pill_class>
                     <svg viewBox="0 0 12 12" class="h-2.5 w-2.5 shrink-0" fill="currentColor" aria-hidden="true">
@@ -190,7 +220,7 @@ pub fn NeedsYou() -> impl IntoView {
             <Show when=move || open.get()>
                 // A click outside closes it (on a phone the page dims).
                 <div class="fixed inset-0 z-40 bg-black/30 md:bg-transparent" on:click=move |_| open.set(false)></div>
-                <div role="dialog" aria-label="What needs you"
+                <div role="dialog" aria-label="What needs you" data-pop=pop.get_value()
                     class="fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-9 md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
                     <div class="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
                         <span class="flex-1 font-semibold">"Needs you"</span>
@@ -200,9 +230,18 @@ pub fn NeedsYou() -> impl IntoView {
                         })}
                     </div>
                     <div class="min-h-0 overflow-y-auto p-1 pb-4 md:pb-1">
+                        {move || failed.get().map(|e| view! {
+                            <div role="alert" class="m-1 flex items-start gap-2 rounded-md border border-red-300 bg-red-50 px-2 py-1.5 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+                                <span class="min-w-0 flex-1 break-words">{load_error(&e)}</span>
+                                <button class="shrink-0 underline" on:click=move |_| retry()>"Try again"</button>
+                            </div>
+                        })}
                         {move || {
                             let a = shown.get();
                             let now = now_ms();
+                            if !loaded.get() {
+                                return failed.with(Option::is_none).then(|| view! { <p class="px-2 py-6 text-center text-muted">"Loading…"</p> }).into_any();
+                            }
                             if a.waiting.is_empty() && a.worth.is_empty() && a.elsewhere.is_empty() {
                                 return view! { <p class="px-2 py-6 text-center text-muted">"Nothing needs you."</p> }.into_any();
                             }
@@ -317,6 +356,11 @@ mod tests {
         assert_eq!(label(0, 0), "What needs you: nothing");
         assert_eq!(pill(0), "");
         assert_eq!(pill(4), "4");
+    }
+
+    #[test]
+    fn a_failed_load_says_why() {
+        assert_eq!(load_error("no realm \"mach5\""), "Couldn't load what needs you: no realm \"mach5\"");
     }
 
     #[test]
