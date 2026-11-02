@@ -701,8 +701,10 @@ async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Respons
     }
 }
 
+/// Trunk's outputs: `name-<16 hex>.ext`, and the wasm, `name-<16 hex>_bg.wasm`.
 fn is_fingerprinted(path: &str) -> bool {
     let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("");
+    let stem = stem.strip_suffix("_bg").unwrap_or(stem);
     stem.rsplit_once('-').is_some_and(|(_, h)| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
@@ -4203,4 +4205,21 @@ async fn answer_decision(
 /// Starts a session that helps you settle the decision.
 async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::decisions::start_session(&st, id).await?))
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::is_fingerprinted;
+
+    #[test]
+    fn trunk_outputs_are_fingerprinted_and_the_rest_not() {
+        // The wasm too: without it, 15 MB went again on every page load.
+        assert!(is_fingerprinted("c6-ui-789d462898aabf89_bg.wasm"));
+        assert!(is_fingerprinted("c6-ui-1de8bb420f162f4a.js"));
+        assert!(is_fingerprinted("input-d3c90d3631cf98b5.css"));
+        assert!(!is_fingerprinted("index.html"));
+        assert!(!is_fingerprinted("vendor/xterm.js"));
+        assert!(!is_fingerprinted("js/terminal.js"));
+        assert!(!is_fingerprinted("c6-ui-notahexhashxxxxx_bg.wasm"));
+    }
 }
