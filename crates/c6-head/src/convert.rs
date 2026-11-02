@@ -187,8 +187,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
 /// (a plan's limits).
 pub fn ephemeral(kind: &ephemeral_event::Kind) -> Option<api::StreamMsg> {
     Some(match kind {
-        ephemeral_event::Kind::Text(d) => api::StreamMsg::Text { turn: d.turn, text: d.text.clone() },
-        ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone() },
+        ephemeral_event::Kind::Text(d) => api::StreamMsg::Text { turn: d.turn, text: d.text.clone(), seq: d.seq },
+        ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone(), seq: d.seq },
         ephemeral_event::Kind::ToolOutput(d) => api::StreamMsg::ToolOutput { call_id: d.call_id.clone(), text: d.text.clone() },
         ephemeral_event::Kind::Activity(a) => api::StreamMsg::Activity { running: a.running, status: a.status.clone() },
         ephemeral_event::Kind::Secret(c) => {

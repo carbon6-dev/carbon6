@@ -296,14 +296,17 @@ impl c6_llm::ModelClient for LinkedClient {
 }
 
 /// Appends `ev`, merging it into the previous event when both are text for
-/// the same stream (same session, kind and turn or tool call).
+/// the same stream (same session, kind, turn and place in the log, or tool
+/// call).
 fn push_merged(pending: &mut Vec<EphemeralEvent>, ev: EphemeralEvent) {
     use ephemeral_event::Kind;
     if let Some(last) = pending.last_mut()
         && last.session_id == ev.session_id
     {
         match (&mut last.kind, ev.kind.as_ref()) {
-            (Some(Kind::Text(a)), Some(Kind::Text(b))) | (Some(Kind::Thinking(a)), Some(Kind::Thinking(b))) if a.turn == b.turn => {
+            (Some(Kind::Text(a)), Some(Kind::Text(b))) | (Some(Kind::Thinking(a)), Some(Kind::Thinking(b)))
+                if a.turn == b.turn && a.seq == b.seq =>
+            {
                 a.text.push_str(&b.text);
                 return;
             }
@@ -324,7 +327,10 @@ mod tests {
     use super::*;
 
     fn text(session: &str, turn: u64, t: &str) -> EphemeralEvent {
-        EphemeralEvent { session_id: session.into(), kind: Some(ephemeral_event::Kind::Text(TextDelta { turn, text: t.into() })) }
+        EphemeralEvent {
+            session_id: session.into(),
+            kind: Some(ephemeral_event::Kind::Text(TextDelta { turn, text: t.into(), ..Default::default() })),
+        }
     }
 
     #[test]

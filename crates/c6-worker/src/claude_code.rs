@@ -1153,12 +1153,7 @@ impl Mapper {
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started)) };
         obs.journal.create_session(&id, &spec, &ev).await?;
-        let log: Arc<dyn EventSink> = Arc::new(crate::session::Writer {
-            session_id: id.clone(),
-            journal: obs.journal.clone(),
-            link: obs.link.clone(),
-            next_seq: tokio::sync::Mutex::new(2),
-        });
+        let log: Arc<dyn EventSink> = Arc::new(crate::session::Writer::new(id.clone(), obs.journal.clone(), obs.link.clone(), 2));
         log.append(session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })).await?;
         self.children.insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true });
         Ok(Some((id, log)))
@@ -1296,10 +1291,12 @@ impl Mapper {
                         Some("text_delta") => sink.ephemeral(ephemeral_event::Kind::Text(TextDelta {
                             turn: self.turn,
                             text: d["text"].as_str().unwrap_or("").into(),
+                            ..Default::default()
                         })),
                         Some("thinking_delta") => sink.ephemeral(ephemeral_event::Kind::Thinking(TextDelta {
                             turn: self.turn,
                             text: d["thinking"].as_str().unwrap_or("").into(),
+                            ..Default::default()
                         })),
                         _ => {}
                     }

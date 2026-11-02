@@ -2662,14 +2662,20 @@ pub enum StreamMsg {
     Event {
         event: Event,
     },
-    /// Live-only deltas, superseded by the next durable event.
+    /// Live-only deltas, superseded by the next durable event. `seq`: the
+    /// log's next event when it streamed; the first reply from there has
+    /// this text (0: not said).
     Text {
         turn: u64,
         text: String,
+        #[serde(default)]
+        seq: u64,
     },
     Thinking {
         turn: u64,
         text: String,
+        #[serde(default)]
+        seq: u64,
     },
     ToolOutput {
         call_id: String,

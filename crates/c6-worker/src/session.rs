@@ -887,12 +887,7 @@ impl SessionManager {
         // A subagent's secrets and head calls go by its tree's top-level
         // session (its row always exists on the head).
         let on_behalf_of = delegation.as_ref().map_or(session_id, |d| d.root_session_id.as_str()).to_owned();
-        let writer = Arc::new(Writer {
-            session_id: session_id.to_owned(),
-            journal: self.journal.clone(),
-            link: self.link.clone(),
-            next_seq: tokio::sync::Mutex::new(next_seq),
-        });
+        let writer = Arc::new(Writer::new(session_id.to_owned(), self.journal.clone(), self.link.clone(), next_seq));
         // On an SSH target, what runs on the worker (hooks, MCP servers)
         // runs in a local folder of the session's.
         let remote = !started.ssh_target.is_empty();
@@ -3228,6 +3223,22 @@ pub(crate) struct Writer {
     pub journal: Arc<Journal>,
     pub link: Arc<HeadLink>,
     pub next_seq: tokio::sync::Mutex<u64>,
+    /// `next_seq` as of the last append, read without waiting on one: what
+    /// streamed text is stamped with.
+    logged: std::sync::atomic::AtomicU64,
+}
+
+impl Writer {
+    /// A writer whose next event is `next_seq`.
+    pub fn new(session_id: String, journal: Arc<Journal>, link: Arc<HeadLink>, next_seq: u64) -> Self {
+        Writer {
+            session_id,
+            journal,
+            link,
+            next_seq: tokio::sync::Mutex::new(next_seq),
+            logged: std::sync::atomic::AtomicU64::new(next_seq),
+        }
+    }
 }
 
 #[async_trait]
@@ -3239,10 +3250,16 @@ impl EventSink for Writer {
         let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
         self.journal.append(&self.session_id, &ev).await?;
         *next += 1;
+        self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(ev.seq)
     }
 
-    fn ephemeral(&self, kind: ephemeral_event::Kind) {
+    fn ephemeral(&self, mut kind: ephemeral_event::Kind) {
+        // Where the log is: its next reply has this text, so a viewer that
+        // got that reply first (catching up) knows to drop it.
+        if let ephemeral_event::Kind::Text(d) | ephemeral_event::Kind::Thinking(d) = &mut kind {
+            d.seq = self.logged.load(std::sync::atomic::Ordering::SeqCst);
+        }
         self.link.ephemeral(EphemeralEvent { session_id: self.session_id.clone(), kind: Some(kind) });
     }
 }
@@ -4217,6 +4234,41 @@ mod handoff_tests {
         assert!(!t.iter().any(|b| b.starts_with("thinking:")), "{t:?}");
         assert_eq!(conv.context_tokens, 90_000);
         assert_eq!(runtime_of(SessionStarted { tool_profile: "generic".into(), ..Default::default() }, &events).tool_profile, "generic");
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use c6_proto::{AssistantMessage, TextDelta, WorkerMsg, worker_msg};
+
+    use super::*;
+
+    /// Streamed text says where the log was: a viewer that catches up gets
+    /// the reply from the log before the text it streamed, and drops that
+    /// text by this instead of drawing the reply twice.
+    #[tokio::test]
+    async fn streamed_text_says_where_the_log_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let started = SessionEvent { seq: 1, ts_ms: 0, kind: Some(session_event::Kind::Started(SessionStarted::default())) };
+        journal.create_session("s", &CreateSession::default(), &started).await.unwrap();
+        let link = Arc::new(HeadLink::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        link.connected(tx);
+        let writer = Writer::new("s".into(), journal, link.clone(), 2);
+        let text = |t: &str| ephemeral_event::Kind::Text(TextDelta { turn: 1, text: t.into(), ..Default::default() });
+        writer.ephemeral(text("Hel"));
+        writer.ephemeral(text("lo"));
+        let reply = AssistantMessage { turn: 1, ..Default::default() };
+        assert_eq!(writer.append(session_event::Kind::Assistant(reply)).await.unwrap(), 2);
+        writer.ephemeral(text("Next"));
+        link.flush_ephemeral();
+        let mut sent = Vec::new();
+        while let Ok(WorkerMsg { msg: Some(worker_msg::Msg::Ephemeral(ev)) }) = rx.try_recv() {
+            let Some(ephemeral_event::Kind::Text(d)) = ev.kind else { panic!("not text") };
+            sent.push((d.text, d.seq));
+        }
+        assert_eq!(sent, [("Hello".to_owned(), 2), ("Next".to_owned(), 3)]);
     }
 }
 

@@ -454,6 +454,10 @@ message SecretCard {
 message TextDelta {
   uint64 turn = 1;
   string text = 2;
+  // The seq the log's next event had when this streamed: the first reply
+  // logged from there has this text, so a viewer that already has that reply
+  // (or a turn's start or end from there) drops it. 0: not said.
+  uint64 seq = 3;
 }
 
 message ToolOutputDelta {

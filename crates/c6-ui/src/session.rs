@@ -205,10 +205,65 @@ pub(crate) enum Window {
     All,
 }
 
-/// Streamed text for `turn` arriving once the log says that turn (or a later
-/// one) ended: its message is already drawn. Turn 0: not said, so shown.
-fn stale(turn: u64, ended: u64) -> bool {
-    turn != 0 && turn <= ended
+/// How far the log has come, for streamed text that arrives after the
+/// message it streamed (catching up, the stream sends what the log has
+/// before what was live meanwhile): drawn again, it doubles the reply.
+#[derive(Clone, Copy, Default)]
+struct Logged {
+    /// The last turn the log says ended.
+    ended: u64,
+    /// The last reply, or start or end of a turn: what streamed before it
+    /// is in it (or was dropped).
+    settled: u64,
+}
+
+impl Logged {
+    /// `e` is in the log, replayed or live.
+    fn note(&mut self, e: &Event) {
+        match e.kind {
+            EventKind::TurnEnded { turn, .. } => {
+                self.ended = self.ended.max(turn);
+                self.settled = self.settled.max(e.seq);
+            }
+            EventKind::Assistant { .. } | EventKind::TurnStarted { .. } => self.settled = self.settled.max(e.seq),
+            _ => {}
+        }
+    }
+
+    /// A live event: noted, and what streamed for it leaves `s`.
+    fn event(&mut self, s: &mut Streaming, e: &Event) {
+        self.note(e);
+        match &e.kind {
+            EventKind::Assistant { .. } => {
+                s.text.clear();
+                s.thinking.clear();
+            }
+            EventKind::ToolResult { call_id, .. } => {
+                s.tool_output.remove(call_id);
+            }
+            // A new turn shows only what it streams.
+            EventKind::TurnEnded { .. } | EventKind::TurnStarted { .. } => *s = Streaming::default(),
+            _ => {}
+        }
+    }
+
+    /// Text streamed in `turn` when the log's next event was `seq` is
+    /// already in a message: its turn ended, or a reply (or turn's start or
+    /// end) from `seq` on is in. 0: not said.
+    fn has(&self, turn: u64, seq: u64) -> bool {
+        (turn != 0 && turn <= self.ended) || (seq != 0 && seq <= self.settled)
+    }
+
+    /// Streamed text or thinking: added to `s` unless the log has it.
+    /// Whether it was.
+    fn stream(&self, s: &mut Streaming, msg: StreamMsg) -> bool {
+        match msg {
+            StreamMsg::Text { turn, text, seq } if !self.has(turn, seq) => s.text.push_str(&text),
+            StreamMsg::Thinking { turn, text, seq } if !self.has(turn, seq) => s.thinking.push_str(&text),
+            _ => return false,
+        }
+        true
+    }
 }
 
 /// Events in a window, and loaded at a time before it.
@@ -243,15 +298,16 @@ impl Feed {
         // The replay arrives all at once (not an event at a time, each
         // drawn and scrolled to).
         let replay = StoredValue::new(Vec::<Event>::new());
-        // The last turn the log says ended: text streamed for it (or an
-        // earlier one) that arrives late is already in its messages.
-        let ended = StoredValue::new(0u64);
+        // How far the log has come: streamed text that arrives late is
+        // already in its messages.
+        let logged = StoredValue::new(Logged::default());
         let handle = api::stream_session(
             id,
             move |msg| match msg {
                 // Replayed turns don't start and stop it again (the log says
                 // whether one is running).
                 StreamMsg::Event { event } if !synced.get_untracked() => {
+                    logged.update_value(|l| l.note(&event));
                     let last =
                         replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
                     if last.is_none_or(|l| l < event.seq) {
@@ -259,21 +315,7 @@ impl Feed {
                     }
                 }
                 StreamMsg::Event { event } => {
-                    if let EventKind::TurnEnded { turn, .. } = event.kind {
-                        ended.update_value(|e| *e = (*e).max(turn));
-                    }
-                    streaming.update(|s| match &event.kind {
-                        EventKind::Assistant { .. } => {
-                            s.text.clear();
-                            s.thinking.clear();
-                        }
-                        EventKind::ToolResult { call_id, .. } => {
-                            s.tool_output.remove(call_id);
-                        }
-                        // A new turn shows only what it streams.
-                        EventKind::TurnEnded { .. } | EventKind::TurnStarted { .. } => *s = Streaming::default(),
-                        _ => {}
-                    });
+                    streaming.update(|s| logged.update_value(|l| l.event(s, &event)));
                     if let EventKind::TurnEnded { .. } = event.kind {
                         activity.set(Some(false));
                     }
@@ -287,9 +329,9 @@ impl Feed {
                     });
                 }
                 StreamMsg::Window { from: f } => from.set(f),
-                StreamMsg::Text { turn, text } if !stale(turn, ended.get_value()) => streaming.update(|s| s.text.push_str(&text)),
-                StreamMsg::Thinking { turn, text } if !stale(turn, ended.get_value()) => streaming.update(|s| s.thinking.push_str(&text)),
-                StreamMsg::Text { .. } | StreamMsg::Thinking { .. } => {}
+                msg @ (StreamMsg::Text { .. } | StreamMsg::Thinking { .. }) => {
+                    streaming.maybe_update(|s| logged.with_value(|l| l.stream(s, msg)))
+                }
                 StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
                 StreamMsg::Activity { running, status } => {
                     activity.set(Some(running));
@@ -303,11 +345,6 @@ impl Feed {
                 StreamMsg::Queue { queued: q } => queued.set(q),
                 StreamMsg::Synced => {
                     let r = replay.try_update_value(std::mem::take).unwrap_or_default();
-                    let last =
-                        r.iter().filter_map(|e| if let EventKind::TurnEnded { turn, .. } = e.kind { Some(turn) } else { None }).max();
-                    if let Some(t) = last {
-                        ended.update_value(|e| *e = (*e).max(t));
-                    }
                     // Opened at a place: drawn from there, not to the end.
                     if let Window::At(at) = window {
                         to.set(bound(&r, at));
@@ -4828,11 +4865,76 @@ mod tests {
     /// next turn's until that one's first message arrives.
     #[test]
     fn late_text_for_an_ended_turn_is_not_shown() {
-        assert!(stale(3, 3), "its turn ended");
-        assert!(stale(2, 3), "an earlier turn");
-        assert!(!stale(4, 3), "the turn running now");
-        assert!(!stale(1, 0), "no turn has ended yet");
-        assert!(!stale(0, 3), "a stream that names no turn is shown");
+        let l = Logged { ended: 3, settled: 0 };
+        assert!(l.has(3, 0), "its turn ended");
+        assert!(l.has(2, 0), "an earlier turn");
+        assert!(!l.has(4, 0), "the turn running now");
+        assert!(!Logged::default().has(1, 0), "no turn has ended yet");
+        assert!(!l.has(0, 0), "a stream that names no turn is shown");
+    }
+
+    fn logged(seq: u64, kind: serde_json::Value) -> Event {
+        let mut e = kind;
+        e["seq"] = seq.into();
+        e["ts"] = 0.into();
+        serde_json::from_value(e).unwrap()
+    }
+
+    fn reply(seq: u64, text: &str) -> Event {
+        logged(
+            seq,
+            serde_json::json!({"type": "assistant", "turn": 3, "blocks": [{"type": "text", "text": text}], "stop_reason": "end_turn"}),
+        )
+    }
+
+    fn result(seq: u64) -> Event {
+        logged(
+            seq,
+            serde_json::json!({"type": "tool_result", "call_id": "c", "tool": "Bash", "output": "", "is_error": false, "truncated": false, "duration_ms": 0}),
+        )
+    }
+
+    fn text(seq: u64, text: &str) -> StreamMsg {
+        StreamMsg::Text { turn: 3, text: text.into(), seq }
+    }
+
+    /// Opened (or caught up) while a turn runs: the head sends the log, which
+    /// already has a reply, then what streamed live meanwhile, that reply's
+    /// text too. Its turn is still running, so only where the text streamed
+    /// in the log tells it is in that reply; the reply is drawn once.
+    #[test]
+    fn text_a_reply_in_the_log_already_has_is_not_shown_again() {
+        let (mut l, mut s) = (Logged::default(), Streaming::default());
+        // Replayed: the turn's start, a tool's result, then the reply (seq 12).
+        for e in [logged(10, serde_json::json!({"type": "turn_started", "turn": 3})), result(11), reply(12, "Now the catch-up preview.")] {
+            l.note(&e);
+        }
+        // Then, live, the text that reply streamed (the log was at 12).
+        l.stream(&mut s, text(12, "Now the catch-up "));
+        l.stream(&mut s, text(12, "preview."));
+        assert_eq!(s.text, "", "the reply is in the log: not drawn twice");
+        // The next reply streams from 13 on: shown.
+        l.stream(&mut s, text(13, "Next"));
+        assert_eq!(s.text, "Next");
+    }
+
+    /// Live, in order: a reply clears what it streamed, and text for it that
+    /// still comes after it is dropped, not the next reply's.
+    #[test]
+    fn a_reply_settles_what_streamed_before_it() {
+        let (mut l, mut s) = (Logged::default(), Streaming::default());
+        l.stream(&mut s, text(12, "Hello"));
+        assert_eq!(s.text, "Hello");
+        l.event(&mut s, &reply(12, "Hello there."));
+        assert_eq!(s.text, "");
+        l.stream(&mut s, text(12, " there."));
+        assert_eq!(s.text, "", "late text for the reply drawn above");
+        // A tool's result or a usage report in between settles nothing.
+        l.event(&mut s, &result(13));
+        l.stream(&mut s, text(14, "Then"));
+        assert_eq!(s.text, "Then");
+        l.stream(&mut s, StreamMsg::Text { turn: 0, text: ".".into(), seq: 0 });
+        assert_eq!(s.text, "Then.", "a stream that says nothing (an older worker) is shown");
     }
 
     #[test]
