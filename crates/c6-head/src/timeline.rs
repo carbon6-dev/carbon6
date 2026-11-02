@@ -1,4 +1,5 @@
-//! A session's timeline: its turns, which the web UI folds into hours,
+//! A session's timeline: its turns, which the web UI shows as an outline
+//! by hour in the session's glance and as the rows of its folded turns,
 //! each with who started it, its steps and a line saying what it did. The
 //! lines come from a small model (a `task:timeline` routing rule's, else
 //! the session's own), one call for the turns of an hour when you open it,
@@ -155,13 +156,10 @@ async fn turns(st: &HeadState, id: &str) -> anyhow::Result<Vec<TimelineTurn>> {
 }
 
 /// The session's turns (`hour`: those that started in the hour from then,
-/// each with its line, made now unless it is already); None while its
-/// timeline is off.
-pub async fn get(st: &HeadState, id: &str, q: &api::TimelineQuery, caller: &Caller) -> anyhow::Result<Option<Vec<TimelineTurn>>> {
+/// each with its line, made now unless it is already), whatever its
+/// switches say: the glance's outline is always there.
+pub async fn get(st: &HeadState, id: &str, q: &api::TimelineQuery, caller: &Caller) -> anyhow::Result<Vec<TimelineTurn>> {
     let row = visible(st, id, caller).await?;
-    if !st.store.session_view(id).await?.timeline {
-        return Ok(None);
-    }
     let mut list = turns(st, id).await?;
     if let Some(h) = q.hour {
         list.retain(|t| t.at >= h && t.at < h + HOUR);
@@ -169,7 +167,7 @@ pub async fn get(st: &HeadState, id: &str, q: &api::TimelineQuery, caller: &Call
     } else {
         known_lines(st, &row.id, &mut list);
     }
-    Ok(Some(list))
+    Ok(list)
 }
 
 fn key(session: &str, t: &TimelineTurn) -> (String, u64, u64) {

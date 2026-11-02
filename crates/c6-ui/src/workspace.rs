@@ -1903,7 +1903,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || chrome().map(|c| view! {
                     <crate::session::SessionControls chrome=c />
                     <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
-                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, timeline, archive" aria-label="Actions"
+                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, fold finished turns, archive" aria-label="Actions"
                         on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
                 })}
                 {move || pinnable().map(|id| {

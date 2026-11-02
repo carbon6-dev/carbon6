@@ -1257,7 +1257,7 @@ fn SessionImportsSetting() -> impl IntoView {
 }
 
 /// Suggested next messages (docs/suggestions.md), and what new sessions
-/// start with (the catch-up card, the timeline), per realm.
+/// start with (the catch-up card, finished turns folded), per realm.
 #[component]
 fn SuggestionsSetting() -> impl IntoView {
     let shown = RwSignal::new(c6_api::SuggestionSettings::default());
@@ -1288,16 +1288,16 @@ fn SuggestionsSetting() -> impl IntoView {
                 "Suggest next messages"
             </label>
             <h3 class="pt-2 text-sm font-medium">"New sessions start with"</h3>
-            <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else the session's own; the prompt is session.catchup). Timeline: the transcript folded into hours, a line per turn, written when you open an hour (task:timeline, session.timeline)."</p>
+            <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, session.timeline)."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || shown.with(|s| s.catchup)
                     on:change=move |ev| set(|s, on| s.catchup = on, event_target_checked(&ev)) />
                 "Catch-up"<span class="text-muted">"a card when you come back"</span>
             </label>
             <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || shown.with(|s| s.timeline)
-                    on:change=move |ev| set(|s, on| s.timeline = on, event_target_checked(&ev)) />
-                "Timeline"<span class="text-muted">"turns folded, by hour"</span>
+                <input type="checkbox" prop:checked=move || shown.with(|s| s.fold)
+                    on:change=move |ev| set(|s, on| s.fold = on, event_target_checked(&ev)) />
+                "Fold finished turns"<span class="text-muted">"one row per finished turn"</span>
             </label>
             {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
         </section>

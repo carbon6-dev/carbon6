@@ -230,7 +230,7 @@ fn own_key(key: &str, realm: &str) -> String {
 }
 
 /// The per-realm setting that says what new sessions start with (its
-/// `catchup` and `timeline`, beside suggestions' `enabled`).
+/// `catchup` and `fold`, beside suggestions' `enabled`).
 const SESSION_VIEW_DEFAULTS: &str = "session_suggestions";
 
 /// Where a session keeps how it shows itself to you (no table of its own).
@@ -631,7 +631,7 @@ impl Store {
             insert_command(&mut tx, c, held).await?;
         }
         // Your new session starts as its realm shows new sessions (Settings
-        // → Suggestions: the catch-up card, the timeline).
+        // → Suggestions: the catch-up card, finished turns folded).
         if s.parent_id.is_none() {
             let mut defaults = None;
             for key in [own_key(SESSION_VIEW_DEFAULTS, &s.realm), SESSION_VIEW_DEFAULTS.to_owned()] {
@@ -654,7 +654,8 @@ impl Store {
         Ok(colour)
     }
 
-    /// How a session shows itself to you (the catch-up card, the timeline).
+    /// How a session shows itself to you (the catch-up card, finished turns
+    /// folded).
     pub async fn session_view(&self, id: &str) -> anyhow::Result<c6_api::SessionViewSettings> {
         Ok(self.raw_setting(&session_view_key(id)).await?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
     }

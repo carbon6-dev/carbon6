@@ -1255,7 +1255,7 @@ pub async fn set_suggestion_settings(s: c6_api::SuggestionSettings) -> Result<()
     empty(Request::put(&format!("/api/v1/settings/suggestions{}", in_realm('?'))).json(&s).map_err(|e| e.to_string())?.send().await).await
 }
 
-/// Whether a session shows a catch-up card and its timeline.
+/// Whether a session shows a catch-up card, and folds its finished turns.
 pub async fn session_view(id: String) -> Result<c6_api::SessionViewSettings, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}/view")).send().await).await
 }
@@ -1276,19 +1276,10 @@ pub async fn catchup(id: String, since: Option<u64>, summary: bool) -> Result<Op
 }
 
 /// A session's turns (`hour`: those of the hour from then, with their
-/// lines); None while its timeline is off.
-pub async fn timeline(id: String, hour: Option<i64>) -> Result<Option<Vec<c6_api::TimelineTurn>>, String> {
+/// lines).
+pub async fn timeline(id: String, hour: Option<i64>) -> Result<Vec<c6_api::TimelineTurn>, String> {
     let hour = hour.map(|h| format!("?hour={h}")).unwrap_or_default();
-    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/timeline{hour}")).send().await).await?;
-    if resp.status() == 204 {
-        return Ok(None);
-    }
-    resp.json().await.map(Some).map_err(|e| e.to_string())
-}
-
-/// About a thousand of a session's events after event `after`.
-pub async fn session_events_after(id: String, after: u64) -> Result<Vec<c6_api::Event>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/events?after={after}")).send().await).await
+    json(Request::get(&format!("/api/v1/sessions/{id}/timeline{hour}")).send().await).await
 }
 
 /// A suggestion was shown, or (`accepted`) taken.

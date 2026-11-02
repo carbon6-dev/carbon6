@@ -1,10 +1,10 @@
 # Catching up on a session — Design
 
-Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("Catching up on a session"). Two features, each opt-in per session: a **catch-up** card when you come back, and a **timeline** that folds the transcript into hours.
+Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("Catching up on a session"). A **catch-up** card when you come back (opt-in per session), and a **timeline** of its turns: an outline by hour in its glance, always there, and finished turns folded into one row each in the transcript (opt-in per session). Reworked the same day: the timeline used to replace the transcript with its hours.
 
 ## 1. Switches
 
-- **Per session:** ⋯ → **Catch-up** ("a card when you come back") and **Timeline** ("turns folded, by hour"), between its actions and Archive. Kept on the head (`GET`/`PUT /api/v1/sessions/{id}/view`, a settings key per session, no table of its own), so they follow you across devices. A switch moves once the head has it, so a timeline just switched on reads its turns from a head that knows it's on.
+- **Per session:** ⋯ → **Catch-up** ("a card when you come back") and **Fold finished turns** ("one row per finished turn"), between its actions and Archive. Kept on the head (`GET`/`PUT /api/v1/sessions/{id}/view`: `catchup`, `fold`; a settings key per session, `session_view:<id>`, no table of its own), so they follow you across devices. A switch moves once the head has it. The glance's outline has no switch.
 - **New sessions:** Settings → Suggestions → *New sessions start with* (per realm, like the suggestions switch; off by default). A session started then gets its realm's choice; changing it later leaves existing sessions alone.
 - **Routing:** a rule for `task:catchup` picks the catch-up's model, one for `task:timeline` the timeline's (on a connection the session's realm may use, its realm's rules first, as `task:suggest`); without one, the session's own model. Prompts: `session.catchup`, `session.timeline` (Settings → Prompts).
 
@@ -25,10 +25,13 @@ Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("
 
 ## 3. Timeline
 
-- A **Timeline · All** switch at the top of the transcript. Folded, each hour is a row, "14:00 · 3 turns · 41 steps", closed but for the hour a turn runs in.
-- An open hour lists a line per turn: who started it ("You: …", "From <session>", "Task done: …", "Comments on <doc>"), what it did, and its steps. Clicking it shows the turn's events in full, inline (read from the head when the transcript hasn't loaded them).
-- What a turn did comes from the small model, one call for an hour's turns when the hour is opened, kept in the head's memory; until then, its last reply's first sentence.
-- `GET /api/v1/sessions/{id}/timeline` gives every turn (when it started, who started it, its steps, its reply's first sentence); `?hour=<ms>` the turns of that hour with their lines. Hours are grouped in the page, by the browser's clock. 204 while its timeline is off (the page says so, and shows an error reading it as one, never as "No turns yet.").
+Two views of a session's turns (decided as "A + B as a switch"):
+
+- **The outline, always there:** the glance's last section, **TIMELINE** (a column beside the transcript when the session is wide, else in the glance the context ring ◔ opens; a sheet on a phone). Each hour is a row, "▾ 22:00 · 3 turns", closed but for the latest. An open hour lists a line per turn: who started it ("You: …", "From <session>", "Task done: …", "Comments on <doc>"), what it did, and its steps. Clicking a line scrolls the transcript to the turn and flashes it, loading older events first when the turn starts before what's loaded (as Find and the catch-up's Jump to it do), and opens it if it's folded.
+- **Fold finished turns** (⋯; off by default): the transcript itself shows each finished turn as one row: ▸, who started it, what it did, the time and its steps. A click opens it in place (▾, its events below), another folds it. The running turn always stays open, and so does one you opened or went to (from the outline, Find, the catch-up, what waits on you, a subagent's thread). A turn that was rewound stays as it was (hidden behind "show N rewound"). A folded turn's events aren't drawn at all, so a long session draws less. The page counts turns from the events it has loaded, as the head does (from the message before a turn's start to its end).
+- What a turn did comes from the small model, one call for an hour's turns when the hour is opened in the outline, kept in the head's memory; until then, its last reply's first sentence. A folded row shows the line once it's made.
+- `GET /api/v1/sessions/{id}/timeline` gives every turn (when it started, who started it, its steps, its reply's first sentence), whatever the session's switches; `?hour=<ms>` the turns of that hour with their lines. Hours are grouped in the page, by the browser's clock. An error reading them shows as one (with Try again), never as "No turns yet.".
+- **Before:** a Timeline switch replaced the whole transcript with the hour list (with "Timeline · All" at its top). A session's stored `timeline` reads as `fold`, and so does the realm's default for new sessions.
 
 ## 4. Not yet
 

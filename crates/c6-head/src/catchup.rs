@@ -1,9 +1,9 @@
 //! Catching up on a session: what it did since you last looked, counted
 //! (never by the model) and in a paragraph a small model writes, for the
 //! catch-up card. Opt-in per session (`/api/v1/sessions/{id}/view`, with
-//! the timeline); the paragraph is made when you look, not per turn, by
-//! the model a `task:catchup` routing rule picks (else the session's own),
-//! and kept in the head's memory.
+//! folding finished turns); the paragraph is made when you look, not per
+//! turn, by the model a `task:catchup` routing rule picks (else the
+//! session's own), and kept in the head's memory.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

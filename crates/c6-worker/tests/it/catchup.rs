@@ -1,9 +1,10 @@
-//! Catching up on a session, and its timeline: off until a session's own
-//! switch (or its realm's default for new sessions) turns them on; what it
-//! did since you looked (or your last message) counted, and summed up by
-//! the model a `task:catchup` rule picks, else the session's own; its
-//! turns, each with a line from `task:timeline`'s model, else the
-//! session's own, made once and kept.
+//! Catching up on a session, and its timeline: the card and folded turns
+//! off until a session's own switch (or its realm's default for new
+//! sessions) turns them on; what it did since you looked (or your last
+//! message) counted, and summed up by the model a `task:catchup` rule
+//! picks, else the session's own; its turns, whatever its switches say,
+//! each with a line from `task:timeline`'s model, else the session's own,
+//! made once and kept.
 
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
@@ -83,19 +84,25 @@ async fn catching_up_on_a_session_and_its_timeline() {
         mock.push(Reply::Text("Ran all five.".into()));
     };
 
-    // 1. Off by default: no card, no timeline.
+    // 1. Off by default: no card, no folding; its turns all the same (the
+    // glance's outline is always there).
     mock.push(Reply::Text("Hi.".into()));
     let a = start("hello").await;
     ended(&a, 1).await;
-    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": false, "timeline": false}));
+    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": false, "fold": false}));
     assert_eq!(send(M::GET, format!("sessions/{a}/catchup"), None, json!(null)).await.status(), StatusCode::NO_CONTENT);
-    assert_eq!(send(M::GET, format!("sessions/{a}/timeline"), None, json!(null)).await.status(), StatusCode::NO_CONTENT);
+    let turns = get(format!("sessions/{a}/timeline")).await;
+    assert_eq!(
+        (turns[0]["by"].clone(), turns[0]["words"].clone(), turns[0]["reply"].clone()),
+        (json!("you"), json!("hello"), json!("Hi.")),
+        "{turns}"
+    );
 
     // 2. The realm's defaults turn them on for new sessions (not for one
     // already started); catch-ups go to a small model.
-    ok(send(M::PUT, "settings/suggestions".into(), None, json!({"enabled": true, "catchup": true, "timeline": true})).await).await;
+    ok(send(M::PUT, "settings/suggestions".into(), None, json!({"enabled": true, "catchup": true, "fold": true})).await).await;
     let s = get("settings/suggestions".into()).await;
-    assert_eq!((s["catchup"].clone(), s["timeline"].clone()), (json!(true), json!(true)), "{s}");
+    assert_eq!((s["catchup"].clone(), s["fold"].clone()), (json!(true), json!(true)), "{s}");
     ok(send(
         M::PUT,
         "settings/routes".into(),
@@ -107,8 +114,8 @@ async fn catching_up_on_a_session_and_its_timeline() {
     five();
     let b = start("run the five commands").await;
     let events = ended(&b, 1).await;
-    assert_eq!(get(format!("sessions/{b}/view")).await, json!({"catchup": true, "timeline": true}));
-    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": false, "timeline": false}));
+    assert_eq!(get(format!("sessions/{b}/view")).await, json!({"catchup": true, "fold": true}));
+    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": false, "fold": false}));
 
     // 3. Never looked at: since your message, six steps, worth a card,
     // counted; no paragraph until asked.
@@ -203,8 +210,11 @@ async fn catching_up_on_a_session_and_its_timeline() {
     assert_eq!(mock.requests().last().unwrap()["model"], "tiny", "the task:timeline rule's model");
 
     // 9. A session's own switches, and only for its realm.
-    ok(send(M::PUT, format!("sessions/{a}/view"), None, json!({"catchup": true, "timeline": false})).await).await;
-    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": true, "timeline": false}));
+    ok(send(M::PUT, format!("sessions/{a}/view"), None, json!({"catchup": true, "fold": false})).await).await;
+    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": true, "fold": false}));
+    // The old switch's name reads as folding.
+    ok(send(M::PUT, format!("sessions/{a}/view"), None, json!({"catchup": true, "timeline": true})).await).await;
+    assert_eq!(get(format!("sessions/{a}/view")).await, json!({"catchup": true, "fold": true}));
     assert_eq!(get(format!("sessions/{a}/catchup")).await["offer"], false, "one step");
     ok(send(M::POST, "realms".into(), None, json!({"id": "lab"})).await).await;
     let token = ok(send(M::POST, "auth/tokens".into(), None, json!({"name": "lab", "realm": "lab"})).await).await;
@@ -213,9 +223,9 @@ async fn catching_up_on_a_session_and_its_timeline() {
         assert_eq!(send(M::GET, path.clone(), Some(lab.clone()), json!(null)).await.status(), StatusCode::NOT_FOUND, "{path} as lab");
     }
 
-    // 10. A long Claude Code session (thousands of events), its timeline
-    // switched off (the realm's default turned it on) and on again: every
-    // turn, however it started (your message, a task's
+    // 10. A long Claude Code session (thousands of events), folding
+    // switched off (the realm's default turned it on): its timeline has
+    // every turn, however it started (your message, a task's
     // notification, another session's, or the CLI by itself), the last one
     // still running.
     let mut long = head.state.store.session(&a).await.unwrap().unwrap();
@@ -227,9 +237,7 @@ async fn catching_up_on_a_session_and_its_timeline() {
     for batch in events.chunks(500) {
         head.state.store.ingest(cc_worker, &long.id, batch).await.unwrap().unwrap();
     }
-    ok(send(M::PUT, format!("sessions/{}/view", long.id), None, json!({"catchup": false, "timeline": false})).await).await;
-    assert_eq!(send(M::GET, format!("sessions/{}/timeline", long.id), None, json!(null)).await.status(), StatusCode::NO_CONTENT);
-    ok(send(M::PUT, format!("sessions/{}/view", long.id), None, json!({"catchup": false, "timeline": true})).await).await;
+    ok(send(M::PUT, format!("sessions/{}/view", long.id), None, json!({"catchup": false, "fold": false})).await).await;
     let turns = get(format!("sessions/{}/timeline", long.id)).await;
     let turns = turns.as_array().unwrap();
     assert_eq!(turns.len(), 267, "every turn");

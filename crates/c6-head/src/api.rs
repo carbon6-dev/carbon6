@@ -971,17 +971,15 @@ async fn session_catchup(
     })
 }
 
-/// A session's turns, for its timeline: 204 while its timeline is off.
+/// A session's turns, for its timeline (the glance's outline, the rows of
+/// folded turns).
 async fn session_timeline(
     State(st): State<Arc<HeadState>>,
     Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Query(q): Query<api::TimelineQuery>,
-) -> ApiResult<Response> {
-    Ok(match crate::timeline::get(&st, &id, &q, &caller).await? {
-        Some(t) => Json(t).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    })
+) -> ApiResult<Json<Vec<api::TimelineTurn>>> {
+    Ok(Json(crate::timeline::get(&st, &id, &q, &caller).await?))
 }
 
 async fn get_session_view(

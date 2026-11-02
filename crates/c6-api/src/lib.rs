@@ -4642,8 +4642,8 @@ pub struct SuggestionSeen {
 }
 
 /// Whether sessions suggest your next message (`/api/v1/settings/suggestions`, per realm),
-/// and what new sessions start with: the catch-up card and the timeline
-/// (each session then has its own, `/api/v1/sessions/{id}/view`).
+/// and what new sessions start with: the catch-up card and finished turns
+/// folded (each session then has its own, `/api/v1/sessions/{id}/view`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SuggestionSettings {
@@ -4652,9 +4652,10 @@ pub struct SuggestionSettings {
     /// New sessions show what happened while you were away.
     #[serde(default)]
     pub catchup: bool,
-    /// New sessions fold their transcript into hours.
-    #[serde(default)]
-    pub timeline: bool,
+    /// New sessions show each finished turn as one row (`timeline`, its
+    /// old name, reads as this).
+    #[serde(default, alias = "timeline")]
+    pub fold: bool,
 }
 
 fn yes() -> bool {
@@ -4663,21 +4664,24 @@ fn yes() -> bool {
 
 impl Default for SuggestionSettings {
     fn default() -> Self {
-        Self { enabled: true, catchup: false, timeline: false }
+        Self { enabled: true, catchup: false, fold: false }
     }
 }
 
 /// How a session shows itself to you (`/api/v1/sessions/{id}/view`), the
 /// same on every device: a catch-up card when you come back, and its
-/// transcript folded into hours. Off unless the realm's defaults for new
-/// sessions turned them on when it started.
+/// finished turns folded, one row each. Off unless the realm's defaults for
+/// new sessions turned them on when it started.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionViewSettings {
     #[serde(default)]
     pub catchup: bool,
-    #[serde(default)]
-    pub timeline: bool,
+    /// Its transcript shows each finished turn as one row, opened by a
+    /// click. Read from `timeline` too (the switch that showed its turns
+    /// by hour in place of the transcript).
+    #[serde(default, alias = "timeline")]
+    pub fold: bool,
 }
 
 /// `GET /api/v1/sessions/{id}/catchup`.
@@ -4756,7 +4760,8 @@ pub struct TimelineQuery {
     pub hour: Option<UnixMs>,
 }
 
-/// A turn of a session, for its timeline (`GET /api/v1/sessions/{id}/timeline`).
+/// A turn of a session, for its timeline (`GET /api/v1/sessions/{id}/timeline`):
+/// the glance's outline, and the rows of its folded turns.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TimelineTurn {
