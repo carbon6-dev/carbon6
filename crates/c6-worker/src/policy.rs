@@ -107,6 +107,9 @@ impl Policies {
         if rule.deny {
             return Some(format!("Denied by policy \"{}\"{why}", rule.name));
         }
+        if only_lists(names, input) {
+            return None;
+        }
         let mut shown = input.to_string();
         if shown.len() > 4000 {
             let mut cut = 4000;
@@ -202,6 +205,14 @@ impl c6_tools::Hooks for Chain {
     }
 }
 
+/// An `app_call` naming no instance and no operation only lists what can
+/// be called: it changes nothing, so it never waits for your approval (a
+/// rule that denies app calls still does).
+fn only_lists(names: &[&str], input: &Value) -> bool {
+    names.iter().any(|n| matches!(*n, "app_call" | "AppCall" | "mcp__carbon6__app_call" | "mcp__carbon6__AppCall"))
+        && ["instance", "operation"].iter().all(|k| input.get(k).and_then(Value::as_str).is_none_or(str::is_empty))
+}
+
 #[cfg(test)]
 mod tests {
     use c6_tools::Hooks;
@@ -248,5 +259,25 @@ mod tests {
         let _ = wait.await;
         assert_eq!(rx.recv().await.unwrap().state, "expired");
         assert!(!p.decide("c5", true), "nothing waits for it any more");
+    }
+
+    #[tokio::test]
+    async fn listing_app_operations_never_waits_but_calling_one_does() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let json = json!([{"name": "apps ask", "tools": "app_call|AppCall", "action": "ask"}]).to_string();
+        let p = Policies::new(&json, &[], tx).unwrap();
+        assert_eq!(p.pre_tool_use("l1", "app_call", &json!({})).await, None, "a listing runs at once");
+        assert_eq!(p.pre_tool_use("l2", "AppCall", &json!({"instance": "", "operation": ""})).await, None);
+        assert!(rx.try_recv().is_err(), "and asks nothing");
+        let p2 = p.clone();
+        let call = json!({"instance": "crm", "operation": "add", "input": {"name": "Barbara"}});
+        let wait = tokio::spawn(async move { p2.pre_tool_use("l3", "app_call", &call).await });
+        assert_eq!(rx.recv().await.unwrap().call_id, "l3", "an operation waits for you");
+        p.decide("l3", true);
+        assert_eq!(wait.await.unwrap(), None);
+        // A rule that denies app calls denies a listing too.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let deny = Policies::new(&json!([{"name": "no apps", "tools": "app_call", "action": "deny"}]).to_string(), &[], tx).unwrap();
+        assert!(deny.pre_tool_use("l4", "app_call", &json!({})).await.is_some());
     }
 }
