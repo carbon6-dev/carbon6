@@ -355,7 +355,9 @@ fn Expandable(src: String, name: String, fill: bool, new_tab: Option<String>, ch
     let open = RwSignal::new(false);
     let href = new_tab.clone();
     view! {
-        <a href=href target="_blank" title="Show it bigger" class="inline-block max-w-full cursor-zoom-in"
+        // A block: a drawing has no size of its own, and in a box that
+        // shrinks to fit its content it would shrink to nothing.
+        <a href=href target="_blank" title="Show it bigger" class=if fill { "block w-full cursor-zoom-in" } else { "block w-fit max-w-full cursor-zoom-in" }
             on:click=move |ev: web_sys::MouseEvent| {
                 ev.stop_propagation();
                 if new_tab.is_none() || (ev.button() == 0 && !(ev.meta_key() || ev.ctrl_key() || ev.shift_key() || ev.alt_key())) {
