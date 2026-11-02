@@ -722,8 +722,9 @@ enum Fit {
     Sheet,
 }
 
-/// A tile at least this wide (64rem) has the comments panel beside the doc.
-const DOCKED_FROM: f64 = 1024.0;
+/// A tile at least this wide (70rem) has the comments panel beside the doc,
+/// leaving the doc ~44rem beside the 26rem panel.
+const DOCKED_FROM: f64 = 1120.0;
 
 /// A button in the doc's bar.
 const BAR: &str = "shrink-0 rounded-md px-2 py-1 text-sm text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800";
@@ -1372,8 +1373,11 @@ pub fn DocPage(id: String) -> impl IntoView {
     };
     view! {
         <div node_ref=root class="relative">
-            <div class="flex items-start">
-                <div class="min-w-0 flex-1">
+            // Docked, the panel sits right beside the doc's reading column
+            // and the two are centred together: at a wide tile's edge it
+            // was far from what it's about.
+            <div class="flex items-start justify-center">
+                <div class=move || if docked.get() { "min-w-0 max-w-3xl flex-1" } else { "min-w-0 flex-1" }>
                     {move || (state.get() == 2).then(bar)}
                     <main class="mx-auto max-w-3xl space-y-4 px-4 pb-8 pt-3">
                         {move || error.get().map(|e| view! {
@@ -1391,7 +1395,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 </div>
                 // Beside the doc, scrolling on its own.
                 {move || docked.get().then(|| view! {
-                    <aside class="sticky top-0 flex w-80 shrink-0 flex-col border-l border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
+                    <aside class="sticky top-0 flex w-[26rem] shrink-0 flex-col border-x border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
                         style=move || format!("height: {}px", tile_h.get())>
                         <CommentsPanel />
                     </aside>
@@ -1469,7 +1473,7 @@ fn FloatingPanel(tile_h: RwSignal<f64>) -> impl IntoView {
         let _ = ctx.panel.try_set(false);
     });
     view! {
-        <div node_ref=node class="absolute right-2 top-full z-10 mt-1 flex w-80 max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div node_ref=node class="absolute right-2 top-full z-10 mt-1 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
             style=move || format!("max-height: {}px", (tile_h.get() - 72.0).max(240.0))>
             <CommentsPanel />
         </div>
@@ -1549,7 +1553,7 @@ fn BlockPop(block: String) -> impl IntoView {
     let node = NodeRef::<leptos::html::Div>::new();
     dismiss(node, "[data-marks]", move || ctx.close_pop());
     view! {
-        <div node_ref=node class="absolute z-30 max-h-[70vh] w-80 max-w-[calc(100%-1rem)] space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div node_ref=node class="absolute z-30 max-h-[70vh] w-96 max-w-[calc(100%-1rem)] space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
             style=move || ctx.pop_at.with(|(top, right)| format!("top: {top}px; right: {right}px"))>
             <PopBody block />
         </div>
