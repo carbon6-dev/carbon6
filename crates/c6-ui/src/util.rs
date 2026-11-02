@@ -47,6 +47,22 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
 
 /// Sizes a message box to what is in it; its CSS `max-height` caps it, and
 /// past that it scrolls.
+/// As `fit`, but an empty box with a long `hint` (a suggested message in
+/// its placeholder) is sized to show all of it: measured as if typed, then
+/// emptied again. Without one, as `fit`.
+pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
+    match hint.filter(|h| !h.is_empty()) {
+        Some(h) if el.value().is_empty() => {
+            el.set_value(h);
+            fit(el);
+            let style = el.get_attribute("style").unwrap_or_default();
+            el.set_value("");
+            let _ = el.set_attribute("style", &style);
+        }
+        _ => fit(el),
+    }
+}
+
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
     // Empty, it keeps its own rows: a long hint doesn't size it.
     if el.value().is_empty() {

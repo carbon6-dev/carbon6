@@ -4205,6 +4205,14 @@ fn Composer(
     ));
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
+    // A suggestion shown in the empty box is sized to show all of it (on a
+    // phone it ran past two lines and was cut off); typing sizes to the text.
+    Effect::new(move || {
+        let hint = shown_next();
+        if let Some(el) = area.get() {
+            crate::util::fit_hint(&el, hint.as_deref());
+        }
+    });
     crate::util::autosize(area, move || text.track());
     // One path for a tap and Tab: fill the draft, never send it. Focus in the
     // gesture handler itself so a phone can open its software keyboard.
@@ -4629,8 +4637,8 @@ fn Composer(
                         data-pop=suggest_pop.get_value()
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
                             // A phone's box is narrow: a hint that fits.
-                            if running.get() { "Message: read at its next step…" } else if wake.is_some() { "Message the subagent" } else if inline { "Reply in this side chat" } else { "Message the agent" }.to_owned()
-                        } else if running.get() { "Send a message; it reaches the agent at its next step…".to_owned() } else if wake.is_some() { "Message the subagent: its report goes to the agent that started it (@ to mention a file, / for commands)".to_owned() } else if inline { "Reply in this side chat (@ to mention a file, / for commands)".to_owned() } else { "Message the agent (Enter to send, Shift+Enter for a new line, @ to mention a file or a person, client, host…, / for commands)".to_owned() }
+                            if running.get() { "Read at its next step…" } else { "@ to mention · / for commands" }.to_owned()
+                        } else if running.get() { "Read at the agent's next step…".to_owned() } else { "@ to mention · / for commands".to_owned() }
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| {
