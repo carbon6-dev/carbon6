@@ -37,6 +37,37 @@ pub fn SlideBox(html: String, width: Signal<f64>) -> impl IntoView {
     }
 }
 
+thread_local! {
+    /// The realm's themes as last loaded, and the editor's last width: a
+    /// deck is drawn again whenever it changes (an agent filling it slide by
+    /// slide), and without these each redraw showed it unstyled until the
+    /// themes came back, at a default width until it was measured: flicker.
+    static THEMES: std::cell::RefCell<Option<Vec<DeckTheme>>> = const { std::cell::RefCell::new(None) };
+    static LAST_WIDTH: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// The realm's themes: the last ones loaded at once, then fresh ones.
+fn themes_signal() -> RwSignal<Option<Vec<DeckTheme>>> {
+    let themes = RwSignal::new(THEMES.with(|t| t.borrow().clone()));
+    spawn_local(async move {
+        if let Ok(t) = api::deck_themes().await {
+            THEMES.with(|c| *c.borrow_mut() = Some(t.clone()));
+            if themes.try_get_untracked().is_some_and(|cur| cur.as_ref() != Some(&t)) {
+                let _ = themes.try_set(Some(t));
+            }
+        }
+    });
+    themes
+}
+
+/// A measured width worth redrawing the slide for. Shrinking always is; a
+/// small growth isn't: a scrollbar appearing and going again as the slide
+/// changes height would otherwise resize it back and forth.
+fn new_width(current: f64, measured: f64) -> Option<f64> {
+    let w = measured.min(1280.0);
+    (measured > 100.0 && (w < current - 0.5 || w > current + 24.0)).then_some(w)
+}
+
 /// The theme CSS for a deck, from the realm's themes.
 fn theme_of(themes: &[DeckTheme], name: &str) -> String {
     themes.iter().find(|t| t.name.eq_ignore_ascii_case(name)).or(themes.first()).map(|t| t.css.clone()).unwrap_or_default()
@@ -74,7 +105,7 @@ pub fn DeckView(
     commenting: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let id = StoredValue::new(doc.summary.id.clone());
-    let themes = LocalResource::new(api::deck_themes);
+    let themes = themes_signal();
     let all = slides(&doc);
     let current = RwSignal::new(0usize);
     // The slide you were on stays picked across reloads, by id (`picked`
@@ -97,7 +128,7 @@ pub fn DeckView(
     let editing = RwSignal::new(None::<(String, String, String)>);
     let notes = RwSignal::new(String::new());
     let dragged = RwSignal::new(None::<usize>);
-    let main_width = RwSignal::new(640.0);
+    let main_width = RwSignal::new(LAST_WIDTH.with(|w| if w.get() > 100.0 { w.get() } else { 640.0 }));
     let main_ref = NodeRef::<leptos::html::Div>::new();
     // The slide fills the panel's width, following it as it changes.
     Effect::new(move |_| {
@@ -106,9 +137,10 @@ pub fn DeckView(
         let Some(el) = main_ref.get() else { return };
         let on = Closure::<dyn Fn(js_sys::Array)>::new(move |entries: js_sys::Array| {
             if let Some(e) = entries.get(0).dyn_ref::<web_sys::ResizeObserverEntry>() {
-                let w = e.content_rect().width();
-                if w > 100.0 {
-                    let _ = main_width.try_set(w.min(1280.0));
+                let Some(current) = main_width.try_get_untracked() else { return };
+                if let Some(w) = new_width(current, e.content_rect().width()) {
+                    LAST_WIDTH.with(|l| l.set(w));
+                    let _ = main_width.try_set(w);
                 }
             }
         });
@@ -179,14 +211,14 @@ pub fn DeckView(
     let theme2 = theme.clone();
     view! {
         <div class="space-y-3" data-deck-view=doc.summary.id.clone()>
-            {move || themes.get().and_then(Result::ok).map(|t| view! { <style>{style(&id.get_value(), &theme_of(&t, &theme2))}</style> })}
+            {move || themes.get().map(|t| view! { <style>{style(&id.get_value(), &theme_of(&t, &theme2))}</style> })}
             <div class="flex flex-wrap items-center gap-2 text-sm">
                 <span class="text-zinc-500">"Theme"</span>
                 <select class=format!("{INPUT} w-auto!") on:change=move |ev| {
                     let t = event_target_value(&ev);
                     send.run(vec![DocOp::Set { title: None, theme: Some(t), size: None, tab: None, tab_title: None, tabs: None, block: None, chip: None, value: None }]);
                 }>
-                    {let theme = theme.clone(); move || themes.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| {
+                    {let theme = theme.clone(); move || themes.get().unwrap_or_default().into_iter().map(|t| {
                         let on = t.name.eq_ignore_ascii_case(&theme);
                         view! { <option value=t.name.clone() selected=on title=t.mood.clone()>{t.name.clone()}</option> }
                     }).collect_view()}
@@ -532,5 +564,22 @@ pub fn BringIn() -> impl IntoView {
                 </section>
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scrollbar coming and going (about 15 pixels) doesn't resize the
+    /// slide back and forth; a real change does.
+    #[test]
+    fn small_growth_is_slack_shrinking_is_not() {
+        assert_eq!(new_width(900.0, 885.0), Some(885.0), "a scrollbar appeared: fit inside it");
+        assert_eq!(new_width(885.0, 900.0), None, "it went again: stay, or it comes back");
+        assert_eq!(new_width(885.0, 940.0), Some(940.0), "the panel grew");
+        assert_eq!(new_width(900.0, 2000.0), Some(1280.0), "never past its own size");
+        assert_eq!(new_width(900.0, 50.0), None, "a panel being laid out");
+        assert_eq!(new_width(1280.0, 1500.0), None);
     }
 }
