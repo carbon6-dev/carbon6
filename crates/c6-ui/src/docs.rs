@@ -1087,12 +1087,24 @@ pub fn DocPage(id: String) -> impl IntoView {
             } else {
                 Fit::Floating
             };
-            if fit.try_get_untracked().is_some_and(|x| x != f) {
+            // A scrollbar coming or going is no resize: the popover makes
+            // the page just tall enough for one, the narrower page rewraps,
+            // the popover is placed again, the scrollbar goes, and round it
+            // went for good. Only a real change of width counts.
+            let resized = tile_w.try_get_untracked().is_some_and(|w| (w - e.width()).abs() >= 24.0);
+            if resized && fit.try_get_untracked().is_some_and(|x| x != f) {
                 let _ = fit.try_set(f);
             }
-            let _ = tile_w.try_set(e.width());
+            if resized {
+                let _ = tile_w.try_set(e.width());
+            }
             let _ = tile_h.try_set(e.height());
         });
+        // Room for the scrollbar is kept whether or not it shows, so it
+        // doesn't change the page's width either.
+        if let Some(area) = area.dyn_ref::<web_sys::HtmlElement>() {
+            let _ = area.style().set_property("scrollbar-gutter", "stable");
+        }
         if let Ok(ro) = web_sys::ResizeObserver::new(on.as_ref().unchecked_ref()) {
             ro.observe(&area);
             on.forget();
