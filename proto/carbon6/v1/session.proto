@@ -135,6 +135,9 @@ message Notice {
   string message = 2;
   // "low", "normal" or "high".
   string priority = 3;
+  // Shown in the transcript only, not sent as a notification (the
+  // worker's own notes, such as Claude Code starting again).
+  bool quiet = 4;
 }
 
 // A tool call a policy holds for your approval, and what became of it.
@@ -651,6 +654,24 @@ message CreateSession {
   // `claude_code_tools` is the choice (an empty one: none); unset (an
   // older head): the defaults.
   bool claude_code_tools_chosen = 34;
+  // The choice as a newer head makes it (it also fills 33 and 34 for older
+  // workers); a newer worker uses this when set.
+  ClaudeCodeToolChoice claude_code = 35;
+}
+
+// carbon6's tools a Claude Code session gets over the MCP bridge
+// (Settings → Agents), and which of them are loaded up front.
+message ClaudeCodeToolChoice {
+  // Every carbon6 tool the session has in carbon6's own loop, without those
+  // Claude Code has its own of (a routing rule's tool list still narrows).
+  bool automatic = 1;
+  // Not automatic: these (names in any profile's naming).
+  repeated string tools = 2;
+  // Loaded into Claude Code's prompt up front (MCP `_meta`
+  // anthropic/alwaysLoad); the rest wait behind its tool search.
+  repeated string core = 3;
+  // `core` is the choice (an empty one: none); unset: the defaults.
+  bool core_chosen = 4;
 }
 
 // What makes a session a subagent: who started it, and as which agent.
@@ -711,6 +732,9 @@ message UserInput {
   string from_session_id = 10;
   string from_title = 11;
   uint32 hops = 12;
+  // Claude Code tools as the head's settings have them now: a session
+  // applies them from this message on, not only those it started with.
+  ClaudeCodeToolChoice claude_code = 13;
 }
 
 message Interrupt {}

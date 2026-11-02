@@ -1,11 +1,14 @@
 //! Which of carbon6's tools a Claude Code session gets over carbon6's MCP
-//! server is a setting (docs/background.md §4): chosen in any profile's
-//! naming, with carbon6's guidance for them in the server's instructions.
+//! server is a setting (docs/background.md §4): automatic unless chosen by
+//! hand (in any profile's naming), some loaded up front, with carbon6's
+//! guidance for them in Claude Code's system prompt. A running session
+//! takes a change up at its next quiet turn: its process starts again,
+//! resuming the conversation, never while a background task runs.
 //! A binary of its own: it sets C6_CLAUDE_BIN.
 
 use std::path::Path;
 
-use c6_api::{SessionDetail, SessionStatus};
+use c6_api::{Event, EventKind};
 use c6_head::HeadConfig;
 use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
@@ -13,20 +16,42 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// A `claude` that records what carbon6's MCP server offers it.
+/// A `claude` that stays up between turns and records each start (its
+/// arguments), its system prompt, and what carbon6's MCP server offers it.
+/// "BGSTART" starts a background task, "BGEND" ends it.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
 [ "$1" = --version ] && exit 0
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> spawns.txt
 url=""
-while [ $# -gt 0 ]; do [ "$1" = "--mcp-config" ] && url=$(printf '%s' "$2" | sed 's/.*"url":"\([^"]*\)".*/\1/'); shift; done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mcp-config) url=$(printf '%s' "$2" | sed 's/.*"url":"\([^"]*\)".*/\1/');;
+    --append-system-prompt) printf '%s' "$2" > system.txt;;
+  esac
+  shift
+done
 post() { curl -s -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' --data "$1" "$url"; }
-read -r line
-echo '{"type":"system","subtype":"init"}'
 post '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}' > init.json
 post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' > tools.json
-echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Looked."}],"stop_reason":"end_turn"},"parent_tool_use_id":null}'
-echo '{"type":"result","subtype":"success","is_error":false,"result":"Looked.","usage":{"input_tokens":1,"output_tokens":1}}'
-while read -r line; do :; done
+uuid_of() { printf '%s' "$1" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p'; }
+echo_of() { printf '{"type":"user","isReplay":true,"uuid":"%s","message":{"role":"user","content":"echo"},"parent_tool_use_id":null}\n' "$(uuid_of "$1")"; }
+say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"},"parent_tool_use_id":null}\n' "$1"; }
+done_ok() { printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'; }
+while read -r line; do
+  case "$line" in *'"control_request"'*) continue;; esac
+  printf '%s\n' '{"type":"system","subtype":"init"}'
+  echo_of "$line"
+  case "$line" in
+    *BGSTART*)
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"bg1","description":"Build","task_type":"local_bash"}'
+      say "Started."; done_ok;;
+    *BGEND*)
+      printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed","summary":"Built"}'
+      say "Finished."; done_ok;;
+    *) say "Reply."; done_ok;;
+  esac
+done
 "#;
     let path = dir.join("claude");
     std::fs::write(&path, script).unwrap();
@@ -36,7 +61,7 @@ while read -r line; do :; done
 }
 
 #[tokio::test]
-async fn claude_code_gets_the_carbon6_tools_you_choose() {
+async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
     if !c6_testkit::have("curl") {
         return;
     }
@@ -75,23 +100,24 @@ async fn claude_code_gets_the_carbon6_tools_you_choose() {
         .await
         .unwrap();
 
-    // The defaults, and what may be chosen.
+    // Automatic by default, with the defaults up front, and what may be chosen.
     let setting: Value = http.get(format!("{api}/settings/claude-code-tools")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(setting["tools"], json!(["Task", "SendMessage", "TaskOutput", "TaskStop", "doc", "MessageSession", "ListSessions"]));
+    assert_eq!(setting["automatic"], true);
+    assert_eq!(setting["core"], json!(["Task", "SendMessage", "doc", "Work", "Remember", "Forget", "TaskPropose", "TaskWithdraw"]));
     let available: Vec<&str> = setting["available"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(available.contains(&"PublishFile") && !available.contains(&"Bash"), "{available:?}");
-    // Not carbon6's to offer: Claude Code has its own.
-    let r = http.put(format!("{api}/settings/claude-code-tools")).json(&json!({"tools": ["doc", "Bash"]})).send().await.unwrap();
-    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert!(r.text().await.unwrap().contains("Bash"));
-    // Chosen in either naming.
-    let r = http
-        .put(format!("{api}/settings/claude-code-tools"))
-        .json(&json!({"tools": ["doc", "publish_file", "remember", "Forget"]}))
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success(), "{}", r.status());
+    // Not carbon6's to offer: Claude Code has its own (also not up front).
+    for bad in [json!({"tools": ["doc", "Bash"]}), json!({"automatic": true, "tools": [], "core": ["Bash"]})] {
+        let r = http.put(format!("{api}/settings/claude-code-tools")).json(&bad).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(r.text().await.unwrap().contains("Bash"));
+    }
+    // Chosen by hand, in either naming, two of them up front.
+    let choose = async |body: Value| {
+        let r = http.put(format!("{api}/settings/claude-code-tools")).json(&body).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
+    };
+    choose(json!({"tools": ["doc", "publish_file", "remember", "Forget"], "core": ["doc", "remember"]})).await;
     // A note for the memory guidance to carry.
     let r = http.post(format!("{api}/memories")).json(&json!({"text": "The build runs on thalassa."})).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.status());
@@ -107,17 +133,79 @@ async fn claude_code_gets_the_carbon6_tools_you_choose() {
         .await
         .unwrap();
     let id = s["id"].as_str().unwrap().to_owned();
-    eventually("the turn to end", async || {
-        let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
-        (d.session.status == SessionStatus::Idle && d.session.end_reason.is_some()).then_some(())
-    })
-    .await;
-    let read = |f: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(project.path().join(f)).unwrap()).unwrap() };
-    let tools = read("tools.json");
-    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["doc", "PublishFile", "Remember", "Forget"], "only those chosen (no connection for subagents here)");
-    let instructions = read("init.json")["result"]["instructions"].as_str().unwrap().to_owned();
-    assert!(instructions.contains("# Memory") && instructions.contains("The build runs on thalassa."), "{instructions}");
+    let events = async || -> Vec<Event> { http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap() };
+    let turns_ended = async |n: usize| {
+        eventually("the turn to end", async || {
+            let evs: Vec<Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+            (evs.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count() >= n).then_some(())
+        })
+        .await
+    };
+    let send = async |text: &str| {
+        let r = http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": text})).send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
+    };
+    let file = |f: &str| std::fs::read_to_string(project.path().join(f)).unwrap();
+    let spawns = || file("spawns.txt").lines().count();
+    let offered = || -> Vec<(String, bool)> {
+        let tools: Value = serde_json::from_str(&file("tools.json")).unwrap();
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap().to_owned(), t["_meta"]["anthropic/alwaysLoad"] == true))
+            .collect()
+    };
+    let restarts = async || {
+        events().await.iter().filter(|e| matches!(&e.kind, EventKind::Notice { title, .. } if title == "Claude Code started again")).count()
+    };
+    turns_ended(1).await;
+
+    let up_front = |names: &[&str]| -> Vec<(String, bool)> {
+        ["doc", "PublishFile", "Remember", "Forget"].iter().map(|n| (n.to_string(), names.contains(n))).collect()
+    };
+    assert_eq!(offered(), up_front(&["doc", "Remember"]), "only those chosen (no connection for subagents here), two up front");
+    let system = file("system.txt");
+    assert!(system.starts_with(c6_agent::CLAUDE_CODE_NOTE), "{system}");
+    assert!(
+        system.contains("# Memory") && system.contains("The build runs on thalassa."),
+        "the guidance is in its system prompt: {system}"
+    );
+    assert_eq!(spawns(), 1, "{}", file("spawns.txt"));
+
+    // Nothing changed: the same process.
+    send("again").await;
+    turns_ended(2).await;
+    assert_eq!(spawns(), 1);
+
+    // A background task runs: a change waits for it.
+    send("BGSTART").await;
+    turns_ended(3).await;
+    choose(json!({"tools": ["doc", "publish_file", "remember", "Forget"], "core": ["doc"]})).await;
+    send("hello").await;
+    turns_ended(4).await;
+    assert_eq!(spawns(), 1, "not while its task runs");
+    send("BGEND").await;
+    turns_ended(5).await;
+    assert_eq!(spawns(), 1);
+
+    // Quiet now: started again with the change, the conversation resumed.
+    send("after").await;
+    turns_ended(6).await;
+    assert_eq!(spawns(), 2);
+    assert!(file("spawns.txt").lines().nth(1).unwrap().contains("--resume"), "the conversation continues");
+    assert_eq!(offered(), up_front(&["doc"]));
+    assert_eq!(restarts().await, 1, "said in the transcript");
+
+    // Automatic: every carbon6 tool the session has.
+    choose(json!({"automatic": true, "tools": []})).await;
+    send("auto").await;
+    turns_ended(7).await;
+    assert_eq!(spawns(), 3);
+    let names: Vec<String> = offered().into_iter().map(|(n, _)| n).collect();
+    assert!(names.len() > 4 && names.contains(&"TaskPropose".to_owned()) && names.contains(&"Work".to_owned()), "{names:?}");
+    assert!(offered().iter().any(|(n, up)| n == "TaskPropose" && *up), "the defaults up front");
+    assert_eq!(restarts().await, 2);
     stop.cancel();
     head.shutdown().await.unwrap();
 }

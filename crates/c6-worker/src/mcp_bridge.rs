@@ -36,9 +36,12 @@ pub(crate) struct Entry {
     /// The session's policies: Claude Code doesn't know them, so its calls
     /// of carbon6's tools are held or denied here, as in carbon6's own loop.
     pub policies: Option<Arc<crate::policy::Policies>>,
-    /// What Claude Code is told about these tools (MCP `instructions`):
-    /// carbon6's guidance for them, which its own loop's prompt carries.
+    /// What Claude Code is told about these tools (MCP `instructions`); its
+    /// system prompt carries carbon6's guidance for them.
     pub instructions: String,
+    /// Those loaded into Claude Code's prompt up front (any profile's
+    /// naming); the rest wait behind its tool search.
+    pub core: Vec<String>,
 }
 
 type Entries = Arc<Mutex<HashMap<String, Arc<Entry>>>>;
@@ -147,7 +150,11 @@ async fn handle(
                 .iter()
                 .map(|t| {
                     let s = t.spec();
-                    json!({"name": s.name, "description": s.description, "inputSchema": s.parameters})
+                    let mut tool = json!({"name": s.name, "description": s.description, "inputSchema": s.parameters});
+                    if entry.core.iter().any(|c| c6_tools::tool_allowed(std::slice::from_ref(c), &s.name)) {
+                        tool["_meta"] = json!({"anthropic/alwaysLoad": true});
+                    }
+                    tool
                 })
                 .collect();
             rpc_result(id, json!({"tools": tools}))
@@ -226,4 +233,43 @@ async fn call_id_for(entry: &Entry, tool: &str, input: &Value) -> String {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     format!("mcp-{}", uuid::Uuid::now_v7())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tools chosen as core are marked to load up front in Claude Code's
+    /// prompt; the others wait behind its tool search.
+    #[tokio::test]
+    async fn core_tools_are_marked_to_load_up_front() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = Bridge::start().await.unwrap();
+        let registration = bridge.register(Entry {
+            session_id: "s".into(),
+            session: Arc::new(SessionTools::new(dir.path().to_owned())),
+            tools: vec![Arc::new(c6_tools::records::Doc::new(false)), Arc::new(c6_tools::Glob)],
+            cancel: Default::default(),
+            journal: Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap()),
+            matched: Default::default(),
+            policies: None,
+            instructions: "carbon6's tools.".into(),
+            core: vec!["doc".into()],
+        });
+        let list: Value = reqwest::Client::new()
+            .post(&registration.url)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let meta = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} in {tools:?}"))["_meta"].clone();
+        assert_eq!(meta("doc"), json!({"anthropic/alwaysLoad": true}));
+        let other = tools.iter().find(|t| t["name"] != "doc").unwrap();
+        assert_eq!(other["_meta"], Value::Null, "not core: found with tool search");
+    }
 }

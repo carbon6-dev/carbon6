@@ -1385,12 +1385,18 @@ async fn put_web_search(State(st): State<Arc<HeadState>>, Json(mut s): Json<api:
 async fn get_claude_code_tools(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::ClaudeCodeTools>> {
     let available =
         c6_worker::session::claude_code_tool_names().into_iter().map(|(name, description)| api::ToolChoice { name, description }).collect();
-    Ok(Json(api::ClaudeCodeTools { tools: crate::sessions::claude_code_tools(&st, None).await?, available }))
+    let mut t = crate::sessions::claude_code_tools(&st, None).await?;
+    t.core.get_or_insert_with(|| c6_worker::session::CLAUDE_CODE_CORE_TOOLS.iter().map(|n| (*n).to_owned()).collect());
+    t.available = available;
+    Ok(Json(t))
 }
 
 async fn put_claude_code_tools(State(st): State<Arc<HeadState>>, Json(t): Json<api::ClaudeCodeTools>) -> ApiResult<StatusCode> {
     let known: Vec<String> = c6_worker::session::claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
-    let unknown: Vec<&String> = t.tools.iter().filter(|n| !known.iter().any(|k| c6_tools::tool_allowed(&[(*n).clone()], k))).collect();
+    let named = if t.automatic { Vec::new() } else { t.tools.clone() };
+    let core = t.core.clone().unwrap_or_default();
+    let unknown: Vec<&String> =
+        named.iter().chain(core.iter()).filter(|n| !known.iter().any(|k| c6_tools::tool_allowed(&[(*n).clone()], k))).collect();
     if !unknown.is_empty() {
         return Err(ApiErr(
             StatusCode::BAD_REQUEST,
@@ -1401,7 +1407,7 @@ async fn put_claude_code_tools(State(st): State<Arc<HeadState>>, Json(t): Json<a
             ),
         ));
     }
-    let v = api::ClaudeCodeTools { tools: t.tools, available: Vec::new() };
+    let v = api::ClaudeCodeTools { automatic: t.automatic, tools: named, core: t.core, available: Vec::new() };
     st.store.set_setting(crate::sessions::CLAUDE_CODE_TOOLS, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }

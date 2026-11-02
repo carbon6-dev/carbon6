@@ -81,6 +81,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::SUGGEST,
     },
     Prompt {
+        name: "session.claude_code",
+        description: "Told to Claude Code sessions about carbon6, at the start of what carbon6 adds to Claude Code's system prompt (its guidance for memory, task cards and the memex follows).",
+        default: c6_agent::CLAUDE_CODE_NOTE,
+    },
+    Prompt {
         name: "session.task_cards",
         description: "When agents propose task cards: work for a separate session, started with one click (docs/task-cards.md).",
         default: text::TASK_CARDS,
@@ -333,7 +338,9 @@ pub async fn for_worker(st: &HeadState, realm: &str) -> String {
     let all = all(st, realm).await;
     let picked: Map<String, Value> = all
         .into_iter()
-        .filter(|(k, _)| k.starts_with("session.subagent") || k.starts_with("session.compact") || k == "session.task_cards")
+        .filter(|(k, _)| {
+            k.starts_with("session.subagent") || k.starts_with("session.compact") || k == "session.task_cards" || k == "session.claude_code"
+        })
         .collect();
     Value::Object(picked).to_string()
 }

@@ -3600,18 +3600,34 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
     let save = move |_| {
         let Some(mut v) = setting.get_untracked() else { return };
         v.available.clear();
+        if v.automatic {
+            v.tools.clear();
+        }
         let v = serde_json::to_value(v).unwrap_or_default();
         spawn_local(async move {
-            status.set(Some(api::put_setting("claude-code-tools", v).await.map(|_| "Saved. New Claude Code sessions will get them.")));
+            status.set(Some(api::put_setting("claude-code-tools", v).await.map(|_| "Saved. Sessions take it up with their next message.")));
         });
     };
-    let toggle = move |name: String, on: bool| {
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b) || a.replace('_', "").eq_ignore_ascii_case(&b.replace('_', ""));
+    // Turns `name` on or off in the offered list (`core`: in those up front).
+    let toggle = move |name: String, on: bool, core: bool| {
+        setting.update(|s| {
+            let Some(s) = s else { return };
+            let list = if core { s.core.get_or_insert_with(Vec::new) } else { &mut s.tools };
+            list.retain(|t| !same(t, &name));
+            if on {
+                list.push(name);
+            }
+        })
+    };
+    let automatic = move |on: bool| {
         setting.update(|s| {
             if let Some(s) = s {
-                s.tools.retain(|t| *t != name);
-                if on {
-                    s.tools.push(name);
+                // Chosen by hand starts from every tool, to take some away.
+                if !on && s.automatic {
+                    s.tools = s.available.iter().map(|t| t.name.clone()).collect();
                 }
+                s.automatic = on;
             }
         })
     };
@@ -3620,21 +3636,41 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
             <div>
                 <h2 class="font-medium">"carbon6 tools in Claude Code sessions"</h2>
                 <p class="text-sm text-zinc-500">
-                    "Claude Code brings its own tools for files, the shell and the web. These are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them comes along. A routing rule's tool list narrows them further. New sessions pick up changes."
+                    "Claude Code brings its own tools for files, the shell and the web. These are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them goes into Claude Code's system prompt. A routing rule's tool list narrows them further. Running sessions take changes up with their next message (Claude Code starts again, resuming its conversation, once it has nothing running)."
                 </p>
             </div>
             {move || setting.get().map(|s| {
-                let chosen = s.tools.clone();
+                let auto = s.automatic;
+                let offered = s.tools.clone();
+                let core = s.core.clone().unwrap_or_default();
                 view! {
+                    <div class="flex flex-wrap gap-4 text-sm">
+                        <label class="flex items-center gap-2">
+                            <input type="radio" name="cc-tools" prop:checked=auto on:change=move |_| automatic(true) />
+                            "Automatic: every carbon6 tool the session has"
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <input type="radio" name="cc-tools" prop:checked=!auto on:change=move |_| automatic(false) />
+                            "Chosen by hand"
+                        </label>
+                    </div>
+                    <p class="text-xs text-zinc-500">"Up front: loaded into Claude Code's prompt from the start. The rest it finds with its tool search when it needs them, which keeps every turn's prompt small."</p>
                     <div class="grid gap-1 sm:grid-cols-2">
                         {s.available.into_iter().map(|t| {
-                            let on = chosen.iter().any(|c| c.eq_ignore_ascii_case(&t.name) || c.replace('_', "").eq_ignore_ascii_case(&t.name));
-                            let name = t.name.clone();
+                            let on = auto || offered.iter().any(|c| same(c, &t.name));
+                            let up = core.iter().any(|c| same(c, &t.name));
+                            let (name, name2) = (t.name.clone(), t.name.clone());
                             view! {
-                                <label class="flex items-start gap-2 text-sm" title=t.description.clone()>
-                                    <input type="checkbox" class="mt-1" prop:checked=on on:change=move |ev| toggle(name.clone(), event_target_checked(&ev)) />
-                                    <span><span class="font-mono text-xs">{t.name.clone()}</span>" "<span class="text-xs text-zinc-500">{t.description.clone()}</span></span>
-                                </label>
+                                <div class="flex items-start gap-2 text-sm" title=t.description.clone()>
+                                    <input type="checkbox" class="mt-1" aria-label=format!("Offer {}", t.name) prop:checked=on prop:disabled=auto
+                                        on:change=move |ev| toggle(name.clone(), event_target_checked(&ev), false) />
+                                    <span class="min-w-0 flex-1"><span class="font-mono text-xs">{t.name.clone()}</span>" "<span class="text-xs text-zinc-500">{t.description.clone()}</span></span>
+                                    <label class="flex shrink-0 items-center gap-1 text-[11px] text-zinc-500">
+                                        <input type="checkbox" prop:checked=up prop:disabled=!on
+                                            on:change=move |ev| toggle(name2.clone(), event_target_checked(&ev), true) />
+                                        "up front"
+                                    </label>
+                                </div>
                             }
                         }).collect_view()}
                     </div>

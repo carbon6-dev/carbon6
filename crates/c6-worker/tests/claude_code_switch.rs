@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
 read -r prompt
-printf '%s\n' "$*" >> claude-calls.log
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> claude-calls.log
 printf '%s\n=====\n' "$prompt" >> claude-prompts.log
 model=default; prev=""
 for a in "$@"; do [ "$prev" = "--model" ] && model="$a"; prev="$a"; done

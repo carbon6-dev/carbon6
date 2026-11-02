@@ -111,7 +111,9 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     assert_eq!(init["result"]["serverInfo"]["name"], "carbon6");
     let tools: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("tools.json")).unwrap()).unwrap();
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc"]);
+    // Automatic: the subagent tools and documents first, then carbon6's
+    // others the session has.
+    assert_eq!(names[..5], ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc"]);
     let task = &tools["result"]["tools"][0]["inputSchema"]["properties"];
     assert_eq!(task["connection"]["enum"], json!(["api"]), "Claude Code is not offered to subagents");
     assert!(task["run_in_background"]["description"].as_str().unwrap().contains("mcp__carbon6__TaskStop"), "{task}");

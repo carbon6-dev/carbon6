@@ -1839,8 +1839,19 @@ impl Default for SubagentLimits {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ClaudeCodeTools {
-    /// Their names (as Claude Code knows them, without `mcp__carbon6__`).
+    /// Every tool the session has in carbon6's own loop, without those
+    /// Claude Code has its own of (the default when nothing is set). A list
+    /// saved before this existed reads as chosen by hand.
+    #[serde(default)]
+    pub automatic: bool,
+    /// Chosen by hand (not automatic): their names (as Claude Code knows
+    /// them, without `mcp__carbon6__`).
     pub tools: Vec<String>,
+    /// Those loaded into Claude Code's prompt up front; the rest wait behind
+    /// its tool search, which keeps its prompt small. None: the defaults
+    /// (subagents, documents, work, memory and task cards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<Vec<String>>,
     /// Every tool that may be chosen, with what it does (ignored when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available: Vec<ToolChoice>,

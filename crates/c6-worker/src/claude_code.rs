@@ -80,13 +80,23 @@ const CLOSE_GRACE: Duration = Duration::from_secs(10);
 
 /// What a process was started with: a turn that needs something else
 /// starts a new one. The model is not here: it is switched in place.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Launch {
     /// The Claude Code conversation it runs.
     pub conversation: String,
     pub effort: Option<String>,
     /// Hooks from the head, as Claude Code settings JSON.
     pub settings: Option<String>,
+    /// carbon6's guidance, added to Claude Code's system prompt
+    /// (`--append-system-prompt`): the same for the life of the process, so
+    /// its prompt stays cached.
+    pub system_prompt: Option<String>,
+    /// carbon6's tools on its MCP bridge, and those loaded up front: a
+    /// process registered with others is not reused for them.
+    pub tools: Vec<String>,
+    /// The worker that started it: a new one starts it again (with what it
+    /// passes now).
+    pub worker: String,
 }
 
 /// Where a session's process takes its input. Shared with the session's
@@ -246,6 +256,9 @@ impl Process {
         }
         if let Some(s) = &launch.settings {
             cmd.args(["--settings", s]);
+        }
+        if let Some(p) = launch.system_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+            cmd.args(["--append-system-prompt", p]);
         }
         if let Some(m) = &mcp {
             // A subagent may work for hours without a word on the bridge:
@@ -1395,7 +1408,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
     }
 
     fn spawn(bin: &Path, cwd: &Path, conversation: &str, resume: bool, observer: Option<Arc<Observer>>) -> Process {
-        let launch = Launch { conversation: conversation.into(), effort: None, settings: None };
+        let launch = Launch { conversation: conversation.into(), ..Default::default() };
         Process::spawn(bin, launch, resume, cwd, "opus", Arc::default(), None, observer).unwrap()
     }
 
@@ -1427,7 +1440,7 @@ case "$*" in *"--input-format stream-json"*) ;; *) echo "missing stream-json inp
 read -r prompt
 pwd > cwd.txt
 printf '%s' "$CLAUDE_CODE_TMPDIR" > output-root.txt
-while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--mcp-config" ] && printf '%s %s %s' "$2" "$MCP_TOOL_TIMEOUT" "$CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT" > mcp.txt; shift; done
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--append-system-prompt" ] && printf '%s' "$2" > system.txt; [ "$1" = "--mcp-config" ] && printf '%s %s %s' "$2" "$MCP_TOOL_TIMEOUT" "$CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT" > mcp.txt; shift; done
 printf '%s' "$prompt" > prompt.txt
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"s","tools":["Bash"],"model":"claude-opus-5-5"}
@@ -1464,7 +1477,7 @@ EOF
         );
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
-        let launch = Launch { conversation: "0199-usage".into(), effort: None, settings: None };
+        let launch = Launch { conversation: "0199-usage".into(), ..Default::default() };
         let mut p = Process::spawn(&bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
         let more = tokio::sync::Notify::new();
         let end =
@@ -1500,7 +1513,13 @@ EOF
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let inputs = vec![input("c1", "list files")];
-        let launch = Launch { conversation: "0199-session".into(), effort: Some("high".into()), settings: Some(r#"{"hooks":{}}"#.into()) };
+        let launch = Launch {
+            conversation: "0199-session".into(),
+            effort: Some("high".into()),
+            settings: Some(r#"{"hooks":{}}"#.into()),
+            system_prompt: Some("carbon6's guidance.".into()),
+            ..Default::default()
+        };
         let bridge = crate::mcp_bridge::Bridge::start().await.unwrap();
         let entry = || crate::mcp_bridge::Entry {
             session_id: "0199-session".into(),
@@ -1511,6 +1530,7 @@ EOF
             matched: Default::default(),
             policies: None,
             instructions: String::new(),
+            core: Vec::new(),
         };
         let more = tokio::sync::Notify::new();
         // A later turn tries --resume first; the fake has no conversation...
@@ -1526,6 +1546,7 @@ EOF
         let end = p.turn(2, inputs, true, Some("CONTEXT"), "opus", &sink, &Vec::new, &more, &CancellationToken::new()).await.unwrap();
         assert_eq!(end.reason, Some(TurnEndReason::Completed));
         assert_eq!(std::fs::read_to_string(dir.path().join("settings.txt")).unwrap(), r#"{"hooks":{}}"#, "the head's hooks are passed on");
+        assert_eq!(std::fs::read_to_string(dir.path().join("system.txt")).unwrap(), "carbon6's guidance.", "in its system prompt");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("mcp.txt")).unwrap(),
             format!("{mcp} 86400000 86400000"),

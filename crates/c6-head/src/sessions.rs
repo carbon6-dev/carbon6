@@ -480,7 +480,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         subagent_templates_json: serde_json::to_string(&crate::templates::for_subagents(st, &row.realm, &row.instance).await)?,
         auto_turns_per_hour: limits.auto_turns_per_hour,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
-        claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?,
+        claude_code: Some(claude_code_choice(st, &row.realm).await?),
+        claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?.tools,
         claude_code_tools_chosen: true,
     })
 }
@@ -736,6 +737,8 @@ pub async fn custom_commands(st: &HeadState, realm: &str) -> anyhow::Result<Vec<
 /// session: commands apply as they are when the message is sent.
 async fn with_command(st: &HeadState, realm: &str, labels: Vec<String>, mut input: UserInput) -> anyhow::Result<UserInput> {
     input.labels = labels;
+    // Claude Code's tools as set now, for sessions started before a change.
+    input.claude_code = Some(claude_code_choice(st, realm).await?);
     // @memex:<label or id>: what the memex knows about it, attached.
     for key in crate::memex::mentions(&input.text) {
         if input.attachments.iter().any(|a| a.name == format!("@memex:{key}")) {
@@ -1319,17 +1322,34 @@ pub async fn sessions_for(st: &HeadState, from: &SessionRow, params: &Value) -> 
 pub const CLAUDE_CODE_TOOLS: &str = "claude_code_tools";
 
 /// The carbon6 tools Claude Code sessions in `realm` get (its own setting,
-/// else root's, else the defaults), or in the realm of the Settings request
-/// (`None`).
-pub async fn claude_code_tools(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<String>> {
+/// else root's, else automatic), or in the realm of the Settings request
+/// (`None`). Automatic lists every tool, for workers that predate it.
+pub async fn claude_code_tools(st: &HeadState, realm: Option<&str>) -> anyhow::Result<api::ClaudeCodeTools> {
     let raw = match realm {
         Some(r) => st.store.setting_for(CLAUDE_CODE_TOOLS, r).await?,
         None => st.store.setting(CLAUDE_CODE_TOOLS).await?,
     };
-    Ok(raw
-        .and_then(|raw| serde_json::from_str::<api::ClaudeCodeTools>(&raw).ok())
-        .map(|t| t.tools)
-        .unwrap_or_else(|| c6_worker::session::CLAUDE_CODE_DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()))
+    let mut t = raw.and_then(|raw| serde_json::from_str::<api::ClaudeCodeTools>(&raw).ok()).unwrap_or(api::ClaudeCodeTools {
+        automatic: true,
+        tools: Vec::new(),
+        core: None,
+        available: Vec::new(),
+    });
+    if t.automatic {
+        t.tools = c6_worker::session::claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
+    }
+    Ok(t)
+}
+
+/// The same, as a session is told it (at its start and with each message).
+pub async fn claude_code_choice(st: &HeadState, realm: &str) -> anyhow::Result<c6_proto::ClaudeCodeToolChoice> {
+    let t = claude_code_tools(st, Some(realm)).await?;
+    Ok(c6_proto::ClaudeCodeToolChoice {
+        automatic: t.automatic,
+        tools: if t.automatic { Vec::new() } else { t.tools },
+        core_chosen: t.core.is_some(),
+        core: t.core.unwrap_or_default(),
+    })
 }
 
 /// The subagent-limits setting.
@@ -1836,6 +1856,7 @@ async fn notify_events(st: &HeadState, session_id: &str, events: &[SessionEvent]
                 call_id: Some(a.call_id.clone()),
                 ..base.clone()
             },
+            Some(Kind::Notice(n)) if n.quiet => continue,
             Some(Kind::Notice(n)) => crate::notify::Note {
                 event: "notice",
                 title: n.title.clone(),

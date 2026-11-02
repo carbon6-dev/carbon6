@@ -90,6 +90,8 @@ pub(crate) struct CommandChoice {
     candidates_json: String,
     /// The session's labels from the head as of the message.
     labels: Vec<String>,
+    /// Claude Code's carbon6 tools as the head's settings have them now.
+    claude_code: Option<c6_proto::ClaudeCodeToolChoice>,
 }
 
 /// A session's labels: the head's (yours, worker:) and the automatic ones
@@ -464,7 +466,8 @@ impl SessionManager {
                     hops: input.hops,
                     ..Default::default()
                 };
-                let choice = CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels };
+                let choice =
+                    CommandChoice { candidates_json: input.command_candidates_json, labels: input.labels, claude_code: input.claude_code };
                 let _ = actor.send(ActorMsg::Input(Box::new(pending), input.model, Box::new(choice)));
                 Ok(())
             }
@@ -1535,6 +1538,12 @@ impl Actor {
                         // Your message: what the agent does from now on is not
                         // a session message's chain.
                         self.session_tools.set_message_hops(0);
+                        // Claude Code's carbon6 tools as they are set now
+                        // (its process is started again with them when they
+                        // changed: `Launch::tools`).
+                        if let Some(c) = choice.claude_code.clone() {
+                            self.spec.claude_code = Some(c);
+                        }
                         // Pick the custom command's variant for this
                         // session, expand the command and attach the files
                         // it mentions, as they are now.
@@ -1759,7 +1768,7 @@ impl Actor {
                         info!(session = %self.writer.session_id, "subagent model set");
                     }
                     Some(ActorMsg::Notice(n)) => {
-                        let notice = c6_proto::Notice { title: n.title, message: n.message, priority: n.priority };
+                        let notice = c6_proto::Notice { title: n.title, message: n.message, priority: n.priority, quiet: false };
                         if let Err(e) = self.writer.append(session_event::Kind::Notice(notice)).await {
                             error!(session = %self.writer.session_id, "recording a notice: {e:#}");
                             return;
@@ -2206,7 +2215,8 @@ impl Actor {
         // default the subagent tools, documents and session messages), of
         // those this session has. A routing rule's tool list narrows them,
         // except the subagent tools and documents, which it never did.
-        let chosen = claude_code_choice(&self.spec);
+        let choice = claude_code_choice(&self.spec);
+        let chosen = |name: &str| choice.as_ref().is_none_or(|c| is_chosen(c, name));
         let narrowed = |name: &str| matches!(name, "doc") || c6_tools::tool_allowed(&self.spec.tools, name);
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
@@ -2215,7 +2225,7 @@ impl Actor {
         tools.extend(claude_code_extras(&self.spec, &labels, c6_tools::browser::find_chrome()));
         tools.retain(|t| {
             let name = t.spec().name;
-            is_chosen(&chosen, &name) && narrowed(&name)
+            chosen(&name) && narrowed(&name)
         });
         let depth = crate::subagent::depth_of(&self.spec);
         let connections = task_connections(&self.spec);
@@ -2235,19 +2245,20 @@ impl Actor {
             Arc::new(c6_tools::BashOutput::carbon6()),
             Arc::new(c6_tools::KillShell::carbon6()),
         ];
-        all.retain(|t| is_chosen(&chosen, &t.spec().name));
+        all.retain(|t| chosen(&t.spec().name));
         all.extend(tools);
         all
     }
 
-    /// What a Claude Code session is told about carbon6's tools it gets
-    /// (the bridge's MCP instructions): carbon6's own guidance for those
-    /// that need it, which carbon6's system prompt carries in its own loop.
-    fn claude_code_instructions(&self, tools: &[Arc<dyn Tool>]) -> String {
+    /// What a Claude Code session is told about carbon6's tools it gets,
+    /// added to its system prompt: the `session.claude_code` prompt, then
+    /// carbon6's own guidance for those that need it (memory, task cards,
+    /// the memex), which carbon6's system prompt carries in its own loop.
+    fn claude_code_system_prompt(&self, tools: &[Arc<dyn Tool>]) -> String {
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
         let labels =
             session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
-        claude_code_guidance(&self.spec, &labels, tools)
+        claude_code_system_prompt(&self.spec, &labels, tools)
     }
 
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
@@ -2306,7 +2317,17 @@ impl Actor {
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
         // carbon6's subagents, offered to Claude Code over MCP.
         let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
-        let bridge_instructions = if claude_code { self.claude_code_instructions(&bridge_tools) } else { String::new() };
+        let bridge_core = claude_code_core(&self.spec);
+        let bridge_prompt = (claude_code && !bridge_tools.is_empty()).then(|| self.claude_code_system_prompt(&bridge_tools));
+        // What the process was started with: other tools, or others up
+        // front, need a new one.
+        let bridge_names: Vec<String> = bridge_tools
+            .iter()
+            .map(|t| {
+                let n = t.spec().name;
+                if bridge_core.iter().any(|c| c6_tools::tool_allowed(std::slice::from_ref(c), &n)) { format!("{n}*") } else { n }
+            })
+            .collect();
         let (manager, journal) = (self.manager.clone(), self.journal.clone());
         // Claude Code's own subagents are mirrored into sessions of their own.
         let observer = Arc::new(crate::claude_code::Observer {
@@ -2369,7 +2390,8 @@ impl Actor {
                             journal: journal.clone(),
                             matched: Mutex::default(),
                             policies: policies.clone(),
-                            instructions: bridge_instructions.clone(),
+                            instructions: CLAUDE_CODE_INTRO.into(),
+                            core: bridge_core.clone(),
                         })
                     })
                 };
@@ -2386,6 +2408,9 @@ impl Actor {
                     conversation: conversation.id.clone(),
                     effort: cfg.effort.clone(),
                     settings: claude_settings,
+                    system_prompt: bridge_prompt,
+                    tools: bridge_names,
+                    worker: c6_core::build().to_owned(),
                 };
                 let process = claude.take();
                 let result = claude_turn(
@@ -2459,10 +2484,15 @@ async fn claude_turn(
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<crate::claude_code::Process>> {
     use crate::claude_code::Process;
-    // Only a process with nothing under way: no tasks, no inputs it has
-    // not taken, no turn it has begun.
+    // Started with other settings (carbon6's tools, guidance, hooks, effort,
+    // worker): closed and started again, resuming its conversation, so a
+    // running session takes them up. Only a process with nothing under way:
+    // no tasks (a restart would end them; the next quiet turn does it), no
+    // inputs it has not taken, no turn it has begun.
+    let mut restarted = false;
     if let Some(p) = process.take_if(|p| p.launch() != &launch && p.idle_until(std::time::Duration::ZERO).is_some()) {
         p.close().await;
+        restarted = true;
     }
     let inputs = inbox.lock().unwrap().drain();
     if process.is_none() && inputs.is_empty() {
@@ -2495,6 +2525,15 @@ async fn claude_turn(
         }
     };
     p.set_turn_cancel(cancel);
+    if restarted && bin.is_some() {
+        sink.append(session_event::Kind::Notice(c6_proto::Notice {
+            title: "Claude Code started again".into(),
+            message: "to apply carbon6's settings as they are now (its tools, guidance or hooks); the conversation continues.".into(),
+            priority: "low".into(),
+            quiet: true,
+        }))
+        .await?;
+    }
     // A new conversation gets the preamble first (also when a resume finds
     // none: the first turn may have failed before Claude Code saved it).
     let preamble = (bin.is_some() && !conversation.resume).then_some(conversation.preamble.as_deref()).flatten();
@@ -2964,13 +3003,28 @@ fn builtin_tools(
 /// documents and session messages.
 pub const CLAUDE_CODE_DEFAULT_TOOLS: &[&str] = &["Task", "SendMessage", "TaskOutput", "TaskStop", "doc", "MessageSession", "ListSessions"];
 
-/// The tools chosen for the session's Claude Code (`CreateSession`'s; from
-/// an older head that sends none: the defaults).
-fn claude_code_choice(spec: &CreateSession) -> Vec<String> {
-    if spec.claude_code_tools_chosen {
-        spec.claude_code_tools.clone()
-    } else {
-        CLAUDE_CODE_DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+/// carbon6's tools loaded into Claude Code's prompt up front unless
+/// Settings → Agents says otherwise; the rest wait behind its tool search:
+/// subagents, documents, the work it serves, memory and task cards.
+pub const CLAUDE_CODE_CORE_TOOLS: &[&str] = &["Task", "SendMessage", "doc", "Work", "Remember", "Forget", "TaskPropose", "TaskWithdraw"];
+
+/// The tools chosen for the session's Claude Code: `None` for every one the
+/// session has (automatic), else those named (from an older head that
+/// sends no choice: the defaults).
+fn claude_code_choice(spec: &CreateSession) -> Option<Vec<String>> {
+    match &spec.claude_code {
+        Some(c) if c.automatic => None,
+        Some(c) => Some(c.tools.clone()),
+        None if spec.claude_code_tools_chosen => Some(spec.claude_code_tools.clone()),
+        None => Some(CLAUDE_CODE_DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()),
+    }
+}
+
+/// Those of them loaded up front (`_meta` anthropic/alwaysLoad).
+fn claude_code_core(spec: &CreateSession) -> Vec<String> {
+    match &spec.claude_code {
+        Some(c) if c.core_chosen => c.core.clone(),
+        _ => CLAUDE_CODE_CORE_TOOLS.iter().map(|t| (*t).to_owned()).collect(),
     }
 }
 
@@ -3016,14 +3070,24 @@ pub fn claude_code_tool_names() -> Vec<(String, String)> {
     out
 }
 
+/// What carbon6's MCP server says about itself (its `instructions`).
+pub const CLAUDE_CODE_INTRO: &str = "carbon6 runs these tools: subagents in its own loop, on any connection and model the session may use; \
+     documents, messages to other sessions and the rest in carbon6, for this session.";
+
+/// What a Claude Code session is told about carbon6 and its tools, added
+/// to its system prompt: the `session.claude_code` prompt, then the
+/// guidance carbon6's loop gives with them.
+fn claude_code_system_prompt(spec: &CreateSession, labels: &[String], tools: &[Arc<dyn Tool>]) -> String {
+    let note = spec_prompt(spec, "session.claude_code", c6_agent::CLAUDE_CODE_NOTE);
+    let guidance = claude_code_guidance(spec, labels, tools);
+    format!("{}\n\n{}", note.trim(), guidance.trim())
+}
+
 /// carbon6's guidance for the tools a Claude Code session gets, which its
 /// own system prompt carries in carbon6's loop: memory (with the notes),
 /// task cards, the memex brief.
 fn claude_code_guidance(spec: &CreateSession, labels: &[String], tools: &[Arc<dyn Tool>]) -> String {
-    let mut out =
-        "carbon6 runs these tools: subagents in its own loop, on any connection and model the session may use; documents, messages to \
-         other sessions and the rest in carbon6, for this session."
-            .to_owned();
+    let mut out = CLAUDE_CODE_INTRO.to_owned();
     if has_tool(tools, "remember") || has_tool(tools, "forget") {
         out.push_str(&memory_section(spec, labels, tools));
     }
@@ -3719,6 +3783,56 @@ mod label_tests {
 #[cfg(test)]
 mod claude_code_tools_tests {
     use super::*;
+
+    /// Automatic gives every tool the session has; a list chosen by hand
+    /// (or by an older head) gives those; the core set defaults to the
+    /// tools agents use most, and every core default is a tool on offer.
+    #[test]
+    fn the_choice_is_automatic_unless_made_by_hand() {
+        let auto = CreateSession {
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(claude_code_choice(&auto), None);
+        let custom = CreateSession {
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { tools: vec!["doc".into()], ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(claude_code_choice(&custom), Some(vec!["doc".into()]));
+        let older = CreateSession { claude_code_tools: vec!["Task".into()], claude_code_tools_chosen: true, ..Default::default() };
+        assert_eq!(claude_code_choice(&older), Some(vec!["Task".into()]));
+        let oldest = CreateSession::default();
+        assert_eq!(claude_code_choice(&oldest).unwrap().len(), CLAUDE_CODE_DEFAULT_TOOLS.len());
+        assert_eq!(claude_code_core(&auto), CLAUDE_CODE_CORE_TOOLS.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        let none_up_front = CreateSession {
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, core_chosen: true, ..Default::default() }),
+            ..Default::default()
+        };
+        assert!(claude_code_core(&none_up_front).is_empty());
+        let names: Vec<String> = claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
+        for c in CLAUDE_CODE_CORE_TOOLS {
+            assert!(names.iter().any(|n| n == c), "{c} is a tool Claude Code can get");
+        }
+    }
+
+    /// What goes into Claude Code's system prompt: the editable note, then
+    /// carbon6's guidance for the tools it got (task cards here).
+    #[test]
+    fn the_system_prompt_carries_the_note_and_the_guidance() {
+        let spec = CreateSession {
+            prompts_json: r#"{"session.task_cards":"Propose useful work.","session.claude_code":"You are in carbon6."}"#.into(),
+            ..Default::default()
+        };
+        let tools: Vec<Arc<dyn Tool>> = claude_code_extras(&spec, &[], None)
+            .into_iter()
+            .filter(|t| matches!(t.spec().name.as_str(), "TaskPropose" | "TaskWithdraw"))
+            .collect();
+        let p = claude_code_system_prompt(&spec, &[], &tools);
+        assert!(p.starts_with("You are in carbon6.\n\n"), "{p}");
+        assert!(p.contains("Propose useful work."), "{p}");
+        let default = claude_code_system_prompt(&CreateSession::default(), &[], &[]);
+        assert!(default.starts_with(c6_agent::CLAUDE_CODE_NOTE));
+    }
 
     /// Claude Code is offered carbon6's own tools, not copies of its own,
     /// with the defaults first.

@@ -32,6 +32,13 @@ Check its changes before relying on them.";
 
 /// What an agent is told after a message from another session
 /// (docs/background.md §6: an editable prompt).
+/// What a Claude Code session is told about carbon6 (`session.claude_code`),
+/// at the start of what carbon6 adds to Claude Code's system prompt.
+pub const CLAUDE_CODE_NOTE: &str = "You are working in a carbon6 session. carbon6 gives you tools of its own over MCP, named \
+`mcp__carbon6__<Name>`: subagents on other models, its documents, the work this session serves, memory, task cards, and, where they \
+are on, its memex, mail, chat, calendar and apps. Some are loaded already; when a task needs one that isn't, find it with tool \
+search. For carbon6's own things (its documents, work, memory, cards), use its tools rather than files.";
+
 pub const SESSION_MESSAGE_NOTE: &str = "This message is from the agent of another session, not from the user. Act on it as part of your work if it is relevant. Reply with the message-session tool (to: its id) only when it asks for something or needs an answer; do not reply just to acknowledge it.";
 
 /// What a subagent is told when you resume it after a turn that did not
