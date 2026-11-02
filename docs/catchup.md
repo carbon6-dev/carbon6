@@ -4,7 +4,7 @@ Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("
 
 ## 1. Switches
 
-- **Per session:** ⋯ → **Catch-up** ("a card when you come back") and **Timeline** ("turns folded, by hour"), between its actions and Archive. Kept on the head (`GET`/`PUT /api/v1/sessions/{id}/view`, a settings key per session, no table of its own), so they follow you across devices.
+- **Per session:** ⋯ → **Catch-up** ("a card when you come back") and **Timeline** ("turns folded, by hour"), between its actions and Archive. Kept on the head (`GET`/`PUT /api/v1/sessions/{id}/view`, a settings key per session, no table of its own), so they follow you across devices. A switch moves once the head has it, so a timeline just switched on reads its turns from a head that knows it's on.
 - **New sessions:** Settings → Suggestions → *New sessions start with* (per realm, like the suggestions switch; off by default). A session started then gets its realm's choice; changing it later leaves existing sessions alone.
 - **Routing:** a rule for `task:catchup` picks the catch-up's model, one for `task:timeline` the timeline's (on a connection the session's realm may use, its realm's rules first, as `task:suggest`); without one, the session's own model. Prompts: `session.catchup`, `session.timeline` (Settings → Prompts).
 
@@ -28,7 +28,7 @@ Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("
 - A **Timeline · All** switch at the top of the transcript. Folded, each hour is a row, "14:00 · 3 turns · 41 steps", closed but for the hour a turn runs in.
 - An open hour lists a line per turn: who started it ("You: …", "From <session>", "Task done: …", "Comments on <doc>"), what it did, and its steps. Clicking it shows the turn's events in full, inline (read from the head when the transcript hasn't loaded them).
 - What a turn did comes from the small model, one call for an hour's turns when the hour is opened, kept in the head's memory; until then, its last reply's first sentence.
-- `GET /api/v1/sessions/{id}/timeline` gives every turn (when it started, who started it, its steps, its reply's first sentence); `?hour=<ms>` the turns of that hour with their lines. Hours are grouped in the page, by the browser's clock. 204 while its timeline is off.
+- `GET /api/v1/sessions/{id}/timeline` gives every turn (when it started, who started it, its steps, its reply's first sentence); `?hour=<ms>` the turns of that hour with their lines. Hours are grouped in the page, by the browser's clock. 204 while its timeline is off (the page says so, and shows an error reading it as one, never as "No turns yet.").
 
 ## 4. Not yet
 

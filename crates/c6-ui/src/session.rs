@@ -1252,24 +1252,29 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
 pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
     let SessionChrome { id, detail, find_open, like_this, as_template, details, col, view_settings, folded, .. } = chrome;
     let session = move || detail.get().and_then(Result::ok).map(|d| d.session);
-    // Its catch-up card and timeline, on or off (kept on the head).
+    // Its catch-up card and timeline, on or off (kept on the head). The
+    // switch moves once the head has it: a timeline shown sooner asks for
+    // its turns before the head knows it's on, and hears it's off.
     let cards = crate::catchup::cards();
     let set_view = move |change: fn(&mut c6_api::SessionViewSettings, bool), on: bool| {
         let Some(mut v) = view_settings.get_untracked() else { return };
         change(&mut v, on);
-        view_settings.set(Some(v.clone()));
-        if !v.catchup
-            && let Some(c) = cards
-        {
-            c.update(|m| {
-                m.remove(&id.get_value());
-            });
-        }
-        if v.timeline {
-            folded.set(true);
-        }
+        let id = id.get_value();
         spawn_local(async move {
-            let _ = api::set_session_view(id.get_value(), v).await;
+            if api::set_session_view(id.clone(), v.clone()).await.is_err() {
+                return;
+            }
+            if !v.catchup
+                && let Some(c) = cards
+            {
+                c.update(|m| {
+                    m.remove(&id);
+                });
+            }
+            if v.timeline {
+                let _ = folded.try_set(true);
+            }
+            let _ = view_settings.try_set(Some(v));
         });
     };
     let flag = move |f: fn(&c6_api::SessionViewSettings) -> bool| Signal::derive(move || view_settings.with(|v| v.as_ref().is_some_and(f)));

@@ -27,6 +27,28 @@ pub struct Hour {
     pub running: bool,
 }
 
+/// What the timeline shows of its turns.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Loaded {
+    Reading,
+    Turns(Vec<TimelineTurn>),
+    /// The head says its timeline is off (a 204).
+    Off,
+    Failed(String),
+}
+
+/// What the timeline shows after `prev`, given the head's answer: a 204
+/// isn't an empty list, and an error is shown as one (unless turns are
+/// shown already: those stay until the next answer).
+pub fn answered(prev: &Loaded, got: Result<Option<Vec<TimelineTurn>>, String>) -> Loaded {
+    match got {
+        Ok(Some(t)) => Loaded::Turns(t),
+        Ok(None) => Loaded::Off,
+        Err(_) if matches!(prev, Loaded::Turns(_)) => prev.clone(),
+        Err(e) => Loaded::Failed(e),
+    }
+}
+
 /// The turns by the hour they started in, oldest first. `offset`: how far
 /// local time is ahead of UTC at a time (ms), so hours are the clock's
 /// (a zone half an hour off UTC too).
@@ -119,13 +141,19 @@ pub fn Timeline(
         marks.track();
         api::timeline(id.get_value(), None)
     });
-    let turns = RwSignal::new(None::<Vec<TimelineTurn>>);
+    let state = RwSignal::new(Loaded::Reading);
     Effect::new(move || {
-        if let Some(Ok(t)) = loaded.get() {
-            turns.set(Some(t.unwrap_or_default()));
+        if let Some(got) = loaded.get() {
+            let next = answered(&state.get_untracked(), got);
+            state.set(next);
         }
     });
-    let all = Memo::new(move |_| turns.with(|t| hours(t.as_deref().unwrap_or_default(), local_offset)));
+    let all = Memo::new(move |_| {
+        state.with(|s| match s {
+            Loaded::Turns(t) => hours(t, local_offset),
+            _ => Vec::new(),
+        })
+    });
     // The lines made so far, by a turn's first event.
     let lines = RwSignal::new(HashMap::<u64, String>::new());
     let open = RwSignal::new(HashSet::<i64>::new());
@@ -167,10 +195,18 @@ pub fn Timeline(
     let shown_turns = RwSignal::new(HashSet::<u64>::new());
     view! {
         <div class="space-y-1">
-            {move || match turns.get() {
-                None => view! { <p class="text-sm text-muted">"Reading its turns…"</p> }.into_any(),
-                Some(t) if t.is_empty() => view! { <p class="text-sm text-muted">"No turns yet."</p> }.into_any(),
-                Some(_) => ().into_any(),
+            {move || match state.get() {
+                Loaded::Reading => view! { <p class="text-sm text-muted">"Reading its turns…"</p> }.into_any(),
+                Loaded::Turns(t) if t.is_empty() => view! { <p class="text-sm text-muted">"No turns yet."</p> }.into_any(),
+                Loaded::Turns(_) => ().into_any(),
+                Loaded::Off => view! { <p class="text-sm text-muted">"Its timeline is off (switched off elsewhere?)."</p> }.into_any(),
+                Loaded::Failed(e) => view! {
+                    <p class="text-sm text-red-600">
+                        {format!("Couldn't read its turns: {e} ")}
+                        <button class="underline" on:click=move |_| loaded.refetch()>"Try again"</button>
+                    </p>
+                }
+                .into_any(),
             }}
             <For each=move || all.get() key=|h| (h.start, h.turns.len(), h.steps, h.running) let:h>
                 {
@@ -300,6 +336,20 @@ mod tests {
         let got = hours(&[turn(1, h(9) + 35 * 60_000, 1, 9)], |_| 30 * 60_000);
         assert_eq!(got[0].start, h(9) + 30 * 60_000);
         assert!(hours(&[], |_| 0).is_empty());
+    }
+
+    #[test]
+    fn an_answer_that_isn_t_turns_isn_t_shown_as_none() {
+        let turns = Loaded::Turns(vec![turn(1, 0, 3, 19)]);
+        assert_eq!(answered(&Loaded::Reading, Ok(Some(vec![]))), Loaded::Turns(vec![]));
+        // A 204: its timeline is off on the head, not empty.
+        assert_eq!(answered(&Loaded::Reading, Ok(None)), Loaded::Off);
+        assert_eq!(answered(&turns, Ok(None)), Loaded::Off);
+        // An error is shown, unless turns are shown already.
+        assert_eq!(answered(&Loaded::Reading, Err("500: boom".into())), Loaded::Failed("500: boom".into()));
+        assert_eq!(answered(&Loaded::Off, Err("500: boom".into())), Loaded::Failed("500: boom".into()));
+        assert_eq!(answered(&turns, Err("500: boom".into())), turns);
+        assert_eq!(answered(&Loaded::Failed("x".into()), Ok(Some(vec![turn(2, 0, 1, 9)]))), Loaded::Turns(vec![turn(2, 0, 1, 9)]));
     }
 
     #[test]

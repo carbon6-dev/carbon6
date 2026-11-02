@@ -213,6 +213,140 @@ async fn catching_up_on_a_session_and_its_timeline() {
         assert_eq!(send(M::GET, path.clone(), Some(lab.clone()), json!(null)).await.status(), StatusCode::NOT_FOUND, "{path} as lab");
     }
 
+    // 10. A long Claude Code session (thousands of events), its timeline
+    // switched off (the realm's default turned it on) and on again: every
+    // turn, however it started (your message, a task's
+    // notification, another session's, or the CLI by itself), the last one
+    // still running.
+    let mut long = head.state.store.session(&a).await.unwrap().unwrap();
+    let cc_worker = c6_core::WorkerId(uuid::Uuid::now_v7());
+    (long.id, long.worker_id) = ("long-claude-code".into(), cc_worker.to_string());
+    head.state.store.create_session(&long, &[], false).await.unwrap();
+    let events = claude_code_log(267);
+    assert!(events.len() > 7_000, "{}", events.len());
+    for batch in events.chunks(500) {
+        head.state.store.ingest(cc_worker, &long.id, batch).await.unwrap().unwrap();
+    }
+    ok(send(M::PUT, format!("sessions/{}/view", long.id), None, json!({"catchup": false, "timeline": false})).await).await;
+    assert_eq!(send(M::GET, format!("sessions/{}/timeline", long.id), None, json!(null)).await.status(), StatusCode::NO_CONTENT);
+    ok(send(M::PUT, format!("sessions/{}/view", long.id), None, json!({"catchup": false, "timeline": true})).await).await;
+    let turns = get(format!("sessions/{}/timeline", long.id)).await;
+    let turns = turns.as_array().unwrap();
+    assert_eq!(turns.len(), 267, "every turn");
+    assert_eq!(turns.iter().map(|t| t["turn"].as_u64().unwrap()).collect::<Vec<_>>(), (1..=267).collect::<Vec<_>>());
+    let by = |b: &str| turns.iter().filter(|t| t["by"] == b).count();
+    assert_eq!((by("you"), by("task"), by("session"), by("")), (134, 45, 44, 44), "who started them");
+    assert!(turns.iter().all(|t| t["steps"].as_u64() == Some(13)), "{:?}", turns[0]);
+    assert_eq!(turns[0]["words"], "turn 1, please");
+    assert_eq!(turns[0]["reply"], "Done with turn 1.");
+    assert!(turns[..266].iter().all(|t| t["end_seq"].as_u64() > Some(0)), "ended");
+    assert_eq!(turns[266]["end_seq"], 0, "the last one runs");
+
     stop.cancel();
     head.shutdown().await.unwrap();
+}
+
+/// A Claude Code session's log as its worker journals it, `turns` turns
+/// long (the last still running), each of 13 steps: six calls of two
+/// commands, then the reply. Its turns start, in turn, on your message, a
+/// background task's notification, your message, another session's
+/// message, your message, and on nothing said (the CLI by itself); each
+/// after a checkpoint.
+fn claude_code_log(turns: u64) -> Vec<c6_proto::SessionEvent> {
+    use c6_proto::{
+        AssistantMessage, BackgroundTask, Checkpoint, ContentBlock, InputDelivered, ModelSpec, NoticeQueued, SessionEvent, SessionStarted,
+        ToolResult, ToolUse, TurnEndReason, TurnEnded, TurnStarted, Usage, UserMessage, content_block::Block, session_event::Kind,
+    };
+    let mut out = Vec::new();
+    let mut push = |kind: Kind| {
+        let seq = out.len() as u64 + 1;
+        out.push(SessionEvent { seq, ts_ms: 1_793_412_506_000 + seq as i64 * 10_000, kind: Some(kind) });
+    };
+    let model = ModelSpec { connection_id: "cc".into(), model: "opus".into(), connection_kind: "claude_code".into(), ..Default::default() };
+    push(Kind::Started(SessionStarted {
+        command_id: "c0".into(),
+        model: Some(model),
+        tool_profile: "claude_code".into(),
+        ..Default::default()
+    }));
+    let usage = || {
+        Kind::Usage(Usage {
+            model: "claude-opus".into(),
+            input_tokens: 4,
+            output_tokens: 7,
+            context_window: 1_000_000,
+            ..Default::default()
+        })
+    };
+    for turn in 1..=turns {
+        let id = format!("c{turn}");
+        let user = |text: String| UserMessage { command_id: id.clone(), text, ..Default::default() };
+        let checkpoint = Kind::Checkpoint(Checkpoint { commit: format!("{turn:040x}"), ..Default::default() });
+        match turn % 6 {
+            2 => {
+                let task = BackgroundTask {
+                    task_id: format!("t{turn}"),
+                    kind: "claude_code".into(),
+                    description: "npm test".into(),
+                    state: "finished".into(),
+                    ..Default::default()
+                };
+                push(Kind::BackgroundTask(task));
+                push(checkpoint);
+                let text = format!("<task-notification>\n<task-id>t{turn}</task-id>\nTask: npm test\n</task-notification>");
+                push(Kind::User(UserMessage { command: "task-notification".into(), ..user(text) }));
+            }
+            4 => {
+                let (from, title) = ("01a195b3".to_owned(), "Release prep".to_owned());
+                push(Kind::NoticeQueued(NoticeQueued {
+                    command_id: id.clone(),
+                    text: "Is it in?".into(),
+                    from_session_id: from.clone(),
+                    from_title: title.clone(),
+                    ..Default::default()
+                }));
+                push(checkpoint);
+                push(Kind::User(UserMessage {
+                    command: "session-message".into(),
+                    from_session_id: from,
+                    from_title: title,
+                    ..user("Is it in?".into())
+                }));
+            }
+            0 => push(checkpoint),
+            _ => {
+                push(checkpoint);
+                push(Kind::User(user(format!("turn {turn}, please"))));
+            }
+        }
+        push(Kind::TurnStarted(TurnStarted { turn, context_window: 1_000_000 }));
+        for call in 0..6 {
+            let calls: Vec<String> = (0..2).map(|i| format!("toolu_{turn}_{call}_{i}")).collect();
+            let blocks = calls
+                .iter()
+                .map(|c| ContentBlock {
+                    block: Some(Block::ToolUse(ToolUse {
+                        id: c.clone(),
+                        name: "Bash".into(),
+                        input_json: r#"{"command":"git status"}"#.into(),
+                    })),
+                })
+                .collect();
+            push(Kind::Assistant(AssistantMessage { turn, blocks, ..Default::default() }));
+            push(usage());
+            for c in calls {
+                push(Kind::ToolResult(ToolResult { call_id: c, tool: "Bash".into(), output: "clean".into(), ..Default::default() }));
+            }
+            if call == 2 {
+                push(Kind::InputDelivered(InputDelivered { command_id: id.clone() }));
+            }
+        }
+        let reply = ContentBlock { block: Some(Block::Text(format!("Done with turn {turn}. Nothing else to do."))) };
+        push(Kind::Assistant(AssistantMessage { turn, blocks: vec![reply], ..Default::default() }));
+        push(usage());
+        if turn < turns {
+            push(Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Completed as i32 }));
+        }
+    }
+    out
 }
