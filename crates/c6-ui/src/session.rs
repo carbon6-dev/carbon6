@@ -467,6 +467,17 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     // came for a particular place (from search).
     let scroller = NodeRef::<leptos::html::Div>::new();
     let stick = RwSignal::new(target.anchor.is_none());
+    // Scrolled more than a screen above the end, and how many events there
+    // were when you left the end (to count what came since).
+    let far = RwSignal::new(false);
+    let left_at = RwSignal::new(0usize);
+    Effect::new(move |was: Option<bool>| {
+        let now = stick.get();
+        if was == Some(true) && !now {
+            left_at.set(events.with_untracked(Vec::len));
+        }
+        now
+    });
     let force_open = ForceOpen(RwSignal::new(target.open.clone()));
     provide_context(force_open);
     provide_context(Reach(RwSignal::new(HashMap::new())));
@@ -633,7 +644,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         // Only up and down: what's wider (code, a table) scrolls within itself.
-        <ScrollBox node_ref=scroller follow=stick class="overflow-x-hidden">
+        <ScrollBox node_ref=scroller follow=stick class="overflow-x-hidden" on_scroll=Callback::new(move |()| {
+            if let Some(el) = scroller.get_untracked() {
+                far.set(el.scroll_height() - el.scroll_top() - el.client_height() > el.client_height());
+            }
+        })>
         <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
@@ -682,6 +697,29 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             </div>
 
         </div>
+        // Scrolled up a screen or more: back to the end in one click, with
+        // what came in meanwhile counted. It stays at the box's lower edge.
+        {move || (far.get() && tab.get() == "transcript").then(|| {
+            let fresh = events.with(|evs| evs.len()).saturating_sub(left_at.get());
+            view! {
+                <div class="pointer-events-none sticky bottom-3 flex justify-end px-4">
+                    <button class="pointer-events-auto rounded-full border border-zinc-300 bg-white/95 px-3 py-1 text-xs font-medium shadow-md hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900/95 dark:hover:bg-zinc-800"
+                        title="To the latest (End)"
+                        on:click=move |_| {
+                            if feed.to.get_untracked().is_some() {
+                                feed.latest();
+                            }
+                            stick.set(true);
+                            far.set(false);
+                            if let Some(el) = scroller.get_untracked() {
+                                el.set_scroll_top(el.scroll_height());
+                            }
+                        }>
+                        {if fresh > 0 { format!("↓ {fresh} new") } else { "↓ Latest".to_owned() }}
+                    </button>
+                </div>
+            }
+        })}
         </ScrollBox>
             <Show when=move || tab.get() == "transcript">
             {move || {
@@ -2872,6 +2910,7 @@ fn tool_kind(name: &str) -> &str {
         "Skill" => "load_skill",
         "doc" | "Doc" | "mcp__carbon6__doc" => "doc",
         "c6_ask" | "mcp__carbon6__ask" => "ask",
+        "app_call" | "AppCall" | "mcp__carbon6__app_call" | "mcp__carbon6__AppCall" => "app_call",
         other => other,
     }
 }
@@ -2929,6 +2968,22 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             let what = s("action");
             let title = s("title");
             if title.is_empty() { format!("{what} {}", s("id")) } else { format!("{what} \"{title}\"") }
+        }
+        // Which operation, with the first of its input; none: a listing.
+        "app_call" => {
+            let (instance, op) = (s("instance"), s("operation"));
+            if op.is_empty() {
+                return "list the app operations it can call".into();
+            }
+            let args: Vec<String> = input
+                .get("input")
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter().take(2).map(|(k, v)| format!("{k}: {}", v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect()
+                })
+                .unwrap_or_default();
+            let target = if instance.is_empty() { op } else { format!("{instance}.{op}") };
+            if args.is_empty() { format!("run {target}") } else { format!("run {target} ({})", args.join(", ")) }
         }
         // Its title, else its first question.
         "ask" => {
@@ -4043,10 +4098,12 @@ fn ApprovalCard(
     let waiting =
         move || open.get() && live.sessions.with(|ss| ss.iter().find(|s| s.id == sid.get_value()).is_none_or(|s| s.awaiting_approval));
     // A shell command reads best as itself.
-    let shown = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
-        .and_then(|v| v["command"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| input.clone());
+    let parsed = serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::Null);
+    let shown = parsed["command"].as_str().map(str::to_owned).unwrap_or_else(|| input.clone());
+    // What it would do, in words, where the tool is one we can say it for.
+    let (label, server) = tool_label(&tool);
+    let raw = parsed.to_string();
+    let what = Some(summarize(&tool, &parsed)).filter(|w| !w.is_empty() && *w != raw && *w != shown);
     let answer = move |allow: bool| {
         spawn_local(async move {
             sent.set(Some(api::decide(sid.get_value(), call.get_value(), allow).await.map(|_| allow)));
@@ -4060,7 +4117,11 @@ fn ApprovalCard(
                 <span class="text-xs text-zinc-500">{format!("policy “{policy}”")}</span>
             </div>
             {(!message.is_empty()).then(|| view! { <p class="text-xs text-zinc-600 dark:text-zinc-400">{message.clone()}</p> })}
-            <div class="text-xs text-zinc-500">{tool}</div>
+            <div class="text-sm" title=tool.clone()>
+                <span class="font-medium">{label}</span>
+                {what.map(|w| format!(": {w}"))}
+                {server.map(|s| view! { <span class="text-xs text-zinc-500">{format!(" · {s}")}</span> })}
+            </div>
             <pre class="max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{shown}</pre>
             {move || match sent.get() {
                 Some(Ok(true)) => view! { <p class="text-xs text-emerald-700">"Approved."</p> }.into_any(),
@@ -4220,6 +4281,13 @@ mod tests {
 
     fn file(name: &str, mb: usize) -> c6_api::AttachmentUpload {
         c6_api::AttachmentUpload { name: name.into(), mime: "image/png".into(), data: "A".repeat(mb * 1024 * 1024 / 3 * 4) }
+    }
+
+    #[test]
+    fn an_app_call_reads_as_what_it_does() {
+        assert_eq!(summarize("app_call", &serde_json::json!({})), "list the app operations it can call");
+        let add = serde_json::json!({"instance": "crm", "operation": "add", "input": {"name": "Barbara"}});
+        assert_eq!(summarize("mcp__carbon6__AppCall", &add), "run crm.add (name: Barbara)");
     }
 
     #[test]
