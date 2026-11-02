@@ -11,6 +11,149 @@ use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
 
 #[tokio::test]
+async fn assistant_restart_closes_abandoned_turns_without_replaying_tools() {
+    use c6_proto::{Approval, Question, SessionEvent, SessionEventBatch, ToolResult, TurnEndReason, TurnStarted, session_event::Kind};
+    let mock = MockLlm::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let start = || {
+        c6_head::start(HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+    };
+    let head = start().await.unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    http.post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    http.put(format!("{api}/settings/assistant"))
+        .json(&json!({"model": {"connection": "m", "model": "mock-1"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    mock.push(Reply::Text("ready".into()));
+    let s: Session = http.post(format!("{api}/assistant")).json(&json!({"prompt": "start"})).send().await.unwrap().json().await.unwrap();
+    let events = eventually("initial assistant turn", async || {
+        let events = head.state.store.events_after(&s.id, 0, i64::MAX).await.unwrap();
+        events.iter().any(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).then_some(events)
+    })
+    .await;
+    let mut idle = head.state.store.session(&s.id).await.unwrap().unwrap();
+    idle.id = "idle-assistant".into();
+    head.state.store.create_session(&idle, &[], false).await.unwrap();
+    let mut waiting = idle.clone();
+    waiting.id = "waiting-assistant".into();
+    head.state.store.create_session(&waiting, &[], false).await.unwrap();
+    let wait_events: Vec<_> = [
+        Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() }),
+        Kind::Approval(Approval { call_id: "approve".into(), state: "requested".into(), tool: "c6_call".into(), ..Default::default() }),
+        Kind::Question(Question {
+            call_id: "question".into(),
+            title: "Which?".into(),
+            state: "asked".into(),
+            fields_json: "[]".into(),
+            ..Default::default()
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, ts_ms: c6_core::now_ms(), kind: Some(kind) })
+    .collect();
+    c6_head::sessions::ingest(
+        &head.state,
+        head.state.assistant.head_id().unwrap(),
+        SessionEventBatch { session_id: waiting.id.clone(), events: wait_events.clone() },
+    )
+    .await
+    .unwrap();
+    let caller = c6_head::realms::Caller::root();
+    assert_eq!(c6_head::decisions::open_count(&head.state, &caller).await.unwrap(), 2);
+    let external_id = c6_core::WorkerId(uuid::Uuid::now_v7());
+    let mut external = idle.clone();
+    external.id = "external-worker-session".into();
+    external.worker_id = external_id.to_string();
+    head.state.store.create_session(&external, &[], false).await.unwrap();
+    head.state
+        .store
+        .ingest(
+            external_id,
+            &external.id,
+            &[SessionEvent {
+                seq: 1,
+                ts_ms: c6_core::now_ms(),
+                kind: Some(Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })),
+            }],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    // Persist exactly the state a killed process leaves: an open turn
+    // ending at a successful tool result, with no task in the new process.
+    let seq = events.last().unwrap().seq;
+    let abandoned = vec![
+        SessionEvent {
+            seq: seq + 1,
+            ts_ms: c6_core::now_ms(),
+            kind: Some(Kind::TurnStarted(TurnStarted { turn: 2, ..Default::default() })),
+        },
+        SessionEvent {
+            seq: seq + 2,
+            ts_ms: c6_core::now_ms(),
+            kind: Some(Kind::ToolResult(ToolResult {
+                call_id: "already-done".into(),
+                tool: "c6_discover".into(),
+                output: "success".into(),
+                ..Default::default()
+            })),
+        },
+    ];
+    head.state.store.ingest(head.state.assistant.head_id().unwrap(), &s.id, &abandoned).await.unwrap().unwrap();
+    assert_eq!(head.state.store.session(&s.id).await.unwrap().unwrap().status, "running");
+    head.shutdown().await.unwrap();
+
+    for _ in 0..2 {
+        let head = start().await.unwrap();
+        let row = head.state.store.session(&s.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "idle", "a dead assistant task is not still running");
+        assert_eq!(row.end_reason, "worker_restarted");
+        let recovered = head.state.store.events_after(&s.id, 0, i64::MAX).await.unwrap();
+        assert_eq!(&recovered[events.len()..events.len() + 2], abandoned.as_slice(), "preserve the original evidence");
+        assert_eq!(recovered.len(), events.len() + 3, "one recovery event, including across another restart");
+        assert!(
+            matches!(&recovered.last().unwrap().kind, Some(Kind::TurnEnded(t)) if t.turn == 2 && t.reason == TurnEndReason::WorkerRestarted as i32)
+        );
+        assert_eq!(mock.requests().len(), 1, "do not continue the model or replay tools automatically");
+        assert_eq!(head.state.store.session(&idle.id).await.unwrap().unwrap().status, "idle");
+        assert!(head.state.store.events_after(&idle.id, 0, i64::MAX).await.unwrap().is_empty());
+        assert_eq!(
+            head.state.store.session(&external.id).await.unwrap().unwrap().status,
+            "running",
+            "external workers survive head restarts"
+        );
+        assert_eq!(head.state.store.events_after(&external.id, 0, i64::MAX).await.unwrap().len(), 1);
+        let row = head.state.store.session(&waiting.id).await.unwrap().unwrap();
+        assert_eq!((row.status.as_str(), row.end_reason.as_str(), row.awaiting), ("idle", "worker_restarted", 0));
+        let settled = head.state.store.events_after(&waiting.id, 0, i64::MAX).await.unwrap();
+        assert_eq!(settled.len(), wait_events.len() + 3, "settle both waiters and the turn exactly once");
+        assert!(settled.iter().any(|e| matches!(&e.kind, Some(Kind::Approval(a)) if a.call_id == "approve" && a.state == "expired")));
+        assert!(settled.iter().any(|e| matches!(&e.kind, Some(Kind::Question(q)) if q.call_id == "question" && q.state == "cancelled")));
+        assert_eq!(c6_head::decisions::open_count(&head.state, &caller).await.unwrap(), 0, "no orphan decision cards");
+        head.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn assistant_reload_restores_usage_since_compaction() {
     for reported in [true, false] {
         let mock = MockLlm::start().await;

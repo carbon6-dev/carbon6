@@ -73,6 +73,7 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
 - **Secrets:** see `c6_call`. API tokens, enrollment tokens and login links reach you only. The transcript keeps a redacted copy.
 - **Scope:** by default the assistant's memex scope is the default one, so no mail, chat, calendars or photos. It holds for everything the assistant reads of the memex: its memex tools and the operations it calls (mail, chat, calendar and contacts operations, searches, commitments, the summaries the memex writes for it), however they reach the memex; an operation's own `scope` can only narrow it. A scope rule can widen it; its labels are `assistant`. Mail can't instruct it unless you let mail in. Even then, destructive operations still ask first.
 - **Identity:** it acts as you, with your permissions, and every call is logged as a tool call in its session.
+- **Head restarts:** an assistant turn cannot survive its head process. On startup, an open turn belonging to the head is closed with `worker_restarted`, preserving the events and tool results already recorded. Its pending approvals expire and its questions are cancelled, settling their decision cards too. It is not resumed or retried automatically; sessions on external workers are left alone.
 
 ## 7. Build order
 

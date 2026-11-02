@@ -69,6 +69,9 @@ pub async fn start(st: Arc<HeadState>, router: axum::Router) -> anyhow::Result<(
     let _ = st.assistant.router.set(router);
     let id = head_worker(&st).await?;
     let _ = st.assistant.head_id.set(id);
+    if let Err(e) = recover(&st, id).await {
+        warn!("recovering assistant turns after head restart: {e:#}");
+    }
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel::<Result<HeadMsg, tonic::Status>>(256);
         let guard = st.registry.attach(id, now_ms(), tx, vec!["assistant".into()], "head");
@@ -112,6 +115,59 @@ pub async fn start(st: Arc<HeadState>, router: axum::Router) -> anyhow::Result<(
             }
         }
     });
+    Ok(())
+}
+
+/// Unlike a worker, the head has no session journal or surviving actor to
+/// finish a turn after restart. Close its abandoned turns before commands
+/// can start new actors. Never replay their model requests or tools.
+async fn recover(st: &Arc<HeadState>, head_id: WorkerId) -> anyhow::Result<()> {
+    let sessions: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id, last_seq FROM sessions WHERE worker_id = ? AND status = 'running' ORDER BY id")
+            .bind(head_id.to_string())
+            .fetch_all(&st.store.pool)
+            .await?;
+    for (session_id, last_seq) in sessions {
+        let result = async {
+            let events = st.store.events_after(&session_id, 0, i64::MAX).await?;
+            let turn = events.iter().rev().find_map(|e| match &e.kind {
+                Some(session_event::Kind::TurnStarted(t)) => Some(t.turn),
+                _ => None,
+            });
+            let Some(turn) = turn else {
+                warn!(session = %session_id, "running assistant has no turn_started event; cannot recover");
+                return anyhow::Ok(());
+            };
+            warn!(session = %session_id, turn, "closing assistant turn interrupted by head restart");
+            let sink = Sink { st: st.clone(), session_id: session_id.clone(), head_id, seq: tokio::sync::Mutex::new(last_seq as u64) };
+            let mut seen = std::collections::HashSet::new();
+            for event in events.iter().rev() {
+                let settled = match &event.kind {
+                    Some(session_event::Kind::TurnStarted(_)) => break,
+                    Some(session_event::Kind::Approval(a)) if seen.insert(("approval", a.call_id.clone())) && a.state == "requested" => {
+                        let mut a = a.clone();
+                        a.state = "expired".into();
+                        Some(session_event::Kind::Approval(a))
+                    }
+                    Some(session_event::Kind::Question(q)) if seen.insert(("question", q.call_id.clone())) && q.state == "asked" => {
+                        let mut q = q.clone();
+                        q.state = "cancelled".into();
+                        Some(session_event::Kind::Question(q))
+                    }
+                    _ => None,
+                };
+                if let Some(event) = settled {
+                    sink.append(event).await?;
+                }
+            }
+            sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::WorkerRestarted as i32 })).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            warn!(session = %session_id, "recovering assistant turn after head restart: {e:#}");
+        }
+    }
     Ok(())
 }
 
@@ -1566,5 +1622,65 @@ mod mention_tests {
                     [@mail](c6:item:42), [@odd](c6:nonsense:1) and [@bad](c6:doc: spaced)";
         assert_eq!(mention_refs(text), ["doc:d1", "project:p1", "item:42"]);
         assert!(mention_refs("plain words").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_corrupt_assistant_does_not_block_startup_or_other_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = || {
+            crate::start(crate::HeadConfig {
+                data_dir: dir.path().to_owned(),
+                bind: vec!["127.0.0.1".parse().unwrap()],
+                ui_port: 0,
+                worker_port: 0,
+                auth: false,
+                ..Default::default()
+            })
+        };
+        let head = start().await.unwrap();
+        let id = head.state.assistant.head_id().unwrap();
+        for (session, data) in [
+            ("a-corrupt", vec![0]), // Not a valid protobuf event.
+            ("b-no-start", SessionEvent { seq: 1, ts_ms: now_ms(), kind: None }.encode_to_vec()),
+            (
+                "c-valid",
+                SessionEvent {
+                    seq: 1,
+                    ts_ms: now_ms(),
+                    kind: Some(session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })),
+                }
+                .encode_to_vec(),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, last_seq) \
+                         VALUES (?, ?, 'test', '', '', '', 'running', 0, 0, 1)",
+            )
+            .bind(session)
+            .bind(id.to_string())
+            .execute(&head.state.store.pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, 1, 0, ?)")
+                .bind(session)
+                .bind(data)
+                .execute(&head.state.store.pool)
+                .await
+                .unwrap();
+        }
+        head.shutdown().await.unwrap();
+
+        let head = start().await.expect("corrupt session recovery must not fail head startup");
+        assert_eq!(head.state.store.session("a-corrupt").await.unwrap().unwrap().status, "running", "leave unreadable evidence alone");
+        assert_eq!(head.state.store.session("b-no-start").await.unwrap().unwrap().status, "running");
+        let recovered = head.state.store.session("c-valid").await.unwrap().unwrap();
+        assert_eq!((recovered.status.as_str(), recovered.end_reason.as_str()), ("idle", "worker_restarted"));
+        assert_eq!(head.state.store.events_after("c-valid", 0, i64::MAX).await.unwrap().len(), 2);
+        head.shutdown().await.unwrap();
     }
 }

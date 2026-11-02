@@ -352,6 +352,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     work::spawn_sweeper(state.clone());
     // ChatGPT plans' usage windows (Claude Code's come with its turns).
     quotas::spawn(state.clone());
+    // Close abandoned assistant waits before rebuilding their decisions,
+    // otherwise reconciliation could reopen a card recovery just settled.
+    assistant::start(state.clone(), api::router(state.clone())).await?;
     {
         let st = state.clone();
         tokio::spawn(async move {
@@ -360,7 +363,6 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
             }
         });
     }
-    assistant::start(state.clone(), api::router(state.clone())).await?;
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();
