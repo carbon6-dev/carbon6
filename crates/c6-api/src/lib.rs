@@ -4700,7 +4700,8 @@ pub struct Attention {
     /// them), newest first; not task cards.
     pub waiting: Vec<AttentionItem>,
     /// Turns that ended or failed since you last saw them, agents' answers
-    /// to your comments, people waiting on you in the Brief; newest first.
+    /// to your comments you haven't seen (one per document), people waiting
+    /// on you in the Brief since you last saw it; newest first.
     pub worth: Vec<AttentionItem>,
     /// Other realms with something waiting: a count each, nothing more.
     pub elsewhere: Vec<AttentionElsewhere>,
@@ -4710,15 +4711,16 @@ pub struct Attention {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttentionItem {
-    /// Stable: `decision:<id>`, `session:<id>`, `thread:<doc>:<thread>` or
-    /// `brief`.
+    /// Stable: `decision:<id>`, `session:<id>`, `doc:<doc>` (a document's
+    /// answers) or `brief`.
     pub key: String,
     /// Waiting: `approval`, `question` or `decision`. Worth a look:
     /// `turn_ended`, `failed`, `comment_answer` or `brief`.
     pub kind: String,
     pub title: String,
-    /// Where it is: the session's title for an approval or a turn, the
-    /// document's for a comment answer.
+    /// Where it is: the session's title for an approval or a turn. For a
+    /// document's answers (`title`: the document's), how many ("3 answers"),
+    /// or the one thread's subject.
     #[serde(default)]
     pub detail: String,
     pub at: UnixMs,
@@ -4730,11 +4732,13 @@ pub struct AttentionItem {
     pub decision_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_id: Option<String>,
+    /// A document's answers: the thread, when there's just one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
-    /// How many (the Brief's row: people waiting on you).
+    /// How many (the Brief's row: people waiting on you; a document's:
+    /// threads with an answer you haven't seen).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
 }
@@ -4749,7 +4753,8 @@ pub struct AttentionElsewhere {
 }
 
 /// `POST /api/v1/attention/seen`: the worth-a-look items you've seen (by
-/// key); none, every one you see.
+/// key, or `thread:<doc>:<thread>` for one thread's answer); none, every
+/// one you see.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttentionSeen {

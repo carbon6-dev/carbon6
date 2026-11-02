@@ -56,7 +56,10 @@ fn text(i: &AttentionItem) -> String {
     match i.kind.as_str() {
         "turn_ended" => format!("“{}” ended its turn", i.detail),
         "failed" => format!("“{}” failed", i.detail),
-        "comment_answer" => format!("An answer on “{}”", i.detail),
+        "comment_answer" => match i.count.unwrap_or(1) {
+            1 => format!("An answer on “{}”", i.title),
+            n => format!("{n} answers on “{}”", i.title),
+        },
         "brief" => match i.count.unwrap_or(0) {
             1 => "1 person waiting on you in the Brief".into(),
             n => format!("{n} people waiting on you in the Brief"),
@@ -87,9 +90,10 @@ fn target(i: &AttentionItem) -> View {
     }
 }
 
-/// Whether opening a row means you've seen it (a turn's end).
+/// Whether opening a row means you've seen it (what's worth a look: a
+/// turn's end, a document's answers, the Brief).
 fn seen_by_opening(kind: &str) -> bool {
-    matches!(kind, "turn_ended" | "failed")
+    matches!(kind, "turn_ended" | "failed" | "comment_answer" | "brief")
 }
 
 /// The line under a waiting row: where it is, its realm if not this page's,
@@ -192,7 +196,7 @@ pub fn NeedsYou() -> impl IntoView {
                         <span class="flex-1 font-semibold">"Needs you"</span>
                         {move || (counts().1 > 0).then(|| view! {
                             <button class="rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                                title="The turns that ended stop being worth a look" on:click=mark_all>"Mark all seen"</button>
+                                title="What's worth a look stops being so until something new comes" on:click=mark_all>"Mark all seen"</button>
                         })}
                     </div>
                     <div class="min-h-0 overflow-y-auto p-1 pb-4 md:pb-1">
@@ -258,7 +262,7 @@ pub(crate) fn Heading(text: String) -> impl IntoView {
 }
 
 /// A row: goes to the item in the focused tile (⌘/Ctrl-click: a new one)
-/// and closes the list; a turn's end is seen once you open it.
+/// and closes the list; what's worth a look is seen once you open it.
 #[component]
 fn Row(item: AttentionItem, close: Callback<()>, children: Children) -> impl IntoView {
     let ws = use_workspace();
@@ -296,7 +300,9 @@ mod tests {
     fn rows_say_what_needs_you() {
         assert_eq!(text(&item("turn_ended")), "“Fix the build” ended its turn");
         assert_eq!(text(&item("failed")), "“Fix the build” failed");
-        assert_eq!(text(&AttentionItem { detail: "Plan".into(), ..item("comment_answer") }), "An answer on “Plan”");
+        let answers = AttentionItem { title: "Plan".into(), detail: "3 answers".into(), count: Some(3), ..item("comment_answer") };
+        assert_eq!(text(&answers), "3 answers on “Plan”");
+        assert_eq!(text(&AttentionItem { count: Some(1), detail: "“per seat”".into(), ..answers }), "An answer on “Plan”");
         assert_eq!(text(&AttentionItem { count: Some(3), ..item("brief") }), "3 people waiting on you in the Brief");
         assert_eq!(text(&AttentionItem { count: Some(1), ..item("brief") }), "1 person waiting on you in the Brief");
         assert_eq!(text(&item("approval")), "Allow shell?");
@@ -344,6 +350,7 @@ mod tests {
         assert_eq!(target(&AttentionItem { session_id: s, ..item("decision") }), View::Decisions);
         assert_eq!(target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }), View::Docs { id: "d1".into() });
         assert_eq!(target(&item("brief")), View::Brief);
-        assert!(seen_by_opening("turn_ended") && !seen_by_opening("comment_answer"));
+        assert!(["turn_ended", "failed", "comment_answer", "brief"].into_iter().all(seen_by_opening));
+        assert!(!["approval", "question", "decision"].into_iter().any(seen_by_opening));
     }
 }

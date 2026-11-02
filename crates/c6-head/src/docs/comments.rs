@@ -114,6 +114,7 @@ pub async fn answered(st: &HeadState, realm: &str, doc: &str) -> usize {
 
 /// A thread an agent answered, waiting for your reply or for you to
 /// resolve it.
+#[derive(Clone, Debug)]
 pub struct Answered {
     pub doc: String,
     /// The document's title.
@@ -121,6 +122,9 @@ pub struct Answered {
     pub thread: String,
     /// What the thread is about (quoted words, a block, a tab).
     pub about: String,
+    /// The agent's answer (the thread's latest comment): another means it
+    /// answered again.
+    pub comment: String,
     /// When the agent answered.
     pub at: i64,
 }
@@ -130,7 +134,7 @@ pub struct Answered {
 pub async fn answered_in(st: &HeadState, realm: &str, limit: i64) -> anyhow::Result<Vec<Answered>> {
     let pool = super::pool(st, realm).await?;
     let rows = sqlx::query(
-        "SELECT t.id, t.doc_id, t.about, d.title, c.at FROM doc_threads t \
+        "SELECT t.id, t.doc_id, t.about, d.title, c.id AS comment, c.at FROM doc_threads t \
          JOIN docs d ON d.id = t.doc_id AND d.deleted_at IS NULL \
          JOIN doc_comments c ON c.id = (SELECT id FROM doc_comments WHERE thread_id = t.id ORDER BY at DESC, id DESC LIMIT 1) \
          WHERE t.state = 'open' AND c.by LIKE 'session:%' ORDER BY c.at DESC LIMIT ?",
@@ -140,7 +144,14 @@ pub async fn answered_in(st: &HeadState, realm: &str, limit: i64) -> anyhow::Res
     .await?;
     Ok(rows
         .iter()
-        .map(|r| Answered { doc: r.get("doc_id"), title: r.get("title"), thread: r.get("id"), about: r.get("about"), at: r.get("at") })
+        .map(|r| Answered {
+            doc: r.get("doc_id"),
+            title: r.get("title"),
+            thread: r.get("id"),
+            about: r.get("about"),
+            comment: r.get("comment"),
+            at: r.get("at"),
+        })
         .collect())
 }
 
