@@ -5020,11 +5020,11 @@ fn Composer(
                             // beside it for Send now (at once).
                             view! {
                                 // One split button: Send, then its ▾ (Send now) past a
-                                // full-height light line, so the two read as one.
+                                // full-height darker line, so the two read as one.
                                 <div class="relative flex items-stretch overflow-hidden rounded-md">
                                     <button class=format!("{SEND} rounded-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
                                         prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
-                                    <button class="flex w-4 shrink-0 items-center justify-center border-l border-sky-300 bg-sky-600 text-white hover:bg-sky-700"
+                                    <button class="flex w-4 shrink-0 items-center justify-center border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>
