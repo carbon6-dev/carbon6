@@ -101,7 +101,7 @@ pub fn ProjectsPage() -> impl IntoView {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-5" data-hold-reloads="">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <h1 class="text-xl font-semibold">"Projects"</h1>
-                <span class="text-sm text-zinc-500">"Long-running efforts: their work, documents and phases"</span>
+                <span class="text-sm text-muted">"Long-running efforts: their work, documents and phases"</span>
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap gap-2">
@@ -120,10 +120,10 @@ pub fn ProjectsPage() -> impl IntoView {
                 </div>
             })}
             {move || match list.get() {
-                None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),
+                None => view! { <p class="text-sm text-muted">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
                 Some(Ok(l)) if l.is_empty() => view! {
-                    <p class="text-sm text-zinc-500">"No projects yet. A project holds the work of an effort that lasts weeks or months, with its plan and other documents."</p>
+                    <p class="text-sm text-muted">"No projects yet. A project holds the work of an effort that lasts weeks or months, with its plan and other documents."</p>
                 }.into_any(),
                 Some(Ok(l)) => view! {
                     <div class="space-y-1">
@@ -138,10 +138,10 @@ pub fn ProjectsPage() -> impl IntoView {
                                         <crate::marks::ValueGlyph key=format!("project:{}", p.id) />
                                         <span class="min-w-[6rem] flex-1 truncate font-medium">{p.fields.title.clone()}</span>
                                         <StatePill state=p.state.clone() />
-                                        <span class="shrink-0 text-xs text-zinc-400">{since(p.fields.moved_at.max(p.updated_at))}</span>
+                                        <span class="shrink-0 text-xs text-muted">{since(p.fields.moved_at.max(p.updated_at))}</span>
                                     </div>
                                     <p class="truncate text-xs text-zinc-600 dark:text-zinc-400">{first.unwrap_or_else(|| p.why.clone())}</p>
-                                    <p class="text-xs text-zinc-500">{format!("{n} open · {} in all{}", p.work.len(), if p.docs.is_empty() { String::new() } else { format!(" · {} documents", p.docs.len()) })}</p>
+                                    <p class="text-xs text-muted">{format!("{n} open · {} in all{}", p.work.len(), if p.docs.is_empty() { String::new() } else { format!(" · {} documents", p.docs.len()) })}</p>
                                 </button>
                             }
                         }).collect_view()}
@@ -149,7 +149,7 @@ pub fn ProjectsPage() -> impl IntoView {
                 }.into_any(),
             }}
             <div class="pt-2">
-                <label class="flex items-center gap-1.5 text-sm text-zinc-500">
+                <label class="flex items-center gap-1.5 text-sm text-muted">
                     <input type="checkbox" prop:checked=move || show_closed.get() on:change=move |ev| show_closed.set(event_target_checked(&ev)) />
                     "Show done and dropped projects"
                 </label>
@@ -162,7 +162,7 @@ pub fn ProjectsPage() -> impl IntoView {
                                     on:click=move |ev| open_project.with_value(|f| f(id.clone(), How::from_mouse(&ev)))>
                                     <StatePill state=p.state.clone() />
                                     <span class="min-w-0 flex-1 truncate">{p.fields.title.clone()}</span>
-                                    <span class="text-xs text-zinc-400">{p.fields.closed_at.map(since).unwrap_or_default()}</span>
+                                    <span class="text-xs text-muted">{p.fields.closed_at.map(since).unwrap_or_default()}</span>
                                 </button>
                             }
                         }).collect_view()}
@@ -262,7 +262,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
         <main class="mx-auto max-w-3xl space-y-4 px-4 py-5" data-hold-reloads="">
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || match shown.get() {
-                None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),
+                None => view! { <p class="text-sm text-muted">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
                 Some(Ok(p)) => {
                     let active = p.fields.status == "active";
@@ -331,9 +331,9 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                         <PhaseStrip p=p.clone() change=phase_cb />
                         <section class="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                             <div class="flex items-center gap-2">
-                                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">"Where we are"</h2>
-                                {p.fields.note.as_ref().map(|n| view! { <span class="text-xs text-zinc-400">{since(n.at)}</span> })}
-                                <button class="text-xs text-zinc-500 hover:underline" title="Write it again now"
+                                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">"Where we are"</h2>
+                                {p.fields.note.as_ref().map(|n| view! { <span class="text-xs text-muted">{since(n.at)}</span> })}
+                                <button class="text-xs text-muted hover:underline" title="Write it again now"
                                     on:click=move |_| spawn_local(async move {
                                         if let Err(e) = api::project_refresh(id.get_value()).await { error.set(Some(e)); }
                                     })>"↻"</button>
@@ -360,7 +360,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                             let me = mine.clone();
                             view! {
                                 <div class="flex items-center gap-2 text-sm">
-                                    <span class="text-zinc-500">"Merge into this:"</span>
+                                    <span class="text-muted">"Merge into this:"</span>
                                     <select class=format!("{INPUT} w-auto!") on:change=move |ev| {
                                         let from = event_target_value(&ev);
                                         if from.is_empty() { return; }
@@ -379,7 +379,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                         <QuickSessions p=p.clone() apply=apply_cb start=quick_cb />
                         <section class="space-y-1">
                             <div class="flex flex-wrap items-center gap-2">
-                                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("Work ({} open)", open.len())}</h2>
+                                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Work ({} open)", open.len())}</h2>
                                 {(active && p.fields.phases.iter().any(|x| x.state != "done")).then(|| view! {
                                     <button class=format!("{BUTTON_QUIET} text-xs") title="A work item to plan the next phase: its session proposes the phase's work and updates the plan"
                                         on:click=move |_| start_plan(c6_api::projects::ProjectPlanIn::default())>"Plan the next phase"</button>
@@ -421,12 +421,12 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                         <Documents p=p.clone() apply=apply_cb />
                         {(!done.is_empty()).then(|| view! {
                             <section class="space-y-1">
-                                <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Closed work"</h2>
+                                <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"Closed work"</h2>
                                 {done.into_iter().map(|w| view! {
-                                    <div class="flex items-center gap-2 px-2 py-0.5 text-sm text-zinc-500">
+                                    <div class="flex items-center gap-2 px-2 py-0.5 text-sm text-muted">
                                         <StatePill state=w.state.clone() />
                                         <Go to=View::Work { id: w.id.clone() } class="min-w-0 flex-1 truncate hover:underline">{w.title.clone()}</Go>
-                                        <span class="text-xs text-zinc-400">{w.closed_at.map(since).unwrap_or_default()}</span>
+                                        <span class="text-xs text-muted">{w.closed_at.map(since).unwrap_or_default()}</span>
                                     </div>
                                 }).collect_view()}
                             </section>
@@ -481,7 +481,7 @@ fn QuickSessions(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>, s
                 <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
                     <span class=format!("rounded px-1.5 py-0.5 text-[11px] font-medium {class}")>{label}</span>
                     <Go to=View::session(q.id.clone()) class="min-w-0 flex-1 truncate hover:underline">{q.title}</Go>
-                    <span class="text-xs text-zinc-400">{since(q.at)}</span>
+                    <span class="text-xs text-muted">{since(q.at)}</span>
                     {ended.then(|| view! {
                         <button class=format!("{BUTTON_QUIET} text-xs") title="A work item in this project, with this session attached: for something you mean to finish"
                             on:click=move |_| spawn_local(async move {
@@ -503,14 +503,14 @@ fn QuickSessions(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>, s
     view! {
         <section class="space-y-1">
             <div class="flex items-center gap-2">
-                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("Sessions ({n})")}</h2>
+                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Sessions ({n})")}</h2>
                 {active.then(|| view! {
                     <button class=format!("{BUTTON_QUIET} text-xs") title="A quick task in this project with no work item, such as drafting a doc"
                         on:click=move |_| start.run(())>"+ Session"</button>
                 })}
             </div>
             {if n == 0 {
-                view! { <p class="px-2 text-xs text-zinc-500">"No quick sessions. Start one for a task that won't outlive it."</p> }.into_any()
+                view! { <p class="px-2 text-xs text-muted">"No quick sessions. Start one for a task that won't outlive it."</p> }.into_any()
             } else {
                 rows.into_any()
             }}
@@ -584,7 +584,7 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                         </button>
                     }
                 }).collect_view()}
-                <button class="rounded-md border border-dashed border-zinc-300 px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
+                <button class="rounded-md border border-dashed border-zinc-300 px-2 py-1 text-xs text-muted hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
                     title="Phases are optional: an ordered list, each with what done means" on:click=move |_| open_editor(None)>
                     {if n == 0 { "+ Phases" } else { "+ Phase" }}
                 </button>
@@ -597,7 +597,7 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                     <div class="space-y-2 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
                         <input class=INPUT placeholder="The phase: Pilot with one team" prop:value=move || title.get() on:input=move |ev| title.set(event_target_value(&ev)) />
                         <input class=INPUT placeholder="Done when: the team uses it daily for a week" prop:value=move || done_when.get() on:input=move |ev| done_when.set(event_target_value(&ev)) />
-                        <label class="flex items-center gap-2 text-xs text-zinc-500">"Target date"
+                        <label class="flex items-center gap-2 text-xs text-muted">"Target date"
                             <input type="date" class=format!("{INPUT} w-auto!") prop:value=move || target.get() on:input=move |ev| target.set(event_target_value(&ev)) />
                         </label>
                         <div class="flex flex-wrap items-center gap-2">
@@ -654,7 +654,7 @@ fn PhaseGroup(
     };
     let real = !phase.get_value().is_empty();
     view! {
-        <div class="flex flex-wrap items-center gap-2 pt-2 text-xs text-zinc-500">
+        <div class="flex flex-wrap items-center gap-2 pt-2 text-xs text-muted">
             <span class=format!("font-medium {}", if state == "current" { "text-violet-700 dark:text-violet-400" } else { "" })>{title}</span>
             {real.then(|| view! { <span>{count}</span> })}
             <span class="flex-1"></span>
@@ -686,14 +686,14 @@ fn Proposed(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> imp
     };
     (!p.fields.proposed.is_empty()).then(|| view! {
         <section class="space-y-1 rounded-lg border border-violet-200 p-3 dark:border-violet-900">
-            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Proposed work"</h2>
+            <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"Proposed work"</h2>
             {p.fields.proposed.iter().map(|x| {
                 let (a, b) = (x.id.clone(), x.id.clone());
                 view! {
                     <div class="flex flex-wrap items-center gap-2 text-sm">
                         <span class="min-w-[10rem] flex-1">
                             <span class="font-medium">{x.title.clone()}</span>
-                            {(!x.done_when.is_empty()).then(|| view! { <span class="ml-2 text-xs text-zinc-500">{format!("done when {}", x.done_when)}</span> })}
+                            {(!x.done_when.is_empty()).then(|| view! { <span class="ml-2 text-xs text-muted">{format!("done when {}", x.done_when)}</span> })}
                             {phase_title(&x.phase).map(|t| view! { <span class="ml-2 text-xs text-violet-700 dark:text-violet-400">{t}</span> })}
                         </span>
                         <button class=format!("{BUTTON} text-xs") on:click=move |_| decide(a.clone(), true)>"Accept"</button>
@@ -724,11 +724,11 @@ fn WorkRow(
             <crate::marks::ValueGlyph key=format!("work:{}", w.id) />
             <span class="min-w-[8rem] flex-1 truncate">
                 <Go to=View::Work { id: w.id.clone() } class="text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>{w.title.clone()}</Go>
-                {(!w.why.is_empty()).then(|| view! { <span class="ml-2 text-xs text-zinc-500">{w.why.clone()}</span> })}
+                {(!w.why.is_empty()).then(|| view! { <span class="ml-2 text-xs text-muted">{w.why.clone()}</span> })}
             </span>
-            <span class="shrink-0 text-xs text-zinc-400">{(w.moved_at > 0).then(|| since(w.moved_at))}</span>
+            <span class="shrink-0 text-xs text-muted">{(w.moved_at > 0).then(|| since(w.moved_at))}</span>
             {(!phases.is_empty()).then(|| view! {
-                <select class="shrink-0 rounded border-none bg-transparent text-xs text-zinc-500" title="Its phase"
+                <select class="shrink-0 rounded border-none bg-transparent text-xs text-muted" title="Its phase"
                     on:change=move |ev| {
                         let (p, w) = (moving_project.clone(), moving.clone());
                         let phase = event_target_value(&ev);
@@ -738,7 +738,7 @@ fn WorkRow(
                     {phases.iter().map(|(id, t)| view! { <option value=id.clone() selected=*id == current>{t.clone()}</option> }).collect_view()}
                 </select>
             })}
-            <button class="shrink-0 text-xs text-zinc-400 hover:text-red-600" title="Take it out of the project (it stays in your work)"
+            <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Take it out of the project (it stays in your work)"
                 on:click=move |_| {
                     let (p, d) = (project.clone(), ProjectDetach { work: Some(wid.clone()), ..Default::default() });
                     spawn_local(async move { apply.run(api::project_detach(p, &d).await) });
@@ -787,7 +787,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
     };
     view! {
         <section class="space-y-1">
-            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Documents"</h2>
+            <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"Documents"</h2>
             {p.docs.iter().map(|d| {
                 let doc = d.doc.clone();
                 let doc2 = d.doc.clone();
@@ -797,14 +797,14 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
                             {format!("{} {}", if d.kind == "deck" { "▦" } else { "▤" }, d.title)}
                         </Go>
-                        <span class="shrink-0 text-xs text-zinc-400">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
-                        <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                        <span class="shrink-0 text-xs text-muted">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
+                        <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
                             title="Its role in the project" on:change=move |ev| set_role(doc.clone(), event_target_value(&ev))>
                             {["", "plan", "spec", "notes", "review"].into_iter().map(|r| view! {
                                 <option value=r selected=current == r>{if r.is_empty() { "no role" } else { r }}</option>
                             }).collect_view()}
                         </select>
-                        <button class="shrink-0 text-xs text-zinc-400 hover:text-red-600" title="Take it off the project (the document stays)"
+                        <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Take it off the project (the document stays)"
                             on:click=move |_| {
                                 let d = ProjectDetach { doc: Some(doc2.clone()), ..Default::default() };
                                 spawn_local(async move { apply.run(api::project_detach(id.get_value(), &d).await) });
@@ -833,7 +833,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 <button class=BUTTON_QUIET on:click=move |_| new_doc("doc")>"+ New doc"</button>
                 <button class=BUTTON_QUIET on:click=move |_| new_doc("deck")>"+ New deck"</button>
             </div>
-            <h2 class="pt-2 text-xs font-medium uppercase tracking-wide text-zinc-500">"Links"</h2>
+            <h2 class="pt-2 text-xs font-medium uppercase tracking-wide text-muted">"Links"</h2>
             {p.fields.links.iter().map(|l| {
                 let r = l.reference.clone();
                 let href = if r.starts_with("http") { r.clone() } else { String::new() };
@@ -845,7 +845,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         } else {
                             view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{format!("↗ {text}")}</a> }.into_any()
                         }}
-                        <button class="shrink-0 text-xs text-zinc-400 hover:text-red-600" on:click=move |_| {
+                        <button class="shrink-0 text-xs text-muted hover:text-red-600" on:click=move |_| {
                             let d = ProjectDetach { link: Some(r.clone()), ..Default::default() };
                             spawn_local(async move { apply.run(api::project_detach(id.get_value(), &d).await) });
                         }>"✕"</button>

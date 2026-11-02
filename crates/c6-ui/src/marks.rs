@@ -203,7 +203,7 @@ pub fn Palette(
         <div class="space-y-[3px]">
             {rows.collect_view()}
             {clear.map(|f| view! {
-                <button class="mt-1 text-[11px] text-zinc-500 hover:underline" on:click=move |ev| { ev.stop_propagation(); f.run(()) }>
+                <button class="mt-1 text-[11px] text-muted hover:underline" on:click=move |ev| { ev.stop_propagation(); f.run(()) }>
                     "Back to its own colour"
                 </button>
             })}

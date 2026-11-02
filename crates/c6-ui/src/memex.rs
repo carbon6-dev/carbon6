@@ -73,7 +73,7 @@ pub fn MemexPage() -> impl IntoView {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-4">
             <div class="flex gap-1 text-sm">
                 {[("search", "Search"), ("review", "Review"), ("commitments", "Commitments"), ("trails", "Trails"), ("add", "Add files")].into_iter().map(|(t, label)| view! {
-                    <button class=move || format!("rounded-md px-3 py-1 {}", if tab.get() == t { "bg-zinc-200 dark:bg-zinc-800" } else { "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-900" })
+                    <button class=move || format!("rounded-md px-3 py-1 {}", if tab.get() == t { "bg-zinc-200 dark:bg-zinc-800" } else { "text-muted hover:bg-zinc-100 dark:hover:bg-zinc-900" })
                         on:click=move |_| tab.set(t)>{label}</button>
                 }).collect_view()}
             </div>
@@ -112,10 +112,10 @@ pub fn MemexPage() -> impl IntoView {
                     }
                 }).collect_view()}
             </div>
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Searching…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Searching…"</p> }>
                 {move || results.get().map(|r| match r {
                     Ok(None) => view! { <NoteBox /> }.into_any(),
-                    Ok(Some(hits)) if hits.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing matches."</p> }.into_any(),
+                    Ok(Some(hits)) if hits.is_empty() => view! { <p class="text-sm text-muted">"Nothing matches."</p> }.into_any(),
                     Ok(Some(hits)) => view! {
                         <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                             {hits.into_iter().map(|h| view! { <Hit h open /> }).collect_view()}
@@ -164,7 +164,7 @@ fn AddFiles() -> impl IntoView {
     };
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-            <p class="text-sm text-zinc-500">"PDF, Word (.docx), Markdown, HTML or text, up to 40 MB each (all but text are read by the c6-extract kit on a worker). Research papers are recognized: their title, authors, identifiers and the papers they cite join the graph. To keep a folder in sync instead, add it under Settings → Memex folders."</p>
+            <p class="text-sm text-muted">"PDF, Word (.docx), Markdown, HTML or text, up to 40 MB each (all but text are read by the c6-extract kit on a worker). Research papers are recognized: their title, authors, identifiers and the papers they cite join the graph. To keep a folder in sync instead, add it under Settings → Memex folders."</p>
             <input class=format!("{INPUT} font-mono text-xs") placeholder="labels for these files, e.g. research, client:acme" prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
             <input type="file" multiple accept=".pdf,.docx,.md,.markdown,.txt,.html,.htm,.rst" class="text-sm" on:change=pick />
             <ul class="space-y-1 text-sm">
@@ -184,10 +184,10 @@ fn Trails(open: RwSignal<Option<String>>) -> impl IntoView {
     let shown = RwSignal::new(None::<String>);
     view! {
         <section class="space-y-3">
-            <p class="text-sm text-zinc-500">"Trails are paths through what you know, step by step, each with a note on why it matters. Add a step from any item (\u{201c}Add to a trail\u{201d}); agents add steps with memex_trail."</p>
+            <p class="text-sm text-muted">"Trails are paths through what you know, step by step, each with a note on why it matters. Add a step from any item (\u{201c}Add to a trail\u{201d}); agents add steps with memex_trail."</p>
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"No trails yet."</p> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"No trails yet."</p> }.into_any(),
                 Ok(v) => view! {
                     <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                         {v.into_iter().map(|t| {
@@ -195,7 +195,7 @@ fn Trails(open: RwSignal<Option<String>>) -> impl IntoView {
                             view! {
                                 <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900" on:click=move |_| shown.set(Some(id.clone()))>
                                     <span class="font-medium">{t.name.clone()}</span>
-                                    <span class="text-xs text-zinc-500">{format!("{} steps · {}", t.step_count, when(t.updated_at))}</span>
+                                    <span class="text-xs text-muted">{format!("{} steps · {}", t.step_count, when(t.updated_at))}</span>
                                 </button>
                             }
                         }).collect_view()}
@@ -234,12 +234,12 @@ fn TrailView(id: String, open: RwSignal<Option<String>>, on_change: impl Fn() + 
                             view! {
                                 <li class="rounded-md bg-zinc-50 p-2 text-sm dark:bg-zinc-900">
                                     <div class="flex flex-wrap items-center gap-2">
-                                        <span class="text-xs text-zinc-400">{i + 1}"."</span>
+                                        <span class="text-xs text-muted">{i + 1}"."</span>
                                         <span class=format!("rounded px-1.5 text-[11px] {}", kind_tone(&s.kind))>{s.kind.clone()}</span>
                                         <button class="font-medium hover:underline" on:click=move |_| open.set(Some(target.clone()))>{s.title.clone()}</button>
-                                        <span class="text-xs text-zinc-500">{format!("by {}", s.made_by)}</span>
+                                        <span class="text-xs text-muted">{format!("by {}", s.made_by)}</span>
                                         <span class="flex-1"></span>
-                                        <button class="text-xs text-zinc-500 hover:text-red-600" title="Remove this step" on:click=move |_| {
+                                        <button class="text-xs text-muted hover:text-red-600" title="Remove this step" on:click=move |_| {
                                             spawn_local(async move {
                                                 match api::memex_trail_remove(tid.get_value(), step).await { Ok(()) => trail.refetch(), Err(e) => error.set(Some(e)) }
                                             });
@@ -309,7 +309,7 @@ fn StatusLine(s: MemexStatus) -> impl IntoView {
         format!("{} of {} passages embedded with {}", s.embedded, s.passages, s.embedding_model)
     };
     view! {
-        <div class="space-y-1 text-xs text-zinc-500">
+        <div class="space-y-1 text-xs text-muted">
             <p>{format!("{} · {total} items ({}) · {} things · {meaning}", s.node.clone().unwrap_or_default(), parts.join(", "), s.things)}</p>
             {s.last_error.clone().map(|e| view! { <p class="text-red-600">{e}</p> })}
         </div>
@@ -328,8 +328,8 @@ fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
             <div class="flex flex-wrap items-center gap-2">
                 <span class=format!("rounded px-1.5 text-[11px] {}", kind_tone(&h.kind))>{h.kind.clone()}</span>
                 <button class="text-left font-medium hover:underline" on:click=move |_| open.set(Some(id.clone()))>{h.title.clone()}</button>
-                <span class="text-xs text-zinc-500">{when(h.created_at)}</span>
-                {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-zinc-400">{m.clone()}</span> }).collect_view()}
+                <span class="text-xs text-muted">{when(h.created_at)}</span>
+                {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-muted">{m.clone()}</span> }).collect_view()}
                 <span class="flex-1"></span>
                 {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session ↗"</Go> })}
                 {doc.map(|d| view! { <Go to=View::Docs { id: d } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document ↗"</Go> })}
@@ -392,7 +392,7 @@ fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<S
         <div class="flex flex-wrap items-center gap-2">
             <span class=format!("rounded px-1.5 text-[11px] {}", kind_tone(&s("kind")))>{s("kind")}</span>
             <h2 class="font-medium">{s("title")}</h2>
-            <span class="text-xs text-zinc-500">{format!("{} · from {}", when(it["created_at"].as_i64().unwrap_or(0)), s("source"))}</span>
+            <span class="text-xs text-muted">{format!("{} · from {}", when(it["created_at"].as_i64().unwrap_or(0)), s("source"))}</span>
             <span class="flex-1"></span>
             {has_original.then(|| view! { <a href=original.clone() target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original ↗"</a> })}
             <button class="text-xs text-red-600 hover:underline" on:click=remove>"Delete"</button>
@@ -417,7 +417,7 @@ fn thing_view(t: Value, open: RwSignal<Option<String>>) -> impl IntoView {
                     <li class="text-sm">
                         <span class=format!("mr-1 rounded px-1 text-[10px] {}", kind_tone(&h.kind))>{h.kind.clone()}</span>
                         <button class="hover:underline" on:click=move |_| open.set(Some(id.clone()))>{h.title.clone()}</button>
-                        <span class="ml-1 text-xs text-zinc-500">{ago(now_ms() - h.created_at)}" ago"</span>
+                        <span class="ml-1 text-xs text-muted">{ago(now_ms() - h.created_at)}" ago"</span>
                     </li>
                 }
             })
@@ -427,14 +427,14 @@ fn thing_view(t: Value, open: RwSignal<Option<String>>) -> impl IntoView {
         <div class="flex items-center gap-2">
             <span class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">{thing["kind"].as_str().unwrap_or_default().to_owned()}</span>
             <h2 class="text-lg font-semibold">{thing["name"].as_str().unwrap_or_default().to_owned()}</h2>
-            <span class="font-mono text-xs text-zinc-500">{thing["label"].as_str().unwrap_or_default().to_owned()}</span>
+            <span class="font-mono text-xs text-muted">{thing["label"].as_str().unwrap_or_default().to_owned()}</span>
         </div>
         // Who they are to you, first.
         <crate::understanding::Cards params=serde_json::json!({"id": key.clone()}) />
-        {(!notes.is_empty()).then(|| view! { <h3 class="text-xs font-medium uppercase text-zinc-500">"Notes"</h3><ul class="space-y-1">{rows(notes.clone())}</ul> })}
-        {(!items.is_empty()).then(|| view! { <h3 class="text-xs font-medium uppercase text-zinc-500">"Items"</h3><ul class="space-y-1">{rows(items.clone())}</ul> })}
+        {(!notes.is_empty()).then(|| view! { <h3 class="text-xs font-medium uppercase text-muted">"Notes"</h3><ul class="space-y-1">{rows(notes.clone())}</ul> })}
+        {(!items.is_empty()).then(|| view! { <h3 class="text-xs font-medium uppercase text-muted">"Items"</h3><ul class="space-y-1">{rows(items.clone())}</ul> })}
         {(!related.is_empty()).then(|| view! {
-            <h3 class="text-xs font-medium uppercase text-zinc-500">"Related"</h3>
+            <h3 class="text-xs font-medium uppercase text-muted">"Related"</h3>
             <div class="flex flex-wrap gap-1">{chips(related.iter().map(|p| p[0].clone()).collect::<Vec<_>>(), open)}</div>
         })}
         <ThingKnowledge label=thing["label"].as_str().unwrap_or_default().to_owned() />
@@ -564,23 +564,23 @@ pub fn MemexSettings() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Memex"</h2>
-                <p class="text-sm text-zinc-500">"Your knowledge store, part of the head: items, the graph of things and the claims about them, and search. carbon6 keeps in it what your sessions do (digests, outputs, pages read, memory notes); sessions start with a brief from it about their labels, and agents can search it, save notes and make claims. What a session may see is set by scope rules below."</p>
+                <p class="text-sm text-muted">"Your knowledge store, part of the head: items, the graph of things and the claims about them, and search. carbon6 keeps in it what your sessions do (digests, outputs, pages read, memory notes); sessions start with a brief from it about their labels, and agents can search it, save notes and make claims. What a session may see is set by scope rules below."</p>
             </div>
             {move || status.get().and_then(Result::ok).map(|s| if s.connected {
                 view! { <p class="text-sm text-emerald-700 dark:text-emerald-400">{format!("{} items", s.items.values().sum::<u64>())}</p> }.into_any()
             } else {
-                view! { <p class="text-sm text-zinc-500">{s.last_error.clone().unwrap_or_else(|| "Starting.".into())}</p> }.into_any()
+                view! { <p class="text-sm text-muted">{s.last_error.clone().unwrap_or_else(|| "Starting.".into())}</p> }.into_any()
             })}
             <div class="grid gap-2 sm:grid-cols-3">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Embedding connection"</span>
+                    <span class="text-xs text-muted">"Embedding connection"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || conn.get() on:change=move |ev| conn.set(event_target_value(&ev))>
                         <option value="">"None (keyword search only)"</option>
                         {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| !matches!(c.kind.as_str(), "anthropic" | "claude_code" | "chatgpt")).map(|c| view! { <option value=c.name.clone()>{c.name.clone()}</option> }).collect_view()}
                     </select>
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Embedding model"</span>
+                    <span class="text-xs text-muted">"Embedding model"</span>
                     <ModelInput connection=conn value=model on_set=move |v| model.set(v) class=format!("{INPUT} py-1 text-xs") placeholder="e.g. nomic-embed-text, text-embedding-3-small" />
                 </label>
                 <label class="flex items-center gap-2 text-sm sm:col-span-3">
@@ -601,7 +601,7 @@ pub fn MemexSettings() -> impl IntoView {
                     };
                     view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">{format!("{title}: connection")}</span>
+                            <span class="text-xs text-muted">{format!("{title}: connection")}</span>
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=move || c.get() on:change=move |ev| c.set(event_target_value(&ev))>
                                 <option value="">{if k == "drafting" { "Same as understanding" } else { "None (off)" }}</option>
                                 {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
@@ -610,12 +610,12 @@ pub fn MemexSettings() -> impl IntoView {
                             </select>
                         </label>
                         <label class=if k == "transcription" { "space-y-0.5 sm:col-span-2" } else { "space-y-0.5" }>
-                            <span class="text-xs text-zinc-500">{format!("{title}: model")}</span>
+                            <span class="text-xs text-muted">{format!("{title}: model")}</span>
                             <ModelInput connection=c value=m on_set=move |v| m.set(v) class=format!("{INPUT} py-1 text-xs") placeholder=hint disabled=inherited />
                         </label>
                         {(k != "transcription").then(|| view! {
                             <label class="space-y-0.5">
-                                <span class="text-xs text-zinc-500">{format!("{title}: reasoning")}</span>
+                                <span class="text-xs text-muted">{format!("{title}: reasoning")}</span>
                                 <select class=format!("{INPUT} py-1 text-sm") prop:disabled=move || inherited.get() prop:value=move || if inherited.get() { String::new() } else { e.get() } on:change=move |ev| e.set(event_target_value(&ev))>
                                     <option value="">{move || if inherited.get() { "Same as understanding" } else if k == "understanding" { "Default (none: fastest)" } else { "Default (low)" }}</option>
                                     {["none", "low", "medium", "high"].map(|o| view! { <option value=o>{o}</option> })}
@@ -624,7 +624,7 @@ pub fn MemexSettings() -> impl IntoView {
                         })}
                     }
                 }).collect_view()}
-                <p class="text-xs text-zinc-500 sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first, and sorts for the brief. Without reasoning a local thinking model (Qwen, gpt-oss) takes seconds a conversation instead of a minute. Drafting writes the replies waiting on requests that need you, using the understanding model by default. A stronger model or reasoning here makes better drafts at a few calls a day, within the same daily budget. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
+                <p class="text-xs text-muted sm:col-span-3">"Understanding reads mail threads, sessions, documents and papers for summaries, topics, commitments and claims, newest first, and sorts for the brief. Without reasoning a local thinking model (Qwen, gpt-oss) takes seconds a conversation instead of a minute. Drafting writes the replies waiting on requests that need you, using the understanding model by default. A stronger model or reasoning here makes better drafts at a few calls a day, within the same daily budget. Vision captions photos and video frames. Everything they make is marked as inferred, with its model; change the model and it is redone."</p>
                 {files.into_iter().map(|(k, f)| {
                     let (title, hint) = match k {
                         "places_file" => ("Places (GeoNames file)", "e.g. ~/memex/cities1000.txt"),
@@ -633,22 +633,22 @@ pub fn MemexSettings() -> impl IntoView {
                     };
                     view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">{title}</span>
+                            <span class="text-xs text-muted">{title}</span>
                             <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=hint prop:value=move || f.get() on:input=move |ev| f.set(event_target_value(&ev)) />
                         </label>
                     }
                 }).collect_view()}
-                <p class="text-xs text-zinc-500 sm:col-span-3">"Photos and videos in memex folders are read in place, by the c6-extract kit on their worker. Files above are paths on the head's machine; nothing is downloaded for you. Places: a GeoNames cities file names where photos were taken. Faces: an UltraFace-style detector and an ArcFace- or MobileFaceNet-style embedder (sent to the kit); faces are grouped and you name them in Review. Videos get keyframes, and transcripts with a transcription model."</p>
+                <p class="text-xs text-muted sm:col-span-3">"Photos and videos in memex folders are read in place, by the c6-extract kit on their worker. Files above are paths on the head's machine; nothing is downloaded for you. Places: a GeoNames cities file names where photos were taken. Faces: an UltraFace-style detector and an ArcFace- or MobileFaceNet-style embedder (sent to the kit); faces are grouped and you name them in Review. Videos get keyframes, and transcripts with a transcription model."</p>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Model calls a day"</span>
+                    <span class="text-xs text-muted">"Model calls a day"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5" title="Model calls understanding makes side by side (1 to 64). With more than one, new mail keeps one for itself. A local Ollama answers one at a time unless started with OLLAMA_NUM_PARALLEL.">
-                    <span class="text-xs text-zinc-500">"Calls at once"</span>
+                    <span class="text-xs text-muted">"Calls at once"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="1" prop:value=move || at_once.get() on:input=move |ev| at_once.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Brief size (characters)"</span>
+                    <span class="text-xs text-muted">"Brief size (characters)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="4000; 0 for none" prop:value=move || chars.get() on:input=move |ev| chars.set(event_target_value(&ev)) />
                 </label>
             </div>
@@ -683,13 +683,13 @@ fn ThingKnowledge(label: String) -> impl IntoView {
             let facts: Vec<c6_api::Fact> = serde_json::from_value(v["facts"].clone()).unwrap_or_default();
             let (current, old): (Vec<_>, Vec<_>) = facts.into_iter().partition(|f| f.valid_to.is_none());
             view! {
-                <h3 class="text-xs font-medium uppercase text-zinc-500">"What sessions learned"</h3>
+                <h3 class="text-xs font-medium uppercase text-muted">"What sessions learned"</h3>
                 {(!page.is_empty()).then(|| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&page)></div> })}
                 <ul class="space-y-2">
                     {current.into_iter().map(|f| view! { <crate::decisions::FactRow f on_change=Callback::new(move |()| tick.update(|t| *t += 1)) /> }).collect_view()}
                 </ul>
                 {(!old.is_empty()).then(|| view! {
-                    <details class="text-xs text-zinc-500">
+                    <details class="text-xs text-muted">
                         <summary class="cursor-pointer">{format!("{} no longer true", old.len())}</summary>
                         <ul class="mt-1 space-y-1">{old.into_iter().map(|f| view! { <li class="line-through">{f.claim}</li> }).collect_view()}</ul>
                     </details>

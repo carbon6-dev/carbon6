@@ -29,7 +29,7 @@ pub fn SessionsPage() -> impl IntoView {
                 let rows = recent.get();
                 (query.with(String::is_empty) && !rows.is_empty()).then(|| view! {
                     <section class="space-y-2">
-                        <h2 class="text-sm font-medium text-zinc-500">"Recently viewed"</h2>
+                        <h2 class="text-sm font-medium text-muted">"Recently viewed"</h2>
                         <div class="rounded-lg border border-zinc-200 p-1 dark:border-zinc-800">
                             {rows.into_iter().map(|(s, at)| view! { <RecentRow s at now /> }).collect_view()}
                         </div>
@@ -50,7 +50,7 @@ pub fn SessionsPage() -> impl IntoView {
 
             <section class="space-y-2">
                 <div class="flex flex-wrap items-center gap-2">
-                    <h2 class="flex-1 text-sm font-medium text-zinc-500">"Sessions"</h2>
+                    <h2 class="flex-1 text-sm font-medium text-muted">"Sessions"</h2>
                     <input class=format!("{INPUT} w-56") placeholder="Search titles, labels, workers, paths" prop:value=move || query.get()
                         on:input=move |ev| query.set(event_target_value(&ev)) />
                     <select class=format!("{INPUT} w-32") prop:value=move || status_filter.get() on:change=move |ev| status_filter.set(event_target_value(&ev))>
@@ -85,7 +85,7 @@ pub fn SessionsPage() -> impl IntoView {
                             .collect();
                         if sessions.is_empty() {
                             let msg = if wanted.is_empty() && q.is_empty() { "No sessions yet." } else { "No sessions match." };
-                            view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">{msg}</p> }.into_any()
+                            view! { <p class="px-4 py-8 text-center text-sm text-muted">{msg}</p> }.into_any()
                         } else {
                             grouped(sessions, &grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now /> }.into_any(), false)
                         }
@@ -158,7 +158,7 @@ pub(crate) fn RecentRow(s: Session, at: i64, now: RwSignal<i64>, #[prop(optional
             <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
             <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
             <span class=format!("inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium {pill}")>{word}</span>
-            <span class="w-14 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - at)}</span>
+            <span class="w-14 shrink-0 text-right text-xs text-muted">{move || ago(now.get() - at)}</span>
         </a>
     }
 }
@@ -274,7 +274,7 @@ fn grouped(
             let rows = grouped(list, &rest, here.clone(), folded, row, compact);
             let (button, body) = if compact {
                 (
-                    "flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60",
+                    "flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60",
                     "ml-1.5 border-l border-zinc-200 pl-1 dark:border-zinc-800",
                 )
             } else {
@@ -286,8 +286,8 @@ fn grouped(
             view! {
                 <div>
                     <button class=button on:click=toggle title=format!("{key}: {}", value.clone().unwrap_or_else(|| format!("no {key}")))>
-                        <span class="w-3 shrink-0 text-sm text-zinc-500">{move || if is_folded.get() { "▸" } else { "▾" }}</span>
-                        {(!compact).then(|| view! { <span class="shrink-0 text-zinc-400">{format!("{key}:")}</span> })}
+                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { "▸" } else { "▾" }}</span>
+                        {(!compact).then(|| view! { <span class="shrink-0 text-muted">{format!("{key}:")}</span> })}
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
                         {(running > 0).then(|| view! {
@@ -330,14 +330,14 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
         keys
     });
     view! {
-        <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+        <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
             <span>"Group by"</span>
             {move || {
                 let levels = grouping.levels.get();
                 levels.iter().enumerate().map(|(i, k)| {
                     let (outer, gone) = (levels.clone(), levels.clone());
                     view! {
-                        {(i > 0).then(|| view! { <span class="text-zinc-400">"›"</span> })}
+                        {(i > 0).then(|| view! { <span class="text-muted">"›"</span> })}
                         <span class="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-mono text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">
                             {(i > 0).then(|| view! {
                                 <button title="Group by this one level further out" on:click=move |_| {
@@ -425,7 +425,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div class="mt-0.5 flex items-center gap-2"><crate::aspects::AspectChips s=chips /></div>
-                <div class="truncate text-xs text-zinc-500">
+                <div class="truncate text-xs text-muted">
                     <span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " <span class="font-mono">{match (&s.ssh, s.cwd.is_empty()) {
                         (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
                         (None, true) => "scratch workspace".to_owned(),
@@ -440,7 +440,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                 })}
             </div>
             <StatusPill status />
-            <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
+            <span class="w-16 shrink-0 text-right text-xs text-muted">{move || ago(now.get() - updated)}</span>
         </Go>
         <SessionMenu id=s.id.clone() />
         </div>
@@ -476,7 +476,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     });
     let small = "rounded px-1 font-normal normal-case tracking-normal hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
-        <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+        <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
             <button class=crate::activity::FOLD title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
                 {move || if open.get() { "▾" } else { "▸" }}
             </button>
@@ -504,7 +504,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
             {move || {
                 let list = sessions.get();
                 if list.is_empty() {
-                    return view! { <p class="px-2 py-2 text-xs text-zinc-500">"No sessions match."</p> }.into_any();
+                    return view! { <p class="px-2 py-2 text-xs text-muted">"No sessions match."</p> }.into_any();
                 }
                 grouped(list, &grouping.levels.get(), String::new(), folded, &move |s| view! { <RailRow s hover /> }.into_any(), true)
             }}
@@ -635,7 +635,7 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
                 <StatusPill status=s.display_status() />
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
-            <div class="space-y-0.5 text-xs text-zinc-500">
+            <div class="space-y-0.5 text-xs text-muted">
                 <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {s.model.clone()}</div>
                 <div class="break-all font-mono">{place}</div>
                 <div>{move || format!("active {}", ago(now.get() - updated))}</div>
@@ -720,12 +720,12 @@ pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>)
             <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">"New session like this one"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
                 </div>
-                <p class="text-xs text-zinc-500">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
-                <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+                <p class="text-xs text-muted">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
+                <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                     {move || connections.get().map(|r| match r {
-                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
                         Ok(conns) => view! { <SessionForm connections=conns seed=seed.get_value() on_started=on_close on_cancel=on_close /> }.into_any(),
                         Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     })}
@@ -806,32 +806,32 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
             <div class="w-full max-w-xl space-y-3 rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">"Save as template"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
                 </div>
-                <p class="text-xs text-zinc-500">"Sessions from it run where this one does, on its model and with its labels."</p>
-                <div class="space-y-0.5 text-xs text-zinc-500">
+                <p class="text-xs text-muted">"Sessions from it run where this one does, on its model and with its labels."</p>
+                <div class="space-y-0.5 text-xs text-muted">
                     <div class="break-all font-mono">{place}</div>
                     <div>{model}</div>
                 </div>
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <span class="text-xs text-muted">"Name"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                 </label>
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Description (agents read it to choose the template)"</span>
+                    <span class="text-xs text-muted">"Description (agents read it to choose the template)"</span>
                     <input class=format!("{INPUT} py-1") prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
                 </label>
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
+                    <span class="text-xs text-muted">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
                     <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
                 </label>
                 <label class="flex items-start gap-2">
                     <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
-                    <span>"Agents may start it"<span class="block text-xs text-zinc-500">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
+                    <span>"Agents may start it"<span class="block text-xs text-muted">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
                 </label>
                 <label class="flex items-start gap-2">
                     <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
-                    <span>"New git worktree"<span class="block text-xs text-zinc-500">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
+                    <span>"New git worktree"<span class="block text-xs text-muted">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
                 </label>
                 <div class="flex items-center justify-end gap-3">
                     {move || status.get().map(|r| match r {
@@ -875,12 +875,12 @@ pub fn SessionDialog(
             <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 text-left shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">{title}</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
                 </div>
-                <p class="text-xs text-zinc-500">{note}</p>
-                <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+                <p class="text-xs text-muted">{note}</p>
+                <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                     {move || connections.get().map(|r| match r {
-                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
                         Ok(conns) => match seed.get_value() {
                             Some(seed) => view! {
                                 <SessionForm connections=conns seed first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
@@ -1183,7 +1183,7 @@ fn SessionForm(
         })}
         <section class=if seeded { "space-y-3" } else { "space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50" }>
             <div class="grid gap-3 sm:grid-cols-[1fr_2fr_auto]">
-                <label class="block text-xs text-zinc-500">
+                <label class="block text-xs text-muted">
                     "Worker"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
                         {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked && w.role != "memex").map(|w| {
@@ -1192,7 +1192,7 @@ fn SessionForm(
                         }).collect_view()}
                     </select>
                 </label>
-                <div class="block text-xs text-zinc-500 sm:col-span-2">
+                <div class="block text-xs text-muted sm:col-span-2">
                     <div class="flex items-center gap-3">
                         <label class="flex items-center gap-1"><input type="radio" name=where_name.clone() prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
                         <label class="flex items-center gap-1" title="Work on another machine over SSH, using the worker's keys and ~/.ssh/config">
@@ -1220,12 +1220,12 @@ fn SessionForm(
                             {move || if cwd.get().is_empty() { "No folder: a scratch workspace (choose one…)".to_owned() } else { cwd.get() }}
                         </button>
                         {move || (!cwd.get().is_empty()).then(|| view! {
-                            <button class="shrink-0 rounded-md px-2 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                            <button class="shrink-0 rounded-md px-2 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                                 title="Work in a scratch workspace instead of a folder" on:click=move |_| cwd.set(String::new())>"✕"</button>
                         })}
                     </div>
                 </div>
-                <label class="block text-xs text-zinc-500">
+                <label class="block text-xs text-muted">
                     "Connection"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| connection.set(event_target_value(&ev)) prop:value=move || connection.get()>
                         {move || (has_routes.get() || auto()).then(|| view! { <option value="">"Auto (your routing rules)"</option> })}
@@ -1234,15 +1234,15 @@ fn SessionForm(
                     <div class="mt-1"><crate::quota::QuotaNote connection /></div>
                 </label>
                 {move || auto().then(|| view! {
-                    <p class="text-xs text-zinc-500">
+                    <p class="text-xs text-muted">
                         "The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."
                     </p>
                 })}
-                <label class="block text-xs text-zinc-500" class:hidden=auto>
+                <label class="block text-xs text-muted" class:hidden=auto>
                     "Model"
                     <div class="mt-1"><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=INPUT.to_owned() placeholder="model id (empty: routing rules, else the default)" /></div>
                 </label>
-                <label class="block text-xs text-zinc-500" class:hidden=move || !effort_supported()>
+                <label class="block text-xs text-muted" class:hidden=move || !effort_supported()>
                     "Effort"
                     <select class=format!("mt-1 {INPUT}") prop:value=move || effort.get() on:change=move |ev| effort.set(event_target_value(&ev))>
                         <option value="">"default"</option>
@@ -1255,12 +1255,12 @@ fn SessionForm(
                 </label>
             </div>
             <div class="grid gap-3 sm:grid-cols-[2fr_1fr]">
-                <label class="block text-xs text-zinc-500">
+                <label class="block text-xs text-muted">
                     "Labels"
                     <input class=format!("mt-1 font-mono {INPUT}") placeholder="optional, e.g. client:acme, spike (repo, folder, worker and model are added automatically)"
                         prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
                 </label>
-                <label class="block text-xs text-zinc-500" title="What you mean to finish that this session serves (docs/work.md)">
+                <label class="block text-xs text-muted" title="What you mean to finish that this session serves (docs/work.md)">
                     "Work"
                     <select class=format!("mt-1 {INPUT}")
                         prop:value=move || { work_items.track(); quick_projects.track(); work_pick.get() }

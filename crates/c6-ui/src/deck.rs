@@ -213,7 +213,7 @@ pub fn DeckView(
         <div class="space-y-3" data-deck-view=doc.summary.id.clone()>
             {move || themes.get().map(|t| view! { <style>{style(&id.get_value(), &theme_of(&t, &theme2))}</style> })}
             <div class="flex flex-wrap items-center gap-2 text-sm">
-                <span class="text-zinc-500">"Theme"</span>
+                <span class="text-muted">"Theme"</span>
                 <select class=format!("{INPUT} w-auto!") on:change=move |ev| {
                     let t = event_target_value(&ev);
                     send.run(vec![DocOp::Set { title: None, theme: Some(t), size: None, tab: None, tab_title: None, tabs: None, block: None, chip: None, value: None }]);
@@ -223,7 +223,7 @@ pub fn DeckView(
                         view! { <option value=t.name.clone() selected=on title=t.mood.clone()>{t.name.clone()}</option> }
                     }).collect_view()}
                 </select>
-                <span class="text-zinc-400">{format!("{total} slides")}</span>
+                <span class="text-muted">{format!("{total} slides")}</span>
                 <span class="flex-1"></span>
                 <button class=BUTTON on:click=move |_| present(false)>"▶ Present"</button>
                 <button class=BUTTON_QUIET title="Notes, the next slide and a timer, in a window of its own" on:click=move |_| { present(true); present(false); }>"Presenter view"</button>
@@ -259,7 +259,7 @@ pub fn DeckView(
                                         <SlideBox html width=Signal::derive(|| 176.0) />
                                     </div>
                                 </div>
-                                <div class="text-[11px] text-zinc-400">{format!("{}{}", i + 1, if hidden { " · hidden" } else { "" })}</div>
+                                <div class="text-[11px] text-muted">{format!("{}{}", i + 1, if hidden { " · hidden" } else { "" })}</div>
                             </div>
                         }
                     }).collect_view()}
@@ -280,7 +280,7 @@ pub fn DeckView(
                                 <SlideBox html width=Signal::derive(move || main_width.get()) />
                             </div>
                             <div class="flex flex-wrap items-center gap-2 text-sm">
-                                <span class="text-zinc-500">{format!("Slide {} of {total}", i + 1)}</span>
+                                <span class="text-muted">{format!("Slide {} of {total}", i + 1)}</span>
                                 {let c = s.id.clone(); view! { <button class=BUTTON_QUIET title="Comment on this slide" on:click=move |_| commenting.set(Some(c.clone()))>"💬"</button> }}
                                 {(!pending).then(|| view! {
                                     <select class=format!("{INPUT} w-auto!") title="Its layout" on:change=move |ev| {
@@ -288,7 +288,7 @@ pub fn DeckView(
                                     }>
                                         {c6_api::docs::LAYOUTS.iter().map(|(l, _)| view! { <option value=*l selected=layout == *l>{*l}</option> }).collect_view()}
                                     </select>
-                                    <label class="flex items-center gap-1 text-zinc-500">
+                                    <label class="flex items-center gap-1 text-muted">
                                         <input type="checkbox" prop:checked=hidden on:change=move |ev| send.run(vec![replace_slide(&sid2, None, None, Some(event_target_checked(&ev)))]) />
                                         "Hidden"
                                     </label>
@@ -296,7 +296,7 @@ pub fn DeckView(
                                 })}
                                 {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{format!("✎ being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
                                 <span class="flex-1"></span>
-                                <button class="text-xs text-zinc-400 hover:text-red-600" title="Delete this slide"
+                                <button class="text-xs text-muted hover:text-red-600" title="Delete this slide"
                                     on:click=move |_| send.run(vec![DocOp::Delete { id: sid3.clone(), if_rev: Some(rev), if_hash: Some(hash.clone()) }])>"Delete slide"</button>
                             </div>
                             {move || editing.get().map(|(_, _, text)| view! {
@@ -320,7 +320,7 @@ pub fn DeckView(
                             })}
                         }
                     })}
-                    {(total == 0).then(|| view! { <p class="text-sm text-zinc-500">"No slides yet: + Slide, or ask a session to make the deck."</p> })}
+                    {(total == 0).then(|| view! { <p class="text-sm text-muted">"No slides yet: + Slide, or ask a session to make the deck."</p> })}
                 </div>
             </div>
         </div>
@@ -408,7 +408,7 @@ pub fn Present(id: String, presenter: bool) -> impl IntoView {
                             <div class="flex gap-6">
                                 <div class="c6deck space-y-2" data-deck=d.summary.id.clone()>
                                     <SlideBox html=current width=Signal::derive(move || width.get()) />
-                                    <div class="flex items-center gap-3 text-sm text-zinc-400">
+                                    <div class="flex items-center gap-3 text-sm text-muted">
                                         <button class="rounded bg-zinc-800 px-3 py-1" on:click=move |_| go(-1)>"◀"</button>
                                         <button class="rounded bg-zinc-800 px-3 py-1" on:click=move |_| go(1)>"▶"</button>
                                         <span>{format!("{} / {}", i + 1, list.len())}</span>
@@ -416,12 +416,12 @@ pub fn Present(id: String, presenter: bool) -> impl IntoView {
                                     </div>
                                 </div>
                                 <div class="min-w-0 flex-1 space-y-3">
-                                    <div class="text-xs uppercase tracking-wide text-zinc-500">"Next"</div>
+                                    <div class="text-xs uppercase tracking-wide text-muted">"Next"</div>
                                     <div class="c6deck" data-deck=d.summary.id.clone()>
                                         {(!next.is_empty()).then(|| view! { <SlideBox html=next.clone() width=Signal::derive(|| 320.0) /> })}
-                                        {next.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"The end."</p> })}
+                                        {next.is_empty().then(|| view! { <p class="text-sm text-muted">"The end."</p> })}
                                     </div>
-                                    <div class="text-xs uppercase tracking-wide text-zinc-500">"Notes"</div>
+                                    <div class="text-xs uppercase tracking-wide text-muted">"Notes"</div>
                                     <p class="whitespace-pre-wrap text-lg leading-relaxed">{if notes.is_empty() { "(no notes)".to_owned() } else { notes }}</p>
                                 </div>
                             </div>
@@ -435,7 +435,7 @@ pub fn Present(id: String, presenter: bool) -> impl IntoView {
                         }.into_any()
                     }
                 }
-                _ => view! { <p class="p-8 text-zinc-500">"Loading…"</p> }.into_any(),
+                _ => view! { <p class="p-8 text-muted">"Loading…"</p> }.into_any(),
             }}
         </div>
     }
@@ -471,7 +471,7 @@ pub fn ThemesSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Deck themes"</h2>
-            <p class="text-sm text-zinc-500">"A deck names its theme; changing a theme restyles every slide of the decks that use it. A theme is CSS custom properties on :root: --bg, --fg, --muted, --accent, --accent-bg, --accent-fg, --surface, --font-display, --font-body, --display-weight. How sessions make decks is in the prompts decks.flow, decks.storyline, decks.design, decks.visuals and decks.review."</p>
+            <p class="text-sm text-muted">"A deck names its theme; changing a theme restyles every slide of the decks that use it. A theme is CSS custom properties on :root: --bg, --fg, --muted, --accent, --accent-bg, --accent-fg, --surface, --font-display, --font-body, --display-weight. How sessions make decks is in the prompts decks.flow, decks.storyline, decks.design, decks.visuals and decks.review."</p>
             {move || list.get().into_iter().enumerate().map(|(i, t)| {
                 let sample = DocBlock {
                     id: "sample".into(),
@@ -494,7 +494,7 @@ pub fn ThemesSetting() -> impl IntoView {
                             <input class=INPUT prop:value=t.mood.clone() placeholder="What it's for" on:change=move |ev| list.update(|l| l[i].mood = event_target_value(&ev)) />
                             <textarea class=format!("{INPUT} min-h-[5rem] font-mono text-xs") prop:value=t.css.clone()
                                 on:change=move |ev| list.update(|l| l[i].css = event_target_value(&ev)) />
-                            <button class="text-xs text-zinc-400 hover:text-red-600" on:click=move |_| list.update(|l| { l.remove(i); })>"Remove"</button>
+                            <button class="text-xs text-muted hover:text-red-600" on:click=move |_| list.update(|l| { l.remove(i); })>"Remove"</button>
                         </div>
                     </div>
                 }
@@ -553,7 +553,7 @@ pub fn BringIn() -> impl IntoView {
                                     <li>{format!("✓ {}", m["title"].as_str().unwrap_or(""))}</li>
                                 }).collect_view()}
                                 {v["skipped"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
-                                    <li class="text-zinc-500">{format!("– {}: {}", m["title"].as_str().unwrap_or(""), m["why"].as_str().unwrap_or(""))}</li>
+                                    <li class="text-muted">{format!("– {}: {}", m["title"].as_str().unwrap_or(""), m["why"].as_str().unwrap_or(""))}</li>
                                 }).collect_view()}
                                 {v["themes"].as_array().filter(|t| !t.is_empty()).map(|t| view! {
                                     <li>{format!("Themes: {}", t.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))}</li>

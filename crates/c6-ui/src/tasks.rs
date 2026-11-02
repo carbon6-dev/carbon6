@@ -194,7 +194,7 @@ pub fn RunningTasks(
                         .into_any()
                     }}
                     <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
-                            <p class="text-zinc-500">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
+                            <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
                             {task_rows(session, list, error, Callback::new(move |id| {
                                 selected.set(Some(id));
                                 at.set(None);
@@ -317,9 +317,9 @@ fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<(
                     <button class=BUTTON_QUIET on:click=move |_| snapshot.refetch()>"Refresh"</button>
                     <button class=BUTTON_QUIET on:click=move |_| on_close.run(())>"Close"</button>
                 </div>
-                <p class="text-xs text-zinc-500">"Read-only live snapshot. Use Refresh to see new output; there is no automatic polling. Inspecting does not wake the model, consume output or change its read cursor."</p>
+                <p class="text-xs text-muted">"Read-only live snapshot. Use Refresh to see new output; there is no automatic polling. Inspecting does not wake the model, consume output or change its read cursor."</p>
                 {move || task.get().map(|t| view! {
-                    <p class="text-xs text-zinc-500">{format!("Session history: {} · {}", t.status(), t.notification())}</p>
+                    <p class="text-xs text-muted">{format!("Session history: {} · {}", t.status(), t.notification())}</p>
                     <pre class="whitespace-pre-wrap break-all font-mono text-xs">{t.description}</pre>
                 })}
                 <Suspense fallback=|| view! { <p role="status">"Loading task snapshot…"</p> }>
@@ -365,17 +365,17 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
     let native = kind == "claude_code";
     let (icon, what, tone) = match state {
         "started" => return None,
-        "finished" if native => ("✓", "finished".to_owned(), "text-zinc-500"),
-        "finished" if agent && exit_code == 0 => ("✓", "finished".to_owned(), "text-zinc-500"),
+        "finished" if native => ("✓", "finished".to_owned(), "text-muted"),
+        "finished" if agent && exit_code == 0 => ("✓", "finished".to_owned(), "text-muted"),
         "finished" if agent => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "finished" if exit_code == 0 => ("✓", "exited 0".to_owned(), "text-zinc-500"),
+        "finished" if exit_code == 0 => ("✓", "exited 0".to_owned(), "text-muted"),
         "finished" => ("✗", format!("exited {exit_code}"), "text-red-600 dark:text-red-400"),
         "failed" => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "stopped" if native => ("■", "stopped by Claude Code".to_owned(), "text-zinc-500"),
-        "stopped" => ("■", "stopped by the agent".to_owned(), "text-zinc-500"),
-        "stopped_by_user" => ("■", "stopped by you".to_owned(), "text-zinc-500"),
+        "stopped" if native => ("■", "stopped by Claude Code".to_owned(), "text-muted"),
+        "stopped" => ("■", "stopped by the agent".to_owned(), "text-muted"),
+        "stopped_by_user" => ("■", "stopped by you".to_owned(), "text-muted"),
         "lost" => ("!", "lost (worker restarted or CLI exited)".to_owned(), "text-amber-700 dark:text-amber-400"),
-        other => ("·", other.to_owned(), "text-zinc-500"),
+        other => ("·", other.to_owned(), "text-muted"),
     };
     let label = if agent { format!("agent: {description}") } else { description.to_owned() };
     let time = if state == "lost" { String::new() } else { format!(" · {}", elapsed(elapsed_ms as i64)) };

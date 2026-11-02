@@ -210,7 +210,7 @@ fn AspectCard(a: Aspect, session: Session, #[prop(into)] on_done: Callback<()>) 
         <div class="space-y-2 p-1">
             <div class="flex items-center gap-2">
                 <Glyph mark shape=a.shape() size=14 />
-                <span class="text-[11px] uppercase tracking-wide text-zinc-500">{a.what()}</span>
+                <span class="text-[11px] uppercase tracking-wide text-muted">{a.what()}</span>
                 <span class="min-w-0 flex-1 truncate font-medium" title=a.label.clone()>{a.label.clone()}</span>
                 {page.map(|v| view! { <Go to=v class="shrink-0 text-xs text-blue-600 hover:underline dark:text-blue-400">"Open"</Go> })}
             </div>
@@ -220,19 +220,19 @@ fn AspectCard(a: Aspect, session: Session, #[prop(into)] on_done: Callback<()>) 
                 let n = list.len();
                 view! {
                     <div class="space-y-0.5">
-                        <div class="text-[11px] text-zinc-500">{match n { 0 => "No other session has it".to_owned(), 1 => "1 other session".to_owned(), n => format!("{n} other sessions") }}</div>
+                        <div class="text-[11px] text-muted">{match n { 0 => "No other session has it".to_owned(), 1 => "1 other session".to_owned(), n => format!("{n} other sessions") }}</div>
                         {list.into_iter().take(8).map(|(id, title, mk)| view! {
                             <Go to=View::session(id) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800">
                                 <Glyph mark=Signal::stored(mk) shape=Shape::Circle size=8 />
                                 <span class="min-w-0 flex-1 truncate">{title}</span>
                             </Go>
                         }).collect_view()}
-                        {(n > 8).then(|| view! { <div class="px-1 text-[11px] text-zinc-400">{format!("+{}", n - 8)}</div> })}
+                        {(n > 8).then(|| view! { <div class="px-1 text-[11px] text-muted">{format!("+{}", n - 8)}</div> })}
                     </div>
                 }
             }}
             <div class="border-t border-zinc-200 pt-2 dark:border-zinc-800">
-                <div class="pb-1 text-[11px] text-zinc-500">"Its mark, wherever it shows"</div>
+                <div class="pb-1 text-[11px] text-muted">"Its mark, wherever it shows"</div>
                 <ValuePalette key=a.key.clone() on_pick=on_done />
             </div>
         </div>
@@ -272,7 +272,7 @@ pub fn AspectChips(s: Session) -> impl IntoView {
                     {list.into_iter().map(|a| {
                         let k = a.key.clone();
                         view! {
-                            <span class="inline-flex min-w-0 items-center gap-1 text-xs text-zinc-500" title=a.what()>
+                            <span class="inline-flex min-w-0 items-center gap-1 text-xs text-muted" title=a.what()>
                                 <Glyph mark=Signal::derive(move || live_mark(&k)) shape=a.shape() size=9 />
                                 <span class="max-w-40 truncate">{a.label.clone()}</span>
                             </span>
@@ -310,7 +310,7 @@ pub fn FacetsSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Session aspects"</h2>
-            <p class="text-xs text-zinc-500">
+            <p class="text-xs text-muted">
                 "What a session's tile bar, its row and its dock line show, each in its own shape. Every value wears the same mark everywhere: click one in a tile's bar to change it, or point at it to dim the tiles without it."
             </p>
             <div class="grid gap-2 sm:grid-cols-2">
@@ -323,13 +323,13 @@ pub fn FacetsSetting() -> impl IntoView {
                             <span class="mt-1"><Glyph mark=Signal::stored("slate".to_owned()) shape=Shape::of(aspect) size=11 /></span>
                             <span>
                                 <span class="block text-sm font-medium">{label}</span>
-                                <span class="block text-xs text-zinc-500">{hint}</span>
+                                <span class="block text-xs text-muted">{hint}</span>
                             </span>
                         </label>
                     }
                 }).collect_view()}
             </div>
-            <p class="text-xs text-zinc-500">"Kept in carbon6, for this realm."</p>
+            <p class="text-xs text-muted">"Kept in carbon6, for this realm."</p>
             {move || error.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
         </section>
     }

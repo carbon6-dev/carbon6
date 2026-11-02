@@ -67,7 +67,7 @@ pub fn AnalyticsPage() -> impl IntoView {
     view! {
         <main class="viz mx-auto max-w-5xl space-y-4 px-4 py-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
-                <p class="text-xs text-zinc-500">"Who worked when, what it cost, and what it took of you, for sessions with the filter's labels."</p>
+                <p class="text-xs text-muted">"Who worked when, what it cost, and what it took of you, for sessions with the filter's labels."</p>
                 <select class=format!("{INPUT} w-auto! py-1 text-sm") prop:value=move || days.get().to_string()
                     on:change=move |ev| days.set(event_target_value(&ev).parse().unwrap_or(30))>
                     <option value="1">"Today"</option>
@@ -77,7 +77,7 @@ pub fn AnalyticsPage() -> impl IntoView {
                 </select>
             </div>
             <crate::labels::LabelFilterBar />
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                 {move || report.get().map(|r| match r {
                     Ok(r) => view! { <Report r by keys /> }.into_any(),
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -145,9 +145,9 @@ fn Stat(label: &'static str, value: String, note: String) -> impl IntoView {
     let tip = note.clone();
     view! {
         <div class="rounded-lg border border-zinc-200 px-3 py-2 dark:border-zinc-800">
-            <p class="text-xs text-zinc-500">{label}</p>
+            <p class="text-xs text-muted">{label}</p>
             <p class="text-lg font-semibold tabular-nums">{value}</p>
-            <p class="truncate text-[11px] text-zinc-500" title=tip>{note}</p>
+            <p class="truncate text-[11px] text-muted" title=tip>{note}</p>
         </div>
     }
 }
@@ -213,7 +213,7 @@ fn DayChart(
     let ticks: Vec<usize> = if n <= 2 { (0..n).collect() } else { vec![0, n / 2, n - 1] };
     let body = view! {
         {legend.map(|l| view! { <div class="flex flex-wrap gap-3 text-xs text-zinc-600 dark:text-zinc-400">{l}</div> })}
-        <div class="flex gap-2 text-[11px] text-zinc-500">
+        <div class="flex gap-2 text-[11px] text-muted">
             <div class="flex h-36 shrink-0 flex-col justify-between text-right tabular-nums">
                 <span>{fmt(max)}</span>
                 <span>"0"</span>
@@ -231,7 +231,7 @@ fn DayChart(
                 </div>
             </div>
         </div>
-        <details class="text-xs text-zinc-500">
+        <details class="text-xs text-muted">
             <summary class="cursor-pointer">"Table"</summary>
             <table class="mt-1 w-full tabular-nums">
                 <thead><tr>
@@ -268,7 +268,7 @@ fn Waits(w: c6_api::Waits) -> impl IntoView {
         "Waiting on you",
         view! {
             <table class="w-full text-sm">
-                <thead class="text-xs text-zinc-500"><tr>
+                <thead class="text-xs text-muted"><tr>
                     <th class="text-left font-normal"></th><th class="pl-3 text-right font-normal">"Times"</th>
                     <th class="pl-3 text-right font-normal">"Median"</th><th class="pl-3 text-right font-normal">"90%"</th>
                 </tr></thead>
@@ -277,7 +277,7 @@ fn Waits(w: c6_api::Waits) -> impl IntoView {
                     {row("Your answer to an approval or question", w.answers, w.answer_median_ms, w.answer_p90_ms)}
                 </tbody>
             </table>
-            <p class="text-xs text-zinc-500">"How long sessions sat waiting for you: what to shorten to get more done."</p>
+            <p class="text-xs text-muted">"How long sessions sat waiting for you: what to shorten to get more done."</p>
         },
     )
 }
@@ -303,7 +303,7 @@ fn Models(rows: Vec<ActivityRow>) -> impl IntoView {
         view! {
             <div class="overflow-x-auto">
                 <table class="w-full min-w-[36rem] text-sm">
-                    <thead class="text-xs text-zinc-500"><tr>
+                    <thead class="text-xs text-muted"><tr>
                         <th class="py-1 text-left font-normal">"Model"</th><th class="w-32"></th><th class=TH>"Time"</th>
                         <th class=TH>"Calls"</th><th class=TH>"Per call"</th><th class=TH>"Output/s"</th>
                         <th class=TH>"Tokens in · out"</th><th class=TH title="Of the input, how much the provider served from its prompt cache">"Cached"</th><th class=TH>"Cost"</th>
@@ -337,7 +337,7 @@ fn Tools(rows: Vec<ToolRow>) -> impl IntoView {
         view! {
             <div class="overflow-x-auto">
                 <table class="w-full min-w-[30rem] text-sm">
-                    <thead class="text-xs text-zinc-500"><tr>
+                    <thead class="text-xs text-muted"><tr>
                         <th class="py-1 text-left font-normal">"Tool"</th><th class="w-32"></th><th class=TH>"Time"</th>
                         <th class=TH>"Calls"</th><th class=TH>"Median"</th><th class=TH>"Failed"</th>
                     </tr></thead>
@@ -373,14 +373,14 @@ fn Groups(rows: Vec<ActivityRow>, by: RwSignal<String>, keys: Memo<Vec<String>>)
             </div>
             <div class="overflow-x-auto">
                 <table class="w-full min-w-[36rem] text-sm">
-                    <thead class="text-xs text-zinc-500"><tr>
+                    <thead class="text-xs text-muted"><tr>
                         <th class="py-1 text-left font-normal">{key.clone()}</th><th class="w-32"></th><th class=TH>"Agent time"</th>
                         <th class=TH>"Sessions"</th><th class=TH>"Turns"</th><th class=TH>"Your messages"</th>
                         <th class=TH>"Corrections per task"</th><th class=TH>"Cost"</th>
                     </tr></thead>
                     <tbody>
                         {rows.into_iter().map(|r| {
-                            let name = if r.key.is_empty() { view! { <span class="italic text-zinc-500">{format!("no {key}")}</span> }.into_any() }
+                            let name = if r.key.is_empty() { view! { <span class="italic text-muted">{format!("no {key}")}</span> }.into_any() }
                                 else { view! { <span>{r.key.clone()}</span> }.into_any() };
                             view! {
                                 <tr class="border-t border-zinc-100 dark:border-zinc-800">

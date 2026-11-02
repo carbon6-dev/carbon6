@@ -32,11 +32,11 @@ pub(crate) fn sorted_as(category: &str) -> (&'static str, &'static str) {
         "needs_you" => ("Needs you", "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"),
         "first_contact" => ("First contact", "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300"),
         "pitch" => ("Cold pitch", "bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"),
-        "newsletter" => ("Newsletter", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
-        "notification" => ("Notification", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
+        "newsletter" => ("Newsletter", "bg-zinc-100 text-muted dark:bg-zinc-900"),
+        "notification" => ("Notification", "bg-zinc-100 text-muted dark:bg-zinc-900"),
         "fyi" => ("FYI", "bg-zinc-100 text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400"),
-        "noise" => ("Noise", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
-        "yours" => ("You wrote last", "bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500"),
+        "noise" => ("Noise", "bg-zinc-100 text-muted dark:bg-zinc-900"),
+        "yours" => ("You wrote last", "bg-zinc-100 text-muted dark:bg-zinc-900"),
         _ => ("", ""),
     }
 }
@@ -145,7 +145,7 @@ pub fn MailPage() -> impl IntoView {
                     }
                 }).collect_view()}
                 {move || labels.get().and_then(Result::ok).filter(|l| !l.is_empty()).map(|ls| view! {
-                    <p class="mt-2 hidden px-2 text-[10px] uppercase tracking-wide text-zinc-400 sm:block">"Labels"</p>
+                    <p class="mt-2 hidden px-2 text-[10px] uppercase tracking-wide text-muted sm:block">"Labels"</p>
                     {ls.into_iter().map(|(_, id, name)| {
                         let key = format!("label:{id}");
                         let k2 = key.clone();
@@ -168,10 +168,10 @@ pub fn MailPage() -> impl IntoView {
                     None => view! {
                         <div>
                             {move || match threads.get() {
-                                None => Some(view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any()),
+                                None => Some(view! { <p class="text-sm text-muted">"Loading…"</p> }.into_any()),
                                 Some(r) => Some(match r {
                                 Err(e) => view! { <MailError e /> }.into_any(),
-                                Ok(v) if v.is_empty() => view! { <p class="p-4 text-center text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
+                                Ok(v) if v.is_empty() => view! { <p class="p-4 text-center text-sm text-muted">"Nothing here."</p> }.into_any(),
                                 Ok(v) => view! {
                                     <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                                         {v.into_iter().map(|t| {
@@ -186,16 +186,16 @@ pub fn MailPage() -> impl IntoView {
                                                             view! { <span class=format!("shrink-0 rounded px-1.5 text-[10px] font-medium {class}") title=x.reason.clone()>{label}</span> }
                                                         })}
                                                         {t.starred.then(|| view! { <span class="text-amber-500">"★"</span> })}
-                                                        {t.attachments.then(|| view! { <span class="text-zinc-400">"📎"</span> })}
-                                                        <span class="shrink-0 text-xs font-normal text-zinc-500">{crate::when::compact(t.date)}</span>
+                                                        {t.attachments.then(|| view! { <span class="text-muted">"📎"</span> })}
+                                                        <span class="shrink-0 text-xs font-normal text-muted">{crate::when::compact(t.date)}</span>
                                                     </div>
                                                     <div class="truncate text-sm">{t.subject.clone()}</div>
-                                                    <div class="truncate text-xs font-normal text-zinc-500">{t.snippet.clone()}</div>
+                                                    <div class="truncate text-xs font-normal text-muted">{t.snippet.clone()}</div>
                                                 </button>
                                             }
                                         }).collect_view()}
                                     </div>
-                                    <div node_ref=end class="p-3 text-center text-xs text-zinc-500">
+                                    <div node_ref=end class="p-3 text-center text-xs text-muted">
                                         {move || if busy.get() { "Loading more…" } else if done.get() { "That's all." } else { "" }}
                                     </div>
                                 }.into_any(),
@@ -245,7 +245,7 @@ fn Sorting(target: String, refresh: RwSignal<u32>, in_brief: bool) -> impl IntoV
             view! {
                 <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                     <span class=format!("rounded px-1.5 text-xs font-medium {class}")>{label}</span>
-                    <span class="min-w-0 flex-1 text-zinc-600 dark:text-zinc-400">{t.reason.clone()}<span class="text-xs text-zinc-400">{format!(" · by {by}")}</span></span>
+                    <span class="min-w-0 flex-1 text-zinc-600 dark:text-zinc-400">{t.reason.clone()}<span class="text-xs text-muted">{format!(" · by {by}")}</span></span>
                     {(t.kind == "mail" && t.category != "pitch" && t.known == Some(false)).then(|| view! {
                         <button class=BUTTON_QUIET title="Their mail is always a cold pitch"
                             on:click=move |_| act("memex.triage.mark", json!({"target": target.get_value(), "mark": "pitch"}))>"Cold pitch"</button>
@@ -292,7 +292,7 @@ fn RequestActions(id: i64, in_brief: bool, refresh: impl Fn() + Copy + Send + Sy
     };
     view! {
         <span class="flex w-full flex-wrap items-center gap-1 sm:w-auto">
-            <span class="text-xs text-zinc-500">"Request:"</span>
+            <span class="text-xs text-muted">"Request:"</span>
             <button class=BUTTON_QUIET on:click=move |_| act(Settle::Done)>"Done"</button>
             <button class=BUTTON_QUIET on:click=move |_| act(Settle::Tomorrow)>"Tomorrow"</button>
             <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(Settle::Drop)>"Drop"</button>
@@ -312,7 +312,7 @@ pub fn SenderMarks() -> impl IntoView {
         marks.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).filter(|l| !l.is_empty()).map(|list| view! {
             <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
                 <h2 class="font-medium">"Senders you marked"</h2>
-                <p class="text-sm text-zinc-500">"A pitch: everything they send is sorted as a cold pitch. Known: nothing they send is."</p>
+                <p class="text-sm text-muted">"A pitch: everything they send is sorted as a cold pitch. Known: nothing they send is."</p>
                 <div class="divide-y divide-zinc-100 text-sm dark:divide-zinc-800">
                     {list.into_iter().map(|x| {
                         let pattern = x["pattern"].as_str().unwrap_or_default().to_owned();
@@ -320,7 +320,7 @@ pub fn SenderMarks() -> impl IntoView {
                         view! {
                             <div class="flex items-center gap-2 py-1.5">
                                 <span class="min-w-0 flex-1 truncate font-mono text-xs">{pattern}</span>
-                                <span class="text-xs text-zinc-500">{if x["mark"] == "pitch" { "cold pitch" } else { "known" }}</span>
+                                <span class="text-xs text-muted">{if x["mark"] == "pitch" { "cold pitch" } else { "known" }}</span>
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                     let p = p.clone();
                                     spawn_local(async move {
@@ -593,13 +593,13 @@ fn Message(m: MailMessage) -> impl IntoView {
             <div class="flex flex-wrap items-baseline gap-2 text-sm">
                 <crate::people::Person class="font-medium" label=if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() }
                     name=if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() } address=m.from.clone() />
-                <span class="text-xs text-zinc-500">
+                <span class="text-xs text-muted">
                     {format!("<{}> to ", m.from)}
                     {people(m.to.clone())}
                     {(!m.cc.is_empty()).then(|| { let cc = m.cc.clone(); view! { " · cc " {people(cc)} } })}
                 </span>
                 <span class="flex-1"></span>
-                <span class="text-xs text-zinc-500">{crate::when::full(m.date)}</span>
+                <span class="text-xs text-muted">{crate::when::full(m.date)}</span>
             </div>
             {match html {
                 Some(h) => view! {
@@ -635,7 +635,7 @@ fn Message(m: MailMessage) -> impl IntoView {
                     {files.iter().map(|a| view! { <FileChip name=a.name.clone() mime=a.mime.clone() size=a.size href=api::mail_attachment(&item, a.index) /> }).collect_view()}
                 </div>
             })}
-            {(!has_html && m.text.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">"(no text)"</p> })}
+            {(!has_html && m.text.is_empty()).then(|| view! { <p class="text-xs text-muted">"(no text)"</p> })}
         </article>
     }
 }
@@ -650,7 +650,7 @@ pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> i
             <span class="text-lg">{icon}</span>
             <span class="min-w-0">
                 <span class="block truncate text-xs font-medium">{name}</span>
-                <span class="block text-[10px] text-zinc-500">{format!("{kind} · {}", self::size(size))}</span>
+                <span class="block text-[10px] text-muted">{format!("{kind} · {}", self::size(size))}</span>
             </span>
         </a>
     }
@@ -796,12 +796,12 @@ pub fn GoogleSettings() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Mail & calendar"
-                    <span class="ml-2 text-sm font-normal text-zinc-500">{move || {
+                    <span class="ml-2 text-sm font-normal text-muted">{move || {
                         let r = api::realm().get();
                         format!("in {} (pick a realm in the header for another's)", if r.is_empty() { "home".to_owned() } else { r })
                     }}</span>
                 </h2>
-                <p class="text-sm text-zinc-500">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts, in each realm you install them in, with that realm's accounts and mail (they run on a worker with Docker or Podman, reaching only Google). The OAuth client here is this realm's own; without one, root's (set in the console) applies. Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
+                <p class="text-sm text-muted">"Your Gmail and Google Workspace accounts: mail, calendars and contacts, synced both ways by the apps gmail, google-calendar and google-contacts, in each realm you install them in, with that realm's accounts and mail (they run on a worker with Docker or Podman, reaching only Google). The OAuth client here is this realm's own; without one, root's (set in the console) applies. Google needs an OAuth client from your Google Cloud project: enable the Gmail, Calendar and People APIs, create an OAuth client of type Web application with the redirect URI below, and set the app to In production (personal Gmail: otherwise sign-ins expire weekly; you will see Google's unverified-app notice once) or Internal (Workspace)."</p>
             </div>
             {move || client.get().and_then(Result::ok).filter(|c| c.apps.len() < 3).map(|c| {
                 let waiting = !c.waiting.is_empty();
@@ -824,9 +824,9 @@ pub fn GoogleSettings() -> impl IntoView {
                 }
             })}
             {move || client.get().and_then(Result::ok).map(|c| view! {
-                <p class="text-xs text-zinc-500">"Redirect URI: " <code class="select-all font-mono">{c.redirect_uri.clone()}</code></p>
+                <p class="text-xs text-muted">"Redirect URI: " <code class="select-all font-mono">{c.redirect_uri.clone()}</code></p>
                 {(c.from_root && !c.client_id.is_empty()).then(|| view! {
-                    <p class="text-xs text-zinc-500">"Using root's client (set in the console). Saving one here gives this realm its own."</p>
+                    <p class="text-xs text-muted">"Using root's client (set in the console). Saving one here gives this realm its own."</p>
                 })}
             })}
             <div class="grid gap-2 sm:grid-cols-2">
@@ -857,7 +857,7 @@ pub fn GoogleSettings() -> impl IntoView {
                             view! {
                                 <div class="flex flex-wrap items-center gap-2 py-1.5">
                                     <span class="font-medium">{a.email.clone()}</span>
-                                    <span class="min-w-0 flex-1 truncate text-xs text-zinc-500" title=mine.join("\n")>{mine.join(" · ")}</span>
+                                    <span class="min-w-0 flex-1 truncate text-xs text-muted" title=mine.join("\n")>{mine.join(" · ")}</span>
                                     <button class="text-xs text-red-600 hover:underline" on:click=move |_| {
                                         if !window().confirm_with_message("Disconnect this account from the Google apps? (What is in the memex stays.)").unwrap_or(false) { return; }
                                         let id = id.clone();

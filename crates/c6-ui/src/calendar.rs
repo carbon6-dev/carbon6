@@ -99,7 +99,7 @@ pub fn CalendarPage() -> impl IntoView {
                 }}</span>
                 <span class="flex-1"></span>
                 {[("agenda", "Agenda"), ("week", "Week"), ("month", "Month")].into_iter().map(|(m, label)| view! {
-                    <button class=move || format!("rounded-md px-2 py-1 text-sm {}", if mode.get() == m { "bg-zinc-200 dark:bg-zinc-800" } else { "text-zinc-500" }) on:click=move |_| mode.set(m)>{label}</button>
+                    <button class=move || format!("rounded-md px-2 py-1 text-sm {}", if mode.get() == m { "bg-zinc-200 dark:bg-zinc-800" } else { "text-muted" }) on:click=move |_| mode.set(m)>{label}</button>
                 }).collect_view()}
                 <button class=BUTTON on:click=move |_| creating.set(true)>"New event"</button>
             </div>
@@ -122,7 +122,7 @@ pub fn CalendarPage() -> impl IntoView {
             })}
             {move || creating.get().then(|| view! { <NewEvent creating refresh /> })}
             {move || open.get().map(|e| view! { <Detail e open refresh /> })}
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                 {move || events.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=format!("{e} (Connect a Google account in Settings → Mail & calendar.)") /> }.into_any(),
                     Ok(list) => {
@@ -135,9 +135,9 @@ pub fn CalendarPage() -> impl IntoView {
                             let e2 = e.clone();
                             let declined = e.my_status == "declined";
                             view! {
-                                <button class=format!("block w-full truncate rounded px-1 py-0.5 text-left text-xs hover:bg-sky-100 dark:hover:bg-sky-950 {}", if declined { "line-through text-zinc-400" } else { "" })
+                                <button class=format!("block w-full truncate rounded px-1 py-0.5 text-left text-xs hover:bg-sky-100 dark:hover:bg-sky-950 {}", if declined { "line-through text-muted" } else { "" })
                                     on:click=move |_| open.set(Some(e2.clone()))>
-                                    {(!e.all_day).then(|| view! { <span class="text-zinc-500">{hm(e.start)}" "</span> })}
+                                    {(!e.all_day).then(|| view! { <span class="text-muted">{hm(e.start)}" "</span> })}
                                     {e.summary.clone()}
                                 </button>
                             }
@@ -149,7 +149,7 @@ pub fn CalendarPage() -> impl IntoView {
                                         let today = d == midnight(js_sys::Date::now());
                                         view! {
                                             <div class="min-h-20 bg-white p-1 dark:bg-zinc-950">
-                                                <div class=if today { "font-semibold text-sky-600" } else { "text-zinc-500" }>{date_of(d).get_date()}</div>
+                                                <div class=if today { "font-semibold text-sky-600" } else { "text-muted" }>{date_of(d).get_date()}</div>
                                                 {on(d).into_iter().take(4).map(chip).collect_view()}
                                             </div>
                                         }
@@ -162,7 +162,7 @@ pub fn CalendarPage() -> impl IntoView {
                                         let evs = on(d);
                                         (!evs.is_empty()).then(|| view! {
                                             <div>
-                                                <h3 class="text-xs font-medium uppercase text-zinc-500">{day_label(d)}</h3>
+                                                <h3 class="text-xs font-medium uppercase text-muted">{day_label(d)}</h3>
                                                 {evs.into_iter().map(chip).collect_view()}
                                             </div>
                                         })
@@ -173,7 +173,7 @@ pub fn CalendarPage() -> impl IntoView {
                                 <div class="grid gap-2 sm:grid-cols-7">
                                     {days.into_iter().map(|d| view! {
                                         <div class="min-h-24 rounded-lg border border-zinc-200 p-1 dark:border-zinc-800">
-                                            <div class="mb-1 text-xs font-medium text-zinc-500">{day_label(d)}</div>
+                                            <div class="mb-1 text-xs font-medium text-muted">{day_label(d)}</div>
                                             {on(d).into_iter().map(chip).collect_view()}
                                         </div>
                                     }).collect_view()}
@@ -228,7 +228,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
             <div class="flex items-start gap-2">
                 <div class="min-w-0 flex-1">
                     <h2 class="font-semibold">{e.summary.clone()}</h2>
-                    <p class="text-sm text-zinc-500">{when}{(!e.location.is_empty()).then(|| format!(" · {}", e.location))}</p>
+                    <p class="text-sm text-muted">{when}{(!e.location.is_empty()).then(|| format!(" · {}", e.location))}</p>
                 </div>
                 <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Close"</button>
             </div>
@@ -238,13 +238,13 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
             {(!e.attendees.is_empty()).then(|| view! {
                 <ul class="text-sm">
                     {e.attendees.iter().map(|a| view! {
-                        <li>{if a.name.is_empty() { a.email.clone() } else { a.name.clone() }}<span class="ml-1 text-xs text-zinc-500">{a.response.clone()}</span></li>
+                        <li>{if a.name.is_empty() { a.email.clone() } else { a.name.clone() }}<span class="ml-1 text-xs text-muted">{a.response.clone()}</span></li>
                     }).collect_view()}
                 </ul>
             })}
             <div class="flex flex-wrap items-center gap-2">
                 {(!e.my_status.is_empty()).then(|| view! {
-                    <span class="text-xs text-zinc-500">"Going?"</span>
+                    <span class="text-xs text-muted">"Going?"</span>
                     <button class=BUTTON_QUIET on:click=move |_| rsvp("accepted")>"Yes"</button>
                     <button class=BUTTON_QUIET on:click=move |_| rsvp("tentative")>"Maybe"</button>
                     <button class=BUTTON_QUIET on:click=move |_| rsvp("declined")>"No"</button>

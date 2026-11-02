@@ -12,7 +12,7 @@ use crate::workspace::{ColumnCtx, Go, Popover, ScrollBox, Target, View, below, u
 use crate::{api, markdown, sessions};
 
 /// The small bordered action buttons on a message row (Edit, Rewind, Ask).
-const UBTN: &str = "rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-zinc-500 shadow-sm hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100";
+const UBTN: &str = "rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-muted shadow-sm hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100";
 
 /// Live-only state, replaced by durable events as they arrive.
 #[derive(Clone, Default)]
@@ -702,7 +702,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                             {s.parent_id.clone().map(|p| if s.parent_call_id.is_some() {
                                 view! { <Lineage session=d.session.clone() /> }.into_any()
                             } else {
-                                view! { <p class="mb-3 text-sm text-zinc-500">"Side chat · branched from "<Go to=View::session(p) class="underline">"its parent session"</Go></p> }.into_any()
+                                view! { <p class="mb-3 text-sm text-muted">"Side chat · branched from "<Go to=View::session(p) class="underline">"its parent session"</Go></p> }.into_any()
                             })}
                         }.into_any()
                     }
@@ -722,7 +722,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     ("transcript", _, _) => ().into_any(),
                     ("config", _, _) => view! { <crate::labels::SessionConfig session=id_stored.get_value() /> }.into_any(),
                     ("outputs", _, _) => view! { <crate::outputs::Outputs session=id_stored.get_value() events chosen=output /> }.into_any(),
-                    _ => view! { <p class="py-6 text-center text-sm text-zinc-500">"Available once the session has started."</p> }.into_any(),
+                    _ => view! { <p class="py-6 text-center text-sm text-muted">"Available once the session has started."</p> }.into_any(),
                 }
             }}
             <div class:hidden=move || tab.get() != "transcript">
@@ -845,7 +845,7 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
                         _ => {}
                     } />
                 <button class=format!("{BUTTON} py-1 text-xs") on:click=move |_| save.run(())>"Save"</button>
-                <button class=format!("{BUTTON_QUIET} py-1 text-xs text-zinc-500") on:click=move |_| on_done.run(())>"Cancel"</button>
+                <button class=format!("{BUTTON_QUIET} py-1 text-xs text-muted") on:click=move |_| on_done.run(())>"Cancel"</button>
             </div>
             {move || error.get().map(|e| view! { <p class="text-[11px] text-red-600">{e}</p> })}
         </div>
@@ -956,7 +956,7 @@ fn SessionBar(
                 })}
                 {bar_tab(tab, "Terminal", "terminal", ())}
                 {bar_tab(tab, "Outputs", "outputs", move || (outputs.get() > 0).then(|| view! {
-                    <span class="tabular-nums text-zinc-500">{outputs.get()}</span>
+                    <span class="tabular-nums text-muted">{outputs.get()}</span>
                 }))}
                 {bar_tab(tab, "Config", "config", ())}
             </div>
@@ -964,7 +964,7 @@ fn SessionBar(
                 <crate::tasks::RunningTasks session=session.get_value() events compact=true on_open=move |()| details.set(true) />
                 <SubagentsPill tree=subagents />
                 {context}
-                <button class=move || format!("{BAR_ITEM} {}", if details.get() { "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100" } else { "text-zinc-500" })
+                <button class=move || format!("{BAR_ITEM} {}", if details.get() { "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100" } else { "text-muted" })
                     title="Details (⌘I)" aria-label="Details" aria-pressed=move || details.get().to_string()
                     on:click=move |_| details.update(|d| *d = !*d)>
                     // A box with its drawer pulled out.
@@ -974,7 +974,7 @@ fn SessionBar(
                     </svg>
                 </button>
                 <Show when=move || own_menu.get()>
-                    <button class=format!("{BAR_ITEM} text-zinc-500") title="Actions: rename, find, new like this, save as template, archive"
+                    <button class=format!("{BAR_ITEM} text-muted") title="Actions: rename, find, new like this, save as template, archive"
                         on:click=move |ev| {
                             rename_from.set_value(below(&ev, 320.0));
                             menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) });
@@ -1041,7 +1041,7 @@ fn Lineage(session: Session) -> impl IntoView {
     });
     let agent = (!session.agent.is_empty()).then(|| format!(" ({})", session.agent));
     view! {
-        <p class="mb-3 flex flex-wrap items-center gap-1 text-sm text-zinc-500">
+        <p class="mb-3 flex flex-wrap items-center gap-1 text-sm text-muted">
             <span class="font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
             {agent}
             <span>"·"</span>
@@ -1206,7 +1206,7 @@ pub(crate) fn SubagentList(tree: SubagentTree, #[prop(optional, into)] on_go: Op
                         }>
                         <span class=format!("w-24 shrink-0 {tone}")>{pill}</span>
                         <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
-                        <span class="max-w-[40%] shrink-0 truncate font-mono text-zinc-500">{s.model.clone()}</span>
+                        <span class="max-w-[40%] shrink-0 truncate font-mono text-muted">{s.model.clone()}</span>
                     </button>
                 }
             })
@@ -1404,7 +1404,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             // expanded cards stay open while the turn continues.
             {move || feed.more().then(|| view! {
                 <div node_ref=top class="flex justify-center">
-                    <button class="text-xs text-zinc-500 underline" on:click=move |_| earlier()>
+                    <button class="text-xs text-muted underline" on:click=move |_| earlier()>
                         {move || if feed.loading.get() { "Loading earlier messages…" } else { "Earlier messages" }}
                     </button>
                 </div>
@@ -1444,7 +1444,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                                     })).unwrap_or_default();
                                     let files = if restored { " · files restored".to_owned() } else if err.is_empty() { String::new() } else { format!(" · files not restored: {err}") };
                                     view! {
-                                        <div class="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-zinc-300 px-3 py-1.5 text-xs text-zinc-500 dark:border-zinc-700">
+                                        <div class="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-zinc-300 px-3 py-1.5 text-xs text-muted dark:border-zinc-700">
                                             <span>{format!("↶ Rewound to before “{what}”{files}")}</span>
                                             <span class="flex-1"></span>
                                             <button class="underline" on:click=move |_| shown.update(|s| if !s.remove(&seq) { s.insert(seq); })>
@@ -1486,8 +1486,8 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             </For>
             {move || to.get().is_some().then(|| view! {
                 <div node_ref=bottom class="flex justify-center gap-3">
-                    <button class="text-xs text-zinc-500 underline" on:click=move |_| feed.later()>"Later messages"</button>
-                    <button class="text-xs text-zinc-500 underline" on:click=move |_| {
+                    <button class="text-xs text-muted underline" on:click=move |_| feed.later()>"Later messages"</button>
+                    <button class="text-xs text-muted underline" on:click=move |_| {
                         feed.latest();
                         if let Some(Follow(f)) = follow { f.set(true) }
                     }>"Latest ↓"</button>
@@ -1506,13 +1506,13 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             // Through the whole turn, so the end of the page doesn't come and
             // go as text starts and stops streaming.
             {move || running.get().then(|| view! {
-                <div class="flex items-center gap-2 text-sm text-zinc-500">
+                <div class="flex items-center gap-2 text-sm text-muted">
                     <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
                     {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
                 </div>
             })}
             {move || running.get().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
-                <p class="font-mono text-[11px] text-zinc-500">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
+                <p class="font-mono text-[11px] text-muted">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
             })}
             {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
@@ -1701,7 +1701,7 @@ fn side_chat(s: Session, open_now: bool) -> AnyView {
     let s = StoredValue::new(s);
     view! {
         <div class="ml-2 border-l-2 border-sky-300 pl-3 dark:border-sky-800">
-            <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
+            <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
                 <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
                 <span class="shrink-0 font-medium text-sky-700 dark:text-sky-400">"Side chat"</span>
                 <span class="truncate text-zinc-700 dark:text-zinc-300">{title}</span>
@@ -1997,7 +1997,7 @@ const SEND_EMPTY: &str = "bg-zinc-600 text-zinc-200";
 const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
 
 /// Stop: a thin ring, a small square in it.
-const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-zinc-400 hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
+const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-muted hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
 
 /// Send's icon, an arrow up: its one path, to change it.
 const SEND_ICON: &str = "M8 13V3M3.5 7.5 8 3l4.5 4.5";
@@ -2021,7 +2021,7 @@ fn stop_icon() -> impl IntoView {
 /// The tile bar's ⋯ menu: an item, the hint after it, and the line
 /// between groups.
 const MENU_ITEM: &str = "flex w-full items-center gap-3 rounded px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800";
-const MENU_HINT: &str = "ml-auto text-[11px] text-zinc-400";
+const MENU_HINT: &str = "ml-auto text-[11px] text-muted";
 const MENU_RULE: &str = "my-1 border-t border-zinc-200 dark:border-zinc-700";
 
 /// A quiet button in the session's bar (how it stands, its details).
@@ -2029,7 +2029,7 @@ const BAR_ITEM: &str = "flex shrink-0 items-center gap-1.5 whitespace-nowrap rou
 
 /// The message box's model chip: quiet, grey text with a background only on
 /// hover, so the toolbar doesn't compete with what you're typing.
-const CHIP: &str = "inline-flex h-6 max-w-full items-center gap-1 rounded-md px-1.5 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+const CHIP: &str = "inline-flex h-6 max-w-full items-center gap-1 rounded-md px-1.5 text-muted hover:bg-zinc-100 hover:text-zinc-800 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
 /// A small on/off switch (the look of the document comments' "Send to agent").
 #[component]
@@ -2199,7 +2199,7 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
                     _ => {}
                 }
             />
-            <span class="min-w-16 px-1 text-center text-xs tabular-nums text-zinc-500" title=move || error.get().unwrap_or_default()>
+            <span class="min-w-16 px-1 text-center text-xs tabular-nums text-muted" title=move || error.get().unwrap_or_default()>
                 {move || match (error.get(), found.get()) {
                     (Some(_), _) => "—".to_owned(),
                     (None, Some(m)) if m.matches.is_empty() => "no matches".to_owned(),
@@ -2209,7 +2209,7 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
             </span>
             <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Previous match (Shift+Enter, ⇧⌘G)" on:click=move |_| step(-1)>"↑"</button>
             <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Next match (Enter, ⌘G)" on:click=move |_| step(1)>"↓"</button>
-            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| close()>"✕"</button>
+            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs text-muted") title="Close (Esc)" on:click=move |_| close()>"✕"</button>
         </div>
     }
 }
@@ -2338,7 +2338,7 @@ fn SessionMessage(from: String, title: String, text: String, prompt: String) -> 
                     </button>
                 })}
                 {(!prompt.is_empty()).then(|| view! {
-                    <details class="text-xs text-zinc-500">
+                    <details class="text-xs text-muted">
                         <summary class="cursor-pointer select-none">"What the agent received"</summary>
                         <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt}</pre>
                     </details>
@@ -2395,7 +2395,7 @@ pub(crate) fn FullImage(
             <img class=if fill { "h-[80dvh] w-[92vw] rounded-md bg-white object-contain shadow-2xl" } else { "max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" } src=src alt=name.clone() on:click=|ev| ev.stop_propagation() />
             <div class="flex items-center gap-3 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
                 <span class="max-w-[60vw] truncate">{name}</span>
-                {(!info.is_empty()).then(|| view! { <span class="text-zinc-400">{info}</span> })}
+                {(!info.is_empty()).then(|| view! { <span class="text-muted">{info}</span> })}
                 {children.map(|c| c())}
                 <button class=FULL_BUTTON title="Close (Esc)" on:click=move |_| close.run(())>"Close"</button>
             </div>
@@ -2441,7 +2441,7 @@ fn render_event(
 ) -> AnyView {
     match &e.kind {
         EventKind::Started { system_prompt, tools, .. } => view! {
-            <details class="text-xs text-zinc-500">
+            <details class="text-xs text-muted">
                 <summary class="cursor-pointer select-none">{format!("Session started · {} tools", tools.len())}</summary>
                 <pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{system_prompt.clone()}</pre>
             </details>
@@ -2459,7 +2459,7 @@ fn render_event(
                 let (icon, what, tone) = match s {
                     "allowed" => ("✓", "Approved", "text-emerald-700 dark:text-emerald-400"),
                     "denied" => ("✗", "Denied", "text-red-600 dark:text-red-400"),
-                    _ => ("⌛", "No answer: not run", "text-zinc-500"),
+                    _ => ("⌛", "No answer: not run", "text-muted"),
                 };
                 view! { <p class=format!("flex items-center gap-2 text-xs {tone}")><span>{icon}</span><span>{what}</span></p> }.into_any()
             }
@@ -2485,9 +2485,9 @@ fn render_event(
                         Some(format!("{}: {text}", if f.label.is_empty() { &f.name } else { &f.label }))
                     })
                     .collect();
-                view! { <p class="flex items-start gap-2 text-xs text-zinc-500"><span>"✎"</span><span>{format!("Answered “{title}” · {}", shown.join(" · "))}</span></p> }.into_any()
+                view! { <p class="flex items-start gap-2 text-xs text-muted"><span>"✎"</span><span>{format!("Answered “{title}” · {}", shown.join(" · "))}</span></p> }.into_any()
             }
-            _ => view! { <p class="flex items-center gap-2 text-xs text-zinc-500"><span>"✗"</span><span>{format!("Not answered: {title}")}</span></p> }.into_any(),
+            _ => view! { <p class="flex items-center gap-2 text-xs text-muted"><span>"✗"</span><span>{format!("Not answered: {title}")}</span></p> }.into_any(),
         },
         EventKind::Notice { title, message, priority } => {
             let tone = if priority == "high" { "border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950" } else { "border-zinc-200 dark:border-zinc-800" };
@@ -2505,14 +2505,14 @@ fn render_event(
             } else {
                 format!("Remembered ({}): {text}", if scope.is_empty() { "every session" } else { scope })
             };
-            view! { <p class="flex items-start gap-2 text-xs text-zinc-500"><span>"🧠"</span><span class="whitespace-pre-wrap">{what}</span></p> }.into_any()
+            view! { <p class="flex items-start gap-2 text-xs text-muted"><span>"🧠"</span><span class="whitespace-pre-wrap">{what}</span></p> }.into_any()
         }
         EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, .. } => {
             crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
         }
         // What the agent was told about a task: folded.
         EventKind::User { text, command, .. } if command == "task-notification" => view! {
-            <details class="text-xs text-zinc-500">
+            <details class="text-xs text-muted">
                 <summary class="cursor-pointer select-none">"↳ the agent was told"</summary>
                 <pre class="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-2 font-mono text-[11px] dark:bg-zinc-900">{text.clone()}</pre>
             </details>
@@ -2566,7 +2566,7 @@ fn render_event(
                         <p class="max-w-[85%] text-right text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
                     })}
                     {(!prompt.is_empty()).then(|| view! {
-                        <details class="max-w-[85%] text-xs text-zinc-500">
+                        <details class="max-w-[85%] text-xs text-muted">
                             <summary class="cursor-pointer select-none text-right">{if delegated { "sent with the subagent note".to_owned() } else if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
                             <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
                         </details>
@@ -2581,7 +2581,7 @@ fn render_event(
                 <div class="space-y-2">
                     {blocks.iter().map(|b| match b {
                         ContentBlock::ServerTool { label } => view! {
-                            <p class="flex items-center gap-2 text-xs text-zinc-500"><span>"⌕"</span><span class="font-mono">{label.clone()}</span></p>
+                            <p class="flex items-center gap-2 text-xs text-muted"><span>"⌕"</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
                         ContentBlock::Text { text } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::to_html(text)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
@@ -2594,14 +2594,14 @@ fn render_event(
                             view! { <ToolCard name=name.clone() input_json=input_json.clone() call_id=id.clone() result=result.into() live_output=live_output.into() /> }.into_any()
                         }
                     }).collect_view()}
-                    {interrupted.then(|| view! { <p class="text-xs italic text-zinc-500">"(response cut off)"</p> })}
+                    {interrupted.then(|| view! { <p class="text-xs italic text-muted">"(response cut off)"</p> })}
                 </div>
             }
             .into_any()
         }
         EventKind::Error { message } => view! { <ErrorBox message=message.clone() /> }.into_any(),
         EventKind::ModelSwitched { model, handoff: None, .. } => view! {
-            <p class="flex items-center gap-2 text-xs text-zinc-500">
+            <p class="flex items-center gap-2 text-xs text-muted">
                 <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
                 {format!("Switched to {model}")}
                 <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
@@ -2618,7 +2618,7 @@ fn render_event(
                     <p>"It got the conversation so far as a transcript: your messages, the replies, and tool calls with their output. The other runtime's reasoning and tool state did not carry over."</p>
                     {shown.map(|(prompt, tools)| view! {
                         <details>
-                            <summary class="cursor-pointer select-none text-zinc-500">"Its system prompt and tools"</summary>
+                            <summary class="cursor-pointer select-none text-muted">"Its system prompt and tools"</summary>
                             <p class="mt-1">{tools}</p>
                             <pre class="mt-1 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt}</pre>
                         </details>
@@ -2628,7 +2628,7 @@ fn render_event(
             .into_any()
         }
         EventKind::Compaction { summary, tokens_before } => view! {
-            <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-700">
+            <details class="rounded-md border border-dashed border-zinc-300 px-3 py-2 text-xs text-muted dark:border-zinc-700">
                 <summary class="cursor-pointer select-none">
                     {format!("Context compacted ({} tokens summarized); the model continues from this summary", tokens(*tokens_before))}
                 </summary>
@@ -2644,9 +2644,9 @@ fn render_event(
                 _ => None,
             };
             view! {
-                {note.map(|n| view! { <p class="text-center text-xs text-zinc-500">{n}</p> })}
+                {note.map(|n| view! { <p class="text-center text-xs text-muted">{n}</p> })}
                 {move || usage.with(|u| u.turns.get(&turn).copied()).map(|t| view! {
-                    <p class="border-t border-zinc-200 pt-1 font-mono text-[11px] text-zinc-400 dark:border-zinc-800">
+                    <p class="border-t border-zinc-200 pt-1 font-mono text-[11px] text-muted dark:border-zinc-800">
                         {format!("Turn {turn} · {}", turn_line(&t, None))}
                     </p>
                 })}
@@ -2660,7 +2660,7 @@ fn render_event(
 #[component]
 fn Thinking(#[prop(into)] text: Signal<String>, open: bool) -> impl IntoView {
     view! {
-        <details class="border-l-2 border-zinc-300 pl-3 text-sm text-zinc-500 dark:border-zinc-700" open=open>
+        <details class="border-l-2 border-zinc-300 pl-3 text-sm text-muted dark:border-zinc-700" open=open>
             <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
             <div class="mt-1 whitespace-pre-wrap text-xs">{move || text.get()}</div>
         </details>
@@ -2731,7 +2731,7 @@ fn subagent_state(running: bool, end: Option<TurnEndReason>) -> (&'static str, &
         (false, Some(TurnEndReason::Interrupted)) => ("⏸ interrupted", "text-amber-700 dark:text-amber-400"),
         (false, Some(TurnEndReason::WorkerRestarted)) => ("⚠ lost", "text-amber-700 dark:text-amber-400"),
         (false, Some(_)) => ("✕ failed", "text-red-600 dark:text-red-400"),
-        (false, None) => ("○ starting", "text-zinc-500"),
+        (false, None) => ("○ starting", "text-muted"),
     }
 }
 
@@ -2817,7 +2817,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
             } else {
                 let (pill, tone) = row.with(|r| subagent_state(false, r.as_ref().and_then(|r| r.end_reason)));
                 view! {
-                    <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
+                    <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
                         <span class="inline-block w-3 shrink-0 text-[9px]">"▶"</span>
                         <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
                         {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="font-mono" title="Started from this template, where it says">{a}</span> })}
@@ -2882,7 +2882,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
         });
     };
     view! {
-        <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200" on:click=move |ev| toggle.run(ev)>
+        <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-200" on:click=move |ev| toggle.run(ev)>
             <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
             <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
             {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="font-mono" title="Started from this template, where it says">{a}</span> })}
@@ -2909,7 +2909,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
                 Some(s) if s.observed => view! {
                     <div class="space-y-3 pb-2 pt-1">
                         <Transcript session=s feed running />
-                        <p class="text-xs text-zinc-500">"Claude Code's own subagent: Claude Code runs and continues it."</p>
+                        <p class="text-xs text-muted">"Claude Code's own subagent: Claude Code runs and continues it."</p>
                     </div>
                 }.into_any(),
                 Some(s) => view! {
@@ -2927,7 +2927,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
                         <Composer id=sid.get_value() running disabled=Signal::derive(|| false) error inline=true wake />
                     </div>
                 }.into_any(),
-                None => view! { <p class="py-1 text-xs text-zinc-500">"Starting…"</p> }.into_any(),
+                None => view! { <p class="py-1 text-xs text-muted">"Starting…"</p> }.into_any(),
             }
         } else {
             view! { <SubagentPeek events=feed.events streaming=feed.streaming /> }.into_any()
@@ -2977,7 +2977,7 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
         })
     });
     view! {
-        <div class="space-y-0.5 pb-1 text-xs text-zinc-500">
+        <div class="space-y-0.5 pb-1 text-xs text-muted">
             {move || lines.get().into_iter().map(|(mark, text)| view! {
                 <p class="flex gap-2 truncate"><span class="w-3 shrink-0">{mark}</span><span class="truncate font-mono">{text}</span></p>
             }).collect_view()}
@@ -3211,11 +3211,11 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
                     Some(s) if s.awaiting_approval => ("text-amber-700 dark:text-amber-400", "needs you"),
                     Some(s) => match s.display_status() {
                         SessionStatus::Running => ("text-blue-600 dark:text-blue-400", "● running"),
-                        SessionStatus::Idle => ("text-zinc-500", "idle"),
+                        SessionStatus::Idle => ("text-muted", "idle"),
                         SessionStatus::Starting => ("text-amber-700 dark:text-amber-400", "starting"),
                         SessionStatus::Failed => ("text-red-600 dark:text-red-400", "failed"),
                     },
-                    None => ("text-zinc-500", "starting"),
+                    None => ("text-muted", "starting"),
                 };
                 let place = s.as_ref().map(|s| live.session_worker(s));
                 view! {
@@ -3223,7 +3223,7 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
                         <span class="truncate text-sm font-medium">{title}</span>
                         <span class="flex min-w-0 shrink-0 items-center gap-1.5 text-xs">
                             <span class=cls>{word}</span>
-                            {place.map(|p| view! { <span class="truncate text-zinc-500">{format!("· {p}")}</span> })}
+                            {place.map(|p| view! { <span class="truncate text-muted">{format!("· {p}")}</span> })}
                         </span>
                     </div>
                 }
@@ -3354,10 +3354,10 @@ fn ToolCard(
                     let (label, server) = tool_label(&name);
                     view! {
                         <span class="shrink-0 whitespace-nowrap text-xs font-semibold" title=name.clone()>{label}</span>
-                        {server.map(|s| view! { <span class="shrink-0 whitespace-nowrap rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400" title=name.clone()>{s}</span> })}
+                        {server.map(|s| view! { <span class="shrink-0 whitespace-nowrap rounded bg-zinc-100 px-1 text-[10px] text-muted dark:bg-zinc-800" title=name.clone()>{s}</span> })}
                     }
                 }
-                <span class=if worded { "min-w-0 flex-1 truncate text-xs text-zinc-600 dark:text-zinc-300" } else { "min-w-0 flex-1 truncate font-mono text-xs text-zinc-500" }>{summary}</span>
+                <span class=if worded { "min-w-0 flex-1 truncate text-xs text-zinc-600 dark:text-zinc-300" } else { "min-w-0 flex-1 truncate font-mono text-xs text-soft" }>{summary}</span>
                 {sent_to.map(|(to, title)| view! {
                     <Go to=View::session(to.clone()) class="min-w-0 max-w-[50%] truncate text-[11px] text-sky-700 hover:underline dark:text-sky-400" stop=true>
                         {move || format!("→ sent to {} ↗", title.get().unwrap_or_else(|| "a session".into()))}
@@ -3370,7 +3370,7 @@ fn ToolCard(
                             on:click=move |ev| { ev.prevent_default(); ev.stop_propagation(); scroll_to(&target); }>"↻ its thread"</button>
                     }
                 })}
-                {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
+                {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-muted">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
                 {move || made_session.and_then(|m| m.get()).map(|(id, title)| view! { <MadeSession id title /> })}
             </summary>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
@@ -3378,7 +3378,7 @@ fn ToolCard(
                     <ul class="space-y-1 text-sm">
                         {items.into_iter().map(|(text, status)| {
                             let (mark, cls) = match status.as_str() {
-                                "completed" => ("☑", "text-zinc-400 line-through"),
+                                "completed" => ("☑", "text-muted line-through"),
                                 "in_progress" => ("▶", "font-medium"),
                                 _ => ("☐", ""),
                             };
@@ -3391,16 +3391,16 @@ fn ToolCard(
                     <pre class=format!("max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900 {}", if r.is_error { "text-red-700 dark:text-red-300" } else { "" })>
                         {r.output}
                     </pre>
-                    {r.truncated.then(|| view! { <p class="text-[11px] text-zinc-500">"Output was truncated for the model."</p> })}
+                    {r.truncated.then(|| view! { <p class="text-[11px] text-muted">"Output was truncated for the model."</p> })}
                 })}
             </div>
         </details>
         {move || doc_card.and_then(|c| c.get()).map(|(id, title, kind, what)| view! {
             <div class="mx-3 mb-2">
                 <crate::workspace::Go to=crate::workspace::View::Docs { id } class="inline-flex items-center gap-2 rounded-md border border-zinc-200 px-2 py-1 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
-                    <span class="text-zinc-400">{if kind == "deck" { "▦" } else { "▤" }}</span>
+                    <span class="text-muted">{if kind == "deck" { "▦" } else { "▤" }}</span>
                     <span class="font-medium">{title}</span>
-                    <span class="text-xs text-zinc-500">{what}</span>
+                    <span class="text-xs text-muted">{what}</span>
                 </crate::workspace::Go>
             </div>
         })}
@@ -3478,7 +3478,7 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
             } else if with_agent {
                 "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-zinc-300 px-4 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
             } else {
-                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-zinc-500 dark:border-zinc-700"
+                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-muted dark:border-zinc-700"
             }>
                 {text.get_value()}
             </div>
@@ -3492,7 +3492,7 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
                 // With the agent already: it reads it at its next step; Send now
                 // stops that step, and the agent takes it as its next turn.
                 None if with_agent => view! {
-                    <span class="flex items-center gap-2 text-xs text-zinc-500">
+                    <span class="flex items-center gap-2 text-xs text-muted">
                         <button class=UBTN title="Stop the agent's current step; it reads this right after (as its next turn)"
                             prop:disabled=move || busy.get() on:click=move |_| {
                                 busy.set(true);
@@ -3505,7 +3505,7 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
                     </span>
                 }.into_any(),
                 None => view! {
-                    <span class="flex items-center gap-2 text-xs text-zinc-500">
+                    <span class="flex items-center gap-2 text-xs text-muted">
                         "queued"
                         {move || queue_ops.get().then(|| view! {
                             <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
@@ -3569,7 +3569,7 @@ fn QueueEditBox(rows: RwSignal<Vec<QueueRow>>, session_id: String, on_close: Cal
     };
     view! {
         <div class="w-full rounded-xl border border-zinc-300 bg-white p-3 text-sm dark:border-zinc-700 dark:bg-zinc-900">
-            <div class="mb-2 flex items-center gap-2 text-xs text-zinc-500">
+            <div class="mb-2 flex items-center gap-2 text-xs text-muted">
                 "Edit the queued messages, then send them again"
                 <span class="flex-1"></span>
                 <button class=format!("{BUTTON_QUIET} text-xs") title="Discard these messages (they were pulled out of the queue)"
@@ -3587,7 +3587,7 @@ fn QueueEditBox(rows: RwSignal<Vec<QueueRow>>, session_id: String, on_close: Cal
                         r.push(QueueRow { id: next, text: String::new() });
                     })>"＋ Add a message"</button>
                 <span class="flex-1"></span>
-                <span class="text-xs text-zinc-400">"Closing this discards these messages"</span>
+                <span class="text-xs text-muted">"Closing this discards these messages"</span>
                 <button class=format!("{BUTTON} text-xs") prop:disabled=move || busy.get() on:click=move |_| send()>"Send"</button>
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
@@ -4059,7 +4059,7 @@ fn Composer(
                                         view! { <span class="px-1">"📄"</span> }.into_any()
                                     }}
                                     <span class="max-w-40 truncate">{a.name.clone()}</span>
-                                    <button class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove" on:click=move |_| attachments.update(|v| { v.remove(i); })>"✕"</button>
+                                    <button class="text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove" on:click=move |_| attachments.update(|v| { v.remove(i); })>"✕"</button>
                                 </div>
                             }
                         }).collect_view()}
@@ -4098,7 +4098,7 @@ fn Composer(
                                                 <button class=row on:mousedown=move |ev| { ev.prevent_default(); complete(format!("memex:{k2}"), false); }>
                                                     <span class="rounded bg-violet-100 px-1 text-[10px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">{kind}</span>
                                                     <span class="ml-1">{name}</span>
-                                                    <span class="ml-2 font-mono text-zinc-400">{key}</span>
+                                                    <span class="ml-2 font-mono text-muted">{key}</span>
                                                 </button>
                                             }.into_any()
                                         }
@@ -4116,9 +4116,9 @@ fn Composer(
                                             view! {
                                                 <button class=row on:mousedown=move |ev| { ev.prevent_default(); complete_command(n2.clone()); }>
                                                     <span class="font-mono">{format!("/{}", c.name)}</span>
-                                                    {(!c.argument_hint.is_empty()).then(|| view! { <span class="ml-1 font-mono text-zinc-400">{c.argument_hint.clone()}</span> })}
-                                                    <span class="ml-2 text-zinc-500">{c.description.clone()}</span>
-                                                    {(c.source != "built-in").then(|| view! { <span class="ml-2 rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800">{c.source.clone()}</span> })}
+                                                    {(!c.argument_hint.is_empty()).then(|| view! { <span class="ml-1 font-mono text-muted">{c.argument_hint.clone()}</span> })}
+                                                    <span class="ml-2 text-muted">{c.description.clone()}</span>
+                                                    {(c.source != "built-in").then(|| view! { <span class="ml-2 rounded bg-zinc-100 px-1 text-[10px] text-muted dark:bg-zinc-800">{c.source.clone()}</span> })}
                                                 </button>
                                             }.into_any()
                                         }
@@ -4226,7 +4226,7 @@ fn Composer(
                     // beside), and Send.
                     <div class="flex items-center gap-1 px-1 pb-1">
                         // Drawn, not an emoji, so it matches the other icons.
-                        <button class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                        <button class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                             title="Attach images or files (or paste / drop them)" aria-label="Attach images or files" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
                             <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
                                 <path d="M8 2.5v11M2.5 8h11" />
@@ -4249,7 +4249,7 @@ fn Composer(
                                         <span class="min-w-0 truncate">{label.clone()}</span>
                                         // What's left of its plan, when it has one.
                                         <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
-                                        <span class="text-zinc-400">"▾"</span>
+                                        <span class="text-muted">"▾"</span>
                                     </button>
                                 }
                             }}
@@ -4263,7 +4263,7 @@ fn Composer(
                             {move || { let (_, mm, e) = s.current.get(); let label = (!mm.is_empty()).then(|| model_label(&mm, &e)); view! {
                                 <button class=CHIP title=SUBAGENTS_HELP aria-label=format!("Subagents' model: {}, change it", label.as_deref().unwrap_or("the session's")) on:click=move |_| toggle()>
                                     <span class="min-w-0 truncate">{match &label { Some(l) => format!("subagents: {l}"), None => "subagents".to_owned() }}</span>
-                                    <span class="text-zinc-400">"▾"</span>
+                                    <span class="text-muted">"▾"</span>
                                 </button>
                             } }}
                         })}
@@ -4275,9 +4275,9 @@ fn Composer(
                                     <div class="font-medium">"Model"</div>
                                     <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>
                                     {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
-                                        <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-zinc-500 dark:text-zinc-400">{title}</span> })}</p>
+                                        <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-muted">{title}</span> })}</p>
                                     })}
-                                    <p class="text-zinc-500 dark:text-zinc-400">"It switches when you send your next message."</p>
+                                    <p class="text-muted">"It switches when you send your next message."</p>
                                 })}
                                 {subagents.map(|s| {
                                     let set = move |req: c6_api::SetSubagentModel| {
@@ -4302,7 +4302,7 @@ fn Composer(
                                     view! {
                                         <div class=if model.is_some() { "space-y-2 border-t border-zinc-200 pt-2 dark:border-zinc-700" } else { "space-y-2" }>
                                             <div class="font-medium">"Subagents"</div>
-                                            <p class="max-w-md text-zinc-500 dark:text-zinc-400">{SUBAGENTS_HELP}</p>
+                                            <p class="max-w-md text-muted">{SUBAGENTS_HELP}</p>
                                             <Switch on=same on_change=flip label="Same as the session" title="Run them on the session's own model, or turn off to choose theirs" />
                                             {move || (!same.get()).then(|| view! {
                                                 <div class="flex flex-wrap items-center gap-2">
@@ -4329,7 +4329,7 @@ fn Composer(
                             // beside it for Send now (stop that step and send).
                             view! {
                                 <div class="relative flex items-center gap-0.5">
-                                    <button class="flex h-5.5 items-center rounded-md px-1 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                    <button class="flex h-5.5 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>"▾"</button>
@@ -4341,7 +4341,7 @@ fn Composer(
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                                 title="Stop the agent's current step; your message starts the next one" on:click=move |_| stop_and_send()>
                                                 <span>"Send now"</span>
-                                                <span class="text-xs text-zinc-400">"⌘/Ctrl ⇧ ↵"</span>
+                                                <span class="text-xs text-muted">"⌘/Ctrl ⇧ ↵"</span>
                                             </button>
                                         </div>
                                     })}
@@ -4359,7 +4359,7 @@ fn Composer(
                     </div>
                 </div>
                 {wake.map(|w| view! {
-                    <label class="flex items-center gap-1.5 self-start text-xs text-zinc-500"
+                    <label class="flex items-center gap-1.5 self-start text-xs text-muted"
                         title="Its report reaches the agent that started it at that agent's next step if it is working; otherwise with its next message, unless this wakes it now.">
                         <input type="checkbox" prop:checked=move || w.get() on:change=move |ev| w.set(event_target_checked(&ev)) />
                         "Wake the agent that started it"
@@ -4407,13 +4407,13 @@ fn ApprovalCard(
             <div class="flex flex-wrap items-center gap-2">
                 <span>"⚠"</span>
                 <span class="font-medium">"Waiting for your approval"</span>
-                <span class="text-xs text-zinc-500">{format!("policy “{policy}”")}</span>
+                <span class="text-xs text-muted">{format!("policy “{policy}”")}</span>
             </div>
             {(!message.is_empty()).then(|| view! { <p class="text-xs text-zinc-600 dark:text-zinc-400">{message.clone()}</p> })}
             <div class="text-sm" title=tool.clone()>
                 <span class="font-medium">{label}</span>
                 {what.map(|w| format!(": {w}"))}
-                {server.map(|s| view! { <span class="text-xs text-zinc-500">{format!(" · {s}")}</span> })}
+                {server.map(|s| view! { <span class="text-xs text-muted">{format!(" · {s}")}</span> })}
             </div>
             <pre class="max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{shown}</pre>
             {move || match sent.get() {
@@ -4513,8 +4513,8 @@ fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_
                             <label class="block space-y-0.5">
                                 <span class="text-xs text-zinc-600 dark:text-zinc-400">{label}{f.required.then_some(" *")}</span>
                                 {input}
-                                {(!f.description.is_empty()).then(|| view! { <span class="block text-[11px] text-zinc-500">{f.description.clone()}</span> })}
-                                {(f.r#type == "secret").then(|| view! { <span class="block text-[11px] text-zinc-500">"Kept from the model: it only passes it on."</span> })}
+                                {(!f.description.is_empty()).then(|| view! { <span class="block text-[11px] text-muted">{f.description.clone()}</span> })}
+                                {(f.r#type == "secret").then(|| view! { <span class="block text-[11px] text-muted">"Kept from the model: it only passes it on."</span> })}
                             </label>
                         }
                     }).collect_view()}
@@ -4540,9 +4540,9 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
             <div class="flex items-center gap-2">
                 <span>"🔑"</span>
                 <span class="font-medium">{card.title.clone()}</span>
-                <span class="text-xs text-zinc-500">"only you see this; it is not kept"</span>
+                <span class="text-xs text-muted">"only you see this; it is not kept"</span>
                 <span class="flex-1"></span>
-                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| on_dismiss.run(id.clone())>"Dismiss"</button>
+                <button class="text-xs text-muted hover:underline" on:click=move |_| on_dismiss.run(id.clone())>"Dismiss"</button>
             </div>
             <pre class="select-all overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{card.value.clone()}</pre>
             <div class="flex items-center gap-2">

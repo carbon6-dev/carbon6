@@ -107,14 +107,14 @@ pub fn PushSetting() -> impl IntoView {
                 <span class="flex-1"></span>
                 {move || match state.get().as_str() {
                     "unsupported" => view! {
-                        <span class="text-xs text-zinc-500">"Not available here: it needs HTTPS (or localhost). On iPhone and iPad, add carbon6 to the Home Screen (Share → Add to Home Screen) and open it from there."</span>
+                        <span class="text-xs text-muted">"Not available here: it needs HTTPS (or localhost). On iPhone and iPad, add carbon6 to the Home Screen (Share → Add to Home Screen) and open it from there."</span>
                     }.into_any(),
                     "denied" => view! { <span class="text-xs text-red-600">"Blocked in this browser's site settings."</span> }.into_any(),
                     _ if !mine.get().is_empty() => view! { <button class=BUTTON_QUIET on:click=move |_| disable(None)>"Turn off here"</button> }.into_any(),
                     _ => view! { <button class=BUTTON on:click=enable>"Turn on here"</button> }.into_any(),
                 }}
             </div>
-            <p class="text-xs text-zinc-500">"Then add a channel of kind push above: those events reach every device turned on here, and tapping an approval opens its Allow / Deny page."</p>
+            <p class="text-xs text-muted">"Then add a channel of kind push above: those events reach every device turned on here, and tapping an approval opens its Allow / Deny page."</p>
             {move || status.get().map(|r| match r {
                 Ok(m) => view! { <p class="text-xs text-emerald-600">{m}</p> }.into_any(),
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -129,7 +129,7 @@ pub fn PushSetting() -> impl IntoView {
                             <div class="flex flex-wrap items-center gap-2 py-1">
                                 <span>{d.name.clone()}</span>
                                 {this.then(|| view! { <span class="rounded bg-sky-100 px-1 text-sky-800 dark:bg-sky-950 dark:text-sky-300">"this device"</span> })}
-                                <span class="text-zinc-500">{format!("via {}{sent}", d.service)}</span>
+                                <span class="text-muted">{format!("via {}{sent}", d.service)}</span>
                                 {d.last_error.clone().map(|e| view! { <span class="text-red-600">{e}</span> })}
                                 <span class="flex-1"></span>
                                 <button class="text-red-600 hover:underline" on:click=move |_| disable(Some(id.clone()))>"Remove"</button>

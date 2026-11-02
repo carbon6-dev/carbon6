@@ -75,7 +75,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
                 {move || {
                     let l = list.get();
                     if l.is_empty() {
-                        return view! { <p class="text-sm text-zinc-500">"Nothing published yet. Deliverables the agent publishes (reports, decks, charts, documents) appear here."</p> }.into_any();
+                        return view! { <p class="text-sm text-muted">"Nothing published yet. Deliverables the agent publishes (reports, decks, charts, documents) appear here."</p> }.into_any();
                     }
                     l.into_iter().rev().map(|(name, vs)| {
                         let latest = vs.last().cloned().expect("a version");
@@ -86,7 +86,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
                             <button class=move || format!("block w-full rounded-md px-2 py-1.5 text-left text-sm {}", if active() { "bg-zinc-200 dark:bg-zinc-800" } else { "hover:bg-zinc-100 dark:hover:bg-zinc-900" })
                                 on:click=move |_| { chosen.set(Some(pick.clone())); version.set(None); }>
                                 <div class="truncate font-medium">{latest.title.clone()}</div>
-                                <div class="truncate font-mono text-[11px] text-zinc-500">{format!("{name} · v{} · {}", vs.len(), size(latest.size))}</div>
+                                <div class="truncate font-mono text-[11px] text-muted">{format!("{name} · v{} · {}", vs.len(), size(latest.size))}</div>
                             </button>
                         }
                     }).collect_view().into_any()
@@ -98,7 +98,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
                 view! {
                     <div class="min-w-0 space-y-2">
                         <div class="flex flex-wrap items-center gap-2">
-                            <h3 class="min-w-0 flex-1 truncate font-medium">{v.title.clone()}<span class="ml-2 font-mono text-xs text-zinc-500">{name.clone()}</span></h3>
+                            <h3 class="min-w-0 flex-1 truncate font-medium">{v.title.clone()}<span class="ml-2 font-mono text-xs text-muted">{name.clone()}</span></h3>
                             {(n > 1).then(|| view! {
                                 <select class="rounded-md border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
                                     prop:value=v.seq.to_string() on:change=move |ev| version.set(event_target_value(&ev).parse().ok())>
@@ -129,7 +129,7 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
     move || {
         let l = list.get();
         if l.is_empty() {
-            return view! { <p class="py-1 text-xs text-zinc-500">"Nothing yet"</p> }.into_any();
+            return view! { <p class="py-1 text-xs text-muted">"Nothing yet"</p> }.into_any();
         }
         let n = l.len();
         view! {
@@ -140,7 +140,7 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
                     <button class="block w-full rounded px-1 py-0.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
                         on:click=move |_| on_pick.run(Some(pick.clone()))>
                         <div class="truncate text-sm">{latest.title.clone()}</div>
-                        <div class="truncate text-[11px] text-zinc-500">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</div>
+                        <div class="truncate text-[11px] text-muted">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</div>
                     </button>
                 }
             }).collect_view()}
@@ -176,7 +176,7 @@ fn Preview(url: String, mime: String) -> impl IntoView {
         }
         .into_any()
     } else {
-        view! { <p class="rounded-md border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500 dark:border-zinc-700">"No preview for this kind of file: download it."</p> }.into_any()
+        view! { <p class="rounded-md border border-dashed border-zinc-300 p-6 text-center text-sm text-muted dark:border-zinc-700">"No preview for this kind of file: download it."</p> }.into_any()
     }
 }
 
@@ -186,7 +186,7 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
     let image = mime.starts_with("image/");
     view! {
         <div class="space-y-1">
-            <p class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <p class="flex flex-wrap items-center gap-2 text-xs text-muted">
                 <span>"📦"</span>
                 <span>"Published"</span>
                 <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>

@@ -5,6 +5,23 @@
    your choice in Settings → Appearance). */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Grey text that reads on either theme: text-muted for secondary text
+   (zinc-500 on white, zinc-400 on the dark greys), text-soft a step
+   stronger (zinc-600 / zinc-300). Bare zinc-500 on zinc-900 is about
+   3.7:1, below AA's 4.5:1. */
+:root {
+  --c6-muted: var(--color-zinc-500);
+  --c6-soft: var(--color-zinc-600);
+}
+.dark {
+  --c6-muted: var(--color-zinc-400);
+  --c6-soft: var(--color-zinc-300);
+}
+@theme inline {
+  --color-muted: var(--c6-muted);
+  --color-soft: var(--c6-soft);
+}
+
 /* The desktop layout (tiles side by side, the header's nav, the sidebar)
    needs height as well as width: a phone on its side is wide but short,
    so it keeps the phone's layout (one tile, the bottom bar, the ☰ menu).

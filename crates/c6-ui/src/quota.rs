@@ -60,7 +60,7 @@ pub enum Tone {
 impl Tone {
     pub fn class(self) -> &'static str {
         match self {
-            Tone::Fine => "text-zinc-500",
+            Tone::Fine => "text-muted",
             Tone::Low => "text-amber-600 dark:text-amber-400",
             Tone::Out => "font-medium text-red-600 dark:text-red-400",
         }
@@ -186,7 +186,7 @@ pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
                     </div>
                 }
             }).collect_view()}
-            {error.map(|e| view! { <div class="text-xs text-zinc-500" title=e.clone()>"Last read failed; showing the last numbers seen."</div> })}
+            {error.map(|e| view! { <div class="text-xs text-muted" title=e.clone()>"Last read failed; showing the last numbers seen."</div> })}
         </div>
     }
 }

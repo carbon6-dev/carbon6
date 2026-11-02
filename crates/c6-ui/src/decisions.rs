@@ -130,17 +130,17 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
     move || {
         match state.get() {
             1 if !in_session => view! { <ErrorBox message=shown.get_untracked().and_then(Result::err).unwrap_or_default() /> }.into_any(),
-            2 if !in_session => view! { <p class="text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
+            2 if !in_session => view! { <p class="text-sm text-muted">"Nothing here."</p> }.into_any(),
             3 => view! {
                 <div class=if in_session { "space-y-2" } else { "space-y-4" } data-decisions="">
-                {in_session.then(|| view! { <p class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Waiting for you"</p> })}
+                {in_session.then(|| view! { <p class="text-xs font-medium uppercase tracking-wide text-muted">"Waiting for you"</p> })}
                 <For each=move || groups.get() key=|(g, _)| g.clone() let:group>
                     <div class="space-y-2">
                         {(!group.0.is_empty()).then(|| {
                             let g = group.0.clone();
                             let n = move || groups.with(|gs| gs.iter().find(|(x, _)| *x == g).map_or(0, |(_, ds)| ds.len()));
                             let name = group.0.clone();
-                            view! { <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">{move || format!("{name} ({})", n())}</h2> }
+                            view! { <h2 class="text-xs font-medium uppercase tracking-wide text-muted">{move || format!("{name} ({})", n())}</h2> }
                         })}
                         {
                             let g = group.0.clone();
@@ -177,7 +177,7 @@ pub fn DecisionsPage() -> impl IntoView {
         <main class="mx-auto max-w-3xl space-y-4 px-4 py-6">
             <div class="flex flex-wrap items-center gap-2">
                 <h1 class="text-lg font-semibold">"Decisions"</h1>
-                <span class="flex-1 text-sm text-zinc-500">"Everything that needs you. What something waits on comes first; agents that asked without stopping carry on, and get your answer as a message."</span>
+                <span class="flex-1 text-sm text-muted">"Everything that needs you. What something waits on comes first; agents that asked without stopping carry on, and get your answer as a message."</span>
                 <select class=format!("{INPUT} w-auto py-1 text-sm") prop:value=move || state.get() on:change=move |ev| state.set(event_target_value(&ev))>
                     <option value="open">"Open"</option>
                     <option value="snoozed">"Snoozed"</option>
@@ -300,18 +300,18 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 <span class="rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800">{d.kind.clone()}</span>
                 {(d.waiting && open).then(|| view! { <span class="rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">"waiting"</span> })}
                 <h2 class="min-w-0 flex-1 font-medium">{d.title.clone()}</h2>
-                {(d.count > 1).then(|| view! { <span class="text-xs text-zinc-500">{format!("raised {}×", d.count)}</span> })}
-                <span class="text-xs text-zinc-500">{ago(now_ms() - d.updated_at)}</span>
+                {(d.count > 1).then(|| view! { <span class="text-xs text-muted">{format!("raised {}×", d.count)}</span> })}
+                <span class="text-xs text-muted">{ago(now_ms() - d.updated_at)}</span>
             </div>
             {(!d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&d.document)></div> })}
             // A task card: exactly what the new session would be told.
             {(d.kind == "task").then(|| d.context["prompt"].as_str().map(str::to_owned)).flatten().map(|p| view! {
                 <details class="text-xs">
-                    <summary class="cursor-pointer select-none text-zinc-500">"What the new session is told"</summary>
+                    <summary class="cursor-pointer select-none text-muted">"What the new session is told"</summary>
                     <pre class="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-zinc-50 p-2 font-mono text-[11px] dark:bg-zinc-900">{p}</pre>
                 </details>
             })}
-            <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
                 {(!in_session).then(|| view! { <span>{format!("from {}", d.source)}</span> })}
                 {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session ↗"</Go> })}
                 {things.into_iter().map(|k| view! { <span class="rounded bg-violet-100 px-1 font-mono text-violet-800 dark:bg-violet-950 dark:text-violet-300">{k}</span> }).collect_view()}
@@ -333,7 +333,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                     } else {
                         view! { <input class=INPUT prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev)) /> }.into_any()
                     };
-                    view! { <label class="block space-y-1"><span class="text-xs text-zinc-500">{label}</span>{input}</label> }
+                    view! { <label class="block space-y-1"><span class="text-xs text-muted">{label}</span>{input}</label> }
                 }).collect_view()}
                 <input class=format!("{INPUT} py-1 text-sm") placeholder="A note with your answer (optional)"
                     prop:value=move || note.get() on:input=move |ev| note.set(event_target_value(&ev)) />
@@ -350,7 +350,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                     {(!d.waiting && d.kind != "task").then(|| view! {
                         <button class=BUTTON_QUIET disabled=move || busy.get() on:click=start title="A session that helps you settle it, with its context">"Work on it"</button>
                         <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "snoozed", "snooze_until": now_ms() + 86_400_000}))>"Tomorrow"</button>
-                        <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>
+                        <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>
                     })}
                 </div>
             })}
@@ -393,7 +393,7 @@ pub fn status_tone(status: &str) -> &'static str {
         "observed" => "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
         "inferred" => "bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300",
         "disputed" => "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200",
-        _ => "bg-zinc-100 text-zinc-400 line-through dark:bg-zinc-900",
+        _ => "bg-zinc-100 text-muted line-through dark:bg-zinc-900",
     }
 }
 
@@ -419,16 +419,16 @@ pub fn FactRow(f: c6_api::Fact, on_change: Callback<()>) -> impl IntoView {
         <li class="space-y-1 rounded-md bg-zinc-50 p-2 text-sm dark:bg-zinc-900">
             <div class="flex flex-wrap items-center gap-2">
                 <span class=format!("rounded px-1.5 text-[11px] {}", status_tone(&f.status))>{f.status.clone()}</span>
-                <span class="text-[11px] text-zinc-500">{f.volatility.clone()}{f.due.then_some(" · due")}</span>
-                {(!f.labels.is_empty()).then(|| view! { <span class="text-[11px] text-zinc-500">{format!("only {}", f.labels.join(", "))}</span> })}
+                <span class="text-[11px] text-muted">{f.volatility.clone()}{f.due.then_some(" · due")}</span>
+                {(!f.labels.is_empty()).then(|| view! { <span class="text-[11px] text-muted">{format!("only {}", f.labels.join(", "))}</span> })}
             </div>
             <p>{f.negative.then_some("NOT: ")}{f.claim.clone()}</p>
-            {(!f.conditions.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">{format!("when: {}", f.conditions)}</p> })}
-            {f.check.clone().map(|c| view! { <p class="font-mono text-[11px] text-zinc-500">{format!("check: {}", c.command)}</p> })}
+            {(!f.conditions.is_empty()).then(|| view! { <p class="text-xs text-muted">{format!("when: {}", f.conditions)}</p> })}
+            {f.check.clone().map(|c| view! { <p class="font-mono text-[11px] text-muted">{format!("check: {}", c.command)}</p> })}
             {(!last.is_null()).then(|| {
                 let what = [last["command"].as_str(), last["source"].as_str()].into_iter().flatten().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
                 view! {
-                    <details class="text-xs text-zinc-500">
+                    <details class="text-xs text-muted">
                         <summary class="cursor-pointer">{format!("evidence ({}) {}", f.evidence.len(), last["by"].as_str().unwrap_or(""))}</summary>
                         <p class="font-mono">{what}</p>
                         <pre class="max-h-40 overflow-auto whitespace-pre-wrap">{last["excerpt"].as_str().unwrap_or("").to_owned()}</pre>

@@ -61,13 +61,13 @@ pub fn ActivityPage() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-5">
             <header class="space-y-1">
                 <h1 class="text-xl font-semibold">"Activity"</h1>
-                <p class="text-sm text-zinc-500">"What's going on now: model calls as they happen, sessions running, and each connector's sync. Kept in the head's memory only (the last 200 calls); a restart clears it."</p>
+                <p class="text-sm text-muted">"What's going on now: model calls as they happen, sessions running, and each connector's sync. Kept in the head's memory only (the last 200 calls); a restart clears it."</p>
             </header>
             {move || data.get().and_then(Result::err).map(|e| view! { <ErrorBox message=e /> })}
 
             <section class="space-y-2">
                 <div class="flex flex-wrap items-baseline gap-3">
-                    <h2 class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Model calls"</h2>
+                    <h2 class="text-[11px] font-semibold uppercase tracking-wide text-muted">"Model calls"</h2>
                     // In flight and waiting, by connection: a local server answers one at a time.
                     {move || {
                         let calls = get("calls");
@@ -83,37 +83,37 @@ pub fn ActivityPage() -> impl IntoView {
                         }).collect_view()
                     }}
                     <span class="flex-1"></span>
-                    <label class="flex items-center gap-1 text-xs text-zinc-500">
+                    <label class="flex items-center gap-1 text-xs text-muted">
                         <input type="checkbox" prop:checked=move || only_live.get() on:change=move |ev| only_live.set(event_target_checked(&ev)) />
                         "Only in flight"
                     </label>
                 </div>
                 <div class="divide-y divide-zinc-100 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || calls.with(Vec::is_empty).then(|| view! {
-                        <p class="px-3 py-2 text-sm text-zinc-500">{if only_live.get() { "No model call in flight." } else { "No model calls since the head started." }}</p>
+                        <p class="px-3 py-2 text-sm text-muted">{if only_live.get() { "No model call in flight." } else { "No model calls since the head started." }}</p>
                     })}
                     <For each=ids key=|id| *id let:id>
                         <CallRow id calls now open />
                     </For>
                 </div>
-                <p class="text-xs text-zinc-500">"Calls the head makes: the brief's sorting and drafts, the memex's reading, vision, the assistant and suggestions. Agent sessions on workers are under Sessions running; embeddings aren't shown."</p>
+                <p class="text-xs text-muted">"Calls the head makes: the brief's sorting and drafts, the memex's reading, vision, the assistant and suggestions. Agent sessions on workers are under Sessions running; embeddings aren't shown."</p>
             </section>
 
             <section class="space-y-2">
-                <h2 class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Sessions running"</h2>
+                <h2 class="text-[11px] font-semibold uppercase tracking-wide text-muted">"Sessions running"</h2>
                 <div class="divide-y divide-zinc-100 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || {
                         let rows = get("sessions").as_array().cloned().unwrap_or_default();
                         if rows.is_empty() {
-                            return view! { <p class="px-3 py-2 text-sm text-zinc-500">"None."</p> }.into_any();
+                            return view! { <p class="px-3 py-2 text-sm text-muted">"None."</p> }.into_any();
                         }
                         rows.into_iter().map(|r| view! {
                             <a class="flex flex-wrap items-baseline gap-x-2 px-3 py-1.5 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900/50"
                                 href=format!("/r/{}/sessions/{}", s(&r["realm"]), s(&r["id"]))>
                                 <span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500"></span>
                                 <span class="min-w-0 flex-1 truncate font-medium">{s(&r["title"])}</span>
-                                <span class="text-xs text-zinc-500">{format!("{} · {} · {}", s(&r["realm"]), s(&r["connection_name"]), s(&r["model"]))}</span>
-                                <span class="text-xs text-zinc-400">{s(&r["worker"])}</span>
+                                <span class="text-xs text-muted">{format!("{} · {} · {}", s(&r["realm"]), s(&r["connection_name"]), s(&r["model"]))}</span>
+                                <span class="text-xs text-muted">{s(&r["worker"])}</span>
                             </a>
                         }).collect_view().into_any()
                     }}
@@ -121,12 +121,12 @@ pub fn ActivityPage() -> impl IntoView {
             </section>
 
             <section class="space-y-2">
-                <h2 class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Connectors"</h2>
+                <h2 class="text-[11px] font-semibold uppercase tracking-wide text-muted">"Connectors"</h2>
                 <div class="grid gap-3 md:grid-cols-2">
                     {move || {
                         let rows = get("connectors").as_array().cloned().unwrap_or_default();
                         if rows.is_empty() {
-                            return view! { <p class="text-sm text-zinc-500">"No app syncs anything yet (Settings → Apps)."</p> }.into_any();
+                            return view! { <p class="text-sm text-muted">"No app syncs anything yet (Settings → Apps)."</p> }.into_any();
                         }
                         let t = now.get();
                         rows.into_iter().map(|c| view! { <Connector c now=t /> }).collect_view().into_any()
@@ -135,7 +135,7 @@ pub fn ActivityPage() -> impl IntoView {
             </section>
 
             <section class="space-y-2">
-                <h2 class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Memex"</h2>
+                <h2 class="text-[11px] font-semibold uppercase tracking-wide text-muted">"Memex"</h2>
                 {move || {
                     let m = get("memex");
                     let st = &m["status"];
@@ -234,10 +234,10 @@ fn CallLine(c: Value, now: i64, open: RwSignal<Option<u64>>) -> impl IntoView {
                 <span class="w-24 shrink-0 font-medium">{s(&c["what"])}</span>
                 <span class="min-w-0 flex-1 truncate" title=s(&c["about"])>{s(&c["about"])}</span>
                 // A pool's call: the member that took it, and the pool.
-                <span class="shrink-0 text-xs text-zinc-500">{format!("{}{} · {}{}", s(&c["connection_name"]), if s(&c["via_name"]).is_empty() { String::new() } else { format!(" (pool {})", s(&c["via_name"])) }, s(&c["model"]), if c["effort"].as_str().is_some_and(|e| !e.is_empty()) { format!(" · {}", s(&c["effort"])) } else { String::new() })}</span>
-                <span class="w-full truncate pl-4 text-xs text-zinc-500 sm:w-auto sm:pl-0">{format!("{state} · {timing}{}{}", if tokens.is_empty() { String::new() } else { format!(" · {tokens}") }, if when.is_empty() { String::new() } else { format!(" · {when}") })}</span>
+                <span class="shrink-0 text-xs text-muted">{format!("{}{} · {}{}", s(&c["connection_name"]), if s(&c["via_name"]).is_empty() { String::new() } else { format!(" (pool {})", s(&c["via_name"])) }, s(&c["model"]), if c["effort"].as_str().is_some_and(|e| !e.is_empty()) { format!(" · {}", s(&c["effort"])) } else { String::new() })}</span>
+                <span class="w-full truncate pl-4 text-xs text-muted sm:w-auto sm:pl-0">{format!("{state} · {timing}{}{}", if tokens.is_empty() { String::new() } else { format!(" · {tokens}") }, if when.is_empty() { String::new() } else { format!(" · {when}") })}</span>
                 {(c["ended_at"].is_null() || !c["latest"].as_str().unwrap_or_default().is_empty()).then(|| view! {
-                    <span class="w-full truncate pl-4 font-mono text-[11px] text-zinc-400">{s(&c["latest"])}</span>
+                    <span class="w-full truncate pl-4 font-mono text-[11px] text-muted">{s(&c["latest"])}</span>
                 })}
                 {c["error"].as_str().filter(|e| !e.is_empty()).map(|e| view! { <span class="w-full pl-4 text-xs text-red-600">{e.to_owned()}</span> })}
             </div>
@@ -273,7 +273,7 @@ fn CallDetail(id: u64, live: bool) -> impl IntoView {
         let size = field(k);
         view! {
             <details class="rounded border border-zinc-200 dark:border-zinc-800" class:hidden=move || shown().is_empty() open=title != "Prompt">
-                <summary class="cursor-pointer px-2 py-1 text-xs text-zinc-500">{move || format!("{title} ({} characters)", size().chars().count())}</summary>
+                <summary class="cursor-pointer px-2 py-1 text-xs text-muted">{move || format!("{title} ({} characters)", size().chars().count())}</summary>
                 <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words px-2 py-1 font-mono text-[11px]">{text}</pre>
             </details>
         }
@@ -281,7 +281,7 @@ fn CallDetail(id: u64, live: bool) -> impl IntoView {
     view! {
         <div class="space-y-2 border-t border-zinc-100 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-900/30">
             {move || match call.get() {
-                None => Some(view! { <p class="text-xs text-zinc-500">"…"</p> }.into_any()),
+                None => Some(view! { <p class="text-xs text-muted">"…"</p> }.into_any()),
                 Some(Err(e)) => Some(view! { <ErrorBox message=e /> }.into_any()),
                 Some(Ok(_)) => None,
             }}
@@ -325,8 +325,8 @@ fn Connector(c: Value, now: i64) -> impl IntoView {
             <div class="flex flex-wrap items-baseline gap-2">
                 <span class=format!("h-2 w-2 shrink-0 self-center rounded-full {}", if syncing { "animate-pulse bg-blue-500" } else if error.is_some() { "bg-red-500" } else if c["enabled"] == true { "bg-emerald-500" } else { "bg-zinc-400" })></span>
                 <span class="font-medium">{s(&c["app"])}</span>
-                <span class="text-xs text-zinc-500">{format!("{} · {} · {}", s(&c["realm"]), s(&c["name"]), s(&c["cron"]))}</span>
-                {(c["enabled"] != true).then(|| view! { <span class="text-xs text-zinc-500">"(off)"</span> })}
+                <span class="text-xs text-muted">{format!("{} · {} · {}", s(&c["realm"]), s(&c["name"]), s(&c["cron"]))}</span>
+                {(c["enabled"] != true).then(|| view! { <span class="text-xs text-muted">"(off)"</span> })}
             </div>
             <p class="text-xs">{line}</p>
             {error.map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
@@ -356,7 +356,7 @@ fn Connector(c: Value, now: i64) -> impl IntoView {
                                 <span class="font-medium">{who}</span>
                                 <span>{s(&a["kind"])}</span>
                                 <span class="flex-1">{what}</span>
-                                {a["updated_at"].as_i64().map(|t| view! { <span class="text-zinc-400">{format!("synced {}", ago(now - t))}</span> })}
+                                {a["updated_at"].as_i64().map(|t| view! { <span class="text-muted">{format!("synced {}", ago(now - t))}</span> })}
                                 {a["error"].as_str().filter(|e| !e.is_empty()).map(|e| view! { <span class="w-full text-red-600">{e.to_owned()}</span> })}
                             </li>
                         }

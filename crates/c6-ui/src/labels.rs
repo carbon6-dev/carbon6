@@ -104,7 +104,7 @@ pub fn LabelFilterBar() -> impl IntoView {
         draft.set(String::new());
     };
     view! {
-        <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+        <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
             <span>"Labels"</span>
             {move || filter.get().into_iter().map(|l| {
                 let gone = l.clone();
@@ -252,7 +252,7 @@ pub fn SessionConfig(session: String) -> impl IntoView {
     let config = LocalResource::new(move || api::session_config(session.get_value()));
     view! {
         <div class="space-y-4 py-2">
-            <p class="text-sm text-zinc-500">
+            <p class="text-sm text-muted">
                 "What the head's settings give this session, by its labels. Commands follow label changes at once; agents, skills and hooks are fixed when a session starts, so a change applies to new sessions."
             </p>
             {move || config.get().map(|r| match r {
@@ -270,7 +270,7 @@ fn ConfigLists(c: EffectiveConfig) -> impl IntoView {
             <section class="space-y-1">
                 <h3 class="text-sm font-medium">{title}</h3>
                 {if items.is_empty() {
-                    view! { <p class="text-xs text-zinc-500">"None set up."</p> }.into_any()
+                    view! { <p class="text-xs text-muted">"None set up."</p> }.into_any()
                 } else {
                     items.into_iter().map(|a| {
                         let on = a.skipped.is_none();
@@ -279,7 +279,7 @@ fn ConfigLists(c: EffectiveConfig) -> impl IntoView {
                                 <span>{if on { "✓" } else { "–" }}</span>
                                 <span class="font-mono text-xs">{a.name}</span>
                                 {a.applies_to.into_iter().map(|l| view! { <LabelChip label=l auto=true /> }).collect_view()}
-                                {a.skipped.map(|s| view! { <span class="text-xs text-zinc-500">{s}</span> })}
+                                {a.skipped.map(|s| view! { <span class="text-xs text-muted">{s}</span> })}
                             </div>
                         }
                     }).collect_view().into_any()

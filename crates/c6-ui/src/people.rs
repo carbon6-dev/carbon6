@@ -87,14 +87,14 @@ fn Card(name: String, address: String, about: Option<String>) -> impl IntoView {
     view! {
         <span class="block">
             <span class="block font-medium">{name.clone()}</span>
-            {has_address.then(|| view! { <span class="block text-xs text-zinc-500">{address.clone()}</span> })}
-            {about.filter(|a| !a.is_empty()).map(|a| view! { <span class="block text-xs text-zinc-500">{a}</span> })}
+            {has_address.then(|| view! { <span class="block text-xs text-muted">{address.clone()}</span> })}
+            {about.filter(|a| !a.is_empty()).map(|a| view! { <span class="block text-xs text-muted">{a}</span> })}
         </span>
         {move || has_address.then(|| match cards.get() {
-            None => view! { <span class="block text-xs text-zinc-500">"Looking…"</span> }.into_any(),
+            None => view! { <span class="block text-xs text-muted">"Looking…"</span> }.into_any(),
             Some(Err(e)) => view! { <span class="block text-xs text-red-600">{e}</span> }.into_any(),
             Some(Ok(list)) if list.is_empty() => view! {
-                <span class="flex items-center gap-2 text-xs text-zinc-500">
+                <span class="flex items-center gap-2 text-xs text-muted">
                     <span>"No card yet."</span>
                     <button type="button" class=format!("{BUTTON_QUIET} text-xs") disabled=move || writing.get() on:click=write>
                         {move || if writing.get() { "Writing…" } else { "Write a card" }}
@@ -103,7 +103,7 @@ fn Card(name: String, address: String, about: Option<String>) -> impl IntoView {
             }.into_any(),
             Some(Ok(list)) => list.into_iter().map(card).collect_view().into_any(),
         })}
-        {move || note.get().map(|n| view! { <span class="block text-xs text-zinc-500">{n}</span> })}
+        {move || note.get().map(|n| view! { <span class="block text-xs text-muted">{n}</span> })}
         {has_address.then(|| view! {
             <Go to=View::Search { q: address.clone(), kind: String::new(), worker: String::new() } class="block text-xs text-sky-700 hover:underline dark:text-sky-400">
                 "Find them in the memex"
@@ -120,12 +120,12 @@ pub(crate) fn card(c: Value) -> impl IntoView {
             <span class="block">
                 <span class="font-medium">{c["name"].as_str().unwrap_or("").to_owned()}</span>
                 <span class="ml-1.5 rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">{f("relationship").replace('_', " ")}</span>
-                {(!f("role").is_empty()).then(|| view! { <span class="ml-1.5 text-xs text-zinc-500">{f("role")}</span> })}
+                {(!f("role").is_empty()).then(|| view! { <span class="ml-1.5 text-xs text-muted">{f("role")}</span> })}
             </span>
             {(!f("story").is_empty()).then(|| view! { <span class="block">{f("story")}</span> })}
-            {(!f("open").is_empty()).then(|| view! { <span class="block text-xs"><span class="text-zinc-500">"Open: "</span>{f("open")}</span> })}
-            {(!f("how").is_empty()).then(|| view! { <span class="block text-xs"><span class="text-zinc-500">"You: "</span>{f("how")}</span> })}
-            <span class="block text-[11px] text-zinc-400">{format!("From {} thread{} with you, the model's reading", c["threads"].as_i64().unwrap_or(0), if c["threads"] == 1 { "" } else { "s" })}</span>
+            {(!f("open").is_empty()).then(|| view! { <span class="block text-xs"><span class="text-muted">"Open: "</span>{f("open")}</span> })}
+            {(!f("how").is_empty()).then(|| view! { <span class="block text-xs"><span class="text-muted">"You: "</span>{f("how")}</span> })}
+            <span class="block text-[11px] text-muted">{format!("From {} thread{} with you, the model's reading", c["threads"].as_i64().unwrap_or(0), if c["threads"] == 1 { "" } else { "s" })}</span>
         </span>
     }
 }

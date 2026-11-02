@@ -326,7 +326,7 @@ fn title_row(mark: Option<String>, glyph: &'static str, title: String, state: Op
         <div class="flex items-start gap-2">
             {match mark {
                 Some(m) => view! { <span class="mt-1.5 h-2 w-2 shrink-0 rounded-full" style=crate::marks::fill(&m)></span> }.into_any(),
-                None => view! { <span class="shrink-0 text-zinc-400">{glyph}</span> }.into_any(),
+                None => view! { <span class="shrink-0 text-muted">{glyph}</span> }.into_any(),
             }}
             <div class="min-w-0 flex-1 break-words font-medium">{title}</div>
             {state.map(|(word, cls)| view! { <span class=format!("shrink-0 rounded-full px-2 py-0.5 text-xs font-medium {cls}")>{word}</span> })}
@@ -352,7 +352,7 @@ fn SessionPeek(id: String) -> impl IntoView {
             let worker = live.session_worker(&s);
             view! {
                 {title_row(Some(crate::marks::of(&s)), "", title, Some((word.to_owned(), cls)))}
-                <div class="truncate text-xs text-zinc-500">
+                <div class="truncate text-xs text-muted">
                     <span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span>
                     {format!(" · active {}", ago(now_ms() - s.updated_at))}
                 </div>
@@ -361,7 +361,7 @@ fn SessionPeek(id: String) -> impl IntoView {
         }
         None => view! {
             {title_row(None, "○", short.clone(), None)}
-            <div class="text-xs text-zinc-500">"Not among this realm's sessions"</div>
+            <div class="text-xs text-muted">"Not among this realm's sessions"</div>
         }
         .into_any(),
     }
@@ -400,7 +400,7 @@ fn DocPeek(id: String) -> impl IntoView {
         };
         view! {
             {title_row(None, "▤", title, None)}
-            <div class="truncate text-xs text-zinc-500">{line}</div>
+            <div class="truncate text-xs text-muted">{line}</div>
         }
     }
 }
@@ -424,7 +424,7 @@ fn ItemPeek(kind: Kind, id: String) -> impl IntoView {
         };
         view! {
             {title_row(Some(mark.clone()), "", title, state)}
-            <div class="text-xs text-zinc-500">{format!("{}{}", kind.word(), if at > 0 { format!(" · moved {}", ago(now_ms() - at)) } else { String::new() })}</div>
+            <div class="text-xs text-muted">{format!("{}{}", kind.word(), if at > 0 { format!(" · moved {}", ago(now_ms() - at)) } else { String::new() })}</div>
         }
     }
 }

@@ -154,7 +154,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
             <nav class="hidden text-sm md:sticky md:top-4 md:block md:w-52 md:shrink-0 md:self-start md:space-y-4">
                 {GROUPS.iter().filter(|(_, pages)| pages.iter().any(|p| here(p.0))).map(|(g, pages)| view! {
                     <div>
-                        <div class="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{*g}</div>
+                        <div class="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">{*g}</div>
                         {pages.iter().map(|(id, t, w)| {
                             let id = *id;
                             view! {
@@ -172,9 +172,9 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
             </nav>
             <div class="min-w-0 flex-1 space-y-5">
                 <div class="border-b border-zinc-200 pb-4 dark:border-zinc-800">
-                    <p class="text-xs text-zinc-500">{move || heading().0}</p>
+                    <p class="text-xs text-muted">{move || heading().0}</p>
                     <h1 class="text-lg font-semibold">{move || heading().1}</h1>
-                    <p class="text-sm text-zinc-500">{move || heading().2}</p>
+                    <p class="text-sm text-muted">{move || heading().2}</p>
                     {move || LIST_PAGES.contains(&current.get().as_str()).then(|| {
                         let text = match crate::place::realm() {
                             Some(r) => format!("Lists here are realm {r}'s own. It also uses root's (the console's): its own replace root's of the same name, and policies and budgets from root always apply."),
@@ -191,7 +191,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     "account" => view! {
                         {move || match auth_required.get().and_then(Result::ok) {
                             Some(s) if s.required => view! { <crate::auth::SignInSettings after_link=note.get_value().as_deref() == Some("link") /> }.into_any(),
-                            Some(_) => view! { <p class="text-sm text-zinc-500">"Sign-in is off on this head (it is started without authentication)."</p> }.into_any(),
+                            Some(_) => view! { <p class="text-sm text-muted">"Sign-in is off on this head (it is started without authentication)."</p> }.into_any(),
                             None => ().into_any(),
                         }}
                     }.into_any(),
@@ -451,7 +451,7 @@ fn AppearanceSetting() -> impl IntoView {
                     on:change=move |_| { theme_set(value); choice.set(value.to_owned()); } />
                 <span>
                     <span class="block text-sm font-medium">{label}</span>
-                    <span class="block text-xs text-zinc-500">{what}</span>
+                    <span class="block text-xs text-muted">{what}</span>
                 </span>
             </label>
         }
@@ -464,7 +464,7 @@ fn AppearanceSetting() -> impl IntoView {
                 {option("light", "Light", "Always light")}
                 {option("dark", "Dark", "Always dark")}
             </div>
-            <p class="text-xs text-zinc-500">"Kept in this browser, so each device can have its own."</p>
+            <p class="text-xs text-muted">"Kept in this browser, so each device can have its own."</p>
         </section>
     }
 }
@@ -556,9 +556,9 @@ fn Inherited(name: &'static str, #[prop(optional_no_strip)] realm: Option<RwSign
                             view! {
                                 <li class="flex flex-wrap items-baseline gap-2" title=serde_json::to_string_pretty(e).unwrap_or_default()>
                                     <span class="font-mono text-xs">{label(e)}</span>
-                                    <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{what(e)}</span>
+                                    <span class="min-w-0 flex-1 truncate text-xs text-muted">{what(e)}</span>
                                     {applies.into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
-                                    {(from != "root").then(|| view! { <span class="rounded bg-zinc-100 px-1 text-[11px] text-zinc-500 dark:bg-zinc-800">{from.clone()}</span> })}
+                                    {(from != "root").then(|| view! { <span class="rounded bg-zinc-100 px-1 text-[11px] text-muted dark:bg-zinc-800">{from.clone()}</span> })}
                                 </li>
                             }
                         }).collect_view()}
@@ -650,7 +650,7 @@ fn Realms() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Realms"</h2>
-            <p class="text-sm text-zinc-500">"A realm keeps an app or a project apart: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more for apps. A realm inherits root's settings. Commons holds what every realm may read: realms publish into it, and you review each item (Decisions) before it is there."</p>
+            <p class="text-sm text-muted">"A realm keeps an app or a project apart: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more for apps. A realm inherits root's settings. Commons holds what every realm may read: realms publish into it, and you review each item (Decisions) before it is there."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || realms.get().and_then(Result::ok).map(|rs| rs.into_iter().map(|r| {
                 let rid = r.id.clone();
@@ -661,10 +661,10 @@ fn Realms() -> impl IntoView {
                     <div class="flex items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                         <span class="font-mono font-medium">{r.id.clone()}</span>
                         <span>{r.name.clone()}</span>
-                        <span class="min-w-0 flex-1 truncate text-zinc-500">{r.description.clone()}</span>
+                        <span class="min-w-0 flex-1 truncate text-muted">{r.description.clone()}</span>
                         <crate::workspace::Go to=crate::workspace::View::Explore { realm: r.id.clone(), section: String::new(), kind: String::new(), id: String::new() } class=format!("{BUTTON_QUIET} text-xs")>"Explore"</crate::workspace::Go>
                         {holds.then(|| view! {
-                            <label class="flex items-center gap-1 text-xs text-zinc-500" title="Every realm reads commons, the knowledge shared by all, unless you turn it off">
+                            <label class="flex items-center gap-1 text-xs text-muted" title="Every realm reads commons, the knowledge shared by all, unless you turn it off">
                                 <input type="checkbox" prop:checked=reads on:change=move |ev| {
                                     let r = c6_api::RealmIn { id: String::new(), name: cname.clone(), description: cdesc.clone(), reads_commons: Some(event_target_checked(&ev)) };
                                     let cid = cid.clone();
@@ -691,7 +691,7 @@ fn Realms() -> impl IntoView {
                 <button class=BUTTON on:click=create>"Create a realm"</button>
             </div>
             <h3 class="pt-2 text-sm font-medium">"Which realms each worker and connection serves"</h3>
-            <p class="text-xs text-zinc-500">"Empty: every realm. One realm: dedicated to it (a realm whose files must stay apart needs a worker of its own)."</p>
+            <p class="text-xs text-muted">"Empty: every realm. One realm: dedicated to it (a realm whose files must stay apart needs a worker of its own)."</p>
             <div class="space-y-1 text-sm">
                 {move || live.workers.get().into_iter().filter(|w| w.role != "memex" && w.role != "head").map(|w| {
                     let text = RwSignal::new(w.realms.join(", "));
@@ -799,13 +799,13 @@ fn Apps() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Packages"</h2>
-            <p class="text-sm text-zinc-500">"Everything you install is a package: an app (it owns data: collections, triggers, settings), a library (configuration that owns nothing), or a kit (software that workers build and run in a sandbox, with tools for agents). An app or library is installed in a realm you choose, as an instance with a name; one package can be installed many times. Its code is its package's and changes only by upgrading (or switching to a fork); what it owns is written only by it. Installing asks you once for everything it and what it requires need. The registry below is local to this head."</p>
+            <p class="text-sm text-muted">"Everything you install is a package: an app (it owns data: collections, triggers, settings), a library (configuration that owns nothing), or a kit (software that workers build and run in a sandbox, with tools for agents). An app or library is installed in a realm you choose, as an instance with a name; one package can be installed many times. Its code is its package's and changes only by upgrading (or switching to a fork); what it owns is written only by it. Installing asks you once for everything it and what it requires need. The registry below is local to this head."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || note.get().map(|n| view! { <div class="md rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&n)></div> })}
             <h3 class="text-sm font-medium">"Installed"</h3>
             {move || installed.get().and_then(Result::ok).map(|list| {
                 if list.is_empty() {
-                    return view! { <p class="text-sm text-zinc-500">"Nothing yet."</p> }.into_any();
+                    return view! { <p class="text-sm text-muted">"Nothing yet."</p> }.into_any();
                 }
                 let names: std::collections::HashMap<i64, String> = list.iter().map(|i| (i.id, i.package.clone())).collect();
                 list.into_iter().map(|i| {
@@ -820,8 +820,8 @@ fn Apps() -> impl IntoView {
                     view! {
                         <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                             <span class="font-medium">{title}</span>
-                            <span class="text-xs text-zinc-500">{format!("{} · {}{} · {}", i.version, i.roles.join(" and "), if i.realm.is_empty() { " for workers".to_owned() } else { format!(" in {}", i.realm) }, i.state)}</span>
-                            <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{(!by.is_empty()).then(|| format!("required by {}", by.join(", ")))}</span>
+                            <span class="text-xs text-muted">{format!("{} · {}{} · {}", i.version, i.roles.join(" and "), if i.realm.is_empty() { " for workers".to_owned() } else { format!(" in {}", i.realm) }, i.state)}</span>
+                            <span class="min-w-0 flex-1 truncate text-xs text-muted">{(!by.is_empty()).then(|| format!("required by {}", by.join(", ")))}</span>
                             // Waiting on your answer: in the console's Decisions.
                             {matches!(i.state.as_str(), "installing" | "upgrading" | "removing").then(|| view! {
                                 <a rel="external" href="/admin/decisions" class="rounded bg-amber-100 px-1.5 text-xs text-amber-900 hover:underline dark:bg-amber-950 dark:text-amber-200">
@@ -873,8 +873,8 @@ fn Apps() -> impl IntoView {
                     <div class="flex flex-wrap items-center gap-2 px-1 text-sm">
                         <span class="font-mono">{format!("{} {}", p.name, p.version)}</span>
                         <span class="rounded bg-zinc-100 px-1.5 text-xs dark:bg-zinc-800">{p.roles.join(", ")}</span>
-                        <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{p.description.clone()}</span>
-                        {(!p.requires.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("requires {}", p.requires.iter().map(|(n, r)| format!("{n} {r}")).collect::<Vec<_>>().join(", "))}</span> })}
+                        <span class="min-w-0 flex-1 truncate text-xs text-muted">{p.description.clone()}</span>
+                        {(!p.requires.is_empty()).then(|| view! { <span class="text-xs text-muted">{format!("requires {}", p.requires.iter().map(|(n, r)| format!("{n} {r}")).collect::<Vec<_>>().join(", "))}</span> })}
                         {(!installed).then(|| view! {
                             <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                 let (name, version) = (name.clone(), version.clone());
@@ -1026,11 +1026,11 @@ fn Grants() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Grants"</h2>
-            <p class="text-sm text-zinc-500">"Realms share nothing unless you grant it: one realm reading another's collection (or some of its records), adding to it, taking a copy once, reading its knowledge, or calling its operations (drafting mail through home's accounts). Every use is logged; revoking stops the flow, and what already crossed stays. Agents ask for grants as decisions."</p>
+            <p class="text-sm text-muted">"Realms share nothing unless you grant it: one realm reading another's collection (or some of its records), adding to it, taking a copy once, reading its knowledge, or calling its operations (drafting mail through home's accounts). Every use is logged; revoking stops the flow, and what already crossed stays. Agents ask for grants as decisions."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || grants.get().and_then(Result::ok).map(|gs| {
                 if gs.is_empty() {
-                    return view! { <p class="text-sm text-zinc-500">"No grants."</p> }.into_any();
+                    return view! { <p class="text-sm text-muted">"No grants."</p> }.into_any();
                 }
                 gs.into_iter().map(|g| {
                     let (gid, gid2) = (g.id.clone(), g.id.clone());
@@ -1046,7 +1046,7 @@ fn Grants() -> impl IntoView {
                                 <span class="font-mono">{format!("{} → {}", g.from_realm, g.to_realm)}</span>
                                 <span class="rounded bg-zinc-100 px-1.5 text-xs dark:bg-zinc-800">{g.mode.clone()}</span>
                                 <span class="min-w-0 flex-1 truncate">{summary}</span>
-                                <span class=if g.state == "active" { "text-xs text-emerald-600" } else { "text-xs text-zinc-500" }>{g.state.clone()}</span>
+                                <span class=if g.state == "active" { "text-xs text-emerald-600" } else { "text-xs text-muted" }>{g.state.clone()}</span>
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                     let gid = gid.clone();
                                     if shown.get_untracked().is_some_and(|(s, _)| s == gid) {
@@ -1066,11 +1066,11 @@ fn Grants() -> impl IntoView {
                                     }>"Revoke"</button>
                                 })}
                             </div>
-                            {(!g.note.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">{g.note.clone()}</p> })}
+                            {(!g.note.is_empty()).then(|| view! { <p class="text-xs text-muted">{g.note.clone()}</p> })}
                             {
                                 let id = g.id.clone();
                                 move || shown.get().filter(|(s, _)| *s == id).map(|(_, uses)| view! {
-                                    <ul class="mt-1 space-y-0.5 text-xs text-zinc-500">
+                                    <ul class="mt-1 space-y-0.5 text-xs text-muted">
                                         {uses.into_iter().map(|u| view! {
                                             <li>{format!("{} · {} · {}", crate::util::ago(crate::util::now_ms() - u.at), u.by, u.what)}</li>
                                         }).collect_view()}
@@ -1122,8 +1122,8 @@ fn Prompts() -> impl IntoView {
     let in_realm = crate::place::realm().is_some();
     view! {
         <section class="space-y-3">
-            <p class="text-sm text-zinc-500">"Everything carbon6 tells a model is here: what agent sessions start with, how conversations are compacted, what subagents and the assistant are told, how action items are worked on, and how the memex reads your records. Change any of them; {{placeholders}} are filled in. A prompt you have not changed follows carbon6's default when a new version improves it."</p>
-            {in_realm.then(|| view! { <p class="text-sm text-zinc-500">"This realm uses root's text (set in the console) unless it sets its own here."</p> })}
+            <p class="text-sm text-muted">"Everything carbon6 tells a model is here: what agent sessions start with, how conversations are compacted, what subagents and the assistant are told, how action items are worked on, and how the memex reads your records. Change any of them; {{placeholders}} are filled in. A prompt you have not changed follows carbon6's default when a new version improves it."</p>
+            {in_realm.then(|| view! { <p class="text-sm text-muted">"This realm uses root's text (set in the console) unless it sets its own here."</p> })}
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 Ok(ps) => ps.into_iter().map(|p| {
@@ -1143,7 +1143,7 @@ fn Prompts() -> impl IntoView {
                             <summary class="cursor-pointer select-none text-sm">
                                 <span class="font-mono font-medium">{p.name.clone()}</span>
                                 {p.edited.then(|| view! { <span class="ml-2 rounded bg-amber-100 px-1 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">{if in_realm { "set here" } else { "edited" }}</span> })}
-                                <span class="ml-2 text-zinc-500">{p.description.clone()}</span>
+                                <span class="ml-2 text-muted">{p.description.clone()}</span>
                             </summary>
                             <div class="mt-2 space-y-2">
                                 <textarea class=format!("{INPUT} h-48 font-mono text-xs") prop:value=move || body.get() on:input=move |ev| body.set(event_target_value(&ev))></textarea>
@@ -1194,10 +1194,10 @@ fn SessionImportsSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Sessions from Claude Code and Codex"</h2>
-                <p class="text-sm text-zinc-500">"A worker you turn this on for brings in the sessions it has in ~/.claude and ~/.codex, and new ones as you go on using those tools: in the Sessions list, searchable, in the memex, and continued here with a message (a Claude Code session through a Claude Code connection keeps Claude Code's own memory of it). Once you continue one here, it is carbon6's."</p>
+                <p class="text-sm text-muted">"A worker you turn this on for brings in the sessions it has in ~/.claude and ~/.codex, and new ones as you go on using those tools: in the Sessions list, searchable, in the memex, and continued here with a message (a Claude Code session through a Claude Code connection keeps Claude Code's own memory of it). Once you continue one here, it is carbon6's."</p>
             </div>
             <div class="flex flex-wrap gap-3 text-sm">
-                <span class="text-zinc-500">"Workers:"</span>
+                <span class="text-muted">"Workers:"</span>
                 {move || workers.get().into_iter().filter(|w| w.role != "memex").map(|w| {
                     let name = w.name.clone();
                     let n2 = name.clone();
@@ -1211,7 +1211,7 @@ fn SessionImportsSetting() -> impl IntoView {
                 }).collect_view()}
             </div>
             <div class="flex flex-wrap gap-3 text-sm">
-                <span class="text-zinc-500">"From:"</span>
+                <span class="text-muted">"From:"</span>
                 {[("claude_code", "Claude Code"), ("codex", "Codex")].into_iter().map(|(k, label)| view! {
                     <label class="flex items-center gap-1">
                         <input type="checkbox" prop:checked=move || { let v = s.get(); v.sources.is_empty() || v.sources.iter().any(|x| x == k) }
@@ -1227,12 +1227,12 @@ fn SessionImportsSetting() -> impl IntoView {
                 }).collect_view()}
             </div>
             <div class="space-y-1">
-                <p class="text-xs text-zinc-500">"Which realm a session goes to, by its folder (the first rule that matches; else home):"</p>
+                <p class="text-xs text-muted">"Which realm a session goes to, by its folder (the first rule that matches; else home):"</p>
                 {move || s.get().rules.into_iter().enumerate().map(|(i, r)| view! {
                     <div class="flex items-center gap-2">
                         <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="~/work" prop:value=r.folder.clone()
                             on:change=move |ev| { let f = event_target_value(&ev); s.update(|v| v.rules[i].folder = f); } />
-                        <span class="text-xs text-zinc-500">"→"</span>
+                        <span class="text-xs text-muted">"→"</span>
                         <input class=format!("{INPUT} w-32 py-1 font-mono text-xs") placeholder="work" prop:value=r.realm.clone()
                             on:change=move |ev| { let x = event_target_value(&ev); s.update(|v| v.rules[i].realm = x); } />
                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| s.update(|v| { v.rules.remove(i); })>"Remove"</button>
@@ -1248,7 +1248,7 @@ fn SessionImportsSetting() -> impl IntoView {
                 <button class=BUTTON on:click=save>"Save"</button>
             </div>
             {move || summary.get().and_then(Result::ok).and_then(|v| v.as_array().cloned()).filter(|a| !a.is_empty()).map(|rows| view! {
-                <p class="text-xs text-zinc-500">"Imported: "{rows.iter().map(|r| format!("{} {} session{} in {}",
+                <p class="text-xs text-muted">"Imported: "{rows.iter().map(|r| format!("{} {} session{} in {}",
                     r["sessions"], if r["source"] == "codex" { "Codex" } else { "Claude Code" },
                     if r["sessions"] == 1 { "" } else { "s" }, r["realm"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")}</p>
             })}
@@ -1280,7 +1280,7 @@ fn SuggestionsSetting() -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Suggested next messages"</h2>
-            <p class="text-sm text-zinc-500">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest."</p>
+            <p class="text-sm text-muted">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || on.get() on:change=toggle />
                 "Suggest next messages"
@@ -1324,7 +1324,7 @@ fn DocsSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Docs"</h2>
-            <p class="text-sm text-zinc-500">"Docs and decks you and agents write together (the Docs page). Sessions have a doc tool; how they write is the prompt docs.style (Settings → Prompts). Every session reads any document of the realm."</p>
+            <p class="text-sm text-muted">"Docs and decks you and agents write together (the Docs page). Sessions have a doc tool; how they write is the prompt docs.style (Settings → Prompts). Every session reads any document of the realm."</p>
             <p class="text-sm font-medium">"Which documents a session edits without asking"</p>
             {choice("work", "The ones it made and its work's. Any other, once you allow it (a decision per document). The default.")}
             {choice("realm", "Any document in this realm.")}
@@ -1364,7 +1364,7 @@ fn DocsGoogle() -> impl IntoView {
     };
     view! {
         <p class="text-sm font-medium">"Google Docs and Slides"</p>
-        <p class="text-sm text-zinc-500">"Exports to Google go to an account here. It is asked only for drive.file: carbon6 reaches the files it makes, nothing else in your Drive. It uses your Google OAuth client (Settings → Mail & calendar), with the Google Drive API enabled for it."</p>
+        <p class="text-sm text-muted">"Exports to Google go to an account here. It is asked only for drive.file: carbon6 reaches the files it makes, nothing else in your Drive. It uses your Google OAuth client (Settings → Mail & calendar), with the Google Drive API enabled for it."</p>
         {move || accounts.get().and_then(Result::ok).map(|list| view! {
             <ul class="space-y-1 text-sm">
                 {list.into_iter().map(|a| {
@@ -1410,7 +1410,7 @@ fn WorkSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Work"</h2>
-            <p class="text-sm text-zinc-500">"What you mean to finish, with the sessions, requests and links that belong to it (the Work panel). A small model call when you start a session (which work it serves) and when something attached moves (where it stands, and whether it looks done): a routing rule with the label task:work picks the model, else the session's own. The prompts are work.attach, work.summary, work.pickup and work.propose."</p>
+            <p class="text-sm text-muted">"What you mean to finish, with the sessions, requests and links that belong to it (the Work panel). A small model call when you start a session (which work it serves) and when something attached moves (where it stands, and whether it looks done): a routing rule with the label task:work picks the model, else the session's own. The prompts are work.attach, work.summary, work.pickup and work.propose."</p>
             {move || shown.get().map(|s| view! {
                 <label class="flex items-center gap-2 text-sm">
                     <input type="checkbox" prop:checked=s.guess on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.guess = on) } />
@@ -1507,7 +1507,7 @@ fn UpdatesSetting() -> impl IntoView {
             <div class="flex items-start justify-between gap-3">
                 <div>
                     <h2 class="font-medium">"Updates"</h2>
-                    <p class="text-sm text-zinc-500">"carbon6 looks for releases on GitHub every 15 minutes and installs only what carbon6's release key signed. The head updates first; then each worker, once its sessions are idle. A version that doesn't start is rolled back."</p>
+                    <p class="text-sm text-muted">"carbon6 looks for releases on GitHub every 15 minutes and installs only what carbon6's release key signed. The head updates first; then each worker, once its sessions are idle. A version that doesn't start is rolled back."</p>
                 </div>
                 <button class=format!("{BUTTON_QUIET} shrink-0 whitespace-nowrap") disabled=move || busy.get() on:click=move |_| act(Box::pin(api::check_updates()))>"Look now"</button>
             </div>
@@ -1519,7 +1519,7 @@ fn UpdatesSetting() -> impl IntoView {
                     (None, true) => String::new(),
                 };
                 view! {
-                    <p class="text-sm">"This is carbon6 " <span class="font-medium">{u.version.clone()}</span>". " <span class="text-zinc-500">{checked}</span></p>
+                    <p class="text-sm">"This is carbon6 " <span class="font-medium">{u.version.clone()}</span>". " <span class="text-muted">{checked}</span></p>
                     {u.releases.into_iter().filter(|r| r.state != "done" || r.version == u.version).take(3).map(|r| {
                         let (v1, v2) = (r.version.clone(), r.version.clone());
                         let open = matches!(r.state.as_str(), "available" | "failed");
@@ -1527,8 +1527,8 @@ fn UpdatesSetting() -> impl IntoView {
                             <details class="rounded-md border border-zinc-200 px-3 py-2 dark:border-zinc-800" open=open>
                                 <summary class="cursor-pointer select-none text-sm">
                                     <span class="font-medium">{format!("carbon6 {}", r.version)}</span>
-                                    <span class="ml-2 text-zinc-500">{r.state.replace('_', " ")}</span>
-                                    {(!r.detail.is_empty() && r.detail != "auto").then(|| view! { <span class="ml-2 text-xs text-zinc-500">{r.detail.clone()}</span> })}
+                                    <span class="ml-2 text-muted">{r.state.replace('_', " ")}</span>
+                                    {(!r.detail.is_empty() && r.detail != "auto").then(|| view! { <span class="ml-2 text-xs text-muted">{r.detail.clone()}</span> })}
                                 </summary>
                                 {r.manual.clone().map(|m| view! { <p class="mt-2 text-sm"><span class="font-medium">"Before updating: "</span>{m}</p> })}
                                 <pre class="mt-2 overflow-auto whitespace-pre-wrap font-sans text-xs text-zinc-600 dark:text-zinc-400">{r.notes.clone()}</pre>
@@ -1542,15 +1542,15 @@ fn UpdatesSetting() -> impl IntoView {
                         }
                     }).collect_view()}
                     <table class="w-full text-left text-sm">
-                        <thead class="text-xs text-zinc-500"><tr><th class="py-1">"Machine"</th><th>"Runs"</th><th>"Installed with"</th><th>"Update"</th></tr></thead>
+                        <thead class="text-xs text-muted"><tr><th class="py-1">"Machine"</th><th>"Runs"</th><th>"Installed with"</th><th>"Update"</th></tr></thead>
                         <tbody>
                             {u.machines.into_iter().map(|m| view! {
                                 <tr class="border-t border-zinc-100 dark:border-zinc-800">
                                     <td class="py-1">{m.name.clone()}</td>
                                     <td class="font-mono text-xs">{m.running.clone()}</td>
-                                    <td class="text-xs text-zinc-500">{if m.method.is_empty() { "—".to_owned() } else { m.method.clone() }}</td>
+                                    <td class="text-xs text-muted">{if m.method.is_empty() { "—".to_owned() } else { m.method.clone() }}</td>
                                     <td class="text-xs">{if m.state.is_empty() { String::new() } else { format!("{} {}", m.version, m.state.replace('_', " ")) }}
-                                        {(!m.detail.is_empty()).then(|| view! { <span class="ml-1 text-zinc-500">{format!("({})", m.detail)}</span> })}</td>
+                                        {(!m.detail.is_empty()).then(|| view! { <span class="ml-1 text-muted">{format!("({})", m.detail)}</span> })}</td>
                                 </tr>
                             }).collect_view()}
                         </tbody>
@@ -1559,14 +1559,14 @@ fn UpdatesSetting() -> impl IntoView {
             })}
             <div class="grid gap-3 text-sm sm:grid-cols-2">
                 <label class="space-y-1">
-                    <span class="block text-xs text-zinc-500">"Channel"</span>
+                    <span class="block text-xs text-muted">"Channel"</span>
                     <select class=SELECT prop:value=move || s.get().channel on:change=move |ev| { let c = event_target_value(&ev); s.update(|v| v.channel = c); }>
                         <option value="stable">"Stable: releases"</option>
                         <option value="edge">"Edge: every green commit on main"</option>
                     </select>
                 </label>
                 <label class="space-y-1">
-                    <span class="block text-xs text-zinc-500">"When a release is out"</span>
+                    <span class="block text-xs text-muted">"When a release is out"</span>
                     <select class=SELECT prop:value=move || s.get().mode on:change=move |ev| { let m = event_target_value(&ev); s.update(|v| v.mode = m); }>
                         <option value="approve">"Ask me (a decision)"</option>
                         <option value="auto">"Update on its own"</option>
@@ -1576,20 +1576,20 @@ fn UpdatesSetting() -> impl IntoView {
                 </label>
                 {move || (s.get().mode == "auto").then(|| view! {
                     <label class="space-y-1">
-                        <span class="block text-xs text-zinc-500">"On its own for (bigger ones ask)"</span>
+                        <span class="block text-xs text-muted">"On its own for (bigger ones ask)"</span>
                         <select class=SELECT prop:value=move || s.get().auto_for on:change=move |ev| { let m = event_target_value(&ev); s.update(|v| v.auto_for = m); }>
                             <option value="patch">"Patch releases (0.3.3 → 0.3.4)"</option>
                             <option value="minor">"Minor releases too (0.3 → 0.4)"</option>
                         </select>
                     </label>
                     <label class="space-y-1">
-                        <span class="block text-xs text-zinc-500">"Only between (the head's time; empty: any time)"</span>
+                        <span class="block text-xs text-muted">"Only between (the head's time; empty: any time)"</span>
                         <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="02:00-05:00" prop:value=move || s.get().window
                             on:change=move |ev| { let w = event_target_value(&ev); s.update(|v| v.window = w); } />
                     </label>
                 })}
                 <label class="space-y-1">
-                    <span class="block text-xs text-zinc-500">"A busy worker waits at most (hours)"</span>
+                    <span class="block text-xs text-muted">"A busy worker waits at most (hours)"</span>
                     <input type="number" min="0" class=format!("{INPUT} w-24 py-1") prop:value=move || s.get().drain_hours.to_string()
                         on:change=move |ev| { let h = event_target_value(&ev).parse().unwrap_or(24); s.update(|v| v.drain_hours = h); } />
                 </label>
@@ -1612,10 +1612,10 @@ fn Upgrades() -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Upgrades"</h2>
-            <p class="text-sm text-zinc-500">"Each new version of carbon6 upgrades its databases when it starts (or with c6h upgrade). The database is copied to backups/ next to it first; a failed upgrade puts the copy back, so nothing changes. To go back to an earlier version, stop carbon6 and put the backup in place of the database. To see what an upgrade would do first: c6h upgrade --check."</p>
+            <p class="text-sm text-muted">"Each new version of carbon6 upgrades its databases when it starts (or with c6h upgrade). The database is copied to backups/ next to it first; a failed upgrade puts the copy back, so nothing changes. To go back to an earlier version, stop carbon6 and put the backup in place of the database. To see what an upgrade would do first: c6h upgrade --check."</p>
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
-                Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"No upgrades yet."</p> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"No upgrades yet."</p> }.into_any(),
                 Ok(v) => v.into_iter().map(|u| {
                     let what = match u.from_version {
                         None => format!("created at version {}", u.to_version),
@@ -1625,8 +1625,8 @@ fn Upgrades() -> impl IntoView {
                         <details class="rounded-md border border-zinc-200 px-3 py-2 dark:border-zinc-800">
                             <summary class="cursor-pointer select-none text-sm">
                                 <span class="font-medium">{format!("{} · {}", u.service, u.database)}</span>
-                                <span class="ml-2 text-zinc-500">{what}</span>
-                                <span class="ml-2 text-xs text-zinc-500">{crate::util::ago(crate::util::now_ms() - u.at)}</span>
+                                <span class="ml-2 text-muted">{what}</span>
+                                <span class="ml-2 text-xs text-muted">{crate::util::ago(crate::util::now_ms() - u.at)}</span>
                             </summary>
                             <pre class="mt-2 overflow-auto whitespace-pre-wrap font-mono text-[11px]">{u.report}</pre>
                         </details>
@@ -1648,7 +1648,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
             <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
                 <div>
                     <h2 class="font-medium">"LLM connections"</h2>
-                    <p class="text-sm text-zinc-500">
+                    <p class="text-sm text-muted">
                         "Model providers for sessions. Keys and sign-ins are encrypted on the head; workers fetch short-lived credentials when they call the model and keep them only in memory."
                     </p>
                 </div>
@@ -1656,7 +1656,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                 <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     <Suspense fallback=|| ()>
                         {move || connections.get().map(|r| match r {
-                            Ok(cs) if cs.is_empty() => view! { <p class="px-4 py-6 text-center text-sm text-zinc-500">"No connections yet."</p> }.into_any(),
+                            Ok(cs) if cs.is_empty() => view! { <p class="px-4 py-6 text-center text-sm text-muted">"No connections yet."</p> }.into_any(),
                             Ok(cs) => cs.into_iter().map(|c| view! { <ConnectionRow c all on_change=move || connections.refetch() error /> }).collect_view().into_any(),
                             Err(e) => view! { <div class="p-3"><ErrorBox message=e /></div> }.into_any(),
                         })}
@@ -1697,19 +1697,19 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
                         <option value="">"Choose a connection"</option>
                         {choices().into_iter().map(|c| view! { <option value=c.id.clone() selected=c.id == m.connection_id>{c.name}</option> }).collect_view()}
                     </select>
-                    <label class="flex shrink-0 items-center gap-1 text-xs text-zinc-500">
+                    <label class="flex shrink-0 items-center gap-1 text-xs text-muted">
                         "Calls at once"
                         <input type="number" min="1" max="64" class="w-16 rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900"
                             prop:value=m.slots.to_string()
                             on:change=move |ev| members.update(|ms| ms[i].slots = event_target_value(&ev).parse().unwrap_or(1)) />
                     </label>
-                    <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=move |_| members.update(|ms| { ms.remove(i); })>"Remove"</button>
+                    <button class=format!("{BUTTON_QUIET} text-muted hover:text-red-600") on:click=move |_| members.update(|ms| { ms.remove(i); })>"Remove"</button>
                 </div>
             }).collect_view()}
-            <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| members.update(|ms| ms.push(PoolMember { connection_id: String::new(), slots: 1 }))>
+            <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| members.update(|ms| ms.push(PoolMember { connection_id: String::new(), slots: 1 }))>
                 "Add a member"
             </button>
-            <p class="text-xs text-zinc-500">
+            <p class="text-xs text-muted">
                 "Each call goes to the least busy member with a free slot, else waits its turn; a member that fails rests and the call goes to another. Pools are for what runs in the head (the memex, the assistant, suggestions), not sessions. Set Settings → Memex → calls at once to about the total of the members' calls at once."
             </p>
         </div>
@@ -1719,7 +1719,7 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
 #[component]
 fn ContextWindow(value: RwSignal<String>) -> impl IntoView {
     view! {
-        <label class="block text-xs text-zinc-500">
+        <label class="block text-xs text-muted">
             "Context window"
             <input type="number" min="1024" max="100000000" step="1" class=format!("mt-1 {INPUT}") placeholder="empty: automatic"
                 prop:value=move || value.get() on:input=move |ev| value.set(event_target_value(&ev)) />
@@ -1732,13 +1732,13 @@ fn ContextWindow(value: RwSignal<String>) -> impl IntoView {
 fn SessionDefaults(subagent_model: RwSignal<String>, compact_at: RwSignal<String>) -> impl IntoView {
     view! {
         <div class="grid gap-2 sm:grid-cols-2">
-            <label class="block text-xs text-zinc-500">
+            <label class="block text-xs text-muted">
                 "Subagent model"
                 <input class=format!("mt-1 {INPUT}") placeholder="empty: the session's own"
                     title="Subagents of sessions on this connection run on this model unless a routing rule or the session names another. A smaller model costs far less for searching and reading."
                     prop:value=move || subagent_model.get() on:input=move |ev| subagent_model.set(event_target_value(&ev)) />
             </label>
-            <label class="block text-xs text-zinc-500">
+            <label class="block text-xs text-muted">
                 "Compact at (% of context window)"
                 <input type="number" min="30" max="95" step="1" class=format!("mt-1 {INPUT}") placeholder="empty: 70 for large windows, else 85"
                     title="Sessions summarize their conversation once it fills this share of the window. Every call sends the whole conversation, so compacting sooner spends fewer tokens per step."
@@ -1843,7 +1843,7 @@ fn ConnectionRow(
                     Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{format!("✓ Connected · {} models", m.len())}</div> }.into_any(),
                     Err(e) => view! { <div class="text-xs text-red-600">{format!("✕ {e}")}</div> }.into_any(),
                 })}
-                <div class="truncate font-mono text-xs text-zinc-500">
+                <div class="truncate font-mono text-xs text-muted">
                     {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
                     {pool.then_some(move || format!(" · {}", members_text()))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
@@ -1856,10 +1856,10 @@ fn ConnectionRow(
                     move || crate::quota::of(&id).map(|q| view! { <div class="mt-1"><crate::quota::QuotaBars q /></div> })
                 }
             </div>
-            {editable.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
-            {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}
-            <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=test>"Test"</button>
-            <button class=format!("{BUTTON_QUIET} text-zinc-500 hover:text-red-600") on:click=remove>"Delete"</button>
+            {editable.then(|| view! { <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
+            {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-muted") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}
+            <button class=format!("{BUTTON_QUIET} text-muted") on:click=test>"Test"</button>
+            <button class=format!("{BUTTON_QUIET} text-muted hover:text-red-600") on:click=remove>"Delete"</button>
         </div>
         {move || reauth.get().then(|| view! { <ChatGptSignIn on_added=move || { reauth.set(false); on_change(); } again=again_id.clone() /> })}
         {move || editing.get().then(|| view! {
@@ -1950,7 +1950,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
 
     let field = move |label: &'static str, sig: RwSignal<String>, placeholder: Signal<&'static str>, input_type: &'static str| {
         view! {
-            <label class="block text-xs text-zinc-500">
+            <label class="block text-xs text-muted">
                 {label}
                 <input type=input_type class=format!("mt-1 {INPUT}") placeholder=placeholder autocomplete="off"
                     prop:value=move || sig.get() on:input=move |ev| sig.set(event_target_value(&ev)) />
@@ -1969,7 +1969,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Add a connection"</h2>
-            <label class="block text-xs text-zinc-500">
+            <label class="block text-xs text-muted">
                 "Kind"
                 <select class=format!("mt-1 {INPUT}") prop:value=move || kind.get() on:change=move |ev| kind.set(event_target_value(&ev))>
                     <option value="anthropic">"Anthropic API (Claude)"</option>
@@ -1986,7 +1986,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                 </div>
             })}
             {move || (kind.get() == "claude_code").then(|| view! {
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "Sessions run the official Claude Code CLI on the worker, with its own tools and sign-in (your Claude subscription or API key). Install it on each worker and run "
                     <code class="font-mono">"claude auth login"</code> " there. No key is stored here."
                 </p>
@@ -1995,7 +1995,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                 {field("Name", name, by_kind("Anthropic", "OpenAI", "Ollama"), "text")}
                 {field("Base URL", base_url, by_kind("https://api.anthropic.com (default)", "https://api.openai.com/v1 (default)", "http://127.0.0.1:11434/v1"), "url")}
                 {field("API key", api_key, by_kind("sk-ant-…", "sk-…", "optional for local servers"), "password")}
-                <label class="block text-xs text-zinc-500">
+                <label class="block text-xs text-muted">
                     "Default model (optional)"
                     // The server's models after a test; any name can be typed.
                     <div class="mt-1"><ModelInput connection=Signal::stored(String::new()) value=default_model on_set=move |v| default_model.set(v) class=INPUT.to_owned()
@@ -2008,7 +2008,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                 Ok(models) => view! {
                     <p class="text-sm text-emerald-700 dark:text-emerald-400">
                         {format!("✓ Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
-                        {(!models.is_empty()).then(|| view! { <span class="text-zinc-500">" (listed in the model field)"</span> })}
+                        {(!models.is_empty()).then(|| view! { <span class="text-muted">" (listed in the model field)"</span> })}
                     </p>
                 }.into_any(),
                 Err(e) => view! { <p class="text-sm text-red-600">{format!("✕ {e}")}</p> }.into_any(),
@@ -2079,17 +2079,17 @@ fn ChatGptSignIn(
             {adding.then(|| view! {
                 <div>
                     <h2 class="font-medium">"Add a ChatGPT account"</h2>
-                    <p class="text-sm text-zinc-500">"Use a ChatGPT plan for OpenAI models; add as many accounts and workspaces as you like, each its own connection. The head keeps and refreshes each sign-in; workers only ever get short-lived tokens. To add a different account than the one signed in at chatgpt.com in this browser, give its email, or sign out there first."</p>
+                    <p class="text-sm text-muted">"Use a ChatGPT plan for OpenAI models; add as many accounts and workspaces as you like, each its own connection. The head keeps and refreshes each sign-in; workers only ever get short-lived tokens. To add a different account than the one signed in at chatgpt.com in this browser, give its email, or sign out there first."</p>
                 </div>
             })}
             {move || match url.get() {
                 None if adding => view! {
                     <div class="flex flex-wrap items-end gap-2">
-                        <label class="block min-w-40 flex-1 text-xs text-zinc-500">
+                        <label class="block min-w-40 flex-1 text-xs text-muted">
                             "Connection name"
                             <input class=format!("mt-1 {INPUT}") placeholder="ChatGPT (your email)" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                         </label>
-                        <label class="block min-w-40 flex-1 text-xs text-zinc-500">
+                        <label class="block min-w-40 flex-1 text-xs text-muted">
                             "Account email (optional)"
                             <input class=format!("mt-1 {INPUT}") type="email" placeholder="to pick the account" prop:value=move || email.get() on:input=move |ev| email.set(event_target_value(&ev)) />
                         </label>
@@ -2098,7 +2098,7 @@ fn ChatGptSignIn(
                 }.into_any(),
                 None => view! {
                     <div class="flex items-center gap-2 text-sm">
-                        <span class="flex-1 text-zinc-500">"Sign this account in again (if its sign-in expired or was revoked)."</span>
+                        <span class="flex-1 text-muted">"Sign this account in again (if its sign-in expired or was revoked)."</span>
                         <button class=BUTTON disabled=move || pending.get() on:click=start>"Sign in again"</button>
                     </div>
                 }.into_any(),
@@ -2165,7 +2165,7 @@ fn step_tone(status: &str) -> &'static str {
         "failed" | "denied" => "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300",
         "running" => "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300",
         "waiting" => "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200",
-        _ => "bg-zinc-100 text-zinc-500 dark:bg-zinc-800",
+        _ => "bg-zinc-100 text-muted dark:bg-zinc-800",
     }
 }
 
@@ -2222,14 +2222,14 @@ fn WorkflowRunsPanel() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
             <div class="flex flex-wrap items-end gap-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Run a workflow"</span>
+                    <span class="text-xs text-muted">"Run a workflow"</span>
                     <select class=format!("{INPUT} py-1") prop:value=move || pick.get() on:change=move |ev| pick.set(event_target_value(&ev))>
                         <option value="">"Choose…"</option>
                         {move || flows.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|w| w.enabled).map(|w| view! { <option value=w.name.clone()>{w.name.clone()}</option> }).collect_view()}
                     </select>
                 </label>
                 <label class="min-w-0 flex-1 space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Input ({{input}})"</span>
+                    <span class="text-xs text-muted">"Input ({{input}})"</span>
                     <input class=format!("{INPUT} py-1") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
                 </label>
                 <button class=BUTTON on:click=start>"Run"</button>
@@ -2241,7 +2241,7 @@ fn WorkflowRunsPanel() -> impl IntoView {
             <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
                 {move || runs.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="py-1 text-xs text-zinc-500">"No workflow runs yet."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-1 text-xs text-muted">"No workflow runs yet."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|run| {
                         let rid = run.id.clone();
                         view! {
@@ -2249,7 +2249,7 @@ fn WorkflowRunsPanel() -> impl IntoView {
                                 <div class="flex flex-wrap items-center gap-2">
                                     <span class="font-medium">{run.workflow.clone()}</span>
                                     <span class=format!("rounded px-1.5 text-[11px] {}", step_tone(&run.status))>{run.status.clone()}</span>
-                                    <span class="text-xs text-zinc-500">{format!("{} · {}", when(run.started_at), run.trigger)}</span>
+                                    <span class="text-xs text-muted">{format!("{} · {}", when(run.started_at), run.trigger)}</span>
                                     {run.error.clone().map(|e| view! { <span class="text-xs text-red-600">{e}</span> })}
                                 </div>
                                 <div class="flex flex-wrap items-center gap-1">
@@ -2356,7 +2356,7 @@ fn JsonSetting(
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">{title}</h2>
             <Inherited name />
-            <p class="text-sm text-zinc-500">{help}</p>
+            <p class="text-sm text-muted">{help}</p>
             <textarea class=format!("{INPUT} min-h-40 font-mono text-xs") placeholder=example
                 prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
             {presets.map(|presets| {
@@ -2376,7 +2376,7 @@ fn JsonSetting(
                             <option value="">"Add a connector…"</option>
                             {presets().into_iter().map(|(l, _, _)| view! { <option value=l>{l}</option> }).collect_view()}
                         </select>
-                        {move || needs.get().map(|n| view! { <span class="text-xs text-zinc-500">{n}</span> })}
+                        {move || needs.get().map(|n| view! { <span class="text-xs text-muted">{n}</span> })}
                     </div>
                 }
             })}
@@ -2485,11 +2485,11 @@ fn HooksSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Hooks"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "Shell commands run on the worker, in the session's folder, at points in every session: to refuse risky tool calls, check work after edits, add context to your messages, or keep the agent going until something passes. New sessions pick up changes."
                 </p>
                 <Inherited name="hooks" />
-                <details class="mt-1 text-sm text-zinc-500">
+                <details class="mt-1 text-sm text-muted">
                     <summary class="cursor-pointer select-none">"How a hook works"</summary>
                     <ul class="mt-1 list-disc space-y-1 pl-5">
                         <li>"The event arrives as JSON on stdin: "<code>"tool_name"</code>", "<code>"tool_input"</code>" (tool events), "<code>"tool_response"</code>" (after a tool), "<code>"prompt"</code>" (your message), "<code>"stop_hook_active"</code>" (Stop), plus "<code>"session_id"</code>" and "<code>"cwd"</code>". "<code>"$C6_PROJECT_DIR"</code>" is the repository root."</li>
@@ -2504,7 +2504,7 @@ fn HooksSetting() -> impl IntoView {
                 <For each=move || rows.get() key=|(id, _)| *id let:row>
                     <HookRow hook=row.1 on_remove=move || rows.update(|r| r.retain(|(id, _)| *id != row.0)) />
                 </For>
-                {move || rows.with(Vec::is_empty).then(|| view! { <p class="text-sm text-zinc-500">"No hooks."</p> })}
+                {move || rows.with(Vec::is_empty).then(|| view! { <p class="text-sm text-muted">"No hooks."</p> })}
             </div>
             <div class="flex flex-wrap items-center justify-between gap-3">
                 <select class=format!("{INPUT} w-auto!") prop:value=move || example.get()
@@ -2532,7 +2532,7 @@ fn HooksSetting() -> impl IntoView {
 
 #[component]
 fn HookRow(hook: RwSignal<Hook>, on_remove: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
-    let label = "text-xs text-zinc-500";
+    let label = "text-xs text-muted";
     view! {
         <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if hook.with(|h| h.enabled) { "" } else { "opacity-60" })>
             <div class="flex flex-wrap items-center gap-2">
@@ -2880,11 +2880,11 @@ fn NotifyExtras() -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
             <label class="block space-y-0.5">
-                <span class="text-xs text-zinc-500">"Links in notifications open"</span>
+                <span class="text-xs text-muted">"Links in notifications open"</span>
                 <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="https://head.example:7700 (set when you first save a channel)"
                     prop:value=move || url.get() on:input=move |ev| url.set(event_target_value(&ev)) />
             </label>
-            <p class="text-xs text-zinc-500">"The address your phone or other devices reach this head at. Approval links work there without signing in, for an hour."</p>
+            <p class="text-xs text-muted">"The address your phone or other devices reach this head at. Approval links work there without signing in, for an hour."</p>
             <div class="flex flex-wrap items-center justify-end gap-2">
                 {move || status.get().map(|r| match r {
                     Ok(m) => view! { <span class="text-sm text-emerald-600">{m}</span> }.into_any(),
@@ -3268,14 +3268,14 @@ fn ListSetting(
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">{title}</h2>
-                <p class="text-sm text-zinc-500">{help}</p>
+                <p class="text-sm text-muted">{help}</p>
             </div>
             <Inherited name realm />
             <div class="space-y-3">
                 <For each=move || rows.get() key=|(id, _)| *id let:row>
                     <ListItem item=row.1 fields on_remove=move || rows.update(|r| r.retain(|(id, _)| *id != row.0)) />
                 </For>
-                {move || rows.with(Vec::is_empty).then(|| view! { <p class="text-sm text-zinc-500">{format!("No {noun}s.")}</p> })}
+                {move || rows.with(Vec::is_empty).then(|| view! { <p class="text-sm text-muted">{format!("No {noun}s.")}</p> })}
             </div>
             <div class="flex flex-wrap items-center justify-between gap-3">
                 <select class=format!("{INPUT} w-auto!") prop:value=move || picked.get()
@@ -3371,13 +3371,13 @@ fn ListItem(
                         <label class="flex items-start gap-2 text-sm sm:col-span-2" title=f.placeholder>
                             <input type="checkbox" class="mt-1" prop:checked=checked
                                 on:change=move |ev| item.update(|m| { m.insert(f.key.into(), serde_json::Value::Bool(event_target_checked(&ev))); }) />
-                            <span>{f.label}<span class="block text-xs text-zinc-500">{f.placeholder}</span></span>
+                            <span>{f.label}<span class="block text-xs text-muted">{f.placeholder}</span></span>
                         </label>
                     }.into_any()
                 } else if let FieldKind::Choice(options) = f.kind {
                     view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <span class="text-xs text-muted">{f.label}</span>
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=get(f.key) on:change=move |ev| set(f.key, event_target_value(&ev))>
                                 {options.iter().map(|o| view! { <option value=*o>{*o}</option> }).collect_view()}
                             </select>
@@ -3386,7 +3386,7 @@ fn ListItem(
                 } else if f.kind == FieldKind::Connection {
                     view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <span class="text-xs text-muted">{f.label}</span>
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=get(f.key) on:change=move |ev| set(f.key, event_target_value(&ev))>
                                 <option value="">{format!("Default: {}", f.placeholder)}</option>
                                 {move || {
@@ -3410,7 +3410,7 @@ fn ListItem(
                     });
                     view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <span class="text-xs text-muted">{f.label}</span>
                             <ModelInput connection value=Signal::derive(get(f.key)) on_set=move |v| set(f.key, v) class=input_class(f) placeholder=f.placeholder />
                         </label>
                     }.into_any()
@@ -3418,7 +3418,7 @@ fn ListItem(
                     // Parsed when you leave the field, so typing is not reformatted.
                     view! {
                         <label class="space-y-0.5 sm:col-span-2">
-                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <span class="text-xs text-muted">{f.label}</span>
                             <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key)
                                 title=if f.kind == FieldKind::Labels { "Sessions with all of these labels: yours, or worker:, repo:, folder: (a path prefix) and model:" } else { "Comma-separated tool names, in any profile's naming; empty: all tools" }
                                 on:change=move |ev| set(f.key, event_target_value(&ev)) />
@@ -3427,7 +3427,7 @@ fn ListItem(
                 } else {
                     view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">{f.label}</span>
+                            <span class="text-xs text-muted">{f.label}</span>
                             <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key) on:input=move |ev| set(f.key, event_target_value(&ev)) />
                         </label>
                     }.into_any()
@@ -3435,7 +3435,7 @@ fn ListItem(
             </div>
             {texts.into_iter().map(|f| view! {
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">{f.label}</span>
+                    <span class="text-xs text-muted">{f.label}</span>
                     <textarea class=format!("{INPUT} min-h-24 font-mono text-xs") placeholder=f.placeholder prop:value=get(f.key)
                         on:input=move |ev| set(f.key, event_target_value(&ev))></textarea>
                 </label>
@@ -3488,10 +3488,10 @@ fn SecretsSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Secrets"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "API keys, tokens and passwords for the agent's shell commands. Each is an environment variable (e.g. $GITHUB_TOKEN) in the sessions it applies to. The agent sees only its name and description: the value is never shown to it, is replaced by [secret:NAME] in command output, and stays encrypted on the head. Values can't be read back here, only replaced."
                 </p>
-                <p class="text-sm text-zinc-500">{move || {
+                <p class="text-sm text-muted">{move || {
                     let r = api::realm().get();
                     if r.is_empty() {
                         "Every realm's secrets. Pick a realm in the header to set one there (new ones here go to home); root's are every realm's that has none of its own by that name.".to_owned()
@@ -3503,7 +3503,7 @@ fn SecretsSetting() -> impl IntoView {
             <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No secrets."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-muted">"No secrets."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|s| {
                         let (edit, del, del_realm) = (s.clone(), s.name.clone(), s.realm.clone());
                         let looking = api::realm().get_untracked();
@@ -3517,7 +3517,7 @@ fn SecretsSetting() -> impl IntoView {
                                         {if inherited { format!("from {whose}") } else { whose.clone() }}
                                     </span>
                                 })}
-                                <span class="min-w-0 flex-1 truncate text-zinc-500">{s.description.clone()}</span>
+                                <span class="min-w-0 flex-1 truncate text-muted">{s.description.clone()}</span>
                                 {s.applies_to.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                     name.set(edit.name.clone());
@@ -3542,23 +3542,23 @@ fn SecretsSetting() -> impl IntoView {
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <span class="text-xs text-muted">"Name"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="GITHUB_TOKEN" prop:disabled=move || editing.get()
                         prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev).to_ascii_uppercase()) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Value"</span>
+                    <span class="text-xs text-muted">"Value"</span>
                     <input type="password" autocomplete="off" class=format!("{INPUT} py-1 font-mono text-xs")
                         placeholder=move || if editing.get() { "leave empty to keep the current value" } else { "the secret" }
                         prop:value=move || value.get() on:input=move |ev| value.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Description (shown to the agent)"</span>
+                    <span class="text-xs text-muted">"Description (shown to the agent)"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="GitHub token with repo scope"
                         prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Applies to"</span>
+                    <span class="text-xs text-muted">"Applies to"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="everywhere, or labels, e.g. repo:github.com/me/app"
                         prop:value=move || applies.get() on:input=move |ev| applies.set(event_target_value(&ev)) />
                 </label>
@@ -3599,48 +3599,48 @@ fn SubagentLimitsSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Limits"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "Subagents can start subagents of their own, down to this depth: 1 lets a session start subagents that start none. Below one session, at most this many work at once; one more is refused until another finishes."
                 </p>
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Depth (1–8)"</span>
+                    <span class="text-xs text-muted">"Depth (1–8)"</span>
                     <input type="number" min="1" max="8" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.max_depth.to_string()) on:input=move |ev| setting.update(|s| s.max_depth = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Working at once (1–64)"</span>
+                    <span class="text-xs text-muted">"Working at once (1–64)"</span>
                     <input type="number" min="1" max="64" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.max_running.to_string()) on:input=move |ev| setting.update(|s| s.max_running = number(&ev)) />
                 </label>
             </div>
-            <p class="text-sm text-zinc-500">
+            <p class="text-sm text-muted">
                 "A background task's end or a subagent's report wakes an idle session, at most this many times an hour; beyond that it waits until the hour allows, or for your next message. A Claude Code session's process stays up this long when idle with no background tasks."
             </p>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Turns notices start per hour (1–200)"</span>
+                    <span class="text-xs text-muted">"Turns notices start per hour (1–200)"</span>
                     <input type="number" min="1" max="200" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.auto_turns_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.auto_turns_per_hour = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Claude Code idle minutes (1–1440)"</span>
+                    <span class="text-xs text-muted">"Claude Code idle minutes (1–1440)"</span>
                     <input type="number" min="1" max="1440" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.claude_code_idle_minutes.to_string()) on:input=move |ev| setting.update(|s| s.claude_code_idle_minutes = number(&ev)) />
                 </label>
             </div>
-            <p class="text-sm text-zinc-500">
+            <p class="text-sm text-muted">
                 "An agent can message another session of its realm. A reply to a message, and a reply to that, make a chain: one longer than this is refused, so two agents can't keep waking each other. A session sends at most this many messages an hour."
             </p>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Longest chain of messages (1–32)"</span>
+                    <span class="text-xs text-muted">"Longest chain of messages (1–32)"</span>
                     <input type="number" min="1" max="32" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.max_message_hops.to_string()) on:input=move |ev| setting.update(|s| s.max_message_hops = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Messages per session per hour (1–1000)"</span>
+                    <span class="text-xs text-muted">"Messages per session per hour (1–1000)"</span>
                     <input type="number" min="1" max="1000" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.messages_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.messages_per_hour = number(&ev)) />
                 </label>
@@ -3706,7 +3706,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"carbon6 tools in Claude Code sessions"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "Claude Code brings its own tools for files, the shell and the web. These are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them goes into Claude Code's system prompt. A routing rule's tool list narrows them further. Running sessions take changes up with their next message (Claude Code starts again, resuming its conversation, once it has nothing running)."
                 </p>
             </div>
@@ -3725,7 +3725,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                             "Chosen by hand"
                         </label>
                     </div>
-                    <p class="text-xs text-zinc-500">"Up front: loaded into Claude Code's prompt from the start. The rest it finds with its tool search when it needs them, which keeps every turn's prompt small."</p>
+                    <p class="text-xs text-muted">"Up front: loaded into Claude Code's prompt from the start. The rest it finds with its tool search when it needs them, which keeps every turn's prompt small."</p>
                     <div class="grid gap-1 sm:grid-cols-2">
                         {s.available.into_iter().map(|t| {
                             let on = auto || offered.iter().any(|c| same(c, &t.name));
@@ -3735,8 +3735,8 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                                 <div class="flex items-start gap-2 text-sm" title=t.description.clone()>
                                     <input type="checkbox" class="mt-1" aria-label=format!("Offer {}", t.name) prop:checked=on prop:disabled=auto
                                         on:change=move |ev| toggle(name.clone(), event_target_checked(&ev), false) />
-                                    <span class="min-w-0 flex-1"><span class="font-mono text-xs">{t.name.clone()}</span>" "<span class="text-xs text-zinc-500">{t.description.clone()}</span></span>
-                                    <label class="flex shrink-0 items-center gap-1 text-[11px] text-zinc-500">
+                                    <span class="min-w-0 flex-1"><span class="font-mono text-xs">{t.name.clone()}</span>" "<span class="text-xs text-muted">{t.description.clone()}</span></span>
+                                    <label class="flex shrink-0 items-center gap-1 text-[11px] text-muted">
                                         <input type="checkbox" prop:checked=up prop:disabled=!on
                                             on:change=move |ev| toggle(name2.clone(), event_target_checked(&ev), true) />
                                         "up front"
@@ -3785,18 +3785,18 @@ fn BriefSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Brief"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "The brief (Mail & chat's home) sorts this realm's mail and Slack, and notifies you at these times with what needs you. Times are in your primary calendar's time zone. Urgent requests (by the memex.triage.urgent prompt, under Prompts) can tell you at once. Notifications go to the channels under Notifications."
                 </p>
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Brief times (HH:MM, comma-separated)"</span>
+                    <span class="text-xs text-muted">"Brief times (HH:MM, comma-separated)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="08:30, 13:30"
                         prop:value=move || times.get() on:input=move |ev| times.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Close of day (HH:MM, empty: none)"</span>
+                    <span class="text-xs text-muted">"Close of day (HH:MM, empty: none)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="17:30"
                         prop:value=move || setting.with(|s| s.close.clone()) on:input=move |ev| setting.update(|s| s.close = event_target_value(&ev)) />
                 </label>
@@ -3839,13 +3839,13 @@ fn WebSearchSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Web search"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "Claude and OpenAI models search the web through their own provider. Others (Ollama, other OpenAI-compatible servers) get a web_search tool through the provider chosen here. Brave and Tavily need an API key, kept as a secret (it must apply to the sessions that search); SearXNG is self-hosted and needs only its URL (with the JSON format enabled)."
                 </p>
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Provider"</span>
+                    <span class="text-xs text-muted">"Provider"</span>
                     <select class=format!("{INPUT} py-1") prop:value=provider on:change=move |ev| setting.update(|s| s.provider = event_target_value(&ev))>
                         <option value="">"Off"</option>
                         <option value="brave">"Brave Search API"</option>
@@ -3856,14 +3856,14 @@ fn WebSearchSetting() -> impl IntoView {
                 {move || match provider().as_str() {
                     "searxng" => view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">"Instance URL"</span>
+                            <span class="text-xs text-muted">"Instance URL"</span>
                             <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="http://10.0.0.5:8888"
                                 prop:value=move || setting.with(|s| s.url.clone()) on:input=move |ev| setting.update(|s| s.url = event_target_value(&ev)) />
                         </label>
                     }.into_any(),
                     "brave" | "tavily" => view! {
                         <label class="space-y-0.5">
-                            <span class="text-xs text-zinc-500">"API key (a secret)"</span>
+                            <span class="text-xs text-muted">"API key (a secret)"</span>
                             <select class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || setting.with(|s| s.secret.clone())
                                 on:change=move |ev| setting.update(|s| s.secret = event_target_value(&ev))>
                                 <option value="">"Choose a secret…"</option>
@@ -4056,7 +4056,7 @@ fn AutomationsSetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Triggers"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "When something happens (a schedule in the head's local time, a webhook call, mail arriving, a record changing, a decision being answered, a session finishing or failing), do something: start a template or workflow, write a record, ask you a decision, or notify you. A filter picks which events count, and parameters take the event's values: \"$.path\" is the value, {{$.path}} puts it in text. A webhook's URL is its only credential, so keep it private. Loop protection stops chains of triggers deeper than five and triggers that run more than their limit an hour."
                 </p>
             </div>
@@ -4064,13 +4064,13 @@ fn AutomationsSetting() -> impl IntoView {
                 <div class="space-y-1 rounded-md bg-amber-50 p-3 text-sm dark:bg-amber-950">
                     <p class="font-medium">"The webhook's URL (shown once; make a new one if it leaks):"</p>
                     <div class="select-all break-all font-mono text-xs">{u.clone()}</div>
-                    <div class="select-all break-all font-mono text-xs text-zinc-500">{format!("curl -X POST --data '{{\"alert\":\"…\"}}' {u}")}</div>
+                    <div class="select-all break-all font-mono text-xs text-muted">{format!("curl -X POST --data '{{\"alert\":\"…\"}}' {u}")}</div>
                 </div>
             })}
             <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No triggers."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-muted">"No triggers."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|a| {
                         let (id1, id2, id3, id4) = (a.id.clone(), a.id.clone(), a.id.clone(), a.id.clone());
                         let (id5, id6, id7) = (a.id.clone(), a.id.clone(), a.id.clone());
@@ -4098,7 +4098,7 @@ fn AutomationsSetting() -> impl IntoView {
                                         });
                                     } />
                                     <span class="font-medium">{a.name.clone()}</span>
-                                    <span class="font-mono text-xs text-zinc-500">{format!("{what} → {does}")}</span>
+                                    <span class="font-mono text-xs text-muted">{format!("{what} → {does}")}</span>
                                     <span class="flex-1"></span>
                                     <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                         let id = id2.clone();
@@ -4128,7 +4128,7 @@ fn AutomationsSetting() -> impl IntoView {
                                         });
                                     }>"Delete"</button>
                                 </div>
-                                <div class="flex flex-wrap items-center gap-2 pl-6 text-xs text-zinc-500">
+                                <div class="flex flex-wrap items-center gap-2 pl-6 text-xs text-muted">
                                     {a.last_run_at.map(|t| format!("last ran {}", when(t)))}
                                     {last.map(|run| {
                                         let r = run.clone();
@@ -4136,7 +4136,7 @@ fn AutomationsSetting() -> impl IntoView {
                                     })}
                                     {a.last_error.clone().map(|e| view! { <span class="text-red-600">{e}</span> })}
                                 </div>
-                                <div class="flex flex-wrap items-center gap-2 pl-6 text-xs text-zinc-500">
+                                <div class="flex flex-wrap items-center gap-2 pl-6 text-xs text-muted">
                                     {(!recent.is_empty()).then(|| view! {
                                         <span class="flex items-center gap-0.5" title="Latest runs, oldest to newest">
                                             {recent.iter().rev().map(|o| view! { <span class=format!("h-2 w-2 rounded-full {}", outcome_dot(o)) title=o.clone()></span> }).collect_view()}
@@ -4166,11 +4166,11 @@ fn AutomationsSetting() -> impl IntoView {
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <span class="text-xs text-muted">"Name"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. Morning health check" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"When"</span>
+                    <span class="text-xs text-muted">"When"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || trigger.get() on:change=move |ev| trigger.set(event_target_value(&ev))>
                         <option value="schedule">"On a schedule"</option>
                         <option value="webhook">"When a webhook is called"</option>
@@ -4182,25 +4182,25 @@ fn AutomationsSetting() -> impl IntoView {
                     </select>
                 </label>
                 <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "series">
-                    <span class="text-xs text-zinc-500">"Threshold (JSON): agg over minutes compared with value, or silent_minutes for points that stop arriving"</span>
+                    <span class="text-xs text-muted">"Threshold (JSON): agg over minutes compared with value, or silent_minutes for points that stop arriving"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=r#"{"series": "model_spend", "agg": "sum", "minutes": 1440, "op": ">", "value": 5}"#
                         prop:value=move || threshold.get() on:input=move |ev| threshold.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "record">
-                    <span class="text-xs text-zinc-500">"Collection"</span>
+                    <span class="text-xs text-muted">"Collection"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. clients" prop:value=move || collection.get() on:input=move |ev| collection.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || !matches!(trigger.get().as_str(), "record" | "decision" | "session" | "series")>
-                    <span class="text-xs text-zinc-500">"Which (empty: all)"</span>
+                    <span class="text-xs text-muted">"Which (empty: all)"</span>
                     <input class=format!("{INPUT} py-1 text-sm") prop:value=move || ops.get() on:input=move |ev| ops.set(event_target_value(&ev))
                         placeholder=move || match trigger.get().as_str() { "record" => "created, updated, deleted", "decision" => "opened, answered, expired", "series" => "crossed, cleared", _ => "finished, failed, needs_approval" } />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "session">
-                    <span class="text-xs text-zinc-500">"Sessions with these labels (empty: all)"</span>
+                    <span class="text-xs text-muted">"Sessions with these labels (empty: all)"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. template:deploy" prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5" class:hidden=move || trigger.get() != "schedule">
-                    <span class="text-xs text-zinc-500">"Schedule (cron: minute hour day month weekday)"</span>
+                    <span class="text-xs text-muted">"Schedule (cron: minute hour day month weekday)"</span>
                     <div class="flex gap-1">
                         <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="0 8 * * mon-fri" prop:value=move || cron.get() on:input=move |ev| cron.set(event_target_value(&ev)) />
                         <select class=format!("{INPUT} w-auto! py-1 text-xs") on:change=move |ev| { let v = event_target_value(&ev); if !v.is_empty() { cron.set(v); } }>
@@ -4210,19 +4210,19 @@ fn AutomationsSetting() -> impl IntoView {
                     </div>
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Switch it off after"</span>
+                    <span class="text-xs text-muted">"Switch it off after"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || disable_after.get().to_string()
                         on:change=move |ev| disable_after.set(event_target_value(&ev).parse().unwrap_or(0))>
                         {[0u32, 1, 2, 3, 5, 10].into_iter().map(|n| view! { <option value=n.to_string()>{if n == 0 { "never".to_owned() } else { format!("{n} failed runs in a row") }}</option> }).collect_view()}
                     </select>
                 </label>
                 <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "memex">
-                    <span class="text-xs text-zinc-500">"Which mail (the message becomes the template's {{input}})"</span>
+                    <span class="text-xs text-muted">"Which mail (the message becomes the template's {{input}})"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="mail.received from:@acme.com subject:invoice (from:, to:, subject:, account:)"
                         prop:value=move || cron.get() on:input=move |ev| cron.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Then"</span>
+                    <span class="text-xs text-muted">"Then"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || action.get() on:change=move |ev| action.set(event_target_value(&ev))>
                         <option value="start">"Start a template or workflow"</option>
                         <option value="write">"Write a record"</option>
@@ -4232,7 +4232,7 @@ fn AutomationsSetting() -> impl IntoView {
                     </select>
                 </label>
                 <label class="space-y-0.5" class:hidden=move || action.get() != "start">
-                    <span class="text-xs text-zinc-500">"Template or workflow"</span>
+                    <span class="text-xs text-muted">"Template or workflow"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || template.get() on:change=move |ev| template.set(event_target_value(&ev))>
                         <option value="">"Choose…"</option>
                         {move || templates.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <option value=t.name.clone()>{t.name.clone()}</option> }).collect_view()}
@@ -4240,11 +4240,11 @@ fn AutomationsSetting() -> impl IntoView {
                     </select>
                 </label>
                 <label class="space-y-0.5 sm:col-span-2">
-                    <span class="text-xs text-zinc-500">"Only when (JSONPath conditions on the event; optional)"</span>
+                    <span class="text-xs text-muted">"Only when (JSONPath conditions on the event; optional)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=r#"{"$.record.fields.stage": "won"}"# prop:value=move || conditions.get() on:input=move |ev| conditions.set(event_target_value(&ev)) />
                 </label>
                 <label class="space-y-0.5 sm:col-span-2" class:hidden=move || action.get() == "start">
-                    <span class="text-xs text-zinc-500">"What to do (JSON; \"$.path\" and {{$.path}} take the event's values)"</span>
+                    <span class="text-xs text-muted">"What to do (JSON; \"$.path\" and {{$.path}} take the event's values)"</span>
                     <textarea class=format!("{INPUT} py-1 font-mono text-xs") rows="3" prop:value=move || params.get() on:input=move |ev| params.set(event_target_value(&ev))
                         placeholder=move || match action.get().as_str() {
                             "write" => r#"{"collection": "payments", "fields": {"amount": "$.body.amount", "from": "$.body.customer"}}"#,
@@ -4254,11 +4254,11 @@ fn AutomationsSetting() -> impl IntoView {
                         }></textarea>
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"At most, runs an hour"</span>
+                    <span class="text-xs text-muted">"At most, runs an hour"</span>
                     <input type="number" min="0" class=format!("{INPUT} py-1 text-sm") prop:value=move || per_hour.get().to_string() on:input=move |ev| per_hour.set(event_target_value(&ev).parse().unwrap_or(60)) />
                 </label>
                 <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule" || action.get() != "start">
-                    <span class="text-xs text-zinc-500">"Input (the template's {{input}})"</span>
+                    <span class="text-xs text-muted">"Input (the template's {{input}})"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
                 </label>
             </div>
@@ -4292,7 +4292,7 @@ fn RunHistory(id: String) -> impl IntoView {
         <div class="ml-6 mt-1 rounded-md border border-zinc-200 text-xs dark:border-zinc-800">
             {move || runs.get().map(|r| match r {
                 Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
-                Ok(v) if v.is_empty() => view! { <p class="p-2 text-zinc-500">"No runs yet."</p> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="p-2 text-muted">"No runs yet."</p> }.into_any(),
                 Ok(v) => v.into_iter().map(|run| {
                     let took = run.finished_at.map(|f| format!(" · {}s", (f - run.started_at) / 1000)).unwrap_or_default();
                     let cost = if run.calls == 0 { String::new() } else { format!(" · {} calls · ${:.2}", run.calls, run.cost) };
@@ -4302,7 +4302,7 @@ fn RunHistory(id: String) -> impl IntoView {
                             <div class="flex flex-wrap items-center gap-2">
                                 <span class=format!("h-2 w-2 rounded-full {}", outcome_dot(&run.outcome))></span>
                                 <span>{when(run.started_at)}</span>
-                                <span class="text-zinc-500">{format!("{} · {}{took}{cost}{cause}", run.trigger, run.outcome)}</span>
+                                <span class="text-muted">{format!("{} · {}{took}{cost}{cause}", run.trigger, run.outcome)}</span>
                             </div>
                             {run.error.clone().map(|e| view! { <p class="pl-4 text-red-600">{e}</p> })}
                             <div class="flex flex-wrap gap-x-3 pl-4">
@@ -4354,25 +4354,25 @@ fn MemorySetting() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Memory"</h2>
-                <p class="text-sm text-zinc-500">
+                <p class="text-sm text-muted">
                     "Notes kept across sessions. Each has a scope, one label (host:web1, repo:github.com/acme/app, client:acme) or none for every session; new sessions get the notes for their labels in their instructions. Agents add and correct notes as they learn (remember / forget); you can edit them here."
                 </p>
             </div>
             <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-zinc-500">"No notes yet."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="py-2 text-sm text-muted">"No notes yet."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|m| {
                         let (edit, del) = (m.clone(), m.id.clone());
                         view! {
                             <div class="flex items-start gap-2 py-2 text-sm">
                                 {if m.scope.is_empty() {
-                                    view! { <span class="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-500 dark:bg-zinc-800">"all"</span> }.into_any()
+                                    view! { <span class="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-muted dark:bg-zinc-800">"all"</span> }.into_any()
                                 } else {
                                     view! { <crate::labels::LabelChip label=m.scope.clone() auto=true stay=true /> }.into_any()
                                 }}
                                 <span class="min-w-0 flex-1 whitespace-pre-wrap">{m.text.clone()}</span>
-                                {m.session_id.clone().map(|s| view! { <crate::workspace::Go to=crate::workspace::View::session(s) class="shrink-0 text-xs text-zinc-500 underline">"by an agent"</crate::workspace::Go> })}
+                                {m.session_id.clone().map(|s| view! { <crate::workspace::Go to=crate::workspace::View::session(s) class="shrink-0 text-xs text-muted underline">"by an agent"</crate::workspace::Go> })}
                                 <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
                                     scope.set(edit.scope.clone());
                                     text.set(edit.text.clone());

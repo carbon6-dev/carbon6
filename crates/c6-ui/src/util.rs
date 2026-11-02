@@ -332,9 +332,9 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
     );
     let items = StoredValue::new(items);
     let trigger = if row {
-        "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+        "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-200 dark:hover:bg-zinc-800"
     } else {
-        "flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+        "flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800"
     };
     let label = if label.is_empty() { "More".to_owned() } else { label };
     view! {

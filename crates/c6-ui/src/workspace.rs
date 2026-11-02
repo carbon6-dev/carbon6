@@ -2146,11 +2146,11 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
         _ => None,
     };
     let pinned = move || session().is_some_and(|id| ws.pinned.with(|p| p.contains(&id)));
-    let btn = "rounded px-1 text-zinc-400 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    let btn = "rounded px-1 text-muted hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
         <div class=move || format!(
             "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] dark:border-zinc-900 {}",
-            if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-zinc-500" },
+            if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
             {move || pos.get().filter(|p| p.index == 1).map(|_| view! {
                 <button class=format!("{btn} md:hidden") title="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>"‹"</button>

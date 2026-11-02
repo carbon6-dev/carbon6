@@ -76,7 +76,7 @@ pub fn ModelInput(
                     on:keydown=move |ev| if ev.key() == "Escape" { shown.set(false) } />
                 <button type="button" tabindex="-1" title="Every model the connection offers"
                     prop:disabled=move || disabled.get()
-                    class="rounded-r-md border border-l-0 border-zinc-300 px-2 text-xs text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                    class="rounded-r-md border border-l-0 border-zinc-300 px-2 text-xs text-muted hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                     on:mousedown=move |ev| { ev.prevent_default(); shown.update(|s| *s = !*s); }>"▾"</button>
             </div>
             {move || (shown.get() && !disabled.get()).then(|| view! {
@@ -85,17 +85,17 @@ pub fn ModelInput(
                     style=move || format!("max-height: {}px", room.get().1)
                     on:mousedown=|ev| ev.prevent_default()>
                     {move || match groups() {
-                        None => view! { <p class="px-2 py-1 text-zinc-500">{if list.is_some() { "Test the connection to list its models." } else { "Asking for the models…" }}</p> }.into_any(),
+                        None => view! { <p class="px-2 py-1 text-muted">{if list.is_some() { "Test the connection to list its models." } else { "Asking for the models…" }}</p> }.into_any(),
                         Some(gs) => {
                             let several = gs.len() > 1;
                             if gs.is_empty() {
-                                return view! { <p class="px-2 py-1 text-zinc-500">"No connections."</p> }.into_any();
+                                return view! { <p class="px-2 py-1 text-muted">"No connections."</p> }.into_any();
                             }
                             gs.into_iter().map(|(name, r)| view! {
-                                {several.then(|| view! { <p class="px-2 pt-1.5 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">{name.clone()}</p> })}
+                                {several.then(|| view! { <p class="px-2 pt-1.5 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">{name.clone()}</p> })}
                                 {match r {
                                     Err(e) => view! { <p class="px-2 py-1 text-red-600">{e}</p> }.into_any(),
-                                    Ok(ms) if ms.is_empty() => view! { <p class="px-2 py-1 text-zinc-500">"It lists no models; type one."</p> }.into_any(),
+                                    Ok(ms) if ms.is_empty() => view! { <p class="px-2 py-1 text-muted">"It lists no models; type one."</p> }.into_any(),
                                     Ok(ms) => ms.into_iter().map(|m| {
                                         let (chosen, label) = (m.clone(), m.clone());
                                         let current = move || value.get() == label;

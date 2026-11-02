@@ -96,7 +96,7 @@ pub fn NotifyToggle() -> impl IntoView {
         }
     };
     view! {
-        <button class="hidden text-xs text-zinc-500 hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title on:click=click>
+        <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title on:click=click>
             {move || match (state.get(), filter.with(Vec::is_empty)) {
                 (true, true) => "🔔 on",
                 (true, false) => "🔔 filtered",

@@ -32,7 +32,7 @@ fn what(status: SessionStatus, tracked: Tracked) -> &'static str {
 }
 
 /// A rail section's ▾/▸.
-pub const FOLD: &str = "w-3 shrink-0 text-left text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100";
+pub const FOLD: &str = "w-3 shrink-0 text-left text-muted hover:text-zinc-900 dark:hover:text-zinc-100";
 
 /// A rail section folded or open, remembered in this browser.
 fn section_open(key: &'static str) -> RwSignal<bool> {
@@ -128,7 +128,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
             .collect::<Vec<_>>()
     });
     view! {
-            <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-muted">
                 <span class="flex items-center gap-1.5">
                     <button class=fold title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
                         {move || if open.get() { "▾" } else { "▸" }}
@@ -162,7 +162,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
             })}
             <div class="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3">
                 {move || hidden.with(|h| (!h.is_empty()).then(|| view! {
-                    <div class="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">"Minimized"</div>
+                    <div class="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wide text-muted">"Minimized"</div>
                     {h.iter().map(|(key, n, views)| view! { <MinimizedItem key=*key n=*n views=views.clone() /> }).collect_view()}
                 }))}
                 {move || {
@@ -173,7 +173,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
                         } else {
                             "Nothing with these labels is running, finished or pinned."
                         };
-                        return view! { <p class="px-2 py-2 text-xs text-zinc-500">{msg}</p> }.into_any();
+                        return view! { <p class="px-2 py-2 text-xs text-muted">{msg}</p> }.into_any();
                     }
                     let group = |which: Tracked, title: &'static str| {
                         let rows: Vec<_> = items.iter().filter(|(_, t)| *t == which).cloned().collect();
@@ -183,7 +183,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
                                     on:click=move |_| ws.attention.set(Vec::new())>"clear"</button>
                             });
                             view! {
-                                <div class="flex items-center justify-between px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">
+                                <div class="flex items-center justify-between px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wide text-muted">
                                     {title} {clear}
                                 </div>
                                 {rows.into_iter().map(|(s, t)| view! { <DockItem s t /> }).collect_view()}
@@ -235,10 +235,10 @@ fn MinimizedItem(key: u64, n: usize, views: Vec<View>) -> impl IntoView {
             <span class=move || state().map_or("h-2 w-2 shrink-0", |(_, d, _)| d)></span>
             <button class="min-w-0 flex-1 text-left" title=tile_title(n, "Bring it back") on:click=move |_| ws.show_tile(key)>
                 <div class="truncate text-sm">{label}</div>
-                <div class="truncate text-[11px] text-zinc-500">{move || state().map_or("minimized", |(_, _, w)| w)}</div>
+                <div class="truncate text-[11px] text-muted">{move || state().map_or("minimized", |(_, _, w)| w)}</div>
             </button>
             {tile_badge(n)}
-            <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+            <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
                 title="Close this tile" aria-label="Close" on:click=move |_| ws.close_tile(key)>"✕"</button>
         </div>
     }
@@ -278,12 +278,12 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
                     <span class="min-w-0 flex-1 truncate text-sm">{s.title.clone()}</span>
                     <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=s.clone() /></span>
                 </div>
-                <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-[11px] text-zinc-500">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
+                <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-[11px] text-muted">{format!("{} · {}", what(s.display_status(), t), worker)}</div>
             </Go>
             {move || number.get().map(tile_badge)}
             {dismissable.then(|| {
                 let id = id.clone();
-                view! { <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" title="Dismiss" aria-label="Dismiss" on:click=move |_| ws.dismiss(&id)>"✕"</button> }
+                view! { <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Dismiss" aria-label="Dismiss" on:click=move |_| ws.dismiss(&id)>"✕"</button> }
             })}
             <crate::sessions::SessionMenu id=id.clone() />
         </div>
@@ -303,11 +303,11 @@ pub fn InboxPage() -> impl IntoView {
     let section = move |title: &'static str, which: Tracked, empty: &'static str| {
         view! {
             <section class="space-y-2">
-                <h2 class="text-sm font-semibold text-zinc-500">{title}</h2>
+                <h2 class="text-sm font-semibold text-muted">{title}</h2>
                 {move || {
                     let rows: Vec<_> = items.get().into_iter().filter(|(_, t)| *t == which).collect();
                     if rows.is_empty() {
-                        view! { <p class="text-sm text-zinc-500">{empty}</p> }.into_any()
+                        view! { <p class="text-sm text-muted">{empty}</p> }.into_any()
                     } else {
                         view! {
                             <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
@@ -328,13 +328,13 @@ pub fn InboxPage() -> impl IntoView {
                 let f = filter.get();
                 let hidden = if f.is_empty() { 0 } else { ws.tracked(&live).into_iter().filter(|(s, _)| !crate::labels::matches(s, &f)).count() };
                 (hidden > 0).then(|| view! {
-                    <p class="-mt-4 text-xs text-zinc-500">{format!("{hidden} more without these labels.")}</p>
+                    <p class="-mt-4 text-xs text-muted">{format!("{hidden} more without these labels.")}</p>
                 })
             }}
             {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Approval)).then(|| section("Needs your approval", Tracked::Approval, ""))}
             {section("Finished, not opened yet", Tracked::Attention, "Nothing finished while you were elsewhere.")}
             {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Attention)).then(|| view! {
-                <button class="-mt-4 text-xs text-zinc-500 underline" on:click=move |_| ws.attention.set(Vec::new())>"Mark all seen"</button>
+                <button class="-mt-4 text-xs text-muted underline" on:click=move |_| ws.attention.set(Vec::new())>"Mark all seen"</button>
             })}
             {section("Running", Tracked::Running, "No sessions are running.")}
             {section("Pinned", Tracked::Pinned, "Pin a session with ☆ in its header to keep it here.")}
@@ -353,7 +353,7 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
             <span class=dot(s.display_status(), t)></span>
             <Go to=View::session(s.id.clone()) class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
-                <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-xs text-zinc-500">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
+                <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-xs text-muted">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                     <div class="mt-1 flex flex-wrap gap-1">
                         {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
@@ -362,10 +362,10 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
                 })}
             </Go>
             {(t == Tracked::Attention).then(|| view! {
-                <button class="rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| ws.dismiss(&dismiss_id)>"Dismiss"</button>
+                <button class="rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| ws.dismiss(&dismiss_id)>"Dismiss"</button>
             })}
             {(t == Tracked::Pinned).then(|| view! {
-                <button class="rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| ws.toggle_pin(&pin_id)>"Unpin"</button>
+                <button class="rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| ws.toggle_pin(&pin_id)>"Unpin"</button>
             })}
         </div>
     }
@@ -390,9 +390,9 @@ pub fn MissionPage() -> impl IntoView {
     });
     view! {
         <main class="space-y-3 px-4 py-4">
-            <p class="text-xs text-zinc-500">"Running, finished-unseen and pinned sessions (or your most recent), live. Reply from a card, or open it beside this view."</p>
+            <p class="text-xs text-muted">"Running, finished-unseen and pinned sessions (or your most recent), live. Reply from a card, or open it beside this view."</p>
             <crate::labels::LabelFilterBar />
-            {move || ids.with(Vec::is_empty).then(|| view! { <p class="text-sm text-zinc-500">"No sessions with these labels."</p> })}
+            {move || ids.with(Vec::is_empty).then(|| view! { <p class="text-sm text-muted">"No sessions with these labels."</p> })}
             <div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(20rem,1fr))]">
                 <For each=move || ids.get() key=|id| id.clone() let:id>
                     <MissionCard id />
@@ -504,7 +504,7 @@ fn MissionCard(id: String) -> impl IntoView {
                 <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
                 </Go>
-                <span class="shrink-0 text-[11px] text-zinc-500">
+                <span class="shrink-0 text-[11px] text-muted">
                     {move || session.get().map(|s| format!("{} · {}", live.session_worker(&s), ago(now_ms() - s.updated_at)))}
                 </span>
                 <crate::sessions::SessionMenu id=open_id.clone() />
@@ -813,7 +813,7 @@ pub fn MobileBar() -> impl IntoView {
                             on:click=move |_| if !pressed.try_update_value(std::mem::take).unwrap_or(false) { ws.show_tile(key) }
                         >{label}</button>
                         {focused.then(|| view! {
-                            <button class="-my-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-sm text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                            <button class="-my-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-sm text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
                                 title="Close this tile" aria-label="Close this tile"
                                 on:pointerdown=move |ev| ev.stop_propagation()
                                 on:click=move |_| ws.close_tile(key)>"×"</button>
@@ -821,7 +821,7 @@ pub fn MobileBar() -> impl IntoView {
                     </div>
                 }).collect_view()}
             </div>
-            <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-zinc-500" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
+            <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-muted" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs tabular-nums text-zinc-600 dark:text-zinc-400"
                 title="Your tiles, and the sessions you viewed lately" aria-haspopup="dialog" aria-expanded=move || sheet.get().to_string()
                 on:click=move |_| sheet.set(true)>{move || sheet_label(tiles.with(Vec::len))}</button>
@@ -942,11 +942,11 @@ fn TabSheet(close: Callback<()>) -> impl IntoView {
         let key = t.key;
         view! {
             <div class=if t.focused { "flex items-center gap-2 rounded-md bg-zinc-100 pl-2 dark:bg-zinc-800" } else { "flex items-center gap-2 rounded-md pl-2" }>
-                <span class="w-4 shrink-0 text-right font-mono text-[11px] tabular-nums text-zinc-500">{t.number}</span>
+                <span class="w-4 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted">{t.number}</span>
                 <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=fill></span>
                 <button class="min-w-0 flex-1 truncate py-2 text-left" class:font-medium=t.focused
                     on:click=move |_| { ws.show_tile(key); close.run(()) }>{t.label}</button>
-                <button class="flex h-9 w-9 shrink-0 items-center justify-center text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                <button class="flex h-9 w-9 shrink-0 items-center justify-center text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
                     title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>"×"</button>
             </div>
         }
@@ -1010,7 +1010,7 @@ fn MailNeedsReply() -> impl IntoView {
     view! {
         {move || threads.get().and_then(Result::ok).filter(|t| !t.is_empty()).map(|t| view! {
             <section class="space-y-2">
-                <h2 class="text-sm font-semibold text-zinc-500">"Mail that needs a reply"</h2>
+                <h2 class="text-sm font-semibold text-muted">"Mail that needs a reply"</h2>
                 <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {t.into_iter().map(|x| view! {
                         <crate::workspace::Go to=crate::workspace::View::Mail class="block px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">

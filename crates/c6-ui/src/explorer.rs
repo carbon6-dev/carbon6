@@ -33,12 +33,12 @@ fn badge(kind: &str) -> (&'static str, &'static str) {
         "trigger" => ("⚡", "text-orange-600"),
         "grant" => ("⇄", "text-teal-600"),
         "view" => ("◱", "text-indigo-600"),
-        "entry" => ("⚙", "text-zinc-500"),
-        "secret" => ("🔒", "text-zinc-500"),
+        "entry" => ("⚙", "text-muted"),
+        "secret" => ("🔒", "text-muted"),
         "realm" => ("◎", "text-zinc-700"),
         "template" => ("✎", "text-amber-700"),
-        "event" => ("◇", "text-zinc-500"),
-        _ => ("•", "text-zinc-500"),
+        "event" => ("◇", "text-muted"),
+        _ => ("•", "text-muted"),
     }
 }
 
@@ -51,8 +51,8 @@ fn RefLine(realm: String, section: String, r: ExRef) -> impl IntoView {
         <Ex to=to class="flex min-w-0 items-baseline gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
             <span class=format!("w-4 shrink-0 text-center {color}") title=r.kind.clone()>{mark}</span>
             <span class="min-w-0 truncate">{r.title.clone()}</span>
-            <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{r.sub.clone()}</span>
-            <span class="shrink-0 text-xs text-zinc-400">{when(r.at)}</span>
+            <span class="min-w-0 flex-1 truncate text-xs text-muted">{r.sub.clone()}</span>
+            <span class="shrink-0 text-xs text-muted">{when(r.at)}</span>
         </Ex>
     }
 }
@@ -110,7 +110,7 @@ pub fn RealmsMap() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
             <div>
                 <h1 class="text-lg font-semibold">"Realms"</h1>
-                <p class="text-sm text-zinc-500">"Each realm keeps an app or a project apart. Open one to explore what it holds; the arrows are grants, the only way data crosses."</p>
+                <p class="text-sm text-muted">"Each realm keeps an app or a project apart. Open one to explore what it holds; the arrows are grants, the only way data crosses."</p>
             </div>
             {move || map.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -130,7 +130,7 @@ pub fn RealmsMap() -> impl IntoView {
                                     <Ex to=explore(&id, "", "", "") class="block space-y-2 rounded-lg border border-zinc-200 p-3 hover:border-zinc-400 dark:border-zinc-800 dark:hover:border-zinc-600">
                                         <div class="flex items-baseline gap-2">
                                             <span class="font-medium">{c["realm"]["name"].as_str().unwrap_or("").to_owned()}</span>
-                                            <span class="font-mono text-xs text-zinc-500">{id.clone()}</span>
+                                            <span class="font-mono text-xs text-muted">{id.clone()}</span>
                                             <span class="flex-1"></span>
                                             {(health > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Needs attention">{health}</span> })}
                                             // Going into a realm loads its own app (⌘-click: a new tab).
@@ -150,12 +150,12 @@ pub fn RealmsMap() -> impl IntoView {
                                                 }
                                             })}
                                         </div>
-                                        <p class="line-clamp-2 text-xs text-zinc-500">{c["realm"]["description"].as_str().unwrap_or("").to_owned()}</p>
+                                        <p class="line-clamp-2 text-xs text-muted">{c["realm"]["description"].as_str().unwrap_or("").to_owned()}</p>
                                         {c["app"]["app"].as_str().map(|a| view! { <p class="text-xs">{format!("app {a} {}", c["app"]["version"].as_str().unwrap_or(""))}</p> })}
                                         <div class="flex flex-wrap gap-1">
                                             {chips.into_iter().map(|t| view! { <span class="rounded bg-zinc-100 px-1.5 text-xs dark:bg-zinc-800">{t}</span> }).collect_view()}
                                         </div>
-                                        <p class="text-xs text-zinc-500">{format!("${:.2} this month{}", c["spend_month"].as_f64().unwrap_or(0.0), c["last_activity"].as_i64().map(|t| format!(" · active {}", ago(now_ms() - t))).unwrap_or_default())}</p>
+                                        <p class="text-xs text-muted">{format!("${:.2} this month{}", c["spend_month"].as_f64().unwrap_or(0.0), c["last_activity"].as_i64().map(|t| format!(" · active {}", ago(now_ms() - t))).unwrap_or_default())}</p>
                                     </Ex>
                                 }
                             }).collect_view()}
@@ -171,7 +171,7 @@ pub fn RealmsMap() -> impl IntoView {
 #[component]
 fn GrantGraph(realms: Vec<Value>, grants: Vec<Value>) -> impl IntoView {
     if grants.is_empty() {
-        return view! { <p class="text-xs text-zinc-500">"No grants: every realm keeps to itself (commons is read by every realm that reads it)."</p> }.into_any();
+        return view! { <p class="text-xs text-muted">"No grants: every realm keeps to itself (commons is read by every realm that reads it)."</p> }.into_any();
     }
     let ids: Vec<String> = realms.iter().filter_map(|r| r["realm"]["id"].as_str().map(str::to_owned)).collect();
     let n = ids.len().max(1) as f64;
@@ -268,15 +268,15 @@ fn Inventory(summary: RealmSummary, realm: String, section: String) -> impl Into
     view! {
         <Ex to=explore(&realm, "", "", "") class="block">
             <h1 class="text-lg font-semibold">{name}</h1>
-            <p class="font-mono text-xs text-zinc-500">{rid}</p>
+            <p class="font-mono text-xs text-muted">{rid}</p>
         </Ex>
-        <Ex to=View::Realms class="text-xs text-zinc-500 underline">"All realms"</Ex>
+        <Ex to=View::Realms class="text-xs text-muted underline">"All realms"</Ex>
         <SearchBox realm=realm.clone() current=section.strip_prefix("search:").unwrap_or("").to_owned() />
         {GROUPS.iter().map(|(g, title)| {
             let entries: Vec<c6_api::ExEntry> = summary.entries.iter().filter(|e| e.group == *g).cloned().collect();
             (!entries.is_empty()).then(|| view! {
                 <div>
-                    <h2 class="px-2 text-xs font-medium uppercase tracking-wide text-zinc-500">{*title}</h2>
+                    <h2 class="px-2 text-xs font-medium uppercase tracking-wide text-muted">{*title}</h2>
                     {entries.into_iter().map(|e| {
                         let active = e.section == section;
                         let count = if e.inherited > 0 { format!("{} +{}", e.count, e.inherited) } else { e.count.to_string() };
@@ -287,17 +287,17 @@ fn Inventory(summary: RealmSummary, realm: String, section: String) -> impl Into
                         let inner = view! {
                             <span class="min-w-0 flex-1 truncate">{label}</span>
                             {dot}
-                            <span class="text-xs text-zinc-500" title=tip>{count}</span>
+                            <span class="text-xs text-muted" title=tip>{count}</span>
                         };
                         match &e.link {
-                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-zinc-400">"↗"</span></Go> }.into_any(),
+                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">"↗"</span></Go> }.into_any(),
                             None => view! { <Ex to=explore(&realm, &e.section, "", "") class=class>{inner}</Ex> }.into_any(),
                         }
                     }).collect_view()}
                 </div>
             })
         }).collect_view()}
-        {no_knowledge.then(|| view! { <p class="px-2 text-xs text-zinc-500">"Knowledge appears when a memex is connected."</p> })}
+        {no_knowledge.then(|| view! { <p class="px-2 text-xs text-muted">"Knowledge appears when a memex is connected."</p> })}
     }
 }
 
@@ -314,7 +314,7 @@ fn Overview(summary: RealmSummary, realm: String) -> impl IntoView {
         <div class="space-y-5">
             <div class="space-y-1">
                 <p class="text-sm">{summary.realm.description.clone()}</p>
-                <p class="text-xs text-zinc-500">
+                <p class="text-xs text-muted">
                     {summary.app.as_ref().map(|a| format!("App {} {} · ", a.app, a.version))}
                     {format!("${:.2} model spend this month", summary.spend_month)}
                     {summary.last_activity.map(|t| format!(" · last activity {}", ago(now_ms() - t)))}
@@ -348,7 +348,7 @@ fn Overview(summary: RealmSummary, realm: String) -> impl IntoView {
             <div class="space-y-1">
                 <div class="flex items-center gap-2">
                     <h2 class="text-sm font-medium">"How it is wired"</h2>
-                    <button class="text-xs text-zinc-500 underline" on:click=move |_| wiring.update(|w| *w = !*w)>{move || if wiring.get() { "hide" } else { "show" }}</button>
+                    <button class="text-xs text-muted underline" on:click=move |_| wiring.update(|w| *w = !*w)>{move || if wiring.get() { "hide" } else { "show" }}</button>
                 </div>
                 {move || wiring.get().then(|| view! { <Wiring realm=rw.clone() /> })}
             </div>
@@ -363,7 +363,7 @@ fn Overview(summary: RealmSummary, realm: String) -> impl IntoView {
                 </div>
                 {move || activity.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing happened in this time."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"Nothing happened in this time."</p> }.into_any(),
                     Ok(v) => v.into_iter().map(|a| view! { <RefLine realm=ra.clone() section=String::new() r=a /> }).collect_view().into_any(),
                 })}
             </div>
@@ -434,7 +434,7 @@ fn Wiring(realm: String) -> impl IntoView {
                     }
                 }
                 if triggers.is_empty() && views.is_empty() {
-                    return view! { <p class="text-sm text-zinc-500">"No triggers or views yet: nothing happens here on its own."</p> }.into_any();
+                    return view! { <p class="text-sm text-muted">"No triggers or views yet: nothing happens here on its own."</p> }.into_any();
                 }
                 let row = 30.0;
                 let height = (sources.len().max(triggers.len()).max(targets.len()).max(1) as f64) * row + 20.0;
@@ -520,17 +520,17 @@ fn SearchResults(realm: String, q: String, selected: String) -> impl IntoView {
     view! {
         <div class="space-y-3">
             <div class="flex items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-zinc-500 hover:underline lg:hidden">"← Overview"</Ex>
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">"← Overview"</Ex>
                 <h2 class="font-medium">{format!("“{q}”")}</h2>
             </div>
             {move || found.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                Ok(gs) if gs.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing in this realm matches."</p> }.into_any(),
+                Ok(gs) if gs.is_empty() => view! { <p class="text-sm text-muted">"Nothing in this realm matches."</p> }.into_any(),
                 Ok(gs) => gs.into_iter().map(|g| {
                     let (rr, ss, sel) = (realm.clone(), section.clone(), selected.clone());
                     view! {
                         <div>
-                            <h3 class="px-2 text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("{} ({}{})", g.label, g.items.len(), if g.more > 0 { format!("+{}", g.more) } else { String::new() })}</h3>
+                            <h3 class="px-2 text-xs font-medium uppercase tracking-wide text-muted">{format!("{} ({}{})", g.label, g.items.len(), if g.more > 0 { format!("+{}", g.more) } else { String::new() })}</h3>
                             {g.items.into_iter().map(|x| {
                                 let on = x.id == sel;
                                 view! { <div class=if on { "rounded bg-sky-50 dark:bg-sky-950" } else { "" }><RefLine realm=rr.clone() section=ss.clone() r=x /></div> }
@@ -558,15 +558,15 @@ fn SectionList(realm: String, section: String, selected: String) -> impl IntoVie
     view! {
         <div class="space-y-2">
             <div class="flex flex-wrap items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-zinc-500 hover:underline lg:hidden">"← Overview"</Ex>
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">"← Overview"</Ex>
                 <h2 class="font-medium">{title}</h2>
-                {(what == "collection").then(|| view! { <Ex to=explore(&realm, &section, "collection", &arg) class="text-xs text-zinc-500 underline">"about this collection"</Ex> })}
+                {(what == "collection").then(|| view! { <Ex to=explore(&realm, &section, "collection", &arg) class="text-xs text-muted underline">"about this collection"</Ex> })}
                 <span class="flex-1"></span>
                 <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Filter" prop:value=move || q.get() on:input=move |ev| q.set(event_target_value(&ev)) />
             </div>
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing here."</p> }.into_any(),
+                Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"Nothing here."</p> }.into_any(),
                 Ok(v) => v.into_iter().map(|x| {
                     let on = x.id == selected;
                     view! { <div class=if on { "rounded bg-sky-50 dark:bg-sky-950" } else { "" }><RefLine realm=rr.clone() section=ss.clone() r=x /></div> }
@@ -599,33 +599,33 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                 view! {
                     <div class="space-y-3">
                         <div class="flex items-start gap-2">
-                            <Ex to=back.clone() class="text-sm text-zinc-500 hover:underline lg:hidden">"←"</Ex>
+                            <Ex to=back.clone() class="text-sm text-muted hover:underline lg:hidden">"←"</Ex>
                             <span class=format!("text-lg {color}")>{mark}</span>
                             <div class="min-w-0 flex-1">
                                 <h2 class="break-words font-medium">{o.title.clone()}</h2>
-                                <p class="text-xs text-zinc-500">{format!("{} · {}", o.kind, o.sub)}</p>
+                                <p class="text-xs text-muted">{format!("{} · {}", o.kind, o.sub)}</p>
                             </div>
-                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-zinc-500 underline" title="Edit it where it lives">"Open ↗"</Go> })}
+                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open ↗"</Go> })}
                         </div>
                         {(!o.fields.is_empty()).then(|| view! {
                             <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
-                                {o.fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| view! { <dt class="text-zinc-500">{k.clone()}</dt><dd class="whitespace-pre-wrap break-words">{v.clone()}</dd> }).collect_view()}
+                                {o.fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| view! { <dt class="text-muted">{k.clone()}</dt><dd class="whitespace-pre-wrap break-words">{v.clone()}</dd> }).collect_view()}
                             </dl>
                         })}
                         {chart.map(|v| view! { <crate::views::ViewBody view=v all=Vec::new() /> })}
                         {(!o.body.is_empty()).then(|| view! { <div class="md max-h-96 overflow-y-auto text-sm" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&o.body)></div> })}
                         <div class="flex items-center gap-2 border-t border-zinc-200 pt-2 dark:border-zinc-800">
                             <h3 class="text-sm font-medium">"Connected"</h3>
-                            <button class="text-xs text-zinc-500 underline" on:click=move |_| graph.update(|g| *g = !*g)>{move || if graph.get() { "as lists" } else { "as a graph" }}</button>
+                            <button class="text-xs text-muted underline" on:click=move |_| graph.update(|g| *g = !*g)>{move || if graph.get() { "as lists" } else { "as a graph" }}</button>
                         </div>
                         {move || if graph.get() {
                             view! { <Neighborhood realm=rg.clone() section=sg.clone() object=o2.clone() /> }.into_any()
                         } else if o2.connected.is_empty() {
-                            view! { <p class="text-sm text-zinc-500">"Nothing connected yet."</p> }.into_any()
+                            view! { <p class="text-sm text-muted">"Nothing connected yet."</p> }.into_any()
                         } else {
                             o2.connected.iter().map(|g| view! {
                                 <div>
-                                    <h4 class="px-2 text-xs font-medium text-zinc-500">{format!("{}{}", g.label, if g.more > 0 { format!(" (+{} more)", g.more) } else { String::new() })}</h4>
+                                    <h4 class="px-2 text-xs font-medium text-muted">{format!("{}{}", g.label, if g.more > 0 { format!(" (+{} more)", g.more) } else { String::new() })}</h4>
                                     {g.items.iter().cloned().map(|x| view! { <RefLine realm=rc.clone() section=sc.clone() r=x /> }).collect_view()}
                                 </div>
                             }).collect_view().into_any()
@@ -707,7 +707,7 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
                             }
                         }).collect_view()}
                     </svg>
-                    <p class="text-xs text-zinc-500">"Two hops: what is connected to it, and what is connected to those. Click a node to open it."</p>
+                    <p class="text-xs text-muted">"Two hops: what is connected to it, and what is connected to those. Click a node to open it."</p>
                 }.into_any()
             }
         })}

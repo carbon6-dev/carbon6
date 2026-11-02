@@ -179,7 +179,7 @@ fn Main() -> impl IntoView {
                         <span class="hidden md:contents"><search::SearchBox /></span>
                     }.into_any()
                 }}
-                <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                <button class="hidden rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                     title=move || format!("New tile (or ⌘-click any link): {} open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", tiles())
                     on:click=move |_| ws.new_tile()>"+ Tile"</button>
                 {(!console).then(|| view! { <notify::NotifyToggle /> })}
@@ -316,7 +316,7 @@ fn NavLink(to: View, label: &'static str) -> impl IntoView {
 #[component]
 fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
     view! {
-        <span class="flex items-center gap-1.5 text-xs text-zinc-500">
+        <span class="flex items-center gap-1.5 text-xs text-muted">
             <span class=move || {
                 if connected.get() { "h-2 w-2 rounded-full bg-emerald-500" } else { "h-2 w-2 animate-pulse rounded-full bg-amber-500" }
             }></span>
@@ -385,12 +385,12 @@ fn PlaceMenu() -> impl IntoView {
                 {move || (elsewhere() > 0).then(|| view! {
                     <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you in other realms">{elsewhere()}</span>
                 })}
-                <span class="text-zinc-400">"▾"</span>
+                <span class="text-muted">"▾"</span>
             </summary>
             // On a phone, the width of the screen (anchored at the chip, it
             // would run off its edge).
             <div class="fixed inset-x-2 top-12 z-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900">
-                <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
+                <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
                     view! {
@@ -399,7 +399,7 @@ fn PlaceMenu() -> impl IntoView {
                             <RealmGlyph id=p.id.clone() />
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                             {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
-                            {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
+                            {current.then(|| view! { <span class="text-muted">"✓"</span> })}
                         </a>
                     }
                 }).collect_view()}
@@ -408,7 +408,7 @@ fn PlaceMenu() -> impl IntoView {
                     <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                     <span class="flex-1">"Console"</span>
                     {move || console_waiting(&places).map(|n| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you: installs, grants">{n}</span> })}
-                    <span class="text-xs text-zinc-500">"realms, workers, system"</span>
+                    <span class="text-xs text-muted">"realms, workers, system"</span>
                 </a>
             </div>
         </details>
@@ -427,7 +427,7 @@ fn PlaceLinks() -> impl IntoView {
     let here = place::realm();
     view! {
         <div class="border-t border-zinc-200 pt-1 text-sm dark:border-zinc-800">
-            <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
+            <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
             {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                 let current = here.as_deref() == Some(p.id.as_str());
                 view! {
@@ -435,7 +435,7 @@ fn PlaceLinks() -> impl IntoView {
                         <RealmGlyph id=p.id.clone() />
                         <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                         {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{p.waiting}</span> })}
-                        {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
+                        {current.then(|| view! { <span class="text-muted">"✓"</span> })}
                     </a>
                 }
             }).collect_view()}
@@ -458,7 +458,7 @@ fn MissingRealm() -> impl IntoView {
             <div class="fixed inset-0 z-50 flex items-center justify-center bg-zinc-50/95 p-6 dark:bg-zinc-950/95">
                 <div class="max-w-md space-y-3 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
                     <h1 class="text-lg font-semibold">{format!("There is no realm {here:?}")}</h1>
-                    <p class="text-sm text-zinc-500">"It may have been deleted, or the address is mistyped. Go to one of yours:"</p>
+                    <p class="text-sm text-muted">"It may have been deleted, or the address is mistyped. Go to one of yours:"</p>
                     <div class="flex flex-wrap gap-2">
                         {ps.into_iter().filter(|p| p.id != "root").map(|p| view! {
                             <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"

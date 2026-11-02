@@ -278,19 +278,19 @@ pub fn BriefPage() -> impl IntoView {
     view! {
         <main class="mx-auto max-w-5xl space-y-5 px-4 py-5">
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {move || notice.get().map(|note| view! { <p class="text-sm text-zinc-500">{note}</p> })}
-            {move || loading.get().then(|| view! { <p class="text-sm text-zinc-500">"Opening request…"</p> })}
+            {move || notice.get().map(|note| view! { <p class="text-sm text-muted">{note}</p> })}
+            {move || loading.get().then(|| view! { <p class="text-sm text-muted">"Opening request…"</p> })}
             {move || match open.get() {
                 Some(r) => view! { <RequestView r b /> }.into_any(),
                 None => view! {
                     <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                         <h1 class="text-xl font-semibold">"Brief"</h1>
-                        <span class="text-sm text-zinc-500">{move || {
+                        <span class="text-sm text-muted">{move || {
                             let n = queue.get().iter().filter(|r| r.category == "needs_you").count();
                             if n == 0 { "Nothing needs you.".to_owned() } else { format!("{n} need you") }
                         }}</span>
                         <span class="flex-1"></span>
-                        <span class="hidden text-xs text-zinc-400 sm:inline">"J/K move · Enter open · E done · H tomorrow · # drop · Esc back"</span>
+                        <span class="hidden text-xs text-muted sm:inline">"J/K move · Enter open · E done · H tomorrow · # drop · Esc back"</span>
                     </header>
                     // Why it may be short: sorting waits for a model, or for
                     // tomorrow's budget.
@@ -331,7 +331,7 @@ pub fn BriefPage() -> impl IntoView {
                     <Section title="FYI" empty="Nothing new to know.">
                         {move || fyi.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|t| view! { <Fyi t b /> }).collect_view()}
                     </Section>
-                    <p class="text-sm text-zinc-500">{move || {
+                    <p class="text-sm text-muted">{move || {
                         let s = status.get().and_then(Result::ok).unwrap_or_default();
                         let n = |k: &str| s["sorted"][k]["n"].as_i64().unwrap_or(0);
                         let by_model = s["sorted"]["mail"]["by_model"].as_i64().unwrap_or(0) + s["sorted"]["chat"]["by_model"].as_i64().unwrap_or(0);
@@ -343,7 +343,7 @@ pub fn BriefPage() -> impl IntoView {
                             if chat == 1 { "chat" } else { "chats" },
                         )
                     }}</p>
-                    <p class="text-sm text-zinc-500">{move || {
+                    <p class="text-sm text-muted">{move || {
                         let c = counts.get().and_then(Result::ok).unwrap_or_default();
                         let n = |k: &str, one: &str, many: &str| {
                             let n = c[k].as_i64().unwrap_or(0);
@@ -366,10 +366,10 @@ pub fn BriefPage() -> impl IntoView {
 fn Section(title: &'static str, empty: &'static str, children: Children) -> impl IntoView {
     view! {
         <section>
-            <h2 class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{title}</h2>
+            <h2 class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">{title}</h2>
             <div class="divide-y divide-zinc-100 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                 {children()}
-                {(!empty.is_empty()).then(|| view! { <p class="hidden px-3 py-2 text-sm text-zinc-500 only:block">{empty}</p> })}
+                {(!empty.is_empty()).then(|| view! { <p class="hidden px-3 py-2 text-sm text-muted only:block">{empty}</p> })}
             </div>
         </section>
     }
@@ -391,7 +391,7 @@ fn Row(r: Request, i: usize, picked: RwSignal<usize>, b: Brief) -> impl IntoView
                     on:click=move |ev| { ev.stop_propagation(); b.merge(other.min(id), other.max(id)); }>"same? merge"</button>
             })}
             {r.due.map(|d| view! { <span class="shrink-0 text-xs text-amber-700 dark:text-amber-400">{format!("by {}", crate::when::compact(d))}</span> })}
-            <span class="shrink-0 text-xs text-zinc-400">{channels(&r)}</span>
+            <span class="shrink-0 text-xs text-muted">{channels(&r)}</span>
         </div>
     }
 }
@@ -425,7 +425,7 @@ fn Owed(c: Commitment, b: Brief) -> impl IntoView {
                 let c = c.clone();
                 move || view! {
                     <span class="min-w-0 flex-1 truncate" title=c.item_title.clone()>{c.what.clone()}{(c.who != "me").then(|| format!(" — {}", c.who))}</span>
-                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-zinc-500">{crate::when::compact(d)}</span> })}
+                    {c.due.map(|d| view! { <span class="shrink-0 text-xs text-muted">{crate::when::compact(d)}</span> })}
                 }.into_any()
             })
             body=ViewFn::from(move || view! {
@@ -434,7 +434,7 @@ fn Owed(c: Commitment, b: Brief) -> impl IntoView {
                     <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| b.call("memex.commitment", json!({"id": id, "status": "dropped"}))>"Drop"</button>
                 </div>
                 {if target.is_empty() {
-                    view! { <p class="text-xs text-zinc-500">{format!("From {title}")}</p> }.into_any()
+                    view! { <p class="text-xs text-muted">{format!("From {title}")}</p> }.into_any()
                 } else {
                     view! { <Source target=target.clone() kind="mail".into() title=title.clone() refresh=RwSignal::new(0) /> }.into_any()
                 }}
@@ -455,7 +455,7 @@ fn Fyi(t: Triage, b: Brief) -> impl IntoView {
                 move || view! {
                     <span class="shrink-0 text-xs">{if t.kind == "mail" { "✉" } else { "💬" }}</span>
                     <span class="min-w-0 flex-1 truncate"><b class="font-medium">{t.sender_name.clone()}</b>" · "{t.title.clone()}</span>
-                    <span class="hidden shrink-0 truncate text-xs text-zinc-500 sm:inline sm:max-w-[40%]">{t.reason.clone()}</span>
+                    <span class="hidden shrink-0 truncate text-xs text-muted sm:inline sm:max-w-[40%]">{t.reason.clone()}</span>
                 }.into_any()
             })
             body=ViewFn::from(move || {
@@ -490,14 +490,14 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
             <aside class="w-full shrink-0 space-y-3 lg:sticky lg:top-0 lg:w-80">
                 <button class=BUTTON_QUIET on:click=move |_| b.show(None)>"← Brief (Esc)"</button>
                 <div class="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
-                    <p class="text-xs uppercase tracking-wide text-zinc-500">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
+                    <p class="text-xs uppercase tracking-wide text-muted">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
                     <h1 class="font-semibold">{r.title.clone()}</h1>
                     <p class="text-sm">
                         <crate::people::Person label=if r.person_name.is_empty() { r.person.clone() } else { format!("{} <{}>", r.person_name, r.person) }
                             name=if r.person_name.is_empty() { r.person.clone() } else { r.person_name.clone() } address=r.person.clone() />
                     </p>
                     {r.due.map(|d| view! { <p class="text-sm text-amber-700 dark:text-amber-400">{format!("By {}", crate::when::full(d))}</p> })}
-                    <p class="text-sm text-zinc-500">{r.reason.clone()}</p>
+                    <p class="text-sm text-muted">{r.reason.clone()}</p>
                     <crate::work::RequestWork id title=if r.person_name.is_empty() { r.title.clone() } else { format!("{}: {}", r.person_name, r.title) } />
                 </div>
                 // A mail thread shows its senders' cards itself.
@@ -509,7 +509,7 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                     <button class=BUTTON_QUIET on:click=move |_| act(id, Settle::NextWeek)>"Next week"</button>
                     <button class=format!("{BUTTON_QUIET} text-red-600") on:click=move |_| act(id, Settle::Drop)>"Drop (#)"</button>
                 </div>
-                <p class="text-xs text-zinc-400">"Or answer in a conversation: once you reply, it's done by itself."</p>
+                <p class="text-xs text-muted">"Or answer in a conversation: once you reply, it's done by itself."</p>
             </aside>
         </div>
     }
@@ -656,16 +656,16 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
     view! {
         <div class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
             <Show when=move || closed.get().is_none() fallback=move || view! {
-                <p class="text-sm text-zinc-500">{move || closed.get()}</p>
+                <p class="text-sm text-muted">{move || closed.get()}</p>
             }>
             {move || failed.get().map(|e| view! { <p class="text-sm text-red-600">{format!("Couldn't draft: {e}")}</p> })}
             {move || match draft.get() {
                 None => view! {
-                    <p class="text-sm text-zinc-500">{move || if automatic && failed.get().is_none() { "A draft is on its way." } else { "No draft yet." }}</p>
+                    <p class="text-sm text-muted">{move || if automatic && failed.get().is_none() { "A draft is on its way." } else { "No draft yet." }}</p>
                     <button class=BUTTON disabled=move || busy.get() || drafting.get() on:click=move |_| redraft()>{move || if drafting.get() { "Drafting…" } else { "Draft a reply" }}</button>
                 }.into_any(),
                 Some(d) => view! {
-                    <p class="text-xs text-zinc-500">{move || {
+                    <p class="text-xs text-muted">{move || {
                         let v = to.get().and_then(Result::ok).unwrap_or_default();
                         if v["kind"] == "mail" {
                             format!("✉ To {} <{}> · {}", v["to_name"].as_str().unwrap_or(""), v["to"][0].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""))
@@ -678,7 +678,7 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                     {(!d.note.is_empty()).then(|| view! { <p class="text-xs text-amber-700 dark:text-amber-400">{format!("Check: {}", d.note)}</p> })}
                     {move || choices(&text.get()).into_iter().map(|(whole, options)| view! {
                         <div class="flex flex-wrap items-center gap-1 text-xs">
-                            <span class="text-zinc-500">"Choose:"</span>
+                            <span class="text-muted">"Choose:"</span>
                             {options.into_iter().map(|o| {
                                 let (whole, chosen) = (whole.clone(), o.clone());
                                 view! {
@@ -745,10 +745,10 @@ pub fn ConversationPage(target: String) -> impl IntoView {
         <main class="mx-auto max-w-5xl space-y-3 p-4">
             <h1 class="text-lg font-semibold">"Messages"</h1>
             {move || match sources.get() {
-                None => view! { <p class="text-sm text-zinc-500">"Loading messages…"</p> }.into_any(),
+                None => view! { <p class="text-sm text-muted">"Loading messages…"</p> }.into_any(),
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
                 Some(Ok(sources)) if sources.is_empty() => view! {
-                    <p class="text-sm text-zinc-500">"This request no longer has a source conversation."</p>
+                    <p class="text-sm text-muted">"This request no longer has a source conversation."</p>
                 }.into_any(),
                 Some(Ok(sources)) => sources.into_iter().rev().map(|s| view! {
                     <Source target=s.target kind=s.kind title=s.title refresh />

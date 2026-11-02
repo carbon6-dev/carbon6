@@ -158,7 +158,7 @@ pub fn NeedsYou() -> impl IntoView {
         match counts() {
             (w, _) if w > 0 => format!("{base} bg-amber-500 text-white"),
             (_, l) if l > 0 => format!("{base} border border-zinc-400 text-zinc-600 dark:border-zinc-500 dark:text-zinc-300"),
-            _ => format!("{base} border border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600"),
+            _ => format!("{base} border border-zinc-300 text-muted dark:border-zinc-700"),
         }
     };
     let number = move || {
@@ -195,7 +195,7 @@ pub fn NeedsYou() -> impl IntoView {
                     <div class="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
                         <span class="flex-1 font-semibold">"Needs you"</span>
                         {move || (counts().1 > 0).then(|| view! {
-                            <button class="rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                            <button class="rounded px-1.5 py-0.5 text-xs text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                                 title="What's worth a look stops being so until something new comes" on:click=mark_all>"Mark all seen"</button>
                         })}
                     </div>
@@ -204,7 +204,7 @@ pub fn NeedsYou() -> impl IntoView {
                             let a = shown.get();
                             let now = now_ms();
                             if a.waiting.is_empty() && a.worth.is_empty() && a.elsewhere.is_empty() {
-                                return view! { <p class="px-2 py-6 text-center text-zinc-500">"Nothing needs you."</p> }.into_any();
+                                return view! { <p class="px-2 py-6 text-center text-muted">"Nothing needs you."</p> }.into_any();
                             }
                             let here = place::realm().unwrap_or_else(|| "root".into());
                             view! {
@@ -217,7 +217,7 @@ pub fn NeedsYou() -> impl IntoView {
                                                 <span class="mt-0.5 shrink-0 rounded bg-amber-100 px-1 text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:bg-amber-950 dark:text-amber-300">{kind}</span>
                                                 <span class="min-w-0 flex-1">
                                                     <span class="block truncate">{title}</span>
-                                                    <span class="block truncate text-xs text-zinc-500">{line}</span>
+                                                    <span class="block truncate text-xs text-muted">{line}</span>
                                                 </span>
                                             </Row>
                                         }
@@ -231,7 +231,7 @@ pub fn NeedsYou() -> impl IntoView {
                                             <Row item=i.clone() close>
                                                 <span class=colour></span>
                                                 <span class="min-w-0 flex-1 truncate">{says}</span>
-                                                <span class="shrink-0 text-xs text-zinc-500">{when}</span>
+                                                <span class="shrink-0 text-xs text-muted">{when}</span>
                                             </Row>
                                         }
                                     }).collect_view()}
@@ -258,7 +258,7 @@ pub fn NeedsYou() -> impl IntoView {
 
 #[component]
 pub(crate) fn Heading(text: String) -> impl IntoView {
-    view! { <div class="px-2 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{text}</div> }
+    view! { <div class="px-2 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">{text}</div> }
 }
 
 /// A row: goes to the item in the focused tile (⌘/Ctrl-click: a new one)

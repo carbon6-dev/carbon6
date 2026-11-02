@@ -165,7 +165,7 @@ pub fn Terminals(
                             <button class="px-2 py-1 font-mono text-xs" title=t.cwd.clone() on:click=move |_| active.set(Some(id2.clone()))>
                                 {label}{t.exited.map(|c| format!(" (exited {c})"))}
                             </button>
-                            <button class="px-1.5 text-zinc-400 hover:text-red-600" title="Close" on:click={let id = t.id.clone(); move |_| close(id.clone())}>"×"</button>
+                            <button class="px-1.5 text-muted hover:text-red-600" title="Close" on:click={let id = t.id.clone(); move |_| close(id.clone())}>"×"</button>
                         </span>
                     }
                 }).collect_view()}
@@ -177,7 +177,7 @@ pub fn Terminals(
             {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
             {move || match active.get() {
                 Some(tid) => view! { <TerminalView worker_id=wid.get_value() terminal_id=tid /> }.into_any(),
-                None => view! { <p class="py-10 text-center text-sm text-zinc-500">"No terminal open."</p> }.into_any(),
+                None => view! { <p class="py-10 text-center text-sm text-muted">"No terminal open."</p> }.into_any(),
             }}
         </div>
     }

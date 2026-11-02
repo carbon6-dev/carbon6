@@ -261,7 +261,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
     let channel_name = place.name.clone();
     let place_name = StoredValue::new(place.name.clone());
     let tool =
-        "rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+        "rounded px-1.5 py-0.5 text-xs text-muted hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     let s2 = send.clone();
     view! {
         <div class="relative px-4 pb-3 pt-1">
@@ -334,7 +334,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                             caret.set(el.selection_start().ok().flatten().unwrap_or(0) as usize);
                         }
                     }></textarea>
-                <div class="flex items-center gap-2 px-2 pb-1 text-[11px] text-zinc-500">
+                <div class="flex items-center gap-2 px-2 pb-1 text-[11px] text-muted">
                     {in_thread.then(|| view! {
                         <label class="flex items-center gap-1">
                             <input type="checkbox" prop:checked=move || broadcast.get() on:change=move |ev| broadcast.set(event_target_checked(&ev)) />

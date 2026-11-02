@@ -40,9 +40,9 @@ pub fn git_state(at: Memo<Option<(String, String)>>, events: RwSignal<Vec<Event>
 fn row(icon: &'static str, main: impl IntoView, side: impl IntoView) -> impl IntoView {
     view! {
         <div class="flex items-start gap-2 py-0.5">
-            <span class="w-4 shrink-0 text-center text-zinc-400">{icon}</span>
+            <span class="w-4 shrink-0 text-center text-muted">{icon}</span>
             <span class="min-w-0 flex-1">{main}</span>
-            <span class="shrink-0 text-xs text-zinc-500">{side}</span>
+            <span class="shrink-0 text-xs text-muted">{side}</span>
         </div>
     }
 }
@@ -50,7 +50,7 @@ fn row(icon: &'static str, main: impl IntoView, side: impl IntoView) -> impl Int
 fn section(title: &'static str, body: impl IntoView) -> impl IntoView {
     view! {
         <section class="min-w-0 space-y-1">
-            <h3 class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">{title}</h3>
+            <h3 class="text-[11px] font-semibold uppercase tracking-wide text-muted">{title}</h3>
             {body}
         </section>
     }
@@ -144,7 +144,7 @@ pub fn Context(session: String, events: RwSignal<Vec<Event>>, usage: Memo<UsageS
         usage.with(|u| {
             let window = u.context_window;
             let Some(used) = u.context else {
-                return view! { <p class="py-1 text-xs text-zinc-500">"Known after the first model call."</p> }.into_any();
+                return view! { <p class="py-1 text-xs text-muted">"Known after the first model call."</p> }.into_any();
             };
             let system = (system_chars.get() / 4).min(used);
             let rest = used - system;
@@ -157,14 +157,14 @@ pub fn Context(session: String, events: RwSignal<Vec<Event>>, usage: Memo<UsageS
                         <span class=format!("size-2.5 shrink-0 rounded-sm {color}")></span>
                         <span class="min-w-0 flex-1 truncate text-zinc-600 dark:text-zinc-400">{label}</span>
                         <span class="tabular-nums">{tokens(n)}</span>
-                        <span class="w-12 text-right tabular-nums text-zinc-500">{if window == 0 { "–".into() } else { format!("{:.1}%", pct(n)) }}</span>
+                        <span class="w-12 text-right tabular-nums text-muted">{if window == 0 { "–".into() } else { format!("{:.1}%", pct(n)) }}</span>
                     </div>
                 }
             };
             view! {
                 <div class="flex items-baseline justify-between gap-2 py-0.5 text-sm">
                     <span class="font-medium">{if window == 0 { tokens(used) } else { format!("{:.0}% used", pct(used)) }}</span>
-                    <span class="text-xs tabular-nums text-zinc-500">{if window == 0 { String::new() } else { format!("{} / {}", tokens(used), tokens(window)) }}</span>
+                    <span class="text-xs tabular-nums text-muted">{if window == 0 { String::new() } else { format!("{} / {}", tokens(used), tokens(window)) }}</span>
                 </div>
                 <div class="relative flex h-2 gap-px overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
                     {bar(rest, "bg-blue-500")}
@@ -177,7 +177,7 @@ pub fn Context(session: String, events: RwSignal<Vec<Event>>, usage: Memo<UsageS
                     {line("bg-amber-500", "System prompt (estimated)", system)}
                     {(window > 0).then(|| line("bg-zinc-200 dark:bg-zinc-700", "Free", free))}
                 </div>
-                <div class="flex items-center justify-between gap-2 pt-0.5 text-xs text-zinc-500">
+                <div class="flex items-center justify-between gap-2 pt-0.5 text-xs text-muted">
                     <span>"Compacts at 85%"</span>
                     <button class=format!("{BUTTON_QUIET} px-2 py-0.5 text-xs") disabled=running title="Summarize the conversation so far to free up context (/compact)" on:click=compact>"Compact now"</button>
                 </div>
@@ -197,7 +197,7 @@ pub fn Usage(usage: Memo<UsageStats>) -> impl IntoView {
                 <p class="pt-1 text-xs text-zinc-600 dark:text-zinc-400">
                     {format!("{turns} turn{} · {} model call{}", if turns == 1 { "" } else { "s" }, u.total.calls, if u.total.calls == 1 { "" } else { "s" })}
                 </p>
-                <p class="font-mono text-[11px] text-zinc-500">{u.total.summary()}</p>
+                <p class="font-mono text-[11px] text-muted">{u.total.summary()}</p>
             }
         })
     }
@@ -245,7 +245,7 @@ pub fn DetailsDrawer(
     let idle = Memo::new(move |_| events.with(|e| crate::tasks::count(e)) == 0 && subagents.is_empty());
     view! {
         <div class="relative shrink-0 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
-            <button class="absolute right-2 top-1.5 z-10 rounded px-1 text-xs text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+            <button class="absolute right-2 top-1.5 z-10 rounded px-1 text-xs text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                 title="Close (Esc)" on:click=move |_| open.set(false)>"✕"</button>
             <div class="max-h-[40vh] overflow-y-auto px-3 pb-3 pt-2 text-sm">
                 <div class="grid grid-cols-1 gap-x-6 gap-y-4 @lg:grid-cols-2 @3xl:grid-cols-3 @5xl:grid-cols-5">
@@ -256,7 +256,7 @@ pub fn DetailsDrawer(
                         <crate::tasks::TaskHistory session=id.clone() events />
                         <SubagentList tree=subagents />
                         <Show when=move || idle.get()>
-                            <p class="py-1 text-xs text-zinc-500">"No background tasks or subagents."</p>
+                            <p class="py-1 text-xs text-muted">"No background tasks or subagents."</p>
                         </Show>
                     })}
                     {section("Outputs", view! {
