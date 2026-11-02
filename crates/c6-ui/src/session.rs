@@ -648,6 +648,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let esc_id = id.clone();
     let esc_armed = RwSignal::new(None::<i64>);
     provide_context(EscArmed(esc_armed));
+    // Claude Code's own background agents stop with the turn: Stop and Esc
+    // ask first while any run.
+    let guard =
+        StopGuard { agents: Memo::new(move |_| events.with(|e| crate::tasks::background_agents(e))), confirm: RwSignal::new(false) };
+    provide_context(guard);
     let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !active() {
             return;
@@ -659,6 +664,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // Taken already (⌘I is italic in a chat's composer).
         let command = (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && !ev.shift_key() && !ev.default_prevented();
         match ev.key().as_str() {
+            "Escape" if guard.confirm.get_untracked() => guard.confirm.set(false),
             "Escape" if details.get_untracked() => details.set(false),
             "Escape" if !in_field && (glance_at.get_untracked().is_some() || sheet.get_untracked()) => chrome.close_glance(),
             // Taken already: a menu, a mention list or a suggestion put away.
@@ -666,10 +672,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 let now = now_ms();
                 if esc_armed.get_untracked().is_some_and(|at| now - at < 1500) {
                     esc_armed.set(None);
-                    let id = esc_id.clone();
-                    spawn_local(async move {
-                        let _ = api::interrupt(id).await;
-                    });
+                    if guard.agents.get_untracked() > 0 {
+                        guard.confirm.set(true);
+                    } else {
+                        let id = esc_id.clone();
+                        spawn_local(async move {
+                            let _ = api::interrupt(id).await;
+                        });
+                    }
                 } else {
                     esc_armed.set(Some(now));
                     set_timeout(
@@ -2192,6 +2202,23 @@ const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
 #[derive(Clone, Copy)]
 struct EscArmed(RwSignal<Option<i64>>);
 
+/// Stop (and Esc twice) while Claude Code's own agents run in the
+/// background: an interrupt stops them too, so Stop asks first
+/// (docs/background.md §4). Send now spares them.
+#[derive(Clone, Copy)]
+struct StopGuard {
+    /// How many run now.
+    agents: Memo<usize>,
+    /// The question is open, by the Stop button.
+    confirm: RwSignal<bool>,
+}
+
+/// What Stop asks while `n` background agents run.
+fn stop_question(n: usize) -> String {
+    let agents = if n == 1 { "1 background agent".to_owned() } else { format!("{n} background agents") };
+    format!("This also stops {agents}. Stop anyway?")
+}
+
 /// Stop: a thin ring, a small square in it.
 const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-muted hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
 
@@ -3698,15 +3725,15 @@ fn Queued(q: QueuedInput, session_id: String, worker_id: c6_api::Uuid, pull: Cal
                     </span>
                 }.into_any(),
                 // With the agent already: it reads it at its next step; Send now
-                // stops that step, and the agent takes it as its next turn.
+                // gives it to the agent at once (docs/background.md §4).
                 None if with_agent => view! {
                     <span class="flex items-center gap-2 text-xs text-muted">
-                        <button class=UBTN title="Stop the agent's current step; it reads this right after (as its next turn)"
+                        <button class=UBTN title="The agent gets this now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)"
                             prop:disabled=move || busy.get() on:click=move |_| {
                                 busy.set(true);
-                                let id = session_id.get_value();
+                                let (id, cid) = (session_id.get_value(), command_id.get_value());
                                 spawn_local(async move {
-                                    if let Err(e) = api::interrupt(id).await { error.set(Some(e)); }
+                                    if let Err(e) = api::send_queued_now(id, cid).await { error.set(Some(e)); }
                                     busy.set(false);
                                 });
                             }>"⏵ Send now"</button>
@@ -4101,7 +4128,8 @@ fn Composer(
         });
     };
     let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace());
-    let send = move || {
+    // `now`: Send now (the agent gets it at once, not at its next step).
+    let send_with = move |now: bool| {
         let t = text.get_untracked();
         let uploads = attachments.get_untracked();
         if (t.trim().is_empty() && uploads.is_empty()) || disabled.get_untracked() {
@@ -4176,7 +4204,7 @@ fn Composer(
         command.set(None);
         let waking = wake.is_some_and(|w| w.get_untracked());
         spawn_local(async move {
-            if let Err(e) = api::send_message_waking(id.get_value(), t.clone(), switch, uploads.clone(), waking).await {
+            if let Err(e) = api::send_message_waking(id.get_value(), t.clone(), switch, uploads.clone(), waking, now).await {
                 error.set(Some(e));
                 text.set(t);
                 attachments.set(uploads);
@@ -4192,37 +4220,34 @@ fn Composer(
             }
         });
     };
-    let stop = move |_| interrupt();
+    let send = move || send_with(false);
+    // The session's own Stop asks first while Claude Code's background agents
+    // run (a side chat's box is another session's).
+    let guard = if inline { None } else { use_context::<StopGuard>() };
+    let stop = move |_| match guard {
+        Some(g) if g.agents.get_untracked() > 0 => g.confirm.set(true),
+        _ => interrupt(),
+    };
+    Effect::new(move || {
+        if let Some(g) = guard
+            && !running.get()
+        {
+            g.confirm.set(false);
+        }
+    });
     let esc_armed = use_context::<EscArmed>();
     // The session's own box keeps in line with its transcript.
     let beside = if inline { None } else { use_context::<GlanceBeside>() };
-    // Send now (stop and send): the message waits in the box until the turn
-    // has stopped, then starts the next one (sent anyway if stopping takes
-    // long: it queues).
-    let stopping = RwSignal::new(false);
     // The ▾ beside Send while the agent works.
     let send_menu = RwSignal::new(false);
-    let stop_and_send = move || {
+    // Send now: the agent gets it at once. Claude Code moves what holds its
+    // turn to the background (or stops only that turn), sparing its
+    // background agents; carbon6's own loop stops the step and this starts
+    // the next (docs/background.md §4).
+    let send_now = move || {
         send_menu.set(false);
-        stopping.set(true);
-        interrupt();
-        set_timeout(
-            move || {
-                // Not if the box has gone meanwhile.
-                if stopping.try_get_untracked() == Some(true) {
-                    stopping.set(false);
-                    send();
-                }
-            },
-            std::time::Duration::from_secs(15),
-        );
+        send_with(true);
     };
-    Effect::new(move || {
-        if stopping.get() && !running.get() {
-            stopping.set(false);
-            send();
-        }
-    });
     let has_text = Memo::new(move |_| !text.with(|t| t.trim().is_empty()) || !attachments.with(Vec::is_empty));
     // The ▾ menu goes with the buttons it belongs to.
     Effect::new(move || {
@@ -4410,7 +4435,7 @@ fn Composer(
                             // While the agent works, ⌘/Ctrl+Shift+Enter is Send now.
                             if crate::util::sends_now(&ev) && running.get_untracked() && has_text.get_untracked() {
                                 ev.prevent_default();
-                                stop_and_send();
+                                send_now();
                             } else if crate::util::sends(&ev) {
                                 ev.prevent_default();
                                 send();
@@ -4532,17 +4557,15 @@ fn Composer(
                         })}
                     </div>
                 })}
-                        <div class="ml-auto flex shrink-0 items-center gap-0.5">
-                        {move || if stopping.get() {
-                            view! { <button class=format!("{STOP} animate-pulse") disabled=true title="Stopping…" aria-label="Stopping…">{stop_icon()}</button> }.into_any()
-                        } else if running.get() && esc_armed.is_some_and(|EscArmed(a)| a.get().is_some()) {
+                        <div class="relative ml-auto flex shrink-0 items-center gap-0.5">
+                        {move || if running.get() && esc_armed.is_some_and(|EscArmed(a)| a.get().is_some()) {
                             // One Esc pressed: Stop says what the next one does.
                             view! { <button class=format!("{STOP} w-auto px-1.5 text-[10px] font-semibold") title="Press Esc again to stop" aria-label="Press Esc again to stop" on:click=stop>"Esc"</button> }.into_any()
                         } else if running.get() && has_text.get() {
                             // Both runtimes take it into the running turn (Claude Code's
                             // process stays up: docs/background.md §4).
                             // Send (the agent reads it at its next step), and ▾
-                            // beside it for Send now (stop that step and send).
+                            // beside it for Send now (at once).
                             view! {
                                 <div class="relative flex items-center gap-0.5">
                                     <button class="flex h-5.5 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
@@ -4555,7 +4578,7 @@ fn Composer(
                                         <div class="fixed inset-0 z-30" on:click=move |_| send_menu.set(false)></div>
                                         <div role="menu" class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                                title="Stop the agent's current step; your message starts the next one" on:click=move |_| stop_and_send()>
+                                                title="The agent gets it now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)" on:click=move |_| send_now()>
                                                 <span>"Send now"</span>
                                                 <span class="text-xs text-muted">"⌘/Ctrl ⇧ ↵"</span>
                                             </button>
@@ -4571,6 +4594,24 @@ fn Composer(
                                     title=send_label aria-label=send_label prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
                             }.into_any()
                         }}
+                        // Stop (or Esc twice) while Claude Code's own agents run
+                        // in the background: they'd stop too, so it asks.
+                        {move || guard.filter(|g| g.confirm.get() && running.get()).map(|g| view! {
+                            <div class="fixed inset-0 z-30" on:click=move |_| g.confirm.set(false)></div>
+                            <div role="alertdialog" class="absolute bottom-full right-0 z-40 mb-1 w-72 max-w-[90vw] space-y-2 rounded-md border border-zinc-200 bg-white p-3 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                                <p>{move || stop_question(g.agents.get())}</p>
+                                <div class="flex flex-wrap justify-end gap-2">
+                                    {move || has_text.get().then(|| view! {
+                                        <button class="rounded-md px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                            title="Don't stop: the agent reads your message at its next step"
+                                            on:click=move |_| { g.confirm.set(false); send(); }>"Send at the next step instead"</button>
+                                    })}
+                                    <button class="rounded-md px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| g.confirm.set(false)>"Cancel"</button>
+                                    <button class="rounded-md bg-red-600 px-2 py-1 text-white hover:bg-red-700"
+                                        on:click=move |_| { g.confirm.set(false); interrupt(); }>"Stop anyway"</button>
+                                </div>
+                            </div>
+                        })}
                         </div>
                     </div>
                 </div>
@@ -4792,6 +4833,12 @@ mod tests {
         assert!(!stale(4, 3), "the turn running now");
         assert!(!stale(1, 0), "no turn has ended yet");
         assert!(!stale(0, 3), "a stream that names no turn is shown");
+    }
+
+    #[test]
+    fn stop_says_how_many_background_agents_it_stops() {
+        assert_eq!(stop_question(1), "This also stops 1 background agent. Stop anyway?");
+        assert_eq!(stop_question(3), "This also stops 3 background agents. Stop anyway?");
     }
 
     fn file(name: &str, mb: usize) -> c6_api::AttachmentUpload {

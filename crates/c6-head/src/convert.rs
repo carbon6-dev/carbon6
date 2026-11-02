@@ -146,6 +146,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             exit_code: t.exit_code,
             elapsed_ms: t.elapsed_ms,
             notify: t.notify,
+            native_type: t.native_type.clone(),
+            foreground: t.foreground,
         },
         Kind::Rewound(r) => {
             api::EventKind::Rewound { to_seq: r.to_seq, restored_files: r.restored_files, restore_error: r.restore_error.clone() }

@@ -18,6 +18,10 @@ struct Task {
     exit_code: i32,
     elapsed_ms: u64,
     notify: bool,
+    /// Claude Code's kind for its own task (`local_agent`, ...), and whether
+    /// it holds the turn.
+    native_type: String,
+    foreground: bool,
 }
 
 impl Task {
@@ -88,18 +92,26 @@ fn kind_name(kind: &str) -> &'static str {
 fn lifecycle(events: &[Event]) -> Vec<Task> {
     let mut out: Vec<Task> = Vec::new();
     for e in events {
-        if let EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, notify } = &e.kind {
-            let since = out.iter().find(|t| &t.id == task_id).map(|t| t.since).unwrap_or(e.ts);
+        if let EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, notify, native_type, foreground } =
+            &e.kind
+        {
+            let before = out.iter().find(|t| &t.id == task_id);
+            let since = before.map(|t| t.since).unwrap_or(e.ts);
+            // Started again: a new run, unless it was running (Claude Code
+            // moved it to the background).
+            let since = if state == "started" && !before.is_some_and(Task::running) { e.ts } else { since };
             out.retain(|r| &r.id != task_id);
             out.push(Task {
                 id: task_id.clone(),
                 kind: kind.clone(),
                 description: description.clone(),
-                since: if state == "started" { e.ts } else { since },
+                since,
                 state: state.clone(),
                 exit_code: *exit_code,
                 elapsed_ms: *elapsed_ms,
                 notify: *notify,
+                native_type: native_type.clone(),
+                foreground: *foreground,
             });
         }
     }
@@ -136,6 +148,12 @@ pub fn running_line(tasks: usize, servers: usize) -> String {
         (t, 0) => format!("⏳ {} running", plural(t, "background task", "background tasks")),
         (t, s) => format!("⏳ {} running · {}", plural(t, "task", "tasks"), plural(s, "server", "servers")),
     }
+}
+
+/// Claude Code's own agents running in the background (`local_agent`, not
+/// holding the turn): a Stop stops them too (docs/background.md §4).
+pub fn background_agents(events: &[Event]) -> usize {
+    lifecycle(events).iter().filter(|t| t.running() && t.kind == "claude_code" && t.native_type == "local_agent" && !t.foreground).count()
 }
 
 /// What the tasks running now are, servers and watchers too.
@@ -389,8 +407,41 @@ mod tests {
                 exit_code: if state == "finished" { 7 } else { 0 },
                 elapsed_ms: 2500,
                 notify: false,
+                native_type: String::new(),
+                foreground: false,
             },
         }
+    }
+
+    /// One of Claude Code's own tasks: its kind, and whether it holds the turn.
+    fn native(seq: u64, task: &str, state: &str, native: &str, fg: bool) -> Event {
+        let mut e = event(seq, task, state);
+        if let EventKind::BackgroundTask { kind, native_type, foreground, .. } = &mut e.kind {
+            *kind = "claude_code".into();
+            *native_type = native.into();
+            *foreground = fg;
+        }
+        e
+    }
+
+    #[test]
+    fn background_agents_are_claude_codes_running_agents_not_in_the_turn() {
+        let evs = [
+            native(1, "bg-agent", "started", "local_agent", false),
+            native(2, "fg-agent", "started", "local_agent", true),
+            native(3, "command", "started", "local_bash", false),
+            native(4, "done-agent", "started", "local_agent", false),
+            native(5, "done-agent", "finished", "local_agent", false),
+            event(6, "shell", "started"),
+        ];
+        assert_eq!(background_agents(&evs), 1);
+        // The CLI moved the foreground one to the background: it counts, and
+        // it has run since it started.
+        let mut moved = evs.to_vec();
+        moved.push(native(7, "fg-agent", "started", "local_agent", false));
+        assert_eq!(background_agents(&moved), 2);
+        let task = lifecycle(&moved).into_iter().find(|t| t.id == "fg-agent").unwrap();
+        assert_eq!(task.since, 2000);
     }
 
     #[test]

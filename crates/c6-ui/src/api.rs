@@ -526,17 +526,19 @@ pub async fn send_message(
     switch: Option<(String, String, String)>,
     attachments: Vec<c6_api::AttachmentUpload>,
 ) -> Result<QueuedInput, String> {
-    send_message_waking(id, text, switch, attachments, false).await
+    send_message_waking(id, text, switch, attachments, false, false).await
 }
 
 /// `wake`: to a subagent, start a turn in its idle parent when its report
-/// comes.
+/// comes. `send_now`: while the agent works, it gets it at once rather than
+/// at its next step (docs/background.md §4).
 pub async fn send_message_waking(
     id: String,
     text: String,
     switch: Option<(String, String, String)>,
     attachments: Vec<c6_api::AttachmentUpload>,
     wake: bool,
+    send_now: bool,
 ) -> Result<QueuedInput, String> {
     let (connection_id, model, effort) = match switch {
         Some((c, m, e)) => (Some(c), Some(m), Some(e).filter(|e| !e.is_empty())),
@@ -544,7 +546,7 @@ pub async fn send_message_waking(
     };
     send_json(
         Request::post(&format!("/api/v1/sessions/{id}/messages")),
-        &SendMessage { text, attachments, connection_id, model, effort, wake },
+        &SendMessage { text, attachments, connection_id, model, effort, wake, send_now },
     )
     .await
 }
@@ -556,6 +558,11 @@ pub async fn resume(id: String, wake: bool) -> Result<QueuedInput, String> {
 
 pub async fn interrupt(id: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/interrupt")).send().await).await
+}
+
+/// Send now for a message already with the agent: it gets it at once.
+pub async fn send_queued_now(id: String, command_id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/queue/{command_id}/now")).send().await).await
 }
 
 pub async fn archive(id: String) -> Result<(), String> {

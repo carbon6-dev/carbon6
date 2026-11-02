@@ -416,6 +416,12 @@ impl Actor {
                 }
                 // What you @-mentioned, read with your access (docs/ask.md §4).
                 let prompt = with_mentions(&self.st, &self.env.realm, &input.text).await;
+                // Send now: the running turn stops, and this starts the next.
+                if input.send_now
+                    && let Some((_, cancel)) = running
+                {
+                    cancel.cancel();
+                }
                 self.inbox.lock().unwrap().push(PendingInput {
                     command_id: cmd.command_id,
                     text: input.text,

@@ -149,6 +149,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/queue/{command_id}", put(edit_queued).delete(cancel_queued))
         .route("/api/v1/sessions/{id}/queue/{command_id}/pull", post(pull_queued))
+        .route("/api/v1/sessions/{id}/queue/{command_id}/now", post(send_queued_now))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/head/fs/list", get(head_fs_list))
         .route("/api/v1/head/fs/read", get(head_fs_read))
@@ -2821,6 +2822,14 @@ async fn resume_session(
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if crate::sessions::interrupt(&st, &id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
+    }
+}
+
+async fn send_queued_now(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    if crate::sessions::send_queued_now(&st, &id, &command_id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))

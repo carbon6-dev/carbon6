@@ -170,6 +170,8 @@ pub(crate) enum ActorMsg {
     /// what is needed to pick the variant of a custom command it invokes.
     Input(Box<PendingInput>, Option<ModelSpec>, Box<CommandChoice>),
     Interrupt,
+    /// Send now for an input already with the agent (its command id).
+    SendNow(String),
     /// A background task started or ended.
     Task(c6_tools::TaskEvent),
     /// A background task that was running when the worker restarted.
@@ -464,6 +466,7 @@ impl SessionManager {
                     from_session_id: input.from_session_id,
                     from_title: input.from_title,
                     hops: input.hops,
+                    send_now: input.send_now,
                     ..Default::default()
                 };
                 let choice =
@@ -498,9 +501,9 @@ impl SessionManager {
                 let _ = actor.send(ActorMsg::Rewind { command_id: cmd.command_id, to_seq: r.to_seq, restore_files: r.restore_files });
                 Ok(())
             }
-            Some(session_command::Kind::Interrupt(_)) => {
+            Some(session_command::Kind::Interrupt(i)) => {
                 if let Some(a) = self.live(&cmd.session_id) {
-                    let _ = a.send(ActorMsg::Interrupt);
+                    let _ = a.send(if i.send_now.is_empty() { ActorMsg::Interrupt } else { ActorMsg::SendNow(i.send_now) });
                 }
                 Ok(())
             }
@@ -1352,6 +1355,9 @@ struct Inbox {
     /// Told when an input is queued (a running Claude Code turn writes it
     /// to its process).
     more: Arc<tokio::sync::Notify>,
+    /// Inputs already with the agent to deliver now (Send now), by command
+    /// id: for a running Claude Code turn.
+    now: Vec<String>,
 }
 
 impl Inbox {
@@ -1360,6 +1366,18 @@ impl Inbox {
             self.queue.push_back((input, model));
             self.more.notify_one();
         }
+    }
+
+    /// Send now for an input already with the agent.
+    fn send_now(&mut self, command_id: String) {
+        self.now.push(command_id);
+        self.more.notify_one();
+    }
+
+    /// What joins a running Claude Code turn: the inputs that may (`join`),
+    /// and those with it already to deliver now.
+    fn joining(&mut self) -> crate::claude_code::Joining {
+        crate::claude_code::Joining { inputs: self.join(), now: std::mem::take(&mut self.now) }
     }
 
     /// Inputs a process never took, first again.
@@ -1595,6 +1613,14 @@ impl Actor {
                         }
                         let held = std::mem::take(&mut self.deferred);
                         let command_id = input.command_id.clone();
+                        // Send now in carbon6's own loop: the turn stops (it takes
+                        // no input once stopping), and this starts the next. A
+                        // Claude Code turn delivers it at once when it writes it
+                        // (`Process::turn`).
+                        let stops = input.send_now && !self.runs_claude_code();
+                        if stops && let Some((_, cancel)) = &running {
+                            cancel.cancel();
+                        }
                         {
                             let mut inbox = self.inbox.lock().unwrap();
                             for (n, _) in held {
@@ -1605,7 +1631,7 @@ impl Actor {
                         // A running turn of carbon6's own loop takes it at its next
                         // step: it is with the agent. (A Claude Code turn says so
                         // when it writes it to its process.)
-                        if running.is_some() && !self.runs_claude_code() {
+                        if running.is_some() && !self.runs_claude_code() && !stops {
                             let delivered = c6_proto::InputDelivered { command_id };
                             if let Err(e) = self.writer.append(session_event::Kind::InputDelivered(delivered)).await {
                                 error!(session = %self.writer.session_id, "recording a delivered input: {e:#}");
@@ -1615,6 +1641,16 @@ impl Actor {
                     }
                     Some(ActorMsg::Interrupt) => {
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
+                    }
+                    Some(ActorMsg::SendNow(command_id)) => {
+                        if running.is_some() && self.runs_claude_code() {
+                            // The running turn asks its process to deliver it now.
+                            self.inbox.lock().unwrap().send_now(command_id);
+                        } else if let Some((_, cancel)) = &running {
+                            // carbon6's own loop: the turn stops, and the agent
+                            // takes it as its next turn.
+                            cancel.cancel();
+                        }
                     }
                     Some(ActorMsg::Delegate(input, done)) => {
                         match done {
@@ -1688,6 +1724,8 @@ impl Actor {
                             elapsed_ms: ev.elapsed.as_millis() as u64,
                             notify: ev.notify,
                             pgid: ev.pgid.unwrap_or(0),
+                            native_type: ev.native_type.clone(),
+                            foreground: ev.foreground,
                         };
                         // The agent stopped it itself: nothing to tell it. Claude
                         // Code tells its agent about its own tasks, except one
@@ -2518,7 +2556,7 @@ async fn claude_turn(
         return Ok(None);
     }
     let more = inbox.lock().unwrap().more.clone();
-    let feed = || inbox.lock().unwrap().join();
+    let feed = || inbox.lock().unwrap().joining();
     let failed = async |message: String| -> anyhow::Result<Option<Process>> {
         for input in &inputs {
             sink.append(input.event()).await?;

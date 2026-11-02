@@ -1804,6 +1804,13 @@ pub struct SendMessage {
     /// turn there (else the parent hears with its next input).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake: bool,
+    /// Send now: while the agent works, it gets this at once rather than at
+    /// its next step (docs/background.md §4). Claude Code moves what holds
+    /// the turn to the background, or stops only that turn, sparing its
+    /// background agents; carbon6's own loop stops the turn and this starts
+    /// the next. While the agent is idle it is an ordinary message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send_now: bool,
 }
 
 /// `GET`/`PUT /api/v1/settings/subagent-limits`: how far subagents may go
@@ -2135,6 +2142,14 @@ pub enum EventKind {
         elapsed_ms: u64,
         #[serde(default)]
         notify: bool,
+        /// An observed Claude Code task's kind as the CLI names it
+        /// ("local_bash", "local_agent", ...); empty otherwise.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        native_type: String,
+        /// That task holds Claude Code's turn (a foreground command or
+        /// subagent, until the CLI moves it to the background).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        foreground: bool,
     },
     /// A tool call started a subagent (the child session).
     SubagentSpawned {

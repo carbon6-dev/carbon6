@@ -2,7 +2,7 @@
 //! queued: the queue says so until the agent takes it at its next step
 //! (docs/background.md §4).
 
-use c6_api::{SessionDetail, SessionStatus};
+use c6_api::{Event, EventKind, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
 use c6_worker::{ConnState, enroll};
@@ -78,5 +78,85 @@ async fn a_message_sent_mid_turn_is_with_the_agent() {
     .await;
     assert_eq!(mock.requests().len(), 2);
     assert!(mock.requests()[1]["messages"].to_string().contains("second"), "it joined the turn");
+    stop.cancel();
+}
+
+/// Send now in carbon6's own loop: the step stops (the turn ends
+/// interrupted, without taking the message), and the message starts the
+/// next turn, as Stop and then Send did before.
+#[tokio::test]
+async fn send_now_stops_the_step_and_starts_the_next_turn() {
+    let mock = MockLlm::start().await;
+    let (head_dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = crate::open_worker(state.path()).await;
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(c6_worker::conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let conn: Value = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // A step that holds.
+    let gate = mock.push_gated(Reply::Text("Working on the first.".into()));
+    mock.push(Reply::Text("On the second now.".into()));
+    let s: Value = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": project.path().display().to_string(), "connection_id": conn["id"], "model": "m", "prompt": "first"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = s["id"].as_str().unwrap().to_owned();
+    eventually("the turn to be running", async || (mock.requests().len() == 1).then_some(())).await;
+
+    let r = http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": "second", "send_now": true})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let (ends, events) = eventually("both turns to end", async || {
+        let events: Vec<Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+        let ends: Vec<TurnEndReason> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::TurnEnded { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        (ends.len() == 2).then_some((ends, events))
+    })
+    .await;
+    gate.notify_one();
+    assert_eq!(ends, [TurnEndReason::Interrupted, TurnEndReason::Completed]);
+    let messages: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::User { text, .. } => Some(text.as_str()),
+            EventKind::TurnStarted { .. } => Some("|"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, ["first", "|", "second", "|"], "the message is the next turn's");
+    assert_eq!(mock.requests().len(), 2);
+    assert!(mock.requests()[1]["messages"].to_string().contains("second"));
     stop.cancel();
 }

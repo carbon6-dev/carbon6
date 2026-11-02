@@ -1005,9 +1005,22 @@ pub async fn send_input_as(
         st,
         &session.realm,
         session.head_labels(),
-        UserInput { text: text.to_owned(), model, attachments: files, wake, delegated_by: delegated_by.to_owned(), ..Default::default() },
+        UserInput {
+            text: text.to_owned(),
+            model,
+            attachments: files,
+            wake,
+            delegated_by: delegated_by.to_owned(),
+            send_now: req.send_now,
+            ..Default::default()
+        },
     )
     .await?;
+    // Send now to a connected worker that doesn't know it (an older one):
+    // as before, the turn stops and this starts the next.
+    if req.send_now && !sends_now(st, worker_id) {
+        interrupt_on(st, worker_id, session_id, String::new());
+    }
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
@@ -1536,12 +1549,31 @@ async fn model_switch(
 /// connected and running the turn.
 pub async fn interrupt(st: &HeadState, session_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(interrupt_on(st, session.worker_id.parse()?, session_id, String::new()))
+}
+
+/// Send now for a message already with the agent (`command_id`): it gets it
+/// at once (docs/background.md §4). Not queued, like an interrupt; an older
+/// worker takes it as one.
+pub async fn send_queued_now(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(interrupt_on(st, session.worker_id.parse()?, session_id, command_id.to_owned()))
+}
+
+fn interrupt_on(st: &HeadState, worker_id: WorkerId, session_id: &str, send_now: String) -> bool {
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
-        kind: Some(session_command::Kind::Interrupt(Default::default())),
+        kind: Some(session_command::Kind::Interrupt(c6_proto::Interrupt { send_now })),
     };
-    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+    st.registry.send_command(worker_id, cmd)
+}
+
+/// The worker takes Send now itself (`UserInput.send_now`), or isn't
+/// connected to say. The head's own (assistant conversations) does.
+fn sends_now(st: &HeadState, worker_id: WorkerId) -> bool {
+    st.assistant.head_id() == Some(worker_id)
+        || st.registry.get(worker_id).is_none_or(|live| live.capabilities.iter().any(|c| c == "send_now"))
 }
 
 /// Your answer to a tool call waiting for approval. `false`: its worker is
