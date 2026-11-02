@@ -1141,8 +1141,9 @@ fn SessionForm(
                     "Connection"
                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| connection.set(event_target_value(&ev)) prop:value=move || connection.get()>
                         {move || (has_routes.get() || auto()).then(|| view! { <option value="">"Auto (your routing rules)"</option> })}
-                        {conns.get_value().into_iter().map(|c| view! { <option value=c.id.clone()>{c.name.clone()}</option> }).collect_view()}
+                        {move || conns.get_value().into_iter().map(|c| view! { <option value=c.id.clone()>{crate::quota::option_label(&c.id, &c.name)}</option> }).collect_view()}
                     </select>
+                    <div class="mt-1"><crate::quota::QuotaNote connection /></div>
                 </label>
                 {move || auto().then(|| view! {
                     <p class="text-xs text-zinc-500">

@@ -181,8 +181,10 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
 }
 
-pub fn ephemeral(kind: &ephemeral_event::Kind) -> api::StreamMsg {
-    match kind {
+/// What a session's viewers see of it; `None` for what is the head's only
+/// (a plan's limits).
+pub fn ephemeral(kind: &ephemeral_event::Kind) -> Option<api::StreamMsg> {
+    Some(match kind {
         ephemeral_event::Kind::Text(d) => api::StreamMsg::Text { turn: d.turn, text: d.text.clone() },
         ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone() },
         ephemeral_event::Kind::ToolOutput(d) => api::StreamMsg::ToolOutput { call_id: d.call_id.clone(), text: d.text.clone() },
@@ -190,7 +192,8 @@ pub fn ephemeral(kind: &ephemeral_event::Kind) -> api::StreamMsg {
         ephemeral_event::Kind::Secret(c) => {
             api::StreamMsg::Secret { call_id: c.call_id.clone(), title: c.title.clone(), value: c.value.clone(), note: c.note.clone() }
         }
-    }
+        ephemeral_event::Kind::RateLimit(_) => return None,
+    })
 }
 
 /// A session as the API shows it. `head`: the head's own worker (its

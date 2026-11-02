@@ -195,7 +195,9 @@ impl EventSink for Sink {
     }
 
     fn ephemeral(&self, kind: ephemeral_event::Kind) {
-        self.st.hub.publish(&self.session_id, crate::convert::ephemeral(&kind));
+        if let Some(msg) = crate::convert::ephemeral(&kind) {
+            self.st.hub.publish(&self.session_id, msg);
+        }
     }
 }
 

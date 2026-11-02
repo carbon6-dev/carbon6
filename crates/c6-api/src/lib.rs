@@ -143,6 +143,51 @@ pub struct Connection {
     pub compact_at: Option<u32>,
 }
 
+/// One usage window of a plan's limits (a Claude Code subscription's, a
+/// ChatGPT plan's): how much of it is used and when it starts afresh.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QuotaWindow {
+    /// What the window is: "5h", "week", "week (Opus)", "overage"…
+    pub name: String,
+    /// Percent of it used, 0 to 100.
+    pub used_percent: f64,
+    /// When it starts afresh; none when the provider didn't say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<UnixMs>,
+    /// "allowed", "warning" (near its limit) or "rejected" (used up), as
+    /// the provider said; empty when it didn't.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+/// A connection's plan limits, as last seen (docs/analytics.md, "Plan
+/// limits"): from Claude Code's own reports as its sessions run, or read
+/// from ChatGPT's usage endpoint every few minutes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConnectionQuota {
+    pub connection_id: String,
+    /// "claude_code" or "chatgpt".
+    pub source: String,
+    pub windows: Vec<QuotaWindow>,
+    /// When they were last seen.
+    pub updated_at: UnixMs,
+    /// Why the last read failed (the windows are the last good ones).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+impl ConnectionQuota {
+    /// The window closest to its limit.
+    pub fn tightest(&self) -> Option<&QuotaWindow> {
+        self.windows.iter().max_by(|a, b| {
+            let rank = |w: &QuotaWindow| if w.status == "rejected" { 1000.0 } else { w.used_percent };
+            rank(a).total_cmp(&rank(b))
+        })
+    }
+}
+
 /// A pool's member: one of the other connections, and how many calls it
 /// takes at once (docs/pools.md).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -3338,7 +3383,7 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 11] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 12] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
@@ -3350,11 +3395,12 @@ pub const NOTIFY_EVENTS: [(&str, &str); 11] = [
     ("budget", "a budget ran out"),
     ("host", "a host's scheduled check failed, or it is reachable again"),
     ("work", "work you left open went quiet, or has needed you for a while"),
+    ("quota", "a plan's usage limit (Claude Code, ChatGPT) passed 80% or 95%, or ran out"),
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 9] =
-    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 10] =
+    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.

@@ -437,6 +437,11 @@ pub async fn connections() -> Result<Vec<Connection>, String> {
     json(Request::get("/api/v1/connections").send().await).await
 }
 
+/// Plan limits per connection, as last seen.
+pub async fn quotas() -> Result<Vec<c6_api::ConnectionQuota>, String> {
+    json(Request::get("/api/v1/connections/quotas").send().await).await
+}
+
 pub async fn create_connection(req: CreateConnection) -> Result<Connection, String> {
     send_json(Request::post("/api/v1/connections"), &req).await
 }

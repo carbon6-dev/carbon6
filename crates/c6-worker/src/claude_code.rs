@@ -1115,6 +1115,11 @@ impl Mapper {
     }
 
     async fn handle(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        // The subscription's limits: for the head, not the transcript.
+        if v["type"] == "rate_limit_event" {
+            sink.ephemeral(ephemeral_event::Kind::RateLimit(c6_proto::RateLimit { json: v["rate_limit_info"].to_string() }));
+            return Ok(());
+        }
         if self.native_task(v) {
             self.saw_output = true;
             return self.task_of_call(v).await;

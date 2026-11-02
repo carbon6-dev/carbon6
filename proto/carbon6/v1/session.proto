@@ -424,7 +424,16 @@ message EphemeralEvent {
     ToolOutputDelta tool_output = 4;
     SessionActivity activity = 5;
     SecretCard secret = 6;
+    RateLimit rate_limit = 7;
   }
+}
+
+// A plan's limits as the model's runtime reported them (Claude Code's
+// rate_limit_event), for the head to keep per connection; never shown in
+// the session.
+message RateLimit {
+  // The report as given (JSON).
+  string json = 1;
 }
 
 // A secret an operation returned (a token, a code), for you only: shown

@@ -44,6 +44,7 @@ pub mod projects;
 pub mod prompts;
 pub mod providers;
 pub mod push;
+pub mod quotas;
 pub mod realms;
 pub mod registry;
 pub mod remote;
@@ -173,6 +174,8 @@ pub struct HeadState {
     pub updates: updates::Updater,
     /// Pools of connections (docs/pools.md).
     pub pools: pools::Pools,
+    /// Plan limits per connection, as last seen.
+    pub quotas: quotas::Quotas,
     /// Documents' changes, for the live feed and their settled events.
     pub docs: docs::Docs,
     /// When each session sent other sessions messages in the last hour
@@ -289,6 +292,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         local_link: Default::default(),
         updates: updater,
         pools: Default::default(),
+        quotas: Default::default(),
         docs: Default::default(),
         messages_sent: Default::default(),
         me: Default::default(),
@@ -338,6 +342,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     decisions::spawn_sweeper(state.clone());
     // Nudges about work left open (docs/work.md §7).
     work::spawn_sweeper(state.clone());
+    // ChatGPT plans' usage windows (Claude Code's come with its turns).
+    quotas::spawn(state.clone());
     {
         let st = state.clone();
         tokio::spawn(async move {

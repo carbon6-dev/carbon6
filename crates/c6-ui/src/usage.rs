@@ -71,6 +71,35 @@ pub fn UsagePage() -> impl IntoView {
     }
 }
 
+/// Each subscription's windows (Claude Code, ChatGPT plans): how much is
+/// used and when it starts afresh.
+#[component]
+fn PlanLimits() -> impl IntoView {
+    let connections = LocalResource::new(api::connections);
+    move || {
+        let quotas = crate::quota::all();
+        let names = connections.get().and_then(Result::ok).unwrap_or_default();
+        let rows: Vec<_> = quotas
+            .into_iter()
+            .filter(|q| !q.windows.is_empty())
+            .map(|q| (names.iter().find(|c| c.id == q.connection_id).map(|c| c.name.clone()).unwrap_or_else(|| q.connection_id.clone()), q))
+            .collect();
+        (!rows.is_empty()).then(|| {
+            view! {
+                <section class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+                    <h2 class="text-sm font-medium">"Plan limits"</h2>
+                    {rows.into_iter().map(|(name, q)| view! {
+                        <div class="flex flex-wrap items-start gap-x-4 gap-y-1">
+                            <span class="w-40 truncate text-xs font-medium">{name}</span>
+                            <crate::quota::QuotaBars q />
+                        </div>
+                    }).collect_view()}
+                </section>
+            }
+        })
+    }
+}
+
 #[component]
 fn Report(r: UsageReport) -> impl IntoView {
     let t = r.total.clone();
@@ -91,6 +120,7 @@ fn Report(r: UsageReport) -> impl IntoView {
                 <Go to=View::Settings { note: None, section: "spending".into() } class="underline">"Settings → Prices"</Go> "."
             </p>
         })}
+        <PlanLimits />
         {(!r.budgets.is_empty()).then(|| view! {
             <section class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                 <h2 class="text-sm font-medium">"Budgets"</h2>

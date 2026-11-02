@@ -61,7 +61,8 @@ pub fn scope(name: &str) -> Option<Scope> {
         "realms.elsewhere",
         "sessions.locate",
     ];
-    const SHARED: &[&str] = &["workers.list", "connections.list", "connections.models", "commands.list", "realms.list", "hosts.list"];
+    const SHARED: &[&str] =
+        &["workers.list", "connections.list", "connections.models", "connections.quotas", "commands.list", "realms.list", "hosts.list"];
     // Realm data whose handlers don't narrow to the caller's realm yet
     // (or that are carbon6-wide today): the console's, until they do.
     const ADMIN: &[&str] = &[
@@ -383,6 +384,7 @@ fn build() -> Vec<Op> {
         op!("workers.terminals.close", "fleet", "DELETE" "/api/v1/workers/{id}/terminals/{tid}", Destructive, Input::None, "Closes a terminal on a worker (its process ends).", choices = &[("id", "workers.list"), ("tid", "workers.terminals.list")]),
 
         // Connections.
+        op!("connections.quotas", "connections", "GET" "/api/v1/connections/quotas", Read, Input::None, "Plan limits per connection, as last seen: each Claude Code subscription's and ChatGPT plan's usage windows (5h, week…), the percent used and when each starts afresh."),
         op!("connections.list", "connections", "GET" "/api/v1/connections", Read, Input::None, "Model connections: name, kind (openai, openai_compat, anthropic, chatgpt, claude_code, pool), base URL, whether a key is set, a pool's members."),
         op!("connections.create", "connections", "POST" "/api/v1/connections", Write, Input::Body(schema::<api::CreateConnection>), "Adds a connection (API key, or a local OpenAI-compatible server such as Ollama). The key is stored encrypted; context_window sets the token window (empty: automatic). For a ChatGPT plan use connections.chatgpt.start. kind pool with members (each a connection and its calls at once) spreads what runs in the head over them (docs/pools.md)."),
         op!("connections.update", "connections", "PATCH" "/api/v1/connections/{id}", Write, Input::Body(schema::<api::UpdateConnection>), "Renames a connection, sets context_window (0 restores automatic), or sets a pool's members (all of them).", choices = &[("id", "connections.list")]),
@@ -1302,6 +1304,7 @@ mod tests {
             include_str!("docs/http.rs"),
             include_str!("projects.rs"),
             include_str!("decks.rs"),
+            include_str!("quotas.rs"),
         ] {
             for c in re.captures_iter(src) {
                 for m in method.captures_iter(&c[2]) {

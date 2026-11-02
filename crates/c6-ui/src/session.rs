@@ -1748,9 +1748,10 @@ fn ModelPicker(
                 .filter(|c| !(no_claude_code && c.kind == "claude_code") || connection.get_untracked() == c.id)
                 .map(|c| {
                 let id = c.id.clone();
-                view! { <option value=c.id.clone() selected=move || connection.get() == id>{c.name.clone()}</option> }
+                view! { <option value=c.id.clone() selected=move || connection.get() == id>{crate::quota::option_label(&c.id, &c.name)}</option> }
             }).collect_view()}
         </select>
+        <crate::quota::QuotaNote connection />
         <div class="w-56"><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" /></div>
         <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
@@ -3773,6 +3774,8 @@ fn Composer(
                             <button class=CHIP title="The model this session runs on: change it" on:click=move |_| toggle("model")>
                                 <span class="text-zinc-500 dark:text-zinc-400">"Model"</span>
                                 <span class="font-medium">{move || { let (_, mm, e) = m.current.get(); model_label(&mm, &e) }}</span>
+                                // What's left of its plan, when it has one.
+                                <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
                                 <span class="text-zinc-400">"▾"</span>
                             </button>
                             {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {

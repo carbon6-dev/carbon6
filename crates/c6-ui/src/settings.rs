@@ -1800,6 +1800,10 @@ fn ConnectionRow(
                     {c.compact_at.map(|n| format!(" · compacts at {n}%"))}
                     {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code" | "pool", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
+                {
+                    let id = c.id.clone();
+                    move || crate::quota::of(&id).map(|q| view! { <div class="mt-1"><crate::quota::QuotaBars q /></div> })
+                }
             </div>
             {editable.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
             {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-zinc-500") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}

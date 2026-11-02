@@ -1803,6 +1803,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
                 _ => "stopped",
             };
             crate::remote::turn_ended(st, &batch.session_id, ev.seq, t.reason).await;
+            crate::quotas::turn_ended(st, &batch.session_id).await;
             crate::triggers::session_ended(st, &batch.session_id, outcome).await;
             match outcome {
                 "ok" => crate::triggers::on_session(st, &batch.session_id, "finished", "").await,
@@ -1953,8 +1954,15 @@ pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEven
     if owner != Some(worker_id) {
         return;
     }
-    if let Some(kind) = &ev.kind {
-        st.hub.publish(&ev.session_id, convert::ephemeral(kind));
+    match &ev.kind {
+        // Claude Code's report of its subscription's limits.
+        Some(c6_proto::ephemeral_event::Kind::RateLimit(r)) => crate::quotas::from_claude_code(st, &ev.session_id, &r.json).await,
+        Some(kind) => {
+            if let Some(msg) = convert::ephemeral(kind) {
+                st.hub.publish(&ev.session_id, msg);
+            }
+        }
+        None => {}
     }
 }
 

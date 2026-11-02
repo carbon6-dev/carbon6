@@ -35,6 +35,7 @@ mod photos;
 mod place;
 mod projects;
 mod push;
+mod quota;
 mod search;
 mod session;
 mod sessions;
@@ -92,6 +93,8 @@ fn Main() -> impl IntoView {
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());
     provide_context(aspects::Spotlight(RwSignal::new(None)));
+    // Plan limits per connection, beside every connection picker.
+    quota::provide();
     // A signed-in browser opening a login link (to sign in again).
     if window().location().pathname().unwrap_or_default().starts_with("/login/") {
         return view! {

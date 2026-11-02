@@ -261,6 +261,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .merge(crate::auth::routes())
         .merge(crate::docs::http::routes())
         .merge(crate::projects::routes())
+        .merge(crate::quotas::routes())
         .merge(crate::decks::routes())
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), settings_realm))
