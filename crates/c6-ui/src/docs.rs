@@ -127,6 +127,14 @@ struct ChipCtx {
     send: StoredValue<Box<dyn Fn(Vec<DocOp>) + Send + Sync>>,
 }
 
+/// A document's comment threads as last loaded, shared by its blocks (each
+/// marks its own) and its Comments section (which loads them).
+#[derive(Clone, Copy)]
+struct ThreadsCtx {
+    shown: RwSignal<Vec<c6_api::docs::DocThread>>,
+    tick: RwSignal<u32>,
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
@@ -720,6 +728,7 @@ pub fn DocPage(id: String) -> impl IntoView {
         send: StoredValue::new(Box::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops)))),
     };
     provide_context(chip_ctx);
+    provide_context(ThreadsCtx { shown: RwSignal::new(Vec::new()), tick });
     Effect::new(move || {
         let Some(Ok(d)) = doc.get() else { return };
         let refs = ref_chips(&d);
@@ -1044,6 +1053,12 @@ fn BlockView(
 ) -> impl IntoView {
     let bid = StoredValue::new(b.id.clone());
     let block = StoredValue::new(b.clone());
+    // Its open comment threads, and whether they're shown under it.
+    let threads = expect_context::<ThreadsCtx>();
+    let open_threads = Memo::new(move |_| {
+        threads.shown.with(|ts| ts.iter().filter(|t| t.state == "open" && t.anchor.block == bid.get_value()).cloned().collect::<Vec<_>>())
+    });
+    let showing = RwSignal::new(false);
     let hover = format!("{} · last written by {} (version {})", b.kind, author_named(&b.by), b.rev);
     let chip_ctx = use_context::<ChipCtx>();
     let (col, ws) = (use_column(), use_workspace());
@@ -1128,9 +1143,26 @@ fn BlockView(
             // Inside the block, in its right padding: outside it, the
             // pointer left the block on its way and the button hid, and at
             // the panel's edge it sat over the scrollbar.
-            <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
-                on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
+            // With open comments, a lasting marker with their count opens
+            // them here; without, 💬 shows on hover to start one.
+            {move || match open_threads.with(Vec::len) {
+                0 => view! {
+                    <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
+                        on:click=move |_| commenting.set(Some(bid.get_value()))>"💬"</button>
+                }.into_any(),
+                n => view! {
+                    <button class="absolute right-0.5 top-0.5 rounded px-1 text-xs font-medium text-violet-700 hover:bg-violet-100 dark:text-violet-300 dark:hover:bg-violet-950"
+                        title=move || if showing.get() { "Hide its comments" } else { "Show its comments here" }
+                        on:click=move |_| showing.update(|s| *s = !*s)>{format!("💬 {n}")}</button>
+                }.into_any(),
+            }}
         </div>
+        {move || (showing.get() && !open_threads.with(Vec::is_empty)).then(|| view! {
+            <div class="my-1 space-y-2 border-l-2 border-violet-300 pl-3 dark:border-violet-800">
+                {open_threads.get().into_iter().map(|t| view! { <Thread t doc=doc_id.get_value() tick=threads.tick /> }).collect_view()}
+                <button class="text-xs text-violet-700 hover:underline dark:text-violet-300" on:click=move |_| commenting.set(Some(bid.get_value()))>"+ Another comment"</button>
+            </div>
+        })}
         {move || (commenting.get() == Some(bid.get_value())).then(|| view! {
             <NewComment doc=doc_id block=bid.get_value() commenting posted=reload />
         })}
@@ -1192,7 +1224,7 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
         tick.track();
         api::doc_threads(id.get_value())
     });
-    let shown = RwSignal::new(Vec::<c6_api::docs::DocThread>::new());
+    let shown = expect_context::<ThreadsCtx>().shown;
     Effect::new(move || {
         if let Some(Ok(t)) = threads.get() {
             shown.set(t);
