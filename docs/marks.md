@@ -29,7 +29,6 @@ Marks you or the head picked live in the head (`marks` table) and reach every br
 ## 3. Where they show
 
 - **A tile's bar**: the session's dot, then its shown aspects as shapes; when the tile is wide (a container query) each is named too. Pointing at one dims every tile whose session doesn't share that value. Clicking one shows the value, the other sessions with it, a way to its page (worker, work), for work the "change…" control, and the palette.
-- **A tile's left edge**: a stripe in its work's mark, so tiles of the same work line up by colour.
 - **The rail, the dock, the sessions list**: the session's mark, and its shown aspects as small shapes (named chips in the list and the rail's card).
 - **Workers** (list and page), **Work** (list, item page, the Brief's "Left open", a session's work line), **Projects** (list, page, its work, and project links in Work): the value's own mark, clickable to change on the worker, work and project pages and in the workers list.
 - **The realm switcher**: each realm's triangle.

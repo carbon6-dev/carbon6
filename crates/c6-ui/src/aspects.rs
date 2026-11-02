@@ -301,7 +301,7 @@ pub fn FacetsSetting() -> impl IntoView {
     };
     let what = |aspect: &str| match aspect {
         "worker" => ("Worker", "The machine it runs on"),
-        "work" => ("Work", "The work it serves; its tile gets a stripe in the work's mark too"),
+        "work" => ("Work", "The work it serves"),
         "project" => ("Project", "The project its work is in"),
         "realm" => ("Realm", "When it isn't home"),
         "repo" => ("Repo", "The git repository it works in"),
