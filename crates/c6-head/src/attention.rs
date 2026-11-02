@@ -240,7 +240,12 @@ struct Seen {
     brief: i64,
 }
 
+/// The realm's own record only: a realm that has none starts empty rather
+/// than borrowing root's (which would hide its Brief row by root's time).
 async fn seen_in(st: &HeadState, realm: &str) -> Seen {
+    if realm != crate::realms::ROOT && !st.store.has_own_setting(SEEN, realm).await.unwrap_or(false) {
+        return Seen::default();
+    }
     st.store.setting_for(SEEN, realm).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
 }
 
