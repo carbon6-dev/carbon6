@@ -37,7 +37,7 @@ Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes
 
   The default asks for one short line in the user's voice, or `-` when there's no clear next step. Then nothing is shown.
 - **Model.**
-  1. The model-routing rule that applies to the session's labels plus `task:suggest`, in the session's realm (then root's). Add one to send suggestions to a small, fast model.
+  1. The model-routing rule that applies to the session's labels plus `task:suggest`, in the session's realm (then root's), whose connection that realm may use (a rule naming another realm's connection is passed over). Add one to send suggestions to a small, fast model; for one realm only, add it in the console under Settings → Model routing → Rules for <realm>.
   2. Without such a rule, the session's own connection and model.
 
   It runs in the head, one call with no tools, low effort, and at most 1,024 output tokens, so a thinking model has room to reason. The answer is cut to one line. A reply with no text at all counts as a failed call, not as "no next step".

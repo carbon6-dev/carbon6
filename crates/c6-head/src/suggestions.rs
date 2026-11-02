@@ -97,28 +97,31 @@ pub async fn seen(st: &HeadState, session_id: &str, for_seq: i64, accepted: bool
 }
 
 /// The connection and model: a routing rule for `task:suggest` that
-/// applies to the session (its realm's rules, then root's), else the
-/// session's own.
+/// applies to the session (its realm's rules first, then root's), else the
+/// session's own. A rule whose connection the session's realm may not use
+/// is passed over.
 async fn model_for(st: &HeadState, row: &crate::store::SessionRow) -> anyhow::Result<(String, String)> {
     let mut labels = row.all_labels();
     labels.push(ROUTE_LABEL.into());
     let connections = st.store.connections().await?;
-    for realm in [row.realm.as_str(), crate::realms::ROOT] {
-        let routes: Vec<api::Route> =
-            serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
-        for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l == ROUTE_LABEL)) {
-            if !api::labels::applies(&r.applies_to, &labels) {
-                continue;
-            }
-            let want = r.connection.trim();
-            let connection = if want.is_empty() {
-                Some(row.connection_id.clone())
-            } else {
-                connections.iter().find(|c| c.id == want || c.name == want).map(|c| c.id.clone())
-            };
-            if let Some(c) = connection {
-                return Ok((c, r.model.trim().to_owned()));
-            }
+    // The realm's rules, then root's (setting_for merges them).
+    let routes: Vec<api::Route> =
+        serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, &row.realm).await?.unwrap_or_default()).unwrap_or_default();
+    for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l == ROUTE_LABEL)) {
+        if !api::labels::applies(&r.applies_to, &labels) {
+            continue;
+        }
+        let want = r.connection.trim();
+        let connection = if want.is_empty() {
+            Some(row.connection_id.clone())
+        } else {
+            connections
+                .iter()
+                .find(|c| (c.id == want || c.name == want) && crate::realms::available(&c.realms, &row.realm))
+                .map(|c| c.id.clone())
+        };
+        if let Some(c) = connection {
+            return Ok((c, r.model.trim().to_owned()));
         }
     }
     Ok((row.connection_id.clone(), row.model.clone()))

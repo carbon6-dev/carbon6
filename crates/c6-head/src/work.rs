@@ -1232,24 +1232,25 @@ pub(crate) async fn model_for_route(
     let route_label = label;
     let connections = st.store.connections().await?;
     let labels = vec![route_label.to_owned()];
-    for r in [realm, crate::realms::ROOT] {
-        let routes: Vec<api::Route> =
-            serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, r).await?.unwrap_or_default()).unwrap_or_default();
-        for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
-            if !api::labels::applies(&route.applies_to, &labels) {
-                continue;
-            }
-            let want = route.connection.trim();
-            let connection = if want.is_empty() {
-                fallback.as_ref().map(|f| f.0.clone())
-            } else {
-                connections.iter().find(|c| c.id == want || c.name == want).map(|c| c.id.clone())
-            };
-            if let Some(c) = connection {
-                let model = route.model.trim();
-                let model = if model.is_empty() { fallback.as_ref().map(|f| f.1.clone()).unwrap_or_default() } else { model.to_owned() };
-                return Ok(Some((c, model)));
-            }
+    // The realm's rules, then root's (setting_for merges them). A rule
+    // whose connection the realm may not use is passed over.
+    let routes: Vec<api::Route> =
+        serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
+    let usable = |c: &crate::store::ConnectionRow| realm == crate::realms::ROOT || crate::realms::available(&c.realms, realm);
+    for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
+        if !api::labels::applies(&route.applies_to, &labels) {
+            continue;
+        }
+        let want = route.connection.trim();
+        let connection = if want.is_empty() {
+            fallback.as_ref().map(|f| f.0.clone())
+        } else {
+            connections.iter().find(|c| (c.id == want || c.name == want) && usable(c)).map(|c| c.id.clone())
+        };
+        if let Some(c) = connection {
+            let model = route.model.trim();
+            let model = if model.is_empty() { fallback.as_ref().map(|f| f.1.clone()).unwrap_or_default() } else { model.to_owned() };
+            return Ok(Some((c, model)));
         }
     }
     Ok(fallback.filter(|(c, _)| !c.is_empty()))
